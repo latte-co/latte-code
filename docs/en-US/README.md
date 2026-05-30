@@ -7,7 +7,7 @@ This directory contains English Fluxcode documentation. Formal English documents
 ### Current Formal Design Documents
 
 - [Architecture Overview](./design/architecture-overview.md)
-  - Current top-level design entry. It states that Fluxcode is externally a code-agent `Data Plane`, that `Control Plane Authority` only means Fluxcode internal runtime authority, and it covers the Lark document relationship, planes / layers, `ActionGraph` boundary, promotion, gate taxonomy, and node-level bounded ReAct.
+  - Current top-level architecture entry. It first gives Fluxcode's top-level positioning as an external code-agent `Data Plane` and clarifies that `Control Plane Authority` only means Fluxcode internal runtime authority; then it expands the code agent operating model and its difference from a plain `ReAct` / transcript-driven agent; after that, it explains how the harness-native runtime supports code-agent behavior as a governance substrate, and covers the runtime loop, key module authority ownership, external collaboration and governance boundaries, non-goals, and drill-down document indexes.
 - [Runtime Kernel Roadmap v0.1-v0.5](./design/runtime-kernel-roadmap-v0.1-v0.5.md)
   - Current version goals and cross-version invariants from `v0.1` through `v0.5`.
 - [Runtime Kernel Task Breakdown v0.1-v0.5](./design/runtime-kernel-task-breakdown.md)
@@ -50,3 +50,11 @@ This directory contains English Fluxcode documentation. Formal English documents
 - When adding or substantially updating a formal English document, add or update the corresponding Chinese document path.
 - If a translation is intentionally deferred, mark the deferral in both language indexes with the reason and expected follow-up.
 - English documents should use the same core terms as Chinese documents, including `Data Plane`, `Control Plane Authority` scoped to internal runtime authority, `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `Reconciler`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `OverlayRevision`, `ContextProjection`, and `NodeExecutor`.
+
+## Terminology Boundaries
+
+- **Research Facts**: Findings from horizontal research and verifiable observations, used to describe existing systems' capabilities and limits.
+- **Design Proposals**: The code-agent operating model and harness-native runtime design derived from research facts; they do not mean existing systems already have these capabilities.
+- **Data Plane**: The external positioning of Code Agent / Fluxcode from the perspective of the whole software engineering system; Fluxcode executes tasks and produces evidence, but does not replace external governance systems.
+- **Control Plane Authority**: Only Fluxcode internal runtime authority, responsible for internal facts, scheduling, side effects, transactions, and recovery semantics; it must not be understood as an external engineering governance control plane.
+- **ActionGraph**: The execution ledger, scheduling surface, recovery entry point, audit index, and UX visualization surface; it is not an omniscient state container.

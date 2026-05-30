@@ -7,7 +7,7 @@
 ### 当前正式设计文档
 
 - [架构设计总览](./design/architecture-overview.md)
-  - 当前顶层设计入口。明确 Fluxcode externally 是 code agent `Data Plane`，`Control Plane Authority` 仅指 Fluxcode internal runtime authority；说明与飞书文档的顶层关系、planes / layers、`ActionGraph` 边界、promotion、gate taxonomy 和 node-level bounded ReAct。
+  - 当前顶层架构入口。先给出 Fluxcode externally 是 code agent `Data Plane` 的顶层定位，并明确 `Control Plane Authority` 仅指 Fluxcode internal runtime authority；再展开 code agent 工作模型，以及与普通 `ReAct` / transcript-driven agent 的区别；随后说明 harness-native runtime 如何作为治理底座支撑 code-agent 行为，并覆盖运行闭环、关键模块权威归属、外部协作与治理边界、非目标和下钻文档索引。
 - [Runtime Kernel Roadmap v0.1-v0.5](./design/runtime-kernel-roadmap-v0.1-v0.5.md)
   - 当前 v0.1-v0.5 阶段目标和跨版本不变量。
 - [Runtime Kernel 任务拆分 v0.1-v0.5](./design/runtime-kernel-task-breakdown.md)
@@ -59,7 +59,7 @@
 ## 术语边界
 
 - **调研事实**：来自横向调研和可复查观察，用于描述已有系统的能力和限制。
-- **设计建议**：基于调研事实推导出的 harness-native runtime 设计，不表示既有系统已经具备该能力。
+- **设计建议**：基于调研事实推导出的 code-agent operating model 与 harness-native runtime 设计，不表示既有系统已经具备该能力。
 - **Data Plane**：从整个软件工程系统视角，Code Agent / Fluxcode 的外部定位；Fluxcode 执行任务并产出证据，但不取代外部治理系统。
 - **Control Plane Authority**：仅指 Fluxcode internal runtime authority，负责内部事实、调度、副作用、事务和恢复语义；不得理解为外部工程治理控制平面。
 - **ActionGraph**：执行账本、调度表面、恢复入口、审计索引和 UX 可视化表面，不是全知状态容器。
