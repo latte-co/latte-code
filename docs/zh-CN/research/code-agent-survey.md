@@ -17,7 +17,7 @@
 ## 调研事实与设计建议的边界
 
 - **调研事实**：本文件记录五个系统已有的架构、能力、状态模型和边界。
-- **设计建议**：仅在“对 harness-native 的启发”“需要重构的能力”等小节中说明这些事实对 harness-native code agent 的影响；完整目标架构见 [Harness-native Code Agent 设计建议](../design/harness-native-code-agent.md)。
+- **设计建议**：仅在“对 harness-native 的启发”“需要重构的能力”等小节中说明这些事实对 harness-native code agent 的影响；完整目标架构见 [架构设计总览](../design/architecture-overview.md)。
 
 ## 调研对象
 
