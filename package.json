@@ -1,0 +1,25 @@
+{
+  "name": "fluxcode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first TypeScript code agent prototype with graph-ready boundaries.",
+  "license": "Apache-2.0",
+  "bin": {
+    "fluxcode": "dist/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@vitest/coverage-v8": "^1.6.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
