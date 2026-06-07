@@ -36,16 +36,44 @@ Basic working code agent
 
 ### 2.1 第一阶段：基础可工作 code agent
 
-最早期的 Fluxcode 应先完成以下闭环：
+最早期的 Fluxcode 应先完成最小 contract-first code agent 闭环。`v0.1` 的 P0 范围包括以下模块，但每一项都只交付最小可用版本，不把 Fluxcode 扩展成完整生态平台：
+
+- CLI。
+- config。
+- `AGENTS.md` loader。
+- session management。
+- agent-loop / phase runner。
+- built-in tools。
+- minimal MCP bridge。
+- local skills。
+- local commands。
+- permission system。
+- evidence / trace。
+- `AgentHandoff`。
+
+这些模块在 `v0.1` 的主链路中统一进入同一 contract、session、permission、evidence 和 trace 边界：
+
+```text
+CLI / local command / local skill / minimal MCP bridge / built-in tools
+  -> TaskSpec
+  -> Session / TaskRunState
+  -> ContextPack
+  -> AgentLoop / PhaseRunner
+  -> PermissionDecision
+  -> Evidence / StepTrace
+  -> AgentHandoff
+```
+
+这个闭环必须能完成：
 
 - 接收用户任务和验收条件。
 - 搜索、读取并理解仓库上下文。
 - 生成小范围代码修改。
 - 运行用户允许的验证命令。
 - 汇报 diff、验证结果、风险和阻塞。
-- 保留最小执行记录，便于复盘。
+- 保留最小执行记录、session 快照、证据和 trace，便于复盘与恢复。
 
-这一阶段不需要完整 `ActionGraph` 或完整事实系统。可以先使用简单的 `TaskRun`、`StepTrace`、`ToolCallRecord`、`PatchSummary` 和 `VerificationResult`。
+这一阶段不需要完整 `ActionGraph` 或完整事实系统。可以先使用简单的 `TaskRunState`、`StepTrace`、`ToolCallRecord`、`PatchSummary`、`VerificationResult`、`PermissionDecision` 和 `AgentHandoff`。`minimal MCP bridge`、`local skills` 和 `local commands` 只能作为进入同一 agent loop 的入口或能力适配层，不能绕过权限、session、trace 或 handoff。
 
 ### 2.2 第二阶段：把执行过程结构化
 
@@ -145,6 +173,10 @@ Fluxcode 的模块不要求同时完整实现，但它们的演进方向应保�
 | --- | --- | --- |
 | `NodeExecutor` | 线性执行任务步骤，调用文件、搜索、编辑和验证能力 | 执行单个 `ActionNode`，支持 deterministic、single-decision、exploratory profile |
 | `Capability Adapter` | 包装本地文件、搜索、shell、Git、LSP 等基础工具 | 外部能力 anti-corruption layer，输出 runtime-native 对象 |
+| `CLI / Local Command` | 把 CLI 或本地命令规格转换为 `TaskSpec`，进入统一 phase / session 系统 | 作为 runtime UX / automation 入口，不直接执行副作用 |
+| `AGENTS.md Loader` | 读取仓库内 `AGENTS.md` 约束并写入 context snapshot / hash | 成为上下文与 policy 输入的一部分，而不是未追踪 prompt 拼接 |
+| `Minimal MCP Bridge` | 从配置声明的 server list / call tools，并统一走 permission / evidence / trace / session | 外部 capability adapter，不是 marketplace、resource / prompt 平台或 server 管理 UI |
+| `Local Skill Loader` | 加载本地 instruction / workflow / command bundle，注入 context / prompt registry | 本地能力包入口，不做 hub、install、publish 或 marketplace |
 | `Policy Core and Guard` | 约束 LLM 不直接越权写文件、跑命令或扩大范围 | 生成并校验结构化 `PolicyDecision` |
 | `ActionGraph` | 从 `StepTrace` 开始，记录关键步骤 | 执行账本、调度表面、恢复入口和 UX 表面 |
 | `StateStore` | 保存任务摘要、验证结果和少量证据引用 | 管理 `Observation`、`Evidence`、versioned `Fact` |
@@ -172,6 +204,7 @@ Fluxcode 与既有工程系统协作，但不替代它们。
 - Fluxcode externally 是 code agent `Data Plane`，不是外部工程治理 `Control Plane`。
 - `Control Plane Authority` 必须限定为 Fluxcode internal runtime authority，并且是渐进式引入的目标。
 - v0.1 的优先级是基础可工作 code agent，而不是完整 runtime kernel。
+- v0.1 的 P0 范围包括 CLI、config、`AGENTS.md` loader、session management、agent-loop / phase runner、built-in tools、minimal MCP bridge、local skills、local commands、permission system、evidence / trace 和 `AgentHandoff`，但都限定为最小 contract-first 闭环能力。
 - `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 是演进方向，不应在早期实现中制造不必要复杂度。
 - 执行记录、工具调用、文件修改和验证结果从第一阶段起就应保留可追溯入口。
 - 设计文档不得暗示 runtime 能力已经全部实现。
@@ -181,6 +214,7 @@ Fluxcode 与既有工程系统协作，但不替代它们。
 - 不把 Fluxcode 设计为外部工程治理 `Control Plane`。
 - 不替代 repo permissions、CI、code review、compliance、release 或 deployment gates。
 - 不要求 v0.1 一次性交付完整 harness-native runtime。
+- 不要求 v0.1 交付完整 MCP platform、marketplace、resource / prompt ecosystem、skill hub、command marketplace、cloud sync、multi-user session 或 full `ActionGraph` persistence。
 - 不把 `ActionGraph` 设计成全知状态数据库。
 - 不把 prompt transcript、模型记忆或工具日志作为长期事实生命周期系统。
 - 不把 agent-level global ReAct loop 作为最终 runtime 主控制器。

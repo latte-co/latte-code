@@ -21,6 +21,7 @@
   - 当前顶层架构入口。定义 code-agent-first 演进路线、模块渐进关系、外部边界和非目标。
 - 当前 / 近期模块级技术设计：
   - [`Code Agent Loop`](./design/modules/code-agent-loop.md)
+  - [`Provider Compatibility Layer`](./design/modules/provider-compatibility-layer.md)
 - 已接受的长期 runtime 演进目标：
   - [`Runtime Evolution`](./design/runtime-evolution/README.md)
   - [`ActionGraph`](./design/runtime-evolution/modules/action-graph.md)
@@ -51,6 +52,7 @@
 | --- | --- | --- |
 | [`design/architecture-overview.md`](./design/architecture-overview.md) | [`../en-US/design/architecture-overview.md`](../en-US/design/architecture-overview.md) | 已对齐 |
 | [`design/modules/code-agent-loop.md`](./design/modules/code-agent-loop.md) | [`../en-US/design/modules/code-agent-loop.md`](../en-US/design/modules/code-agent-loop.md) | 已对齐 |
+| [`design/modules/provider-compatibility-layer.md`](./design/modules/provider-compatibility-layer.md) | [`../en-US/design/modules/provider-compatibility-layer.md`](../en-US/design/modules/provider-compatibility-layer.md) | 已对齐 |
 | [`design/runtime-evolution/README.md`](./design/runtime-evolution/README.md) | [`../en-US/design/runtime-evolution/README.md`](../en-US/design/runtime-evolution/README.md) | 已对齐 |
 | [`design/runtime-evolution/modules/README.md`](./design/runtime-evolution/modules/README.md) | [`../en-US/design/runtime-evolution/modules/README.md`](../en-US/design/runtime-evolution/modules/README.md) | 已对齐 |
 | [`design/runtime-evolution/modules/action-graph.md`](./design/runtime-evolution/modules/action-graph.md) | [`../en-US/design/runtime-evolution/modules/action-graph.md`](../en-US/design/runtime-evolution/modules/action-graph.md) | 已对齐 |

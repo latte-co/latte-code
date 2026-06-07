@@ -36,16 +36,44 @@ Basic working code agent
 
 ### 2.1 Stage One: Basic Working Code Agent
 
-The earliest Fluxcode should complete this loop:
+The earliest Fluxcode should complete the minimal contract-first code agent loop. The `v0.1` P0 scope includes the following modules, but each one is only the minimum usable version; `v0.1` does not become a full ecosystem platform:
+
+- CLI.
+- config.
+- `AGENTS.md` loader.
+- session management.
+- agent-loop / phase runner.
+- built-in tools.
+- minimal MCP bridge.
+- local skills.
+- local commands.
+- permission system.
+- evidence / trace.
+- `AgentHandoff`.
+
+These modules enter the same contract, session, permission, evidence, and trace boundaries through the `v0.1` main flow:
+
+```text
+CLI / local command / local skill / minimal MCP bridge / built-in tools
+  -> TaskSpec
+  -> Session / TaskRunState
+  -> ContextPack
+  -> AgentLoop / PhaseRunner
+  -> PermissionDecision
+  -> Evidence / StepTrace
+  -> AgentHandoff
+```
+
+This loop must:
 
 - Accept a user task and acceptance criteria.
 - Search, read, and understand repository context.
 - Generate small, scoped code changes.
 - Run user-approved verification commands.
 - Report diff, verification result, risks, and blockers.
-- Keep a minimal execution record for review.
+- Keep minimal execution records, session snapshots, evidence, and trace for review and recovery.
 
-This stage does not need a full `ActionGraph` or fact system. It may start with `TaskRun`, `StepTrace`, `ToolCallRecord`, `PatchSummary`, and `VerificationResult`.
+This stage does not need a full `ActionGraph` or fact system. It may start with `TaskRunState`, `StepTrace`, `ToolCallRecord`, `PatchSummary`, `VerificationResult`, `PermissionDecision`, and `AgentHandoff`. The `minimal MCP bridge`, `local skills`, and `local commands` may only act as entry points or capability adapters into the same agent loop; they must not bypass permissions, sessions, trace, or handoff.
 
 ### 2.2 Stage Two: Structure Execution
 
@@ -145,6 +173,10 @@ Fluxcode modules do not need to be fully implemented at the same time, but their
 | --- | --- | --- |
 | `NodeExecutor` | Run linear task steps and call file, search, edit, and verification capabilities | Execute a single `ActionNode` with deterministic, single-decision, or exploratory profile |
 | `Capability Adapter` | Wrap basic local tools | Anti-corruption layer that emits runtime-native objects |
+| `CLI / Local Command` | Convert CLI or local command specs into `TaskSpec` and enter the unified phase / session system | Runtime UX / automation entry, not a direct side-effect executor |
+| `AGENTS.md Loader` | Read repository `AGENTS.md` constraints and write them into context snapshot / hash | Part of context and policy input, not untracked prompt concatenation |
+| `Minimal MCP Bridge` | List / call tools from config-defined servers through unified permission / evidence / trace / session | External capability adapter, not a marketplace, resource / prompt platform, or server-management UI |
+| `Local Skill Loader` | Load local instruction / workflow / command bundles into context / prompt registry | Local capability bundle entry, not hub / install / publish / marketplace |
 | `Policy Core and Guard` | Prevent LLM from writing, running commands, or expanding scope without guardrails | Produce and validate structured `PolicyDecision` |
 | `ActionGraph` | Start as `StepTrace` | Execution ledger, scheduling surface, recovery entry, and UX surface |
 | `StateStore` | Store task summaries, verification results, and evidence references | Manage `Observation`, `Evidence`, and versioned `Fact` |
@@ -172,6 +204,7 @@ Fluxcode works with existing engineering systems but does not replace them.
 - Fluxcode externally is a code-agent `Data Plane`, not an external engineering `Control Plane`.
 - `Control Plane Authority` must be scoped to Fluxcode internal runtime authority, and is introduced incrementally.
 - The `v0.1` priority is a basic working code agent, not a full runtime kernel.
+- The `v0.1` P0 scope includes CLI, config, `AGENTS.md` loader, session management, agent-loop / phase runner, built-in tools, minimal MCP bridge, local skills, local commands, permission system, evidence / trace, and `AgentHandoff`, but all are limited to the minimum contract-first loop.
 - `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` are evolution targets; early implementation should not create unnecessary complexity.
 - Execution records, tool calls, file changes, and verification results should have traceable entry points from the first stage.
 - Design documents must not imply the runtime capabilities are fully implemented.
@@ -181,6 +214,7 @@ Fluxcode works with existing engineering systems but does not replace them.
 - Do not design Fluxcode as an external engineering governance `Control Plane`.
 - Do not replace repo permissions, CI, code review, compliance, release, or deployment gates.
 - Do not require `v0.1` to deliver the full harness-native runtime.
+- Do not require `v0.1` to deliver a full MCP platform, marketplace, resource / prompt ecosystem, skill hub, command marketplace, cloud sync, multi-user session, or full `ActionGraph` persistence.
 - Do not make `ActionGraph` an omniscient state database.
 - Do not use prompt transcript, model memory, or tool logs as the long-term fact lifecycle system.
 - Do not use agent-level global ReAct as the final runtime controller.

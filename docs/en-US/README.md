@@ -21,6 +21,7 @@ The current design posture is evolutionary: Fluxcode should first become a basic
   - Current top-level architecture entry. It defines the code-agent-first evolution path, module relationships, external boundaries, and non-goals.
 - Current / near-term module-level technical designs:
   - [`Code Agent Loop`](./design/modules/code-agent-loop.md)
+  - [`Provider Compatibility Layer`](./design/modules/provider-compatibility-layer.md)
 - Accepted long-term runtime evolution targets:
   - [`Runtime Evolution`](./design/runtime-evolution/README.md)
   - [`ActionGraph`](./design/runtime-evolution/modules/action-graph.md)
@@ -45,6 +46,7 @@ The current design posture is evolutionary: Fluxcode should first become a basic
 | --- | --- | --- |
 | [`design/architecture-overview.md`](./design/architecture-overview.md) | [`../zh-CN/design/architecture-overview.md`](../zh-CN/design/architecture-overview.md) | Aligned |
 | [`design/modules/code-agent-loop.md`](./design/modules/code-agent-loop.md) | [`../zh-CN/design/modules/code-agent-loop.md`](../zh-CN/design/modules/code-agent-loop.md) | Aligned |
+| [`design/modules/provider-compatibility-layer.md`](./design/modules/provider-compatibility-layer.md) | [`../zh-CN/design/modules/provider-compatibility-layer.md`](../zh-CN/design/modules/provider-compatibility-layer.md) | Aligned |
 | [`design/runtime-evolution/README.md`](./design/runtime-evolution/README.md) | [`../zh-CN/design/runtime-evolution/README.md`](../zh-CN/design/runtime-evolution/README.md) | Aligned |
 | [`design/runtime-evolution/modules/README.md`](./design/runtime-evolution/modules/README.md) | [`../zh-CN/design/runtime-evolution/modules/README.md`](../zh-CN/design/runtime-evolution/modules/README.md) | Aligned |
 | [`design/runtime-evolution/modules/action-graph.md`](./design/runtime-evolution/modules/action-graph.md) | [`../zh-CN/design/runtime-evolution/modules/action-graph.md`](../zh-CN/design/runtime-evolution/modules/action-graph.md) | Aligned |

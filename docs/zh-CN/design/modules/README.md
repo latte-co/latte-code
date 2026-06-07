@@ -5,6 +5,7 @@
 当前 / 近期模块文档：
 
 - [`Code Agent Loop`](./code-agent-loop.md)
+- [`Provider Compatibility Layer`](./provider-compatibility-layer.md)
 
 ## 边界说明
 
