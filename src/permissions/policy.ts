@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PermissionConfig, ShellToolConfig } from "../config/types.js";
 import type { PermissionDecision, PermissionRequest } from "./types.js";
@@ -8,9 +9,14 @@ export class PermissionPolicy {
   constructor(private readonly config: PermissionConfig, private readonly shellConfig?: ShellToolConfig) {}
 
   decide(request: PermissionRequest): PermissionDecision {
-    const commandCategory = classifyCommand(request.call.input.command);
+    const command = typeof request.call.input.command === "string" ? request.call.input.command.trim() : undefined;
+    const commandCategory = classifyCommand(command);
     const pathDecision = this.pathDecision(request);
     if (pathDecision.denied) return this.result("deny", request, pathDecision.reason, commandCategory, true);
+    if (request.toolName === "shell_exec" && command !== undefined) {
+      const shellDecision = this.shellCommandDecision(request, command, commandCategory);
+      if (shellDecision !== undefined) return shellDecision;
+    }
     if (commandCategory !== undefined && this.shellRequiresApproval(request, commandCategory)) {
       if (HIGH_RISK_COMMAND_CATEGORIES.has(commandCategory)) {
         return this.result(this.config.highRiskTools, request, `Command category '${commandCategory}' requires high-risk policy`, commandCategory, false);
@@ -57,6 +63,17 @@ export class PermissionPolicy {
     return this.shellConfig?.requireApprovalFor.includes(commandCategory) === true;
   }
 
+  private shellCommandDecision(request: PermissionRequest, command: string, commandCategory: string | undefined): PermissionDecision | undefined {
+    if (commandCategory !== undefined && HIGH_RISK_COMMAND_CATEGORIES.has(commandCategory)) return undefined;
+    if (commandCategory !== undefined && this.shellConfig?.requireApprovalFor.includes(commandCategory) === true) return undefined;
+    const allowCommands = this.shellConfig?.allowCommands ?? [];
+    const manifestCommands = declaredManifestCommands(request.cwd);
+    if ([...allowCommands, ...manifestCommands].map(normalizeCommand).includes(normalizeCommand(command))) {
+      return this.result("allow", request, "Shell command is allowed by tools.shell.allowCommands or project manifest scripts", commandCategory, false);
+    }
+    return this.result("ask", request, "Shell command is not listed in tools.shell.allowCommands", commandCategory, false);
+  }
+
   private result(action: PermissionDecision["action"], request: PermissionRequest, reason: string, commandCategory: string | undefined, sensitivePath: boolean): PermissionDecision {
     return {
       action,
@@ -71,6 +88,24 @@ export class PermissionPolicy {
       }
     };
   }
+}
+
+function declaredManifestCommands(cwd: string): string[] {
+  try {
+    const value = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8")) as unknown;
+    if (!isRecord(value) || !isRecord(value.scripts)) return [];
+    return Object.keys(value.scripts).flatMap((name) => (name === "test" ? ["npm test", "npm run test"] : [`npm run ${name}`]));
+  } catch {
+    return [];
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, " ");
 }
 
 export function classifyCommand(value: unknown): string | undefined {

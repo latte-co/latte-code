@@ -1,11 +1,41 @@
-import { mkdtemp } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/defaults.js";
 import { mergeConfig } from "../../src/config/config.js";
-import { parseArgs } from "../../src/cli/main.js";
+import { parseArgs, runCli } from "../../src/cli/main.js";
 import { createAgentLoop, createDefaultRegistry } from "../../src/runtime/create-agent.js";
+import type { ModelTurn } from "../../src/model/types.js";
+
+interface PackageMetadata {
+  bin?: {
+    fluxcode?: string;
+  };
+  scripts?: Record<string, string>;
+}
+
+interface TypeScriptConfig {
+  compilerOptions?: {
+    rootDir?: string;
+    outDir?: string;
+  };
+}
+
+function artifact(value: unknown): ModelTurn {
+  return { type: "message", content: JSON.stringify(value) };
+}
+
+function happyScript(summary = "done"): ModelTurn[] {
+  return [
+    artifact({ objective: "hello", scope: ["workspace"], acceptance: ["complete"], nonGoals: [], constraints: [], blockers: [] }),
+    artifact({ summary: "context", filesRead: [], relevantSnippets: [], commandSources: [], openQuestions: [] }),
+    artifact({ summary: "plan", targetFiles: [], steps: ["handoff"], verificationCommands: [], risks: [] }),
+    artifact({ changedFiles: [], diffRefs: [], rationale: "no changes", evidenceRefs: [] }),
+    artifact([{ command: "not run", status: "skipped", summary: "not required", evidenceRefs: [] }]),
+    artifact({ id: "handoff_test", status: "completed", summary, changedFiles: [], verification: [{ command: "not run", status: "skipped", summary: "not required", evidenceRefs: [] }], risks: [], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] })
+  ];
+}
 
 describe("runtime factory and CLI helpers", () => {
   it("creates registry from enabled and disabled tool config", () => {
@@ -15,7 +45,7 @@ describe("runtime factory and CLI helpers", () => {
 
   it("creates an agent loop with memory stores and fake script", async () => {
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
-    const loop = createAgentLoop({ cwd: process.cwd(), config, fakeScript: [{ type: "message", content: "ok" }] });
+    const loop = createAgentLoop({ cwd: process.cwd(), config, fakeScript: happyScript("ok") });
     const result = await loop.run({ input: "hello" });
     expect(result.finalResponse).toBe("ok");
   });
@@ -23,26 +53,113 @@ describe("runtime factory and CLI helpers", () => {
   it("creates an agent loop with filesystem stores in a temp cwd", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fluxcode-runtime-fs-"));
     const config = mergeConfig(DEFAULT_CONFIG, {});
-    const loop = createAgentLoop({ cwd: dir, config, fakeScript: [{ type: "message", content: "fs ok" }] });
+    const loop = createAgentLoop({ cwd: dir, config, fakeScript: happyScript("fs ok") });
     const result = await loop.run({ input: "hello" });
     expect(result.finalResponse).toBe("fs ok");
   });
 
   it("uses an explicitly supplied model client", async () => {
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
-    const model = { async generate() { return { type: "message" as const, content: "explicit" }; } };
+    const script = happyScript("explicit");
+    const model = { async generate() { return script.shift() ?? artifact({ id: "handoff_test", status: "completed", summary: "explicit", changedFiles: [], verification: [], risks: [], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] }); } };
     const loop = createAgentLoop({ cwd: process.cwd(), config, model });
     await expect(loop.run({ input: "hello" })).resolves.toMatchObject({ finalResponse: "explicit" });
   });
 
   it("uses the default fake response when no model script is supplied", async () => {
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
-    await expect(createAgentLoop({ cwd: process.cwd(), config }).run({ input: "hello" })).resolves.toMatchObject({ finalResponse: "Fake model has no configured script." });
+    await expect(createAgentLoop({ cwd: process.cwd(), config }).run({ input: "hello" })).resolves.toMatchObject({ status: "blocked", pendingInput: { kind: "question", schemaName: "TaskSpec" } });
   });
 
-  it("parses run/resume/session/evidence style arguments", () => {
-    expect(parseArgs(["run", "hello", "world", "--config", "a.jsonc", "--session", "s1"])).toEqual({ command: "run", input: "hello world", configPath: "a.jsonc", sessionId: "s1" });
-    expect(parseArgs([])).toEqual({ command: "run", input: "" });
+  it("fails fast instead of falling back to fake when real provider credentials are missing", () => {
+    const config = mergeConfig(DEFAULT_CONFIG, {
+      models: {
+        default: "primary",
+        providers: {
+          primary: { type: "openai-compatible", model: "gpt-test", apiKeyEnv: "FLUXCODE_TEST_MISSING_KEY" }
+        }
+      }
+    });
+    expect(() => createAgentLoop({ cwd: process.cwd(), config, fakeScript: [{ type: "message", content: "must not run" }], env: {} })).toThrow("FLUXCODE_TEST_MISSING_KEY");
+  });
+
+  it("parses headless run/resume/show/list arguments", () => {
+    expect(parseArgs(["run", "hello", "world", "--config", "a.jsonc", "--session", "s1", "--output", "text"])).toEqual({ command: "run", input: "hello world", configPath: "a.jsonc", sessionId: "s1", output: "text" });
+    expect(parseArgs(["resume", "run_1", "--input", "{\"kind\":\"question\",\"questionId\":\"q1\",\"answerText\":\"ok\"}"])).toEqual({ command: "resume", input: "run_1", output: "json", resumeInput: "{\"kind\":\"question\",\"questionId\":\"q1\",\"answerText\":\"ok\"}" });
+    expect(parseArgs([])).toEqual({ command: "run", input: "", output: "json" });
+    expect(() => parseArgs(["list", "--output", "yaml"])).toThrow("--output");
+  });
+
+  it("keeps the package bin aligned with the emitted CLI entrypoint", async () => {
+    const [packageMetadata, tsconfig] = await Promise.all([
+      readJsonFile<PackageMetadata>("package.json"),
+      readJsonFile<TypeScriptConfig>("tsconfig.json")
+    ]);
+    const rootDir = tsconfig.compilerOptions?.rootDir ?? ".";
+    const outDir = tsconfig.compilerOptions?.outDir ?? "dist";
+    const emittedCliPath = join(outDir, relative(rootDir, "src/cli/main.ts")).replace(/\.ts$/, ".js").split(sep).join("/");
+
+    expect(packageMetadata.bin?.fluxcode).toBe(emittedCliPath);
+    expect(packageMetadata.scripts?.["smoke:provider"]).toBe("node scripts/provider-smoke.mjs");
+  });
+
+  it("runs, shows, lists and resumes through the CLI headless JSON contract", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-headless-"));
+    const logged: string[] = [];
+    const errored: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
+      logged.push(value);
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((value: string) => {
+      errored.push(value);
+    });
+    try {
+      const runCode = await runCli(["run", "needs", "artifact", "--output", "json"], { cwd: dir });
+      expect(runCode).toBe(21);
+      const runEnvelope = JSON.parse(logged.at(-1) ?? "{}") as { runId: string; sessionId: string; status: string; pendingInput?: { kind: string; questionId?: string } };
+      expect(runEnvelope).toMatchObject({ status: "blocked" });
+      expect(runEnvelope.pendingInput).toMatchObject({ kind: "question" });
+
+      const showCode = await runCli(["show", runEnvelope.runId, "--output", "json"], { cwd: dir });
+      expect(showCode).toBe(21);
+      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runId: runEnvelope.runId, sessionId: runEnvelope.sessionId, status: "blocked" });
+
+      const listCode = await runCli(["list", "--output", "json"], { cwd: dir });
+      expect(listCode).toBe(0);
+      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runs: [{ runId: runEnvelope.runId, status: "blocked" }] });
+
+      const questionId = runEnvelope.pendingInput?.questionId ?? "";
+      const resumeCode = await runCli(["resume", runEnvelope.runId, "--input", JSON.stringify({ kind: "question", questionId, answerText: "continue" }), "--output", "json"], { cwd: dir });
+      expect(resumeCode).toBe(21);
+      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ sessionId: runEnvelope.sessionId, status: "blocked" });
+      expect(errored).toEqual([]);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("renders text output and validates resume input errors without legacy session/evidence commands", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-text-"));
+    const logged: string[] = [];
+    const errored: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
+      logged.push(value);
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((value: string) => {
+      errored.push(value);
+    });
+    try {
+      expect(await runCli(["run", "text mode", "--output", "text"], { cwd: dir })).toBe(21);
+      expect(logged.at(-1)).toContain("Status blocked");
+      expect(await runCli(["resume", "missing", "--input", "{}", "--output", "json"], { cwd: dir })).toBe(2);
+      expect(errored.at(-1)).toContain("Invalid ResumeInput contract");
+      expect(await runCli(["session", "--output", "json"], { cwd: dir })).toBe(2);
+      expect(errored.join("\n")).toContain("Unsupported command 'session'");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("keeps console usage test-contained", () => {
@@ -52,3 +169,7 @@ describe("runtime factory and CLI helpers", () => {
     spy.mockRestore();
   });
 });
+
+async function readJsonFile<T>(path: string): Promise<T> {
+  return JSON.parse(await readFile(join(process.cwd(), path), "utf8")) as T;
+}

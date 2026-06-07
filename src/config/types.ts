@@ -1,4 +1,16 @@
-export type ProviderType = "fake" | "openai-compatible";
+export const IMPLEMENTED_PROVIDER_TYPES = ["fake", "openai-compatible"] as const;
+export const FUTURE_PROVIDER_TYPES = ["openai-responses", "anthropic", "gemini", "vertex", "bedrock", "ollama", "custom"] as const;
+
+export type ImplementedProviderType = (typeof IMPLEMENTED_PROVIDER_TYPES)[number];
+export type FutureProviderType = (typeof FUTURE_PROVIDER_TYPES)[number];
+export type ProviderType = ImplementedProviderType | FutureProviderType;
+
+export function providerTypeStatus(value: unknown): "implemented" | "future" | "unsupported" {
+  if (typeof value === "string" && (IMPLEMENTED_PROVIDER_TYPES as readonly string[]).includes(value)) return "implemented";
+  if (typeof value === "string" && (FUTURE_PROVIDER_TYPES as readonly string[]).includes(value)) return "future";
+  return "unsupported";
+}
+
 export type PermissionMode = "allow" | "ask" | "deny";
 
 export interface ModelProviderConfig {
@@ -26,6 +38,7 @@ export interface PermissionConfig {
 
 export interface ShellToolConfig {
   defaultTimeoutMs: number;
+  allowCommands: string[];
   requireApprovalFor: string[];
 }
 
@@ -34,6 +47,65 @@ export interface ToolConfig {
   disabled: string[];
   maxOutputBytes: number;
   shell: ShellToolConfig;
+}
+
+export interface RuntimeConfig {
+  maxPhaseSteps: number;
+  maxRepairTurns: number;
+  stopOnVerificationFailure: boolean;
+}
+
+export interface PromptConfig {
+  profile: string;
+  language: string;
+}
+
+export interface AgentsConfig {
+  agentsFile: string;
+  loadFrom: ("repoRoot" | "cwd")[];
+  snapshot: boolean;
+  hashAlgorithm: "sha256";
+}
+
+export interface ContextConfig {
+  maxPromptBytes: number;
+  maxToolResultBytes: number;
+  recentStepCount: number;
+  preserve: string[];
+}
+
+export interface CommandsConfig {
+  enabled: string[];
+  localDirectory: string;
+  allowLocalCommands: boolean;
+}
+
+export interface SkillsConfig {
+  enabled: string[];
+  localDirectories: string[];
+  allowSideEffects: boolean;
+}
+
+export interface McpServerConfig {
+  enabled?: boolean;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  tools?: Record<string, McpToolConfig>;
+}
+
+export interface McpToolConfig {
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  mutating?: boolean;
+  riskLevel?: "low" | "medium" | "high";
+}
+
+export interface McpConfig {
+  enabled: boolean;
+  servers: Record<string, McpServerConfig>;
+  requireExplicitEnable: boolean;
+  routeThroughPermission: boolean;
 }
 
 export interface SessionConfig {
@@ -63,8 +135,15 @@ export interface CoverageConfig {
 export interface FluxcodeConfig {
   schemaVersion: 1;
   models: ModelConfig;
+  runtime: RuntimeConfig;
+  prompts: PromptConfig;
+  agents: AgentsConfig;
+  context: ContextConfig;
   permissions: PermissionConfig;
   tools: ToolConfig;
+  commands: CommandsConfig;
+  skills: SkillsConfig;
+  mcp: McpConfig;
   session: SessionConfig;
   evidence: EvidenceConfig;
   coverage: CoverageConfig;

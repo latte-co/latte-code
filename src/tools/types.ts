@@ -22,11 +22,20 @@ export interface ToolResult {
   truncated: boolean;
 }
 
+export interface FileReadSnapshot {
+  path: string;
+  sha256: string;
+  mtimeMs: number;
+  size: number;
+  readAt: string;
+}
+
 export interface ToolExecutionContext {
   cwd: string;
   sessionId: string;
   maxOutputBytes: number;
   shellDefaultTimeoutMs?: number;
+  fileSnapshots?: Record<string, FileReadSnapshot>;
 }
 
 export type EvidenceMapper = (input: JsonObject, result: ToolResult, permission: PermissionDecision) => EvidenceDraft;

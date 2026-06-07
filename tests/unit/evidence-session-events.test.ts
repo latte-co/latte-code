@@ -8,6 +8,7 @@ import { FileSessionStore, InMemorySessionStore, recoverSessionFromEvents, recov
 import { stableId, toJsonObject, isJsonValue, truncateText } from "../../src/shared/types.js";
 import type { PermissionDecision } from "../../src/permissions/types.js";
 import type { ToolDefinition } from "../../src/tools/types.js";
+import { FileTaskRunStore, InMemoryTaskRunStore, createTaskRunState } from "../../src/core/run-state.js";
 
 const permission: PermissionDecision = { action: "allow", reason: "test", requirement: { reason: "test" }, metadata: { toolName: "read_file", riskLevel: "low", mutating: false, sensitivePath: false } };
 
@@ -49,6 +50,7 @@ describe("event log, evidence store and recovery", () => {
     const events = new FileEventLog(join(dir, "events.jsonl"));
     await events.append("session.created", "s2", { sessionId: "s2" });
     await events.append("permission.decided", "s2", { action: "ask", callId: "c1", toolName: "write_file", reason: "mutating" });
+    await events.append("permission.decided", "s4", { action: "ask", callId: "c4", toolName: "shell_exec", reason: "verify", permissionId: "p4", phase: "verify", pendingAction: "shell_exec", command: "npm test", path: "package.json", toolCall: { id: "c4", name: "shell_exec", input: { command: "npm test" } }, pendingInput: { kind: "permission", permissionId: "p4", toolCallId: "c4", phase: "verify", action: "shell_exec", reason: "verify", command: "npm test", path: "package.json", options: ["approve", "deny"] } });
     expect((await events.read("s2")).length).toBe(2);
     const evidenceStore = new FileEvidenceStore(join(dir, "evidence"));
     const record = await evidenceStore.record("s2", "read_file", { inputSummary: "in", outputSummary: "out", references: ["ref"], truncated: false }, permission);
@@ -62,16 +64,43 @@ describe("event log, evidence store and recovery", () => {
     const fileSessions = new FileSessionStore(join(dir, "sessions"));
     const saved = await fileSessions.create("s3");
     saved.finalResponse = "ok";
+    saved.pendingInput = { kind: "question", questionId: "q", phase: "plan", prompt: "json", expectedAnswer: "json", schemaName: "ChangePlan" };
     await fileSessions.save(saved);
     expect((await fileSessions.get("s3"))?.finalResponse).toBe("ok");
+    expect((await fileSessions.get("s3"))?.pendingInput).toMatchObject({ schemaName: "ChangePlan" });
     await expect(fileSessions.get("missing")).resolves.toBeUndefined();
     const recoveredAsk = recoverSessionFromEvents("s2", await events.read("s2"));
     expect(recoveredAsk.status).toBe("waiting_permission");
+    const recoveredDetailedAsk = recoverSessionFromEvents("s4", await events.read("s4"));
+    expect(recoveredDetailedAsk.pendingPermission).toMatchObject({ command: "npm test", path: "package.json" });
     await events.append("loop.failed", "s2", { error: "boom" });
     expect(recoverSessionFromEvents("s2", await events.read("s2")).status).toBe("failed");
     await events.append("permission.decided", "s-deny", { action: "deny", callId: "c2", toolName: "write_file", reason: "blocked" });
     expect(recoverSessionFromEvents("s-deny", await events.read("s-deny")).status).toBe("denied");
     await expect(new InMemoryEvidenceStore().get("missing")).resolves.toBeUndefined();
+  });
+
+  it("stores TaskRunState snapshots and recovers run updates from append-only events", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fluxcode-run-state-"));
+    const memoryRuns = new InMemoryTaskRunStore();
+    const created = await memoryRuns.create({ sessionId: "s-run", taskInput: "do work", runId: "run_fixed" });
+    created.status = "running";
+    await memoryRuns.save(created);
+    expect((await memoryRuns.get("run_fixed"))?.status).toBe("running");
+    expect(await memoryRuns.list("s-run")).toHaveLength(1);
+
+    const fileRuns = new FileTaskRunStore(join(dir, "runs"));
+    await fileRuns.save(created);
+    expect((await fileRuns.get("run_fixed"))?.contextSnapshot.taskInput).toBe("do work");
+    expect(await fileRuns.list()).toHaveLength(1);
+
+    const events = new InMemoryEventLog();
+    const run = createTaskRunState("s-recover", "recover", "run_recover");
+    run.status = "blocked";
+    await events.append("run.updated", "s-recover", { runId: run.id, runState: JSON.parse(JSON.stringify(run)) });
+    const recovered = recoverSessionFromEvents("s-recover", await events.read("s-recover"));
+    expect(recovered.runState?.id).toBe("run_recover");
+    expect(recovered.status).toBe("blocked");
   });
 
   it("maps tool evidence with truncation", () => {

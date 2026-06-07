@@ -1,4 +1,5 @@
-import type { AgentResult, RunAgentInput } from "../core/agent-loop.js";
+import type { RunAgentInput } from "../core/agent-loop.js";
+import type { TaskRunStatus } from "../core/contracts.js";
 
 export interface NodeContract {
   nodeId: string;
@@ -28,7 +29,7 @@ export interface NodeExecutionInput extends RunAgentInput {
 
 export interface NodeExecutionResult {
   nodeId: string;
-  status: AgentResult["status"];
+  status: TaskRunStatus;
   summary: string;
   evidenceIds: string[];
   concerns: string[];

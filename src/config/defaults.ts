@@ -8,6 +8,27 @@ export const DEFAULT_CONFIG: FluxcodeConfig = {
       fake: { type: "fake", model: "fake-scripted" }
     }
   },
+  runtime: {
+    maxPhaseSteps: 8,
+    maxRepairTurns: 1,
+    stopOnVerificationFailure: true
+  },
+  prompts: {
+    profile: "default-code-agent-v1",
+    language: "en-US"
+  },
+  agents: {
+    agentsFile: "AGENTS.md",
+    loadFrom: ["repoRoot", "cwd"],
+    snapshot: true,
+    hashAlgorithm: "sha256"
+  },
+  context: {
+    maxPromptBytes: 120000,
+    maxToolResultBytes: 32768,
+    recentStepCount: 6,
+    preserve: ["task", "acceptance", "constraints", "changedFiles", "verification"]
+  },
   permissions: {
     defaultMode: "ask",
     allowReadOnlyTools: true,
@@ -17,13 +38,30 @@ export const DEFAULT_CONFIG: FluxcodeConfig = {
     denyGlobs: ["**/.env*", "**/node_modules/**", "**/.git/**"]
   },
   tools: {
-    enabled: ["read_file", "list_directory", "search", "write_file", "shell_exec"],
+    enabled: ["read_file", "list_directory", "search", "edit_file", "write_file", "shell_exec", "read_project_manifest", "git_diff"],
     disabled: [],
     maxOutputBytes: 32768,
     shell: {
       defaultTimeoutMs: 120000,
+      allowCommands: ["npm test", "npm run build", "npm run test:coverage"],
       requireApprovalFor: ["network", "install", "delete", "git-write"]
     }
+  },
+  commands: {
+    enabled: ["run", "resume", "show", "list"],
+    localDirectory: ".fluxcode/commands",
+    allowLocalCommands: true
+  },
+  skills: {
+    enabled: [],
+    localDirectories: [".fluxcode/skills"],
+    allowSideEffects: false
+  },
+  mcp: {
+    enabled: false,
+    servers: {},
+    requireExplicitEnable: true,
+    routeThroughPermission: true
   },
   session: {
     store: "filesystem",

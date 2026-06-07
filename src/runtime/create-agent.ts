@@ -2,33 +2,47 @@ import { join } from "node:path";
 import { AgentLoop } from "../core/agent-loop.js";
 import { InMemoryEventLog, FileEventLog } from "../events/event-log.js";
 import { InMemoryEvidenceStore, FileEvidenceStore } from "../evidence/store.js";
-import { FakeModelClient } from "../model/fake.js";
 import type { ModelClient, ModelTurn } from "../model/types.js";
+import { createModelClient } from "../model/provider.js";
 import { PermissionPolicy } from "../permissions/policy.js";
+import { createDefaultPromptRegistry } from "../prompts/registry.js";
 import { InMemorySessionStore, FileSessionStore } from "../session/session.js";
 import { createBuiltinTools } from "../tools/builtin.js";
 import { ToolRegistry } from "../tools/registry.js";
 import type { FluxcodeConfig } from "../config/types.js";
+import { createMcpToolDefinitions, type McpBridgeClient } from "../mcp/bridge.js";
+import { loadRuntimeContextSources } from "./context-sources.js";
 
 export interface CreateAgentOptions {
   cwd: string;
   config: FluxcodeConfig;
   model?: ModelClient;
   fakeScript?: readonly (ModelTurn | Error)[];
+  env?: NodeJS.ProcessEnv;
+  fetch?: typeof fetch;
+  mcpClient?: McpBridgeClient;
 }
 
-export function createDefaultRegistry(config: FluxcodeConfig): ToolRegistry {
+export function createDefaultRegistry(config: FluxcodeConfig, mcpClient?: McpBridgeClient): ToolRegistry {
   const registry = new ToolRegistry();
   const disabled = new Set(config.tools.disabled);
   const enabled = new Set(config.tools.enabled);
   for (const tool of createBuiltinTools()) {
     if (enabled.has(tool.name) && !disabled.has(tool.name)) registry.register(tool);
   }
+  for (const tool of createMcpToolDefinitions(config, mcpClient)) {
+    if (!disabled.has(tool.name)) registry.register(tool);
+  }
   return registry;
 }
 
 export function createAgentLoop(options: CreateAgentOptions): AgentLoop {
-  const model = options.model ?? new FakeModelClient(options.fakeScript ?? [{ type: "message", content: "Fake model has no configured script." }]);
+  const model = options.model ?? createModelClient({
+    config: options.config,
+    ...(options.fakeScript === undefined ? {} : { fakeScript: options.fakeScript }),
+    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch })
+  });
   const sessions = options.config.session.store === "memory" ? new InMemorySessionStore() : new FileSessionStore(join(options.cwd, options.config.session.directory));
   const evidence = options.config.evidence.store === "memory" ? new InMemoryEvidenceStore() : new FileEvidenceStore(join(options.cwd, options.config.evidence.directory));
   const events = options.config.session.store === "memory" ? new InMemoryEventLog() : new FileEventLog(join(options.cwd, options.config.session.directory, "events.jsonl"));
@@ -36,10 +50,13 @@ export function createAgentLoop(options: CreateAgentOptions): AgentLoop {
     cwd: options.cwd,
     config: options.config,
     model,
-    registry: createDefaultRegistry(options.config),
+    registry: createDefaultRegistry(options.config, options.mcpClient),
     permissions: new PermissionPolicy(options.config.permissions, options.config.tools.shell),
     sessions,
     events,
-    evidence
+    evidence,
+    promptRegistry: createDefaultPromptRegistry(options.config.prompts.profile, options.config.prompts.language),
+    loadContextSources: () => loadRuntimeContextSources(options.cwd, options.config),
+    maxTurns: options.config.runtime.maxPhaseSteps
   });
 }

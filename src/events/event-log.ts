@@ -4,6 +4,18 @@ import type { JsonObject } from "../shared/types.js";
 
 export type EventType =
   | "session.created"
+  | "run.created"
+  | "run.updated"
+  | "phase.started"
+  | "phase.completed"
+  | "phase.blocked"
+  | "agents.snapshot"
+  | "skills.loaded"
+  | "command.routed"
+  | "step.started"
+  | "step.completed"
+  | "recovery.failed"
+  | "resume.received"
   | "user.input"
   | "model.requested"
   | "model.responded"

@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG } from "../../src/config/defaults.js";
 import { PermissionPolicy, classifyCommand, globMatches } from "../../src/permissions/policy.js";
 import type { PermissionRequest } from "../../src/permissions/types.js";
@@ -61,10 +64,24 @@ describe("PermissionPolicy", () => {
   });
 
   it("applies shell requireApprovalFor before generic mutating shell policy", () => {
-    const permissiveShellPolicy = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "allow", highRiskTools: "deny" }, { ...DEFAULT_CONFIG.tools.shell, requireApprovalFor: ["network"] });
+    const permissiveShellPolicy = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "allow", highRiskTools: "deny" }, { ...DEFAULT_CONFIG.tools.shell, allowCommands: ["printf ok"], requireApprovalFor: ["network"] });
     expect(permissiveShellPolicy.decide(request({ toolName: "shell_exec", call: { id: "c", name: "shell_exec", input: { command: "curl https://example.com" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
     expect(permissiveShellPolicy.decide(request({ toolName: "shell_exec", call: { id: "c", name: "shell_exec", input: { command: "printf ok" } }, riskLevel: "medium", mutating: true })).action).toBe("allow");
+    expect(permissiveShellPolicy.decide(request({ toolName: "shell_exec", call: { id: "c", name: "shell_exec", input: { command: "printf nope" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
     expect(permissiveShellPolicy.decide(request({ call: { id: "c", name: "read_file", input: { path: "README.md", command: "curl https://example.com" } } })).action).toBe("allow");
+  });
+
+  it("allows shell commands declared in the project manifest scripts", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fluxcode-permission-manifest-"));
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { custom: "node custom.js", test: "vitest run" } }), "utf8");
+    const policy = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "ask" }, { ...DEFAULT_CONFIG.tools.shell, allowCommands: [] });
+    expect(policy.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "custom", name: "shell_exec", input: { command: "npm run custom" } }, riskLevel: "medium", mutating: true })).action).toBe("allow");
+    expect(policy.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "test", name: "shell_exec", input: { command: "npm test" } }, riskLevel: "medium", mutating: true })).action).toBe("allow");
+    const missingShellConfig = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "allow" });
+    expect(missingShellConfig.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "shell", name: "shell_exec", input: { command: "printf ok" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
+    const noScriptsDir = mkdtempSync(join(tmpdir(), "fluxcode-permission-no-scripts-"));
+    writeFileSync(join(noScriptsDir, "package.json"), JSON.stringify({ name: "fixture" }), "utf8");
+    expect(policy.decide(request({ cwd: noScriptsDir, toolName: "shell_exec", call: { id: "unknown", name: "shell_exec", input: { command: "npm run missing" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
   });
 
   it("matches simple deny globs", () => {
