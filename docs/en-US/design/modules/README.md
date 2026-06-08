@@ -5,6 +5,7 @@ This directory only stores module-level technical designs that the current `v0.1
 Current / near-term module documents:
 
 - [`Code Agent Loop`](./code-agent-loop.md)
+- [`Context Management and Compression`](./context-management-and-compression.md)
 - [`Provider Compatibility Layer`](./provider-compatibility-layer.md)
 
 ## Boundary Notes

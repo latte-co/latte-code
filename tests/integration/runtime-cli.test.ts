@@ -5,7 +5,10 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/defaults.js";
 import { mergeConfig } from "../../src/config/config.js";
 import { parseArgs, runCli } from "../../src/cli/main.js";
+import { createQuestionPendingInput } from "../../src/core/contracts.js";
+import { buildBlockedHandoff, createTaskRunState, setRunPendingInput } from "../../src/core/run-state.js";
 import { createAgentLoop, createDefaultRegistry } from "../../src/runtime/create-agent.js";
+import { FileSessionStore } from "../../src/session/session.js";
 import type { ModelTurn } from "../../src/model/types.js";
 
 interface PackageMetadata {
@@ -15,11 +18,18 @@ interface PackageMetadata {
   scripts?: Record<string, string>;
 }
 
+interface PackageLockMetadata {
+  packages?: {
+    ""?: PackageMetadata;
+  };
+}
+
 interface TypeScriptConfig {
   compilerOptions?: {
     rootDir?: string;
     outDir?: string;
   };
+  include?: string[];
 }
 
 function artifact(value: unknown): ModelTurn {
@@ -66,9 +76,31 @@ describe("runtime factory and CLI helpers", () => {
     await expect(loop.run({ input: "hello" })).resolves.toMatchObject({ finalResponse: "explicit" });
   });
 
-  it("uses the default fake response when no model script is supplied", async () => {
+  it("rejects the default fake provider when no model script is supplied", () => {
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
-    await expect(createAgentLoop({ cwd: process.cwd(), config }).run({ input: "hello" })).resolves.toMatchObject({ status: "blocked", pendingInput: { kind: "question", schemaName: "TaskSpec" } });
+    expect(() => createAgentLoop({ cwd: process.cwd(), config })).toThrow("no fakeScript was supplied");
+  });
+
+  it("fails fast on default CLI run without a real provider or fakeScript", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-default-provider-"));
+    const logged: string[] = [];
+    const errored: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
+      logged.push(value);
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((value: string) => {
+      errored.push(value);
+    });
+    try {
+      const runCode = await runCli(["run", "读取 package.json 并总结项目", "--output", "json"], { cwd: dir });
+      expect(runCode).toBe(2);
+      expect(logged).toEqual([]);
+      expect(JSON.parse(errored.at(-1) ?? "{}")).toMatchObject({ error: expect.stringContaining("Configure a real model provider") });
+      expect(errored.at(-1)).toContain("fakeScript");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("fails fast instead of falling back to fake when real provider credentials are missing", () => {
@@ -91,20 +123,24 @@ describe("runtime factory and CLI helpers", () => {
   });
 
   it("keeps the package bin aligned with the emitted CLI entrypoint", async () => {
-    const [packageMetadata, tsconfig] = await Promise.all([
+    const [packageMetadata, packageLockMetadata, tsconfig] = await Promise.all([
       readJsonFile<PackageMetadata>("package.json"),
+      readJsonFile<PackageLockMetadata>("package-lock.json"),
       readJsonFile<TypeScriptConfig>("tsconfig.json")
     ]);
     const rootDir = tsconfig.compilerOptions?.rootDir ?? ".";
     const outDir = tsconfig.compilerOptions?.outDir ?? "dist";
-    const emittedCliPath = join(outDir, relative(rootDir, "src/cli/main.ts")).replace(/\.ts$/, ".js").split(sep).join("/");
+    const emittedCliPath = join(outDir, relative(rootDir, "bin/fluxcode.ts")).replace(/\.ts$/, ".js").split(sep).join("/");
 
     expect(packageMetadata.bin?.fluxcode).toBe(emittedCliPath);
+    expect(packageLockMetadata.packages?.[""]?.bin?.fluxcode).toBe(emittedCliPath);
+    expect(tsconfig.include).toContain("bin/**/*.ts");
     expect(packageMetadata.scripts?.["smoke:provider"]).toBe("node scripts/provider-smoke.mjs");
   });
 
-  it("runs, shows, lists and resumes through the CLI headless JSON contract", async () => {
+  it("shows and lists a seeded run through the CLI headless JSON contract", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-headless-"));
+    const seeded = await seedBlockedRun(dir);
     const logged: string[] = [];
     const errored: string[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
@@ -114,24 +150,13 @@ describe("runtime factory and CLI helpers", () => {
       errored.push(value);
     });
     try {
-      const runCode = await runCli(["run", "needs", "artifact", "--output", "json"], { cwd: dir });
-      expect(runCode).toBe(21);
-      const runEnvelope = JSON.parse(logged.at(-1) ?? "{}") as { runId: string; sessionId: string; status: string; pendingInput?: { kind: string; questionId?: string } };
-      expect(runEnvelope).toMatchObject({ status: "blocked" });
-      expect(runEnvelope.pendingInput).toMatchObject({ kind: "question" });
-
-      const showCode = await runCli(["show", runEnvelope.runId, "--output", "json"], { cwd: dir });
+      const showCode = await runCli(["show", seeded.runId, "--output", "json"], { cwd: dir });
       expect(showCode).toBe(21);
-      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runId: runEnvelope.runId, sessionId: runEnvelope.sessionId, status: "blocked" });
+      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runId: seeded.runId, sessionId: seeded.sessionId, status: "blocked" });
 
       const listCode = await runCli(["list", "--output", "json"], { cwd: dir });
       expect(listCode).toBe(0);
-      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runs: [{ runId: runEnvelope.runId, status: "blocked" }] });
-
-      const questionId = runEnvelope.pendingInput?.questionId ?? "";
-      const resumeCode = await runCli(["resume", runEnvelope.runId, "--input", JSON.stringify({ kind: "question", questionId, answerText: "continue" }), "--output", "json"], { cwd: dir });
-      expect(resumeCode).toBe(21);
-      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ sessionId: runEnvelope.sessionId, status: "blocked" });
+      expect(JSON.parse(logged.at(-1) ?? "{}")).toMatchObject({ runs: [{ runId: seeded.runId, status: "blocked" }] });
       expect(errored).toEqual([]);
     } finally {
       logSpy.mockRestore();
@@ -141,6 +166,7 @@ describe("runtime factory and CLI helpers", () => {
 
   it("renders text output and validates resume input errors without legacy session/evidence commands", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-text-"));
+    const seeded = await seedBlockedRun(dir);
     const logged: string[] = [];
     const errored: string[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
@@ -150,7 +176,7 @@ describe("runtime factory and CLI helpers", () => {
       errored.push(value);
     });
     try {
-      expect(await runCli(["run", "text mode", "--output", "text"], { cwd: dir })).toBe(21);
+      expect(await runCli(["show", seeded.runId, "--output", "text"], { cwd: dir })).toBe(21);
       expect(logged.at(-1)).toContain("Status blocked");
       expect(await runCli(["resume", "missing", "--input", "{}", "--output", "json"], { cwd: dir })).toBe(2);
       expect(errored.at(-1)).toContain("Invalid ResumeInput contract");
@@ -172,4 +198,18 @@ describe("runtime factory and CLI helpers", () => {
 
 async function readJsonFile<T>(path: string): Promise<T> {
   return JSON.parse(await readFile(join(process.cwd(), path), "utf8")) as T;
+}
+
+async function seedBlockedRun(dir: string): Promise<{ runId: string; sessionId: string }> {
+  const store = new FileSessionStore(join(dir, DEFAULT_CONFIG.session.directory));
+  const session = await store.create("session_seeded");
+  const run = createTaskRunState(session.id, "seeded task", "run_seeded");
+  const pendingInput = createQuestionPendingInput({ questionId: "question_seeded", phase: "intake", prompt: "Seeded blocked fixture", expectedAnswer: "json", schemaName: "TaskSpec" });
+  setRunPendingInput(run, pendingInput);
+  run.handoff = buildBlockedHandoff(run, pendingInput.prompt, pendingInput);
+  session.status = run.status;
+  session.pendingInput = pendingInput;
+  session.runState = run;
+  await store.save(session);
+  return { runId: run.id, sessionId: session.id };
 }

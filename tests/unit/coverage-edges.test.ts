@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -135,7 +135,7 @@ describe("coverage edge contracts for release path", () => {
     if (tool === undefined) throw new Error("expected mcp tool");
     await expect(tool.execute({}, { cwd: process.cwd(), sessionId: "s", maxOutputBytes: 10 })).resolves.toMatchObject({ summary: "no output", references: ["mcp://plain/lookup"], truncated: false });
 
-    await expect(createModelClient({ config: DEFAULT_CONFIG }).generate({ messages: [], tools: [], toolResults: [] })).resolves.toEqual({ type: "message", content: "Fake model has no configured script." });
+    expect(() => createModelClient({ config: DEFAULT_CONFIG })).toThrow("no fakeScript was supplied");
     await expect(createModelClient({ config: DEFAULT_CONFIG, fakeScript: [{ type: "message", content: "scripted" }] }).generate({ messages: [], tools: [], toolResults: [] })).resolves.toEqual({ type: "message", content: "scripted" });
     const missingProviderConfig = mergeConfig(DEFAULT_CONFIG, undefined);
     missingProviderConfig.models.default = "missing";

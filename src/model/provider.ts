@@ -18,7 +18,12 @@ export function createModelClient(options: CreateModelClientOptions): ModelClien
   if (Object.prototype.hasOwnProperty.call(provider, "apiMode")) {
     throw new Error(`Provider '${providerId}' uses unsupported apiMode; set models.providers.${providerId}.type explicitly instead`);
   }
-  if (provider.type === "fake") return new FakeModelClient(options.fakeScript ?? [{ type: "message", content: "Fake model has no configured script." }]);
+  if (provider.type === "fake") {
+    if (options.fakeScript === undefined) {
+      throw new Error(`Provider '${providerId}' is the scripted fake provider but no fakeScript was supplied. Configure a real model provider via --config, ~/.fluxcode/fluxcode.jsonc, or .fluxcode/fluxcode.jsonc, or pass an explicit fakeScript in tests.`);
+    }
+    return new FakeModelClient(options.fakeScript);
+  }
   if (provider.type === "openai-compatible") {
     return new OpenAICompatibleModelClient({
       providerId,

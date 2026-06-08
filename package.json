@@ -6,13 +6,14 @@
   "description": "Local-first TypeScript code agent prototype with graph-ready boundaries.",
   "license": "Apache-2.0",
   "bin": {
-    "fluxcode": "dist/src/cli/main.js"
+    "fluxcode": "dist/bin/fluxcode.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "smoke:provider": "node scripts/provider-smoke.mjs"
+    "smoke:provider": "node scripts/provider-smoke.mjs",
+    "install:local": "node scripts/install-local.js"
   },
   "engines": {
     "node": ">=20.0.0"
