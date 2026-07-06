@@ -2,13 +2,14 @@
 
 ## 1. Project Overview
 
-Lattecode is currently a local-first TypeScript code agent / harness-native runtime design repository. The confirmed project baselines are as follows:
+Lattecode is currently a TypeScript code agent project. Lattecode is a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. The confirmed project baselines are as follows:
 
-- Content format: Markdown technical documentation plus TypeScript project scaffolding / source area (see `src/`). Formal design documents must not imply that the runtime-kernel capabilities are already implemented.
+- Content format: Markdown technical documentation plus TypeScript project scaffolding / source area (see `src/`). Formal design documents must not imply that full internal-runtime capabilities are already implemented.
 - License: Apache License 2.0 (see `LICENSE`).
 - Declared runtime / framework / package manager versions: Node.js >= 20, TypeScript, Vitest (see `package.json`, `tsconfig.json`, `vitest.config.ts`).
-- Design theme: harness-native code agent as a data-plane code agent with internal runtime authority.
-- Reference frame: from the external software-engineering-system perspective, Lattecode is a code agent `Data Plane`; it does not replace repo permissions, CI, review, compliance, or deployment gates. `Control Plane Authority` means only Lattecode internal runtime authority.
+- Current product goal: code-agent-first. Near-term work should make Lattecode complete local repository tasks by understanding context, editing within scope, running verification, and producing reviewable handoff.
+- Runtime evolution boundary: full runtime concepts are long-term internal evolution, not `v0.1` product promises. They should grow from working code-agent traces, evidence, permissions, effects, and recovery needs.
+- Reference frame: from the external software-engineering-system perspective, Lattecode is a code agent `Data Plane`; it does not replace repo permissions, CI, review, compliance, or deployment gates. `Control Plane Authority` means only Lattecode internal runtime authority after runtime structure is introduced incrementally.
 - Key terminology: `Data Plane`, `Control Plane Authority` scoped to internal runtime authority, `ActionGraph`, `ActionNode`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `Reconciler`, `OverlayRevision`, `ContextProjection`, `NodeExecutor`.
 
 Do NOT treat local tool or runtime files under `.opencode/`, `.oh-my-code/`, `.tmp/`, or `log/` as project source code, package manager evidence, or build entry points.
@@ -20,14 +21,15 @@ Do NOT treat local tool or runtime files under `.opencode/`, `.oh-my-code/`, `.t
 | `docs/zh-CN/README.md` | Documentation index and maintenance conventions | – |
 | `docs/zh-CN/research/` | Research facts, cross-product comparisons, verifiable observational conclusions | `docs/zh-CN/README.md` |
 | `docs/zh-CN/research/code-agent-survey.md` | Cross-product research on `claude-code`, `codex`, `CodeWhale`, `opencode`, `oh-my-openagent` | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/` | Design proposals, architecture layering, interface models, phased roadmap | `docs/zh-CN/README.md` |
+| `docs/zh-CN/design/` | Design proposals, architecture layering, interface models, and module models | `docs/zh-CN/README.md` |
 | `docs/zh-CN/design/architecture-overview.md` | Current formal architecture overview: external `Data Plane` reference frame, internal runtime authority, module document map, promotion/gate/ReAct boundaries | `docs/zh-CN/README.md` |
 | `docs/zh-CN/design/modules/` | Current module-level technical design placeholders for implementation work | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/runtime-kernel-task-breakdown.md` | Current independent v0.1-v0.5 task breakdown | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/runtime-kernel-roadmap-v0.1-v0.5.md` | Current v0.1-v0.5 runtime kernel roadmap | `docs/zh-CN/README.md` |
+| `docs/zh-CN/design/runtime-evolution/` | Accepted long-term runtime evolution targets, not `v0.1` product promises | `docs/zh-CN/README.md` |
+| `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md` | Current independent v0.1-v0.5 code-agent evolution task breakdown | `docs/zh-CN/README.md` |
+| `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md` | Current v0.1-v0.5 code-agent evolution roadmap | `docs/zh-CN/README.md` |
 | `docs/en-US/README.md` | English documentation index and translation status | `docs/README.md` |
 | `docs/en-US/design/` | English counterparts for maintained formal design documents | `docs/en-US/README.md` |
-| `src/` | TypeScript source area. Do not infer runtime-kernel implementation completeness from design documents; future runtime-kernel evolution should follow the current architecture overview, module designs, roadmap, and task breakdown. | `docs/zh-CN/design/architecture-overview.md`, `docs/zh-CN/design/modules/`, `docs/zh-CN/design/runtime-kernel-roadmap-v0.1-v0.5.md`, `docs/zh-CN/design/runtime-kernel-task-breakdown.md` |
+| `src/` | TypeScript source area for code-agent implementation work. Do not infer internal-runtime implementation completeness from design documents; future runtime evolution should follow the current architecture overview, near-term module designs, runtime-evolution targets, roadmap, and task breakdown. | `docs/zh-CN/design/architecture-overview.md`, `docs/zh-CN/design/modules/`, `docs/zh-CN/design/runtime-evolution/`, `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`, `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md` |
 | `tests/` | Vitest unit + integration tests | `vitest.config.ts` |
 | `package.json` / `tsconfig.json` / `vitest.config.ts` | Node/TypeScript/Vitest project configuration | – |
 | `lattecode.config.example.jsonc` | JSONC example configuration, no secrets | – |
@@ -99,7 +101,7 @@ This repository currently maintains primarily English technical Markdown. Writin
 ## Boundary between Research Facts and Design Proposals
 
 - **Research Facts**: Record the existing architecture, capabilities, and boundaries of the system.
-- **Design Proposals**: Explain the impact of these facts on the harness-native code agent.
+- **Design Proposals**: Explain the impact of these facts on the code-agent operating model and long-term runtime evolution.
 ```
 
 ❌ Avoid: Presenting unverified judgments as established facts
@@ -111,7 +113,7 @@ This solution will definitely completely solve all code agent state management p
 ✅ Recommended: Technical prose + backtick-quoted identifiers
 
 ```markdown
-Lattecode is externally a code-agent `Data Plane`; `Control Plane Authority` refers only to internal runtime authority over facts, scheduling, effects, transactions, and reconcile semantics. `ActionGraph` remains the execution ledger and UX surface.
+Lattecode is first a code agent: it understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. Runtime concepts such as `ActionGraph` and `StateStore` are long-term internal evolution targets, not `v0.1` product promises.
 ```
 
 ❌ Avoid: Unmarked terminology, sloganized expressions
@@ -139,9 +141,13 @@ docs/research/agent调查.md
 ✅ **Always do**
 
 - Always read `docs/zh-CN/README.md` before adding or moving documents.
-- Always place research facts in `docs/zh-CN/research/`, and design proposals, interface models, and roadmaps in `docs/zh-CN/design/`.
+- Always place research facts in `docs/zh-CN/research/`.
+- Always place design proposals and interface/module models in `docs/zh-CN/design/`.
+- Always place roadmaps, task breakdowns, and milestone targets in `docs/zh-CN/milestones/targets/`.
 - Always update the `docs/zh-CN/README.md` index when adding new documents.
 - Always update `docs/en-US/README.md` when adding English counterparts or marking translation status.
+- Always preserve the current positioning: Lattecode is first a code agent. Current implementation may focus on local repository workflows, but do not use local-repository scope or long-term runtime terms as front-stage product labels.
+- Always present `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` as concepts that grow from working code-agent traces, evidence, permissions, effects, and recovery needs.
 - Always maintain consistency of terminology: `Data Plane`, internal-runtime-scoped `Control Plane Authority`, `ActionGraph`, `ActionNode`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `Reconciler`, `OverlayRevision`, `ContextProjection`, `NodeExecutor`.
 - Always state the fact that commands, tests, or toolchain are "non-existent / not declared" rather than filling in guesses.
 - Before completing documentation changes, verify that `docs/README.md`, `docs/zh-CN/README.md`, and `docs/en-US/README.md` point only to existing maintained documents.
@@ -169,11 +175,13 @@ docs/research/agent调查.md
 - `docs/zh-CN/research/code-agent-survey.md`: Cross-product research on code agent / agent workflow.
 - `docs/zh-CN/design/architecture-overview.md`: Current formal architecture overview and top-level reference frame.
 - `docs/zh-CN/design/modules/`: Current module-level technical design placeholders.
-- `docs/zh-CN/design/runtime-kernel-task-breakdown.md`: Current independent v0.1-v0.5 task breakdown.
-- `docs/zh-CN/design/runtime-kernel-roadmap-v0.1-v0.5.md`: Current runtime kernel roadmap from v0.1 to v0.5.
+- `docs/zh-CN/design/runtime-evolution/`: Accepted long-term runtime evolution targets.
+- `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md`: Current independent v0.1-v0.5 task breakdown.
+- `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`: Current code-agent evolution roadmap from v0.1 to v0.5.
 - `docs/en-US/design/architecture-overview.md`: English counterpart for the architecture overview.
 - `docs/en-US/design/modules/`: English counterparts for module-level technical design placeholders.
-- `docs/en-US/design/runtime-kernel-task-breakdown.md`: English counterpart for the task breakdown.
-- `docs/en-US/design/runtime-kernel-roadmap-v0.1-v0.5.md`: English counterpart for the v0.1-v0.5 runtime kernel roadmap.
+- `docs/en-US/design/runtime-evolution/`: English long-term runtime evolution targets.
+- `docs/en-US/milestones/targets/runtime-kernel-task-breakdown.md`: English counterpart for the task breakdown.
+- `docs/en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`: English counterpart for the v0.1-v0.5 code-agent evolution roadmap.
 - `LICENSE`: Apache License 2.0.
 - `.gitignore`: Ignore rules for local tools, runtime, caches, builds, and sensitive files.

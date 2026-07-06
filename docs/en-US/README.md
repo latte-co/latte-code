@@ -2,7 +2,7 @@
 
 This directory contains Lattecode research, accepted designs, proposals, and milestones. Formal English documents should remain structurally and semantically aligned with [`docs/zh-CN/`](../zh-CN/README.md).
 
-The current design posture is evolutionary: Lattecode should first become a basic, working local-first code agent, then gradually structure its execution trace, facts, evidence, side effects, transactions, scheduling, and recovery into a harness-native runtime. Runtime terms describe target direction and interface constraints; they do not mean `src/` already implements the full runtime kernel.
+The current design posture is evolutionary: Lattecode is first a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. Current implementation may focus first on local repository workflows, but that is not the product-positioning label. Long-term runtime structure should grow from working code-agent traces, evidence, permissions, effects, and recovery needs. Runtime terms describe target direction and interface constraints; they do not mean `src/` already implements the full internal runtime.
 
 ## Directory Layers
 
@@ -80,7 +80,7 @@ The current design posture is evolutionary: Lattecode should first become a basi
 ## Terminology Boundaries
 
 - **Research Facts**: Findings from horizontal research and verifiable observations, used to describe existing systems' capabilities and limits.
-- **Design Proposals**: The code-agent operating model and harness-native runtime evolution path derived from research facts; they do not mean existing systems already have these capabilities.
+- **Design Proposals**: The code-agent operating model and long-term runtime evolution path derived from research facts; they do not mean existing systems already have these capabilities.
 - **Data Plane**: The external positioning of Code Agent / Lattecode from the perspective of the whole software engineering system; Lattecode executes tasks and produces evidence, but does not replace external governance systems.
 - **Control Plane Authority**: Only Lattecode internal runtime authority, and only after runtime structure is introduced incrementally; it must not be understood as an external engineering governance control plane.
 - **ActionGraph**: The long-term execution ledger, scheduling surface, recovery entry point, audit index, and UX visualization surface; runtime evolution documents describe accepted evolution targets and do not imply implementation.

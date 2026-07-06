@@ -184,7 +184,7 @@ Provider compatibility 不应把 provider name 或用户配置键作为单一事
 | `gemini` | Google Generative AI | contents/parts、function calling、safety feedback、candidate stream | 中 |
 | `vertex` | Vertex AI Gemini / enterprise endpoints | project/location/auth、quota、regional boundary | 中：部署环境更复杂 |
 | `bedrock-converse` | AWS Bedrock Converse / ConverseStream | AWS auth、model ARN、content blocks、throttling metadata | 中 / 后续 |
-| `ollama-native` | Ollama 本地 API | local models、limited tool support、pull/list model lifecycle | 高：local-first 路线相关 |
+| `ollama-native` | Ollama 本地 API | local models、limited tool support、pull/list model lifecycle | 高：与本地代码仓库工作流相关 |
 | `local-router-openai-compatible` | LiteLLM、OpenRouter、企业代理、本地 router | OpenAI-like surface 但 capability/headers/error 不一致 | 高：必须显式 data boundary |
 
 注意：同一 provider 或 `type` 可能支持多个内部 API mode；同一 API mode 也可能由多个 provider 或 router 实现。Lattecode 不能通过 provider name 隐式切换 mode；需要通过配置解析、capability metadata 或用户确认的 adapter 选择明确建立映射。
@@ -337,7 +337,7 @@ type NormalizedModelError = {
 | Sub-roadmap | 目标 | 可映射到的现有 lane | Exit criteria |
 | --- | --- | --- | --- |
 | `PCL-0` | 固化 `ModelRuntime`、`NormalizedModelEvent`、`ProviderCapability` 和 config credential refs | `v0.1` Model loop / Config | fake runtime + one direct-fetch adapter fixture 通过 conformance |
-| `PCL-1` | `openai-compatible-chat` 与 `ollama-native` 最小 adapter | 基础 local-first agent | text streaming、tool-call fixture、redacted auth、mocked errors 通过 |
+| `PCL-1` | `openai-compatible-chat` 与 `ollama-native` 最小 adapter | 面向本地代码仓库工作流的基础 code agent | text streaming、tool-call fixture、redacted auth、mocked errors 通过 |
 | `PCL-2` | router / OpenAI-compatible local gateway support | provider extensibility lane | data boundary、capability override、rate-limit normalization 通过 |
 | `PCL-3` | `openai-responses`、`anthropic-messages`、`gemini` adapter PoC | post-v0.1 provider expansion | golden transcripts、tool calls、stream event assembly 通过 |
 | `PCL-4` | enterprise deployment：Vertex / Bedrock / auth profiles / failover policy | later deployment hardening | opt-in live smoke、cloud auth redaction、no silent boundary switch |

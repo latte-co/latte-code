@@ -13,11 +13,11 @@
 | v0.1 | local tool wrapper | 文件、搜索、编辑、shell 验证可用且有记录 |
 | v0.2 | `CapabilityDescriptor` | 声明输入、输出、权限、风险和 failure modes |
 | v0.4 | effect-aware adapter | mutating capability 产生 effect record |
-| v0.5 | anti-corruption layer | 外部协议只能输出 runtime-native 对象 |
+| v0.5 | anti-corruption layer | 外部协议只能输出内部 runtime 对象 |
 
 ## 责任
 
-- 把文件、shell、LSP、Git、MCP、测试运行器、模型调用等外部能力包装为 runtime-native `Capability`。
+- 把文件、shell、LSP、Git、MCP、测试运行器、模型调用等外部能力包装为内部 runtime `Capability`。
 - 声明 input/output、pre/post condition、permission、sandbox、evidence requirement 和 failure modes。
 - 将外部结果翻译成 `Observation`、`Evidence`、`EffectRecord` 或 `ActionResult`。
 - 隔离外部协议污染，如 prompt injection、权限语义不一致和不透明副作用。
@@ -44,7 +44,7 @@ type CapabilityDescriptor = {
 ## 不变量
 
 - 每次能力调用必须能被 trace 记录。
-- 外部能力结果必须被翻译成 runtime-native 对象。
+- 外部能力结果必须被翻译成内部 runtime 对象。
 - mutating capability 必须先有 effect 记录或等价修改摘要。
 - adapter 必须记录 sandbox / trust boundary。
 

@@ -184,7 +184,7 @@ The internal implementation layer should still build adapters by API mode / prot
 | `gemini` | Google Generative AI | contents/parts, function calling, safety feedback, candidate stream | Medium |
 | `vertex` | Vertex AI Gemini / enterprise endpoints | project/location/auth, quota, regional boundary | Medium: more complex deployment environment |
 | `bedrock-converse` | AWS Bedrock Converse / ConverseStream | AWS auth, model ARN, content blocks, throttling metadata | Medium / later |
-| `ollama-native` | Ollama local API | local models, limited tool support, pull/list model lifecycle | High: relevant to local-first direction |
+| `ollama-native` | Ollama local API | local models, limited tool support, pull/list model lifecycle | High: relevant to local repository workflows |
 | `local-router-openai-compatible` | LiteLLM, OpenRouter, enterprise proxy, local router | OpenAI-like surface with inconsistent capability/headers/errors | High: requires explicit data boundary |
 
 One provider or `type` may support multiple internal API modes; one API mode may be implemented by many providers or routers. Lattecode must not implicitly switch modes based on provider name; the mapping must be explicit through config parsing, capability metadata, or a user-confirmed adapter choice.
@@ -337,7 +337,7 @@ To avoid conflict with the current formal `v0.1`-`v0.5` roadmap labels, this doc
 | Sub-roadmap | Goal | Mappable existing lane | Exit criteria |
 | --- | --- | --- | --- |
 | `PCL-0` | Stabilize `ModelRuntime`, `NormalizedModelEvent`, `ProviderCapability`, and config credential refs | `v0.1` Model loop / Config | Fake runtime + one direct-fetch adapter fixture pass conformance |
-| `PCL-1` | Minimal `openai-compatible-chat` and `ollama-native` adapters | Basic local-first agent | Text streaming, tool-call fixtures, redacted auth, and mocked errors pass |
+| `PCL-1` | Minimal `openai-compatible-chat` and `ollama-native` adapters | Basic code agent for local repository workflows | Text streaming, tool-call fixtures, redacted auth, and mocked errors pass |
 | `PCL-2` | Router / OpenAI-compatible local gateway support | Provider extensibility lane | Data boundary, capability override, and rate-limit normalization pass |
 | `PCL-3` | `openai-responses`, `anthropic-messages`, and `gemini` adapter PoCs | Post-v0.1 provider expansion | Golden transcripts, tool calls, and stream event assembly pass |
 | `PCL-4` | Enterprise deployment: Vertex / Bedrock / auth profiles / failover policy | Later deployment hardening | Opt-in live smoke, cloud auth redaction, and no silent boundary switch |

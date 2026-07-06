@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义 Lattecode `v0.1` 至 `v0.5` 的渐进路线。文件名保留 `runtime-kernel-roadmap` 是为了维持现有索引稳定；内容已调整为 code-agent-first：先做基础可工作的 local-first code agent，再逐步演进到 harness-native runtime。
+本文定义 Lattecode `v0.1` 至 `v0.5` 的渐进路线。文件名保留 `runtime-kernel-roadmap` 是为了维持现有索引稳定；内容已调整为 code-agent-first：先做面向本地代码仓库工作流的基础可工作 code agent，再让 runtime 结构从 trace、evidence、permission、effect 和 recovery 需求中逐步长出来。
 
 英文对应文档：[`docs/en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../../../en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md)。
 
@@ -13,7 +13,7 @@ v0.1 Basic Working Code Agent
   -> v0.2 Structured Trace and Tool Discipline
   -> v0.3 Evidence, Facts, and Context Projection
   -> v0.4 Controlled Effects, Transactions, and Recovery
-  -> v0.5 Harness-native Runtime Hardening
+  -> v0.5 Internal Runtime Hardening
 ```
 
 参考系：Lattecode externally 是 code agent `Data Plane`；`Control Plane Authority` 仅指 Lattecode internal runtime authority，并且只在 runtime 结构逐步形成后成立。
@@ -25,7 +25,7 @@ v0.1 Basic Working Code Agent
 - 从第一天起保留可追溯执行记录，避免未来无法演进。
 - 工具调用、文件修改和验证结果必须能被复盘。
 - LLM 可以参与理解、计划和修改，但不应成为长期事实来源或未受约束的工具执行者。
-- Harness-native runtime 是演进方向，不是 MVP 的复杂度起点。
+- 完整内部 runtime 结构是长期演进方向，不是 MVP 的复杂度起点。
 
 ## 3. 版本表
 
@@ -35,7 +35,7 @@ v0.1 Basic Working Code Agent
 | `v0.2` | Structured Trace and Tool Discipline | 把执行步骤结构化为可追溯 task trace，建立基础 capability 边界 | 不把 trace 过早复杂化为完整 graph 平台 |
 | `v0.3` | Evidence, Facts, and Context Projection | 区分 observation、evidence、fact，引入最小 context projection | 不把模型推断直接当事实 |
 | `v0.4` | Controlled Effects, Transactions, and Recovery | 强化 extension / effect / transaction 边界，引入 `EffectRecord`、overlay / transaction lite、transaction gate 和恢复 / reconcile 语义，使 mutating action 不再只靠自然语言记录 | 不把 ecosystem、MCP、plugin、skills、hooks、LSP 或 TUI 替代为 runtime 主线；MCP / skills 不是本阶段首次出现 |
-| `v0.5` | Harness-native Runtime Hardening | 收敛 `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 的 runtime 不变量 | 不以 benchmark 通过率替代架构不变量 |
+| `v0.5` | Internal Runtime Hardening | 收敛 `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 的 runtime 不变量 | 不以 benchmark 通过率替代架构不变量 |
 
 ## 3.1 TUI / renderer 演进线
 
@@ -149,9 +149,9 @@ MCP、skills、commands 在 `v0.1` 已作为最小入口或桥接能力出现。
 - 外部 capability 不能绕过 schema、permission、evidence、trace、effect 或 transaction gate；被禁用的外部工具对模型不可见，且不能通过名称调用。
 - 外部结果必须有截断、引用和 evidence 记录，不能直接成为 `Fact`。
 
-## 8. `v0.5`: Harness-native Runtime Hardening
+## 8. `v0.5`: Internal Runtime Hardening
 
-`v0.5` 将前面阶段沉淀的 trace、evidence、context、effect、transaction、recovery 和受控 extension boundary 收敛为 harness-native runtime。副作用、事务和恢复在 `v0.4` 已进入主线；本阶段负责把它们与 `ActionGraph`、`StateStore`、`Scheduler` 和 `Reconciler` 一起硬化为 runtime 不变量。
+`v0.5` 将前面阶段沉淀的 trace、evidence、context、effect、transaction、recovery 和受控 extension boundary 收敛为完整内部 runtime。副作用、事务和恢复在 `v0.4` 已进入主线；本阶段负责把它们与 `ActionGraph`、`StateStore`、`Scheduler` 和 `Reconciler` 一起硬化为 runtime 不变量。
 
 ### 必须建立的能力
 

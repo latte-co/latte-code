@@ -2,7 +2,7 @@
 
 ## 文档状态与适用边界
 
-本文是 Lattecode 当前正式设计总览，用于统一团队对实现节奏的理解。它将早期目标从“一次性交付完整 harness-native runtime”调整为“先交付基础可工作的 local-first code agent，再逐步演进到 harness-native runtime”。
+本文是 Lattecode 当前正式设计总览，用于统一团队对当前产品目标的理解：Lattecode 首先是一个 code agent：它理解代码仓库上下文，执行小范围代码修改，运行验证，并输出可审查的交付结果。Runtime 结构后续从可工作的 trace、evidence、permission、effect 和 recovery 需求中逐步演进。
 
 英文对应文档：[`docs/en-US/design/architecture-overview.md`](../../en-US/design/architecture-overview.md)。
 
@@ -10,7 +10,7 @@
 
 ## 1. 顶层定位
 
-从整个软件工程系统视角看，Lattecode 是 code agent `Data Plane`：它读取仓库、理解任务、调用工具、生成修改、运行验证、产出证据，并把结果交给人类和既有工程系统判断。Lattecode 不取代 repo permissions、CI、code review、compliance、release 或 deployment gates。
+从整个软件工程系统视角看，Lattecode 是 code agent `Data Plane`：它读取仓库、理解任务、调用工具、执行小范围修改、运行验证、产出证据，并把结果交给人类和既有工程系统判断。Lattecode 不取代 repo permissions、CI、code review、compliance、release 或 deployment gates。
 
 `Control Plane Authority` 在本文中只表示 Lattecode internal runtime authority。这个内部权威不是 v0.1 的起点要求，而是随着执行轨迹、事实、副作用、事务和恢复能力逐步结构化后形成的 runtime 权威边界。
 
@@ -18,8 +18,8 @@
 
 | 层级 | 目标 | 团队需要先理解什么 |
 | --- | --- | --- |
-| 近期产品形态 | 一个基础、可工作的 local-first code agent | 能完成真实代码任务，能解释改了什么、验证了什么、还有什么风险 |
-| 长期架构方向 | harness-native runtime | 把执行过程结构化为可审计、可恢复、可治理的 runtime 对象 |
+| 近期产品形态 | 一个基础、可工作的 code agent，当前先聚焦本地代码仓库工作流 | 能完成真实代码任务，能解释改了什么、验证了什么、还有什么风险 |
+| 长期架构方向 | 内部 runtime 演进 | 把执行过程结构化为可审计、可恢复、可治理的 runtime 对象 |
 
 ## 2. 渐进式架构路线
 
@@ -31,7 +31,7 @@ Basic working code agent
   -> Evidence and fact discipline
   -> Controlled effects and transactions
   -> Scheduling and reconciliation
-  -> Harness-native runtime
+  -> Long-term internal runtime
 ```
 
 ### 2.1 第一阶段：基础可工作 code agent
@@ -107,9 +107,9 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 这一步解决“agent 做过什么、能否恢复、不能恢复时如何交给人”。
 
-### 2.5 第五阶段：形成 harness-native runtime
+### 2.5 第五阶段：形成长期内部 runtime
 
-当上述能力稳定后，Lattecode 才进入完整 harness-native runtime 形态：
+当上述能力稳定后，Lattecode 才进入完整长期内部 runtime 形态：
 
 - `ActionGraph` 成为执行账本、调度表面、恢复入口和 UX 表面。
 - `StateStore` 管理 facts、evidence 和生命周期。
@@ -172,7 +172,7 @@ Lattecode 的模块不要求同时完整实现，但它们的演进方向应保�
 | 模块 / 对象 | 早期角色 | 成熟角色 |
 | --- | --- | --- |
 | `NodeExecutor` | 线性执行任务步骤，调用文件、搜索、编辑和验证能力 | 执行单个 `ActionNode`，支持 deterministic、single-decision、exploratory profile |
-| `Capability Adapter` | 包装本地文件、搜索、shell、Git、LSP 等基础工具 | 外部能力 anti-corruption layer，输出 runtime-native 对象 |
+| `Capability Adapter` | 包装本地文件、搜索、shell、Git、LSP 等基础工具 | 外部能力 anti-corruption layer，输出内部 runtime 对象 |
 | `CLI / Local Command` | 把 CLI 或本地命令规格转换为 `TaskSpec`，进入统一 phase / session 系统 | 作为 runtime UX / automation 入口，不直接执行副作用 |
 | `AGENTS.md Loader` | 读取仓库内 `AGENTS.md` 约束并写入 context snapshot / hash | 成为上下文与 policy 输入的一部分，而不是未追踪 prompt 拼接 |
 | `Minimal MCP Bridge` | 从配置声明的 server list / call tools，并统一走 permission / evidence / trace / session | 外部 capability adapter，不是 marketplace、resource / prompt 平台或 server 管理 UI |
@@ -203,9 +203,10 @@ Lattecode 与既有工程系统协作，但不替代它们。
 
 - Lattecode externally 是 code agent `Data Plane`，不是外部工程治理 `Control Plane`。
 - `Control Plane Authority` 必须限定为 Lattecode internal runtime authority，并且是渐进式引入的目标。
-- v0.1 的优先级是基础可工作 code agent，而不是完整 runtime kernel。
+- v0.1 的优先级是基础可工作 code agent，而不是完整内部 runtime。
 - v0.1 的 P0 范围包括 CLI、config、`AGENTS.md` loader、session management、agent-loop / phase runner、built-in tools、minimal MCP bridge、local skills、local commands、permission system、evidence / trace 和 `AgentHandoff`，但都限定为最小 contract-first 闭环能力。
 - `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 是演进方向，不应在早期实现中制造不必要复杂度。
+- Runtime 概念从可工作的 code-agent trace、evidence、permission、effect 和 recovery 需求中长出来，不是 `v0.1` 产品承诺。
 - 执行记录、工具调用、文件修改和验证结果从第一阶段起就应保留可追溯入口。
 - 设计文档不得暗示 runtime 能力已经全部实现。
 
@@ -213,7 +214,7 @@ Lattecode 与既有工程系统协作，但不替代它们。
 
 - 不把 Lattecode 设计为外部工程治理 `Control Plane`。
 - 不替代 repo permissions、CI、code review、compliance、release 或 deployment gates。
-- 不要求 v0.1 一次性交付完整 harness-native runtime。
+- 不要求 v0.1 一次性交付完整内部 runtime。
 - 不要求 v0.1 交付完整 MCP platform、marketplace、resource / prompt ecosystem、skill hub、command marketplace、cloud sync、multi-user session 或 full `ActionGraph` persistence。
 - 不把 `ActionGraph` 设计成全知状态数据库。
 - 不把 prompt transcript、模型记忆或工具日志作为长期事实生命周期系统。
@@ -224,7 +225,7 @@ Lattecode 与既有工程系统协作，但不替代它们。
 | 文档 | 角色 |
 | --- | --- |
 | 本文 | 当前正式架构总览，定义 code-agent-first 的演进路线、模块渐进关系、外部边界和非目标 |
-| [`../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md) | v0.1-v0.5 从基础 code agent 到 harness-native runtime 的阶段目标 |
+| [`../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md) | v0.1-v0.5 从基础 code agent 到长期内部 runtime 演进的阶段目标 |
 | [`../milestones/targets/runtime-kernel-task-breakdown.md`](../milestones/targets/runtime-kernel-task-breakdown.md) | 独立任务拆分，记录每个版本的任务、依赖、验收和非目标 |
 | [`../milestones/targets/v0.1-implementation-plan-review.md`](../milestones/targets/v0.1-implementation-plan-review.md) | v0.1 实现计划与技术评审，覆盖选型、依赖、风险和测试计划 |
 | [`modules/code-agent-loop.md`](./modules/code-agent-loop.md) | `Code Agent Loop` 模块设计，定义 `Intake -> Understand -> Plan -> Edit -> Verify -> Handoff` |
@@ -237,6 +238,6 @@ Lattecode 与既有工程系统协作，但不替代它们。
 | [`runtime-evolution/modules/transaction-manager.md`](./runtime-evolution/modules/transaction-manager.md) | `TransactionManager` 如何从 patch 批次演进为事务边界 |
 | [`runtime-evolution/modules/reconciler.md`](./runtime-evolution/modules/reconciler.md) | `Reconciler` 如何从失败记录演进为恢复机制 |
 | [`runtime-evolution/modules/policy-core-and-guard.md`](./runtime-evolution/modules/policy-core-and-guard.md) | `PolicyDecision`、policy core、guard 和 gate 的渐进设计 |
-| [`runtime-evolution/modules/capability-adapter.md`](./runtime-evolution/modules/capability-adapter.md) | capability adapter、工具调用边界和 runtime-native 输出设计 |
+| [`runtime-evolution/modules/capability-adapter.md`](./runtime-evolution/modules/capability-adapter.md) | capability adapter、工具调用边界和内部 runtime 输出设计 |
 | [`runtime-evolution/modules/context-projection.md`](./runtime-evolution/modules/context-projection.md) | `ContextProjection` 上下文投影设计 |
 | [`runtime-evolution/modules/node-executor.md`](./runtime-evolution/modules/node-executor.md) | `NodeExecutor` 执行 profile 和 bounded ReAct 演进设计 |

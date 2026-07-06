@@ -1,6 +1,6 @@
 # Runtime Module Evolution Targets
 
-This directory stores accepted long-term runtime module targets. They define module boundaries, data contracts, and acceptance direction for evolving from the basic code agent toward the harness-native runtime during `v0.2-v0.5`.
+This directory stores accepted long-term runtime module targets. They define module boundaries, data contracts, and acceptance direction for evolving from the basic code agent toward full internal runtime structure during `v0.2-v0.5`.
 
 For current / near-term module design, see [`../../modules/`](../../modules/README.md). Documents in this directory must not be read as evidence that the current `v0.1` implementation already has full runtime capability.
 

@@ -2,364 +2,221 @@
 
 ## 文档状态
 
-本文定义 Lattecode `v0.1` 的基础 code agent 循环。它基于对 Claude Code、CodeWhale、Codex、opencode 四类 conversation-native code agent 的临时源码调研结论，但不把 `.tmp/` 下源码当作 Lattecode 正式源码或构建依据。
+本文定义 Lattecode `v0.1` 面向本地代码仓库任务的最小 ReAct loop。设计优先级是先成为可用的 local code agent：读取仓库上下文，做受控文件修改，运行验证，并交付可审查结果。
 
 英文对应文档：[`docs/en-US/design/modules/code-agent-loop.md`](../../../en-US/design/modules/code-agent-loop.md)。
 
-## 1. 结论
+## 1. 目标与非目标
 
-生产级可用的 basic code agent 最小形态不是纯状态机，也不是裸 ReAct。它应是：
+`v0.1` 的目标是实现一个最小、可恢复、可验证的 code agent loop，足以完成本地仓库里的小型开发、修复和文档任务。
 
-```text
-Persistent TaskRun
-  + phase-gated ReAct
-  + typed tool contract
-  + permission / path / edit / shell / verification gates
-  + append-only event log
-  + structured handoff
-```
+| 类别 | 内容 |
+| --- | --- |
+| 目标 | 接收任务输入，加载仓库指令和相关文件，执行 ReAct 工具循环，修改文件，运行验证，输出 handoff |
+| 目标 | 对所有写入、shell、外部路径访问保留明确权限边界 |
+| 目标 | 保留可恢复的 run record：消息、工具调用、工具结果、修改文件、验证结果、阻塞原因 |
+| 非目标 | 不在 `v0.1` 前置完整 `ActionGraph`、高级 `Scheduler`、`Reconciler` 或完整 `runtime kernel` |
+| 非目标 | 不做多智能体、插件市场、TUI / IDE cockpit、事务回滚、云端协作或长期记忆系统 |
 
-外层 phase runner 只负责工程边界：阶段顺序、预算、权限、结构化产物校验、持久化和恢复。内层仍保留 ReAct query loop：模型可以多轮调用工具、观察结果、修正计划和继续执行。
+如果任务需要新建项目脚手架、安装依赖、删除文件、提交代码、改变 git 状态或发布内容，agent 必须请求用户确认；不能静默执行。
 
-因此，`lattecode run "实现一个贪吃蛇游戏"` 要真正可运行，至少需要：
+## 2. 最小 Loop 形态
 
-- 能接入真实模型 provider，而不是只返回 fake model 默认消息。
-- 能通过 CLI、local command、local skill、minimal MCP bridge 和 built-in tools 统一生成 `TaskSpec`。
-- 能加载 config、`AGENTS.md`、session snapshot 和 pinned constraints，形成可复用 `ContextPack`。
-- 能在目标仓库中读取、搜索、编辑、创建文件。
-- 能对写入和 shell 执行做 gate。
-- 能运行仓库已声明的验证命令。
-- 能把结果交付为 `AgentHandoff`，包括 changed files、verification、risks、blockers。
-
-如果目标仓库没有应用框架、测试框架或依赖决策，Lattecode 必须明确阻塞并请求用户确认，不能静默 scaffold、安装依赖或发布。
-
-## 2. Basic Code Agent 最小功能集
-
-| 能力 | v0.1 最小要求 | 不做什么 |
-| --- | --- | --- |
-| CLI entry | `lattecode run <task>` 启动真实 agent loop，输出 JSON / text handoff | 不做 TUI / IDE cockpit |
-| Config | 加载 project-local JSONC config，覆盖 models、runtime、tools、permissions、session、commands、skills、MCP | 不做 secrets 存储或全局策略平台 |
-| `AGENTS.md` loader | 读取 repo root / cwd 边界内的 `AGENTS.md`，记录 snapshot/hash 并注入 context | 不把未追踪文本直接拼入 prompt |
-| Session / TaskRun | 创建可恢复 `TaskRunState`，保存 phase、status、steps、artifacts、tool calls、events、context snapshot | 不做 cloud sync、多设备或多用户协作 |
-| Model loop | 支持真实 `ModelClient` + `FakeModelClient` 测试；phase 内部允许 ReAct | 不把 provider SDK 泄漏到 core loop |
-| Provider abstraction | 先支持 `fake` 与 `openai-compatible` | 不做完整 provider catalog |
-| Tool contract | 每个 tool 有 schema、mutating、risk、permission、summary、references | 不允许裸函数工具 |
-| Built-in tools | 提供最小 read/search/edit/write/shell/manifest/diff 能力 | 不做大型工具生态或插件市场 |
-| Minimal MCP bridge | 从 config-defined servers list/call tools，统一走 permission、evidence、trace、session | 默认 disabled 或 explicit enabled；不做 marketplace、resource / prompt platform、server management UI |
-| Local skills | 加载本地 instruction / workflow / command bundle，注入 context / prompt registry | 不做 hub、install、publish、marketplace；skill 不能直接执行 side effects |
-| Local commands | 读取 built-in / local command specs，将命令转成 `TaskSpec` / phase event | command 不绕过 agent-loop、permission 或 session |
-| Read/search | 支持目录、文件读取、文本搜索，输出可截断摘要和 references | 不做大型索引系统 |
-| Edit/write | 支持 `edit_file` 严格 old/new 局部替换和受控 `write_file` 创建新文件 | 不鼓励整文件无差别重写 |
-| Shell verify | 仅运行声明命令、配置 allowlist 或用户确认命令 | 不开放任意 shell |
-| Prompt registry | system prompt + phase prompt 有 id/version/schema | 不把 prompt 散落在代码字符串中 |
-| Context budget | 使用 `TaskSpec`、artifacts、evidence summary、recent steps 构造 prompt | 不无限拼 transcript |
-| Evidence/event | 每次 tool call、permission decision、phase artifact 写入事件或 evidence | 不只靠自然语言总结 |
-| Handoff | 输出 changed files、verification、risks、blockers、next steps | 不把失败包装成成功 |
-| Recovery | append-only event log + session snapshot 可恢复运行状态 | 不做复杂 graph recovery |
-
-`v0.1` 主链路固定为：
+主链路固定为：
 
 ```text
-CLI / local command / local skill / minimal MCP bridge / built-in tools
-  -> TaskSpec
-  -> Session / TaskRunState
+TaskInput
   -> ContextPack
-  -> AgentLoop / PhaseRunner
-  -> PermissionDecision
-  -> Evidence / StepTrace
-  -> AgentHandoff
-```
-
-MCP、skill 和 command 的最小边界如下：
-
-- MCP：只支持 config-defined servers、list tools 和 call tool。MCP tool 必须转换为 Lattecode tool contract，并统一走 permission、evidence、trace 和 session；默认 disabled 或 explicit enabled；不能绕过权限；不做 marketplace、resource / prompt platform 或 server management UI。
-- Skill：只支持 local skill loader。skill 是 instruction / workflow / command bundle，可注入 context / prompt registry；不能直接执行 side effects；不做 hub、install、publish 或 marketplace。
-- Command：只支持 built-in / local command specs。command 必须 route through `TaskSpec`、phase event 和 session system；不能直接调用 tool 绕过 agent-loop、permission 或 session。
-
-### 2.1 TUI / output boundary
-
-本文重新建立 `v0.1` 的 TUI / output decisions。`v0.1` release-critical path 仍是 headless JSON / text `AgentHandoff`；正式 TUI、IDE cockpit 或 full-screen cockpit 不进入 `v0.1` release acceptance。
-
-输出边界如下：
-
-- `--output json` 和 `--output text` 必须保留，且自动化、CI、non-TTY 和重定向场景不能依赖 TUI。
-- `--ui tui` 或独立 experimental command 只能是 opt-in；没有显式选择时，CLI 应维持 headless handoff 行为。
-- TUI 只消费 runtime events 和 `AgentHandoff` / view model，不驱动 permission、session、runtime mutation，也不改变 schema、evidence、trace 或 handoff 语义。
-- runtime core 不 import `react`、`ink` 或 `@opentui/*`；UI dependency 必须留在 renderer adapter 或 experimental package 边界内。
-- `PlainTextRenderer` 是 non-TTY、CI、snapshot、crash fallback 的默认可用路径；Lattecode 不自研完整 terminal renderer。
-
-Renderer 边界采用稳定 view model：
-
-```text
-runtime event stream
-  -> stable TuiViewModel
-  -> InkRenderer | OpenTuiRenderer | PlainTextRenderer
-```
-
-`InkRenderer` 可以作为 `v0.2` / `v0.3` 的 experimental PoC 方向；如果选定的 Ink 路径要求 Node `>=22`，必须有 Node gate，也可以采用 `Ink v6` pin、optional / lazy import 或独立 experimental package。`OpenTuiRenderer` 只作为 `v0.4+` adapter evaluation gate；只有当 `ActionGraph` 在 `v0.5+` 成为实际 UX surface 后，才考虑 cockpit hardening candidate。主 runtime 不引入 Bun / Zig / native build chain。
-
-## 3. Loop 形态
-
-`v0.1` 采用 phase-gated ReAct：
-
-```text
-Intake
-  -> Understand
-  -> Plan
-  -> Edit
-  -> Verify
+  -> ReAct turn loop
+  -> Tool results / Changed files
+  -> Verification
   -> Handoff
 ```
 
-每个 phase 是一个 contract：
+| 环节 | 责任 | 最小产物 |
+| --- | --- | --- |
+| `TaskInput` | 记录用户目标、范围、约束、验收标准 | `taskId`、原始输入、可选 acceptance |
+| `ContextPack` | 汇总仓库指令、相关文件、最近工具结果、开放问题 | 文件引用、摘要、token 预算状态 |
+| `ReAct turn loop` | 模型在“思考 -> 调工具 -> 观察结果”之间迭代 | 消息、工具调用、工具结果 |
+| `Tool results / Changed files` | 持久化读写结果和变更摘要 | changed files、diff refs、permission refs |
+| `Verification` | 运行声明的验证命令或记录不能验证的原因 | command、status、summary、evidence refs |
+| `Handoff` | 输出可审查交付物 | summary、changed files、verification、risks、blockers |
+
+ReAct turn 的最小步骤：
+
+1. 用 `TaskInput`、`ContextPack`、最近工具结果构造模型输入。
+2. 模型返回普通消息或工具调用。
+3. runtime 校验工具 schema、路径边界、权限和预算。
+4. 执行工具，记录结果、摘要和 evidence reference。
+5. 更新 loop state；如果需要权限或用户输入，进入等待状态。
+6. 当模型认为修改完成时，必须进入验证和 handoff；不能只靠自然语言结束任务。
+
+## 3. Loop State 与记录
+
+`v0.1` 不需要复杂图结构，但必须有一个可恢复的 `TaskRunState`。
 
 ```ts
-type AgentPhase = "intake" | "understand" | "plan" | "edit" | "verify" | "handoff";
+type TaskRunStatus =
+  | "running"
+  | "waiting_permission"
+  | "blocked"
+  | "failed"
+  | "completed";
 
-type PhaseContract<Output> = {
-  phase: AgentPhase;
-  allowedTools: string[];
-  maxReactSteps: number;
-  outputSchemaName: string;
-  validateOutput(value: unknown): Output;
-  next(output: Output, run: TaskRunState): AgentPhase | "completed" | "blocked";
-};
-```
-
-phase 内部仍然是 ReAct：
-
-```text
-build phase prompt
-  -> model.generate
-  -> tool calls
-  -> permission / schema / path / shell gates
-  -> tool results
-  -> next model turn
-  -> structured phase output
-```
-
-phase 完成条件不是“模型说完成了”，而是对应 artifact 通过 schema 校验。
-
-| Phase | 允许工具 | 必须产物 | 失败方式 |
-| --- | --- | --- | --- |
-| `Intake` | 无或只读配置 | `TaskSpec` | 目标 / 范围不清则 ask user |
-| `Understand` | `list_directory`、`read_file`、`search`、`read_project_manifest` | `ContextPack` | 找不到上下文则 block / ask |
-| `Plan` | read-only tools | `ChangePlan` | 需要 scaffold / dependency 决策则 ask |
-| `Edit` | `read_file`、`edit_file`、`write_file`、可选 `apply_patch` | `PatchSummary` | edit gate 不通过则 block |
-| `Verify` | `shell_exec`、read-only tools | `VerificationResult[]` | 验证失败则 failed handoff，不得伪成功 |
-| `Handoff` | 无或 `git_diff` | `AgentHandoff` | 必须列出未验证和阻塞 |
-
-TUI 不能作为任何 phase 的完成条件。phase artifact 仍以 schema 校验为准，renderer 只能展示 `StepTrace`、runtime events、permission prompt 状态和最终 `AgentHandoff`。
-
-## 4. 数据契约
-
-```ts
 type TaskRunState = {
-  id: string;
-  sessionId: string;
-  status: "queued" | "running" | "waiting_permission" | "blocked" | "failed" | "completed";
-  currentPhase: AgentPhase;
-  task?: TaskSpec;
-  context?: ContextPack;
-  plan?: ChangePlan;
-  patch?: PatchSummary;
-  verification: VerificationResult[];
-  handoff?: AgentHandoff;
-  steps: StepTrace[];
-  resume?: ResumeMarker;
-  contextSnapshot: ContextSnapshot;
-};
-
-type StepTrace = {
-  id: string;
-  phase: AgentPhase;
-  status: "pending" | "running" | "done" | "blocked" | "failed";
-  promptId: string;
-  promptVersion: string;
-  summary: string;
-  toolCallIds: string[];
-  evidenceIds: string[];
-  reactBudget: { maxSteps: number; usedSteps: number };
-  error?: string;
-};
-
-type ResumeMarker =
-  | { type: "permission"; permissionId: string }
-  | { type: "blocked"; questionId: string }
-  | { type: "failed"; failedStepId: string }
-  | { type: "completed"; handoffId: string };
-
-type ContextSnapshot = {
+  taskId: string;
+  status: TaskRunStatus;
   taskInput: string;
-  messageRefs: string[];
-  decisionRefs: string[];
-  compactedSummary: string;
-  pinnedConstraints: string[];
-  agentsMd?: { path: string; hash: string; summary: string };
-  skills?: { name: string; path: string; hash: string; summary: string }[];
-  commands?: { name: string; path: string; hash: string; description: string }[];
-  mcpTools?: { server: string; tool: string; toolName: string }[];
-};
-
-type PendingInput =
-  | {
-      kind: "permission";
-      permissionId: string;
-      toolCallId: string;
-      phase: AgentPhase;
-      action: "write_file" | "edit_file" | "shell_exec" | "mcp_call" | "external_path";
-      reason: string;
-      command?: string;
-      path?: string;
-      options: ["approve", "deny"];
-    }
-  | {
-      kind: "question";
-      questionId: string;
-      phase: AgentPhase;
-      prompt: string;
-      expectedAnswer: "text" | "json";
-      schemaName?: string;
-    };
-
-type ResumeInput =
-  | { kind: "permission"; permissionId: string; decision: "approve" | "deny"; reason?: string }
-  | { kind: "question"; questionId: string; answerText?: string; answerJson?: unknown };
-
-type HeadlessRunEnvelope = {
-  runId: string;
-  sessionId: string;
-  status: TaskRunState["status"];
-  pendingInput?: PendingInput;
-  handoff?: AgentHandoff;
+  messages: MessageRecord[];
+  context: ContextPack;
+  toolCalls: ToolCallRecord[];
+  toolResults: ToolResultRecord[];
+  changedFiles: ChangedFileRecord[];
+  permissions: PermissionRecord[];
+  verification: VerificationRecord[];
+  handoffStatus?: "not_ready" | "ready" | "delivered";
+  compactedSummary?: string;
+  resumeReason?: string;
 };
 ```
 
-`PendingInput`、`ResumeInput` 和 `HeadlessRunEnvelope` 是 `v0.1` headless run / resume 的 canonical contract。`waiting_permission` 必须携带 `pendingInput.kind = "permission"`，`blocked` 必须携带 `pendingInput.kind = "question"`。`AgentHandoff.blockers`、`requiredDecisions`、`TaskRunState.resume` 和 event log 必须复用同一个 `permissionId` / `questionId`，避免 CLI resume 和 handoff 出现双套 id。
-
-旧 `AgentResult.status` / `SessionState.status` 只保留 compatibility 语义；其中旧 `denied` 不再是 canonical `TaskRunState.status`，在 headless envelope、`graph-ready` wrapper 和后续 run-state 中必须映射为 `blocked`，并通过 blocker / required decision 说明权限拒绝或外部决策缺口。
-
-### 4.1 Session management 最小范围
-
-`v0.1` 的 session management 是 local-first run recovery，不是长期协作或记忆系统。
-
-| 范围 | 最小要求 |
+| 记录 | 必需字段 |
 | --- | --- |
-| Lifecycle | 支持 create / list / show / resume；session id 稳定；cwd 和 repo root 在 session 创建时固定 |
-| `TaskRunState.status` | 仅使用 `queued`、`running`、`waiting_permission`、`blocked`、`failed`、`completed` |
-| Resume semantics | `waiting_permission -> approve/deny -> continue`；`blocked -> user input -> continue`；`failed -> repair/retry`；`completed -> follow-up/fork later` |
-| Context snapshot | 保存 task input、messages、decisions、compacted summary、pinned constraints、`AGENTS.md` snapshot/hash |
-| Trace/evidence binding | 绑定 `StepTrace`、`Evidence`、tool invocation、shell output summary、file edit summary、verification result |
+| `MessageRecord` | role、content summary、token estimate、createdAt |
+| `ToolCallRecord` | id、tool name、input summary、mutating、permission id、createdAt |
+| `ToolResultRecord` | tool call id、status、output summary、evidence refs、error |
+| `ChangedFileRecord` | path、operation、read revision、write revision、diff ref |
+| `PermissionRecord` | id、action、path / command、reason、decision、decidedAt |
+| `VerificationRecord` | command、status、exit code、summary、evidence refs |
 
-明确非目标：不做 cloud sync、多设备、多用户协作、完整 branch / fork graph、long-term memory 或 full `ActionGraph` persistence。
+这些记录用于三件事：继续下一轮模型输入、恢复中断任务、生成最终 handoff。
 
-关键 artifact：
+## 4. 最小工具集
 
-| Artifact | 用途 |
+| 工具 | 是否修改状态 | 用途 | 最小约束 |
+| --- | --- | --- | --- |
+| `list_directory` | 否 | 查看目录结构 | 只能访问仓库内路径 |
+| `read_file` | 否 | 读取文件内容 | 大文件截断并保留引用 |
+| `search_text` | 否 | 搜索文件和文本 | 默认忽略依赖目录、构建产物和敏感文件 |
+| `edit_file` | 是 | 基于已读取内容做局部替换 | 必须 read-before-write，old text 默认唯一匹配 |
+| `write_file` | 是 | 创建新文件或受控整文件写入 | 创建意图必须明确；覆盖已有文件需要确认 |
+| `shell_exec` | 可能 | 运行验证命令 | 仅允许验证类命令，其他命令需确认 |
+| `git_diff` | 否 | 读取当前 diff 作为 handoff evidence | 只读；不执行 `git add`、`commit`、`push` |
+
+`v0.1` 可以先不提供大型工具生态。内置工具要覆盖本地仓库任务的最小闭环：读、找、改、写、验证、看 diff。
+
+## 5. 工具契约与权限
+
+每个工具必须声明：
+
+| 字段 | 含义 |
 | --- | --- |
-| `TaskSpec` | 用户目标、范围、验收、非目标、约束 |
-| `ContextPack` | 已读取文件、相关片段、命令来源、开放问题 |
-| `ChangePlan` | 修改文件、步骤、验证命令、风险 |
-| `PatchSummary` | changed files、diff refs、修改理由 |
-| `VerificationResult` | command、status、exit code、summary、output refs |
-| `AgentHandoff` | 最终交付摘要、验证、风险、阻塞、下一步 |
+| `name` | 稳定工具名 |
+| `inputSchema` | 可校验输入结构 |
+| `mutating` | 是否可能修改文件、进程、网络或外部状态 |
+| `risk` | `low`、`medium`、`high` |
+| `permission` | `allow`、`ask`、`deny` 或 allowlist 规则 |
+| `resultSummary` | 面向下一轮模型和 handoff 的短摘要 |
+| `evidenceRefs` | 文件、diff、命令输出或 tool result 引用 |
 
-当前 `v0.1` 实现切片采用以下最小字段集合，后续版本可在不破坏 headless contract 的前提下扩展：
+权限规则：
 
-| Artifact | 最小字段 |
+- 只读工具默认可执行，但必须受仓库路径边界和敏感文件规则限制。
+- `edit_file` 和 `write_file` 必须先读取目标文件；新文件必须有明确 create intent。
+- 写入前需要校验路径、旧内容匹配、文件是否过期；高风险 diff 需要用户确认。
+- `shell_exec` 只默认允许运行项目声明、配置 allowlist 或用户明确确认的验证命令。
+- 不允许静默安装依赖、删除文件、发起网络请求、修改 git 状态或执行发布命令。
+- `git_diff` 是只读 evidence 工具；`git add`、`git commit`、`git push` 不属于默认工具集。
+
+权限被拒绝时，任务应进入 `blocked` 或输出带 blocker 的 handoff，而不是把拒绝包装成成功。
+
+## 6. Context Policy
+
+`ContextPack` 是每轮模型输入的工程边界。它不应无限拼接完整 transcript。
+
+| Context lane | 内容 |
 | --- | --- |
-| `TaskSpec` | `objective`、`scope`、`acceptance`、`nonGoals`、`constraints`、`blockers` |
-| `ContextPack` | `summary`、`filesRead`、`relevantSnippets`、`commandSources`、`openQuestions` |
-| `ChangePlan` | `summary`、`targetFiles`、`steps`、`verificationCommands`、`risks` |
-| `PatchSummary` | `changedFiles`、`diffRefs`、`rationale`、`evidenceRefs` |
-| `VerificationResult` | `command`、`status`、`summary`、`evidenceRefs`，可选 `exitCode`、`outputRefs` |
-| `AgentHandoff` | `id`、`status`、`summary`、`changedFiles`、`verification`、`risks`、`blockers`、`requiredDecisions`、`traceRefs`、`evidenceRefs` |
+| Repo instructions | `AGENTS.md`、项目 README、用户显式约束 |
+| Task input | 原始任务、范围、验收标准、非目标 |
+| Relevant files | 已读取文件摘要、关键片段、路径引用 |
+| Recent tool results | 最近工具结果、错误、权限决策、diff 摘要 |
+| Verification plan | 可运行命令、已运行命令、跳过原因 |
+| Open questions | 需要用户确认的问题和阻塞项 |
 
-## 5. Gate 完整列表
+Token 预算策略：
 
-| Gate | 触发点 | 通过条件 | 失败语义 | 验收方式 |
-| --- | --- | --- | --- | --- |
-| `provider_gate` | run 启动 | default provider 存在、API key 可解析、模型支持 tools | fail fast | 缺 env 时 CLI 返回清晰错误 |
-| `config_gate` | config load | schemaVersion、models、tools、permissions、context 合法 | fail fast | 无效配置单元测试 |
-| `agents_gate` | context 构造前 | `AGENTS.md` snapshot/hash 已记录，且路径在 repo root / cwd 边界内 | block / ignore with reason | 外部或不可读 `AGENTS.md` 不静默进入 prompt |
-| `task_gate` | `Intake` 完成 | `TaskSpec.objective` 非空，范围和非目标明确 | ask user | 模糊任务触发 ask |
-| `context_budget_gate` | 每次 model call 前 | prompt 未超预算，必保留 lanes 未丢失 | block / compact | 超长 tool output 被摘要，验收条件保留 |
-| `tool_schema_gate` | tool 执行前 | tool name 存在，input 符合 schema | tool error，继续或 block | invalid JSON / invalid args 测试 |
-| `permission_gate` | mutating / shell / external path 前 | allow / ask / deny 决策明确 | ask / deny / block | write 和 shell 默认 ask |
-| `path_boundary_gate` | file tool 前 | path 在 workspace 或 trusted external paths | deny / ask | `../`、`.git`、`.env` 被阻止 |
-| `read_before_write_gate` | edit/write 前 | 修改文件已读取或有明确 create intent | block / ask | 未读直接 edit 被拒绝 |
-| `stale_write_gate` | edit/write 前 | file hash / mtime 与读取时一致 | block / reread | 并发修改触发 reread |
-| `edit_match_gate` | `edit_file` 前 | oldText 唯一匹配，或显式 replaceAll | block | 多匹配要求更多上下文 |
-| `diff_review_gate` | mutating edit/write 后、落盘前或后 | diff summary 可审查，高风险需确认 | ask / deny | diff 进入 permission metadata |
-| `shell_command_gate` | `shell_exec` 前 | 命令来自 allowlist、manifest scripts 或用户确认 | ask / deny | install/delete/network/git-write 默认阻止 |
-| `mcp_gate` | MCP tool list / call 前 | server 显式启用，tool 映射到 Lattecode contract，并经过 permission | ask / deny / block | disabled MCP server 对模型不可见 |
-| `skill_gate` | skill 加载 / 注入前 | skill 来自本地允许路径，只注入 instruction / workflow / command spec | deny / block | skill 不能直接执行 side effects |
-| `command_gate` | local command 执行前 | command 转成 `TaskSpec` / phase event，并进入 session | ask / deny / block | command 不能直接绕过 loop 调 tool |
-| `verification_gate` | `Verify` 完成 | 声明验证已运行并记录结果，或明确 skipped 原因 | failed / skipped handoff | 测试失败时 status 非 completed-success |
-| `handoff_gate` | 输出前 | changed files、verification、risks、blockers 完整 | fail internal | handoff snapshot 测试 |
-| `recovery_gate` | resume 前 | event log 与 snapshot 可重建，无悬挂 tool call | repair / fail | interrupted tool call resume 测试 |
+- 永远保留任务目标、验收标准、权限决策、changed files 和 blocker。
+- 长工具输出必须摘要；摘要保留 evidence ref，必要时可重新读取原始文件。
+- 旧消息可压缩成 `compactedSummary`，但不能丢失用户明确约束。
+- 如果上下文不足以安全修改文件，agent 应读取更多文件或进入 `blocked`。
 
-这些 gates 是 `v0.1` 必须验收的最小集合。它们不等价于完整 OS sandbox；如果没有平台级隔离，文档和 CLI 输出不能声称具备 sandbox。
+## 7. Verification 与 Handoff
 
-## 6. 测试策略
+验证命令来源优先级：
 
-### 6.1 单元测试
+1. 用户明确指定的命令。
+2. 项目配置或 package manifest 中声明的测试 / 构建 /检查命令。
+3. agent 根据仓库事实提出的命令，并经过 allowlist 或用户确认。
 
-| 范围 | 测试内容 |
+不能运行验证时，必须记录 skipped reason。验证失败时，最终状态不能是成功。
+
+`AgentHandoff` 最小字段：
+
+| 字段 | 含义 |
 | --- | --- |
-| Config | merge、env placeholder、invalid provider、shell allowlist |
-| `AGENTS.md` | snapshot/hash、repo boundary、missing / unreadable behavior |
-| Provider | fake、openai-compatible request mapping、missing API key、tool call parse error |
-| Session | create / list / show / resume、status transitions、cwd / repo root 固定 |
-| Prompt | 每个 phase prompt 有 id/version/schema，包含必要边界 |
-| Context | compaction 保留 task / acceptance / blockers / verification |
-| Tool schema | invalid tool name、invalid args、output truncation |
-| Permission | allow / ask / deny、mutating、high risk、deny globs |
-| Edit | unique replace、多匹配、stale file、line ending 保留 |
-| Shell | allowlist、timeout、output cap、blocked install/delete/network/git-write |
-| MCP / Skill / Command | disabled-by-default MCP、skill no-side-effect、command routes through `TaskSpec` |
-| Handoff | failed verification 不会被标成成功 |
+| `status` | `completed`、`failed` 或 `blocked` |
+| `summary` | 完成了什么 |
+| `changedFiles` | 文件路径、操作类型、diff ref |
+| `commandsRun` | 命令、退出码、摘要、evidence ref |
+| `risks` | 未覆盖风险、行为变化、兼容性担忧 |
+| `blockers` | 权限拒绝、信息缺口、验证失败 |
+| `evidenceRefs` | 文件片段、diff、工具结果、命令输出引用 |
 
-### 6.2 集成测试
+handoff 面向代码审查和后续接手，不应只输出“已完成”。
 
-集成测试必须用真实文件系统临时仓库，不只测纯函数。
+## 8. Failure 与 Resume 状态
 
-| 场景 | Fixture | 断言 |
+| 状态 | 含义 | Resume 行为 |
 | --- | --- | --- |
-| happy path | 小型 TypeScript / web app fixture | 修改源码、补测试、`npm test` 通过、handoff 完整 |
-| snake game | 已有 Vite / vanilla app fixture | 生成游戏文件、测试或 build 通过 |
-| permission ask | mutating edit / shell | 返回 waiting_permission 或 blocked，不写文件 |
-| verification fail | 测试故意失败 | handoff 标记 failed，保留失败摘要 |
-| context overflow | 大工具输出 | 输出被摘要，关键约束不丢 |
-| interrupted resume | tool call 后中断 | resume 后无悬挂 tool call，可继续或安全失败 |
-| stale write | 读取后外部修改文件 | edit 被阻止或重新读取 |
-| local command / skill / MCP | 命令、skill 或 MCP tool 触发任务 | 全部进入 `TaskSpec -> Session -> PhaseRunner`，并产生 permission / evidence / trace |
+| `waiting_permission` | 工具调用需要用户批准 | 用户 approve 后继续；deny 后进入 `blocked` 或 handoff |
+| `blocked` | 缺少用户决策、上下文或权限 | 用户补充输入后继续；否则保持 blocker |
+| `failed` | 工具执行或验证失败，且无法自动修复 | 可从失败点重试，或输出失败 handoff |
+| `completed` | handoff 已生成，任务闭环结束 | 后续请求应创建新 task 或 follow-up task |
 
-### 6.3 Provider 集成测试
+对 `waiting_permission`、`blocked` 和 `failed` 的继续恢复必须复用同一个 `taskId`，读取已有 messages、tool results、changed files、permissions 和 verification 记录，避免重复写入或重复执行高风险 shell。`completed` run 只能读取或复盘已完成状态；如需继续推进，应创建 follow-up task。
 
-`v0.1` 不应把真实模型测试作为普通 CI 必需项。分层如下：
+## 9. 延后事项
 
-- CI 必跑：`FakeModelClient` scripted integration。
-- 可选本地 smoke：配置真实 provider 后跑一个小 fixture。
-- 禁止在 CI 中依赖外部 API key，除非有专门 secret 和显式 opt-in。
+以下内容属于后续演进，不进入 `v0.1` 的最小 ReAct loop：
 
-## 7. 与后续 runtime 的演进关系
+- 完整图执行模型，例如把每个步骤提升为 `ActionGraph` 节点。
+- 高级 `Scheduler`、并发执行、优先级队列和跨任务调度。
+- `Reconciler` 驱动的自动修复、复杂事实系统和长期状态推理。
+- 完整 `runtime kernel`、事务 / 回滚、effect ledger 或 overlay revision。
+- 多智能体协作、角色编排、插件市场、远程工具生态。
+- TUI / IDE cockpit 作为核心交互面。
 
-| v0.1 对象 | 后续对象 | 演进方式 |
-| --- | --- | --- |
-| `TaskRunState` | `ActionGraph` seed | phase / step 变成 node / edge |
-| `StepTrace` | `ActionNode` | 增加 dependsOn、readSet、writeSet、effect refs |
-| tool evidence | `Evidence` | 增加 coverage、freshness、artifact refs |
-| permission decisions | `PolicyDecision` / gate records | 结构化进入 policy layer |
-| edit / shell records | `EffectRecord` | 增加 expected / observed / compensation |
-| failed handoff | `ReconcileDecision` | 增加 affected refs 和 repair action |
+这些方向可以从 `v0.1` 的 messages、tool records、permissions、verification 和 handoff evidence 中自然演进；不应先于可工作的本地 code agent loop。
 
-## 8. v0.1 Done Definition
+## 10. `v0.1` 实现切片与验收
 
-- `lattecode run "实现一个贪吃蛇游戏"` 在已有 web app fixture 中能产出真实代码变更。
-- 至少一个 scripted fake-model 集成测试覆盖完整 loop。
-- 至少一个真实 provider smoke test 可手动运行。
-- 所有 P0 gates 有单元或集成测试。
-- CLI 输出包含 `AgentHandoff`，并能定位 event log / evidence / changed files。
-- session lifecycle、`AGENTS.md` snapshot、minimal MCP bridge、local skill loader 和 local command specs 都进入最小 contract-first 闭环。
-- 失败、阻塞、跳过验证都不会被报告为成功。
+实现切片：
+
+- `lattecode run <task>` 创建 `TaskRunState`，写入 `taskId` 和原始任务输入。
+- 加载仓库指令、相关文件和最近工具结果，构造 `ContextPack`。
+- 接入模型 client，支持多轮 ReAct tool call。
+- 提供最小内置工具：list、read、search、edit、write、shell verification、git diff。
+- 对 mutating tool、shell、外部路径执行 permission gate。
+- 强制 read-before-write、路径边界、stale write 检查和 diff evidence。
+- 运行验证命令或记录不能验证的原因。
+- 输出 `AgentHandoff`，包含 changed files、commands run、results、risks、blockers、evidence refs。
+- 支持 `waiting_permission`、`blocked`、`failed` 的本地 resume；`completed` run 只能读取、复盘或派生 follow-up task，不能继续原任务的 mutating loop。
+
+验收标准：
+
+- 在一个已有小型仓库 fixture 中，agent 能完成简单代码或文档修改并生成 diff。
+- scripted fake-model 集成测试覆盖完整 `TaskInput -> ContextPack -> ReAct -> Verification -> Handoff`。
+- 写入前未读取目标文件会被阻止。
+- 未确认的 install、delete、network、git write 命令会被阻止或进入 `waiting_permission`。
+- 验证失败时 handoff 状态为 `failed` 或 `blocked`，不会报告成功。
+- handoff 能列出 changed files、验证命令、结果摘要、风险和 evidence refs。

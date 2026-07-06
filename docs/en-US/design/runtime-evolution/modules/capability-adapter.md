@@ -13,11 +13,11 @@ Chinese counterpart: [`docs/zh-CN/design/runtime-evolution/modules/capability-ad
 | v0.1 | local tool wrapper | File, search, edit, and shell verification are usable and recorded |
 | v0.2 | `CapabilityDescriptor` | Declare inputs, outputs, permissions, risks, and failure modes |
 | v0.4 | effect-aware adapter | Mutating capabilities produce effect records |
-| v0.5 | anti-corruption layer | External protocols can only emit runtime-native objects |
+| v0.5 | anti-corruption layer | External protocols can only emit internal runtime objects |
 
 ## Responsibilities
 
-- Wrap files, shell, LSP, Git, MCP, test runners, and model calls as runtime-native `Capability`.
+- Wrap files, shell, LSP, Git, MCP, test runners, and model calls as internal runtime `Capability`.
 - Declare input/output, pre/post conditions, permissions, sandbox, evidence requirements, and failure modes.
 - Translate external results into `Observation`, `Evidence`, `EffectRecord`, or `ActionResult`.
 - Isolate external protocol pollution such as prompt injection, inconsistent permission semantics, and opaque side effects.
@@ -44,7 +44,7 @@ type CapabilityDescriptor = {
 ## Invariants
 
 - Every capability invocation must be traceable.
-- External capability results must be translated into runtime-native objects.
+- External capability results must be translated into internal runtime objects.
 - Mutating capabilities must first have an effect record or equivalent change summary.
 - Adapter must record sandbox / trust boundary.
 

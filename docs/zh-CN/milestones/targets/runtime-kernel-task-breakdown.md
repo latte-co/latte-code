@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文是 Lattecode 从基础 code agent 演进到 harness-native runtime 的独立任务拆分文档。文件名保留 `runtime-kernel-task-breakdown` 是为了维持现有索引稳定；内容已调整为渐进式实现排期。
+本文是 Lattecode 从基础 code agent 演进到长期内部 runtime 结构的独立任务拆分文档。文件名保留 `runtime-kernel-task-breakdown` 是为了维持现有索引稳定；内容已调整为渐进式实现排期。
 
 英文对应文档：[`docs/en-US/milestones/targets/runtime-kernel-task-breakdown.md`](../../../en-US/milestones/targets/runtime-kernel-task-breakdown.md)。
 
@@ -13,7 +13,7 @@ v0.1 Basic working code agent
   -> v0.2 Structured trace and tool discipline
   -> v0.3 Evidence, facts, and context projection
   -> v0.4 Controlled effects, transactions, and recovery
-  -> v0.5 Harness-native runtime hardening
+  -> v0.5 Internal runtime hardening
 ```
 
 全版本共同前提：Lattecode externally 是 code agent `Data Plane`；内部 `Control Plane Authority` 仅表示 Lattecode internal runtime authority，且是逐步形成的目标。
@@ -113,7 +113,7 @@ v0.1 Basic working code agent
 - 主 runtime 引入 Bun / Zig / native build chain。
 - 用 ecosystem / MCP / plugin / skills / hooks / LSP 替代 effects / transactions / recovery 主线。
 
-## 6. `v0.5`: Harness-native Runtime Hardening
+## 6. `v0.5`: Internal Runtime Hardening
 
 ### 任务列表
 

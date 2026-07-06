@@ -2,7 +2,7 @@
 
 ## Status
 
-This document defines Lattecode's evolution path from `v0.1` through `v0.5`. The historical file name `runtime-kernel-roadmap` is retained to keep existing indexes stable; the content now follows a code-agent-first approach: first build a basic working local-first code agent, then gradually evolve it into a harness-native runtime.
+This document defines Lattecode's evolution path from `v0.1` through `v0.5`. The historical file name `runtime-kernel-roadmap` is retained to keep existing indexes stable; the content now follows a code-agent-first approach: first build a basic working code agent for local repository workflows, then let runtime structure grow from traces, evidence, permissions, effects, and recovery needs.
 
 Chinese counterpart: [`docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../../../zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md).
 
@@ -13,7 +13,7 @@ v0.1 Basic Working Code Agent
   -> v0.2 Structured Trace and Tool Discipline
   -> v0.3 Evidence, Facts, and Context Projection
   -> v0.4 Controlled Effects, Transactions, and Recovery
-  -> v0.5 Harness-native Runtime Hardening
+  -> v0.5 Internal Runtime Hardening
 ```
 
 Reference frame: Lattecode is externally a code-agent `Data Plane`; `Control Plane Authority` only means Lattecode internal runtime authority, and only after runtime structure forms incrementally.
@@ -25,7 +25,7 @@ Reference frame: Lattecode is externally a code-agent `Data Plane`; `Control Pla
 - Keep traceable execution records from day one, so later evolution is possible.
 - Tool calls, file changes, and verification results must be reviewable.
 - LLMs may help with understanding, planning, and editing, but should not become long-term fact sources or unconstrained tool executors.
-- Harness-native runtime is the direction, not the MVP complexity starting point.
+- Full internal runtime structure is the long-term direction, not the MVP complexity starting point.
 
 ## 3. Version Table
 
@@ -35,7 +35,7 @@ Reference frame: Lattecode is externally a code-agent `Data Plane`; `Control Pla
 | `v0.2` | Structured Trace and Tool Discipline | Structure execution steps as traceable task trace and establish basic capability boundaries | Over-building trace into a full graph platform |
 | `v0.3` | Evidence, Facts, and Context Projection | Separate observation, evidence, and fact; introduce minimal context projection | Treating model inference as fact |
 | `v0.4` | Controlled Effects, Transactions, and Recovery | Harden extension / effect / transaction boundaries; introduce `EffectRecord`, overlay / transaction lite, transaction gate, and recovery / reconcile semantics so mutating actions are no longer only natural-language records | Replacing the runtime mainline with ecosystem, MCP, plugins, skills, hooks, LSP, or TUI work; MCP / skills are not first introduced here |
-| `v0.5` | Harness-native Runtime Hardening | Consolidate runtime invariants for `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` | Replacing architecture invariants with benchmark scores |
+| `v0.5` | Internal Runtime Hardening | Consolidate runtime invariants for `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` | Replacing architecture invariants with benchmark scores |
 
 ## 3.1 TUI / renderer evolution lane
 
@@ -149,9 +149,9 @@ MCP, skills, and commands already appear in `v0.1` as minimal entries or bridge 
 - External capabilities cannot bypass schema, permission, evidence, trace, effect, or transaction gates; disabled external tools are invisible to the model and cannot be invoked by name.
 - External results have truncation, references, and evidence records; they do not directly become `Fact`.
 
-## 8. `v0.5`: Harness-native Runtime Hardening
+## 8. `v0.5`: Internal Runtime Hardening
 
-`v0.5` consolidates trace, evidence, context, effects, transactions, recovery, and controlled extension boundaries from previous stages into a harness-native runtime. Side effects, transactions, and recovery enter the mainline in `v0.4`; this stage hardens them with `ActionGraph`, `StateStore`, `Scheduler`, and `Reconciler` into runtime invariants.
+`v0.5` consolidates trace, evidence, context, effects, transactions, recovery, and controlled extension boundaries from previous stages into a full internal runtime. Side effects, transactions, and recovery enter the mainline in `v0.4`; this stage hardens them with `ActionGraph`, `StateStore`, `Scheduler`, and `Reconciler` into runtime invariants.
 
 ### Required Capabilities
 

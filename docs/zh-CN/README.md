@@ -2,7 +2,7 @@
 
 本目录收录 Lattecode 相关的工程调研、已固化设计、提案和里程碑。正式文档应与英文目录 [`docs/en-US/`](../en-US/README.md) 保持结构和语义对齐。
 
-当前设计节奏是渐进式：先实现一个基础、可工作的 local-first code agent，再把执行轨迹、事实、证据、副作用、事务、调度和恢复逐步结构化为 harness-native runtime。文档中的 runtime 术语表示演进目标和接口约束，不表示当前 `src/` 已经具备完整 runtime-kernel 能力。
+当前设计节奏是渐进式：Lattecode 首先是一个 code agent：它理解代码仓库上下文，执行小范围代码修改，运行验证，并输出可审查的交付结果。当前实现可以先聚焦本地代码仓库工作流，但这不是产品定位标签。长期 runtime 结构应从可工作的 code-agent trace、evidence、permission、effect 和 recovery 需求中长出来。文档中的 runtime 术语表示演进目标和接口约束，不表示当前 `src/` 已经具备完整内部 runtime 能力。
 
 ## 目录分层
 
@@ -86,7 +86,7 @@
 ## 术语边界
 
 - **调研事实**：来自横向调研和可复查观察，用于描述已有系统的能力和限制。
-- **设计建议**：基于调研事实推导出的 code-agent operating model 与 harness-native runtime 演进路线，不表示既有系统已经具备该能力。
+- **设计建议**：基于调研事实推导出的 code-agent operating model 与长期 runtime 演进路线，不表示既有系统已经具备该能力。
 - **Data Plane**：从整个软件工程系统视角，Code Agent / Lattecode 的外部定位；Lattecode 执行任务并产出证据，但不取代外部治理系统。
 - **Control Plane Authority**：仅指 Lattecode internal runtime authority，且只在逐步引入 runtime 结构后成立；不得理解为外部工程治理控制平面。
 - **ActionGraph**：长期目标中的执行账本、调度表面、恢复入口、审计索引和 UX 可视化表面；runtime evolution 文档描述已接受的演进目标，不表示已经实现。

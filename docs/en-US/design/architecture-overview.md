@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This is the current formal architecture overview for Lattecode. It aligns the team on a slower implementation rhythm: first deliver a basic, working local-first code agent, then gradually evolve it into a harness-native runtime.
+This is the current formal architecture overview for Lattecode. It aligns the team on the current product goal: Lattecode is first a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. Runtime structure evolves later from working traces, evidence, permissions, effects, and recovery needs.
 
 Chinese counterpart: [`docs/zh-CN/design/architecture-overview.md`](../../zh-CN/design/architecture-overview.md).
 
@@ -10,7 +10,7 @@ This document describes design goals, evolution path, and module boundaries. It 
 
 ## 1. Top-level Positioning
 
-From the perspective of the broader software engineering system, Lattecode is a code-agent `Data Plane`: it reads repositories, understands tasks, calls tools, generates changes, runs verification, produces evidence, and hands results to humans and existing engineering systems. Lattecode does not replace repo permissions, CI, code review, compliance, release, or deployment gates.
+From the perspective of the broader software engineering system, Lattecode is a code-agent `Data Plane`: it reads repositories, understands tasks, calls tools, makes scoped changes, runs verification, produces evidence, and hands results to humans and existing engineering systems. Lattecode does not replace repo permissions, CI, code review, compliance, release, or deployment gates.
 
 `Control Plane Authority` in this document only means Lattecode internal runtime authority. This internal authority is not a `v0.1` starting requirement. It forms gradually as execution trace, facts, side effects, transactions, and recovery become structured runtime objects.
 
@@ -18,8 +18,8 @@ Lattecode therefore uses two layers of narrative:
 
 | Layer | Goal | What the team should understand first |
 | --- | --- | --- |
-| Near-term product shape | A basic, working local-first code agent | Complete real coding tasks and explain changes, verification, and risks |
-| Long-term architecture direction | Harness-native runtime | Structure execution into auditable, recoverable, governable runtime objects |
+| Near-term product shape | A basic, working code agent focused first on local repository workflows | Complete real coding tasks and explain changes, verification, and risks |
+| Long-term architecture direction | Internal runtime evolution | Structure execution into auditable, recoverable, governable runtime objects |
 
 ## 2. Evolutionary Architecture Path
 
@@ -31,7 +31,7 @@ Basic working code agent
   -> Evidence and fact discipline
   -> Controlled effects and transactions
   -> Scheduling and reconciliation
-  -> Harness-native runtime
+  -> Long-term internal runtime
 ```
 
 ### 2.1 Stage One: Basic Working Code Agent
@@ -107,9 +107,9 @@ When Lattecode handles more file edits, shell commands, Git operations, or exter
 
 This stage answers: what did the agent do, can it recover, and when must it hand off?
 
-### 2.5 Stage Five: Harness-native Runtime
+### 2.5 Stage Five: Long-term Internal Runtime
 
-After the previous capabilities become stable, Lattecode reaches the full harness-native runtime shape:
+After the previous capabilities become stable, Lattecode can reach the full long-term internal runtime shape:
 
 - `ActionGraph` becomes execution ledger, scheduling surface, recovery entry, and UX surface.
 - `StateStore` manages facts, evidence, and lifecycle.
@@ -172,7 +172,7 @@ Lattecode modules do not need to be fully implemented at the same time, but thei
 | Module / Object | Early role | Mature role |
 | --- | --- | --- |
 | `NodeExecutor` | Run linear task steps and call file, search, edit, and verification capabilities | Execute a single `ActionNode` with deterministic, single-decision, or exploratory profile |
-| `Capability Adapter` | Wrap basic local tools | Anti-corruption layer that emits runtime-native objects |
+| `Capability Adapter` | Wrap basic local tools | Anti-corruption layer that emits internal runtime objects |
 | `CLI / Local Command` | Convert CLI or local command specs into `TaskSpec` and enter the unified phase / session system | Runtime UX / automation entry, not a direct side-effect executor |
 | `AGENTS.md Loader` | Read repository `AGENTS.md` constraints and write them into context snapshot / hash | Part of context and policy input, not untracked prompt concatenation |
 | `Minimal MCP Bridge` | List / call tools from config-defined servers through unified permission / evidence / trace / session | External capability adapter, not a marketplace, resource / prompt platform, or server-management UI |
@@ -203,9 +203,10 @@ Lattecode works with existing engineering systems but does not replace them.
 
 - Lattecode externally is a code-agent `Data Plane`, not an external engineering `Control Plane`.
 - `Control Plane Authority` must be scoped to Lattecode internal runtime authority, and is introduced incrementally.
-- The `v0.1` priority is a basic working code agent, not a full runtime kernel.
+- The `v0.1` priority is a basic working code agent, not a full internal runtime.
 - The `v0.1` P0 scope includes CLI, config, `AGENTS.md` loader, session management, agent-loop / phase runner, built-in tools, minimal MCP bridge, local skills, local commands, permission system, evidence / trace, and `AgentHandoff`, but all are limited to the minimum contract-first loop.
 - `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` are evolution targets; early implementation should not create unnecessary complexity.
+- Runtime concepts grow from working code-agent traces, evidence, permissions, effects, and recovery needs; they are not `v0.1` product promises.
 - Execution records, tool calls, file changes, and verification results should have traceable entry points from the first stage.
 - Design documents must not imply the runtime capabilities are fully implemented.
 
@@ -213,7 +214,7 @@ Lattecode works with existing engineering systems but does not replace them.
 
 - Do not design Lattecode as an external engineering governance `Control Plane`.
 - Do not replace repo permissions, CI, code review, compliance, release, or deployment gates.
-- Do not require `v0.1` to deliver the full harness-native runtime.
+- Do not require `v0.1` to deliver the full internal runtime.
 - Do not require `v0.1` to deliver a full MCP platform, marketplace, resource / prompt ecosystem, skill hub, command marketplace, cloud sync, multi-user session, or full `ActionGraph` persistence.
 - Do not make `ActionGraph` an omniscient state database.
 - Do not use prompt transcript, model memory, or tool logs as the long-term fact lifecycle system.
@@ -224,7 +225,7 @@ Lattecode works with existing engineering systems but does not replace them.
 | Document | Role |
 | --- | --- |
 | This document | Formal architecture overview for the code-agent-first evolution path, module relationships, external boundaries, and non-goals |
-| [`../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md) | Stage goals from a basic code agent to harness-native runtime |
+| [`../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md) | Stage goals from a basic code agent to long-term internal runtime evolution |
 | [`../milestones/targets/runtime-kernel-task-breakdown.md`](../milestones/targets/runtime-kernel-task-breakdown.md) | Independent task breakdown with tasks, dependencies, acceptance criteria, and non-goals |
 | [`../milestones/targets/v0.1-implementation-plan-review.md`](../milestones/targets/v0.1-implementation-plan-review.md) | `v0.1` implementation plan and technical review covering choices, dependencies, risks, and tests |
 | [`modules/code-agent-loop.md`](./modules/code-agent-loop.md) | `Code Agent Loop` module design, defining `Intake -> Understand -> Plan -> Edit -> Verify -> Handoff` |
@@ -237,6 +238,6 @@ Lattecode works with existing engineering systems but does not replace them.
 | [`runtime-evolution/modules/transaction-manager.md`](./runtime-evolution/modules/transaction-manager.md) | How `TransactionManager` evolves from patch batches |
 | [`runtime-evolution/modules/reconciler.md`](./runtime-evolution/modules/reconciler.md) | How `Reconciler` evolves from failure records |
 | [`runtime-evolution/modules/policy-core-and-guard.md`](./runtime-evolution/modules/policy-core-and-guard.md) | Gradual design of `PolicyDecision`, policy core, guard, and gates |
-| [`runtime-evolution/modules/capability-adapter.md`](./runtime-evolution/modules/capability-adapter.md) | Capability adapter, tool boundaries, and runtime-native outputs |
+| [`runtime-evolution/modules/capability-adapter.md`](./runtime-evolution/modules/capability-adapter.md) | Capability adapter, tool boundaries, and internal runtime outputs |
 | [`runtime-evolution/modules/context-projection.md`](./runtime-evolution/modules/context-projection.md) | `ContextProjection` design |
 | [`runtime-evolution/modules/node-executor.md`](./runtime-evolution/modules/node-executor.md) | `NodeExecutor` profiles and bounded ReAct evolution |

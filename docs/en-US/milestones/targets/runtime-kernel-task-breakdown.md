@@ -2,7 +2,7 @@
 
 ## Status
 
-This is the independent task breakdown for evolving Lattecode from a basic code agent to a harness-native runtime. The historical file name `runtime-kernel-task-breakdown` is retained to keep existing indexes stable; the content now follows an incremental implementation plan.
+This is the independent task breakdown for evolving Lattecode from a basic code agent into long-term internal runtime structure. The historical file name `runtime-kernel-task-breakdown` is retained to keep existing indexes stable; the content now follows an incremental implementation plan.
 
 Chinese counterpart: [`docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md`](../../../zh-CN/milestones/targets/runtime-kernel-task-breakdown.md).
 
@@ -13,7 +13,7 @@ v0.1 Basic working code agent
   -> v0.2 Structured trace and tool discipline
   -> v0.3 Evidence, facts, and context projection
   -> v0.4 Controlled effects, transactions, and recovery
-  -> v0.5 Harness-native runtime hardening
+  -> v0.5 Internal runtime hardening
 ```
 
 Shared premise: Lattecode is externally a code-agent `Data Plane`; internal `Control Plane Authority` only means Lattecode internal runtime authority, and is a gradually formed target.
@@ -113,7 +113,7 @@ Shared premise: Lattecode is externally a code-agent `Data Plane`; internal `Con
 - Bun / Zig / native build chain in the main runtime.
 - Replacing the effects / transactions / recovery mainline with ecosystem / MCP / plugin / skills / hooks / LSP work.
 
-## 6. `v0.5`: Harness-native Runtime Hardening
+## 6. `v0.5`: Internal Runtime Hardening
 
 ### Tasks
 
