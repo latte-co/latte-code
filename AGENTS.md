@@ -2,13 +2,13 @@
 
 ## 1. Project Overview
 
-Fluxcode is currently a local-first TypeScript code agent / harness-native runtime design repository. The confirmed project baselines are as follows:
+Lattecode is currently a local-first TypeScript code agent / harness-native runtime design repository. The confirmed project baselines are as follows:
 
 - Content format: Markdown technical documentation plus TypeScript project scaffolding / source area (see `src/`). Formal design documents must not imply that the runtime-kernel capabilities are already implemented.
 - License: Apache License 2.0 (see `LICENSE`).
 - Declared runtime / framework / package manager versions: Node.js >= 20, TypeScript, Vitest (see `package.json`, `tsconfig.json`, `vitest.config.ts`).
 - Design theme: harness-native code agent as a data-plane code agent with internal runtime authority.
-- Reference frame: from the external software-engineering-system perspective, Fluxcode is a code agent `Data Plane`; it does not replace repo permissions, CI, review, compliance, or deployment gates. `Control Plane Authority` means only Fluxcode internal runtime authority.
+- Reference frame: from the external software-engineering-system perspective, Lattecode is a code agent `Data Plane`; it does not replace repo permissions, CI, review, compliance, or deployment gates. `Control Plane Authority` means only Lattecode internal runtime authority.
 - Key terminology: `Data Plane`, `Control Plane Authority` scoped to internal runtime authority, `ActionGraph`, `ActionNode`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `Reconciler`, `OverlayRevision`, `ContextProjection`, `NodeExecutor`.
 
 Do NOT treat local tool or runtime files under `.opencode/`, `.oh-my-code/`, `.tmp/`, or `log/` as project source code, package manager evidence, or build entry points.
@@ -30,7 +30,7 @@ Do NOT treat local tool or runtime files under `.opencode/`, `.oh-my-code/`, `.t
 | `src/` | TypeScript source area. Do not infer runtime-kernel implementation completeness from design documents; future runtime-kernel evolution should follow the current architecture overview, module designs, roadmap, and task breakdown. | `docs/zh-CN/design/architecture-overview.md`, `docs/zh-CN/design/modules/`, `docs/zh-CN/design/runtime-kernel-roadmap-v0.1-v0.5.md`, `docs/zh-CN/design/runtime-kernel-task-breakdown.md` |
 | `tests/` | Vitest unit + integration tests | `vitest.config.ts` |
 | `package.json` / `tsconfig.json` / `vitest.config.ts` | Node/TypeScript/Vitest project configuration | – |
-| `fluxcode.config.example.jsonc` | JSONC example configuration, no secrets | – |
+| `lattecode.config.example.jsonc` | JSONC example configuration, no secrets | – |
 | `LICENSE` | Apache License 2.0 text | – |
 | `.gitignore` | Ignore Node/build/cache/coverage/local tool/runtime outputs | – |
 
@@ -111,7 +111,7 @@ This solution will definitely completely solve all code agent state management p
 ✅ Recommended: Technical prose + backtick-quoted identifiers
 
 ```markdown
-Fluxcode is externally a code-agent `Data Plane`; `Control Plane Authority` refers only to internal runtime authority over facts, scheduling, effects, transactions, and reconcile semantics. `ActionGraph` remains the execution ledger and UX surface.
+Lattecode is externally a code-agent `Data Plane`; `Control Plane Authority` refers only to internal runtime authority over facts, scheduling, effects, transactions, and reconcile semantics. `ActionGraph` remains the execution ledger and UX surface.
 ```
 
 ❌ Avoid: Unmarked terminology, sloganized expressions

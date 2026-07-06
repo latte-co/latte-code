@@ -2,7 +2,7 @@
 
 ## Status
 
-This document defines the basic code agent loop for Fluxcode `v0.1`. It is based on temporary source research of Claude Code, CodeWhale, Codex, and opencode, but `.tmp/` sources are not treated as Fluxcode formal source or build inputs.
+This document defines the basic code agent loop for Lattecode `v0.1`. It is based on temporary source research of Claude Code, CodeWhale, Codex, and opencode, but `.tmp/` sources are not treated as Lattecode formal source or build inputs.
 
 Chinese counterpart: [`docs/zh-CN/design/modules/code-agent-loop.md`](../../../zh-CN/design/modules/code-agent-loop.md).
 
@@ -21,7 +21,7 @@ Persistent TaskRun
 
 The outer phase runner owns engineering boundaries: phase order, budgets, permissions, structured artifact validation, persistence, and recovery. The inner loop still keeps ReAct query behavior: the model can call tools, observe results, adjust the plan, and continue.
 
-For `fluxcode run "implement a snake game"` to be truly runnable, Fluxcode needs at least:
+For `lattecode run "implement a snake game"` to be truly runnable, Lattecode needs at least:
 
 - A real model provider, not only the fake default response.
 - A unified path for CLI, local command, local skill, minimal MCP bridge, and built-in tools to produce `TaskSpec`.
@@ -31,13 +31,13 @@ For `fluxcode run "implement a snake game"` to be truly runnable, Fluxcode needs
 - Declared verification command execution.
 - `AgentHandoff` containing changed files, verification, risks, and blockers.
 
-If the target repository lacks application framework, test framework, or dependency decisions, Fluxcode must block clearly and ask the user. It must not silently scaffold, install dependencies, or publish.
+If the target repository lacks application framework, test framework, or dependency decisions, Lattecode must block clearly and ask the user. It must not silently scaffold, install dependencies, or publish.
 
 ## 2. Basic Code Agent Minimum Feature Set
 
 | Capability | `v0.1` minimum | Non-goals |
 | --- | --- | --- |
-| CLI entry | `fluxcode run <task>` starts the real agent loop and outputs JSON / text handoff | No TUI / IDE cockpit |
+| CLI entry | `lattecode run <task>` starts the real agent loop and outputs JSON / text handoff | No TUI / IDE cockpit |
 | Config | Load project-local JSONC config for models, runtime, tools, permissions, session, commands, skills, and MCP | No secrets storage or global policy platform |
 | `AGENTS.md` loader | Read `AGENTS.md` within repo root / cwd boundaries, record snapshot/hash, and inject it into context | No untracked text concatenated directly into prompts |
 | Session / TaskRun | Create recoverable `TaskRunState` with phase, status, steps, artifacts, tool calls, events, and context snapshot | No cloud sync, multi-device, or multi-user collaboration |
@@ -72,7 +72,7 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 The minimum MCP, skill, and command boundaries are:
 
-- MCP: only config-defined servers, list tools, and call tool. MCP tools must be converted into the Fluxcode tool contract and routed through permission, evidence, trace, and session. MCP is disabled by default or explicitly enabled; it cannot bypass permissions; no marketplace, resource / prompt platform, or server-management UI.
+- MCP: only config-defined servers, list tools, and call tool. MCP tools must be converted into the Lattecode tool contract and routed through permission, evidence, trace, and session. MCP is disabled by default or explicitly enabled; it cannot bypass permissions; no marketplace, resource / prompt platform, or server-management UI.
 - Skill: only a local skill loader. A skill is an instruction / workflow / command bundle that can inject into context / prompt registry; it cannot directly execute side effects; no hub, install, publish, or marketplace.
 - Command: only built-in / local command specs. Commands must route through `TaskSpec`, phase events, and the session system; they cannot call tools directly to bypass the agent loop, permission, or session.
 
@@ -86,7 +86,7 @@ The output boundary is:
 - `--ui tui` or a standalone experimental command may only be opt-in; without explicit selection, the CLI should keep headless handoff behavior.
 - TUI only consumes runtime events and `AgentHandoff` / view model. It must not drive permissions, sessions, runtime mutation, schema, evidence, trace, or handoff semantics.
 - Runtime core must not import `react`, `ink`, or `@opentui/*`; UI dependencies must stay behind renderer adapters or experimental package boundaries.
-- `PlainTextRenderer` is the default available path for non-TTY, CI, snapshots, and crash fallback; Fluxcode does not build a complete terminal renderer in-house.
+- `PlainTextRenderer` is the default available path for non-TTY, CI, snapshots, and crash fallback; Lattecode does not build a complete terminal renderer in-house.
 
 Renderer boundaries use a stable view model:
 
@@ -292,7 +292,7 @@ The current `v0.1` implementation slice uses the following minimum field set. La
 | `edit_match_gate` | before `edit_file` | oldText matches exactly once unless replaceAll explicit | block | multiple matches need more context |
 | `diff_review_gate` | after mutating edit/write before or after apply | diff summary reviewable, high risk asks | ask / deny | diff enters permission metadata |
 | `shell_command_gate` | before `shell_exec` | command from allowlist, manifest scripts, or user approval | ask / deny | install/delete/network/git-write blocked by default |
-| `mcp_gate` | before MCP tool list / call | server explicitly enabled, tool mapped to Fluxcode contract, and permission checked | ask / deny / block | disabled MCP servers are invisible to the model |
+| `mcp_gate` | before MCP tool list / call | server explicitly enabled, tool mapped to Lattecode contract, and permission checked | ask / deny / block | disabled MCP servers are invisible to the model |
 | `skill_gate` | before skill load / injection | skill comes from allowed local path and only injects instruction / workflow / command spec | deny / block | skill cannot directly execute side effects |
 | `command_gate` | before local command execution | command becomes `TaskSpec` / phase event and enters session | ask / deny / block | command cannot bypass the loop and call tools directly |
 | `verification_gate` | after `Verify` | declared verification ran and result recorded, or skipped reason explicit | failed / skipped handoff | test failure not marked success |
@@ -356,7 +356,7 @@ Integration tests must use real temporary filesystem repositories, not only pure
 
 ## 8. `v0.1` Done Definition
 
-- `fluxcode run "implement a snake game"` produces real code changes in an existing web app fixture.
+- `lattecode run "implement a snake game"` produces real code changes in an existing web app fixture.
 - At least one scripted fake-model integration test covers the full loop.
 - At least one real-provider smoke test can be run manually.
 - Every P0 gate has unit or integration tests.

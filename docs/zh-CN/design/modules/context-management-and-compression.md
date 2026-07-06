@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义 Fluxcode 近期上下文管理与压缩设计。它位于当前 / 近期模块设计层：约束 `v0.1` 已有上下文预算行为，并说明下一步如何演进到 `ContextLedger`、lane-aware `ContextProjection`、`ToolOutputRef`、append-only revision / `CompactionRecord`，以及 cache-aware prompt rendering envelope。
+本文定义 Lattecode 近期上下文管理与压缩设计。它位于当前 / 近期模块设计层：约束 `v0.1` 已有上下文预算行为，并说明下一步如何演进到 `ContextLedger`、lane-aware `ContextProjection`、`ToolOutputRef`、append-only revision / `CompactionRecord`，以及 cache-aware prompt rendering envelope。
 
 本文引用长期 `StateStore`、`Fact` graph 和 token-aware provider window 时，仅表示后续 runtime evolution 方向，不表示当前 `src/` 已经实现这些能力。
 
@@ -10,7 +10,7 @@
 
 ## 1. 设计目标
 
-Fluxcode 的上下文压缩不是普通 transcript summary，而是可审计的历史转换：每次压缩都必须说明输入范围、保留内容、丢弃内容、引用的外部工具输出、预算决策和使用的 prompt 版本。
+Lattecode 的上下文压缩不是普通 transcript summary，而是可审计的历史转换：每次压缩都必须说明输入范围、保留内容、丢弃内容、引用的外部工具输出、预算决策和使用的 prompt 版本。
 
 近期目标是形成以下链路：
 
@@ -31,7 +31,7 @@ Session / Event Log / Evidence / Tool Outputs
 - Stable Prefix / Append-only Ledger / Dynamic Suffix 是 prompt 渲染和 provider cache 行为的 envelope；它包裹 10-lane `ContextLane` 模型，不替代 lane 本身。
 - provider prompt cache 只是性能优化，不是状态来源、权限来源、事实来源或恢复来源；cache hit / miss / eviction 不能改变语义、证据、恢复和预算决策。
 - cached prefix 仍然计入 provider context window；cache eligibility 必须服从 policy、data boundary、retention 和 secret-redaction 边界，不是所有稳定材料都允许被 provider-side cache。
-- `.tmp/codeagent/claude-code`、`CodeWhale`、`codex`、`opencode` 只作为横向调研输入；不得把 `.tmp/` 代码当成 Fluxcode 正式源码、接口或实现依据。
+- `.tmp/codeagent/claude-code`、`CodeWhale`、`codex`、`opencode` 只作为横向调研输入；不得把 `.tmp/` 代码当成 Lattecode 正式源码、接口或实现依据。
 
 ## 2. 三层边界
 
@@ -433,6 +433,6 @@ session metadata
 
 - 不在当前设计中实现 long-term memory 或跨设备同步。
 - 不把模型生成 summary 晋升为 `Fact`。
-- 不把 provider prompt cache、cache key 或 cache hit 结果当成 Fluxcode 状态、事实、权限或恢复来源。
+- 不把 provider prompt cache、cache key 或 cache hit 结果当成 Lattecode 状态、事实、权限或恢复来源。
 - 不通过 context compaction 绕过 permission、path boundary、redaction 或 evidence freshness。
 - 不要求 `v0.1` 立即引入完整 `StateStore`、`ActionGraph` 或 token-aware provider SDK 适配。

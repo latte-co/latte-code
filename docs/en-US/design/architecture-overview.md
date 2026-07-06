@@ -1,8 +1,8 @@
-# Fluxcode Architecture Overview
+# Lattecode Architecture Overview
 
 ## Status and Scope
 
-This is the current formal architecture overview for Fluxcode. It aligns the team on a slower implementation rhythm: first deliver a basic, working local-first code agent, then gradually evolve it into a harness-native runtime.
+This is the current formal architecture overview for Lattecode. It aligns the team on a slower implementation rhythm: first deliver a basic, working local-first code agent, then gradually evolve it into a harness-native runtime.
 
 Chinese counterpart: [`docs/zh-CN/design/architecture-overview.md`](../../zh-CN/design/architecture-overview.md).
 
@@ -10,11 +10,11 @@ This document describes design goals, evolution path, and module boundaries. It 
 
 ## 1. Top-level Positioning
 
-From the perspective of the broader software engineering system, Fluxcode is a code-agent `Data Plane`: it reads repositories, understands tasks, calls tools, generates changes, runs verification, produces evidence, and hands results to humans and existing engineering systems. Fluxcode does not replace repo permissions, CI, code review, compliance, release, or deployment gates.
+From the perspective of the broader software engineering system, Lattecode is a code-agent `Data Plane`: it reads repositories, understands tasks, calls tools, generates changes, runs verification, produces evidence, and hands results to humans and existing engineering systems. Lattecode does not replace repo permissions, CI, code review, compliance, release, or deployment gates.
 
-`Control Plane Authority` in this document only means Fluxcode internal runtime authority. This internal authority is not a `v0.1` starting requirement. It forms gradually as execution trace, facts, side effects, transactions, and recovery become structured runtime objects.
+`Control Plane Authority` in this document only means Lattecode internal runtime authority. This internal authority is not a `v0.1` starting requirement. It forms gradually as execution trace, facts, side effects, transactions, and recovery become structured runtime objects.
 
-Fluxcode therefore uses two layers of narrative:
+Lattecode therefore uses two layers of narrative:
 
 | Layer | Goal | What the team should understand first |
 | --- | --- | --- |
@@ -23,7 +23,7 @@ Fluxcode therefore uses two layers of narrative:
 
 ## 2. Evolutionary Architecture Path
 
-Fluxcode no longer asks the team to start with the full set of `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler`. The abstractions should grow out of a working code agent.
+Lattecode no longer asks the team to start with the full set of `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler`. The abstractions should grow out of a working code agent.
 
 ```text
 Basic working code agent
@@ -36,7 +36,7 @@ Basic working code agent
 
 ### 2.1 Stage One: Basic Working Code Agent
 
-The earliest Fluxcode should complete the minimal contract-first code agent loop. The `v0.1` P0 scope includes the following modules, but each one is only the minimum usable version; `v0.1` does not become a full ecosystem platform:
+The earliest Lattecode should complete the minimal contract-first code agent loop. The `v0.1` P0 scope includes the following modules, but each one is only the minimum usable version; `v0.1` does not become a full ecosystem platform:
 
 - CLI.
 - config.
@@ -99,7 +99,7 @@ This stage answers: how does the agent know what it knows?
 
 ### 2.4 Stage Four: Effects, Transactions, and Recovery
 
-When Fluxcode handles more file edits, shell commands, Git operations, or external APIs, introduce `EffectLedger`, `TransactionManager`, and `Reconciler`:
+When Lattecode handles more file edits, shell commands, Git operations, or external APIs, introduce `EffectLedger`, `TransactionManager`, and `Reconciler`:
 
 - Mutating actions have effect declarations before execution.
 - File changes bind to overlay or transaction boundaries.
@@ -109,7 +109,7 @@ This stage answers: what did the agent do, can it recover, and when must it hand
 
 ### 2.5 Stage Five: Harness-native Runtime
 
-After the previous capabilities become stable, Fluxcode reaches the full harness-native runtime shape:
+After the previous capabilities become stable, Lattecode reaches the full harness-native runtime shape:
 
 - `ActionGraph` becomes execution ledger, scheduling surface, recovery entry, and UX surface.
 - `StateStore` manages facts, evidence, and lifecycle.
@@ -119,11 +119,11 @@ After the previous capabilities become stable, Fluxcode reaches the full harness
 
 ## 3. Basic Code Agent Operating Model
 
-Early Fluxcode should stay direct, explainable, and testable.
+Early Lattecode should stay direct, explainable, and testable.
 
-This stage should align with the baseline capabilities of mature conversation-native code agents: keep the ReAct query loop, unified tool contract, permission-before-execution, file and shell safety, session recovery, context budget, and CLI / headless reuse. Fluxcode should not sacrifice these basic interaction capabilities in `v0.1` for future runtime abstractions.
+This stage should align with the baseline capabilities of mature conversation-native code agents: keep the ReAct query loop, unified tool contract, permission-before-execution, file and shell safety, session recovery, context budget, and CLI / headless reuse. Lattecode should not sacrifice these basic interaction capabilities in `v0.1` for future runtime abstractions.
 
-Fluxcode's difference is adding a phase artifact boundary around ReAct: the model still explores and edits through tool loops, but each phase must end with a structured object. This preserves the usability of Claude Code style systems while leaving migratable data for later `ActionNode`, `Evidence`, `EffectRecord`, and `ReconcileDecision`.
+Lattecode's difference is adding a phase artifact boundary around ReAct: the model still explores and edits through tool loops, but each phase must end with a structured object. This preserves the usability of Claude Code style systems while leaving migratable data for later `ActionNode`, `Evidence`, `EffectRecord`, and `ReconcileDecision`.
 
 | Phase | Behavior | Minimal artifact |
 | --- | --- | --- |
@@ -153,7 +153,7 @@ The early implementation may stay simple, but it should keep records that suppor
 
 ## 5. Relationship with Plain `ReAct` Agents
 
-`ReAct` / transcript-driven loops are useful for early exploration and local tool use. Fluxcode may use that strategy in the basic code agent stage, but it should not be the only long-term state carrier.
+`ReAct` / transcript-driven loops are useful for early exploration and local tool use. Lattecode may use that strategy in the basic code agent stage, but it should not be the only long-term state carrier.
 
 The recommended `v0.1` design is therefore not removing ReAct, but **phase-gated ReAct**: the outer phase runner manages phase boundaries, budgets, permissions, and artifact schemas, while the inner query loop keeps multi-turn model-tool interaction.
 
@@ -167,7 +167,7 @@ Evolution constraints:
 
 ## 6. Module Relationships
 
-Fluxcode modules do not need to be fully implemented at the same time, but their evolution direction should stay consistent. Current / near-term module design lives in [`modules/`](./modules/README.md), while accepted long-term runtime targets live in [`runtime-evolution/`](./runtime-evolution/README.md).
+Lattecode modules do not need to be fully implemented at the same time, but their evolution direction should stay consistent. Current / near-term module design lives in [`modules/`](./modules/README.md), while accepted long-term runtime targets live in [`runtime-evolution/`](./runtime-evolution/README.md).
 
 | Module / Object | Early role | Mature role |
 | --- | --- | --- |
@@ -188,21 +188,21 @@ Fluxcode modules do not need to be fully implemented at the same time, but their
 
 ## 7. External Collaboration and Governance Boundaries
 
-Fluxcode works with existing engineering systems but does not replace them.
+Lattecode works with existing engineering systems but does not replace them.
 
-| External object / system | Role in Fluxcode | What it cannot do |
+| External object / system | Role in Lattecode | What it cannot do |
 | --- | --- | --- |
 | Docs, requirements, designs | User intent, constraints, acceptance background | Directly become internal `Fact` |
-| Issues / project work items | External task and collaboration state | Replace Fluxcode execution records |
+| Issues / project work items | External task and collaboration state | Replace Lattecode execution records |
 | PR / code review | External review comments and merge context | Bypass local verification and human judgment |
 | CI / tests / static checks | Verification signal and failure evidence | Prove every inference automatically |
-| Approval / compliance / release flows | External governance gate | Become Fluxcode internal `Control Plane Authority` |
+| Approval / compliance / release flows | External governance gate | Become Lattecode internal `Control Plane Authority` |
 | Comments / chat / human confirmations | Human feedback and confirmation | Bypass evidence and record boundaries |
 
 ## 8. Current Design Invariants
 
-- Fluxcode externally is a code-agent `Data Plane`, not an external engineering `Control Plane`.
-- `Control Plane Authority` must be scoped to Fluxcode internal runtime authority, and is introduced incrementally.
+- Lattecode externally is a code-agent `Data Plane`, not an external engineering `Control Plane`.
+- `Control Plane Authority` must be scoped to Lattecode internal runtime authority, and is introduced incrementally.
 - The `v0.1` priority is a basic working code agent, not a full runtime kernel.
 - The `v0.1` P0 scope includes CLI, config, `AGENTS.md` loader, session management, agent-loop / phase runner, built-in tools, minimal MCP bridge, local skills, local commands, permission system, evidence / trace, and `AgentHandoff`, but all are limited to the minimum contract-first loop.
 - `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` are evolution targets; early implementation should not create unnecessary complexity.
@@ -211,7 +211,7 @@ Fluxcode works with existing engineering systems but does not replace them.
 
 ## 9. Non-goals
 
-- Do not design Fluxcode as an external engineering governance `Control Plane`.
+- Do not design Lattecode as an external engineering governance `Control Plane`.
 - Do not replace repo permissions, CI, code review, compliance, release, or deployment gates.
 - Do not require `v0.1` to deliver the full harness-native runtime.
 - Do not require `v0.1` to deliver a full MCP platform, marketplace, resource / prompt ecosystem, skill hub, command marketplace, cloud sync, multi-user session, or full `ActionGraph` persistence.

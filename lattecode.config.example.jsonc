@@ -1,5 +1,5 @@
 {
-  // Default local-first Fluxcode configuration. Do not place secrets here.
+  // Default local-first Lattecode configuration. Do not place secrets here.
   "schemaVersion": 1,
   "models": {
     "default": "fake",
@@ -11,8 +11,8 @@
       "primary": {
         "type": "openai-compatible",
         "model": "gpt-5.5",
-        "baseUrl": "${FLUXCODE_MODEL_BASE_URL}",
-        "apiKeyEnv": "FLUXCODE_MODEL_API_KEY",
+        "baseUrl": "${LATTECODE_MODEL_BASE_URL}",
+        "apiKeyEnv": "LATTECODE_MODEL_API_KEY",
         "temperature": 0.2,
         "maxOutputTokens": 8192
       }
@@ -59,12 +59,12 @@
   },
   "commands": {
     "enabled": ["run", "resume", "show", "list"],
-    "localDirectory": ".fluxcode/commands",
+    "localDirectory": ".lattecode/commands",
     "allowLocalCommands": true
   },
   "skills": {
     "enabled": [],
-    "localDirectories": [".fluxcode/skills"],
+    "localDirectories": [".lattecode/skills"],
     "allowSideEffects": false
   },
   "mcp": {
@@ -84,13 +84,13 @@
   },
   "session": {
     "store": "filesystem",
-    "directory": ".fluxcode/sessions",
+    "directory": ".lattecode/sessions",
     "autosave": true,
     "maxTranscriptBytes": 1048576
   },
   "evidence": {
     "store": "filesystem",
-    "directory": ".fluxcode/evidence",
+    "directory": ".lattecode/evidence",
     "captureToolInputs": "summary",
     "captureToolOutputs": "summary",
     "maxEvidenceBytes": 262144

@@ -14,7 +14,7 @@ import { recoverSessionFromSnapshotAndEvents } from "../session/session.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { SchemaValidationError } from "../tools/schema.js";
-import type { FluxcodeConfig } from "../config/types.js";
+import type { LattecodeConfig } from "../config/types.js";
 import { stableId } from "../shared/types.js";
 import type { AgentHandoff, AgentPhase, PendingInput, ResumeInput, StepTrace, TaskRunState, TaskRunStatus } from "./contracts.js";
 import { createPermissionPendingInput, createQuestionPendingInput, isResumeInput } from "./contracts.js";
@@ -23,7 +23,7 @@ import { applyPhaseArtifact, buildBlockedHandoff, buildFailedHandoff, createStep
 
 export interface AgentLoopOptions {
   cwd: string;
-  config: FluxcodeConfig;
+  config: LattecodeConfig;
   model: ModelClient;
   registry: ToolRegistry;
   permissions: PermissionPolicy;
@@ -611,7 +611,7 @@ function syntheticPermission(call: ToolCall, action: PermissionDecision["action"
   return { action, reason, requirement: { reason }, metadata: { toolName: call.name, riskLevel: "high", mutating: false, sensitivePath: false } };
 }
 
-function executionContext(cwd: string, session: SessionState, config: FluxcodeConfig) {
+function executionContext(cwd: string, session: SessionState, config: LattecodeConfig) {
   session.fileSnapshots ??= {};
   return { cwd, sessionId: session.id, maxOutputBytes: config.tools.maxOutputBytes, shellDefaultTimeoutMs: config.tools.shell.defaultTimeoutMs, fileSnapshots: session.fileSnapshots };
 }

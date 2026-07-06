@@ -1,6 +1,6 @@
-# Fluxcode Milestones
+# Lattecode Milestones
 
-This directory manages Fluxcode targets, plans, task breakdowns, and completed records.
+This directory manages Lattecode targets, plans, task breakdowns, and completed records.
 
 ## Directories
 

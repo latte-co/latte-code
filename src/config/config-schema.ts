@@ -1,8 +1,8 @@
 import type { JsonObject } from "../shared/types.js";
 
-export const FLUXCODE_CONFIG_SCHEMA: JsonObject = {
+export const LATTECODE_CONFIG_SCHEMA: JsonObject = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
-  title: "FluxcodeConfig",
+  title: "LattecodeConfig",
   type: "object",
   required: ["schemaVersion"],
   properties: {

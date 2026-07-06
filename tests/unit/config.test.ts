@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/defaults.js";
 import { findConfigPath, findConfigPaths, loadConfig, mergeConfig } from "../../src/config/config.js";
 import { parseJsonc, stripJsonComments, removeTrailingCommas } from "../../src/config/jsonc.js";
-import { FLUXCODE_CONFIG_SCHEMA } from "../../src/config/config-schema.js";
+import { LATTECODE_CONFIG_SCHEMA } from "../../src/config/config-schema.js";
 
 describe("JSONC config", () => {
   it("parses comments and trailing commas without touching strings", () => {
@@ -38,9 +38,9 @@ describe("JSONC config", () => {
   });
 
   it("loads explicit JSONC file and validates provider references", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-config-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-config-"));
     const path = join(dir, "custom.jsonc");
-    await writeConfig(join(dir, ".fluxcode", "fluxcode.jsonc"), `{ "schemaVersion": 1, "session": { "store": "filesystem" } }`);
+    await writeConfig(join(dir, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "session": { "store": "filesystem" } }`);
     await writeFile(path, `{ "schemaVersion": 1, "models": { "default": "fake" }, "session": { "store": "memory" } }`, "utf8");
     const loaded = await loadConfig({ cwd: dir, configPath: path });
     expect(loaded.path).toBe(path);
@@ -82,7 +82,7 @@ describe("JSONC config", () => {
   });
 
   it("keeps the example config on user-facing provider type", async () => {
-    const raw = await readFile(join(process.cwd(), "fluxcode.config.example.jsonc"), "utf8");
+    const raw = await readFile(join(process.cwd(), "lattecode.config.example.jsonc"), "utf8");
     expect(raw).not.toContain("apiMode");
     expect(raw).toContain('"type": "fake"');
     expect(raw).toContain('"type": "openai-compatible"');
@@ -99,7 +99,7 @@ describe("JSONC config", () => {
 
   it("loads global JSONC config", async () => {
     const { cwd, home } = await configFixture();
-    const path = join(home, ".fluxcode", "fluxcode.jsonc");
+    const path = join(home, ".lattecode", "lattecode.jsonc");
     await writeConfig(path, `{ // global config
       "schemaVersion": 1,
       "session": { "store": "memory" },
@@ -112,7 +112,7 @@ describe("JSONC config", () => {
 
   it("loads global JSON config", async () => {
     const { cwd, home } = await configFixture();
-    const path = join(home, ".fluxcode", "fluxcode.json");
+    const path = join(home, ".lattecode", "lattecode.json");
     await writeConfig(path, `{ "schemaVersion": 1, "runtime": { "maxPhaseSteps": 3 } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.paths).toEqual([path]);
@@ -121,7 +121,7 @@ describe("JSONC config", () => {
 
   it("loads project JSONC config", async () => {
     const { cwd, home } = await configFixture();
-    const path = join(cwd, ".fluxcode", "fluxcode.jsonc");
+    const path = join(cwd, ".lattecode", "lattecode.jsonc");
     await writeConfig(path, `{ "schemaVersion": 1, "prompts": { "language": "zh-CN" } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.paths).toEqual([path]);
@@ -130,7 +130,7 @@ describe("JSONC config", () => {
 
   it("loads project JSON config", async () => {
     const { cwd, home } = await configFixture();
-    const path = join(cwd, ".fluxcode", "fluxcode.json");
+    const path = join(cwd, ".lattecode", "lattecode.json");
     await writeConfig(path, `{ "schemaVersion": 1, "commands": { "allowLocalCommands": false } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.paths).toEqual([path]);
@@ -139,8 +139,8 @@ describe("JSONC config", () => {
 
   it("selects JSONC before JSON at the same level", async () => {
     const { cwd, home } = await configFixture();
-    const jsoncPath = join(cwd, ".fluxcode", "fluxcode.jsonc");
-    const jsonPath = join(cwd, ".fluxcode", "fluxcode.json");
+    const jsoncPath = join(cwd, ".lattecode", "lattecode.jsonc");
+    const jsonPath = join(cwd, ".lattecode", "lattecode.json");
     await writeConfig(jsonPath, `{ "schemaVersion": 1, "session": { "store": "memory" } }`);
     await writeConfig(jsoncPath, `{ "schemaVersion": 1, "runtime": { "maxPhaseSteps": 4 } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
@@ -152,8 +152,8 @@ describe("JSONC config", () => {
 
   it("reads global and project configs and deep merges them", async () => {
     const { cwd, home } = await configFixture();
-    const globalPath = join(home, ".fluxcode", "fluxcode.jsonc");
-    const projectPath = join(cwd, ".fluxcode", "fluxcode.json");
+    const globalPath = join(home, ".lattecode", "lattecode.jsonc");
+    const projectPath = join(cwd, ".lattecode", "lattecode.json");
     await writeConfig(globalPath, `{ "schemaVersion": 1, "tools": { "shell": { "allowCommands": ["npm test"], "defaultTimeoutMs": 1000 } } }`);
     await writeConfig(projectPath, `{ "schemaVersion": 1, "tools": { "shell": { "defaultTimeoutMs": 2000 } } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
@@ -167,8 +167,8 @@ describe("JSONC config", () => {
 
   it("lets project keys override global keys", async () => {
     const { cwd, home } = await configFixture();
-    await writeConfig(join(home, ".fluxcode", "fluxcode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "zh-CN" }, "runtime": { "maxPhaseSteps": 2 } }`);
-    await writeConfig(join(cwd, ".fluxcode", "fluxcode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "en-US" } }`);
+    await writeConfig(join(home, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "zh-CN" }, "runtime": { "maxPhaseSteps": 2 } }`);
+    await writeConfig(join(cwd, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "en-US" } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.config.prompts.language).toBe("en-US");
     expect(loaded.config.runtime.maxPhaseSteps).toBe(2);
@@ -180,12 +180,12 @@ describe("JSONC config", () => {
     expect(loaded.path).toBeUndefined();
     expect(loaded.paths).toEqual([]);
     expect(loaded.config).toEqual(DEFAULT_CONFIG);
-    expect(FLUXCODE_CONFIG_SCHEMA.properties).toBeDefined();
+    expect(LATTECODE_CONFIG_SCHEMA.properties).toBeDefined();
   });
 
   it("falls back to discovered config when an explicit path is absent", async () => {
     const { cwd, home } = await configFixture();
-    const projectPath = join(cwd, ".fluxcode", "fluxcode.jsonc");
+    const projectPath = join(cwd, ".lattecode", "lattecode.jsonc");
     await writeConfig(projectPath, `{ "schemaVersion": 1, "session": { "store": "memory" } }`);
     const loaded = await loadConfig({ cwd, homeDir: home, configPath: join(cwd, "missing.jsonc") });
     expect(loaded.paths).toEqual([projectPath]);
@@ -194,7 +194,7 @@ describe("JSONC config", () => {
 });
 
 async function configFixture(): Promise<{ cwd: string; home: string }> {
-  const root = await mkdtemp(join(tmpdir(), "fluxcode-config-fixture-"));
+  const root = await mkdtemp(join(tmpdir(), "lattecode-config-fixture-"));
   return { cwd: join(root, "project"), home: join(root, "home") };
 }
 

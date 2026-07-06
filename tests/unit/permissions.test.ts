@@ -72,14 +72,14 @@ describe("PermissionPolicy", () => {
   });
 
   it("allows shell commands declared in the project manifest scripts", () => {
-    const dir = mkdtempSync(join(tmpdir(), "fluxcode-permission-manifest-"));
+    const dir = mkdtempSync(join(tmpdir(), "lattecode-permission-manifest-"));
     writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { custom: "node custom.js", test: "vitest run" } }), "utf8");
     const policy = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "ask" }, { ...DEFAULT_CONFIG.tools.shell, allowCommands: [] });
     expect(policy.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "custom", name: "shell_exec", input: { command: "npm run custom" } }, riskLevel: "medium", mutating: true })).action).toBe("allow");
     expect(policy.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "test", name: "shell_exec", input: { command: "npm test" } }, riskLevel: "medium", mutating: true })).action).toBe("allow");
     const missingShellConfig = new PermissionPolicy({ ...DEFAULT_CONFIG.permissions, mutatingTools: "allow" });
     expect(missingShellConfig.decide(request({ cwd: dir, toolName: "shell_exec", call: { id: "shell", name: "shell_exec", input: { command: "printf ok" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
-    const noScriptsDir = mkdtempSync(join(tmpdir(), "fluxcode-permission-no-scripts-"));
+    const noScriptsDir = mkdtempSync(join(tmpdir(), "lattecode-permission-no-scripts-"));
     writeFileSync(join(noScriptsDir, "package.json"), JSON.stringify({ name: "fixture" }), "utf8");
     expect(policy.decide(request({ cwd: noScriptsDir, toolName: "shell_exec", call: { id: "unknown", name: "shell_exec", input: { command: "npm run missing" } }, riskLevel: "medium", mutating: true })).action).toBe("ask");
   });

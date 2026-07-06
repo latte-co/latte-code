@@ -13,7 +13,7 @@ import type { ModelTurn } from "../../src/model/types.js";
 
 interface PackageMetadata {
   bin?: {
-    fluxcode?: string;
+    lattecode?: string;
   };
   scripts?: Record<string, string>;
 }
@@ -61,7 +61,7 @@ describe("runtime factory and CLI helpers", () => {
   });
 
   it("creates an agent loop with filesystem stores in a temp cwd", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-runtime-fs-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-runtime-fs-"));
     const config = mergeConfig(DEFAULT_CONFIG, {});
     const loop = createAgentLoop({ cwd: dir, config, fakeScript: happyScript("fs ok") });
     const result = await loop.run({ input: "hello" });
@@ -82,7 +82,7 @@ describe("runtime factory and CLI helpers", () => {
   });
 
   it("fails fast on default CLI run without a real provider or fakeScript", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-default-provider-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-cli-default-provider-"));
     const logged: string[] = [];
     const errored: string[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation((value: string) => {
@@ -108,11 +108,11 @@ describe("runtime factory and CLI helpers", () => {
       models: {
         default: "primary",
         providers: {
-          primary: { type: "openai-compatible", model: "gpt-test", apiKeyEnv: "FLUXCODE_TEST_MISSING_KEY" }
+          primary: { type: "openai-compatible", model: "gpt-test", apiKeyEnv: "LATTECODE_TEST_MISSING_KEY" }
         }
       }
     });
-    expect(() => createAgentLoop({ cwd: process.cwd(), config, fakeScript: [{ type: "message", content: "must not run" }], env: {} })).toThrow("FLUXCODE_TEST_MISSING_KEY");
+    expect(() => createAgentLoop({ cwd: process.cwd(), config, fakeScript: [{ type: "message", content: "must not run" }], env: {} })).toThrow("LATTECODE_TEST_MISSING_KEY");
   });
 
   it("parses headless run/resume/show/list arguments", () => {
@@ -130,16 +130,16 @@ describe("runtime factory and CLI helpers", () => {
     ]);
     const rootDir = tsconfig.compilerOptions?.rootDir ?? ".";
     const outDir = tsconfig.compilerOptions?.outDir ?? "dist";
-    const emittedCliPath = join(outDir, relative(rootDir, "bin/fluxcode.ts")).replace(/\.ts$/, ".js").split(sep).join("/");
+    const emittedCliPath = join(outDir, relative(rootDir, "bin/lattecode.ts")).replace(/\.ts$/, ".js").split(sep).join("/");
 
-    expect(packageMetadata.bin?.fluxcode).toBe(emittedCliPath);
-    expect(packageLockMetadata.packages?.[""]?.bin?.fluxcode).toBe(emittedCliPath);
+    expect(packageMetadata.bin?.lattecode).toBe(emittedCliPath);
+    expect(packageLockMetadata.packages?.[""]?.bin?.lattecode).toBe(emittedCliPath);
     expect(tsconfig.include).toContain("bin/**/*.ts");
     expect(packageMetadata.scripts?.["smoke:provider"]).toBe("node scripts/provider-smoke.mjs");
   });
 
   it("shows and lists a seeded run through the CLI headless JSON contract", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-headless-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-cli-headless-"));
     const seeded = await seedBlockedRun(dir);
     const logged: string[] = [];
     const errored: string[] = [];
@@ -165,7 +165,7 @@ describe("runtime factory and CLI helpers", () => {
   });
 
   it("renders text output and validates resume input errors without legacy session/evidence commands", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-cli-text-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-cli-text-"));
     const seeded = await seedBlockedRun(dir);
     const logged: string[] = [];
     const errored: string[] = [];

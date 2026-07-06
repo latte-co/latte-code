@@ -2,7 +2,7 @@
 
 ## Status
 
-This document defines the near-term Fluxcode design for context management and compression. It belongs to the current / near-term module design layer: it constrains the existing `v0.1` context budget behavior and describes how to evolve toward `ContextLedger`, lane-aware `ContextProjection`, `ToolOutputRef`, append-only revisions / `CompactionRecord`, and a cache-aware prompt rendering envelope.
+This document defines the near-term Lattecode design for context management and compression. It belongs to the current / near-term module design layer: it constrains the existing `v0.1` context budget behavior and describes how to evolve toward `ContextLedger`, lane-aware `ContextProjection`, `ToolOutputRef`, append-only revisions / `CompactionRecord`, and a cache-aware prompt rendering envelope.
 
 References to long-term `StateStore`, `Fact` graph, and token-aware provider windows describe later runtime evolution only. They do not mean the current `src/` implementation already has those capabilities.
 
@@ -10,7 +10,7 @@ Chinese counterpart: [`docs/zh-CN/design/modules/context-management-and-compress
 
 ## 1. Design Goal
 
-Fluxcode context compression is not plain transcript summary. It is an auditable history transformation: every compaction must state its input range, retained material, discarded material, external tool-output references, budget decision, and prompt version.
+Lattecode context compression is not plain transcript summary. It is an auditable history transformation: every compaction must state its input range, retained material, discarded material, external tool-output references, budget decision, and prompt version.
 
 The near-term target is:
 
@@ -31,7 +31,7 @@ Core invariants:
 - Stable Prefix / Append-only Ledger / Dynamic Suffix is the prompt-rendering and provider-cache envelope. It wraps the 10-lane `ContextLane` model; it does not replace the lanes themselves.
 - Provider prompt cache is a performance optimization only. It is not a source of state, authority, facts, or recovery. Cache hit / miss / eviction must not change semantics, evidence, recovery, or budget decisions.
 - Cached prefix still counts toward the provider context window. Cache eligibility must obey policy, data boundary, retention, and secret-redaction boundaries; not all stable material may be cached provider-side.
-- `.tmp/codeagent/claude-code`, `CodeWhale`, `codex`, and `opencode` are comparative research inputs only; `.tmp/` code must not be treated as formal Fluxcode source, interface, or implementation evidence.
+- `.tmp/codeagent/claude-code`, `CodeWhale`, `codex`, and `opencode` are comparative research inputs only; `.tmp/` code must not be treated as formal Lattecode source, interface, or implementation evidence.
 
 ## 2. Three-layer Boundary
 
@@ -70,7 +70,7 @@ An entry `summary` is prompt-usable context, not a fact. Fact promotion remains 
 
 ### 3.2 Per-turn `ContextProjection`
 
-Before each model call, Fluxcode builds a per-turn `ContextProjection`. It is input to `PromptRegistry`, not a persistent fact source.
+Before each model call, Lattecode builds a per-turn `ContextProjection`. It is input to `PromptRegistry`, not a persistent fact source.
 
 ```ts
 type TurnContextProjection = {
@@ -234,7 +234,7 @@ type EvidenceRef = {
 Boundary rules:
 
 - Storage choice: `v0.1` may continue to keep event-log / session-snapshot summaries; near-term implementation may write large outputs to local blobs or artifact files. Regardless of storage, the prompt keeps only the summary, ref id, truncated marker, and redaction marker.
-- Missing / invalid ref: Fluxcode must not infer the original output from an old summary. Projection marks it `unavailable` and either blocks, degrades, or requests a safe re-run depending on the lane policy.
+- Missing / invalid ref: Lattecode must not infer the original output from an old summary. Projection marks it `unavailable` and either blocks, degrades, or requests a safe re-run depending on the lane policy.
 - Permission / read failure: if the ref exists but cannot be read, the prompt may show only the ref, failure reason, and `permission_required` marker. It must not leak out-of-bound content or treat unread content as verified evidence.
 - Redaction recovery: redacted output cannot be reconstructed from compaction summaries. Resume may use only the redaction marker, allowed public summary, and re-fetchable non-sensitive evidence. If the task depends on the original content, enter pending input or repair.
 - `Evidence` boundary: `Evidence` records proof, verification, and audit meaning; `ToolOutputRef` records where the raw or large output lives. `Evidence.summary` may reference `ToolOutputRef.id`, but it must not assume the reference is always readable.
@@ -433,6 +433,6 @@ Testing must go beyond overflow. Minimum matrix:
 
 - Do not implement long-term memory or cross-device sync in this design.
 - Do not promote model-generated summaries into `Fact`.
-- Do not treat provider prompt cache, cache keys, or cache-hit results as Fluxcode state, facts, authority, or recovery sources.
+- Do not treat provider prompt cache, cache keys, or cache-hit results as Lattecode state, facts, authority, or recovery sources.
 - Do not use context compaction to bypass permission, path boundary, redaction, or evidence freshness.
 - Do not require `v0.1` to immediately introduce a full `StateStore`, `ActionGraph`, or token-aware provider SDK adapter.

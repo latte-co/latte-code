@@ -1,6 +1,6 @@
-# Fluxcode 里程碑
+# Lattecode 里程碑
 
-本目录用于管理 Fluxcode 的目标、计划、任务拆分和完成记录。
+本目录用于管理 Lattecode 的目标、计划、任务拆分和完成记录。
 
 ## 目录
 

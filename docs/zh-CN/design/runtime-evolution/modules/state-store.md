@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义 `StateStore` 的渐进式设计。早期 Fluxcode 不需要完整事实数据库，但必须避免把 transcript、工具输出或模型推断直接当成长期事实。
+本文定义 `StateStore` 的渐进式设计。早期 Lattecode 不需要完整事实数据库，但必须避免把 transcript、工具输出或模型推断直接当成长期事实。
 
 英文对应文档：[`docs/en-US/design/runtime-evolution/modules/state-store.md`](../../../../en-US/design/runtime-evolution/modules/state-store.md)。
 

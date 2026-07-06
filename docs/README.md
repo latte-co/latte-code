@@ -1,11 +1,11 @@
-# Fluxcode Documentation
+# Lattecode Documentation
 
-Fluxcode documentation is organized by language:
+Lattecode documentation is organized by language:
 
 - [English (en-US)](./en-US/README.md)
 - [中文 (zh-CN)](./zh-CN/README.md)
 
-The current design posture is evolutionary: Fluxcode should first become a basic, working local-first code agent, then gradually introduce harness-native runtime structure as the implementation proves which abstractions are necessary.
+The current design posture is evolutionary: Lattecode should first become a basic, working local-first code agent, then gradually introduce harness-native runtime structure as the implementation proves which abstractions are necessary.
 
 Formal documentation in `docs/zh-CN/` and `docs/en-US/` should stay structurally aligned. The formal design entry is `design/architecture-overview.md` in each language. Current / near-term module designs live under `design/modules/`, while accepted long-term runtime evolution targets live under `design/runtime-evolution/`.
 

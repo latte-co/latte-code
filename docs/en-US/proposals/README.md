@@ -1,4 +1,4 @@
-# Fluxcode Proposals
+# Lattecode Proposals
 
 This directory stores design proposals and idea documents that are not yet incorporated into the current formal design set.
 

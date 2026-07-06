@@ -2,15 +2,15 @@
 
 ## 文档状态
 
-本文记录 Fluxcode 未来 / 近期的模型 provider 兼容层设计约束。它用于指导后续 `src/model` 与 `src/config` 的实现演进，不表示当前 `src/` 已经具备完整 provider catalog、多协议 transport、自动 failover 或 live smoke 能力。
+本文记录 Lattecode 未来 / 近期的模型 provider 兼容层设计约束。它用于指导后续 `src/model` 与 `src/config` 的实现演进，不表示当前 `src/` 已经具备完整 provider catalog、多协议 transport、自动 failover 或 live smoke 能力。
 
 英文对应文档：[`docs/en-US/design/modules/provider-compatibility-layer.md`](../../../en-US/design/modules/provider-compatibility-layer.md)。
 
-本文基于对 `opencode`、`openclaw` 等临时输入的比较性调研结论整理，但 `.tmp/` 下项目只作为 research input，不作为 Fluxcode 正式源码、配置格式或构建依据。
+本文基于对 `opencode`、`openclaw` 等临时输入的比较性调研结论整理，但 `.tmp/` 下项目只作为 research input，不作为 Lattecode 正式源码、配置格式或构建依据。
 
 ## 1. 目标与非目标
 
-Provider Compatibility Layer 的目标是让 `AgentLoop` 保持 provider-agnostic，同时允许 Fluxcode 逐步接入不同模型 API 模式、模型能力、部署环境和认证方式。
+Provider Compatibility Layer 的目标是让 `AgentLoop` 保持 provider-agnostic，同时允许 Lattecode 逐步接入不同模型 API 模式、模型能力、部署环境和认证方式。
 
 核心目标：
 
@@ -49,7 +49,7 @@ AgentLoop / PhaseRunner
 
 ## 3. 内部协议边界
 
-在 capability matrix 之前，必须先固化 Fluxcode 内部模型协议。Provider adapter 的职责是把外部 API 转换为这些内部概念，而不是让外部 API shape 向内扩散。
+在 capability matrix 之前，必须先固化 Lattecode 内部模型协议。Provider adapter 的职责是把外部 API 转换为这些内部概念，而不是让外部 API shape 向内扩散。
 
 ### 3.1 `ModelRuntime`
 
@@ -116,7 +116,7 @@ type ProviderCapability = {
 };
 ```
 
-Capability registry 必须区分“provider 声称支持”和“Fluxcode adapter 已归一化并测试通过”。`AgentLoop` 只能依赖后者。
+Capability registry 必须区分“provider 声称支持”和“Lattecode adapter 已归一化并测试通过”。`AgentLoop` 只能依赖后者。
 
 ## 4. 概念拆分
 
@@ -161,7 +161,7 @@ Provider compatibility 不应把 provider name 或用户配置键作为单一事
 
 ## 5. Provider `type` / internal API taxonomy
 
-用户配置层应优先使用 `type` 表达 provider / deployment 类别。`type` 是配置分类和模板选择入口，不是直接对外暴露的 protocol discriminator，也不表示当前 Fluxcode 已经实现该类别下的所有 provider。
+用户配置层应优先使用 `type` 表达 provider / deployment 类别。`type` 是配置分类和模板选择入口，不是直接对外暴露的 protocol discriminator，也不表示当前 Lattecode 已经实现该类别下的所有 provider。
 
 | User-facing `type` | 典型用途 | 默认内部解析方向 |
 | --- | --- | --- |
@@ -187,7 +187,7 @@ Provider compatibility 不应把 provider name 或用户配置键作为单一事
 | `ollama-native` | Ollama 本地 API | local models、limited tool support、pull/list model lifecycle | 高：local-first 路线相关 |
 | `local-router-openai-compatible` | LiteLLM、OpenRouter、企业代理、本地 router | OpenAI-like surface 但 capability/headers/error 不一致 | 高：必须显式 data boundary |
 
-注意：同一 provider 或 `type` 可能支持多个内部 API mode；同一 API mode 也可能由多个 provider 或 router 实现。Fluxcode 不能通过 provider name 隐式切换 mode；需要通过配置解析、capability metadata 或用户确认的 adapter 选择明确建立映射。
+注意：同一 provider 或 `type` 可能支持多个内部 API mode；同一 API mode 也可能由多个 provider 或 router 实现。Lattecode 不能通过 provider name 隐式切换 mode；需要通过配置解析、capability metadata 或用户确认的 adapter 选择明确建立映射。
 
 ## 6. Capability matrix
 
@@ -213,15 +213,15 @@ Capability use rules：
 
 ## 7. Tool / function calling normalization
 
-Fluxcode tool calling 的内部契约必须独立于 provider：
+Lattecode tool calling 的内部契约必须独立于 provider：
 
 ```text
-Fluxcode ToolSpec
+Lattecode ToolSpec
   -> adapter-specific tool declaration
   -> provider stream tool events
   -> NormalizedToolCall
   -> permission / schema gate
-  -> Fluxcode tool execution
+  -> Lattecode tool execution
   -> adapter-specific tool result message
 ```
 
@@ -240,7 +240,7 @@ Transcript 是可恢复 agent run 的一部分，不应保存 provider 原始响
 
 要求：
 
-- 输入 transcript 使用 Fluxcode canonical message/content/tool-result model。
+- 输入 transcript 使用 Lattecode canonical message/content/tool-result model。
 - 输出 stream 先归一化为 `NormalizedModelEvent`，再写入 event log、UI、tool assembler 和 final transcript。
 - 原始 provider response 只可在 debug mode 下以 redacted form 作为 evidence attachment，默认不持久化。
 - replay 基于 normalized events，不依赖 provider SDK object。
@@ -322,13 +322,13 @@ type NormalizedModelError = {
 
 ## 12. SDK / HTTP adapter policy
 
-当前实现方向应优先保持 direct fetch / minimal HTTP adapter，以便 Fluxcode 控制协议边界、事件归一化和凭据安全。未来可以引入 SDK 或 AI SDK 风格 provider wrapper，但必须满足：
+当前实现方向应优先保持 direct fetch / minimal HTTP adapter，以便 Lattecode 控制协议边界、事件归一化和凭据安全。未来可以引入 SDK 或 AI SDK 风格 provider wrapper，但必须满足：
 
 - SDK wrapper 只能存在于 provider adapter 内部，不能成为 `AgentLoop`、phase contract 或 tool contract 的类型依赖。
-- SDK response、stream chunk、error class 必须立即转换为 Fluxcode normalized protocol。
-- SDK 自动 retry、telemetry、credential discovery、proxy、file upload 等 side effect 必须显式关闭或包装到 Fluxcode policy 下。
+- SDK response、stream chunk、error class 必须立即转换为 Lattecode normalized protocol。
+- SDK 自动 retry、telemetry、credential discovery、proxy、file upload 等 side effect 必须显式关闭或包装到 Lattecode policy 下。
 - SDK version 与 provider catalog metadata 必须可测试、可 pin、可替换。
-- 如果采用 Vercel AI SDK / provider catalog 风格，只能借鉴 catalog/wrapper 组织方式；不能让 `streamText` 或 SDK-specific message shape 泄漏为 Fluxcode 内部协议。
+- 如果采用 Vercel AI SDK / provider catalog 风格，只能借鉴 catalog/wrapper 组织方式；不能让 `streamText` 或 SDK-specific message shape 泄漏为 Lattecode 内部协议。
 
 ## 13. Provider compatibility sub-roadmap
 
@@ -384,4 +384,4 @@ Live smoke 策略：
 - `opencode` 展示了 AI SDK/provider catalog 风格、branded provider/model identity、capability metadata、`streamText` 和 OpenAI-compatible provider catalog 等可参考组织方式。
 - `openclaw` 展示了显式 API modes、provider config、discovery/runtime auth/stream wrapping/capability hooks、自定义 transports、auth profiles、failover 和 cooldown 等可参考边界。
 
-这些事实只说明外部系统的可观察设计选择；Fluxcode 的正式设计以本文、`Code Agent Loop`、架构总览和现有 roadmap 为准。
+这些事实只说明外部系统的可观察设计选择；Lattecode 的正式设计以本文、`Code Agent Loop`、架构总览和现有 roadmap 为准。

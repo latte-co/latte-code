@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG } from "./defaults.js";
 import { parseJsonc } from "./jsonc.js";
 import { providerTypeStatus } from "./types.js";
-import type { FluxcodeConfig } from "./types.js";
+import type { LattecodeConfig } from "./types.js";
 import { isRecord, jsonClone } from "../shared/types.js";
 
 export interface LoadConfigOptions {
@@ -16,15 +16,15 @@ export interface LoadConfigOptions {
 type PartialJson = Record<string, unknown>;
 
 export interface LoadedConfig {
-  config: FluxcodeConfig;
+  config: LattecodeConfig;
   path?: string;
   paths: string[];
 }
 
-export function mergeConfig(base: FluxcodeConfig, override: unknown): FluxcodeConfig {
+export function mergeConfig(base: LattecodeConfig, override: unknown): LattecodeConfig {
   if (override === undefined) return jsonClone(base);
   if (!isRecord(override)) throw new Error("Config root must be an object");
-  const merged = mergeObjects(base, override) as FluxcodeConfig;
+  const merged = mergeObjects(base, override) as LattecodeConfig;
   validateConfig(merged);
   return merged;
 }
@@ -39,7 +39,7 @@ function mergeObjects(base: unknown, override: unknown): unknown {
   return result;
 }
 
-export function validateConfig(config: FluxcodeConfig): void {
+export function validateConfig(config: LattecodeConfig): void {
   if (config.schemaVersion !== 1) throw new Error("Unsupported schemaVersion");
   const provider = config.models.providers[config.models.default];
   if (provider === undefined) throw new Error(`Default model provider '${config.models.default}' is not defined`);
@@ -106,7 +106,7 @@ export function validateConfig(config: FluxcodeConfig): void {
   }
 }
 
-function validateProvider(id: string, provider: FluxcodeConfig["models"]["providers"][string]): void {
+function validateProvider(id: string, provider: LattecodeConfig["models"]["providers"][string]): void {
   if (Object.prototype.hasOwnProperty.call(provider, "apiMode")) {
     throw new Error(`Provider '${id}' uses unsupported apiMode; set models.providers.${id}.type explicitly instead`);
   }
@@ -177,11 +177,11 @@ export async function findConfigPaths(options: LoadConfigOptions): Promise<strin
 }
 
 function globalConfigCandidates(homeDir: string): string[] {
-  return [join(homeDir, ".fluxcode", "fluxcode.jsonc"), join(homeDir, ".fluxcode", "fluxcode.json")];
+  return [join(homeDir, ".lattecode", "lattecode.jsonc"), join(homeDir, ".lattecode", "lattecode.json")];
 }
 
 function projectConfigCandidates(cwd: string): string[] {
-  return [join(cwd, ".fluxcode", "fluxcode.jsonc"), join(cwd, ".fluxcode", "fluxcode.json")];
+  return [join(cwd, ".lattecode", "lattecode.jsonc"), join(cwd, ".lattecode", "lattecode.json")];
 }
 
 async function findFirstExistingFile(candidates: string[]): Promise<string | undefined> {

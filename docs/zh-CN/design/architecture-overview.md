@@ -1,8 +1,8 @@
-# Fluxcode 架构设计总览
+# Lattecode 架构设计总览
 
 ## 文档状态与适用边界
 
-本文是 Fluxcode 当前正式设计总览，用于统一团队对实现节奏的理解。它将早期目标从“一次性交付完整 harness-native runtime”调整为“先交付基础可工作的 local-first code agent，再逐步演进到 harness-native runtime”。
+本文是 Lattecode 当前正式设计总览，用于统一团队对实现节奏的理解。它将早期目标从“一次性交付完整 harness-native runtime”调整为“先交付基础可工作的 local-first code agent，再逐步演进到 harness-native runtime”。
 
 英文对应文档：[`docs/en-US/design/architecture-overview.md`](../../en-US/design/architecture-overview.md)。
 
@@ -10,11 +10,11 @@
 
 ## 1. 顶层定位
 
-从整个软件工程系统视角看，Fluxcode 是 code agent `Data Plane`：它读取仓库、理解任务、调用工具、生成修改、运行验证、产出证据，并把结果交给人类和既有工程系统判断。Fluxcode 不取代 repo permissions、CI、code review、compliance、release 或 deployment gates。
+从整个软件工程系统视角看，Lattecode 是 code agent `Data Plane`：它读取仓库、理解任务、调用工具、生成修改、运行验证、产出证据，并把结果交给人类和既有工程系统判断。Lattecode 不取代 repo permissions、CI、code review、compliance、release 或 deployment gates。
 
-`Control Plane Authority` 在本文中只表示 Fluxcode internal runtime authority。这个内部权威不是 v0.1 的起点要求，而是随着执行轨迹、事实、副作用、事务和恢复能力逐步结构化后形成的 runtime 权威边界。
+`Control Plane Authority` 在本文中只表示 Lattecode internal runtime authority。这个内部权威不是 v0.1 的起点要求，而是随着执行轨迹、事实、副作用、事务和恢复能力逐步结构化后形成的 runtime 权威边界。
 
-因此，Fluxcode 的设计采用两层叙事：
+因此，Lattecode 的设计采用两层叙事：
 
 | 层级 | 目标 | 团队需要先理解什么 |
 | --- | --- | --- |
@@ -23,7 +23,7 @@
 
 ## 2. 渐进式架构路线
 
-Fluxcode 不再要求团队从完整 `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 全套概念开始实现。更合适的路线是让抽象从可工作的 code agent 中长出来。
+Lattecode 不再要求团队从完整 `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 全套概念开始实现。更合适的路线是让抽象从可工作的 code agent 中长出来。
 
 ```text
 Basic working code agent
@@ -36,7 +36,7 @@ Basic working code agent
 
 ### 2.1 第一阶段：基础可工作 code agent
 
-最早期的 Fluxcode 应先完成最小 contract-first code agent 闭环。`v0.1` 的 P0 范围包括以下模块，但每一项都只交付最小可用版本，不把 Fluxcode 扩展成完整生态平台：
+最早期的 Lattecode 应先完成最小 contract-first code agent 闭环。`v0.1` 的 P0 范围包括以下模块，但每一项都只交付最小可用版本，不把 Lattecode 扩展成完整生态平台：
 
 - CLI。
 - config。
@@ -99,7 +99,7 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 ### 2.4 第四阶段：引入副作用、事务和恢复
 
-当 Fluxcode 开始处理更多文件修改、命令执行、Git 操作或外部 API 时，再引入 `EffectLedger`、`TransactionManager` 和 `Reconciler`：
+当 Lattecode 开始处理更多文件修改、命令执行、Git 操作或外部 API 时，再引入 `EffectLedger`、`TransactionManager` 和 `Reconciler`：
 
 - mutating action 在执行前有 effect 声明。
 - 文件修改绑定 overlay 或 transaction。
@@ -109,7 +109,7 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 ### 2.5 第五阶段：形成 harness-native runtime
 
-当上述能力稳定后，Fluxcode 才进入完整 harness-native runtime 形态：
+当上述能力稳定后，Lattecode 才进入完整 harness-native runtime 形态：
 
 - `ActionGraph` 成为执行账本、调度表面、恢复入口和 UX 表面。
 - `StateStore` 管理 facts、evidence 和生命周期。
@@ -119,11 +119,11 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 ## 3. 基础 code agent 工作模型
 
-早期 Fluxcode 的工作模型应保持直接、可解释、可测试。
+早期 Lattecode 的工作模型应保持直接、可解释、可测试。
 
-这个阶段应对齐成熟 conversation-native code agent 的基础能力基线：保留 ReAct query loop、统一 tool contract、权限前置、文件和 shell 安全、session recovery、上下文预算和 CLI / headless 复用。Fluxcode 不应在 `v0.1` 为了未来 runtime 抽象牺牲这些基础交互能力。
+这个阶段应对齐成熟 conversation-native code agent 的基础能力基线：保留 ReAct query loop、统一 tool contract、权限前置、文件和 shell 安全、session recovery、上下文预算和 CLI / headless 复用。Lattecode 不应在 `v0.1` 为了未来 runtime 抽象牺牲这些基础交互能力。
 
-Fluxcode 的差异点是给 ReAct 增加 phase artifact boundary：模型仍通过工具循环完成探索和修改，但每个阶段结束必须产出结构化对象。这样可以先获得 Claude Code 类系统的可用性，同时为后续 `ActionNode`、`Evidence`、`EffectRecord` 和 `ReconcileDecision` 留下可迁移数据。
+Lattecode 的差异点是给 ReAct 增加 phase artifact boundary：模型仍通过工具循环完成探索和修改，但每个阶段结束必须产出结构化对象。这样可以先获得 Claude Code 类系统的可用性，同时为后续 `ActionNode`、`Evidence`、`EffectRecord` 和 `ReconcileDecision` 留下可迁移数据。
 
 | 阶段 | 行为 | 最小产物 |
 | --- | --- | --- |
@@ -153,9 +153,9 @@ Fluxcode 的差异点是给 ReAct 增加 phase artifact boundary：模型仍通�
 
 ## 5. 与普通 `ReAct` agent 的关系
 
-`ReAct` / transcript-driven loop 适合早期探索和局部工具调用。Fluxcode 可以在基础 code agent 阶段使用这种策略，但不应把它当成长期架构的唯一状态载体。
+`ReAct` / transcript-driven loop 适合早期探索和局部工具调用。Lattecode 可以在基础 code agent 阶段使用这种策略，但不应把它当成长期架构的唯一状态载体。
 
-因此，Fluxcode 的 `v0.1` 推荐方案不是“去 ReAct”，而是 **phase-gated ReAct**：外层 phase runner 管理阶段边界、预算、权限和 artifact schema，内层 query loop 保留模型与工具的多轮交互。
+因此，Lattecode 的 `v0.1` 推荐方案不是“去 ReAct”，而是 **phase-gated ReAct**：外层 phase runner 管理阶段边界、预算、权限和 artifact schema，内层 query loop 保留模型与工具的多轮交互。
 
 演进约束如下：
 
@@ -167,7 +167,7 @@ Fluxcode 的差异点是给 ReAct 增加 phase artifact boundary：模型仍通�
 
 ## 6. 模块关系
 
-Fluxcode 的模块不要求同时完整实现，但它们的演进方向应保持一致。当前 / 近期模块设计放在 [`modules/`](./modules/README.md)，已接受的长期 runtime 目标放在 [`runtime-evolution/`](./runtime-evolution/README.md)。
+Lattecode 的模块不要求同时完整实现，但它们的演进方向应保持一致。当前 / 近期模块设计放在 [`modules/`](./modules/README.md)，已接受的长期 runtime 目标放在 [`runtime-evolution/`](./runtime-evolution/README.md)。
 
 | 模块 / 对象 | 早期角色 | 成熟角色 |
 | --- | --- | --- |
@@ -188,21 +188,21 @@ Fluxcode 的模块不要求同时完整实现，但它们的演进方向应保�
 
 ## 7. 外部协作与治理边界
 
-Fluxcode 与既有工程系统协作，但不替代它们。
+Lattecode 与既有工程系统协作，但不替代它们。
 
-| 外部对象 / 系统 | 在 Fluxcode 中的角色 | 不能做什么 |
+| 外部对象 / 系统 | 在 Lattecode 中的角色 | 不能做什么 |
 | --- | --- | --- |
 | 文档、需求说明、设计稿 | 用户意图、约束、验收背景 | 不能直接成为内部 `Fact` |
-| Issue / 项目管理项 | 外部任务和协作状态 | 不能替代 Fluxcode 的执行记录 |
+| Issue / 项目管理项 | 外部任务和协作状态 | 不能替代 Lattecode 的执行记录 |
 | PR / code review | 外部审查意见和合入上下文 | 不能绕过本地验证和人工判断 |
 | CI / 测试 / 静态检查 | 验证信号和失败证据 | 不能自动证明所有推断成立 |
-| 审批 / 合规 / 发布流程 | 外部治理 gate | 不能成为 Fluxcode 内部 `Control Plane Authority` |
+| 审批 / 合规 / 发布流程 | 外部治理 gate | 不能成为 Lattecode 内部 `Control Plane Authority` |
 | 评论 / 聊天 / 人工确认 | 人工反馈和确认 | 不能绕过证据和记录边界 |
 
 ## 8. 当前设计不变量
 
-- Fluxcode externally 是 code agent `Data Plane`，不是外部工程治理 `Control Plane`。
-- `Control Plane Authority` 必须限定为 Fluxcode internal runtime authority，并且是渐进式引入的目标。
+- Lattecode externally 是 code agent `Data Plane`，不是外部工程治理 `Control Plane`。
+- `Control Plane Authority` 必须限定为 Lattecode internal runtime authority，并且是渐进式引入的目标。
 - v0.1 的优先级是基础可工作 code agent，而不是完整 runtime kernel。
 - v0.1 的 P0 范围包括 CLI、config、`AGENTS.md` loader、session management、agent-loop / phase runner、built-in tools、minimal MCP bridge、local skills、local commands、permission system、evidence / trace 和 `AgentHandoff`，但都限定为最小 contract-first 闭环能力。
 - `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager`、`Reconciler` 是演进方向，不应在早期实现中制造不必要复杂度。
@@ -211,7 +211,7 @@ Fluxcode 与既有工程系统协作，但不替代它们。
 
 ## 9. 非目标
 
-- 不把 Fluxcode 设计为外部工程治理 `Control Plane`。
+- 不把 Lattecode 设计为外部工程治理 `Control Plane`。
 - 不替代 repo permissions、CI、code review、compliance、release 或 deployment gates。
 - 不要求 v0.1 一次性交付完整 harness-native runtime。
 - 不要求 v0.1 交付完整 MCP platform、marketplace、resource / prompt ecosystem、skill hub、command marketplace、cloud sync、multi-user session 或 full `ActionGraph` persistence。

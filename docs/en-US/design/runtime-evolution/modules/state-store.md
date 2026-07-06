@@ -2,7 +2,7 @@
 
 ## Status
 
-This document defines the evolutionary design for `StateStore`. Early Fluxcode does not need a full fact database, but it must avoid treating transcript, tool output, or model inference as long-term fact.
+This document defines the evolutionary design for `StateStore`. Early Lattecode does not need a full fact database, but it must avoid treating transcript, tool output, or model inference as long-term fact.
 
 Chinese counterpart: [`docs/zh-CN/design/runtime-evolution/modules/state-store.md`](../../../../zh-CN/design/runtime-evolution/modules/state-store.md).
 

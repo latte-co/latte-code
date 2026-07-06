@@ -46,7 +46,7 @@ describe("event log, evidence store and recovery", () => {
   });
 
   it("persists file event log, file evidence and session snapshots", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-state-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-state-"));
     const events = new FileEventLog(join(dir, "events.jsonl"));
     await events.append("session.created", "s2", { sessionId: "s2" });
     await events.append("permission.decided", "s2", { action: "ask", callId: "c1", toolName: "write_file", reason: "mutating" });
@@ -81,7 +81,7 @@ describe("event log, evidence store and recovery", () => {
   });
 
   it("stores TaskRunState snapshots and recovers run updates from append-only events", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-run-state-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-run-state-"));
     const memoryRuns = new InMemoryTaskRunStore();
     const created = await memoryRuns.create({ sessionId: "s-run", taskInput: "do work", runId: "run_fixed" });
     created.status = "running";

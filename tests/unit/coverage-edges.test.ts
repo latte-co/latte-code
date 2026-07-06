@@ -64,7 +64,7 @@ describe("coverage edge contracts for release path", () => {
   });
 
   it("covers file task-run and session stores plus event recovery branches", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-store-edges-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-store-edges-"));
     const taskRuns = new FileTaskRunStore(join(dir, "runs"));
     const created = await taskRuns.create({ sessionId: "s", taskInput: "task", runId: "run_file" });
     await expect(taskRuns.get(created.id)).resolves.toMatchObject({ id: "run_file" });

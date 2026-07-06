@@ -1,4 +1,4 @@
-import type { FluxcodeConfig, McpToolConfig } from "../config/types.js";
+import type { LattecodeConfig, McpToolConfig } from "../config/types.js";
 import type { JsonObject } from "../shared/types.js";
 import { isJsonValue } from "../shared/types.js";
 import type { RiskLevel, ToolDefinition, ToolResult } from "../tools/types.js";
@@ -15,7 +15,7 @@ export interface McpToolSnapshot {
   enabled: boolean;
 }
 
-export function listConfiguredMcpTools(config: FluxcodeConfig): McpToolSnapshot[] {
+export function listConfiguredMcpTools(config: LattecodeConfig): McpToolSnapshot[] {
   if (!config.mcp.enabled || !config.mcp.routeThroughPermission) return [];
   return Object.entries(config.mcp.servers).flatMap(([serverName, server]) => {
     if (config.mcp.requireExplicitEnable && server.enabled !== true) return [];
@@ -23,7 +23,7 @@ export function listConfiguredMcpTools(config: FluxcodeConfig): McpToolSnapshot[
   });
 }
 
-export function createMcpToolDefinitions(config: FluxcodeConfig, client?: McpBridgeClient): ToolDefinition[] {
+export function createMcpToolDefinitions(config: LattecodeConfig, client?: McpBridgeClient): ToolDefinition[] {
   if (!config.mcp.enabled || !config.mcp.routeThroughPermission) return [];
   return Object.entries(config.mcp.servers).flatMap(([serverName, server]) => {
     if (config.mcp.requireExplicitEnable && server.enabled !== true) return [];

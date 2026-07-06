@@ -2,19 +2,19 @@
 
 ## Document Status
 
-This document records the future / near-term model provider compatibility constraints for Fluxcode. It should guide later `src/model` and `src/config` implementation work; it does not mean the current `src/` already implements a full provider catalog, multi-protocol transport layer, automatic failover, or live smoke capability.
+This document records the future / near-term model provider compatibility constraints for Lattecode. It should guide later `src/model` and `src/config` implementation work; it does not mean the current `src/` already implements a full provider catalog, multi-protocol transport layer, automatic failover, or live smoke capability.
 
 Chinese counterpart: [`docs/zh-CN/design/modules/provider-compatibility-layer.md`](../../../zh-CN/design/modules/provider-compatibility-layer.md).
 
-This document is derived from comparative research inputs such as `opencode` and `openclaw`, but projects under `.tmp/` are research inputs only. They are not Fluxcode formal source code, configuration format, or build evidence.
+This document is derived from comparative research inputs such as `opencode` and `openclaw`, but projects under `.tmp/` are research inputs only. They are not Lattecode formal source code, configuration format, or build evidence.
 
 ## 1. Goals and Non-goals
 
-The Provider Compatibility Layer should keep `AgentLoop` provider-agnostic while allowing Fluxcode to gradually support different model API modes, model capabilities, deployment environments, and authentication styles.
+The Provider Compatibility Layer should keep `AgentLoop` provider-agnostic while allowing Lattecode to gradually support different model API modes, model capabilities, deployment environments, and authentication styles.
 
 Core goals:
 
-- `AgentLoop` depends only on Fluxcode's internal model runtime protocol, not provider SDKs, HTTP details, or provider-specific event shapes.
+- `AgentLoop` depends only on Lattecode's internal model runtime protocol, not provider SDKs, HTTP details, or provider-specific event shapes.
 - Provider compatibility logic lives under `src/model`; configuration parsing and credential references are supported by `src/config`.
 - User-facing config uses `type` to express the provider / deployment class; implementation then resolves it into API mode / protocol dialect / transport adapter, and `apiMode` is not the main user-facing config key.
 - User-facing config-layer `type`, provider identity/catalog, internal API mode/protocol dialect, model capability metadata, deployment/runtime environment, auth/runtime state/router, and provider-specific quirks are separate concepts.
@@ -49,7 +49,7 @@ Boundary rules:
 
 ## 3. Internal Protocol Boundary
 
-Fluxcode must define its internal model protocol before defining the capability matrix. Provider adapters convert external APIs into these internal concepts; external API shapes must not spread inward.
+Lattecode must define its internal model protocol before defining the capability matrix. Provider adapters convert external APIs into these internal concepts; external API shapes must not spread inward.
 
 ### 3.1 `ModelRuntime`
 
@@ -116,7 +116,7 @@ type ProviderCapability = {
 };
 ```
 
-The capability registry must distinguish what a provider claims from what the Fluxcode adapter has normalized and tested. `AgentLoop` may depend only on the latter.
+The capability registry must distinguish what a provider claims from what the Lattecode adapter has normalized and tested. `AgentLoop` may depend only on the latter.
 
 ## 4. Concept Separation
 
@@ -161,7 +161,7 @@ Safety requirement: config may contain only secret references such as `apiKeyEnv
 
 ## 5. Provider `type` / Internal API Taxonomy
 
-The user config layer should use `type` to express the provider / deployment class. `type` is a config classification and template-selection entry point, not a directly exposed protocol discriminator, and it does not mean Fluxcode currently implements every provider in that class.
+The user config layer should use `type` to express the provider / deployment class. `type` is a config classification and template-selection entry point, not a directly exposed protocol discriminator, and it does not mean Lattecode currently implements every provider in that class.
 
 | User-facing `type` | Typical use | Default internal resolution direction |
 | --- | --- | --- |
@@ -187,7 +187,7 @@ The internal implementation layer should still build adapters by API mode / prot
 | `ollama-native` | Ollama local API | local models, limited tool support, pull/list model lifecycle | High: relevant to local-first direction |
 | `local-router-openai-compatible` | LiteLLM, OpenRouter, enterprise proxy, local router | OpenAI-like surface with inconsistent capability/headers/errors | High: requires explicit data boundary |
 
-One provider or `type` may support multiple internal API modes; one API mode may be implemented by many providers or routers. Fluxcode must not implicitly switch modes based on provider name; the mapping must be explicit through config parsing, capability metadata, or a user-confirmed adapter choice.
+One provider or `type` may support multiple internal API modes; one API mode may be implemented by many providers or routers. Lattecode must not implicitly switch modes based on provider name; the mapping must be explicit through config parsing, capability metadata, or a user-confirmed adapter choice.
 
 ## 6. Capability Matrix
 
@@ -213,15 +213,15 @@ Capability use rules:
 
 ## 7. Tool / Function Calling Normalization
 
-Fluxcode's internal tool-calling contract is independent of providers:
+Lattecode's internal tool-calling contract is independent of providers:
 
 ```text
-Fluxcode ToolSpec
+Lattecode ToolSpec
   -> adapter-specific tool declaration
   -> provider stream tool events
   -> NormalizedToolCall
   -> permission / schema gate
-  -> Fluxcode tool execution
+  -> Lattecode tool execution
   -> adapter-specific tool result message
 ```
 
@@ -230,7 +230,7 @@ Normalization requirements:
 - `ToolSpec` contains only name, description, JSON schema, mutating/risk metadata, and permission hints; it does not contain provider SDK types.
 - Tool arguments must not execute before full assembly.
 - Partial JSON, duplicate tool ids, missing tool names, parallel tool calls, and tool-call cancellation must have deterministic handling.
-- If a provider lacks native tools, Fluxcode may use a prompted JSON/tool protocol, but it must mark the path as degraded and reduce automatic execution permission.
+- If a provider lacks native tools, Lattecode may use a prompted JSON/tool protocol, but it must mark the path as degraded and reduce automatic execution permission.
 - Tool result injection must preserve `toolCallId` to avoid mismatches under parallel tool calls.
 - Adapters normalize provider-specific finish reasons into internal values such as `tool_calls`, `stop`, `length`, `content_filter`, `cancelled`, and `error`.
 
@@ -240,7 +240,7 @@ The transcript is part of a recoverable agent run. Raw provider responses should
 
 Requirements:
 
-- Input transcripts use Fluxcode's canonical message/content/tool-result model.
+- Input transcripts use Lattecode's canonical message/content/tool-result model.
 - Output streams normalize into `NormalizedModelEvent` before being written to event logs, UI, tool assemblers, and final transcripts.
 - Raw provider responses may be attached only in debug mode and only in redacted form; they are not persisted by default.
 - Replay uses normalized events, not provider SDK objects.
@@ -322,13 +322,13 @@ Policy requirements:
 
 ## 12. SDK / HTTP Adapter Policy
 
-The current implementation direction should prefer direct fetch / minimal HTTP adapters so Fluxcode controls protocol boundaries, event normalization, and credential safety. Future SDKs or AI SDK-style provider wrappers are allowed only if:
+The current implementation direction should prefer direct fetch / minimal HTTP adapters so Lattecode controls protocol boundaries, event normalization, and credential safety. Future SDKs or AI SDK-style provider wrappers are allowed only if:
 
 - SDK wrappers exist only inside provider adapters and never become type dependencies of `AgentLoop`, phase contracts, or tool contracts.
-- SDK responses, stream chunks, and error classes immediately convert into Fluxcode normalized protocol.
-- SDK automatic retry, telemetry, credential discovery, proxy behavior, file upload, and similar side effects are explicitly disabled or wrapped under Fluxcode policy.
+- SDK responses, stream chunks, and error classes immediately convert into Lattecode normalized protocol.
+- SDK automatic retry, telemetry, credential discovery, proxy behavior, file upload, and similar side effects are explicitly disabled or wrapped under Lattecode policy.
 - SDK version and provider catalog metadata are testable, pinned, and replaceable.
-- If Fluxcode borrows Vercel AI SDK / provider catalog organization, it borrows only the catalog/wrapper pattern. `streamText` and SDK-specific message shapes must not leak into Fluxcode's internal protocol.
+- If Lattecode borrows Vercel AI SDK / provider catalog organization, it borrows only the catalog/wrapper pattern. `streamText` and SDK-specific message shapes must not leak into Lattecode's internal protocol.
 
 ## 13. Provider Compatibility Sub-roadmap
 
@@ -381,7 +381,7 @@ When implementing Provider Compatibility Layer adapters, each adapter should at 
 
 Comparative research notes:
 
-- `opencode` shows an AI SDK/provider catalog style, branded provider/model identity, capability metadata, `streamText`, and OpenAI-compatible provider catalog organization that Fluxcode can study.
-- `openclaw` shows explicit API modes, provider config, discovery/runtime auth/stream wrapping/capability hooks, custom transports, auth profiles, failover, and cooldown boundaries that Fluxcode can study.
+- `opencode` shows an AI SDK/provider catalog style, branded provider/model identity, capability metadata, `streamText`, and OpenAI-compatible provider catalog organization that Lattecode can study.
+- `openclaw` shows explicit API modes, provider config, discovery/runtime auth/stream wrapping/capability hooks, custom transports, auth profiles, failover, and cooldown boundaries that Lattecode can study.
 
-These facts describe observable choices in external systems. Fluxcode's formal design authority remains this document, `Code Agent Loop`, the architecture overview, and the current roadmap.
+These facts describe observable choices in external systems. Lattecode's formal design authority remains this document, `Code Agent Loop`, the architecture overview, and the current roadmap.

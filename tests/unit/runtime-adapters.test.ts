@@ -14,7 +14,7 @@ import { createTaskRunState } from "../../src/core/run-state.js";
 
 describe("Step 5 runtime adapters", () => {
   it("loads AGENTS.md through repo/cwd boundary with snapshot hash and summary", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-agents-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-agents-"));
     await mkdir(join(dir, ".git"));
     await writeFile(join(dir, "AGENTS.md"), "# Rules\n\n- Keep tests passing.\n- Do not bypass gates.\n", "utf8");
     const snapshot = await loadAgentsSnapshot({ cwd: dir, config: DEFAULT_CONFIG.agents });
@@ -28,7 +28,7 @@ describe("Step 5 runtime adapters", () => {
   });
 
   it("combines repo and cwd AGENTS snapshots and handles disabled or invalid AGENTS config", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-agents-combined-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-agents-combined-"));
     await mkdir(join(dir, ".git"));
     const child = join(dir, "child");
     await mkdir(child);
@@ -41,53 +41,53 @@ describe("Step 5 runtime adapters", () => {
     await expect(loadAgentsSnapshot({ cwd: dir, config: { ...DEFAULT_CONFIG.agents, snapshot: false } })).resolves.toBeUndefined();
     await expect(loadAgentsSnapshot({ cwd: dir, config: { ...DEFAULT_CONFIG.agents, agentsFile: join(dir, "AGENTS.md") } })).rejects.toThrow("agents_gate");
 
-    const empty = await mkdtemp(join(tmpdir(), "fluxcode-agents-empty-"));
+    const empty = await mkdtemp(join(tmpdir(), "lattecode-agents-empty-"));
     await writeFile(join(empty, "AGENTS.md"), "\n\n", "utf8");
     await expect(loadAgentsSnapshot({ cwd: empty, config: { ...DEFAULT_CONFIG.agents, loadFrom: [] } })).resolves.toMatchObject({ summary: "Empty AGENTS.md", source: "repoRoot" });
     await expect(loadAgentsSnapshot({ cwd: empty, config: { ...DEFAULT_CONFIG.agents, agentsFile: "MISSING.md", loadFrom: ["cwd", "cwd"] } })).resolves.toBeUndefined();
 
-    const unreadable = await mkdtemp(join(tmpdir(), "fluxcode-agents-unreadable-"));
+    const unreadable = await mkdtemp(join(tmpdir(), "lattecode-agents-unreadable-"));
     await mkdir(join(unreadable, "AGENTS.md"));
     await expect(loadAgentsSnapshot({ cwd: unreadable, config: { ...DEFAULT_CONFIG.agents, loadFrom: ["cwd"] } })).rejects.toThrow("failed to read");
   });
 
   it("loads local skills as instruction-only context and rejects side effects", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-skills-"));
-    await mkdir(join(dir, ".fluxcode", "skills", "safe"), { recursive: true });
-    await mkdir(join(dir, ".fluxcode", "skills", "unsafe"), { recursive: true });
-    await writeFile(join(dir, ".fluxcode", "skills", "safe", "skill.json"), JSON.stringify({ name: "safe", instructions: "Prefer small patches.", workflows: ["read first"] }), "utf8");
-    await writeFile(join(dir, ".fluxcode", "skills", "unsafe", "skill.json"), JSON.stringify({ name: "unsafe", instructions: "bad", sideEffects: true }), "utf8");
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-skills-"));
+    await mkdir(join(dir, ".lattecode", "skills", "safe"), { recursive: true });
+    await mkdir(join(dir, ".lattecode", "skills", "unsafe"), { recursive: true });
+    await writeFile(join(dir, ".lattecode", "skills", "safe", "skill.json"), JSON.stringify({ name: "safe", instructions: "Prefer small patches.", workflows: ["read first"] }), "utf8");
+    await writeFile(join(dir, ".lattecode", "skills", "unsafe", "skill.json"), JSON.stringify({ name: "unsafe", instructions: "bad", sideEffects: true }), "utf8");
 
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["safe"] } })).resolves.toMatchObject([{ name: "safe", instructions: "Prefer small patches." }]);
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["unsafe"] } })).rejects.toThrow("skill_gate");
   });
 
   it("loads markdown skills and fails closed for missing or invalid skill paths", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-skills-markdown-"));
-    await mkdir(join(dir, ".fluxcode", "skills"), { recursive: true });
-    await writeFile(join(dir, ".fluxcode", "skills", "doc.md"), "Use documented workflow.", "utf8");
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-skills-markdown-"));
+    await mkdir(join(dir, ".lattecode", "skills"), { recursive: true });
+    await writeFile(join(dir, ".lattecode", "skills", "doc.md"), "Use documented workflow.", "utf8");
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: [] } })).resolves.toEqual([]);
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["doc"] } })).resolves.toMatchObject([{ name: "doc", instructions: "Use documented workflow." }]);
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["missing"] } })).rejects.toThrow("was not found");
-    await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["doc"], localDirectories: [join(dir, ".fluxcode", "skills")] } })).rejects.toThrow("skill_gate");
+    await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["doc"], localDirectories: [join(dir, ".lattecode", "skills")] } })).rejects.toThrow("skill_gate");
 
-    await writeFile(join(dir, ".fluxcode", "skills", "fallback.json"), JSON.stringify({ workflows: ["one", 2], commands: [{ run: "x" }, null] }), "utf8");
+    await writeFile(join(dir, ".lattecode", "skills", "fallback.json"), JSON.stringify({ workflows: ["one", 2], commands: [{ run: "x" }, null] }), "utf8");
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["fallback"], allowSideEffects: true } })).resolves.toMatchObject([{ name: "fallback", instructions: "", workflows: ["one"], commandSpecs: [expect.stringContaining("run"), "null"] }]);
-    await writeFile(join(dir, ".fluxcode", "skills", "bad.json"), "[]", "utf8");
+    await writeFile(join(dir, ".lattecode", "skills", "bad.json"), "[]", "utf8");
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["bad"] } })).rejects.toThrow("JSON object");
-    await mkdir(join(dir, ".fluxcode", "skills", "directory", "skill.json"), { recursive: true });
+    await mkdir(join(dir, ".lattecode", "skills", "directory", "skill.json"), { recursive: true });
     await expect(loadLocalSkills({ cwd: dir, config: { ...DEFAULT_CONFIG.skills, enabled: ["directory"] } })).rejects.toThrow();
   });
 
   it("loads local commands as TaskSpec routes without tool calls", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-commands-"));
-    await mkdir(join(dir, ".fluxcode", "commands"), { recursive: true });
-    await writeFile(join(dir, ".fluxcode", "commands", "fix.json"), JSON.stringify({
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-commands-"));
+    await mkdir(join(dir, ".lattecode", "commands"), { recursive: true });
+    await writeFile(join(dir, ".lattecode", "commands", "fix.json"), JSON.stringify({
       name: "fix",
       description: "Fix {{args}}",
       task: { objective: "Fix {{args}}", scope: ["workspace"], acceptance: ["tests pass"], nonGoals: ["no install"], constraints: ["use gates"], blockers: [] }
     }), "utf8");
-    await writeFile(join(dir, ".fluxcode", "commands", "bad.json"), JSON.stringify({ name: "bad", shell: "rm -rf .", task: { objective: "bad", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] } }), "utf8");
+    await writeFile(join(dir, ".lattecode", "commands", "bad.json"), JSON.stringify({ name: "bad", shell: "rm -rf .", task: { objective: "bad", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] } }), "utf8");
 
     const specs = await loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["fix"] });
     const routed = routeCommandInput("/fix issue 1", specs);
@@ -96,10 +96,10 @@ describe("Step 5 runtime adapters", () => {
   });
 
   it("handles disabled local commands, unmatched routes, and invalid command specs", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-commands-invalid-"));
-    await mkdir(join(dir, ".fluxcode", "commands"), { recursive: true });
-    await writeFile(join(dir, ".fluxcode", "commands", "plain.json"), JSON.stringify({ task: { objective: "Plain", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] } }), "utf8");
-    await writeFile(join(dir, ".fluxcode", "commands", "invalid.json"), JSON.stringify({ name: "invalid", task: { objective: "missing arrays" } }), "utf8");
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-commands-invalid-"));
+    await mkdir(join(dir, ".lattecode", "commands"), { recursive: true });
+    await writeFile(join(dir, ".lattecode", "commands", "plain.json"), JSON.stringify({ task: { objective: "Plain", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] } }), "utf8");
+    await writeFile(join(dir, ".lattecode", "commands", "invalid.json"), JSON.stringify({ name: "invalid", task: { objective: "missing arrays" } }), "utf8");
     await expect(loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, allowLocalCommands: false, enabled: ["plain"] })).resolves.toEqual([]);
     const [plain] = await loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["plain"] });
     if (plain === undefined) throw new Error("expected plain command");
@@ -109,8 +109,8 @@ describe("Step 5 runtime adapters", () => {
     expect(routeCommandInput("/missing", [plain])).toBeUndefined();
     expect(routeCommandInput("/plain", [plain])?.task.objective).toBe("Plain");
     await expect(loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["invalid"] })).rejects.toThrow("valid TaskSpec");
-    await expect(loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["plain"], localDirectory: join(dir, ".fluxcode", "commands") })).rejects.toThrow("command_gate");
-    await writeFile(join(dir, ".fluxcode", "commands", "array.json"), "[]", "utf8");
+    await expect(loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["plain"], localDirectory: join(dir, ".lattecode", "commands") })).rejects.toThrow("command_gate");
+    await writeFile(join(dir, ".lattecode", "commands", "array.json"), "[]", "utf8");
     await expect(loadLocalCommandSpecs(dir, { ...DEFAULT_CONFIG.commands, enabled: ["array"] })).rejects.toThrow("JSON object");
   });
 

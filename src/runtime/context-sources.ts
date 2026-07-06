@@ -1,4 +1,4 @@
-import type { FluxcodeConfig } from "../config/types.js";
+import type { LattecodeConfig } from "../config/types.js";
 import { loadAgentsSnapshot, type AgentsSnapshot } from "../context/agents.js";
 import { loadLocalCommandSpecs, type CommandSpec } from "../commands/registry.js";
 import { listConfiguredMcpTools, type McpToolSnapshot } from "../mcp/bridge.js";
@@ -11,7 +11,7 @@ export interface RuntimeContextSources {
   mcpTools: McpToolSnapshot[];
 }
 
-export async function loadRuntimeContextSources(cwd: string, config: FluxcodeConfig): Promise<RuntimeContextSources> {
+export async function loadRuntimeContextSources(cwd: string, config: LattecodeConfig): Promise<RuntimeContextSources> {
   const [agentsMd, skills, commands] = await Promise.all([
     loadAgentsSnapshot({ cwd, config: config.agents }),
     loadLocalSkills({ cwd, config: config.skills }),

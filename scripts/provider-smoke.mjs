@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-const apiKeyEnv = "FLUXCODE_MODEL_API_KEY";
-const baseUrlEnv = "FLUXCODE_MODEL_BASE_URL";
+const apiKeyEnv = "LATTECODE_MODEL_API_KEY";
+const baseUrlEnv = "LATTECODE_MODEL_BASE_URL";
 const cliPath = join(process.cwd(), "dist", "src", "cli", "main.js");
 
 if (!existsSync(cliPath)) {
@@ -19,8 +19,8 @@ if (process.env[apiKeyEnv] === undefined || process.env[apiKeyEnv]?.trim() === "
   process.exit(2);
 }
 
-const smokeDir = await mkdtemp(join(tmpdir(), "fluxcode-provider-smoke-"));
-const configPath = join(smokeDir, "fluxcode.provider-smoke.config.jsonc");
+const smokeDir = await mkdtemp(join(tmpdir(), "lattecode-provider-smoke-"));
+const configPath = join(smokeDir, "lattecode.provider-smoke.config.jsonc");
 await writeFile(configPath, JSON.stringify({
   schemaVersion: 1,
   models: {
@@ -28,7 +28,7 @@ await writeFile(configPath, JSON.stringify({
     providers: {
       primary: {
         type: "openai-compatible",
-        model: process.env.FLUXCODE_MODEL_NAME ?? "gpt-5.5",
+        model: process.env.LATTECODE_MODEL_NAME ?? "gpt-5.5",
         baseUrl: process.env[baseUrlEnv] ?? "https://api.openai.com/v1",
         apiKeyEnv,
         temperature: 0,

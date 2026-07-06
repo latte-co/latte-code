@@ -1,14 +1,14 @@
-# Fluxcode
+# Lattecode
 
-Fluxcode is a local-first, harness-native code agent runtime design project. It combines English technical documentation with an early TypeScript source area for runtime-kernel implementation work.
+Lattecode is a local-first, harness-native code agent runtime design project. It combines English technical documentation with an early TypeScript source area for runtime-kernel implementation work.
 
 The project is design-first and intentionally conservative about implementation claims. The current documentation defines the reference frame, architecture boundaries, module contracts, roadmap, and task breakdown; it does not imply that the full runtime kernel is already implemented.
 
 ## Reference Frame
 
-From the broader software-engineering-system perspective, Fluxcode is a code-agent `Data Plane` component. It may read repositories, call tools, propose changes, run verification, and hand results to humans or existing engineering systems.
+From the broader software-engineering-system perspective, Lattecode is a code-agent `Data Plane` component. It may read repositories, call tools, propose changes, run verification, and hand results to humans or existing engineering systems.
 
-Fluxcode does not replace repository permissions, CI, code review, compliance, release, or deployment gates. In this repository, `Control Plane Authority` means only Fluxcode internal runtime authority inside the process and task boundary.
+Lattecode does not replace repository permissions, CI, code review, compliance, release, or deployment gates. In this repository, `Control Plane Authority` means only Lattecode internal runtime authority inside the process and task boundary.
 
 ## Architecture Concepts
 
@@ -75,9 +75,9 @@ No root `dev` command is currently declared.
 | `package.json` | Package metadata, Node engine declaration, and declared scripts. |
 | `tsconfig.json` | TypeScript configuration. |
 | `vitest.config.ts` | Vitest configuration. |
-| `fluxcode.config.example.jsonc` | Example JSONC configuration without secrets. |
+| `lattecode.config.example.jsonc` | Example JSONC configuration without secrets. |
 | `LICENSE` | Apache License 2.0 text. |
 
 ## License
 
-Fluxcode is licensed under the [Apache License 2.0](LICENSE).
+Lattecode is licensed under the [Apache License 2.0](LICENSE).

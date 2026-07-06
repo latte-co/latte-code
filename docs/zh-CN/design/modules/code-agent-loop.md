@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义 Fluxcode `v0.1` 的基础 code agent 循环。它基于对 Claude Code、CodeWhale、Codex、opencode 四类 conversation-native code agent 的临时源码调研结论，但不把 `.tmp/` 下源码当作 Fluxcode 正式源码或构建依据。
+本文定义 Lattecode `v0.1` 的基础 code agent 循环。它基于对 Claude Code、CodeWhale、Codex、opencode 四类 conversation-native code agent 的临时源码调研结论，但不把 `.tmp/` 下源码当作 Lattecode 正式源码或构建依据。
 
 英文对应文档：[`docs/en-US/design/modules/code-agent-loop.md`](../../../en-US/design/modules/code-agent-loop.md)。
 
@@ -21,7 +21,7 @@ Persistent TaskRun
 
 外层 phase runner 只负责工程边界：阶段顺序、预算、权限、结构化产物校验、持久化和恢复。内层仍保留 ReAct query loop：模型可以多轮调用工具、观察结果、修正计划和继续执行。
 
-因此，`fluxcode run "实现一个贪吃蛇游戏"` 要真正可运行，至少需要：
+因此，`lattecode run "实现一个贪吃蛇游戏"` 要真正可运行，至少需要：
 
 - 能接入真实模型 provider，而不是只返回 fake model 默认消息。
 - 能通过 CLI、local command、local skill、minimal MCP bridge 和 built-in tools 统一生成 `TaskSpec`。
@@ -31,13 +31,13 @@ Persistent TaskRun
 - 能运行仓库已声明的验证命令。
 - 能把结果交付为 `AgentHandoff`，包括 changed files、verification、risks、blockers。
 
-如果目标仓库没有应用框架、测试框架或依赖决策，Fluxcode 必须明确阻塞并请求用户确认，不能静默 scaffold、安装依赖或发布。
+如果目标仓库没有应用框架、测试框架或依赖决策，Lattecode 必须明确阻塞并请求用户确认，不能静默 scaffold、安装依赖或发布。
 
 ## 2. Basic Code Agent 最小功能集
 
 | 能力 | v0.1 最小要求 | 不做什么 |
 | --- | --- | --- |
-| CLI entry | `fluxcode run <task>` 启动真实 agent loop，输出 JSON / text handoff | 不做 TUI / IDE cockpit |
+| CLI entry | `lattecode run <task>` 启动真实 agent loop，输出 JSON / text handoff | 不做 TUI / IDE cockpit |
 | Config | 加载 project-local JSONC config，覆盖 models、runtime、tools、permissions、session、commands、skills、MCP | 不做 secrets 存储或全局策略平台 |
 | `AGENTS.md` loader | 读取 repo root / cwd 边界内的 `AGENTS.md`，记录 snapshot/hash 并注入 context | 不把未追踪文本直接拼入 prompt |
 | Session / TaskRun | 创建可恢复 `TaskRunState`，保存 phase、status、steps、artifacts、tool calls、events、context snapshot | 不做 cloud sync、多设备或多用户协作 |
@@ -72,7 +72,7 @@ CLI / local command / local skill / minimal MCP bridge / built-in tools
 
 MCP、skill 和 command 的最小边界如下：
 
-- MCP：只支持 config-defined servers、list tools 和 call tool。MCP tool 必须转换为 Fluxcode tool contract，并统一走 permission、evidence、trace 和 session；默认 disabled 或 explicit enabled；不能绕过权限；不做 marketplace、resource / prompt platform 或 server management UI。
+- MCP：只支持 config-defined servers、list tools 和 call tool。MCP tool 必须转换为 Lattecode tool contract，并统一走 permission、evidence、trace 和 session；默认 disabled 或 explicit enabled；不能绕过权限；不做 marketplace、resource / prompt platform 或 server management UI。
 - Skill：只支持 local skill loader。skill 是 instruction / workflow / command bundle，可注入 context / prompt registry；不能直接执行 side effects；不做 hub、install、publish 或 marketplace。
 - Command：只支持 built-in / local command specs。command 必须 route through `TaskSpec`、phase event 和 session system；不能直接调用 tool 绕过 agent-loop、permission 或 session。
 
@@ -86,7 +86,7 @@ MCP、skill 和 command 的最小边界如下：
 - `--ui tui` 或独立 experimental command 只能是 opt-in；没有显式选择时，CLI 应维持 headless handoff 行为。
 - TUI 只消费 runtime events 和 `AgentHandoff` / view model，不驱动 permission、session、runtime mutation，也不改变 schema、evidence、trace 或 handoff 语义。
 - runtime core 不 import `react`、`ink` 或 `@opentui/*`；UI dependency 必须留在 renderer adapter 或 experimental package 边界内。
-- `PlainTextRenderer` 是 non-TTY、CI、snapshot、crash fallback 的默认可用路径；Fluxcode 不自研完整 terminal renderer。
+- `PlainTextRenderer` 是 non-TTY、CI、snapshot、crash fallback 的默认可用路径；Lattecode 不自研完整 terminal renderer。
 
 Renderer 边界采用稳定 view model：
 
@@ -292,7 +292,7 @@ type HeadlessRunEnvelope = {
 | `edit_match_gate` | `edit_file` 前 | oldText 唯一匹配，或显式 replaceAll | block | 多匹配要求更多上下文 |
 | `diff_review_gate` | mutating edit/write 后、落盘前或后 | diff summary 可审查，高风险需确认 | ask / deny | diff 进入 permission metadata |
 | `shell_command_gate` | `shell_exec` 前 | 命令来自 allowlist、manifest scripts 或用户确认 | ask / deny | install/delete/network/git-write 默认阻止 |
-| `mcp_gate` | MCP tool list / call 前 | server 显式启用，tool 映射到 Fluxcode contract，并经过 permission | ask / deny / block | disabled MCP server 对模型不可见 |
+| `mcp_gate` | MCP tool list / call 前 | server 显式启用，tool 映射到 Lattecode contract，并经过 permission | ask / deny / block | disabled MCP server 对模型不可见 |
 | `skill_gate` | skill 加载 / 注入前 | skill 来自本地允许路径，只注入 instruction / workflow / command spec | deny / block | skill 不能直接执行 side effects |
 | `command_gate` | local command 执行前 | command 转成 `TaskSpec` / phase event，并进入 session | ask / deny / block | command 不能直接绕过 loop 调 tool |
 | `verification_gate` | `Verify` 完成 | 声明验证已运行并记录结果，或明确 skipped 原因 | failed / skipped handoff | 测试失败时 status 非 completed-success |
@@ -356,7 +356,7 @@ type HeadlessRunEnvelope = {
 
 ## 8. v0.1 Done Definition
 
-- `fluxcode run "实现一个贪吃蛇游戏"` 在已有 web app fixture 中能产出真实代码变更。
+- `lattecode run "实现一个贪吃蛇游戏"` 在已有 web app fixture 中能产出真实代码变更。
 - 至少一个 scripted fake-model 集成测试覆盖完整 loop。
 - 至少一个真实 provider smoke test 可手动运行。
 - 所有 P0 gates 有单元或集成测试。

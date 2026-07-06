@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文是 Fluxcode 从基础 code agent 演进到 harness-native runtime 的独立任务拆分文档。文件名保留 `runtime-kernel-task-breakdown` 是为了维持现有索引稳定；内容已调整为渐进式实现排期。
+本文是 Lattecode 从基础 code agent 演进到 harness-native runtime 的独立任务拆分文档。文件名保留 `runtime-kernel-task-breakdown` 是为了维持现有索引稳定；内容已调整为渐进式实现排期。
 
 英文对应文档：[`docs/en-US/milestones/targets/runtime-kernel-task-breakdown.md`](../../../en-US/milestones/targets/runtime-kernel-task-breakdown.md)。
 
@@ -16,7 +16,7 @@ v0.1 Basic working code agent
   -> v0.5 Harness-native runtime hardening
 ```
 
-全版本共同前提：Fluxcode externally 是 code agent `Data Plane`；内部 `Control Plane Authority` 仅表示 Fluxcode internal runtime authority，且是逐步形成的目标。
+全版本共同前提：Lattecode externally 是 code agent `Data Plane`；内部 `Control Plane Authority` 仅表示 Lattecode internal runtime authority，且是逐步形成的目标。
 
 ## 2. `v0.1`: Basic Working Code Agent
 
@@ -30,7 +30,7 @@ v0.1 Basic working code agent
 | `v0.1-phase-gated-react` | 在现有 query loop 上实现 phase-gated ReAct：phase 内部允许工具循环，phase 结束校验结构化 artifact | `v0.1-cli-config-contract`, `v0.1-session-management` | `Understand`、`Plan`、`Edit`、`Verify` 能使用 ReAct，但必须产出 schema 合法对象 |
 | `v0.1-built-in-tools` | 建立 built-in tools 最小集合：read/search/edit/write/shell/manifest/minimal diff summary，并保留 tool contract | `v0.1-phase-gated-react` | 工具声明 schema、read-only / mutating、权限需求、风险等级、结果摘要；P0 diff 只输出 changed files / diff summary，危险工具不能裸执行 |
 | `v0.1-permission-pipeline` | 建立 allow / deny / ask 权限管线，并把结果写入事件和 trace | `v0.1-built-in-tools` | 未授权命令或路径访问会 block / ask，而不是继续执行 |
-| `v0.1-minimal-mcp-bridge` | 实现最小 MCP bridge：config-defined servers、list/call tools、默认 disabled 或 explicit enabled | `v0.1-built-in-tools`, `v0.1-permission-pipeline` | MCP tool 统一映射到 Fluxcode tool contract，进入 permission / evidence / trace / session，不能绕过权限 |
+| `v0.1-minimal-mcp-bridge` | 实现最小 MCP bridge：config-defined servers、list/call tools、默认 disabled 或 explicit enabled | `v0.1-built-in-tools`, `v0.1-permission-pipeline` | MCP tool 统一映射到 Lattecode tool contract，进入 permission / evidence / trace / session，不能绕过权限 |
 | `v0.1-local-skill-loader` | 实现 local skill loader：加载本地 instruction / workflow / command bundle，注入 context / prompt registry | `v0.1-agents-loader`, `v0.1-session-management` | skill 不能直接执行 side effects；不做 hub、install、publish、marketplace |
 | `v0.1-local-command-specs` | 实现 built-in / local command specs：command -> `TaskSpec` / phase event / session | `v0.1-cli-config-contract`, `v0.1-session-management` | command 不绕过 agent-loop、permission 或 session |
 | `v0.1-evidence-trace-binding` | 绑定 `StepTrace`、`Evidence`、tool invocation、shell output summary、file edit summary、verification result | `v0.1-permission-pipeline`, `v0.1-minimal-mcp-bridge`, `v0.1-local-skill-loader`, `v0.1-local-command-specs` | 最终汇报可追溯每个关键行动，工具、文件修改和验证结果有证据引用 |
@@ -129,7 +129,7 @@ v0.1 Basic working code agent
 ### 非目标
 
 - 以 benchmark 通过率替代 runtime invariant。
-- 把 Fluxcode 描述为外部 CI / review / deployment gate。
+- 把 Lattecode 描述为外部 CI / review / deployment gate。
 - 让外部协议直接写入内部 `StateStore`、`EffectLedger` 或 `TransactionManager`。
 - 在 `ActionGraph` 成为实际 UX surface 前，把 cockpit hardening 或 `OpenTUI` 设为 `v0.5` 默认依赖。
 

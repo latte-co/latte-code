@@ -9,7 +9,7 @@ const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const projectRoot = process.cwd();
 const packageJsonPath = join(projectRoot, "package.json");
 
-const tempDir = await mkdtemp(join(tmpdir(), "fluxcode-local-install-"));
+const tempDir = await mkdtemp(join(tmpdir(), "lattecode-local-install-"));
 let originalPackageJson;
 
 try {
@@ -288,7 +288,7 @@ function getVerificationCommand(pkg) {
     return undefined;
   }
 
-  const preferredBinName = binNames.includes("fluxcode") ? "fluxcode" : binNames[0];
+  const preferredBinName = binNames.includes("lattecode") ? "lattecode" : binNames[0];
   return `${preferredBinName} --version`;
 }
 

@@ -9,13 +9,13 @@ import { createDefaultPromptRegistry } from "../prompts/registry.js";
 import { InMemorySessionStore, FileSessionStore } from "../session/session.js";
 import { createBuiltinTools } from "../tools/builtin.js";
 import { ToolRegistry } from "../tools/registry.js";
-import type { FluxcodeConfig } from "../config/types.js";
+import type { LattecodeConfig } from "../config/types.js";
 import { createMcpToolDefinitions, type McpBridgeClient } from "../mcp/bridge.js";
 import { loadRuntimeContextSources } from "./context-sources.js";
 
 export interface CreateAgentOptions {
   cwd: string;
-  config: FluxcodeConfig;
+  config: LattecodeConfig;
   model?: ModelClient;
   fakeScript?: readonly (ModelTurn | Error)[];
   env?: NodeJS.ProcessEnv;
@@ -23,7 +23,7 @@ export interface CreateAgentOptions {
   mcpClient?: McpBridgeClient;
 }
 
-export function createDefaultRegistry(config: FluxcodeConfig, mcpClient?: McpBridgeClient): ToolRegistry {
+export function createDefaultRegistry(config: LattecodeConfig, mcpClient?: McpBridgeClient): ToolRegistry {
   const registry = new ToolRegistry();
   const disabled = new Set(config.tools.disabled);
   const enabled = new Set(config.tools.enabled);

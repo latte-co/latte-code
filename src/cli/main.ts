@@ -2,7 +2,7 @@
 import { cwd } from "node:process";
 import { join } from "node:path";
 import { loadConfig } from "../config/config.js";
-import type { FluxcodeConfig } from "../config/types.js";
+import type { LattecodeConfig } from "../config/types.js";
 import { createHeadlessRunEnvelopeFromAgentResult, createHeadlessRunEnvelopeFromTaskRunState, exitCodeForTaskRunStatus, isResumeInput, type HeadlessRunEnvelope, type HeadlessRunListEnvelope, type ResumeInput } from "../core/contracts.js";
 import { createAgentLoop } from "../runtime/create-agent.js";
 import { FileSessionStore, InMemorySessionStore, type SessionState, type SessionStore } from "../session/session.js";
@@ -129,7 +129,7 @@ function parseResumeInput(value: string | undefined): ResumeInput {
   return parsed;
 }
 
-function createCliSessionStore(currentCwd: string, config: FluxcodeConfig): SessionStore {
+function createCliSessionStore(currentCwd: string, config: LattecodeConfig): SessionStore {
   return config.session.store === "memory" ? new InMemorySessionStore() : new FileSessionStore(join(currentCwd, config.session.directory));
 }
 
@@ -170,10 +170,10 @@ function renderTextEnvelope(envelope: HeadlessRunEnvelope): string {
   if (envelope.pendingInput !== undefined) {
     if (envelope.pendingInput.kind === "permission") {
       lines.push(`Pending permission ${envelope.pendingInput.permissionId}: ${envelope.pendingInput.reason}`);
-      lines.push(`Resume with: fluxcode resume ${envelope.runId} --input '{"kind":"permission","permissionId":"${envelope.pendingInput.permissionId}","decision":"approve"}'`);
+      lines.push(`Resume with: lattecode resume ${envelope.runId} --input '{"kind":"permission","permissionId":"${envelope.pendingInput.permissionId}","decision":"approve"}'`);
     } else {
       lines.push(`Pending question ${envelope.pendingInput.questionId}: ${envelope.pendingInput.prompt}`);
-      lines.push(`Resume with: fluxcode resume ${envelope.runId} --input '{"kind":"question","questionId":"${envelope.pendingInput.questionId}","answerText":"..."}'`);
+      lines.push(`Resume with: lattecode resume ${envelope.runId} --input '{"kind":"question","questionId":"${envelope.pendingInput.questionId}","answerText":"..."}'`);
     }
   }
   if (envelope.handoff !== undefined) {
@@ -195,10 +195,10 @@ function writeError(output: OutputMode, message: string): void {
 }
 
 function printUsage(): void {
-  console.error("Usage: fluxcode run <task> [--output json|text] [--config path] [--session id]");
-  console.error("       fluxcode resume <runId> --input '<ResumeInput JSON>' [--output json|text] [--config path]");
-  console.error("       fluxcode show <runId> [--output json|text] [--config path]");
-  console.error("       fluxcode list [--output json|text] [--config path]");
+  console.error("Usage: lattecode run <task> [--output json|text] [--config path] [--session id]");
+  console.error("       lattecode resume <runId> --input '<ResumeInput JSON>' [--output json|text] [--config path]");
+  console.error("       lattecode show <runId> [--output json|text] [--config path]");
+  console.error("       lattecode list [--output json|text] [--config path]");
 }
 
 function errorMessage(error: unknown): string {

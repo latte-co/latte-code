@@ -29,7 +29,7 @@ describe("ToolRegistry and builtin tools", () => {
   });
 
   it("executes read, list, search, edit, manifest, diff, write and shell tools", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-tools-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-tools-"));
     await mkdir(join(dir, "sub"));
     await mkdir(join(dir, "node_modules"));
     await execFileAsync("git", ["init"], { cwd: dir });
@@ -81,13 +81,13 @@ describe("ToolRegistry and builtin tools", () => {
     });
     const invalidManifest = await toolRegistry.execute({ id: "manifest-invalid", name: "read_project_manifest", input: { path: "invalid-package" } }, context);
     expect(invalidManifest.output?.declaredCommands).toEqual([]);
-    const nonGitDir = await mkdtemp(join(tmpdir(), "fluxcode-tools-nongit-"));
+    const nonGitDir = await mkdtemp(join(tmpdir(), "lattecode-tools-nongit-"));
     const diffFailure = await toolRegistry.execute({ id: "diff-fail", name: "git_diff", input: {} }, { ...context, cwd: nonGitDir });
     expect(diffFailure.ok).toBe(false);
   });
 
   it("normalizes shell failures and duplicate registration", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-tools-fail-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-tools-fail-"));
     const toolRegistry = registry();
     const firstTool = createBuiltinTools()[0];
     if (firstTool === undefined) throw new Error("expected at least one builtin tool");
@@ -100,7 +100,7 @@ describe("ToolRegistry and builtin tools", () => {
   });
 
   it("enforces read-before-write, stale-write, and edit-match gates when snapshots are tracked", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-tools-gates-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-tools-gates-"));
     await writeFile(join(dir, "input.txt"), "same\nsame\n", "utf8");
     const toolRegistry = registry();
     const context = { cwd: dir, sessionId: "s1", maxOutputBytes: 1024, fileSnapshots: {} };
@@ -114,7 +114,7 @@ describe("ToolRegistry and builtin tools", () => {
   });
 
   it("blocks write and edit when only file mtime changed since read", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-tools-mtime-gates-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-tools-mtime-gates-"));
     const toolRegistry = registry();
     const editContext = { cwd: dir, sessionId: "s1", maxOutputBytes: 1024, fileSnapshots: {} };
     const writeContext = { cwd: dir, sessionId: "s2", maxOutputBytes: 1024, fileSnapshots: {} };
@@ -133,7 +133,7 @@ describe("ToolRegistry and builtin tools", () => {
   });
 
   it("covers builtin tool edge branches without changing tool semantics", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-tools-edges-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-tools-edges-"));
     await mkdir(join(dir, "sub"));
     await writeFile(join(dir, "sub", "input.txt"), "anchor\n", "utf8");
     await writeFile(join(dir, "large.txt"), "x".repeat(1024 * 1024 + 2), "utf8");
@@ -160,13 +160,13 @@ describe("ToolRegistry and builtin tools", () => {
     const largeSearch = await toolRegistry.execute({ id: "search-large", name: "search", input: { path: "large.txt", query: "x" } }, untrackedContext);
     expect(largeSearch.output?.matches).toEqual([]);
 
-    const packageArrayDir = await mkdtemp(join(tmpdir(), "fluxcode-tools-package-array-"));
+    const packageArrayDir = await mkdtemp(join(tmpdir(), "lattecode-tools-package-array-"));
     await writeFile(join(packageArrayDir, "package.json"), "[]", "utf8");
     await writeFile(join(packageArrayDir, "tsconfig.json"), "{}", "utf8");
     const manifest = await toolRegistry.execute({ id: "manifest", name: "read_project_manifest", input: { path: "." } }, { cwd: packageArrayDir, sessionId: "s3", maxOutputBytes: 100 });
     expect(manifest.output?.declaredCommands).toEqual([]);
     expect(manifest.output?.configFiles).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "tsconfig.json" })]));
-    const packageNoScriptsDir = await mkdtemp(join(tmpdir(), "fluxcode-tools-package-no-scripts-"));
+    const packageNoScriptsDir = await mkdtemp(join(tmpdir(), "lattecode-tools-package-no-scripts-"));
     await writeFile(join(packageNoScriptsDir, "package.json"), JSON.stringify({ name: "fixture" }), "utf8");
     const manifestNoScripts = await toolRegistry.execute({ id: "manifest-no-scripts", name: "read_project_manifest", input: { path: "." } }, { cwd: packageNoScriptsDir, sessionId: "s4", maxOutputBytes: 100 });
     expect(manifestNoScripts.output?.declaredCommands).toEqual([]);

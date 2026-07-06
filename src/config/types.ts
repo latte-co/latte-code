@@ -132,7 +132,7 @@ export interface CoverageConfig {
   exclude: string[];
 }
 
-export interface FluxcodeConfig {
+export interface LattecodeConfig {
   schemaVersion: 1;
   models: ModelConfig;
   runtime: RuntimeConfig;

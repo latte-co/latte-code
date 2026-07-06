@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-本文定义 Fluxcode `v0.1` 至 `v0.5` 的渐进路线。文件名保留 `runtime-kernel-roadmap` 是为了维持现有索引稳定；内容已调整为 code-agent-first：先做基础可工作的 local-first code agent，再逐步演进到 harness-native runtime。
+本文定义 Lattecode `v0.1` 至 `v0.5` 的渐进路线。文件名保留 `runtime-kernel-roadmap` 是为了维持现有索引稳定；内容已调整为 code-agent-first：先做基础可工作的 local-first code agent，再逐步演进到 harness-native runtime。
 
 英文对应文档：[`docs/en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../../../en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md)。
 
@@ -16,11 +16,11 @@ v0.1 Basic Working Code Agent
   -> v0.5 Harness-native Runtime Hardening
 ```
 
-参考系：Fluxcode externally 是 code agent `Data Plane`；`Control Plane Authority` 仅指 Fluxcode internal runtime authority，并且只在 runtime 结构逐步形成后成立。
+参考系：Lattecode externally 是 code agent `Data Plane`；`Control Plane Authority` 仅指 Lattecode internal runtime authority，并且只在 runtime 结构逐步形成后成立。
 
 ## 2. 核心原则
 
-- 先证明 Fluxcode 能作为 code agent 完成真实代码任务，再沉淀 runtime 抽象。
+- 先证明 Lattecode 能作为 code agent 完成真实代码任务，再沉淀 runtime 抽象。
 - v0.1 不要求完整 `ActionGraph`、`StateStore`、`Scheduler`、`EffectLedger`、`TransactionManager` 或 `Reconciler`。
 - 从第一天起保留可追溯执行记录，避免未来无法演进。
 - 工具调用、文件修改和验证结果必须能被复盘。
@@ -55,13 +55,13 @@ v0.1 Basic Working Code Agent
 
 ### 目标
 
-`v0.1` 应证明 Fluxcode 能在本地仓库中完成一个真实代码任务：理解上下文、修改文件、运行验证、汇报结果。
+`v0.1` 应证明 Lattecode 能在本地仓库中完成一个真实代码任务：理解上下文、修改文件、运行验证、汇报结果。
 
-实现形态应以 Claude Code 类系统的 conversation-native query loop 为基础，但增加 Fluxcode 自己的 phase artifact boundary。也就是说，模型仍通过 ReAct 与工具交互；阶段完成必须提交 `TaskSpec`、`ContextPack`、`ChangePlan`、`PatchSummary`、`VerificationResult` 或 `AgentHandoff` 等结构化对象。
+实现形态应以 Claude Code 类系统的 conversation-native query loop 为基础，但增加 Lattecode 自己的 phase artifact boundary。也就是说，模型仍通过 ReAct 与工具交互；阶段完成必须提交 `TaskSpec`、`ContextPack`、`ChangePlan`、`PatchSummary`、`VerificationResult` 或 `AgentHandoff` 等结构化对象。
 
 ### 必须建立的能力
 
-- CLI：`fluxcode run` / resume / show / list 等最小 headless 入口。
+- CLI：`lattecode run` / resume / show / list 等最小 headless 入口。
 - Config：project-local JSONC 配置覆盖 models、runtime、tools、permissions、session、commands、skills、MCP，且不存 secrets。
 - `AGENTS.md` loader：读取 repo root / cwd 边界内约束，记录 snapshot/hash，进入 context snapshot。
 - Session lifecycle：create / list / show / resume；stable session id；cwd / repo root 固定；`TaskRunState.status` 仅使用 `queued`、`running`、`waiting_permission`、`blocked`、`failed`、`completed`。
@@ -84,7 +84,7 @@ v0.1 Basic Working Code Agent
 ### 验收方向
 
 - 能完成至少一个端到端代码修改任务。
-- `fluxcode run "实现一个贪吃蛇游戏"` 这类命令能够进入真实 agent loop；如果目标仓库具备应用和测试基础，应产出代码、测试和验证结果。
+- `lattecode run "实现一个贪吃蛇游戏"` 这类命令能够进入真实 agent loop；如果目标仓库具备应用和测试基础，应产出代码、测试和验证结果。
 - 如果仓库缺少实现目标所需的框架、测试或依赖决策，应明确请求用户确认，不能静默 scaffold 或安装依赖。
 - 每次工具调用和文件修改有可读记录。
 - 验证命令、结果和失败信息被记录。
@@ -138,7 +138,7 @@ MCP、skills、commands 在 `v0.1` 已作为最小入口或桥接能力出现。
 - `OverlayRevision` / transaction lite：把 patch 批次、effect ids、验证新鲜度和 rollback handle 绑定到同一 transaction boundary。
 - `transaction_gate`：commit 前检查验证新鲜度、overlay 状态、不可补偿 effect 的 approval 状态和 rollback 条件。
 - Recovery / reconcile boundary：partial effect、failed effect、stale fact、invalid overlay 或 rollback handle 缺失时，进入 blocked / needs_reconcile / human handoff，而不是继续自动执行。
-- Compatibility / extension boundary：MCP、plugin、skills、hooks、LSP 等外部 capability 如被引入，必须转换为 Fluxcode `CapabilityDescriptor`，并进入 validation、permission、evidence、trace、effect 和 transaction 管线；只读 LSP 可作为低风险 compatibility lane，code action 写入后置。
+- Compatibility / extension boundary：MCP、plugin、skills、hooks、LSP 等外部 capability 如被引入，必须转换为 Lattecode `CapabilityDescriptor`，并进入 validation、permission、evidence、trace、effect 和 transaction 管线；只读 LSP 可作为低风险 compatibility lane，code action 写入后置。
 - `OpenTUI` adapter evaluation gate：仅作为 `v0.4+` side gate 评估 future cockpit / `ActionGraph` surface 需求、安装负担、native build 可靠性和 fallback 行为；不作为 `v0.4` release 必交付项、默认依赖或 renderer 选择。
 
 ### 验收方向
@@ -171,7 +171,7 @@ MCP、skills、commands 在 `v0.1` 已作为最小入口或桥接能力出现。
 
 ## 9. 跨版本不变量
 
-- Fluxcode externally remains a code-agent `Data Plane`。
+- Lattecode externally remains a code-agent `Data Plane`。
 - `Control Plane Authority` 必须限定为 internal runtime authority。
 - v0.1 优先交付基础可工作 agent，不追求完整 runtime。
 - 每个阶段只引入当前问题所需的最小抽象。

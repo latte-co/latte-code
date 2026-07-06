@@ -1,12 +1,12 @@
 {
-  "name": "fluxcode",
+  "name": "@latte-co/lattecode",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Local-first TypeScript code agent prototype with graph-ready boundaries.",
   "license": "Apache-2.0",
   "bin": {
-    "fluxcode": "dist/bin/fluxcode.js"
+    "lattecode": "dist/bin/lattecode.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -178,7 +178,7 @@ export function writeFileTool(): ToolDefinition {
 export function readProjectManifestTool(): ToolDefinition {
   return {
     name: "read_project_manifest",
-    description: "Read a summary of local package, TypeScript, test, and Fluxcode manifest files.",
+    description: "Read a summary of local package, TypeScript, test, and Lattecode manifest files.",
     inputSchema: { type: "object", additionalProperties: false, properties: { path: { type: "string" } } },
     outputSchema: { type: "object" },
     riskLevel: "low",
@@ -361,7 +361,7 @@ async function readProjectManifest(root: string): Promise<{ summary: JsonObject;
   const configFiles: { path: string; kind: string }[] = [];
   const packageJson = await readJson(join(root, "package.json"));
   if (packageJson !== undefined) configFiles.push({ path: join(root, "package.json"), kind: "package.json" });
-  for (const file of ["tsconfig.json", "vitest.config.ts", "vitest.config.js", "fluxcode.config.jsonc", "fluxcode.config.example.jsonc"]) {
+  for (const file of ["tsconfig.json", "vitest.config.ts", "vitest.config.js", "lattecode.config.jsonc", "lattecode.config.example.jsonc"]) {
     const path = join(root, file);
     if (await exists(path)) configFiles.push({ path, kind: file });
   }

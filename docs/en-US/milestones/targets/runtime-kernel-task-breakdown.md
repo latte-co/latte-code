@@ -2,7 +2,7 @@
 
 ## Status
 
-This is the independent task breakdown for evolving Fluxcode from a basic code agent to a harness-native runtime. The historical file name `runtime-kernel-task-breakdown` is retained to keep existing indexes stable; the content now follows an incremental implementation plan.
+This is the independent task breakdown for evolving Lattecode from a basic code agent to a harness-native runtime. The historical file name `runtime-kernel-task-breakdown` is retained to keep existing indexes stable; the content now follows an incremental implementation plan.
 
 Chinese counterpart: [`docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md`](../../../zh-CN/milestones/targets/runtime-kernel-task-breakdown.md).
 
@@ -16,7 +16,7 @@ v0.1 Basic working code agent
   -> v0.5 Harness-native runtime hardening
 ```
 
-Shared premise: Fluxcode is externally a code-agent `Data Plane`; internal `Control Plane Authority` only means Fluxcode internal runtime authority, and is a gradually formed target.
+Shared premise: Lattecode is externally a code-agent `Data Plane`; internal `Control Plane Authority` only means Lattecode internal runtime authority, and is a gradually formed target.
 
 ## 2. `v0.1`: Basic Working Code Agent
 
@@ -30,7 +30,7 @@ Shared premise: Fluxcode is externally a code-agent `Data Plane`; internal `Cont
 | `v0.1-phase-gated-react` | Implement phase-gated ReAct on the existing query loop: tool loops are allowed inside phases, and phase completion validates structured artifacts | `v0.1-cli-config-contract`, `v0.1-session-management` | `Understand`, `Plan`, `Edit`, and `Verify` can use ReAct but must produce schema-valid objects |
 | `v0.1-built-in-tools` | Establish minimal built-in tools: read/search/edit/write/shell/manifest/minimal diff summary, retaining tool contract | `v0.1-phase-gated-react` | Tools declare schema, read-only / mutating status, permission requirements, risk level, and result summary; P0 diff only emits changed files / diff summary, and dangerous tools do not execute naked |
 | `v0.1-permission-pipeline` | Establish allow / deny / ask permission pipeline and write decisions into events and trace | `v0.1-built-in-tools` | Unauthorized command or path access blocks / asks instead of continuing |
-| `v0.1-minimal-mcp-bridge` | Implement minimal MCP bridge: config-defined servers, list/call tools, disabled by default or explicitly enabled | `v0.1-built-in-tools`, `v0.1-permission-pipeline` | MCP tools map into Fluxcode tool contract and enter permission / evidence / trace / session; no permission bypass |
+| `v0.1-minimal-mcp-bridge` | Implement minimal MCP bridge: config-defined servers, list/call tools, disabled by default or explicitly enabled | `v0.1-built-in-tools`, `v0.1-permission-pipeline` | MCP tools map into Lattecode tool contract and enter permission / evidence / trace / session; no permission bypass |
 | `v0.1-local-skill-loader` | Implement local skill loader: load local instruction / workflow / command bundles into context / prompt registry | `v0.1-agents-loader`, `v0.1-session-management` | Skills cannot directly execute side effects; no hub, install, publish, or marketplace |
 | `v0.1-local-command-specs` | Implement built-in / local command specs: command -> `TaskSpec` / phase event / session | `v0.1-cli-config-contract`, `v0.1-session-management` | Commands do not bypass agent-loop, permission, or session |
 | `v0.1-evidence-trace-binding` | Bind `StepTrace`, `Evidence`, tool invocation, shell output summary, file edit summary, and verification result | `v0.1-permission-pipeline`, `v0.1-minimal-mcp-bridge`, `v0.1-local-skill-loader`, `v0.1-local-command-specs` | Final report can trace each key action; tools, file changes, and verification results have evidence refs |
@@ -129,7 +129,7 @@ Shared premise: Fluxcode is externally a code-agent `Data Plane`; internal `Cont
 ### Non-goals
 
 - Replacing runtime invariants with benchmark scores.
-- Describing Fluxcode as external CI / review / deployment gate.
+- Describing Lattecode as external CI / review / deployment gate.
 - Letting external protocols write directly into internal `StateStore`, `EffectLedger`, or `TransactionManager`.
 - Making cockpit hardening or `OpenTUI` a default `v0.5` dependency before `ActionGraph` becomes a real UX surface.
 

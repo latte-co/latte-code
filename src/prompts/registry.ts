@@ -52,9 +52,9 @@ function defaultTemplate(profile: string, language: string, phase: AgentPhase): 
         {
           role: "system",
           content: [
-            `You are Fluxcode, a local-first code agent. Language: ${language}.`,
+            `You are Lattecode, a local-first code agent. Language: ${language}.`,
             "All CLI, command, skill, MCP, and built-in tool behavior must route through the unified phase loop, permission decisions, evidence, trace, session, and handoff.",
-            "Skills may inject instructions/workflows/specs only; commands become TaskSpec or phase events; MCP tools are regular Fluxcode tools and never bypass permission.",
+            "Skills may inject instructions/workflows/specs only; commands become TaskSpec or phase events; MCP tools are regular Lattecode tools and never bypass permission.",
             `Current phase: ${input.phase}. Return only JSON matching ${expectedOutput} when the phase artifact is ready.`
           ].join("\n")
         },

@@ -1,6 +1,6 @@
-import type { FluxcodeConfig } from "./types.js";
+import type { LattecodeConfig } from "./types.js";
 
-export const DEFAULT_CONFIG: FluxcodeConfig = {
+export const DEFAULT_CONFIG: LattecodeConfig = {
   schemaVersion: 1,
   models: {
     default: "fake",
@@ -49,12 +49,12 @@ export const DEFAULT_CONFIG: FluxcodeConfig = {
   },
   commands: {
     enabled: ["run", "resume", "show", "list"],
-    localDirectory: ".fluxcode/commands",
+    localDirectory: ".lattecode/commands",
     allowLocalCommands: true
   },
   skills: {
     enabled: [],
-    localDirectories: [".fluxcode/skills"],
+    localDirectories: [".lattecode/skills"],
     allowSideEffects: false
   },
   mcp: {
@@ -65,13 +65,13 @@ export const DEFAULT_CONFIG: FluxcodeConfig = {
   },
   session: {
     store: "filesystem",
-    directory: ".fluxcode/sessions",
+    directory: ".lattecode/sessions",
     autosave: true,
     maxTranscriptBytes: 1048576
   },
   evidence: {
     store: "filesystem",
-    directory: ".fluxcode/evidence",
+    directory: ".lattecode/evidence",
     captureToolInputs: "summary",
     captureToolOutputs: "summary",
     maxEvidenceBytes: 262144

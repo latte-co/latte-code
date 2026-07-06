@@ -2,7 +2,7 @@
 
 ## Status
 
-This document defines Fluxcode's evolution path from `v0.1` through `v0.5`. The historical file name `runtime-kernel-roadmap` is retained to keep existing indexes stable; the content now follows a code-agent-first approach: first build a basic working local-first code agent, then gradually evolve it into a harness-native runtime.
+This document defines Lattecode's evolution path from `v0.1` through `v0.5`. The historical file name `runtime-kernel-roadmap` is retained to keep existing indexes stable; the content now follows a code-agent-first approach: first build a basic working local-first code agent, then gradually evolve it into a harness-native runtime.
 
 Chinese counterpart: [`docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../../../zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md).
 
@@ -16,11 +16,11 @@ v0.1 Basic Working Code Agent
   -> v0.5 Harness-native Runtime Hardening
 ```
 
-Reference frame: Fluxcode is externally a code-agent `Data Plane`; `Control Plane Authority` only means Fluxcode internal runtime authority, and only after runtime structure forms incrementally.
+Reference frame: Lattecode is externally a code-agent `Data Plane`; `Control Plane Authority` only means Lattecode internal runtime authority, and only after runtime structure forms incrementally.
 
 ## 2. Core Principles
 
-- First prove Fluxcode can complete real coding tasks as a code agent, then extract runtime abstractions.
+- First prove Lattecode can complete real coding tasks as a code agent, then extract runtime abstractions.
 - `v0.1` does not require a full `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, or `Reconciler`.
 - Keep traceable execution records from day one, so later evolution is possible.
 - Tool calls, file changes, and verification results must be reviewable.
@@ -55,13 +55,13 @@ Shared boundary: runtime core must not import `react`, `ink`, or `@opentui/*`; t
 
 ### Goal
 
-`v0.1` should prove Fluxcode can complete a real coding task in a local repository: understand context, modify files, run verification, and report results.
+`v0.1` should prove Lattecode can complete a real coding task in a local repository: understand context, modify files, run verification, and report results.
 
-The implementation should build on a Claude Code style conversation-native query loop, but add Fluxcode's own phase artifact boundary. The model still interacts with tools through ReAct; phase completion requires structured objects such as `TaskSpec`, `ContextPack`, `ChangePlan`, `PatchSummary`, `VerificationResult`, or `AgentHandoff`.
+The implementation should build on a Claude Code style conversation-native query loop, but add Lattecode's own phase artifact boundary. The model still interacts with tools through ReAct; phase completion requires structured objects such as `TaskSpec`, `ContextPack`, `ChangePlan`, `PatchSummary`, `VerificationResult`, or `AgentHandoff`.
 
 ### Required Capabilities
 
-- CLI: minimal headless entries such as `fluxcode run`, resume, show, and list.
+- CLI: minimal headless entries such as `lattecode run`, resume, show, and list.
 - Config: project-local JSONC config for models, runtime, tools, permissions, session, commands, skills, and MCP, with no secrets storage.
 - `AGENTS.md` loader: read constraints within repo root / cwd boundaries, record snapshot/hash, and enter context snapshot.
 - Session lifecycle: create / list / show / resume; stable session id; fixed cwd / repo root; `TaskRunState.status` only uses `queued`, `running`, `waiting_permission`, `blocked`, `failed`, `completed`.
@@ -84,8 +84,8 @@ The implementation should build on a Claude Code style conversation-native query
 ### Acceptance Direction
 
 - Complete at least one end-to-end coding task.
-- Commands such as `fluxcode run "implement a snake game"` enter the real agent loop; if the target repository has the application and test foundation, they produce code, tests, and verification results.
-- If the repository lacks required framework, test, or dependency decisions, Fluxcode asks for confirmation instead of silently scaffolding or installing dependencies.
+- Commands such as `lattecode run "implement a snake game"` enter the real agent loop; if the target repository has the application and test foundation, they produce code, tests, and verification results.
+- If the repository lacks required framework, test, or dependency decisions, Lattecode asks for confirmation instead of silently scaffolding or installing dependencies.
 - Every tool call and file change has a readable record.
 - Verification command, result, and failure information are recorded.
 - The final report lets users judge what changed, why, and whether it was verified.
@@ -128,7 +128,7 @@ The implementation should build on a Claude Code style conversation-native query
 
 ## 7. `v0.4`: Controlled Effects, Transactions, and Recovery
 
-The `v0.4` runtime mainline stays aligned with the formal architecture and runtime-evolution modules: after the `v0.1` through `v0.3` foundations for tools, trace, evidence, facts, context, and permissions are stable, Fluxcode introduces effect declarations, overlay / transaction lite, transaction gates, and basic recovery / reconcile semantics. The goal is to make mutating actions auditable, blockable, recoverable, or handoff-ready; it is not to make ecosystem extensibility the main delivery theme for this stage.
+The `v0.4` runtime mainline stays aligned with the formal architecture and runtime-evolution modules: after the `v0.1` through `v0.3` foundations for tools, trace, evidence, facts, context, and permissions are stable, Lattecode introduces effect declarations, overlay / transaction lite, transaction gates, and basic recovery / reconcile semantics. The goal is to make mutating actions auditable, blockable, recoverable, or handoff-ready; it is not to make ecosystem extensibility the main delivery theme for this stage.
 
 MCP, skills, and commands already appear in `v0.1` as minimal entries or bridge capabilities. `v0.4` is not their first delivery stage; it hardens extension / effect / transaction boundaries. Any MCP, plugin, skills, hooks, LSP, or similar capability must enter the same capability schema, permission, evidence, trace, effect, and transaction-gate pipeline; it must not bypass the runtime mainline or replace the evolution of `EffectLedger`, `TransactionManager`, or `Reconciler`.
 
@@ -138,7 +138,7 @@ MCP, skills, and commands already appear in `v0.1` as minimal entries or bridge 
 - `OverlayRevision` / transaction lite: bind patch batches, effect ids, verification freshness, and rollback handles into one transaction boundary.
 - `transaction_gate`: before commit, check verification freshness, overlay status, approval status for non-compensable effects, and rollback conditions.
 - Recovery / reconcile boundary: partial effects, failed effects, stale facts, invalid overlays, or missing rollback handles enter blocked / needs_reconcile / human handoff instead of continuing automatically.
-- Compatibility / extension boundary: if MCP, plugins, skills, hooks, LSP, or similar external capabilities are introduced, they must be converted into Fluxcode `CapabilityDescriptor` records and routed through validation, permission, evidence, trace, effect, and transaction pipelines; read-only LSP may remain a low-risk compatibility lane, while code-action writes are deferred.
+- Compatibility / extension boundary: if MCP, plugins, skills, hooks, LSP, or similar external capabilities are introduced, they must be converted into Lattecode `CapabilityDescriptor` records and routed through validation, permission, evidence, trace, effect, and transaction pipelines; read-only LSP may remain a low-risk compatibility lane, while code-action writes are deferred.
 - `OpenTUI` adapter evaluation gate: only a `v0.4+` side gate to evaluate future cockpit / `ActionGraph` surface needs, install burden, native build reliability, and fallback behavior; it is not a required `v0.4` release deliverable, default dependency, or renderer choice.
 
 ### Acceptance Direction
@@ -171,7 +171,7 @@ MCP, skills, and commands already appear in `v0.1` as minimal entries or bridge 
 
 ## 9. Cross-version Invariants
 
-- Fluxcode externally remains a code-agent `Data Plane`.
+- Lattecode externally remains a code-agent `Data Plane`.
 - `Control Plane Authority` must be scoped to internal runtime authority.
 - `v0.1` prioritizes a basic working agent, not a full runtime.
 - Each stage introduces only the minimal abstraction needed for current problems.

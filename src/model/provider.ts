@@ -1,11 +1,11 @@
 import { providerTypeStatus } from "../config/types.js";
-import type { FluxcodeConfig } from "../config/types.js";
+import type { LattecodeConfig } from "../config/types.js";
 import { FakeModelClient } from "./fake.js";
 import { OpenAICompatibleModelClient } from "./openai-compatible.js";
 import type { ModelClient, ModelTurn } from "./types.js";
 
 export interface CreateModelClientOptions {
-  config: FluxcodeConfig;
+  config: LattecodeConfig;
   env?: NodeJS.ProcessEnv;
   fakeScript?: readonly (ModelTurn | Error)[];
   fetch?: typeof fetch;
@@ -20,7 +20,7 @@ export function createModelClient(options: CreateModelClientOptions): ModelClien
   }
   if (provider.type === "fake") {
     if (options.fakeScript === undefined) {
-      throw new Error(`Provider '${providerId}' is the scripted fake provider but no fakeScript was supplied. Configure a real model provider via --config, ~/.fluxcode/fluxcode.jsonc, or .fluxcode/fluxcode.jsonc, or pass an explicit fakeScript in tests.`);
+      throw new Error(`Provider '${providerId}' is the scripted fake provider but no fakeScript was supplied. Configure a real model provider via --config, ~/.lattecode/lattecode.jsonc, or .lattecode/lattecode.jsonc, or pass an explicit fakeScript in tests.`);
     }
     return new FakeModelClient(options.fakeScript);
   }

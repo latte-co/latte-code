@@ -73,7 +73,7 @@ function happyScript(summary = "done"): ModelTurn[] {
 
 describe("AgentLoop integration", () => {
   it("runs fake-model tool call through permission, execution, evidence and final response", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-"));
     await writeFile(join(dir, "note.txt"), "hello agent", "utf8");
     const model = new FakeModelClient([
       task("read note"),
@@ -94,14 +94,14 @@ describe("AgentLoop integration", () => {
   });
 
   it("accepts fenced JSON phase artifacts from model responses", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-fenced-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-fenced-"));
     const fencedTask: ModelTurn = { type: "message", content: `\`\`\`json\n${JSON.stringify({ objective: "fenced", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] })}\n\`\`\`` };
     const { loop } = createLoop(dir, new FakeModelClient([fencedTask, context(), plan(), patch(), verification(), handoff("fenced done")]));
     await expect(loop.run({ input: "fenced" })).resolves.toMatchObject({ status: "completed", finalResponse: "fenced done" });
   });
 
   it("resumes an existing session snapshot by id", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-resume-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-resume-"));
     const model = new FakeModelClient([...happyScript("first"), ...happyScript("second")]);
     const { loop } = createLoop(dir, model);
     const first = await loop.run({ input: "one", sessionId: "fixed" });
@@ -111,7 +111,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("replays event log after snapshot cursor when opening an existing session", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-replay-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-replay-"));
     const model = new FakeModelClient(happyScript("after replay"));
     const { loop, events, sessions } = createLoop(dir, model);
     await events.append("session.created", "stale", { sessionId: "stale" });
@@ -125,7 +125,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("recovers an existing session from event log when the snapshot is missing", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-log-recover-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-log-recover-"));
     const model = new FakeModelClient(happyScript("after log recovery"));
     const { loop, events } = createLoop(dir, model);
     await events.append("session.created", "log-only", { sessionId: "log-only" });
@@ -136,7 +136,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("pauses mutating write for confirmation by default", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-ask-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-ask-"));
     const model = new FakeModelClient([task("write"), context(), plan(), { type: "tool_calls", toolCalls: [{ id: "c2", name: "write_file", input: { path: "out.txt", content: "unsafe" } }] }]);
     const { loop } = createLoop(dir, model);
     const result = await loop.run({ input: "write" });
@@ -146,7 +146,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("denies dangerous shell commands and does not execute them", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-deny-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-deny-"));
     const model = new FakeModelClient([task("delete"), context(), plan(), patch(), { type: "tool_calls", toolCalls: [{ id: "c3", name: "shell_exec", input: { command: "rm -rf important" } }] }]);
     const { loop } = createLoop(dir, model);
     const result = await loop.run({ input: "delete" });
@@ -156,7 +156,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("asks for shell commands matching requireApprovalFor even when generic mutating shell is allowed", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-shell-ask-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-shell-ask-"));
     const model = new FakeModelClient([task("network"), context(), plan(), patch(), { type: "tool_calls", toolCalls: [{ id: "c3b", name: "shell_exec", input: { command: "curl https://example.com" } }] }]);
     const { loop } = createLoop(dir, model, { permissions: { mutatingTools: "allow" }, tools: { shell: { requireApprovalFor: ["network"] } } });
     const result = await loop.run({ input: "network" });
@@ -165,7 +165,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("records invalid tool parameters without executing the tool", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-invalid-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-invalid-"));
     const model = new FakeModelClient([
       task("bad"),
       { type: "tool_calls", toolCalls: [{ id: "c4", name: "read_file", input: { missing: "path" } }] },
@@ -182,7 +182,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("executes Step 4 edit_file and requires git_diff before changed-file handoff", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-step4-edit-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-step4-edit-"));
     await execFileAsync("git", ["init"], { cwd: dir });
     await writeFile(join(dir, "target.txt"), "before\n", "utf8");
     const model = new FakeModelClient([
@@ -204,7 +204,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("finalizes release handoff with canonical verification, trace, evidence, and changed files", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-release-handoff-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-release-handoff-"));
     await execFileAsync("git", ["init"], { cwd: dir });
     await writeFile(join(dir, "target.txt"), "before\n", "utf8");
     const model = new FakeModelClient([
@@ -229,7 +229,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("blocks write_file through read_before_write_gate when overwrite intent is unsafe", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-read-before-write-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-read-before-write-"));
     await writeFile(join(dir, "target.txt"), "before\n", "utf8");
     const model = new FakeModelClient([
       task("unsafe overwrite"),
@@ -246,7 +246,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("repairs an invalid phase artifact before advancing", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-repair-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-repair-"));
     const model = new FakeModelClient([
       { type: "message", content: "not json" },
       task("repaired"),
@@ -264,7 +264,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("resumes a waiting permission with the same permission id and binds tool evidence to the run", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-resume-permission-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-resume-permission-"));
     await execFileAsync("git", ["init"], { cwd: dir });
     const model = new FakeModelClient([
       task("write and resume"),
@@ -288,7 +288,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("resumes a blocked question and continues the current phase", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-resume-question-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-resume-question-"));
     const model = new FakeModelClient([
       task("needs context"),
       context({ openQuestions: ["Which file?"] }),
@@ -309,7 +309,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("maps mismatched resume inputs and denied permission resume to blocked handoff contracts", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-resume-negative-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-resume-negative-"));
     const questionLoop = createLoop(dir, new FakeModelClient([task("needs context"), context({ openQuestions: ["Which file?"] })])).loop;
     const blocked = await questionLoop.run({ input: "needs context" });
     const mismatch = await questionLoop.resume({ sessionId: blocked.session.id, input: { kind: "permission", permissionId: "wrong", decision: "approve" } });
@@ -339,7 +339,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("covers resume edge states and recovery repairs without changing run semantics", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-resume-edges-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-resume-edges-"));
     const { loop, sessions } = createLoop(dir, new FakeModelClient([...happyScript("after repaired question"), patch(), verification(), handoff("after pending call"), patch(), verification(), handoff("after missing pending call")]), { permissions: { mutatingTools: "allow" } });
     const noPending = await loop.resume({ sessionId: "new-session", input: { kind: "question", questionId: "q", answerText: "answer" } });
     expect(noPending.status).toBe("blocked");
@@ -375,7 +375,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("covers release gate validation failures as blocked repair prompts", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-gate-edges-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-gate-edges-"));
     const missingVerification = createLoop(dir, new FakeModelClient([task("verify missing"), context(), plan({ verificationCommands: ["npm test"] }), patch(), artifact([])]), { runtime: { maxRepairTurns: 0 } }).loop;
     const missing = await missingVerification.run({ input: "missing verification" });
     expect(missing.status).toBe("blocked");
@@ -403,7 +403,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("covers tool execution non-error and blocking gate normalization", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-tool-errors-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-tool-errors-"));
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" }, permissions: { mutatingTools: "allow" }, runtime: { maxRepairTurns: 0 } });
     const throwingRegistry = new ToolRegistry();
     throwingRegistry.register({ name: "read_file", description: "throws", inputSchema: { type: "object" }, outputSchema: { type: "object" }, riskLevel: "low", mutating: false, permission: { reason: "read" }, async execute() { throw "non-error tool failure"; } });
@@ -429,7 +429,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("blocks before model execution when preserved context exceeds budget", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-context-budget-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-context-budget-"));
     const { loop } = createLoop(dir, new FakeModelClient(happyScript("unused")), { context: { maxPromptBytes: 10, maxToolResultBytes: 5 } });
     const result = await loop.run({ input: "budget" });
     expect(result.status).toBe("blocked");
@@ -437,7 +437,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("blocks when runtime context sources fail before prompt execution", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-context-source-fail-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-context-source-fail-"));
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" }, agents: { agentsFile: join(dir, "AGENTS.md") } });
     const loop = new AgentLoop({ cwd: dir, config, model: new FakeModelClient(happyScript("unused")), registry: createDefaultRegistry(config), permissions: new PermissionPolicy(config.permissions, config.tools.shell), sessions: new InMemorySessionStore(), events: new InMemoryEventLog(), evidence: new InMemoryEvidenceStore(), loadContextSources: () => loadRuntimeContextSources(dir, config) });
     const result = await loop.run({ input: "load context" });
@@ -446,7 +446,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("fails recovery with an explicit failed handoff when persisted run state is incomplete", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-recovery-fallback-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-recovery-fallback-"));
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
     const sessions = new InMemorySessionStore();
     const run = createTaskRunState("corrupt", "recover", "run_corrupt");
@@ -482,11 +482,11 @@ describe("AgentLoop integration", () => {
   });
 
   it("injects AGENTS.md snapshots into context without untracked prompt text", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-agents-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-agents-"));
     await mkdir(join(dir, ".git"));
-    await mkdir(join(dir, ".fluxcode", "skills", "safe"), { recursive: true });
+    await mkdir(join(dir, ".lattecode", "skills", "safe"), { recursive: true });
     await writeFile(join(dir, "AGENTS.md"), "# Agent Rules\n\n- Preserve permission gates.\n", "utf8");
-    await writeFile(join(dir, ".fluxcode", "skills", "safe", "skill.json"), JSON.stringify({ name: "safe", instructions: "Use safe skill instructions." }), "utf8");
+    await writeFile(join(dir, ".lattecode", "skills", "safe", "skill.json"), JSON.stringify({ name: "safe", instructions: "Use safe skill instructions." }), "utf8");
     const model = new FakeModelClient(happyScript("agents loaded"));
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" }, skills: { enabled: ["safe"] } });
     const loop = new AgentLoop({ cwd: dir, config, model, registry: createDefaultRegistry(config), permissions: new PermissionPolicy(config.permissions, config.tools.shell), sessions: new InMemorySessionStore(), events: new InMemoryEventLog(), evidence: new InMemoryEvidenceStore(), loadContextSources: () => loadRuntimeContextSources(dir, config) });
@@ -499,9 +499,9 @@ describe("AgentLoop integration", () => {
   });
 
   it("routes local commands to TaskSpec and continues through the phase runner", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-command-"));
-    await mkdir(join(dir, ".fluxcode", "commands"), { recursive: true });
-    await writeFile(join(dir, ".fluxcode", "commands", "fix.json"), JSON.stringify({
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-command-"));
+    await mkdir(join(dir, ".lattecode", "commands"), { recursive: true });
+    await writeFile(join(dir, ".lattecode", "commands", "fix.json"), JSON.stringify({
       name: "fix",
       description: "Fix a target",
       task: { objective: "Fix {{args}}", scope: ["workspace"], acceptance: ["done"], nonGoals: ["no direct tools"], constraints: ["route through loop"], blockers: [] }
@@ -518,7 +518,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("routes enabled MCP tools through permission, evidence, trace, and session", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-mcp-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-mcp-"));
     const config = mergeConfig(DEFAULT_CONFIG, {
       session: { store: "memory" },
       evidence: { store: "memory" },
@@ -542,7 +542,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("wraps agent loop as a graph-ready NodeExecutor", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-node-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-node-"));
     const model = new FakeModelClient(happyScript("node done"));
     const { loop } = createLoop(dir, model);
     const executor = new AgentNodeExecutor(loop);
@@ -553,7 +553,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("NodeExecutor reports pending permission as concern", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-node-wait-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-node-wait-"));
     const model = new FakeModelClient([task("write"), context(), plan(), { type: "tool_calls", toolCalls: [{ id: "c5", name: "write_file", input: { path: "x", content: "y" } }] }]);
     const { loop } = createLoop(dir, model);
     const result = await new AgentNodeExecutor(loop).execute({ input: "write", contract: { nodeId: "N", goal: "g", allowedTools: ["write_file"], acceptance: [] } });
@@ -562,7 +562,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("NodeExecutor enforces node contract allowedTools", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-node-tools-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-node-tools-"));
     const model = new FakeModelClient([task("write"), context(), plan(), { type: "tool_calls", toolCalls: [{ id: "c6", name: "write_file", input: { path: "x", content: "y" } }] }]);
     const { loop, events } = createLoop(dir, model);
     const result = await new AgentNodeExecutor(loop).execute({ input: "write", contract: { nodeId: "N", goal: "g", allowedTools: ["read_file"], acceptance: [] } });
@@ -574,7 +574,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("NodeExecutor reports failed loop errors as concerns", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-node-fail-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-node-fail-"));
     const { loop } = createLoop(dir, new FakeModelClient([new Error("provider down")]));
     const result = await new AgentNodeExecutor(loop).execute({ input: "fail", contract: { nodeId: "N", goal: "g", allowedTools: [], acceptance: [] } });
     expect(result.status).toBe("failed");
@@ -586,7 +586,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("NodeExecutor forwards an optional session id", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-node-session-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-node-session-"));
     const model = new FakeModelClient([...happyScript("first"), ...happyScript("second")]);
     const { loop } = createLoop(dir, model);
     const executor = new AgentNodeExecutor(loop);
@@ -596,7 +596,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("fails safely when the model provider throws", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-fail-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-fail-"));
     const model = new FakeModelClient([new Error("provider down")]);
     const { loop } = createLoop(dir, model);
     const result = await loop.run({ input: "fail" });
@@ -606,7 +606,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("normalizes non-Error provider failures", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-string-fail-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-string-fail-"));
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
     const model = { async generate() { throw "string failure"; } };
     const loop = new AgentLoop({ cwd: dir, config, model, registry: createDefaultRegistry(config), permissions: new PermissionPolicy(config.permissions, config.tools.shell), sessions: new InMemorySessionStore(), events: new InMemoryEventLog(), evidence: new InMemoryEvidenceStore() });
@@ -620,7 +620,7 @@ describe("AgentLoop integration", () => {
   });
 
   it("fails safely when maxTurns is exceeded", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fluxcode-loop-max-"));
+    const dir = await mkdtemp(join(tmpdir(), "lattecode-loop-max-"));
     const model = new FakeModelClient([{ type: "tool_calls", toolCalls: [] }, { type: "tool_calls", toolCalls: [] }]);
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
     const loop = new AgentLoop({ cwd: dir, config, model, registry: new ToolRegistry(), permissions: new PermissionPolicy(config.permissions, config.tools.shell), sessions: new InMemorySessionStore(), events: new InMemoryEventLog(), evidence: new InMemoryEvidenceStore(), maxTurns: 1 });
