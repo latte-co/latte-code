@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local-first TypeScript code agent prototype with graph-ready boundaries.",
+  "description": "TypeScript code agent prototype with local tools and provider adapters.",
   "license": "Apache-2.0",
   "bin": {
     "lattecode": "dist/bin/lattecode.js"

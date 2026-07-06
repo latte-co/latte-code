@@ -9,9 +9,7 @@ export const DEFAULT_CONFIG: LattecodeConfig = {
     }
   },
   runtime: {
-    maxPhaseSteps: 8,
-    maxRepairTurns: 1,
-    stopOnVerificationFailure: true
+    maxTurns: 8
   },
   prompts: {
     profile: "default-code-agent-v1",
@@ -26,8 +24,8 @@ export const DEFAULT_CONFIG: LattecodeConfig = {
   context: {
     maxPromptBytes: 120000,
     maxToolResultBytes: 32768,
-    recentStepCount: 6,
-    preserve: ["task", "acceptance", "constraints", "changedFiles", "verification"]
+    recentTurnCount: 6,
+    preserve: ["request", "acceptance", "constraints", "changedFiles", "verification"]
   },
   permissions: {
     defaultMode: "ask",
@@ -72,16 +70,6 @@ export const DEFAULT_CONFIG: LattecodeConfig = {
   evidence: {
     store: "filesystem",
     directory: ".lattecode/evidence",
-    captureToolInputs: "summary",
-    captureToolOutputs: "summary",
     maxEvidenceBytes: 262144
-  },
-  coverage: {
-    provider: "vitest",
-    statements: 98,
-    branches: 98,
-    functions: 98,
-    lines: 98,
-    exclude: ["tests/**", "src/testing/**", "src/cli/main.ts", "src/index.ts"]
   }
 };

@@ -5,11 +5,9 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/defaults.js";
 import { mergeConfig } from "../../src/config/config.js";
 import { listConfiguredMcpTools, createMcpToolDefinitions } from "../../src/mcp/bridge.js";
-import { createHeadlessRunEnvelopeFromAgentResult, createHeadlessRunEnvelopeFromTaskRunState, createPermissionPendingInput, createQuestionPendingInput, exitCodeForTaskRunStatus, isAgentHandoff, isHeadlessRunEnvelope, isPendingInput, isResumeInput, isTaskRunState, mapLegacyAgentStatus } from "../../src/core/contracts.js";
-import { applyPhaseArtifact, buildBlockedHandoff, buildFailedHandoff, copyTaskRunState, createStepTrace, createTaskRunState, FileTaskRunStore, finalizeAgentHandoff, InMemoryTaskRunStore, setRunPendingInput, setRunStatus } from "../../src/core/run-state.js";
-import { createDefaultPhaseContracts } from "../../src/core/phases.js";
+import { createHeadlessRunEnvelopeFromAgentResult, createHeadlessRunEnvelopeFromTaskRunState, createPermissionPendingInput, createQuestionPendingInput, exitCodeForTaskRunStatus, isAgentHandoff, isHeadlessRunEnvelope, isPendingInput, isResumeInput, isTaskRunState } from "../../src/core/contracts.js";
+import { buildBlockedHandoff, buildFailedHandoff, copyTaskRunState, createTaskRunState, createTurnTrace, finalizeAgentHandoff, setRunPendingInput, setRunStatus } from "../../src/core/run-state.js";
 import { InMemorySessionStore, FileSessionStore, recoverSessionFromEvents } from "../../src/session/session.js";
-import { AgentNodeExecutor, concernFor, summarizeResult } from "../../src/graph-ready/node-executor.js";
 import { AgentLoop } from "../../src/core/agent-loop.js";
 import { FakeModelClient } from "../../src/model/fake.js";
 import { createModelClient } from "../../src/model/provider.js";
@@ -17,7 +15,6 @@ import { ToolRegistry } from "../../src/tools/registry.js";
 import { InMemoryEventLog } from "../../src/events/event-log.js";
 import { InMemoryEvidenceStore } from "../../src/evidence/store.js";
 import { PermissionPolicy } from "../../src/permissions/policy.js";
-import { PromptRegistry } from "../../src/prompts/registry.js";
 import { createAgentLoop } from "../../src/runtime/create-agent.js";
 
 describe("coverage edge contracts for release path", () => {
@@ -47,32 +44,22 @@ describe("coverage edge contracts for release path", () => {
   });
 
   it("covers contract guards and handoff finalization fallbacks", () => {
-    const run = new InMemoryTaskRunStore();
-    expect(run.list()).resolves.toEqual([]);
-    const state = copyTaskRunState({ id: "run", sessionId: "s", status: "running", currentPhase: "verify", verification: [{ command: "npm test", status: "passed", summary: "ok", evidenceRefs: ["ev-v"] }], steps: [{ id: "step", phase: "verify", status: "done", promptId: "p", promptVersion: "1", summary: "done", toolCallIds: [], evidenceIds: ["ev-step"], reactBudget: { maxSteps: 1, usedSteps: 1 } }], patch: { changedFiles: ["a.ts"], diffRefs: [], rationale: "r", evidenceRefs: ["ev-patch"] }, plan: { summary: "p", targetFiles: ["a.ts"], steps: [], verificationCommands: ["npm test"], risks: ["risk"] }, contextSnapshot: { taskInput: "task", messageRefs: [], decisionRefs: [], compactedSummary: "", pinnedConstraints: [] } });
+    const state = copyTaskRunState({ id: "run", sessionId: "s", status: "running", changedFiles: ["a.ts"], changeEvidenceRefs: ["ev-change"], verification: [{ command: "npm test", status: "passed", summary: "ok", evidenceRefs: ["ev-v"] }], turns: [{ id: "turn", status: "done", promptId: "p", promptVersion: "1", summary: "done", toolCallIds: [], evidenceIds: ["ev-turn"], turnBudget: { maxTurns: 1, usedTurns: 1 } }], contextSnapshot: { taskInput: "task", messageRefs: [], decisionRefs: [], compactedSummary: "", pinnedConstraints: [] } });
     const finalized = finalizeAgentHandoff(state, { id: "h", status: "completed", summary: "done", changedFiles: [], verification: [], risks: [], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] });
-    expect(finalized).toMatchObject({ changedFiles: ["a.ts"], risks: ["risk"], traceRefs: ["step"], evidenceRefs: ["ev-step", "ev-patch", "ev-v"] });
+    expect(finalized).toMatchObject({ changedFiles: ["a.ts"], risks: [], traceRefs: ["turn"], evidenceRefs: ["ev-turn", "ev-change", "ev-v"] });
     const pending = createPermissionPendingInput("s", { id: "c", name: "mcp_server_tool", input: {} }, "approve mcp");
     setRunPendingInput(state, pending);
     expect(finalizeAgentHandoff(state, buildBlockedHandoff(state, "blocked", pending)).requiredDecisions).toEqual([{ kind: "permission", id: pending.permissionId, reason: "approve mcp" }]);
     expect(buildFailedHandoff(state, "failed").status).toBe("failed");
     expect(isAgentHandoff({ ...finalized, verification: [{}] })).toBe(false);
     expect(isHeadlessRunEnvelope({ runId: "r", sessionId: "s", status: "completed", handoff: finalized })).toBe(true);
-    expect(isPendingInput({ kind: "question", questionId: "q", phase: "bad", prompt: "p", expectedAnswer: "text" })).toBe(false);
+    expect(isPendingInput({ kind: "question", questionId: "q", prompt: "p", expectedAnswer: "text" })).toBe(true);
     expect(isResumeInput({ kind: "question", questionId: "q", answerJson: () => undefined })).toBe(false);
     expect(isTaskRunState({ ...state, contextSnapshot: { taskInput: "x" } })).toBe(false);
   });
 
-  it("covers file task-run and session stores plus event recovery branches", async () => {
+  it("covers file session stores plus event recovery branches", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lattecode-store-edges-"));
-    const taskRuns = new FileTaskRunStore(join(dir, "runs"));
-    const created = await taskRuns.create({ sessionId: "s", taskInput: "task", runId: "run_file" });
-    await expect(taskRuns.get(created.id)).resolves.toMatchObject({ id: "run_file" });
-    await expect(taskRuns.get("missing")).resolves.toBeUndefined();
-    await writeFile(join(dir, "runs", "bad.json"), "{}", "utf8");
-    await expect(taskRuns.get("bad")).resolves.toBeUndefined();
-    await expect(taskRuns.list("s")).resolves.toHaveLength(1);
-
     const memory = new InMemorySessionStore();
     await memory.create("mem");
     expect(await memory.list()).toHaveLength(1);
@@ -84,48 +71,10 @@ describe("coverage edge contracts for release path", () => {
 
     const recovered = recoverSessionFromEvents("s", [
       { seq: 1, type: "session.created", sessionId: "s", timestamp: "t", payload: { sessionId: "s" } },
-      { seq: 2, type: "permission.decided", sessionId: "s", timestamp: "t", payload: { action: "ask", callId: "c", toolName: "shell_exec", reason: "ask", permissionId: "p", phase: "verify", pendingAction: "shell_exec", command: "npm test", toolCall: { id: "c", name: "shell_exec", input: { command: "npm test" } }, pendingInput: { kind: "permission", permissionId: "p", toolCallId: "c", phase: "verify", action: "shell_exec", reason: "ask", command: "npm test", options: ["approve", "deny"] } } },
+      { seq: 2, type: "permission.decided", sessionId: "s", timestamp: "t", payload: { action: "ask", callId: "c", toolName: "shell_exec", reason: "ask", permissionId: "p", pendingAction: "shell_exec", command: "npm test", toolCall: { id: "c", name: "shell_exec", input: { command: "npm test" } }, pendingInput: { kind: "permission", permissionId: "p", toolCallId: "c", action: "shell_exec", reason: "ask", command: "npm test", options: ["approve", "deny"] } } },
       { seq: 3, type: "loop.completed", sessionId: "s", timestamp: "t", payload: { finalResponse: "done" } }
     ]);
     expect(recovered).toMatchObject({ status: "completed", finalResponse: "done" });
-  });
-
-  it("covers phase contract negative branches and graph-ready fallback summaries", async () => {
-    const contracts = createDefaultPhaseContracts(1);
-    const baseRun = { id: "r", sessionId: "s", status: "running" as const, currentPhase: "intake" as const, verification: [], steps: [], contextSnapshot: { taskInput: "", messageRefs: [], decisionRefs: [], compactedSummary: "", pinnedConstraints: [] } };
-    expect(() => contracts.intake.validateOutput({})).toThrow("TaskSpec");
-    expect(contracts.intake.next({ objective: "o", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: ["need decision"] }, baseRun)).toBe("blocked");
-    expect(() => contracts.understand.validateOutput({})).toThrow("ContextPack");
-    expect(contracts.understand.next({ summary: "c", filesRead: [], relevantSnippets: [], commandSources: [], openQuestions: ["q"] }, baseRun)).toBe("blocked");
-    expect(() => contracts.plan.validateOutput({})).toThrow("ChangePlan");
-    expect(() => contracts.edit.validateOutput({})).toThrow("PatchSummary");
-    expect(() => contracts.verify.validateOutput([{}])).toThrow("VerificationResult");
-    expect(contracts.verify.next([{ command: "npm test", status: "failed", summary: "failed", evidenceRefs: [] }], baseRun)).toBe("failed");
-    expect(() => contracts.handoff.validateOutput({})).toThrow("AgentHandoff");
-
-    expect(summarizeResult({ status: "blocked", session: { id: "s", status: "blocked", transcript: [], evidenceIds: [], lastEventSeq: 0 }, evidence: [], pendingInput: { kind: "question", questionId: "q", phase: "plan", prompt: "answer", expectedAnswer: "text" } })).toBe("answer");
-    expect(concernFor({ status: "failed", session: { id: "s", status: "failed", transcript: [], evidenceIds: [], lastEventSeq: 0 }, evidence: [], handoff: { id: "h", status: "failed", summary: "failed", changedFiles: [], verification: [], risks: ["risk"], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] } })).toBe("risk");
-    const loop = new AgentLoop({ cwd: process.cwd(), config: mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } }), model: new FakeModelClient([new Error("graph fail")]), registry: new ToolRegistry(), permissions: new PermissionPolicy(DEFAULT_CONFIG.permissions, DEFAULT_CONFIG.tools.shell), sessions: new InMemorySessionStore(), events: new InMemoryEventLog(), evidence: new InMemoryEvidenceStore() });
-    await expect(new AgentNodeExecutor(loop).execute({ input: "x", contract: { nodeId: "N", goal: "g", allowedTools: [], acceptance: [] } })).resolves.toMatchObject({ status: "failed", concerns: ["graph fail"] });
-  });
-
-  it("covers graph-ready summary and concern precedence branches", () => {
-    const baseSession = { id: "s", status: "blocked" as const, transcript: [], evidenceIds: ["ev-session"], lastEventSeq: 1 };
-    const handoff = { id: "h", status: "blocked" as const, summary: "handoff summary", changedFiles: [], verification: [], risks: [], blockers: ["blocker"], requiredDecisions: [], traceRefs: [], evidenceRefs: ["ev-handoff"] };
-    const run = createTaskRunState("s", "task", "r-node");
-    run.handoff = { ...handoff, risks: ["run risk"], blockers: ["run blocker"] };
-    expect(summarizeResult({ status: "blocked", session: baseSession, evidence: [], runState: run })).toBe("handoff summary");
-    expect(summarizeResult({ status: "completed", session: { ...baseSession, status: "completed" }, evidence: [], finalResponse: "final" })).toBe("final");
-    expect(summarizeResult({ status: "blocked", session: baseSession, evidence: [], error: "error" })).toBe("error");
-    expect(summarizeResult({ status: "waiting_permission", session: baseSession, evidence: [], pendingInput: createPermissionPendingInput("s", { id: "p", name: "write_file", input: { path: "a" } }, "permission reason") })).toBe("permission reason");
-    expect(summarizeResult({ status: "waiting_permission", session: baseSession, evidence: [], pendingPermission: { callId: "p", toolName: "write_file", reason: "legacy permission" } })).toBe("legacy permission");
-    expect(concernFor({ status: "blocked", session: baseSession, evidence: [], runState: run })).toBe("run risk");
-    expect(concernFor({ status: "blocked", session: baseSession, evidence: [], handoff })).toBe("blocker");
-    expect(concernFor({ status: "blocked", session: baseSession, evidence: [], runState: { ...run, handoff: { ...run.handoff, risks: [], blockers: ["run blocker"] } } })).toBe("run blocker");
-    expect(concernFor({ status: "blocked", session: baseSession, evidence: [], error: "error" })).toBe("error");
-    expect(concernFor({ status: "waiting_permission", session: baseSession, evidence: [], pendingInput: createPermissionPendingInput("s", { id: "p2", name: "write_file", input: { path: "a" } }, "permission concern") })).toBe("permission concern");
-    expect(concernFor({ status: "blocked", session: baseSession, evidence: [], pendingInput: createQuestionPendingInput({ questionId: "q", phase: "plan", prompt: "question concern", expectedAnswer: "text" }) })).toBe("question concern");
-    expect(concernFor({ status: "waiting_permission", session: baseSession, evidence: [], pendingPermission: { callId: "p3", toolName: "write_file", reason: "legacy concern" } })).toBe("legacy concern");
   });
 
   it("covers MCP defaults, model factory branches, and prompt lookup failures", async () => {
@@ -145,7 +94,7 @@ describe("coverage edge contracts for release path", () => {
     expect(() => createModelClient({ config: unsupportedProviderConfig })).toThrow("unsupported provider type");
     const futureProviderConfig = mergeConfig(DEFAULT_CONFIG, undefined);
     Object.assign(futureProviderConfig.models.providers.fake ?? {}, { type: "anthropic" });
-    expect(() => createModelClient({ config: futureProviderConfig })).toThrow("recognized but not implemented in this runtime");
+    expect(() => createModelClient({ config: futureProviderConfig })).toThrow("reserved for a future provider adapter");
     const apiModeProviderConfig = mergeConfig(DEFAULT_CONFIG, undefined);
     Object.assign(apiModeProviderConfig.models.providers.fake ?? {}, { apiMode: "openai-compatible-chat" });
     expect(() => createModelClient({ config: apiModeProviderConfig })).toThrow(/apiMode.*type/);
@@ -161,21 +110,9 @@ describe("coverage edge contracts for release path", () => {
       else process.env.MODEL_KEY = previous;
     }
     expect(createAgentLoop({ cwd: process.cwd(), config: openAiConfig, env: { MODEL_KEY: "secret" }, fetch: async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 }) })).toBeInstanceOf(AgentLoop);
-    expect(() => new PromptRegistry().get("intake")).toThrow("not registered");
   });
 
-  it("covers legacy envelope pending-permission compatibility", () => {
-    const envelope = createHeadlessRunEnvelopeFromAgentResult({
-      status: "blocked",
-      session: { id: "s", status: "blocked", transcript: [], evidenceIds: ["ev"], lastEventSeq: 1, pendingPermission: { callId: "c", toolName: "write_file", reason: "ask", path: "a.ts" } },
-      evidence: []
-    });
-    expect(envelope).toMatchObject({ pendingInput: { kind: "permission", toolCallId: "c", path: "a.ts" }, handoff: { requiredDecisions: [expect.objectContaining({ kind: "permission" })] } });
-  });
-
-  it("covers contract guard false branches and legacy envelope status mapping", () => {
-    expect(mapLegacyAgentStatus("denied")).toBe("blocked");
-    expect(mapLegacyAgentStatus("running")).toBe("running");
+  it("covers contract guard false branches and current envelope creation", () => {
     expect(exitCodeForTaskRunStatus("completed")).toBe(0);
     expect(exitCodeForTaskRunStatus("waiting_permission")).toBe(20);
     expect(exitCodeForTaskRunStatus("blocked")).toBe(21);
@@ -190,7 +127,7 @@ describe("coverage edge contracts for release path", () => {
     expect(createPermissionPendingInput("s", { id: "x", name: "external", input: { path: "outside" } }, "external").action).toBe("external_path");
     expect(createPermissionPendingInput("s", { id: "x2", name: "external", input: {} }, "external").action).toBe("mcp_call");
 
-    const question = createQuestionPendingInput({ questionId: "q", phase: "plan", prompt: "why", expectedAnswer: "json", schemaName: "Schema" });
+    const question = createQuestionPendingInput({ questionId: "q", prompt: "why", expectedAnswer: "json", schemaName: "Schema" });
     expect(isPendingInput(question)).toBe(true);
     expect(isPendingInput({ ...permission, options: ["approve"] })).toBe(false);
     expect(isPendingInput({ ...permission, command: 1 })).toBe(false);
@@ -210,17 +147,14 @@ describe("coverage edge contracts for release path", () => {
     expect(createHeadlessRunEnvelopeFromTaskRunState(run)).toMatchObject({ pendingInput: question, handoff: run.handoff });
     expect(createHeadlessRunEnvelopeFromAgentResult({ status: "waiting_permission", session: { id: "s", status: "waiting_permission", transcript: [], evidenceIds: [], lastEventSeq: 0 }, evidence: [] })).toEqual({ runId: "s", sessionId: "s", status: "waiting_permission" });
     expect(createHeadlessRunEnvelopeFromAgentResult({ status: "running", session: { id: "s", status: "running", transcript: [], evidenceIds: [], lastEventSeq: 0 }, evidence: [] })).toEqual({ runId: "s", sessionId: "s", status: "running" });
-    expect(createHeadlessRunEnvelopeFromAgentResult({ status: "completed", session: { id: "s", status: "completed", transcript: [], evidenceIds: ["ev"], lastEventSeq: 2 }, evidence: [], finalResponse: "done" })).toMatchObject({ handoff: { status: "completed", summary: "done", risks: [], blockers: [] } });
-    expect(createHeadlessRunEnvelopeFromAgentResult({ status: "failed", session: { id: "s", status: "failed", transcript: [], evidenceIds: [], lastEventSeq: 3 }, evidence: [] })).toMatchObject({ handoff: { status: "failed", summary: "Legacy agent result requires compatibility handoff.", risks: [expect.stringContaining("Compatibility")] } });
-    const blockedPermissionInput = createPermissionPendingInput("s", { id: "blocked-permission", name: "write_file", input: { path: "a.ts" } }, "permission required");
-    expect(createHeadlessRunEnvelopeFromAgentResult({ status: "blocked", session: { id: "s", status: "blocked", transcript: [], evidenceIds: [], lastEventSeq: 4, pendingInput: blockedPermissionInput }, evidence: [] })).toMatchObject({ handoff: { summary: "permission required", requiredDecisions: [{ kind: "permission", id: blockedPermissionInput.permissionId, reason: "permission required" }] } });
+    expect(createHeadlessRunEnvelopeFromAgentResult({ status: "blocked", session: { id: "s", status: "blocked", transcript: [], evidenceIds: [], lastEventSeq: 4, runState: run }, runState: run, handoff: run.handoff, pendingInput: question, evidence: [] })).toMatchObject({ runId: "r-contract", pendingInput: question, handoff: run.handoff });
     expect(isHeadlessRunEnvelope({ runId: "r", sessionId: "s", status: "running" })).toBe(true);
     expect(isHeadlessRunEnvelope({ runId: "r", sessionId: "s", status: "running", pendingInput: { kind: "bad" } })).toBe(false);
     expect(isAgentHandoff({ ...run.handoff, status: "failed" })).toBe(true);
     expect(isAgentHandoff({ ...run.handoff, status: "blocked" })).toBe(true);
     expect(isAgentHandoff({ ...run.handoff, requiredDecisions: [{ kind: "other", id: "x", reason: "r" }] })).toBe(false);
-    expect(isTaskRunState({ ...run, steps: [{ ...createStepTrace({ runId: "r", phase: "edit", index: 0, maxSteps: 1 }), status: "failed", error: "x" }] })).toBe(true);
-    expect(isTaskRunState({ ...run, task: { objective: "x" } })).toBe(false);
+    expect(isTaskRunState({ ...run, turns: [{ ...createTurnTrace({ runId: "r", index: 0, maxTurns: 1 }), status: "failed", error: "x" }] })).toBe(true);
+    expect(isTaskRunState({ ...run, agentContext: { objective: "x" } })).toBe(false);
     expect(isTaskRunState({ ...run, contextSnapshot: { ...run.contextSnapshot, skills: [{ name: "s", path: "p", hash: "h", summary: "i" }], commands: [{ name: "c", path: "p", hash: "h", description: "d" }], mcpTools: [{ server: "s", tool: "t", toolName: "mcp_s_t" }] } })).toBe(true);
     expect(isTaskRunState({ ...run, contextSnapshot: { ...run.contextSnapshot, skills: [{ name: "s" }] } })).toBe(false);
     expect(isTaskRunState({ ...run, contextSnapshot: { ...run.contextSnapshot, agentsMd: { path: "p", hash: "h" } } })).toBe(false);
@@ -228,30 +162,24 @@ describe("coverage edge contracts for release path", () => {
 
   it("covers run-state merge and dedupe branches", async () => {
     const run = createTaskRunState("s", "task", "r-state");
-    const step = createStepTrace({ runId: run.id, phase: "plan", index: 0, maxSteps: 1 });
-    step.evidenceIds.push("ev-step");
-    run.steps.push(step);
-    applyPhaseArtifact(run, "intake", { objective: "o", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] });
-    applyPhaseArtifact(run, "understand", { summary: "c", filesRead: [], relevantSnippets: [], commandSources: [], openQuestions: [] });
-    applyPhaseArtifact(run, "plan", { summary: "p", targetFiles: [], steps: [], verificationCommands: [], risks: ["risk"] });
-    applyPhaseArtifact(run, "edit", { changedFiles: ["a.ts"], diffRefs: [], rationale: "r", evidenceRefs: ["ev-patch"] });
-    applyPhaseArtifact(run, "verify", [{ command: "npm test", status: "passed", summary: "ok", evidenceRefs: ["ev-v"] }]);
-    const pending = createQuestionPendingInput({ questionId: "q-state", phase: "handoff", prompt: "answer", expectedAnswer: "text" });
+    const turn = createTurnTrace({ runId: run.id, index: 0, maxTurns: 1 });
+    turn.evidenceIds.push("ev-turn");
+    run.turns.push(turn);
+    run.agentContext = { objective: "o", scope: [], acceptance: [], nonGoals: [], constraints: [], blockers: [] };
+    run.changedFiles = ["a.ts"];
+    run.changeEvidenceRefs = ["ev-change"];
+    run.verification = [{ command: "npm test", status: "passed", summary: "ok", evidenceRefs: ["ev-v"] }];
+    const pending = createQuestionPendingInput({ questionId: "q-state", prompt: "answer", expectedAnswer: "text" });
     setRunPendingInput(run, pending);
-    const finalized = finalizeAgentHandoff(run, { id: "h", status: "blocked", summary: "blocked", changedFiles: ["a.ts", "b.ts"], verification: [{ command: "npm test", status: "skipped", summary: "old", evidenceRefs: [] }], risks: ["risk"], blockers: [], requiredDecisions: [{ kind: "question", id: "q-state", reason: "answer" }], traceRefs: [step.id], evidenceRefs: ["ev-v", "ev-handoff"] });
+    const finalized = finalizeAgentHandoff(run, { id: "h", status: "blocked", summary: "blocked", changedFiles: ["a.ts", "b.ts"], verification: [{ command: "npm test", status: "skipped", summary: "old", evidenceRefs: [] }], risks: ["risk"], blockers: [], requiredDecisions: [{ kind: "question", id: "q-state", reason: "answer" }], traceRefs: [turn.id], evidenceRefs: ["ev-v", "ev-handoff"] });
     expect(finalized.blockers).toEqual(["blocked"]);
     expect(finalized.changedFiles).toEqual(["a.ts", "b.ts"]);
-    expect(finalized.evidenceRefs).toEqual(expect.arrayContaining(["ev-patch", "ev-v", "ev-handoff"]));
+    expect(finalized.evidenceRefs).toEqual(expect.arrayContaining(["ev-change", "ev-v", "ev-handoff"]));
     expect(finalized.requiredDecisions).toHaveLength(1);
     expect(finalized.verification[0]?.summary).toBe("ok");
     setRunStatus(run, "completed", { type: "completed", handoffId: "h" });
     expect(run.resume).toEqual({ type: "completed", handoffId: "h" });
     setRunStatus(run, "running");
     expect(run.resume).toBeUndefined();
-    const store = new InMemoryTaskRunStore();
-    await store.create({ sessionId: "s", taskInput: "task", runId: "one" });
-    await store.create({ sessionId: "other", taskInput: "task", runId: "two" });
-    await expect(store.get("missing")).resolves.toBeUndefined();
-    await expect(store.list("s")).resolves.toHaveLength(1);
   });
 });

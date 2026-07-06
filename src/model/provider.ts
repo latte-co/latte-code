@@ -33,6 +33,6 @@ export function createModelClient(options: CreateModelClientOptions): ModelClien
     });
   }
   const status = providerTypeStatus(provider.type);
-  if (status === "future") throw new Error(`Provider '${providerId}' type '${provider.type}' is recognized but not implemented in this runtime`);
+  if (status === "future") throw new Error(`Provider '${providerId}' type '${provider.type}' is reserved for a future provider adapter`);
   throw new Error(`Provider '${providerId}' has unsupported provider type '${String(provider.type)}'`);
 }

@@ -32,19 +32,8 @@ interface TypeScriptConfig {
   include?: string[];
 }
 
-function artifact(value: unknown): ModelTurn {
-  return { type: "message", content: JSON.stringify(value) };
-}
-
 function happyScript(summary = "done"): ModelTurn[] {
-  return [
-    artifact({ objective: "hello", scope: ["workspace"], acceptance: ["complete"], nonGoals: [], constraints: [], blockers: [] }),
-    artifact({ summary: "context", filesRead: [], relevantSnippets: [], commandSources: [], openQuestions: [] }),
-    artifact({ summary: "plan", targetFiles: [], steps: ["handoff"], verificationCommands: [], risks: [] }),
-    artifact({ changedFiles: [], diffRefs: [], rationale: "no changes", evidenceRefs: [] }),
-    artifact([{ command: "not run", status: "skipped", summary: "not required", evidenceRefs: [] }]),
-    artifact({ id: "handoff_test", status: "completed", summary, changedFiles: [], verification: [{ command: "not run", status: "skipped", summary: "not required", evidenceRefs: [] }], risks: [], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] })
-  ];
+  return [{ type: "message", content: summary }];
 }
 
 describe("runtime factory and CLI helpers", () => {
@@ -71,7 +60,7 @@ describe("runtime factory and CLI helpers", () => {
   it("uses an explicitly supplied model client", async () => {
     const config = mergeConfig(DEFAULT_CONFIG, { session: { store: "memory" }, evidence: { store: "memory" } });
     const script = happyScript("explicit");
-    const model = { async generate() { return script.shift() ?? artifact({ id: "handoff_test", status: "completed", summary: "explicit", changedFiles: [], verification: [], risks: [], blockers: [], requiredDecisions: [], traceRefs: [], evidenceRefs: [] }); } };
+    const model = { async generate() { return script.shift() ?? { type: "message" as const, content: "explicit" }; } };
     const loop = createAgentLoop({ cwd: process.cwd(), config, model });
     await expect(loop.run({ input: "hello" })).resolves.toMatchObject({ finalResponse: "explicit" });
   });
@@ -204,7 +193,7 @@ async function seedBlockedRun(dir: string): Promise<{ runId: string; sessionId: 
   const store = new FileSessionStore(join(dir, DEFAULT_CONFIG.session.directory));
   const session = await store.create("session_seeded");
   const run = createTaskRunState(session.id, "seeded task", "run_seeded");
-  const pendingInput = createQuestionPendingInput({ questionId: "question_seeded", phase: "intake", prompt: "Seeded blocked fixture", expectedAnswer: "json", schemaName: "TaskSpec" });
+  const pendingInput = createQuestionPendingInput({ questionId: "question_seeded", prompt: "Seeded blocked fixture", expectedAnswer: "json", schemaName: "AgentTaskContext" });
   setRunPendingInput(run, pendingInput);
   run.handoff = buildBlockedHandoff(run, pendingInput.prompt, pendingInput);
   session.status = run.status;

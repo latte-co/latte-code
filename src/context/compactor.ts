@@ -21,16 +21,15 @@ export interface BuiltContextMessages {
 
 export function buildContextProjection(run: TaskRunState, toolResults: readonly ToolResult[]): string {
   const projection = {
-    task: run.task,
-    acceptance: run.task?.acceptance ?? [],
-    constraints: run.task?.constraints ?? run.contextSnapshot.pinnedConstraints,
-    nonGoals: run.task?.nonGoals ?? [],
-    artifacts: {
-      context: run.context,
-      plan: run.plan,
-      patch: run.patch,
-      verification: run.verification
+    agentContext: run.agentContext,
+    acceptance: run.agentContext?.acceptance ?? [],
+    constraints: run.agentContext?.constraints ?? run.contextSnapshot.pinnedConstraints,
+    nonGoals: run.agentContext?.nonGoals ?? [],
+    changes: {
+      changedFiles: run.changedFiles,
+      evidenceRefs: run.changeEvidenceRefs
     },
+    verification: run.verification,
     contextSnapshot: run.contextSnapshot,
     recentToolResults: toolResults.map((result) => ({ toolName: result.toolName, ok: result.ok, summary: result.summary, references: result.references, truncated: result.truncated }))
   };
@@ -42,7 +41,7 @@ export function buildContextMessages(input: BuildContextMessagesInput): BuiltCon
   let messages = [...input.baseMessages, ...transcript];
   if (bytes(messages) <= input.config.maxPromptBytes) return { messages, compacted: false };
 
-  const compactedTranscript = compactTranscript(input.transcript, input.config.recentStepCount, input.config.maxToolResultBytes).map((entry): ModelMessage => ({ role: entry.role, content: entry.content }));
+  const compactedTranscript = compactTranscript(input.transcript, input.config.recentTurnCount, input.config.maxToolResultBytes).map((entry): ModelMessage => ({ role: entry.role, content: entry.content }));
   const compactedSummary = summarizeCompaction(input.transcript, compactedTranscript.length);
   input.run.contextSnapshot.compactedSummary = compactedSummary;
   messages = [...input.baseMessages, { role: "system", content: `Compacted prior context: ${compactedSummary}` }, ...compactedTranscript];
@@ -50,7 +49,7 @@ export function buildContextMessages(input: BuildContextMessagesInput): BuiltCon
 
   const essentials = input.baseMessages;
   if (bytes(essentials) > input.config.maxPromptBytes) {
-    return { messages: essentials, compacted: true, blockedReason: "context_budget_gate: preserved task, acceptance, constraints, changedFiles, and verification lanes exceed maxPromptBytes" };
+    return { messages: essentials, compacted: true, blockedReason: "context_budget_gate: preserved request, acceptance, constraints, changedFiles, and verification lanes exceed maxPromptBytes" };
   }
   input.run.contextSnapshot.compactedSummary = `${compactedSummary}\nDropped older transcript entries after context budget compaction.`;
   return { messages: essentials, compacted: true };

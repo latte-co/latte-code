@@ -5,10 +5,6 @@ export interface EvidenceDraft {
   outputSummary: string;
   references: string[];
   truncated: boolean;
-  graphHints?: {
-    nodeId?: string;
-    gateId?: string;
-  };
 }
 
 export interface EvidenceRecord extends EvidenceDraft {

@@ -5,7 +5,6 @@ import { InMemoryEvidenceStore, FileEvidenceStore } from "../evidence/store.js";
 import type { ModelClient, ModelTurn } from "../model/types.js";
 import { createModelClient } from "../model/provider.js";
 import { PermissionPolicy } from "../permissions/policy.js";
-import { createDefaultPromptRegistry } from "../prompts/registry.js";
 import { InMemorySessionStore, FileSessionStore } from "../session/session.js";
 import { createBuiltinTools } from "../tools/builtin.js";
 import { ToolRegistry } from "../tools/registry.js";
@@ -55,8 +54,7 @@ export function createAgentLoop(options: CreateAgentOptions): AgentLoop {
     sessions,
     events,
     evidence,
-    promptRegistry: createDefaultPromptRegistry(options.config.prompts.profile, options.config.prompts.language),
     loadContextSources: () => loadRuntimeContextSources(options.cwd, options.config),
-    maxTurns: options.config.runtime.maxPhaseSteps
+    maxTurns: options.config.runtime.maxTurns
   });
 }

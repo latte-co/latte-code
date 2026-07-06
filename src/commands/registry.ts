@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { CommandsConfig } from "../config/types.js";
-import type { TaskSpec } from "../core/contracts.js";
-import { isTaskSpec } from "../core/contracts.js";
+import type { AgentTaskContext } from "../core/contracts.js";
+import { isAgentTaskContext } from "../core/contracts.js";
 import { isRecord, truncateText } from "../shared/types.js";
 
 export interface CommandSpec {
@@ -11,13 +11,13 @@ export interface CommandSpec {
   description: string;
   path: string;
   hash: string;
-  task: TaskSpec;
+  context: AgentTaskContext;
 }
 
 export interface RoutedCommand {
   command: CommandSpec;
   args: string;
-  task: TaskSpec;
+  context: AgentTaskContext;
 }
 
 const COMMAND_SIDE_EFFECT_KEYS = new Set(["toolCalls", "tools", "shell", "writeFiles", "scripts", "sideEffects"]);
@@ -38,7 +38,7 @@ export function routeCommandInput(input: string, specs: readonly CommandSpec[]):
   const spec = specs.find((candidate) => candidate.name === rawName);
   if (spec === undefined) return undefined;
   const args = rest.join(" ");
-  return { command: spec, args, task: taskWithArgs(spec.task, args) };
+  return { command: spec, args, context: contextWithArgs(spec.context, args) };
 }
 
 async function loadCommandSpec(root: string, file: string): Promise<CommandSpec> {
@@ -48,22 +48,22 @@ async function loadCommandSpec(root: string, file: string): Promise<CommandSpec>
   const parsed = JSON.parse(content) as unknown;
   if (!isRecord(parsed)) throw new Error(`command_gate: ${path} must contain a JSON object`);
   assertNoSideEffects(parsed, path);
-  const task = parsed.task;
-  if (!isTaskSpec(task)) throw new Error(`command_gate: ${path} must provide a valid TaskSpec under task`);
+  const context = parsed.context;
+  if (!isAgentTaskContext(context)) throw new Error(`command_gate: ${path} must provide a valid agent context under context`);
   const name = typeof parsed.name === "string" ? parsed.name : file.replace(/\.json$/u, "");
-  const description = typeof parsed.description === "string" ? parsed.description : task.objective;
-  return { name, description: truncateText(description, 500).text, path, hash: sha256(content), task };
+  const description = typeof parsed.description === "string" ? parsed.description : context.objective;
+  return { name, description: truncateText(description, 500).text, path, hash: sha256(content), context };
 }
 
-function taskWithArgs(task: TaskSpec, args: string): TaskSpec {
-  if (args.trim().length === 0) return JSON.parse(JSON.stringify(task)) as TaskSpec;
+function contextWithArgs(context: AgentTaskContext, args: string): AgentTaskContext {
+  if (args.trim().length === 0) return JSON.parse(JSON.stringify(context)) as AgentTaskContext;
   return {
-    objective: task.objective.replaceAll("{{args}}", args),
-    scope: task.scope.map((entry) => entry.replaceAll("{{args}}", args)),
-    acceptance: task.acceptance.map((entry) => entry.replaceAll("{{args}}", args)),
-    nonGoals: task.nonGoals.map((entry) => entry.replaceAll("{{args}}", args)),
-    constraints: task.constraints.map((entry) => entry.replaceAll("{{args}}", args)),
-    blockers: task.blockers.map((entry) => entry.replaceAll("{{args}}", args))
+    objective: context.objective.replaceAll("{{args}}", args),
+    scope: context.scope.map((entry) => entry.replaceAll("{{args}}", args)),
+    acceptance: context.acceptance.map((entry) => entry.replaceAll("{{args}}", args)),
+    nonGoals: context.nonGoals.map((entry) => entry.replaceAll("{{args}}", args)),
+    constraints: context.constraints.map((entry) => entry.replaceAll("{{args}}", args)),
+    blockers: context.blockers.map((entry) => entry.replaceAll("{{args}}", args))
   };
 }
 

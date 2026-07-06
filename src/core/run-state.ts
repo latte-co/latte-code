@@ -1,78 +1,15 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { AgentPhase, AgentHandoff, ChangePlan, ContextPack, ContextSnapshot, PatchSummary, PendingInput, ResumeMarker, StepTrace, TaskRunState, TaskRunStatus, TaskSpec, VerificationResult } from "./contracts.js";
-import { isTaskRunState } from "./contracts.js";
+import type { AgentHandoff, ContextSnapshot, PendingInput, ResumeMarker, TaskRunState, TaskRunStatus, TurnTrace, VerificationResult } from "./contracts.js";
 import { stableId } from "../shared/types.js";
-import type { PhaseArtifact } from "./phases.js";
-
-export interface TaskRunStore {
-  create(input: { sessionId: string; taskInput: string; runId?: string }): Promise<TaskRunState>;
-  save(run: TaskRunState): Promise<void>;
-  get(runId: string): Promise<TaskRunState | undefined>;
-  list(sessionId?: string): Promise<TaskRunState[]>;
-}
-
-export class InMemoryTaskRunStore implements TaskRunStore {
-  private readonly runs = new Map<string, TaskRunState>();
-
-  async create(input: { sessionId: string; taskInput: string; runId?: string }): Promise<TaskRunState> {
-    const run = createTaskRunState(input.sessionId, input.taskInput, input.runId);
-    this.runs.set(run.id, copyTaskRunState(run));
-    return copyTaskRunState(run);
-  }
-
-  async save(run: TaskRunState): Promise<void> {
-    this.runs.set(run.id, copyTaskRunState(run));
-  }
-
-  async get(runId: string): Promise<TaskRunState | undefined> {
-    const run = this.runs.get(runId);
-    return run === undefined ? undefined : copyTaskRunState(run);
-  }
-
-  async list(sessionId?: string): Promise<TaskRunState[]> {
-    return [...this.runs.values()].filter((run) => sessionId === undefined || run.sessionId === sessionId).map(copyTaskRunState);
-  }
-}
-
-export class FileTaskRunStore implements TaskRunStore {
-  constructor(private readonly directory: string) {}
-
-  async create(input: { sessionId: string; taskInput: string; runId?: string }): Promise<TaskRunState> {
-    const run = createTaskRunState(input.sessionId, input.taskInput, input.runId);
-    await this.save(run);
-    return copyTaskRunState(run);
-  }
-
-  async save(run: TaskRunState): Promise<void> {
-    await mkdir(this.directory, { recursive: true });
-    await writeFile(join(this.directory, `${run.id}.json`), JSON.stringify(run, null, 2), "utf8");
-  }
-
-  async get(runId: string): Promise<TaskRunState | undefined> {
-    try {
-      const value = JSON.parse(await readFile(join(this.directory, `${runId}.json`), "utf8")) as unknown;
-      return isTaskRunState(value) ? value : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  async list(sessionId?: string): Promise<TaskRunState[]> {
-    const files = await readdir(this.directory).catch(() => []);
-    const runs = await Promise.all(files.filter((file) => file.endsWith(".json")).map((file) => readFile(join(this.directory, file), "utf8").then((content) => JSON.parse(content) as unknown).catch(() => undefined)));
-    return runs.filter((run): run is TaskRunState => isTaskRunState(run) && (sessionId === undefined || run.sessionId === sessionId)).map(copyTaskRunState);
-  }
-}
 
 export function createTaskRunState(sessionId: string, taskInput: string, runId = stableId("run", [sessionId, taskInput, new Date().toISOString(), Math.random().toString()])): TaskRunState {
   return {
     id: runId,
     sessionId,
     status: "queued",
-    currentPhase: "intake",
+    changedFiles: [],
+    changeEvidenceRefs: [],
     verification: [],
-    steps: [],
+    turns: [],
     contextSnapshot: createContextSnapshot(taskInput)
   };
 }
@@ -81,27 +18,17 @@ export function createContextSnapshot(taskInput: string): ContextSnapshot {
   return { taskInput, messageRefs: [], decisionRefs: [], compactedSummary: "", pinnedConstraints: [] };
 }
 
-export function createStepTrace(input: { runId: string; phase: AgentPhase; index: number; maxSteps: number }): StepTrace {
+export function createTurnTrace(input: { runId: string; index: number; maxTurns: number }): TurnTrace {
   return {
-    id: stableId("step", [input.runId, input.phase, String(input.index)]),
-    phase: input.phase,
+    id: stableId("turn", [input.runId, String(input.index)]),
     status: "running",
-    promptId: `phase:${input.phase}`,
+    promptId: "code-agent",
     promptVersion: "v0.1",
-    summary: `Running ${input.phase} phase`,
+    summary: "Running direct ReAct code-agent turn",
     toolCallIds: [],
     evidenceIds: [],
-    reactBudget: { maxSteps: input.maxSteps, usedSteps: 0 }
+    turnBudget: { maxTurns: input.maxTurns, usedTurns: 0 }
   };
-}
-
-export function applyPhaseArtifact(run: TaskRunState, phase: AgentPhase, artifact: PhaseArtifact): void {
-  if (phase === "intake") run.task = artifact as TaskSpec;
-  if (phase === "understand") run.context = artifact as ContextPack;
-  if (phase === "plan") run.plan = artifact as ChangePlan;
-  if (phase === "edit") run.patch = artifact as PatchSummary;
-  if (phase === "verify") run.verification = artifact as VerificationResult[];
-  if (phase === "handoff") run.handoff = artifact as AgentHandoff;
 }
 
 export function setRunStatus(run: TaskRunState, status: TaskRunStatus, resume?: ResumeMarker): void {
@@ -120,31 +47,31 @@ export function setRunPendingInput(run: TaskRunState, pendingInput: PendingInput
 export function buildBlockedHandoff(run: TaskRunState, summary: string, pendingInput?: PendingInput): AgentHandoff {
   const requiredDecision = pendingInput === undefined ? [] : [{ kind: pendingInput.kind, id: pendingInput.kind === "permission" ? pendingInput.permissionId : pendingInput.questionId, reason: pendingInput.kind === "permission" ? pendingInput.reason : pendingInput.prompt }];
   return {
-    id: stableId("handoff", [run.id, "blocked", String(run.steps.length)]),
+    id: stableId("handoff", [run.id, "blocked", String(run.turns.length)]),
     status: "blocked",
     summary,
-    changedFiles: run.patch?.changedFiles ?? [],
+    changedFiles: run.changedFiles,
     verification: run.verification,
-    risks: run.plan?.risks ?? [],
+    risks: [],
     blockers: [summary],
     requiredDecisions: requiredDecision,
-    traceRefs: run.steps.map((step) => step.id),
-    evidenceRefs: unique(run.steps.flatMap((step) => step.evidenceIds))
+    traceRefs: run.turns.map((turn) => turn.id),
+    evidenceRefs: unique(run.turns.flatMap((turn) => turn.evidenceIds))
   };
 }
 
 export function buildFailedHandoff(run: TaskRunState, summary: string): AgentHandoff {
   return {
-    id: stableId("handoff", [run.id, "failed", String(run.steps.length)]),
+    id: stableId("handoff", [run.id, "failed", String(run.turns.length)]),
     status: "failed",
     summary,
-    changedFiles: run.patch?.changedFiles ?? [],
+    changedFiles: run.changedFiles,
     verification: run.verification,
-    risks: [...(run.plan?.risks ?? []), summary],
+    risks: [summary],
     blockers: [],
     requiredDecisions: [],
-    traceRefs: run.steps.map((step) => step.id),
-    evidenceRefs: unique(run.steps.flatMap((step) => step.evidenceIds))
+    traceRefs: run.turns.map((turn) => turn.id),
+    evidenceRefs: unique(run.turns.flatMap((turn) => turn.evidenceIds))
   };
 }
 
@@ -152,13 +79,13 @@ export function finalizeAgentHandoff(run: TaskRunState, handoff: AgentHandoff): 
   const pendingDecision = run.pendingInput === undefined ? [] : [{ kind: run.pendingInput.kind, id: run.pendingInput.kind === "permission" ? run.pendingInput.permissionId : run.pendingInput.questionId, reason: run.pendingInput.kind === "permission" ? run.pendingInput.reason : run.pendingInput.prompt }];
   return {
     ...handoff,
-    changedFiles: unique([...(run.patch?.changedFiles ?? []), ...handoff.changedFiles]),
+    changedFiles: unique([...run.changedFiles, ...handoff.changedFiles]),
     verification: mergeVerification(run.verification, handoff.verification),
-    risks: unique([...(run.plan?.risks ?? []), ...handoff.risks]),
+    risks: unique(handoff.risks),
     blockers: handoff.status === "blocked" && handoff.blockers.length === 0 ? [handoff.summary] : unique(handoff.blockers),
     requiredDecisions: uniqueDecisions([...handoff.requiredDecisions, ...pendingDecision]),
-    traceRefs: unique([...run.steps.map((step) => step.id), ...handoff.traceRefs]),
-    evidenceRefs: unique([...run.steps.flatMap((step) => step.evidenceIds), ...(run.patch?.evidenceRefs ?? []), ...run.verification.flatMap((entry) => entry.evidenceRefs), ...handoff.evidenceRefs])
+    traceRefs: unique([...run.turns.map((turn) => turn.id), ...handoff.traceRefs]),
+    evidenceRefs: unique([...run.turns.flatMap((turn) => turn.evidenceIds), ...run.changeEvidenceRefs, ...run.verification.flatMap((entry) => entry.evidenceRefs), ...handoff.evidenceRefs])
   };
 }
 

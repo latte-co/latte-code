@@ -5,7 +5,7 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
-export type AgentStatus = "queued" | "running" | "completed" | "waiting_permission" | "blocked" | "denied" | "failed";
+export type AgentStatus = "queued" | "running" | "completed" | "waiting_permission" | "blocked" | "failed";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

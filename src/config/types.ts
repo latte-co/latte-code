@@ -50,9 +50,7 @@ export interface ToolConfig {
 }
 
 export interface RuntimeConfig {
-  maxPhaseSteps: number;
-  maxRepairTurns: number;
-  stopOnVerificationFailure: boolean;
+  maxTurns: number;
 }
 
 export interface PromptConfig {
@@ -70,7 +68,7 @@ export interface AgentsConfig {
 export interface ContextConfig {
   maxPromptBytes: number;
   maxToolResultBytes: number;
-  recentStepCount: number;
+  recentTurnCount: number;
   preserve: string[];
 }
 
@@ -118,18 +116,7 @@ export interface SessionConfig {
 export interface EvidenceConfig {
   store: "filesystem" | "memory";
   directory: string;
-  captureToolInputs: "summary" | "full" | "none";
-  captureToolOutputs: "summary" | "full" | "none";
   maxEvidenceBytes: number;
-}
-
-export interface CoverageConfig {
-  provider: "vitest";
-  statements: number;
-  branches: number;
-  functions: number;
-  lines: number;
-  exclude: string[];
 }
 
 export interface LattecodeConfig {
@@ -146,5 +133,4 @@ export interface LattecodeConfig {
   mcp: McpConfig;
   session: SessionConfig;
   evidence: EvidenceConfig;
-  coverage: CoverageConfig;
 }

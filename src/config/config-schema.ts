@@ -18,8 +18,7 @@ export const LATTECODE_CONFIG_SCHEMA: JsonObject = {
     skills: { type: "object" },
     mcp: { type: "object" },
     session: { type: "object" },
-    evidence: { type: "object" },
-    coverage: { type: "object" }
+    evidence: { type: "object" }
   },
   additionalProperties: false
 };

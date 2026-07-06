@@ -5,7 +5,6 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { JsonObject } from "../shared/types.js";
 import { isJsonValue, truncateText } from "../shared/types.js";
-import type { PermissionDecision } from "../permissions/types.js";
 import type { FileReadSnapshot, ToolDefinition, ToolExecutionContext, ToolResult } from "./types.js";
 
 const execAsync = promisify(exec);
@@ -38,12 +37,11 @@ function result(callId: string, toolName: string, ok: boolean, summary: string, 
   return { callId, toolName, ok, summary, references, output, truncated, ...(error === undefined ? {} : { error }) };
 }
 
-const baseEvidenceMapper = (input: JsonObject, toolResult: ToolResult, permission: PermissionDecision) => ({
+const baseEvidenceMapper = (input: JsonObject, toolResult: ToolResult) => ({
   inputSummary: JSON.stringify(input),
   outputSummary: toolResult.summary,
   references: toolResult.references,
-  truncated: toolResult.truncated,
-  graphHints: permission.action === "allow" ? { gateId: "permission.allow" } : { gateId: `permission.${permission.action}` }
+  truncated: toolResult.truncated
 });
 
 export function createBuiltinTools(): ToolDefinition[] {

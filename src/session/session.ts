@@ -5,7 +5,7 @@ import type { AgentStatus } from "../shared/types.js";
 import { stableId } from "../shared/types.js";
 import type { FileReadSnapshot } from "../tools/types.js";
 import type { ToolCall } from "../tools/types.js";
-import { isPendingInput, isTaskRunState, type AgentPhase, type PendingInput, type TaskRunState } from "../core/contracts.js";
+import { isPendingInput, isTaskRunState, type PendingInput, type TaskRunState } from "../core/contracts.js";
 
 export interface TranscriptEntry {
   role: "user" | "assistant" | "tool";
@@ -17,7 +17,6 @@ export interface PendingPermissionState {
   toolName: string;
   reason: string;
   permissionId?: string;
-  phase?: AgentPhase;
   action?: Extract<PendingInput, { kind: "permission" }>["action"];
   command?: string;
   path?: string;
@@ -144,7 +143,6 @@ function applyEvent(state: SessionState, event: AgentEvent): void {
       toolName: event.payload.toolName,
       reason: event.payload.reason,
       ...(typeof event.payload.permissionId === "string" ? { permissionId: event.payload.permissionId } : {}),
-      ...(isAgentPhasePayload(event.payload.phase) ? { phase: event.payload.phase } : {}),
       ...(isPermissionActionPayload(event.payload.pendingAction) ? { action: event.payload.pendingAction } : {}),
       ...(typeof event.payload.command === "string" ? { command: event.payload.command } : {}),
       ...(typeof event.payload.path === "string" ? { path: event.payload.path } : {})
@@ -158,7 +156,7 @@ function applyEvent(state: SessionState, event: AgentEvent): void {
     }
   }
   if (event.type === "permission.decided" && event.payload.action === "deny") {
-    state.status = "denied";
+    state.status = "blocked";
     delete state.pendingPermission;
     delete state.pendingInput;
     delete state.pendingToolCall;
@@ -182,10 +180,6 @@ function pushTranscript(state: SessionState, entry: TranscriptEntry): void {
   const last = state.transcript.at(-1);
   if (last?.role === entry.role && last.content === entry.content) return;
   state.transcript.push(entry);
-}
-
-function isAgentPhasePayload(value: unknown): value is AgentPhase {
-  return value === "intake" || value === "understand" || value === "plan" || value === "edit" || value === "verify" || value === "handoff";
 }
 
 function isPermissionActionPayload(value: unknown): value is PendingPermissionState["action"] {
@@ -214,7 +208,6 @@ function copyPendingInput(input: PendingInput): PendingInput {
       kind: "permission",
       permissionId: input.permissionId,
       toolCallId: input.toolCallId,
-      phase: input.phase,
       action: input.action,
       reason: input.reason,
       ...(input.command === undefined ? {} : { command: input.command }),
@@ -225,7 +218,6 @@ function copyPendingInput(input: PendingInput): PendingInput {
   return {
     kind: "question",
     questionId: input.questionId,
-    phase: input.phase,
     prompt: input.prompt,
     expectedAnswer: input.expectedAnswer,
     ...(input.schemaName === undefined ? {} : { schemaName: input.schemaName })

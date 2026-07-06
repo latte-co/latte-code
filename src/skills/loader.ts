@@ -9,7 +9,6 @@ export interface SkillContextEntry {
   path: string;
   hash: string;
   instructions: string;
-  workflows: string[];
   commandSpecs: string[];
 }
 
@@ -44,18 +43,16 @@ function parseSkill(path: string, fallbackName: string, content: string, allowSi
     if (!allowSideEffects) assertNoSideEffects(parsed, path);
     const name = typeof parsed.name === "string" ? parsed.name : fallbackName;
     const instructions = typeof parsed.instructions === "string" ? parsed.instructions : "";
-    const workflows = Array.isArray(parsed.workflows) ? parsed.workflows.filter((entry): entry is string => typeof entry === "string") : [];
     const commandSpecs = Array.isArray(parsed.commands) ? parsed.commands.map((entry) => JSON.stringify(entry)).filter((entry) => entry.length > 0) : [];
     return {
       name,
       path,
       hash: sha256(content),
       instructions: truncateText(instructions, 2000).text,
-      workflows: workflows.map((entry) => truncateText(entry, 1000).text),
       commandSpecs
     };
   }
-  return { name: fallbackName, path, hash: sha256(content), instructions: truncateText(content, 2000).text, workflows: [], commandSpecs: [] };
+  return { name: fallbackName, path, hash: sha256(content), instructions: truncateText(content, 2000).text, commandSpecs: [] };
 }
 
 function assertNoSideEffects(value: Record<string, unknown>, path: string): void {

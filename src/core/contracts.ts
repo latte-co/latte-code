@@ -1,24 +1,8 @@
 import type { AgentResult } from "./agent-loop.js";
-import type { SessionState } from "../session/session.js";
 import type { ToolCall } from "../tools/types.js";
 import { isJsonValue, isRecord, stableId, type JsonValue } from "../shared/types.js";
 
-export type AgentPhase = "intake" | "understand" | "plan" | "edit" | "verify" | "handoff";
-
 export const TASK_RUN_STATUSES = ["queued", "running", "waiting_permission", "blocked", "failed", "completed"] as const;
-
-export const V0_1_CONTRACT_AUTHORITY = {
-  releaseCriticalPath: "headless-agent-handoff",
-  graphReadyRole: "compatibility-wrapper",
-  canonicalStatusOwner: "TaskRunState.status",
-  legacyStatusBehavior: "compatibility-mapping-only",
-  formalSources: [
-    "docs/zh-CN/design/modules/code-agent-loop.md",
-    "docs/zh-CN/milestones/targets/v0.1-engineering-baseline.md",
-    "docs/zh-CN/milestones/targets/v0.1-implementation-plan-review.md"
-  ],
-  executionMirror: ".oh-my-code/plans/v0-1-docs-src-gap-implementation-plan.md"
-} as const;
 
 export type TaskRunStatus = (typeof TASK_RUN_STATUSES)[number];
 
@@ -27,7 +11,6 @@ export type PendingInput =
       kind: "permission";
       permissionId: string;
       toolCallId: string;
-      phase: AgentPhase;
       action: "write_file" | "edit_file" | "shell_exec" | "mcp_call" | "external_path";
       reason: string;
       command?: string;
@@ -37,7 +20,6 @@ export type PendingInput =
   | {
       kind: "question";
       questionId: string;
-      phase: AgentPhase;
       prompt: string;
       expectedAnswer: "text" | "json";
       schemaName?: string;
@@ -60,7 +42,7 @@ export type ResumeInput =
 export type ResumeMarker =
   | { type: "permission"; permissionId: string }
   | { type: "blocked"; questionId: string }
-  | { type: "failed"; failedStepId: string }
+  | { type: "failed"; failedTurnId: string }
   | { type: "completed"; handoffId: string };
 
 export interface ContextSnapshot {
@@ -103,7 +85,7 @@ export interface AgentHandoff {
   evidenceRefs: string[];
 }
 
-export interface TaskSpec {
+export interface AgentTaskContext {
   objective: string;
   scope: string[];
   acceptance: string[];
@@ -112,49 +94,19 @@ export interface TaskSpec {
   blockers: string[];
 }
 
-export interface ContextSnippet {
-  path: string;
-  summary: string;
-  evidenceRefs: string[];
-}
-
-export interface ContextPack {
-  summary: string;
-  filesRead: string[];
-  relevantSnippets: ContextSnippet[];
-  commandSources: string[];
-  openQuestions: string[];
-}
-
-export interface ChangePlan {
-  summary: string;
-  targetFiles: string[];
-  steps: string[];
-  verificationCommands: string[];
-  risks: string[];
-}
-
-export interface PatchSummary {
-  changedFiles: string[];
-  diffRefs: string[];
-  rationale: string;
-  evidenceRefs: string[];
-}
-
 export type VerificationResult = HandoffVerificationRef;
 
-export type StepTraceStatus = "pending" | "running" | "done" | "blocked" | "failed";
+export type TurnTraceStatus = "pending" | "running" | "done" | "blocked" | "failed";
 
-export interface StepTrace {
+export interface TurnTrace {
   id: string;
-  phase: AgentPhase;
-  status: StepTraceStatus;
+  status: TurnTraceStatus;
   promptId: string;
   promptVersion: string;
   summary: string;
   toolCallIds: string[];
   evidenceIds: string[];
-  reactBudget: { maxSteps: number; usedSteps: number };
+  turnBudget: { maxTurns: number; usedTurns: number };
   error?: string;
 }
 
@@ -162,13 +114,11 @@ export interface TaskRunState {
   id: string;
   sessionId: string;
   status: TaskRunStatus;
-  currentPhase: AgentPhase;
-  task?: TaskSpec;
-  context?: ContextPack;
-  plan?: ChangePlan;
-  patch?: PatchSummary;
+  agentContext?: AgentTaskContext;
+  changedFiles: string[];
+  changeEvidenceRefs: string[];
   verification: VerificationResult[];
-  steps: StepTrace[];
+  turns: TurnTrace[];
   resume?: ResumeMarker;
   pendingInput?: PendingInput;
   handoff?: AgentHandoff;
@@ -191,12 +141,6 @@ export function isTaskRunStatus(value: unknown): value is TaskRunStatus {
   return value === "queued" || value === "running" || value === "waiting_permission" || value === "blocked" || value === "failed" || value === "completed";
 }
 
-export function mapLegacyAgentStatus(status: AgentResult["status"] | SessionState["status"]): TaskRunStatus {
-  if (status === "denied") return "blocked";
-  if (isTaskRunStatus(status)) return status;
-  return "failed";
-}
-
 export function exitCodeForTaskRunStatus(status: TaskRunStatus): number {
   if (status === "completed") return 0;
   if (status === "waiting_permission") return 20;
@@ -210,7 +154,6 @@ export function createPermissionPendingInput(sessionId: string, call: ToolCall, 
     kind: "permission",
     permissionId: stableId("permission", [sessionId, call.id]),
     toolCallId: call.id,
-    phase: inferAgentPhaseFromToolName(call.name),
     action: inferPermissionAction(call.name, call.input.path),
     reason,
     ...(typeof call.input.command === "string" ? { command: call.input.command } : {}),
@@ -219,11 +162,10 @@ export function createPermissionPendingInput(sessionId: string, call: ToolCall, 
   };
 }
 
-export function createQuestionPendingInput(input: { questionId: string; phase: AgentPhase; prompt: string; expectedAnswer: "text" | "json"; schemaName?: string }): Extract<PendingInput, { kind: "question" }> {
+export function createQuestionPendingInput(input: { questionId: string; prompt: string; expectedAnswer: "text" | "json"; schemaName?: string }): Extract<PendingInput, { kind: "question" }> {
   return {
     kind: "question",
     questionId: input.questionId,
-    phase: input.phase,
     prompt: input.prompt,
     expectedAnswer: input.expectedAnswer,
     ...(input.schemaName === undefined ? {} : { schemaName: input.schemaName })
@@ -231,15 +173,14 @@ export function createQuestionPendingInput(input: { questionId: string; phase: A
 }
 
 export function createHeadlessRunEnvelopeFromAgentResult(result: AgentResult): HeadlessRunEnvelope {
-  const status = result.runState?.status ?? mapLegacyAgentStatus(result.status);
-  const pendingInput = result.pendingInput ?? result.runState?.pendingInput ?? pendingInputFromLegacySession(result.session);
-  const handoff = result.handoff ?? result.runState?.handoff ?? createCompatibilityHandoff(result, status, pendingInput);
+  const run = result.runState ?? result.session.runState;
+  if (run !== undefined) return createHeadlessRunEnvelopeFromTaskRunState(run);
   return {
-    runId: result.runState?.id ?? result.session.id,
+    runId: result.session.id,
     sessionId: result.session.id,
-    status,
-    ...(pendingInput === undefined ? {} : { pendingInput }),
-    ...(handoff === undefined ? {} : { handoff })
+    status: result.status,
+    ...(result.pendingInput === undefined ? {} : { pendingInput: result.pendingInput }),
+    ...(result.handoff === undefined ? {} : { handoff: result.handoff })
   };
 }
 
@@ -259,7 +200,6 @@ export function isPendingInput(value: unknown): value is PendingInput {
     return (
       typeof value.permissionId === "string" &&
       typeof value.toolCallId === "string" &&
-      isAgentPhase(value.phase) &&
       isPermissionPendingAction(value.action) &&
       typeof value.reason === "string" &&
       (value.command === undefined || typeof value.command === "string") &&
@@ -271,7 +211,7 @@ export function isPendingInput(value: unknown): value is PendingInput {
     );
   }
   if (value.kind === "question") {
-    return typeof value.questionId === "string" && isAgentPhase(value.phase) && typeof value.prompt === "string" && (value.expectedAnswer === "text" || value.expectedAnswer === "json") && (value.schemaName === undefined || typeof value.schemaName === "string");
+    return typeof value.questionId === "string" && typeof value.prompt === "string" && (value.expectedAnswer === "text" || value.expectedAnswer === "json") && (value.schemaName === undefined || typeof value.schemaName === "string");
   }
   return false;
 }
@@ -311,40 +251,27 @@ export function isAgentHandoff(value: unknown): value is AgentHandoff {
   );
 }
 
-export function isTaskSpec(value: unknown): value is TaskSpec {
+export function isAgentTaskContext(value: unknown): value is AgentTaskContext {
   return isRecord(value) && typeof value.objective === "string" && isStringArray(value.scope) && isStringArray(value.acceptance) && isStringArray(value.nonGoals) && isStringArray(value.constraints) && isStringArray(value.blockers);
-}
-
-export function isContextPack(value: unknown): value is ContextPack {
-  return isRecord(value) && typeof value.summary === "string" && isStringArray(value.filesRead) && Array.isArray(value.relevantSnippets) && value.relevantSnippets.every(isContextSnippet) && isStringArray(value.commandSources) && isStringArray(value.openQuestions);
-}
-
-export function isChangePlan(value: unknown): value is ChangePlan {
-  return isRecord(value) && typeof value.summary === "string" && isStringArray(value.targetFiles) && isStringArray(value.steps) && isStringArray(value.verificationCommands) && isStringArray(value.risks);
-}
-
-export function isPatchSummary(value: unknown): value is PatchSummary {
-  return isRecord(value) && isStringArray(value.changedFiles) && isStringArray(value.diffRefs) && typeof value.rationale === "string" && isStringArray(value.evidenceRefs);
 }
 
 export function isVerificationResult(value: unknown): value is VerificationResult {
   return isHandoffVerificationRef(value);
 }
 
-export function isStepTrace(value: unknown): value is StepTrace {
+export function isTurnTrace(value: unknown): value is TurnTrace {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
-    isAgentPhase(value.phase) &&
-    isStepTraceStatus(value.status) &&
+    isTurnTraceStatus(value.status) &&
     typeof value.promptId === "string" &&
     typeof value.promptVersion === "string" &&
     typeof value.summary === "string" &&
     isStringArray(value.toolCallIds) &&
     isStringArray(value.evidenceIds) &&
-    isRecord(value.reactBudget) &&
-    typeof value.reactBudget.maxSteps === "number" &&
-    typeof value.reactBudget.usedSteps === "number" &&
+    isRecord(value.turnBudget) &&
+    typeof value.turnBudget.maxTurns === "number" &&
+    typeof value.turnBudget.usedTurns === "number" &&
     (value.error === undefined || typeof value.error === "string")
   );
 }
@@ -355,81 +282,21 @@ export function isTaskRunState(value: unknown): value is TaskRunState {
     typeof value.id === "string" &&
     typeof value.sessionId === "string" &&
     isTaskRunStatus(value.status) &&
-    isAgentPhase(value.currentPhase) &&
-    (value.task === undefined || isTaskSpec(value.task)) &&
-    (value.context === undefined || isContextPack(value.context)) &&
-    (value.plan === undefined || isChangePlan(value.plan)) &&
-    (value.patch === undefined || isPatchSummary(value.patch)) &&
+    (value.agentContext === undefined || isAgentTaskContext(value.agentContext)) &&
+    isStringArray(value.changedFiles) &&
+    isStringArray(value.changeEvidenceRefs) &&
     Array.isArray(value.verification) &&
     value.verification.every(isVerificationResult) &&
-    Array.isArray(value.steps) &&
-    value.steps.every(isStepTrace) &&
+    Array.isArray(value.turns) &&
+    value.turns.every(isTurnTrace) &&
     (value.pendingInput === undefined || isPendingInput(value.pendingInput)) &&
     (value.handoff === undefined || isAgentHandoff(value.handoff)) &&
     isContextSnapshot(value.contextSnapshot)
   );
 }
 
-function createCompatibilityHandoff(result: AgentResult, status: TaskRunStatus, pendingInput: PendingInput | undefined): AgentHandoff | undefined {
-  if (status === "waiting_permission") return undefined;
-  if (status === "running" || status === "queued") return undefined;
-  const evidenceRefs = result.session.evidenceIds;
-  const blockedReason = pendingInput?.kind === "question" ? pendingInput.prompt : result.error;
-  return {
-    id: stableId("handoff", [result.session.id, status, String(result.session.lastEventSeq)]),
-    status: status === "completed" ? "completed" : status === "failed" ? "failed" : "blocked",
-    summary: result.finalResponse ?? result.error ?? pendingInputReason(pendingInput) ?? "Legacy agent result requires compatibility handoff.",
-    changedFiles: [],
-    verification: [],
-    risks: status === "completed" ? [] : ["Compatibility handoff was derived from the legacy transcript loop."],
-    blockers: blockedReason === undefined ? [] : [blockedReason],
-    requiredDecisions: pendingInput === undefined ? [] : [pendingInputToDecisionRef(pendingInput)],
-    traceRefs: [],
-    evidenceRefs
-  };
-}
-
-function pendingInputFromLegacySession(session: SessionState): PendingInput | undefined {
-  if (session.pendingInput !== undefined) return session.pendingInput;
-  if (session.pendingPermission === undefined) return undefined;
-  return {
-    kind: "permission",
-    permissionId: session.pendingPermission.permissionId ?? stableId("permission", [session.id, session.pendingPermission.callId]),
-    toolCallId: session.pendingPermission.callId,
-    phase: session.pendingPermission.phase ?? inferAgentPhaseFromToolName(session.pendingPermission.toolName),
-    action: session.pendingPermission.action ?? inferPermissionAction(session.pendingPermission.toolName),
-    reason: session.pendingPermission.reason,
-    ...(session.pendingPermission.command === undefined ? {} : { command: session.pendingPermission.command }),
-    ...(session.pendingPermission.path === undefined ? {} : { path: session.pendingPermission.path }),
-    options: ["approve", "deny"]
-  };
-}
-
-function pendingInputToDecisionRef(input: PendingInput): RequiredDecisionRef {
-  if (input.kind === "permission") {
-    return { kind: "permission", id: input.permissionId, reason: input.reason };
-  }
-  return { kind: "question", id: input.questionId, reason: input.prompt };
-}
-
-function pendingInputReason(input: PendingInput | undefined): string | undefined {
-  if (input === undefined) return undefined;
-  return input.kind === "permission" ? input.reason : input.prompt;
-}
-
-function isAgentPhase(value: unknown): value is AgentPhase {
-  return value === "intake" || value === "understand" || value === "plan" || value === "edit" || value === "verify" || value === "handoff";
-}
-
 function isPermissionPendingAction(value: unknown): value is Extract<PendingInput, { kind: "permission" }>["action"] {
   return value === "write_file" || value === "edit_file" || value === "shell_exec" || value === "mcp_call" || value === "external_path";
-}
-
-function inferAgentPhaseFromToolName(toolName: string): AgentPhase {
-  if (toolName === "shell_exec") return "verify";
-  if (toolName === "write_file" || toolName === "edit_file") return "edit";
-  if (toolName === "read_file" || toolName === "list_directory" || toolName === "search" || toolName === "read_project_manifest") return "understand";
-  return "plan";
 }
 
 function inferPermissionAction(toolName: string, path?: unknown): Extract<PendingInput, { kind: "permission" }>["action"] {
@@ -452,11 +319,7 @@ function isRequiredDecisionRef(value: unknown): value is RequiredDecisionRef {
   return isRecord(value) && (value.kind === "permission" || value.kind === "question") && typeof value.id === "string" && typeof value.reason === "string";
 }
 
-function isContextSnippet(value: unknown): value is ContextSnippet {
-  return isRecord(value) && typeof value.path === "string" && typeof value.summary === "string" && isStringArray(value.evidenceRefs);
-}
-
-function isStepTraceStatus(value: unknown): value is StepTraceStatus {
+function isTurnTraceStatus(value: unknown): value is TurnTraceStatus {
   return value === "pending" || value === "running" || value === "done" || value === "blocked" || value === "failed";
 }
 

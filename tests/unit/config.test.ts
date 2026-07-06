@@ -24,13 +24,13 @@ describe("JSONC config", () => {
     expect(mergeConfig(DEFAULT_CONFIG, undefined).schemaVersion).toBe(1);
     const config = mergeConfig(DEFAULT_CONFIG, {
       session: { store: "memory" },
-      runtime: { maxPhaseSteps: 3 },
-      context: { preserve: ["task"] },
+      runtime: { maxTurns: 3 },
+      context: { preserve: ["request"] },
       tools: { enabled: ["read_file"], shell: { defaultTimeoutMs: 10, allowCommands: ["npm test"] } }
     });
     expect(config.session.store).toBe("memory");
-    expect(config.runtime.maxPhaseSteps).toBe(3);
-    expect(config.context.preserve).toEqual(["task"]);
+    expect(config.runtime.maxTurns).toBe(3);
+    expect(config.context.preserve).toEqual(["request"]);
     expect(config.tools.enabled).toEqual(["read_file"]);
     expect(config.tools.shell.defaultTimeoutMs).toBe(10);
     expect(config.tools.shell.allowCommands).toEqual(["npm test"]);
@@ -51,17 +51,15 @@ describe("JSONC config", () => {
     expect(() => mergeConfig(DEFAULT_CONFIG, { permissions: { defaultMode: "sometimes" } })).toThrow("Invalid permission");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { apiKeyEnv: "" } } } })).toThrow("empty apiKeyEnv");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { primary: { type: "openai-compatible", model: "gpt-test" } } } })).toThrow("requires apiKeyEnv");
-    expect(() => mergeConfig(DEFAULT_CONFIG, { runtime: { maxPhaseSteps: 0 } })).toThrow("runtime.maxPhaseSteps");
+    expect(() => mergeConfig(DEFAULT_CONFIG, { runtime: { maxTurns: 0 } })).toThrow("runtime.maxTurns");
     expect(() => mergeConfig(DEFAULT_CONFIG, { tools: { shell: { allowCommands: [1] } } })).toThrow("tools.shell.allowCommands");
     expect(() => mergeConfig(DEFAULT_CONFIG, { agents: { loadFrom: ["outside"] } })).toThrow("Invalid agents.loadFrom");
-    expect(() => mergeConfig(DEFAULT_CONFIG, { coverage: { lines: 101 } })).toThrow("Coverage");
+    expect(() => mergeConfig(DEFAULT_CONFIG, { coverage: { lines: 80 } })).toThrow("Unknown top-level config key 'coverage'");
     expect(() => mergeConfig(DEFAULT_CONFIG, null)).toThrow("Config root");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { type: "unsupported" } } } })).toThrow("unsupported provider type");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { model: " " } } } })).toThrow("model");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { baseUrl: " " } } } })).toThrow("baseUrl");
     expect(() => mergeConfig(DEFAULT_CONFIG, { agents: { hashAlgorithm: "sha1" } })).toThrow("sha256");
-    expect(() => mergeConfig(DEFAULT_CONFIG, { runtime: { stopOnVerificationFailure: "yes" } })).toThrow("runtime.stopOnVerificationFailure");
-    expect(() => mergeConfig(DEFAULT_CONFIG, { runtime: { maxRepairTurns: -1 } })).toThrow("runtime.maxRepairTurns");
     expect(() => mergeConfig(DEFAULT_CONFIG, { context: { maxToolResultBytes: 0 } })).toThrow("context.maxToolResultBytes");
     expect(() => mergeConfig(DEFAULT_CONFIG, { mcp: { servers: [] } })).toThrow("mcp.servers");
     expect(() => mergeConfig(DEFAULT_CONFIG, { mcp: { servers: { s: { enabled: "yes" } } } })).toThrow("mcp.servers.s.enabled");
@@ -77,7 +75,7 @@ describe("JSONC config", () => {
   it("rejects apiMode and distinguishes future provider taxonomy from typos", () => {
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { apiMode: "openai-compatible-chat" } } } })).toThrow(/apiMode.*type/);
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { default: "primary", providers: { primary: { apiMode: "openai-compatible-chat", model: "gpt-test", apiKeyEnv: "MODEL_KEY" } } } })).toThrow(/apiMode.*type/);
-    expect(() => mergeConfig(DEFAULT_CONFIG, { models: { default: "primary", providers: { primary: { type: "anthropic", model: "claude-test" } } } })).toThrow("recognized but not implemented in this runtime");
+    expect(() => mergeConfig(DEFAULT_CONFIG, { models: { default: "primary", providers: { primary: { type: "anthropic", model: "claude-test" } } } })).toThrow("reserved for a future provider adapter");
     expect(() => mergeConfig(DEFAULT_CONFIG, { models: { providers: { fake: { type: "opneai-compatible" } } } })).toThrow("unsupported provider type");
   });
 
@@ -113,10 +111,10 @@ describe("JSONC config", () => {
   it("loads global JSON config", async () => {
     const { cwd, home } = await configFixture();
     const path = join(home, ".lattecode", "lattecode.json");
-    await writeConfig(path, `{ "schemaVersion": 1, "runtime": { "maxPhaseSteps": 3 } }`);
+    await writeConfig(path, `{ "schemaVersion": 1, "runtime": { "maxTurns": 3 } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.paths).toEqual([path]);
-    expect(loaded.config.runtime.maxPhaseSteps).toBe(3);
+    expect(loaded.config.runtime.maxTurns).toBe(3);
   });
 
   it("loads project JSONC config", async () => {
@@ -142,11 +140,11 @@ describe("JSONC config", () => {
     const jsoncPath = join(cwd, ".lattecode", "lattecode.jsonc");
     const jsonPath = join(cwd, ".lattecode", "lattecode.json");
     await writeConfig(jsonPath, `{ "schemaVersion": 1, "session": { "store": "memory" } }`);
-    await writeConfig(jsoncPath, `{ "schemaVersion": 1, "runtime": { "maxPhaseSteps": 4 } }`);
+    await writeConfig(jsoncPath, `{ "schemaVersion": 1, "runtime": { "maxTurns": 4 } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.paths).toEqual([jsoncPath]);
     expect(loaded.path).toBe(jsoncPath);
-    expect(loaded.config.runtime.maxPhaseSteps).toBe(4);
+    expect(loaded.config.runtime.maxTurns).toBe(4);
     expect(loaded.config.session.store).toBe(DEFAULT_CONFIG.session.store);
   });
 
@@ -167,11 +165,11 @@ describe("JSONC config", () => {
 
   it("lets project keys override global keys", async () => {
     const { cwd, home } = await configFixture();
-    await writeConfig(join(home, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "zh-CN" }, "runtime": { "maxPhaseSteps": 2 } }`);
+    await writeConfig(join(home, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "zh-CN" }, "runtime": { "maxTurns": 2 } }`);
     await writeConfig(join(cwd, ".lattecode", "lattecode.jsonc"), `{ "schemaVersion": 1, "prompts": { "language": "en-US" } }`);
     const loaded = await loadConfig({ cwd, homeDir: home });
     expect(loaded.config.prompts.language).toBe("en-US");
-    expect(loaded.config.runtime.maxPhaseSteps).toBe(2);
+    expect(loaded.config.runtime.maxTurns).toBe(2);
   });
 
   it("falls back to defaults when discovered config files are missing", async () => {

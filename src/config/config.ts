@@ -14,6 +14,21 @@ export interface LoadConfigOptions {
 }
 
 type PartialJson = Record<string, unknown>;
+const TOP_LEVEL_CONFIG_KEYS = new Set<keyof LattecodeConfig>([
+  "schemaVersion",
+  "models",
+  "runtime",
+  "prompts",
+  "agents",
+  "context",
+  "permissions",
+  "tools",
+  "commands",
+  "skills",
+  "mcp",
+  "session",
+  "evidence"
+]);
 
 export interface LoadedConfig {
   config: LattecodeConfig;
@@ -40,6 +55,11 @@ function mergeObjects(base: unknown, override: unknown): unknown {
 }
 
 export function validateConfig(config: LattecodeConfig): void {
+  for (const key of Object.keys(config)) {
+    if (!TOP_LEVEL_CONFIG_KEYS.has(key as keyof LattecodeConfig)) {
+      throw new Error(`Unknown top-level config key '${key}'`);
+    }
+  }
   if (config.schemaVersion !== 1) throw new Error("Unsupported schemaVersion");
   const provider = config.models.providers[config.models.default];
   if (provider === undefined) throw new Error(`Default model provider '${config.models.default}' is not defined`);
@@ -50,9 +70,7 @@ export function validateConfig(config: LattecodeConfig): void {
       throw new Error(`Provider '${id}' has empty apiKeyEnv`);
     }
   }
-  validatePositiveInteger("runtime.maxPhaseSteps", config.runtime.maxPhaseSteps);
-  validateNonNegativeInteger("runtime.maxRepairTurns", config.runtime.maxRepairTurns);
-  validateBoolean("runtime.stopOnVerificationFailure", config.runtime.stopOnVerificationFailure);
+  validatePositiveInteger("runtime.maxTurns", config.runtime.maxTurns);
   validateNonEmptyString("prompts.profile", config.prompts.profile);
   validateNonEmptyString("prompts.language", config.prompts.language);
   validateNonEmptyString("agents.agentsFile", config.agents.agentsFile);
@@ -64,7 +82,7 @@ export function validateConfig(config: LattecodeConfig): void {
   if (config.agents.hashAlgorithm !== "sha256") throw new Error("agents.hashAlgorithm must be sha256");
   validatePositiveInteger("context.maxPromptBytes", config.context.maxPromptBytes);
   validatePositiveInteger("context.maxToolResultBytes", config.context.maxToolResultBytes);
-  validateNonNegativeInteger("context.recentStepCount", config.context.recentStepCount);
+  validateNonNegativeInteger("context.recentTurnCount", config.context.recentTurnCount);
   validateStringArray("context.preserve", config.context.preserve);
   for (const mode of [config.permissions.defaultMode, config.permissions.mutatingTools, config.permissions.highRiskTools]) {
     if (!["allow", "ask", "deny"].includes(mode)) throw new Error(`Invalid permission mode '${mode}'`);
@@ -101,9 +119,6 @@ export function validateConfig(config: LattecodeConfig): void {
       }
     }
   }
-  for (const threshold of [config.coverage.statements, config.coverage.branches, config.coverage.functions, config.coverage.lines]) {
-    if (threshold < 0 || threshold > 100) throw new Error("Coverage thresholds must be between 0 and 100");
-  }
 }
 
 function validateProvider(id: string, provider: LattecodeConfig["models"]["providers"][string]): void {
@@ -112,7 +127,7 @@ function validateProvider(id: string, provider: LattecodeConfig["models"]["provi
   }
 
   const status = providerTypeStatus(provider.type);
-  if (status === "future") throw new Error(`Provider '${id}' type '${provider.type}' is recognized but not implemented in this runtime`);
+  if (status === "future") throw new Error(`Provider '${id}' type '${provider.type}' is reserved for a future provider adapter`);
   if (status === "unsupported") throw new Error(`Provider '${id}' has unsupported provider type '${String(provider.type)}'`);
   validateNonEmptyString(`Provider '${id}' model`, provider.model);
   if (provider.type === "openai-compatible" && provider.apiKeyEnv === undefined) throw new Error(`Provider '${id}' requires apiKeyEnv`);
