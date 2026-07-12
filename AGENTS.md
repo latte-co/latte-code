@@ -1,187 +1,43 @@
 # AGENTS.md
 
-## 1. Project Overview
+## Project
 
-Lattecode is currently a TypeScript code agent project. Lattecode is a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. The confirmed project baselines are as follows:
+Lattecode is a Rust 2024 workspace implementing a code agent with a Ratatui frontend and headless CLI. Rust is the only implementation; do not add Node.js, TypeScript, or compatibility layers.
 
-- Content format: Markdown technical documentation plus TypeScript project scaffolding / source area (see `src/`). Formal design documents must not imply that full internal-runtime capabilities are already implemented.
-- License: Apache License 2.0 (see `LICENSE`).
-- Declared runtime / framework / package manager versions: Node.js >= 20, TypeScript, Vitest (see `package.json`, `tsconfig.json`, `vitest.config.ts`).
-- Current product goal: code-agent-first. Near-term work should make Lattecode complete local repository tasks by understanding context, editing within scope, running verification, and producing reviewable handoff.
-- Runtime evolution boundary: full runtime concepts are long-term internal evolution, not `v0.1` product promises. They should grow from working code-agent traces, evidence, permissions, effects, and recovery needs.
-- Reference frame: from the external software-engineering-system perspective, Lattecode is a code agent `Data Plane`; it does not replace repo permissions, CI, review, compliance, or deployment gates. `Control Plane Authority` means only Lattecode internal runtime authority after runtime structure is introduced incrementally.
-- Key terminology: `Data Plane`, `Control Plane Authority` scoped to internal runtime authority, `ActionGraph`, `ActionNode`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `Reconciler`, `OverlayRevision`, `ContextProjection`, `NodeExecutor`.
+## Structure
 
-Do NOT treat local tool or runtime files under `.opencode/`, `.oh-my-code/`, `.tmp/`, or `log/` as project source code, package manager evidence, or build entry points.
+- `crates/latte-core`: serializable protocol and state machine; independent of storage, providers, and UI.
+- `crates/latte-engine`: privileged authority for SQLite state, leases, policy, filesystem tools, effects, and supervised processes.
+- `crates/latte-headless`: provider, repository context, agent loop, verification, handoff, and command service.
+- `crates/latte-tui`: pure UI projection/reducer and Ratatui terminal lifecycle.
+- `crates/lattecode`: binary composition and CLI contracts.
+- `docs/en-US` and `docs/zh-CN`: maintained architecture and operations docs.
 
-## 2. Project Structure Map
+Local `.latte/`, `.oh-my-code/`, `.tmp/`, `target/`, logs, and secrets are not project source.
 
-| Directory / File | Purpose | Local Documentation |
-| --- | --- | --- |
-| `docs/zh-CN/README.md` | Documentation index and maintenance conventions | – |
-| `docs/zh-CN/research/` | Research facts, cross-product comparisons, verifiable observational conclusions | `docs/zh-CN/README.md` |
-| `docs/zh-CN/research/code-agent-survey.md` | Cross-product research on `claude-code`, `codex`, `CodeWhale`, `opencode`, `oh-my-openagent` | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/` | Design proposals, architecture layering, interface models, and module models | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/architecture-overview.md` | Current formal architecture overview: external `Data Plane` reference frame, internal runtime authority, module document map, promotion/gate/ReAct boundaries | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/modules/` | Current module-level technical design placeholders for implementation work | `docs/zh-CN/README.md` |
-| `docs/zh-CN/design/runtime-evolution/` | Accepted long-term runtime evolution targets, not `v0.1` product promises | `docs/zh-CN/README.md` |
-| `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md` | Current independent v0.1-v0.5 code-agent evolution task breakdown | `docs/zh-CN/README.md` |
-| `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md` | Current v0.1-v0.5 code-agent evolution roadmap | `docs/zh-CN/README.md` |
-| `docs/en-US/README.md` | English documentation index and translation status | `docs/README.md` |
-| `docs/en-US/design/` | English counterparts for maintained formal design documents | `docs/en-US/README.md` |
-| `src/` | TypeScript source area for code-agent implementation work. Do not infer internal-runtime implementation completeness from design documents; future runtime evolution should follow the current architecture overview, near-term module designs, runtime-evolution targets, roadmap, and task breakdown. | `docs/zh-CN/design/architecture-overview.md`, `docs/zh-CN/design/modules/`, `docs/zh-CN/design/runtime-evolution/`, `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`, `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md` |
-| `tests/` | Vitest unit + integration tests | `vitest.config.ts` |
-| `package.json` / `tsconfig.json` / `vitest.config.ts` | Node/TypeScript/Vitest project configuration | – |
-| `lattecode.config.example.jsonc` | JSONC example configuration, no secrets | – |
-| `LICENSE` | Apache License 2.0 text | – |
-| `.gitignore` | Ignore Node/build/cache/coverage/local tool/runtime outputs | – |
+## Required checks
 
-## 3. Build & Development Commands
-
-The following basic TypeScript/Vitest commands are currently declared:
+Run the complete local gate with `make ci`. See `DEVELOPMENT.md` for setup, individual targets, and troubleshooting.
 
 ```bash
-npm run build
-npm test
-npm run test:coverage
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo doc --workspace --no-deps
 ```
 
-No `dev`, release, remote service, or monorepo/workspace commands are declared; do not invent guessed commands.
+When installed, also run `cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 90` and `cargo deny check`. Do not lower the coverage floor.
 
-## 4. Testing Instructions
+## Invariants
 
-The current authoritative testing framework is Vitest, with test files located at `tests/**/*.test.ts`.
+- `latte-engine` is the sole privileged effect authority; frontends use typed commands and projections.
+- Persist declared/prepared effects before execution. Never infer success after interruption; record `Unknown` and require reconciliation.
+- Bind mutations to exact run revision, lease fencing token, input digest, and single-use approval.
+- Keep filesystem mutations workspace-contained and handle-relative. Unsupported safety primitives fail before `Started`.
+- Execute commands argv-first. Explicit shell execution is high-risk and must pass policy.
+- Bound output, timeout, cancellation, and shutdown. On Unix, supervise the whole process group.
+- Never log or persist provider keys.
+- Required verification cannot complete when failed, missing, or not run.
+- TUI actions reduce to typed runtime commands; Enter never implicitly approves permission.
 
-```bash
-npm test
-npm run test:coverage
-```
-
-The coverage threshold is set to 98% in `vitest.config.ts`. No standalone lint command is currently declared.
-
-## 5. Git Workflow
-
-The repository currently appears to be in an early / newly initialized stage; do not assume established branching strategies or commit conventions.
-
-Permitted operations:
-
-- Modify Markdown documents directly related to the task.
-- When adding documents to `docs/zh-CN/research/`, update the index in `docs/zh-CN/README.md` accordingly.
-- When adding documents to `docs/zh-CN/design/`, update the index in `docs/zh-CN/README.md` accordingly.
-- When adding or substantially updating maintained formal documentation in `docs/zh-CN/` or `docs/en-US/`, update the corresponding document in the other language or explicitly mark translation deferral in both language indexes.
-- Verify that only expected file changes are included before committing.
-
-Prohibited operations:
-
-- (CRITICAL) Do not commit, amend, push, rebase, tag, or create PRs without explicit user request.
-- (CRITICAL) Do not commit `.env*`, logs, caches, `.opencode/`, `.oh-my-code/`, `.tmp/`, `log/`, or `node_modules/`.
-- Do not treat local tool state ignored by `.gitignore` as project deliverables.
-- Do not introduce package manager files or scaffolding files without source code / build configuration.
-
-## 6. Code Style Guidelines
-
-This repository currently maintains primarily English technical Markdown. Writing should maintain clear boundaries between facts and design proposals; English technical identifiers should use backticks; filenames should use lowercase kebab-case.
-
-### Documentation / Code Alignment
-
-- Code changes that implement runtime concepts must keep the corresponding design documentation aligned.
-- If implementation behavior diverges from `docs/` design documents, update the documents in the same change or explicitly document the divergence.
-- Do not introduce new core runtime terminology in code without reflecting it in the relevant design documentation.
-
-### Bilingual Documentation Alignment
-
-- Formal documentation under `docs/zh-CN/` and `docs/en-US/` must stay structurally aligned.
-- When adding or substantially updating a formal Chinese document, add or update the corresponding English document path, and vice versa.
-- If a translation is intentionally deferred, mark it explicitly in both language indexes with the reason and expected follow-up.
-- Do not let `docs/en-US/README.md` remain a generic placeholder once English counterparts exist.
-
-✅ Recommended: Separate research facts from design proposals
-
-```markdown
-## Boundary between Research Facts and Design Proposals
-
-- **Research Facts**: Record the existing architecture, capabilities, and boundaries of the system.
-- **Design Proposals**: Explain the impact of these facts on the code-agent operating model and long-term runtime evolution.
-```
-
-❌ Avoid: Presenting unverified judgments as established facts
-
-```markdown
-This solution will definitely completely solve all code agent state management problems.
-```
-
-✅ Recommended: Technical prose + backtick-quoted identifiers
-
-```markdown
-Lattecode is first a code agent: it understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. Runtime concepts such as `ActionGraph` and `StateStore` are long-term internal evolution targets, not `v0.1` product promises.
-```
-
-❌ Avoid: Unmarked terminology, sloganized expressions
-
-```markdown
-The graph is the soul of the system, and the scheduler closes the loop.
-```
-
-✅ Recommended: Use lowercase kebab-case for document filenames
-
-```text
-docs/design/architecture-overview.md
-docs/research/code-agent-survey.md
-```
-
-❌ Avoid: Mixed spaces, uppercase, or ambiguous naming
-
-```text
-docs/design/Harness Native Final Draft.md
-docs/research/agent调查.md
-```
-
-## 7. Boundaries & Guardrails
-
-✅ **Always do**
-
-- Always read `docs/zh-CN/README.md` before adding or moving documents.
-- Always place research facts in `docs/zh-CN/research/`.
-- Always place design proposals and interface/module models in `docs/zh-CN/design/`.
-- Always place roadmaps, task breakdowns, and milestone targets in `docs/zh-CN/milestones/targets/`.
-- Always update the `docs/zh-CN/README.md` index when adding new documents.
-- Always update `docs/en-US/README.md` when adding English counterparts or marking translation status.
-- Always preserve the current positioning: Lattecode is first a code agent. Current implementation may focus on local repository workflows, but do not use local-repository scope or long-term runtime terms as front-stage product labels.
-- Always present `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` as concepts that grow from working code-agent traces, evidence, permissions, effects, and recovery needs.
-- Always maintain consistency of terminology: `Data Plane`, internal-runtime-scoped `Control Plane Authority`, `ActionGraph`, `ActionNode`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, `PolicyDecision`, `Observation`, `Evidence`, `Fact`, `Reconciler`, `OverlayRevision`, `ContextProjection`, `NodeExecutor`.
-- Always state the fact that commands, tests, or toolchain are "non-existent / not declared" rather than filling in guesses.
-- Before completing documentation changes, verify that `docs/README.md`, `docs/zh-CN/README.md`, and `docs/en-US/README.md` point only to existing maintained documents.
-
-⚠️ **Ask first**
-
-- Ask the user before introducing source directories, package managers, build systems, testing frameworks, or formatting tools.
-- Confirm objectives before rewriting core design conclusions, MVP scope, or key terminology.
-- Confirm before significantly restructuring the `docs/` directory or moving existing documents.
-- Confirm before running commands that modify the environment, install dependencies, or generate caches.
-
-🚫 **Never do**
-
-- Never treat `.opencode/`, `.oh-my-code/`, `.tmp/`, or `log/` as project source code or configuration sources.
-- Never treat `.tmp/` design drafts as formal source of truth; use them only as temporary inputs and re-establish conclusions in `docs/`.
-- Never run guessed `test`, `build`, `lint`, `typecheck`, `dev`, install, or scaffolding commands.
-- Never commit secrets, `.env*`, logs, caches, build artifacts, or dependency directories.
-- Never overstate implementation maturity, release processes, or stable technology stack versions beyond the files and commands declared in this repository.
-- Never write any license other than Apache License 2.0 into the project description, unless explicitly changed in the repository files.
-
-## 8. Related Documentation
-
-- `docs/zh-CN/README.md`: Documentation index and maintenance conventions.
-- `docs/en-US/README.md`: English documentation index and translation status.
-- `docs/zh-CN/research/code-agent-survey.md`: Cross-product research on code agent / agent workflow.
-- `docs/zh-CN/design/architecture-overview.md`: Current formal architecture overview and top-level reference frame.
-- `docs/zh-CN/design/modules/`: Current module-level technical design placeholders.
-- `docs/zh-CN/design/runtime-evolution/`: Accepted long-term runtime evolution targets.
-- `docs/zh-CN/milestones/targets/runtime-kernel-task-breakdown.md`: Current independent v0.1-v0.5 task breakdown.
-- `docs/zh-CN/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`: Current code-agent evolution roadmap from v0.1 to v0.5.
-- `docs/en-US/design/architecture-overview.md`: English counterpart for the architecture overview.
-- `docs/en-US/design/modules/`: English counterparts for module-level technical design placeholders.
-- `docs/en-US/design/runtime-evolution/`: English long-term runtime evolution targets.
-- `docs/en-US/milestones/targets/runtime-kernel-task-breakdown.md`: English counterpart for the task breakdown.
-- `docs/en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`: English counterpart for the v0.1-v0.5 code-agent evolution roadmap.
-- `LICENSE`: Apache License 2.0.
-- `.gitignore`: Ignore rules for local tools, runtime, caches, builds, and sensitive files.
+Keep English and Chinese formal docs aligned. Document only implemented behavior and name platform limits. Do not commit, push, tag, publish, or create a PR without an explicit user request.

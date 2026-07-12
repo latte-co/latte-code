@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 90
+      - if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@cargo-deny
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo deny check
+
+  windows-compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Process supervision and safe mutation fail closed at runtime on non-Unix.
+      - run: cargo check --workspace --all-targets --all-features
+
+  release-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: lattecode-linux-x86_64
+            binary: target/release/lattecode
+          - os: macos-latest
+            artifact: lattecode-macos-arm64
+            binary: target/release/lattecode
+          - os: windows-latest
+            artifact: lattecode-windows-x86_64
+            binary: target/release/lattecode.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p lattecode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error

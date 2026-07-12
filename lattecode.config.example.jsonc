@@ -1,94 +1,11 @@
 {
-  // Default Lattecode configuration. Do not place secrets here.
-  "schemaVersion": 1,
-  "models": {
-    "default": "fake",
-    "providers": {
-      "fake": {
-        "type": "fake",
-        "model": "fake-scripted"
-      },
-      "primary": {
-        "type": "openai-compatible",
-        "model": "gpt-5.5",
-        "baseUrl": "${LATTECODE_MODEL_BASE_URL}",
-        "apiKeyEnv": "LATTECODE_MODEL_API_KEY",
-        "temperature": 0.2,
-        "maxOutputTokens": 8192
-      }
+  // Embedding configuration. The lattecode CLI currently reads LATTE_* variables.
+  "database": { "path": ".latte/lattecode.db" },
+  "runtime": { "command_buffer": 32, "event_buffer": 128 },
+  "providers": {
+    "primary": {
+      "base_url": "${LATTE_OPENAI_ENDPOINT}",
+      "api_key": "${LATTE_OPENAI_API_KEY}"
     }
-  },
-  "runtime": {
-    "maxTurns": 8
-  },
-  "prompts": {
-    "profile": "default-code-agent-v1",
-    "language": "en-US"
-  },
-  "agents": {
-    "agentsFile": "AGENTS.md",
-    "loadFrom": ["repoRoot", "cwd"],
-    "snapshot": true,
-    "hashAlgorithm": "sha256"
-  },
-  "context": {
-    "maxPromptBytes": 120000,
-    "maxToolResultBytes": 32768,
-    "recentTurnCount": 6,
-    "preserve": ["request", "acceptance", "constraints", "changedFiles", "verification"]
-  },
-  "permissions": {
-    "defaultMode": "ask",
-    "allowReadOnlyTools": true,
-    "mutatingTools": "ask",
-    "highRiskTools": "deny",
-    "trustedDirectories": ["."],
-    "denyGlobs": ["**/.env*", "**/node_modules/**", "**/.git/**"]
-  },
-  "tools": {
-    "enabled": ["read_file", "list_directory", "search", "edit_file", "write_file", "shell_exec", "read_project_manifest", "git_diff"],
-    "disabled": [],
-    "maxOutputBytes": 32768,
-    "shell": {
-      "defaultTimeoutMs": 120000,
-      "allowCommands": ["npm test", "npm run build", "npm run test:coverage"],
-      "requireApprovalFor": ["network", "install", "delete", "git-write"]
-    }
-  },
-  "commands": {
-    "enabled": ["run", "resume", "show", "list"],
-    "localDirectory": ".lattecode/commands",
-    "allowLocalCommands": true
-  },
-  "skills": {
-    "enabled": [],
-    "localDirectories": [".lattecode/skills"],
-    "allowSideEffects": false
-  },
-  "mcp": {
-    "enabled": false,
-    "servers": {},
-    // Example shape when explicitly enabled:
-    // "servers": {
-    //   "local": {
-    //     "enabled": true,
-    //     "tools": {
-    //       "lookup": { "description": "Lookup local data", "mutating": false, "riskLevel": "low" }
-    //     }
-    //   }
-    // },
-    "requireExplicitEnable": true,
-    "routeThroughPermission": true
-  },
-  "session": {
-    "store": "filesystem",
-    "directory": ".lattecode/sessions",
-    "autosave": true,
-    "maxTranscriptBytes": 1048576
-  },
-  "evidence": {
-    "store": "filesystem",
-    "directory": ".lattecode/evidence",
-    "maxEvidenceBytes": 262144
   }
 }

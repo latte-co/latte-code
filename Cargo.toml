@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/latte-core",
+  "crates/latte-engine",
+  "crates/latte-headless",
+  "crates/latte-tui",
+  "crates/lattecode",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/latte-code/latte-code"
+rust-version = "1.93"
+
+[workspace.dependencies]
+latte-core = { path = "crates/latte-core", version = "0.1.0" }
+latte-engine = { path = "crates/latte-engine", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time"] }
+uuid = { version = "1.20", features = ["serde", "v7"] }
+json5 = "0.4"
+rusqlite = { version = "0.38", features = ["bundled"] }
+tempfile = "3.24"
+sha2 = "0.10"
+regex = "1.12"
+globset = "0.4"
+ignore = "0.4"
+cap-std = "4.0"
+nix = { version = "0.30", features = ["signal", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.30"
+crossterm = "0.29"
+signal-hook = "0.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = 1

@@ -1,87 +1,89 @@
 # Lattecode
 
-Lattecode is a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff.
+Lattecode is a Rust code agent for scoped repository changes. It provides a Ratatui terminal interface and a scriptable headless CLI over the same durable runtime.
 
-The project is design-first and intentionally conservative about implementation claims. The current implementation focus is local repository workflows, but that is an execution boundary, not the product positioning. Runtime concepts are documented as long-term internal evolution; they do not imply that the full internal runtime is already implemented.
+中文文档见 [docs/zh-CN/README.md](docs/zh-CN/README.md). Architecture details are in [docs/en-US/design/architecture-overview.md](docs/en-US/design/architecture-overview.md).
 
-## Reference Frame
+## Requirements
 
-From the broader software-engineering-system perspective, Lattecode is a code-agent `Data Plane` component. It may read repositories, call tools, make scoped changes, run verification, and hand results to humans or existing engineering systems.
+- Rust 1.93 or newer (the pinned toolchain is in `rust-toolchain.toml`)
+- A terminal for the interactive TUI
+- An OpenAI-compatible chat-completions endpoint for `run` and `resume`
 
-Lattecode does not replace repository permissions, CI, code review, compliance, release, or deployment gates. In this repository, `Control Plane Authority` means only Lattecode internal runtime authority inside the process and task boundary.
+## Build and install
 
-## Runtime Evolution Concepts
+```bash
+cargo build --workspace
+cargo install --path crates/lattecode
+```
 
-The long-term runtime evolution documents use the following concepts. These concepts should grow from working code-agent traces, evidence, permissions, effects, and recovery needs; they are not `v0.1` product promises.
+Run `cargo run -p lattecode -- --help` without installing.
 
-- `ActionGraph`: execution ledger, scheduling surface, and user-facing audit surface.
-- `ActionNode`: a concrete unit of planned or executed work inside the graph.
-- `StateStore`: owner of `Observation`, `Evidence`, versioned `Fact`, and fact lifecycle.
-- `Scheduler`: decides which `ActionNode` can run based on dependencies, blockers, budgets, and recovery state.
-- `EffectLedger`: records declared effects, effect results, and compensation state for mutating actions.
-- `TransactionManager`: owns overlays, checkpoints, commits, rollbacks, and transaction status.
-- `Reconciler`: detects and repairs drift across graph, facts, effects, and transactions.
-- `PolicyDecision`: constrained decision output used by policy and guard boundaries.
-- `Observation`, `Evidence`, `Fact`: separate layers for raw observations, traceable evidence, and promoted versioned facts.
-- `NodeExecutor`: executes nodes through deterministic, single-decision, or bounded exploratory profiles.
+## Use
 
-## Documentation
+```bash
+lattecode tui
+lattecode run --focus crates/latte-core "add the requested validation"
+lattecode resume <run-id> --allow
+lattecode resume <run-id> --deny
+lattecode show <run-id>
+lattecode list
+lattecode --json show <run-id>
+lattecode --json list
+```
 
-- [Documentation language index](docs/README.md)
-- [English documentation index](docs/en-US/README.md)
-- [Architecture overview](docs/en-US/design/architecture-overview.md)
-- [Code Agent Evolution Roadmap v0.1-v0.5](docs/en-US/milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md)
-- [Code Agent Evolution Task Breakdown v0.1-v0.5](docs/en-US/milestones/targets/runtime-kernel-task-breakdown.md)
-- Near-term module technical designs:
-  - [`Code Agent Loop`](docs/en-US/design/modules/code-agent-loop.md)
-  - [`Context Management and Compression`](docs/en-US/design/modules/context-management-and-compression.md)
-  - [`Provider Compatibility Layer`](docs/en-US/design/modules/provider-compatibility-layer.md)
-- Long-term runtime evolution targets:
-  - [`ActionGraph`](docs/en-US/design/runtime-evolution/modules/action-graph.md)
-  - [`StateStore`](docs/en-US/design/runtime-evolution/modules/state-store.md)
-  - [`Scheduler`](docs/en-US/design/runtime-evolution/modules/scheduler.md)
-  - [`EffectLedger`](docs/en-US/design/runtime-evolution/modules/effect-ledger.md)
-  - [`TransactionManager`](docs/en-US/design/runtime-evolution/modules/transaction-manager.md)
-  - [`Reconciler`](docs/en-US/design/runtime-evolution/modules/reconciler.md)
-  - [`Policy Core and Guard`](docs/en-US/design/runtime-evolution/modules/policy-core-and-guard.md)
-  - [`Capability Adapter`](docs/en-US/design/runtime-evolution/modules/capability-adapter.md)
-  - [`ContextProjection`](docs/en-US/design/runtime-evolution/modules/context-projection.md)
-  - [`NodeExecutor`](docs/en-US/design/runtime-evolution/modules/node-executor.md)
+With no arguments Lattecode opens the TUI when stdin/stdout are terminals. `run` and `resume` require:
+
+```bash
+export LATTE_OPENAI_ENDPOINT="https://example.invalid/v1/chat/completions"
+export LATTE_OPENAI_MODEL="model-name"
+export LATTE_OPENAI_API_KEY="..."
+export LATTE_VERIFY_ARGV='["cargo","test","--workspace"]'
+```
+
+`LATTE_VERIFY_ARGV` is a JSON argv array and is executed without a shell. State is stored in `.latte/lattecode.db`; do not commit that directory. Provider secrets stay in memory and are never written to the database.
+
+## Safety and recovery
+
+- `latte-engine` is the sole authority for filesystem and process effects.
+- Mutations bind to the workspace, lease, revision, content digest, and a single-use approval.
+- Effect state is persisted before execution. Ambiguous interruption becomes `Unknown` and requires explicit reconciliation; it is never silently retried.
+- File writes use handle-relative replacement on supported platforms and fail before starting on unsupported platforms.
+- Process execution is argv-first, drains bounded output, and terminates Unix process groups on timeout or cancellation. Process supervision fails closed on non-Unix targets; Windows is compile-checked in CI but execution is unsupported.
+- TUI permission prompts default to deny and approval requires an explicit action.
+
+## Configuration library
+
+The engine exposes a JSONC loader for embedders. See [lattecode.config.example.jsonc](lattecode.config.example.jsonc). The CLI uses the `LATTE_*` variables above directly.
 
 ## Development
 
-Declared runtime and tooling baseline:
-
-- Node.js `>=20.0.0`
-- TypeScript
-- Vitest
-
-Declared commands:
+The complete local setup and workflow are documented in [DEVELOPMENT.md](DEVELOPMENT.md). The shortest path is:
 
 ```bash
-npm run build
-npm test
-npm run test:coverage
+make setup
+make ci
 ```
 
-No root `dev` command is currently declared.
+Individual Cargo commands remain available:
 
-## Repository Layout
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo doc --workspace --no-deps
+```
 
-| Path | Purpose |
+Coverage is checked with `cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 90`; dependencies with `cargo deny check`.
+
+## Workspace
+
+| Crate | Responsibility |
 | --- | --- |
-| `docs/` | Language-indexed documentation root. |
-| `docs/en-US/` | English formal documentation and translation status. |
-| `docs/en-US/design/` | Architecture overview, near-term module designs, and long-term runtime evolution targets. |
-| `docs/zh-CN/` | Chinese formal documentation and maintained counterparts. |
-| `src/` | TypeScript source area for code-agent implementation work. Do not infer full internal-runtime maturity from its presence. |
-| `tests/` | Vitest unit and integration tests. |
-| `package.json` | Package metadata, Node engine declaration, and declared scripts. |
-| `tsconfig.json` | TypeScript configuration. |
-| `vitest.config.ts` | Vitest configuration. |
-| `lattecode.config.example.jsonc` | Example JSONC configuration without secrets. |
-| `LICENSE` | Apache License 2.0 text. |
+| `latte-core` | Typed IDs, commands, events, run state, and transitions |
+| `latte-engine` | SQLite/WAL, leases, policy, tools, effects, and process supervision |
+| `latte-headless` | Provider, context, agent loop, verification, and headless service |
+| `latte-tui` | Ratatui projection/reducer and terminal lifecycle |
+| `lattecode` | User-facing CLI and TUI binary |
 
-## License
-
-Lattecode is licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).

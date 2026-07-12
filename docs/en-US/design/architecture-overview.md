@@ -1,243 +1,56 @@
-# Lattecode Architecture Overview
+# Rust architecture
 
-## Status and Scope
+Completion uses a stable A/B workspace snapshot while holding the engine operation gate. Snapshot B is the verification linearization point immediately before the atomic database commit. The handoff stores B's manifest digest and verification time; changes after B are not claimed as verified and can be detected by comparing a later manifest with that digest. Symbolic links are hashed as topology records and unsafe or unstable links fail closed.
 
-This is the current formal architecture overview for Lattecode. It aligns the team on the current product goal: Lattecode is first a code agent that understands repository context, makes scoped code changes, runs verification, and produces reviewable handoff. Runtime structure evolves later from working traces, evidence, permissions, effects, and recovery needs.
+Workspace manifest paths and symbolic-link targets must be valid UTF-8. Non-UTF-8 operating-system path bytes fail closed and are never replaced or folded into lossy manifest keys.
+Manifest keys serialize the exact UTF-8 path component array as JSON; they never normalize separators. A literal backslash in a Unix filename therefore remains distinct from a nested path.
 
-Chinese counterpart: [`docs/zh-CN/design/architecture-overview.md`](../../zh-CN/design/architecture-overview.md).
+Chinese counterpart: [中文架构说明](../../zh-CN/design/architecture-overview.md).
 
-This document describes design goals, evolution path, and module boundaries. It does not mean `src/` already implements these capabilities.
-
-## 1. Top-level Positioning
-
-From the perspective of the broader software engineering system, Lattecode is a code-agent `Data Plane`: it reads repositories, understands tasks, calls tools, makes scoped changes, runs verification, produces evidence, and hands results to humans and existing engineering systems. Lattecode does not replace repo permissions, CI, code review, compliance, release, or deployment gates.
-
-`Control Plane Authority` in this document only means Lattecode internal runtime authority. This internal authority is not a `v0.1` starting requirement. It forms gradually as execution trace, facts, side effects, transactions, and recovery become structured runtime objects.
-
-Lattecode therefore uses two layers of narrative:
-
-| Layer | Goal | What the team should understand first |
-| --- | --- | --- |
-| Near-term product shape | A basic, working code agent focused first on local repository workflows | Complete real coding tasks and explain changes, verification, and risks |
-| Long-term architecture direction | Internal runtime evolution | Structure execution into auditable, recoverable, governable runtime objects |
-
-## 2. Evolutionary Architecture Path
-
-Lattecode no longer asks the team to start with the full set of `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler`. The abstractions should grow out of a working code agent.
+## Composition
 
 ```text
-Basic working code agent
-  -> Structured task trace
-  -> Evidence and fact discipline
-  -> Controlled effects and transactions
-  -> Scheduling and reconciliation
-  -> Long-term internal runtime
+lattecode CLI/TUI
+  |-- latte-tui -------- projection + typed UI actions
+  |-- latte-headless --- provider + context + agent loop + verification
+        |-- latte-engine -- storage + policy + effects + tools + processes
+              |-- latte-core -- IDs + commands + events + state transitions
 ```
 
-### 2.1 Stage One: Basic Working Code Agent
+`latte-core` has no storage, provider, or UI dependency. `latte-engine` owns all privileged effects and exposes a restricted handle. Both frontends consume durable projections and issue typed commands; they do not mutate repository or runtime state directly.
 
-The earliest Lattecode should complete the minimal contract-first code agent loop. The `v0.1` P0 scope includes the following modules, but each one is only the minimum usable version; `v0.1` does not become a full ecosystem platform:
+## Durable state
 
-- CLI.
-- config.
-- `AGENTS.md` loader.
-- session management.
-- agent-loop / phase runner.
-- built-in tools.
-- minimal MCP bridge.
-- local skills.
-- local commands.
-- permission system.
-- evidence / trace.
-- `AgentHandoff`.
+Each workspace uses `.latte/lattecode.db`. SQLite runs with WAL, foreign keys, a busy timeout, and full synchronous durability. The single writer commits an event, revision, and projection atomically. Command IDs are deduplicated across restart.
 
-These modules enter the same contract, session, permission, evidence, and trace boundaries through the `v0.1` main flow:
+Run writes require a live owner lease and monotonically fenced token. Reacquiring an expired lease advances the fencing epoch, including for the same owner. A stale owner cannot append events after takeover.
+
+## Effects and permissions
+
+Effects follow:
 
 ```text
-CLI / local command / local skill / minimal MCP bridge / built-in tools
-  -> TaskSpec
-  -> Session / TaskRunState
-  -> ContextPack
-  -> AgentLoop / PhaseRunner
-  -> PermissionDecision
-  -> Evidence / StepTrace
-  -> AgentHandoff
+Declared -> Prepared -> Started -> ObservedSuccess | ObservedFailed | Unknown
 ```
 
-This loop must:
+The runtime persists intent and a pre-effect hash before execution. Approval binds the effect ID, run revision, lease, and exact request digest and is single-use. Permission consumption and the `Prepared -> Started` transition are atomic. A crash or ambiguous observation produces `Unknown`; retry requires reconciliation instead of guessing success.
 
-- Accept a user task and acceptance criteria.
-- Search, read, and understand repository context.
-- Generate small, scoped code changes.
-- Run user-approved verification commands.
-- Report diff, verification result, risks, and blockers.
-- Keep minimal execution records, session snapshots, evidence, and trace for review and recovery.
+Filesystem tools enforce workspace containment, denied globs, stale-content checks, and exact edit/create intent. Mutating writes use a held directory handle and same-directory atomic rename where safe primitives exist. Unsupported targets fail before permission consumption or `Started`.
 
-This stage does not need a full `ActionGraph` or fact system. It may start with `TaskRunState`, `StepTrace`, `ToolCallRecord`, `PatchSummary`, `VerificationResult`, `PermissionDecision`, and `AgentHandoff`. The `minimal MCP bridge`, `local skills`, and `local commands` may only act as entry points or capability adapters into the same agent loop; they must not bypass permissions, sessions, trace, or handoff.
+## Process supervision
 
-### 2.2 Stage Two: Structure Execution
+Commands are argv-first. Shell syntax is classified separately and treated as high-risk. Output is drained concurrently with byte caps; timeout and cancellation use a bounded grace period. Unix execution creates and supervises a process group, sends `TERM`, then `KILL`, and certifies descendant shutdown. Non-Unix process execution currently fails closed before creating an effect. CI compile-checks Windows but does not claim Windows process execution support.
 
-After the basic agent can complete tasks, structure its execution records:
+## Agent runtime
 
-- `StepTrace` evolves into `ActionNode`.
-- A simple task log evolves into `ActionGraph`.
-- Tool output starts to distinguish raw output, summaries, and citable evidence.
-- Every change and verification can be traced back to a concrete step.
+The headless runtime assembles repository context, including `AGENTS.md`, talks to an OpenAI-compatible chat-completions provider, executes typed tool requests through the engine, runs the configured verification argv, and persists evidence plus a handoff. Completion policies prevent a run requiring verification from completing when verification failed or was not run.
 
-The goal is not complex scheduling. The goal is to stop carrying task state only in chat transcript.
+The CLI supports `run`, `resume`, `show`, and `list`, plus versioned JSON output. The TUI is a Ratatui projection over the same engine state, handles lag through snapshot refresh, shows permission/input/unknown states explicitly, and restores terminal state through normal exit, error, panic, and interrupt paths.
 
-### 2.3 Stage Three: Evidence, Facts, and Context Projection
+## Trust boundaries
 
-After execution trace stabilizes, introduce `Observation`, `Evidence`, `Fact`, and `ContextProjection`:
-
-- Tool output first becomes `Observation`.
-- Sourced and scoped material becomes `Evidence`.
-- Only checked claims become `Fact`.
-- LLM input comes from `ContextProjection`, not direct transcript trimming.
-
-This stage answers: how does the agent know what it knows?
-
-### 2.4 Stage Four: Effects, Transactions, and Recovery
-
-When Lattecode handles more file edits, shell commands, Git operations, or external APIs, introduce `EffectLedger`, `TransactionManager`, and `Reconciler`:
-
-- Mutating actions have effect declarations before execution.
-- File changes bind to overlay or transaction boundaries.
-- Verification failures, external file changes, partial effects, and stale facts can trigger recovery or human handoff.
-
-This stage answers: what did the agent do, can it recover, and when must it hand off?
-
-### 2.5 Stage Five: Long-term Internal Runtime
-
-After the previous capabilities become stable, Lattecode can reach the full long-term internal runtime shape:
-
-- `ActionGraph` becomes execution ledger, scheduling surface, recovery entry, and UX surface.
-- `StateStore` manages facts, evidence, and lifecycle.
-- `Scheduler` dispatches nodes based on dependencies, gates, budgets, and state.
-- `EffectLedger` and `TransactionManager` manage side effects and commit boundaries.
-- `Reconciler` handles mismatches across graph, fact, effect, transaction, and reality.
-
-## 3. Basic Code Agent Operating Model
-
-Early Lattecode should stay direct, explainable, and testable.
-
-This stage should align with the baseline capabilities of mature conversation-native code agents: keep the ReAct query loop, unified tool contract, permission-before-execution, file and shell safety, session recovery, context budget, and CLI / headless reuse. Lattecode should not sacrifice these basic interaction capabilities in `v0.1` for future runtime abstractions.
-
-Lattecode's difference is adding a phase artifact boundary around ReAct: the model still explores and edits through tool loops, but each phase must end with a structured object. This preserves the usability of Claude Code style systems while leaving migratable data for later `ActionNode`, `Evidence`, `EffectRecord`, and `ReconcileDecision`.
-
-| Phase | Behavior | Minimal artifact |
-| --- | --- | --- |
-| Task intake | Record goal, scope, acceptance criteria, and non-goals | `TaskSpec` |
-| Repository understanding | Search files, read docs, locate relevant code and tests | `StepTrace`, context summary |
-| Planning | Produce a short plan or internal step list | task steps |
-| Editing | Generate and apply scoped patches | diff, change rationale |
-| Verification | Run declared and allowed test or build commands | `VerificationResult` |
-| Handoff | Report changes, evidence, risks, blockers, and next steps | handoff summary |
-
-The early implementation may stay simple, but it should keep records that support later evolution: what each step did, why it did it, what tools it called, what output it produced, whether it modified files, and how verification ended.
-
-## 4. How Runtime Concepts Evolve
-
-| Early object | Mature runtime object | When to introduce |
-| --- | --- | --- |
-| `TaskSpec` | `TaskSpec` + graph objective | Keep from v0.1 |
-| `StepTrace` | `ActionNode` | When recovery, blocking, retry, and audit are needed |
-| task log | `ActionGraph` | When steps have dependencies and verification relations |
-| tool output | `Observation` | When raw observations and conclusions must be separated |
-| verified output | `Evidence` | When verification, file snippets, or user confirmations must be cited |
-| accepted claim | `Fact` | When context needs lifecycle and confidence |
-| prompt context | `ContextProjection` | When transcript trimming becomes unreliable |
-| write summary | `EffectRecord` | When side effects need audit or recovery |
-| patch batch | `OverlayRevision` / `Transaction` | When changes need commit gates or rollback |
-| retry note | `ReconcileDecision` | When failure cannot be solved by another prompt retry |
-
-## 5. Relationship with Plain `ReAct` Agents
-
-`ReAct` / transcript-driven loops are useful for early exploration and local tool use. Lattecode may use that strategy in the basic code agent stage, but it should not be the only long-term state carrier.
-
-The recommended `v0.1` design is therefore not removing ReAct, but **phase-gated ReAct**: the outer phase runner manages phase boundaries, budgets, permissions, and artifact schemas, while the inner query loop keeps multi-turn model-tool interaction.
-
-Evolution constraints:
-
-- `v0.1` may be a linear agent loop, but it must leave structured step trace.
-- From `v0.2`, important steps should map to `ActionNode`.
-- From `v0.3`, tool output and model inference cannot directly become `Fact`.
-- From `v0.4`, mutating effects, transactions, and recovery cannot rely only on natural-language notes.
-- In the full runtime, node-level bounded ReAct is only a local execution strategy for `NodeExecutor`.
-
-## 6. Module Relationships
-
-Lattecode modules do not need to be fully implemented at the same time, but their evolution direction should stay consistent. Current / near-term module design lives in [`modules/`](./modules/README.md), while accepted long-term runtime targets live in [`runtime-evolution/`](./runtime-evolution/README.md).
-
-| Module / Object | Early role | Mature role |
-| --- | --- | --- |
-| `NodeExecutor` | Run linear task steps and call file, search, edit, and verification capabilities | Execute a single `ActionNode` with deterministic, single-decision, or exploratory profile |
-| `Capability Adapter` | Wrap basic local tools | Anti-corruption layer that emits internal runtime objects |
-| `CLI / Local Command` | Convert CLI or local command specs into `TaskSpec` and enter the unified phase / session system | Runtime UX / automation entry, not a direct side-effect executor |
-| `AGENTS.md Loader` | Read repository `AGENTS.md` constraints and write them into context snapshot / hash | Part of context and policy input, not untracked prompt concatenation |
-| `Minimal MCP Bridge` | List / call tools from config-defined servers through unified permission / evidence / trace / session | External capability adapter, not a marketplace, resource / prompt platform, or server-management UI |
-| `Local Skill Loader` | Load local instruction / workflow / command bundles into context / prompt registry | Local capability bundle entry, not hub / install / publish / marketplace |
-| `Policy Core and Guard` | Prevent LLM from writing, running commands, or expanding scope without guardrails | Produce and validate structured `PolicyDecision` |
-| `ActionGraph` | Start as `StepTrace` | Execution ledger, scheduling surface, recovery entry, and UX surface |
-| `StateStore` | Store task summaries, verification results, and evidence references | Manage `Observation`, `Evidence`, and versioned `Fact` |
-| `ContextProjection` | Organize minimal task context | Generate sourced, budgeted, trust-scoped LLM input |
-| `EffectLedger` | Record file changes and command summaries | Manage effect declarations, observed effects, and compensation state |
-| `TransactionManager` | Manage patch batches and pre-handoff verification | Manage `OverlayRevision`, checkpoint, commit, and rollback |
-| `Scheduler` | Start as a linear next-step runner | Dispatch nodes based on dependencies, gates, budgets, and recovery state |
-| `Reconciler` | Record failures and blockers | Handle mismatches across graph, fact, effect, and transaction |
-
-## 7. External Collaboration and Governance Boundaries
-
-Lattecode works with existing engineering systems but does not replace them.
-
-| External object / system | Role in Lattecode | What it cannot do |
-| --- | --- | --- |
-| Docs, requirements, designs | User intent, constraints, acceptance background | Directly become internal `Fact` |
-| Issues / project work items | External task and collaboration state | Replace Lattecode execution records |
-| PR / code review | External review comments and merge context | Bypass local verification and human judgment |
-| CI / tests / static checks | Verification signal and failure evidence | Prove every inference automatically |
-| Approval / compliance / release flows | External governance gate | Become Lattecode internal `Control Plane Authority` |
-| Comments / chat / human confirmations | Human feedback and confirmation | Bypass evidence and record boundaries |
-
-## 8. Current Design Invariants
-
-- Lattecode externally is a code-agent `Data Plane`, not an external engineering `Control Plane`.
-- `Control Plane Authority` must be scoped to Lattecode internal runtime authority, and is introduced incrementally.
-- The `v0.1` priority is a basic working code agent, not a full internal runtime.
-- The `v0.1` P0 scope includes CLI, config, `AGENTS.md` loader, session management, agent-loop / phase runner, built-in tools, minimal MCP bridge, local skills, local commands, permission system, evidence / trace, and `AgentHandoff`, but all are limited to the minimum contract-first loop.
-- `ActionGraph`, `StateStore`, `Scheduler`, `EffectLedger`, `TransactionManager`, and `Reconciler` are evolution targets; early implementation should not create unnecessary complexity.
-- Runtime concepts grow from working code-agent traces, evidence, permissions, effects, and recovery needs; they are not `v0.1` product promises.
-- Execution records, tool calls, file changes, and verification results should have traceable entry points from the first stage.
-- Design documents must not imply the runtime capabilities are fully implemented.
-
-## 9. Non-goals
-
-- Do not design Lattecode as an external engineering governance `Control Plane`.
-- Do not replace repo permissions, CI, code review, compliance, release, or deployment gates.
-- Do not require `v0.1` to deliver the full internal runtime.
-- Do not require `v0.1` to deliver a full MCP platform, marketplace, resource / prompt ecosystem, skill hub, command marketplace, cloud sync, multi-user session, or full `ActionGraph` persistence.
-- Do not make `ActionGraph` an omniscient state database.
-- Do not use prompt transcript, model memory, or tool logs as the long-term fact lifecycle system.
-- Do not use agent-level global ReAct as the final runtime controller.
-
-## 10. Drill-down Documents
-
-| Document | Role |
-| --- | --- |
-| This document | Formal architecture overview for the code-agent-first evolution path, module relationships, external boundaries, and non-goals |
-| [`../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md`](../milestones/targets/runtime-kernel-roadmap-v0.1-v0.5.md) | Stage goals from a basic code agent to long-term internal runtime evolution |
-| [`../milestones/targets/runtime-kernel-task-breakdown.md`](../milestones/targets/runtime-kernel-task-breakdown.md) | Independent task breakdown with tasks, dependencies, acceptance criteria, and non-goals |
-| [`../milestones/targets/v0.1-implementation-plan-review.md`](../milestones/targets/v0.1-implementation-plan-review.md) | `v0.1` implementation plan and technical review covering choices, dependencies, risks, and tests |
-| [`modules/code-agent-loop.md`](./modules/code-agent-loop.md) | `Code Agent Loop` module design, defining `Intake -> Understand -> Plan -> Edit -> Verify -> Handoff` |
-| [`../milestones/targets/v0.1-engineering-baseline.md`](../milestones/targets/v0.1-engineering-baseline.md) | `v0.1` runnable engineering baseline target for providers, config, tools, prompts, and context compaction |
-| [`runtime-evolution/README.md`](./runtime-evolution/README.md) | Accepted long-term runtime evolution entry, separated from current / near-term module design and generic unaccepted proposals |
-| [`runtime-evolution/modules/action-graph.md`](./runtime-evolution/modules/action-graph.md) | How `ActionGraph` / `ActionNode` evolve from `StepTrace` |
-| [`runtime-evolution/modules/state-store.md`](./runtime-evolution/modules/state-store.md) | Gradual design of `StateStore`, `Observation`, `Evidence`, and `Fact` |
-| [`runtime-evolution/modules/scheduler.md`](./runtime-evolution/modules/scheduler.md) | How `Scheduler` evolves from a linear runner |
-| [`runtime-evolution/modules/effect-ledger.md`](./runtime-evolution/modules/effect-ledger.md) | How `EffectLedger` evolves from change records |
-| [`runtime-evolution/modules/transaction-manager.md`](./runtime-evolution/modules/transaction-manager.md) | How `TransactionManager` evolves from patch batches |
-| [`runtime-evolution/modules/reconciler.md`](./runtime-evolution/modules/reconciler.md) | How `Reconciler` evolves from failure records |
-| [`runtime-evolution/modules/policy-core-and-guard.md`](./runtime-evolution/modules/policy-core-and-guard.md) | Gradual design of `PolicyDecision`, policy core, guard, and gates |
-| [`runtime-evolution/modules/capability-adapter.md`](./runtime-evolution/modules/capability-adapter.md) | Capability adapter, tool boundaries, and internal runtime outputs |
-| [`runtime-evolution/modules/context-projection.md`](./runtime-evolution/modules/context-projection.md) | `ContextProjection` design |
-| [`runtime-evolution/modules/node-executor.md`](./runtime-evolution/modules/node-executor.md) | `NodeExecutor` profiles and bounded ReAct evolution |
+- Provider credentials are resolved in memory and redacted from debug output.
+- Repository text, model output, and tool output are untrusted inputs.
+- The model cannot directly invoke filesystem or process APIs.
+- Approval defaults to denial and cannot be implied by a generic Enter key.
+- Recovery never converts missing evidence into success.
