@@ -1,7 +1,14 @@
+use latte_core::valid_openai_chat_tool_call_id;
 use latte_engine::ToolDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -52,7 +59,7 @@ pub struct ToolCall {
     pub input: Value,
 }
 pub(crate) fn valid_tool_call_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+    valid_openai_chat_tool_call_id(id)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
@@ -61,6 +68,66 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub input_request: Option<InputRequest>,
+    #[serde(default)]
+    pub usage: ProviderUsage,
+    #[serde(default)]
+    pub finish_reason: Option<FinishReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<Value>,
+}
+pub type ProviderOutcome = ProviderResponse;
+
+#[derive(Clone, Debug)]
+pub struct ProviderRequest {
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDescriptor>,
+}
+
+pub trait ProviderEventSink: Send + Sync {
+    fn observe(&self, event: ProviderEvent);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderEvent {
+    Attempt {
+        number: u32,
+    },
+    /// A real provider-stream text delta. Non-streaming paths never emit this.
+    AssistantDelta {
+        text: String,
+    },
+}
+
+#[derive(Clone)]
+pub struct ProviderContext {
+    pub deadline: Instant,
+    pub cancellation: latte_engine::CancellationToken,
+    pub events: Option<Arc<dyn ProviderEventSink>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub tools: bool,
+    pub parallel_tool_calls: bool,
+    pub input_request: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Other(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputRequest {
@@ -71,6 +138,16 @@ pub struct InputRequest {
 }
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    #[error("provider request cancelled")]
+    Cancelled,
+    #[error("provider capability unavailable: {0}")]
+    Capability(String),
+    #[error("provider rejected request: http {status}{request_id}")]
+    Http {
+        status: u16,
+        request_id: String,
+        retryable: bool,
+    },
     #[error("provider timeout")]
     Timeout,
     #[error("provider transport: {0}")]
@@ -79,12 +156,17 @@ pub enum ProviderError {
     Malformed(String),
 }
 
-pub trait Provider: Send + Sync {
-    fn complete(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDescriptor],
-    ) -> impl std::future::Future<Output = Result<ProviderResponse, ProviderError>> + Send;
+pub type ProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderOutcome, ProviderError>> + Send + 'a>>;
+pub trait Provider: Send + Sync + 'static {
+    fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_>;
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -103,17 +185,22 @@ impl FakeProvider {
     }
 }
 impl Provider for FakeProvider {
-    async fn complete(
-        &self,
-        _: &[Message],
-        _: &[ToolDescriptor],
-    ) -> Result<ProviderResponse, ProviderError> {
-        self.responses
+    fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+        let result = self
+            .responses
             .lock()
             .unwrap()
             .pop_front()
-            .ok_or_else(|| ProviderError::Malformed("fake provider exhausted".into()))?
-            .map_err(ProviderError::Transport)
+            .ok_or_else(|| ProviderError::Malformed("fake provider exhausted".into()))
+            .and_then(|value| value.map_err(ProviderError::Transport));
+        Box::pin(async move { result })
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: true,
+        }
     }
 }
 
@@ -124,6 +211,11 @@ pub struct OpenAiProvider {
     model: String,
     api_key: String,
     timeout: Duration,
+    compatibility_input_request: bool,
+    max_attempts: u32,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    streaming: bool,
 }
 impl OpenAiProvider {
     pub fn new(
@@ -142,15 +234,55 @@ impl OpenAiProvider {
             model: model.into(),
             api_key: api_key.into(),
             timeout,
+            compatibility_input_request: false,
+            max_attempts: 1,
+            temperature: None,
+            max_tokens: None,
+            streaming: false,
         })
+    }
+    #[must_use]
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+    #[must_use]
+    pub fn with_compatibility_input_request(mut self, enabled: bool) -> Self {
+        self.compatibility_input_request = enabled;
+        self
+    }
+    #[must_use]
+    pub fn with_sampling_options(
+        mut self,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+        self
+    }
+    /// Enables `OpenAI` Chat Completions SSE. The provider still accepts a valid
+    /// inline JSON response without inventing deltas.
+    #[must_use]
+    pub fn with_streaming(mut self, enabled: bool) -> Self {
+        self.streaming = enabled;
+        self
     }
 }
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
     messages: Vec<WireRequestMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
-    tool_choice: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 #[derive(Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
@@ -199,10 +331,32 @@ struct WireToolFunction {
 #[derive(Deserialize)]
 struct Wire {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default)]
+    provider_state: Option<Value>,
 }
 #[derive(Deserialize)]
 struct Choice {
     message: WireMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokenDetails>,
+}
+#[derive(Debug, Deserialize)]
+struct WirePromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 #[derive(Deserialize)]
 struct WireMessage {
@@ -259,17 +413,17 @@ fn wire_message(message: &Message) -> Result<WireRequestMessage<'_>, ProviderErr
     })
 }
 impl Provider for OpenAiProvider {
-    async fn complete(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDescriptor],
-    ) -> Result<ProviderResponse, ProviderError> {
-        let send = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&Request {
-                model: &self.model,
+    #[allow(clippy::too_many_lines)]
+    fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
+        let this = self.clone();
+        Box::pin(async move {
+            let messages = &request.messages;
+            let tools = &request.tools;
+            if context.cancellation.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            let body = Request {
+                model: &this.model,
                 messages: messages
                     .iter()
                     .map(wire_message)
@@ -280,67 +434,500 @@ impl Provider for OpenAiProvider {
                         kind: "function",
                         function: WireToolFunction {
                             name: tool.name.clone(),
-                            description: format!("engine-owned {} operation", tool.effect),
-                            parameters: tool_schema(&tool.name),
+                            description: tool.description.clone(),
+                            parameters: tool.input_schema.clone(),
                         },
                     })
                     .collect(),
-                tool_choice: "auto",
-            })
-            .send();
-        let response = tokio::time::timeout(self.timeout, send)
-            .await
-            .map_err(|_| ProviderError::Timeout)?
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout
-                } else {
-                    ProviderError::Transport(e.to_string())
+                tool_choice: (!tools.is_empty()).then_some("auto"),
+                temperature: this.temperature,
+                max_tokens: this.max_tokens,
+                stream: this.streaming.then_some(true),
+            };
+            let mut attempt = 0;
+            let response = loop {
+                attempt += 1;
+                if context.cancellation.is_cancelled() {
+                    return Err(ProviderError::Cancelled);
                 }
-            })?;
-        if !response.status().is_success() {
-            return Err(ProviderError::Transport(format!(
-                "http {}",
-                response.status()
-            )));
+                emit_provider_event(&context, ProviderEvent::Attempt { number: attempt });
+                let remaining = context
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(this.timeout);
+                if remaining.is_zero() {
+                    return Err(ProviderError::Timeout);
+                }
+                let sent = tokio::time::timeout(
+                    remaining,
+                    this.client
+                        .post(&this.endpoint)
+                        .bearer_auth(&this.api_key)
+                        .json(&body)
+                        .send(),
+                )
+                .await;
+                let response = match sent {
+                    Err(_) => return Err(ProviderError::Timeout),
+                    Ok(Err(error)) if error.is_connect() && attempt < this.max_attempts => {
+                        retry_pause(&context, attempt, None).await?;
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(if error.is_timeout() {
+                            ProviderError::Timeout
+                        } else {
+                            ProviderError::Transport(error.to_string())
+                        });
+                    }
+                    Ok(Ok(response)) => response,
+                };
+                let status = response.status().as_u16();
+                if !response.status().is_success()
+                    && matches!(status, 408 | 429 | 502 | 503 | 504)
+                    && attempt < this.max_attempts
+                {
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(Duration::from_secs);
+                    retry_pause(&context, attempt, retry_after).await?;
+                    continue;
+                }
+                break response;
+            };
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| format!(" (request {v})"))
+                    .unwrap_or_default();
+                if this.streaming && matches!(status, 400 | 404 | 415 | 422) {
+                    // A fallback is allowed only when the stream request was
+                    // rejected before it produced *any* response body bytes.
+                    let error_body = response
+                        .bytes()
+                        .await
+                        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+                    if error_body.is_empty() {
+                        let mut inline_body = serde_json::to_value(&body)
+                            .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+                        inline_body
+                            .as_object_mut()
+                            .expect("request serializes to object")
+                            .remove("stream");
+                        return complete_inline_once(&this, inline_body, &context).await;
+                    }
+                }
+                return Err(ProviderError::Http {
+                    status,
+                    request_id,
+                    retryable: matches!(status, 408 | 429 | 502 | 503 | 504),
+                });
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if this.streaming && content_type.contains("text/event-stream") {
+                return parse_openai_sse(response, &context).await;
+            }
+            let wire: Wire = response
+                .json()
+                .await
+                .map_err(|e| ProviderError::Malformed(e.to_string()))?;
+            decode_wire(wire, this.compatibility_input_request)
+        })
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: self.compatibility_input_request,
         }
-        let wire: Wire = response
-            .json()
-            .await
-            .map_err(|e| ProviderError::Malformed(e.to_string()))?;
-        let message = wire
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| ProviderError::Malformed("missing choices".into()))?
-            .message;
-        let input_request = message.input_request;
-        let tool_calls: Vec<ToolCall> = message
-            .tool_calls
-            .into_iter()
-            .map(|call| {
-                Ok(ToolCall {
-                    id: call.id,
-                    name: call.function.name,
-                    input: serde_json::from_str(&call.function.arguments)
-                        .map_err(|e| ProviderError::Malformed(e.to_string()))?,
-                })
+    }
+}
+
+fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
+    // Rendering observers are intentionally outside the provider critical
+    // path. A slow terminal reducer cannot hold the network response open.
+    if let Some(sink) = &context.events {
+        let sink = Arc::clone(sink);
+        tokio::task::spawn_blocking(move || sink.observe(event));
+    }
+}
+
+async fn complete_inline_once(
+    provider: &OpenAiProvider,
+    body: Value,
+    context: &ProviderContext,
+) -> Result<ProviderResponse, ProviderError> {
+    if context.cancellation.is_cancelled() {
+        return Err(ProviderError::Cancelled);
+    }
+    let remaining = context
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .min(provider.timeout);
+    if remaining.is_zero() {
+        return Err(ProviderError::Timeout);
+    }
+    let response = tokio::time::timeout(
+        remaining,
+        provider
+            .client
+            .post(&provider.endpoint)
+            .bearer_auth(&provider.api_key)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| ProviderError::Timeout)?
+    .map_err(|error| ProviderError::Transport(error.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        return Err(ProviderError::Http {
+            status,
+            request_id: response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!(" (request {value})"))
+                .unwrap_or_default(),
+            retryable: false,
+        });
+    }
+    let wire = response
+        .json()
+        .await
+        .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+    decode_wire(wire, provider.compatibility_input_request)
+}
+
+fn decode_wire(
+    wire: Wire,
+    compatibility_input_request: bool,
+) -> Result<ProviderResponse, ProviderError> {
+    if wire.provider_state.is_some() {
+        return Err(ProviderError::Capability(
+            "openai-chat does not support provider state".into(),
+        ));
+    }
+    let usage = usage_from_wire(wire.usage);
+    let choice = wire
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ProviderError::Malformed("missing choices".into()))?;
+    let message = choice.message;
+    if message.input_request.is_some() && !compatibility_input_request {
+        return Err(ProviderError::Malformed(
+            "nonstandard message.input_request requires compatibility_input_request".into(),
+        ));
+    }
+    let tool_calls = decode_tool_calls(message.tool_calls)?;
+    Ok(ProviderResponse {
+        message: message.content,
+        tool_calls,
+        input_request: message.input_request,
+        usage,
+        finish_reason: choice.finish_reason.map(finish_reason),
+        provider_state: None,
+    })
+}
+
+fn usage_from_wire(usage: Option<WireUsage>) -> ProviderUsage {
+    usage.map_or_else(ProviderUsage::default, |usage| ProviderUsage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        cached_tokens: usage
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens),
+    })
+}
+
+fn finish_reason(reason: String) -> FinishReason {
+    match reason.as_str() {
+        "stop" => FinishReason::Stop,
+        "tool_calls" => FinishReason::ToolCalls,
+        "length" => FinishReason::Length,
+        "content_filter" => FinishReason::ContentFilter,
+        _ => FinishReason::Other(reason),
+    }
+}
+
+fn decode_tool_calls(values: Vec<WireCall>) -> Result<Vec<ToolCall>, ProviderError> {
+    let calls = values
+        .into_iter()
+        .map(|call| {
+            Ok(ToolCall {
+                id: call.id,
+                name: call.function.name,
+                input: serde_json::from_str(&call.function.arguments)
+                    .map_err(|error| ProviderError::Malformed(error.to_string()))?,
             })
-            .collect::<Result<_, ProviderError>>()?;
-        let mut ids = std::collections::BTreeSet::new();
-        if tool_calls
-            .iter()
-            .any(|call| !valid_tool_call_id(&call.id) || !ids.insert(call.id.clone()))
-        {
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    validate_tool_calls(&calls)?;
+    Ok(calls)
+}
+
+fn validate_tool_calls(calls: &[ToolCall]) -> Result<(), ProviderError> {
+    let mut ids = std::collections::BTreeSet::new();
+    if calls
+        .iter()
+        .any(|call| !valid_tool_call_id(&call.id) || !ids.insert(call.id.clone()))
+    {
+        return Err(ProviderError::Malformed(
+            "tool call ids must match [A-Za-z0-9_-]{1,256} and be unique".into(),
+        ));
+    }
+    Ok(())
+}
+
+const MAX_SSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 256 * 1024;
+const MAX_SSE_TOOL_CALLS: usize = 128;
+
+#[derive(Debug, Deserialize)]
+struct StreamWire {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+#[derive(Debug, Deserialize)]
+struct StreamToolCall {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: StreamFunction,
+}
+#[derive(Debug, Default, Deserialize)]
+struct StreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+#[derive(Default)]
+struct StreamAssembly {
+    content: String,
+    tools: Vec<StreamToolAssembly>,
+    finish_reason: Option<String>,
+    usage: Option<WireUsage>,
+}
+#[derive(Default)]
+struct StreamToolAssembly {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+async fn parse_openai_sse(
+    mut response: reqwest::Response,
+    context: &ProviderContext,
+) -> Result<ProviderResponse, ProviderError> {
+    let mut buffer = Vec::<u8>::new();
+    let mut data_lines = Vec::<String>::new();
+    let mut total = 0_usize;
+    let mut done = false;
+    let mut assembly = StreamAssembly::default();
+    loop {
+        let next = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|error| ProviderError::Transport(error.to_string()))?,
+            () = context.cancellation.cancelled() => return Err(ProviderError::Cancelled),
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        total = total.saturating_add(chunk.len());
+        if total > MAX_SSE_BODY_BYTES {
+            return Err(ProviderError::Malformed("SSE body exceeds limit".into()));
+        }
+        buffer.extend_from_slice(&chunk);
+        while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = buffer.drain(..=position).collect();
+            let _ = line.pop();
+            if line.last() == Some(&b'\r') {
+                let _ = line.pop();
+            }
+            if line.is_empty() {
+                if !data_lines.is_empty() {
+                    done =
+                        consume_sse_event(&data_lines.join("\n"), &mut assembly, context)? || done;
+                    data_lines.clear();
+                    if done {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if line.starts_with(b":") {
+                continue;
+            }
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                continue;
+            };
+            let field = &line[..colon];
+            let value = &line[colon + 1..];
+            if field == b"data" {
+                let value = value.strip_prefix(b" ").unwrap_or(value);
+                if value.len() > MAX_SSE_EVENT_BYTES {
+                    return Err(ProviderError::Malformed("SSE event exceeds limit".into()));
+                }
+                data_lines.push(
+                    std::str::from_utf8(value)
+                        .map_err(|_| ProviderError::Malformed("SSE data is not UTF-8".into()))?
+                        .to_owned(),
+                );
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    if !data_lines.is_empty() && !done {
+        done = consume_sse_event(&data_lines.join("\n"), &mut assembly, context)?;
+    }
+    if !done {
+        return Err(ProviderError::Malformed(
+            "SSE stream ended without [DONE]".into(),
+        ));
+    }
+    let calls = assembly
+        .tools
+        .into_iter()
+        .map(|tool| {
+            let id = tool
+                .id
+                .ok_or_else(|| ProviderError::Malformed("stream tool call missing id".into()))?;
+            let name = tool
+                .name
+                .ok_or_else(|| ProviderError::Malformed("stream tool call missing name".into()))?;
+            Ok(ToolCall {
+                id,
+                name,
+                input: serde_json::from_str(&tool.arguments)
+                    .map_err(|error| ProviderError::Malformed(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    validate_tool_calls(&calls)?;
+    Ok(ProviderResponse {
+        message: (!assembly.content.is_empty()).then_some(assembly.content),
+        tool_calls: calls,
+        input_request: None,
+        usage: usage_from_wire(assembly.usage),
+        finish_reason: assembly.finish_reason.map(finish_reason),
+        provider_state: None,
+    })
+}
+
+fn consume_sse_event(
+    data: &str,
+    assembly: &mut StreamAssembly,
+    context: &ProviderContext,
+) -> Result<bool, ProviderError> {
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let wire: StreamWire = serde_json::from_str(data)
+        .map_err(|error| ProviderError::Malformed(format!("invalid SSE JSON: {error}")))?;
+    if let Some(usage) = wire.usage {
+        assembly.usage = Some(usage);
+    }
+    let Some(choice) = wire.choices.into_iter().next() else {
+        return Ok(false);
+    };
+    if let Some(reason) = choice.finish_reason {
+        assembly.finish_reason = Some(reason);
+    }
+    if let Some(delta) = choice.delta.content
+        && !delta.is_empty()
+    {
+        assembly.content.push_str(&delta);
+        if assembly.content.len() > MAX_SSE_BODY_BYTES {
             return Err(ProviderError::Malformed(
-                "tool call ids must be nonempty and unique".into(),
+                "stream assistant content exceeds limit".into(),
             ));
         }
-        Ok(ProviderResponse {
-            message: message.content,
-            tool_calls,
-            input_request,
-        })
+        emit_provider_event(context, ProviderEvent::AssistantDelta { text: delta });
+    }
+    for delta in choice.delta.tool_calls {
+        if delta.index >= MAX_SSE_TOOL_CALLS {
+            return Err(ProviderError::Malformed(
+                "too many stream tool calls".into(),
+            ));
+        }
+        while assembly.tools.len() <= delta.index {
+            assembly.tools.push(StreamToolAssembly::default());
+        }
+        let target = &mut assembly.tools[delta.index];
+        if let Some(id) = delta.id {
+            if target.id.as_ref().is_some_and(|old| old != &id) {
+                return Err(ProviderError::Malformed("stream tool id changed".into()));
+            }
+            target.id = Some(id);
+        }
+        if let Some(name) = delta.function.name {
+            if target.name.as_ref().is_some_and(|old| old != &name) {
+                return Err(ProviderError::Malformed("stream tool name changed".into()));
+            }
+            target.name = Some(name);
+        }
+        if let Some(arguments) = delta.function.arguments {
+            target.arguments.push_str(&arguments);
+            if target.arguments.len() > MAX_SSE_EVENT_BYTES {
+                return Err(ProviderError::Malformed(
+                    "stream tool arguments exceed limit".into(),
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+async fn retry_pause(
+    context: &ProviderContext,
+    attempt: u32,
+    retry_after: Option<Duration>,
+) -> Result<(), ProviderError> {
+    let exponential =
+        Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt.saturating_sub(1).min(4)));
+    let delay = retry_after
+        .unwrap_or(exponential)
+        .min(Duration::from_secs(2));
+    if Instant::now()
+        .checked_add(delay)
+        .is_none_or(|wake| wake >= context.deadline)
+    {
+        return Err(ProviderError::Timeout);
+    }
+    tokio::select! {
+        () = tokio::time::sleep(delay) => Ok(()),
+        () = context.cancellation.cancelled() => Err(ProviderError::Cancelled),
     }
 }
 impl std::fmt::Debug for OpenAiProvider {
@@ -353,6 +940,7 @@ impl std::fmt::Debug for OpenAiProvider {
             .finish_non_exhaustive()
     }
 }
+#[cfg(test)]
 fn tool_schema(name: &str) -> Value {
     match name {
         "read_file" => {
@@ -382,14 +970,17 @@ fn tool_schema(name: &str) -> Value {
     }
 }
 
+#[cfg(test)]
 fn path_schema() -> Value {
     serde_json::json!({"type":"string","minLength":1,"maxLength":4096})
 }
 
+#[cfg(test)]
 fn output_cap_schema() -> Value {
     serde_json::json!({"type":"integer","minimum":1,"maximum":65536})
 }
 
+#[cfg(test)]
 fn digest_schema() -> Value {
     serde_json::json!({"type":"string","pattern":"^[0-9a-f]{64}$"})
 }
@@ -403,6 +994,13 @@ mod tests {
         sync::mpsc,
         thread,
     };
+    fn context() -> ProviderContext {
+        ProviderContext {
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancellation: latte_engine::CancellationToken::new(),
+            events: None,
+        }
+    }
     fn server(status: &str, body: &str, delay: u64) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -448,6 +1046,356 @@ mod tests {
         });
         (format!("http://{address}"), rx)
     }
+    fn sequence_server(responses: Vec<(&str, &str)>) -> (String, mpsc::Receiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|(s, b)| (s.to_owned(), b.to_owned()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for (index, (status, body)) in responses.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 16 * 1024];
+                let _ = socket.read(&mut buffer);
+                tx.send(index + 1).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), rx)
+    }
+
+    fn sse_server(chunks: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            for chunk in chunks {
+                socket.write_all(&chunk).unwrap();
+                socket.flush().unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn normalizes_usage_finish_reason_and_retries_only_eligible_statuses() {
+        let ok = r#"{"choices":[{"finish_reason":"length","message":{"content":"ok"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":2}}}"#;
+        let (endpoint, attempts) =
+            sequence_server(vec![("503 Service Unavailable", "{}"), ("200 OK", ok)]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.usage,
+            ProviderUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                total_tokens: Some(10),
+                cached_tokens: Some(2)
+            }
+        );
+        assert_eq!(response.finish_reason, Some(FinishReason::Length));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert_eq!(attempts.recv().unwrap(), 2);
+
+        let (endpoint, attempts) =
+            sequence_server(vec![("401 Unauthorized", "{}"), ("200 OK", ok)]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        assert!(matches!(
+            provider
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
+            Err(ProviderError::Http { status: 401, .. })
+        ));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert!(attempts.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_handles_crlf_comments_multidata_utf8_splits_and_real_deltas() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<ProviderEvent>>);
+        impl ProviderEventSink for Events {
+            fn observe(&self, event: ProviderEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let payload = concat!(
+            ": keepalive\r\n\r\n",
+            "data: {\"choices\":[\r\n",
+            "data: {\"delta\":{\"content\":\"hé\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut chunks = Vec::new();
+        let bytes = payload.as_bytes();
+        for part in bytes.chunks(7) {
+            chunks.push(part.to_vec());
+        }
+        let events = Arc::new(Events::default());
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    cancellation: latte_engine::CancellationToken::new(),
+                    events: Some(events.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.message.as_deref(), Some("héllo"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            response.tool_calls[0].input,
+            serde_json::json!({"path":"a"})
+        );
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        for _ in 0..100 {
+            if events.0.lock().unwrap().iter().any(
+                |event| matches!(event, ProviderEvent::AssistantDelta { text } if text == "llo"),
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            events.0.lock().unwrap().iter().any(
+                |event| matches!(event, ProviderEvent::AssistantDelta { text } if text == "llo")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_falls_back_once_only_for_zero_body_unsupported_response() {
+        let (endpoint, attempts) = sequence_server(vec![
+            ("400 Bad Request", ""),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"inline"}}]}"#,
+            ),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true)
+            .with_max_attempts(3);
+        let output = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.message.as_deref(), Some("inline"));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert_eq!(attempts.recv().unwrap(), 2);
+        assert!(attempts.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn maps_all_chat_finish_reasons() {
+        for (wire, expected) in [
+            ("stop", FinishReason::Stop),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("length", FinishReason::Length),
+            ("content_filter", FinishReason::ContentFilter),
+            ("vendor", FinishReason::Other("vendor".into())),
+        ] {
+            let body = format!(
+                r#"{{"choices":[{{"finish_reason":"{wire}","message":{{"content":"ok"}}}}]}}"#
+            );
+            let provider =
+                OpenAiProvider::new(server("200 OK", &body, 0), "m", "k", Duration::from_secs(1))
+                    .unwrap();
+            let response = provider
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![],
+                    },
+                    context(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.finish_reason, Some(expected));
+            assert!(response.provider_state.is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn retry_is_bounded_cancel_aware_and_never_retries_malformed_success() {
+        let (endpoint, attempts) = sequence_server(vec![
+            ("503 Service Unavailable", "{}"),
+            ("503 Service Unavailable", "{}"),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        assert!(matches!(
+            provider
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
+            Err(ProviderError::Http { status: 503, .. })
+        ));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert_eq!(attempts.recv().unwrap(), 2);
+
+        let (endpoint, attempts) = sequence_server(vec![
+            ("200 OK", "{"),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"unexpected"}}]}"#,
+            ),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        assert!(matches!(
+            provider
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
+            Err(ProviderError::Malformed(_))
+        ));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert!(attempts.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let (endpoint, attempts) = sequence_server(vec![
+            ("503 Service Unavailable", "{}"),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"unexpected"}}]}"#,
+            ),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        let cancellation = latte_engine::CancellationToken::new();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let result = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    cancellation,
+                    events: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Cancelled)));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert!(attempts.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let (endpoint, attempts) = sequence_server(vec![
+            ("503 Service Unavailable", "{}"),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"unexpected"}}]}"#,
+            ),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        let result = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_millis(50),
+                    cancellation: latte_engine::CancellationToken::new(),
+                    events: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ProviderError::Timeout)));
+        assert_eq!(attempts.recv().unwrap(), 1);
+        assert!(attempts.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_provider_state_explicitly() {
+        let provider = OpenAiProvider::new(
+            server(
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"}}],"provider_state":{"cursor":"x"}}"#,
+                0,
+            ),
+            "m",
+            "k",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            provider
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
+            Err(ProviderError::Capability(_))
+        ));
+    }
     #[tokio::test]
     async fn parses_structured_response_and_redacts_auth() {
         let (endpoint, captured) = capturing_server(
@@ -457,6 +1405,8 @@ mod tests {
             OpenAiProvider::new(endpoint, "m", "super-secret", Duration::from_secs(1)).unwrap();
         let tools = [ToolDescriptor {
             name: "read_file".into(),
+            description: "Engine-owned read operation".into(),
+            input_schema: tool_schema("read_file"),
             version: 1,
             effect: "read".into(),
         }];
@@ -475,7 +1425,16 @@ mod tests {
                 content: "result".into(),
             },
         ];
-        let response = provider.complete(&messages, &tools).await.unwrap();
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages,
+                    tools: tools.into(),
+                },
+                context(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.tool_calls[0].name, "read_file");
         let outbound = captured.recv().unwrap();
         assert_eq!(outbound["model"], "m");
@@ -491,7 +1450,7 @@ mod tests {
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "engine-owned read operation",
+                    "description": "Engine-owned read operation",
                     "parameters": tool_schema("read_file")
                 }
             })
@@ -501,17 +1460,69 @@ mod tests {
         assert!(!debug.contains("super-secret"));
     }
     #[tokio::test]
+    async fn sampling_options_are_sent_only_when_configured() {
+        let response = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let (endpoint, captured) = capturing_server(response);
+        OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_sampling_options(Some(0.25), Some(321))
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let configured = captured.recv().unwrap();
+        assert_eq!(configured["temperature"], 0.25);
+        assert_eq!(configured["max_tokens"], 321);
+
+        let (endpoint, captured) = capturing_server(response);
+        OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let absent = captured.recv().unwrap();
+        assert!(absent.get("temperature").is_none());
+        assert!(absent.get("max_tokens").is_none());
+    }
+    #[tokio::test]
     async fn classifies_malformed_http_error_and_timeout() {
         let duplicate = OpenAiProvider::new(server("200 OK", r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"x","function":{"name":"read_file","arguments":"{}"}},{"id":"x","function":{"name":"read_file","arguments":"{}"}}]}}]}"#, 0), "m", "k", Duration::from_secs(1)).unwrap();
         assert!(matches!(
-            duplicate.complete(&[], &[]).await,
+            duplicate
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
             Err(ProviderError::Malformed(_))
         ));
         let malformed =
             OpenAiProvider::new(server("200 OK", "{}", 0), "m", "k", Duration::from_secs(1))
                 .unwrap();
         assert!(matches!(
-            malformed.complete(&[], &[]).await,
+            malformed
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
             Err(ProviderError::Malformed(_))
         ));
         let error = OpenAiProvider::new(
@@ -522,8 +1533,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            error.complete(&[], &[]).await,
-            Err(ProviderError::Transport(_))
+            error
+                .complete(
+                    ProviderRequest {
+                        messages: vec![],
+                        tools: vec![]
+                    },
+                    context()
+                )
+                .await,
+            Err(ProviderError::Http { .. })
         ));
         let slow = OpenAiProvider::new(
             server("200 OK", "{}", 200),
@@ -533,7 +1552,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            slow.complete(&[], &[]).await,
+            slow.complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![]
+                },
+                context()
+            )
+            .await,
             Err(ProviderError::Timeout)
         ));
     }
@@ -584,12 +1610,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_ids_are_bounded_opaque_and_control_free() {
-        assert!(valid_tool_call_id("call_:+./?[]{}-✓"));
+    fn tool_call_ids_follow_safe_openai_chat_grammar() {
+        assert!(valid_tool_call_id("call_abc-123_DEF"));
         assert!(valid_tool_call_id(&"x".repeat(256)));
         assert!(!valid_tool_call_id(""));
         assert!(!valid_tool_call_id(&"x".repeat(257)));
         assert!(!valid_tool_call_id("bad\ncall"));
         assert!(!valid_tool_call_id("bad\u{85}call"));
+        assert!(!valid_tool_call_id("token=value"));
+        assert!(!valid_tool_call_id("call:unsafe"));
     }
 }

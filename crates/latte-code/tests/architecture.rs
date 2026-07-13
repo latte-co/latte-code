@@ -15,7 +15,7 @@ fn workspace_dependency_matrix_is_exact() {
         "latte-engine",
         "latte-headless",
         "latte-tui",
-        "lattecode",
+        "latte-code",
     ]);
     let mut actual = BTreeMap::new();
     for package in metadata["packages"].as_array().unwrap() {
@@ -39,7 +39,7 @@ fn workspace_dependency_matrix_is_exact() {
     );
     assert_eq!(actual["latte-tui"], BTreeSet::from(["latte-core"]));
     assert_eq!(
-        actual["lattecode"],
+        actual["latte-code"],
         BTreeSet::from(["latte-core", "latte-engine", "latte-headless", "latte-tui"])
     );
 }

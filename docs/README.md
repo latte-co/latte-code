@@ -1,4 +1,4 @@
-# Lattecode documentation
+# Latte Code documentation
 
 - [English](en-US/README.md)
 - [中文](zh-CN/README.md)

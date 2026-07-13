@@ -2,7 +2,7 @@
 
 ## Project
 
-Lattecode is a Rust 2024 workspace implementing a code agent with a Ratatui frontend and headless CLI. Rust is the only implementation; do not add Node.js, TypeScript, or compatibility layers.
+Latte Code is a Rust 2024 workspace implementing a code agent with a Ratatui frontend and headless CLI. Rust is the only implementation; do not add Node.js, TypeScript, or compatibility layers.
 
 ## Structure
 
@@ -10,7 +10,7 @@ Lattecode is a Rust 2024 workspace implementing a code agent with a Ratatui fron
 - `crates/latte-engine`: privileged authority for SQLite state, leases, policy, filesystem tools, effects, and supervised processes.
 - `crates/latte-headless`: provider, repository context, agent loop, verification, handoff, and command service.
 - `crates/latte-tui`: pure UI projection/reducer and Ratatui terminal lifecycle.
-- `crates/lattecode`: binary composition and CLI contracts.
+- `crates/latte-code`: binary composition and CLI contracts.
 - `docs/en-US` and `docs/zh-CN`: maintained architecture and operations docs.
 
 Local `.latte/`, `.oh-my-code/`, `.tmp/`, `target/`, logs, and secrets are not project source.

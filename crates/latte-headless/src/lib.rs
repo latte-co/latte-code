@@ -9,8 +9,10 @@ use latte_engine::EngineHandle;
 use std::path::PathBuf;
 pub mod context;
 pub mod provider;
+pub mod registry;
 pub mod runtime;
 pub mod service;
+pub mod thread;
 /// Parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeadlessCommand {

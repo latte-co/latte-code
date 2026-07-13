@@ -36,6 +36,12 @@ macro_rules! typed_id {
 typed_id!(RunId);
 typed_id!(CommandId);
 typed_id!(EventId);
+// Thread identifiers deliberately do not reuse the v1 run identifiers.  A
+// thread is a durable conversation which can contain several immutable runs.
+typed_id!(ThreadId);
+typed_id!(ThreadCommandId);
+typed_id!(ThreadEventId);
+typed_id!(TranscriptEntryId);
 
 /// Supplies wall-clock Unix milliseconds.
 pub trait Clock: Send + Sync {
@@ -55,11 +61,17 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        wall_time_ms()
     }
+}
+
+/// Returns the current wall-clock time as milliseconds since the Unix epoch.
+#[must_use]
+pub fn wall_time_ms() -> u64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Production `UUIDv7` source backed by an injected clock.

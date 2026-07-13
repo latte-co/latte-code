@@ -1,6 +1,6 @@
-# Lattecode 文档
+# Latte Code 文档
 
-- [项目说明](../../README.md)：安装、CLI/TUI 使用、环境变量、安全机制与开发检查。
+- [项目说明](../../README.md)：安装、CLI/TUI 使用、分层 `latte-code.jsonc` Provider 配置、密钥环境引用、安全机制与开发检查。
 - [架构](design/architecture-overview.md)：当前 Rust 实现的 crate 与运行时边界。
 - [English documentation](../en-US/README.md)。
 

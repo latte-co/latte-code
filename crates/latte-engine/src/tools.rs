@@ -22,6 +22,8 @@ const DEFAULT_CAP: usize = 64 * 1024;
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ToolDescriptor {
     pub name: String,
+    pub description: String,
+    pub input_schema: Value,
     pub version: u32,
     pub effect: String,
 }
@@ -136,6 +138,8 @@ impl Tool for Builtin {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: self.name.into(),
+            description: format!("Engine-owned {} operation", self.name.replace('_', " ")),
+            input_schema: tool_schema(self.name),
             version: 1,
             effect: format!("{:?}", self.effect).to_lowercase(),
         }
@@ -219,6 +223,36 @@ impl Tool for Builtin {
             action,
             expected_hash: None,
         })
+    }
+}
+
+pub(crate) fn tool_schema(name: &str) -> Value {
+    let path = || json!({"type":"string","minLength":1,"maxLength":4096});
+    let cap = || json!({"type":"integer","minimum":1,"maximum":65536});
+    let digest = || json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    match name {
+        "read_file" => {
+            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_output":cap()},"additionalProperties":false})
+        }
+        "list_directory" => {
+            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_entries":{"type":"integer","minimum":1,"maximum":10000}},"additionalProperties":false})
+        }
+        "search" => {
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10000},"max_output":cap()},"additionalProperties":false})
+        }
+        "read_project_manifest" | "git_diff" => {
+            json!({"type":"object","required":[],"properties":{"max_output":cap()},"additionalProperties":false})
+        }
+        "edit_file" => {
+            json!({"type":"object","required":["path","after","precondition"],"properties":{"path":path(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"precondition":digest()},"anyOf":[{"required":["before"]},{"required":["anchor"]}],"additionalProperties":false})
+        }
+        "write_file" => {
+            json!({"type":"object","required":["path","content","create_intent"],"properties":{"path":path(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest()},"additionalProperties":false})
+        }
+        "process" => {
+            json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"oneOf":[{"required":["argv"]},{"required":["shell"]}],"additionalProperties":false})
+        }
+        _ => json!({"type":"object","required":[],"properties":{},"additionalProperties":false}),
     }
 }
 

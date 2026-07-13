@@ -1,6 +1,6 @@
 # 本地开发指南
 
-本文说明如何在本地构建、测试和验证 Rust 版本的 Lattecode。项目不依赖 Node.js、npm 或 TypeScript 工具链。
+本文说明如何在本地构建、测试和验证 Rust 版本的 Latte Code。项目不依赖 Node.js、npm 或 TypeScript 工具链。
 
 ## 环境准备
 
@@ -59,14 +59,15 @@ make run ARGS='--help'
 make run ARGS='--json list'
 ```
 
-执行真实的 `run` 或 `resume --allow` 前，需要设置：
+没有配置文件时，CLI/TUI 会使用内置默认配置。自定义配置按“内置默认值 → `$HOME/.latte/latte-code.jsonc` → `<workspace>/.latte/latte-code.jsonc`”递归合并；相同 key 由工作区配置覆盖，数组和标量整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，只需导出最终配置所引用的密钥。若要自定义当前工作区：
 
 ```bash
-export LATTE_OPENAI_ENDPOINT='https://example.invalid/v1/chat/completions'
-export LATTE_OPENAI_MODEL='model-name'
-export LATTE_OPENAI_API_KEY='...'
-export LATTE_VERIFY_ARGV='["cargo","test","--workspace"]'
+mkdir -p .latte
+cp latte-code.config.example.jsonc .latte/latte-code.jsonc
+export OPENAI_API_KEY='...'
 ```
+
+用户配置和工作区配置都可以只写需要覆盖的 key。在 `.latte/latte-code.jsonc` 中可配置 `default_provider`、`providers.<name>`、`database.path` 和 `verification.argv`。示例使用 `type: "openai-chat"`、`base_url`、`model`，以及 `api_key: { source: "env", name: "OPENAI_API_KEY" }`；CLI/TUI 只在实际调用 Provider 时于内存中解析该引用。不要把密钥直接写进 JSONC。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
 
 `resume --deny`、等待态取消、查看运行记录和 Unknown reconciliation 不依赖 Provider 凭证。
 
@@ -90,7 +91,7 @@ Windows 上的进程监督和安全文件变更目前运行时 fail-closed；CI 
 
 ## 本地状态与清理
 
-运行状态存放在 `.latte/lattecode.db`，构建输出位于 `target/`。这些目录已被 Git 忽略。
+运行状态默认存放在 `.latte/latte-code.db`；可通过 `database.path` 配置其他位置。构建输出位于 `target/`。默认状态目录与构建目录已被 Git 忽略。
 
 ```bash
 make clean

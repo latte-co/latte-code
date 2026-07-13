@@ -179,7 +179,7 @@ fn config_loader_and_builder_validation_are_exercised_through_public_api() {
     let config_dir = dir.path().join(".latte");
     std::fs::create_dir(&config_dir).unwrap();
     std::fs::write(
-        config_dir.join("lattecode.jsonc"),
+        config_dir.join("latte-engine.jsonc"),
         r#"{
           database: { path: ".latte/test.db" },
           runtime: { command_buffer: 4, event_buffer: 8 },

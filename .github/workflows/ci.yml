@@ -51,20 +51,20 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: lattecode-linux-x86_64
-            binary: target/release/lattecode
+            artifact: latte-code-linux-x86_64
+            binary: target/release/latte-code
           - os: macos-latest
-            artifact: lattecode-macos-arm64
-            binary: target/release/lattecode
+            artifact: latte-code-macos-arm64
+            binary: target/release/latte-code
           - os: windows-latest
-            artifact: lattecode-windows-x86_64
-            binary: target/release/lattecode.exe
+            artifact: latte-code-windows-x86_64
+            binary: target/release/latte-code.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p lattecode
+      - run: cargo build --release -p latte-code
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

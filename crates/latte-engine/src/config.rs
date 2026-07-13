@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::{collections::BTreeMap, env, fs, path::Path};
 use thiserror::Error;
 
-/// Lattecode's single user configuration format.
+/// Latte Code's engine embedding configuration format.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -21,7 +21,7 @@ pub struct DatabaseConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            path: ".latte/lattecode.db".into(),
+            path: ".latte/latte-code.db".into(),
         }
     }
 }
@@ -75,9 +75,9 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Loads `.latte/lattecode.jsonc` relative to `root`.
+    /// Loads `.latte/latte-engine.jsonc` relative to `root`.
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
-        Self::load_path(&root.join(".latte/lattecode.jsonc"))
+        Self::load_path(&root.join(".latte/latte-engine.jsonc"))
     }
 
     /// Loads an explicit JSONC path, resolves `${NAME}` values, and validates it.

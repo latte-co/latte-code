@@ -8,10 +8,11 @@ use std::{
 
 fn invoke(args: &[&str], configure: impl FnOnce(&mut Command)) -> Output {
     let root = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lattecode"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_latte-code"));
     command
         .args(args)
         .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
         .env_remove("LATTE_OPENAI_ENDPOINT")
         .env_remove("LATTE_OPENAI_MODEL")
         .env_remove("LATTE_OPENAI_API_KEY")
@@ -31,6 +32,21 @@ fn preserve_coverage_profiles(command: &mut Command) {
     }
 }
 
+fn write_config(command: &Command, endpoint: &str, verification: &str) {
+    write_config_with_database(command, endpoint, verification, ".latte/latte-code.db");
+}
+
+fn write_config_with_database(
+    command: &Command,
+    endpoint: &str,
+    verification: &str,
+    database_path: &str,
+) {
+    let root = command.get_current_dir().unwrap();
+    std::fs::create_dir_all(root.join(".latte")).unwrap();
+    std::fs::write(root.join(".latte/latte-code.jsonc"), format!(r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#)).unwrap();
+}
+
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -39,7 +55,7 @@ fn json(output: &Output) -> Value {
 fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
     let help = invoke(&["--help"], |_| {});
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("lattecode [--json] run"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("latte-code [--json] run"));
 
     let json_help = invoke(&["--json", "--help"], |_| {});
     assert!(json_help.status.success());
@@ -52,11 +68,16 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
 
     let missing = invoke(
         &["--json", "show", "01900000-0000-7000-8000-000000000001"],
-        |_| {},
+        |command| write_config(command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#),
     );
     assert_eq!(missing.status.code(), Some(4));
     assert_eq!(json(&missing)["error"]["code"], "run_not_found");
-    let missing_text = invoke(&["show", "01900000-0000-7000-8000-000000000002"], |_| {});
+    let missing_text = invoke(
+        &["show", "01900000-0000-7000-8000-000000000002"],
+        |command| {
+            write_config(command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+        },
+    );
     assert_eq!(missing_text.status.code(), Some(4));
     assert!(String::from_utf8_lossy(&missing_text.stderr).contains("was not found"));
 
@@ -70,10 +91,40 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
 }
 
 #[test]
+fn nested_build_directory_discovers_workspace_and_uses_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("target/debug");
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_latte-code"))
+        .args(["--json", "list"])
+        .current_dir(&nested)
+        .env("HOME", root.path().join("home"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join(".latte/latte-code.db").exists());
+    assert!(!nested.join(".latte/latte-code.db").exists());
+}
+
+#[test]
 fn configuration_and_provider_failures_are_typed() {
     let missing = invoke(&["--json", "run", "do work"], |_| {});
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(json(&missing)["error"]["code"], "configuration");
+    assert!(
+        json(&missing)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("OPENAI_API_KEY")
+    );
 
     let missing_deny = invoke(
         &[
@@ -87,27 +138,32 @@ fn configuration_and_provider_failures_are_typed() {
     assert_eq!(missing_deny.status.code(), Some(4));
     assert_eq!(json(&missing_deny)["error"]["code"], "run_not_found");
 
+    let empty_database = invoke(&["--json", "list"], |command| {
+        write_config_with_database(command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#, "  ");
+    });
+    assert_eq!(empty_database.status.code(), Some(2));
+    assert!(
+        json(&empty_database)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("database.path must not be empty")
+    );
+
     let invalid_verification = invoke(&["--json", "run", "do work"], |command| {
-        command
-            .env("LATTE_OPENAI_ENDPOINT", "http://127.0.0.1:1")
-            .env("LATTE_OPENAI_MODEL", "test")
-            .env("LATTE_OPENAI_API_KEY", "secret")
-            .env("LATTE_VERIFY_ARGV", "not-json");
+        write_config(command, "http://127.0.0.1:1", "not-json");
+        command.env("TEST_OPENAI_KEY", "secret");
     });
     assert_eq!(invalid_verification.status.code(), Some(2));
     assert!(
         json(&invalid_verification)["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("invalid LATTE_VERIFY_ARGV")
+            .contains("invalid JSONC")
     );
 
     let empty_verification = invoke(&["--json", "run", "do work"], |command| {
-        command
-            .env("LATTE_OPENAI_ENDPOINT", "http://127.0.0.1:1")
-            .env("LATTE_OPENAI_MODEL", "test")
-            .env("LATTE_OPENAI_API_KEY", "secret")
-            .env("LATTE_VERIFY_ARGV", "[]");
+        write_config(command, "http://127.0.0.1:1", "[]");
+        command.env("TEST_OPENAI_KEY", "secret");
     });
     assert_eq!(empty_verification.status.code(), Some(2));
     assert!(
@@ -118,25 +174,17 @@ fn configuration_and_provider_failures_are_typed() {
     );
 
     let transport = invoke(&["--json", "run", "do work"], |command| {
-        command
-            .env("LATTE_OPENAI_ENDPOINT", "http://127.0.0.1:1")
-            .env("LATTE_OPENAI_MODEL", "test")
-            .env("LATTE_OPENAI_API_KEY", "secret")
-            .env("LATTE_VERIFY_ARGV", r#"["/usr/bin/true"]"#);
+        write_config(command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+        command.env("TEST_OPENAI_KEY", "secret");
     });
     assert_eq!(transport.status.code(), Some(1));
     assert_eq!(json(&transport)["status"], "failed");
     assert_eq!(json(&transport)["data"]["run"]["status"], "failed");
 
-    for (missing_name, configure_partial) in
-        [("LATTE_OPENAI_MODEL", 1_u8), ("LATTE_OPENAI_API_KEY", 2_u8)]
     {
+        let missing_name = "TEST_OPENAI_KEY";
         let output = invoke(&["--json", "run", "do work"], |command| {
-            command.env("LATTE_OPENAI_ENDPOINT", "http://127.0.0.1:1");
-            if configure_partial >= 2 {
-                command.env("LATTE_OPENAI_MODEL", "test");
-            }
-            command.env("LATTE_VERIFY_ARGV", r#"["/usr/bin/true"]"#);
+            write_config(command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
         });
         assert_eq!(output.status.code(), Some(2));
         assert!(
@@ -215,25 +263,29 @@ fn completion_server() -> String {
 }
 
 fn configured(command: &mut Command, endpoint: &str, verification: &str) {
-    command
-        .env("LATTE_OPENAI_ENDPOINT", endpoint)
-        .env("LATTE_OPENAI_MODEL", "mock")
-        .env("LATTE_OPENAI_API_KEY", "secret")
-        .env("LATTE_VERIFY_ARGV", verification);
+    write_config(command, endpoint, verification);
+    command.env("TEST_OPENAI_KEY", "secret");
 }
 
 #[test]
 #[allow(clippy::too_many_lines)]
 fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     let root = tempfile::tempdir().unwrap();
-    let binary = env!("CARGO_BIN_EXE_lattecode");
+    let binary = env!("CARGO_BIN_EXE_latte-code");
     let execute = |args: &[&str], endpoint: &str| {
         let mut command = Command::new(binary);
         command
             .args(args)
             .current_dir(root.path())
+            .env("HOME", root.path().join("home"))
             .stdin(Stdio::null());
-        configured(&mut command, endpoint, r#"["/usr/bin/true"]"#);
+        write_config_with_database(
+            &command,
+            endpoint,
+            r#"["/usr/bin/true"]"#,
+            "state/nested/custom.db",
+        );
+        command.env("TEST_OPENAI_KEY", "secret");
         preserve_coverage_profiles(&mut command);
         command.output().unwrap()
     };
@@ -264,6 +316,8 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     let listed = execute(&["list"], &endpoint);
     assert!(listed.status.success());
     assert!(String::from_utf8_lossy(&listed.stdout).contains(&run_id));
+    assert!(root.path().join("state/nested/custom.db").exists());
+    assert!(!root.path().join(".latte/latte-code.db").exists());
 
     let root2 = tempfile::tempdir().unwrap();
     let endpoint2 = completion_server();
@@ -272,8 +326,15 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
         command
             .args(args)
             .current_dir(root2.path())
+            .env("HOME", root2.path().join("home"))
             .stdin(Stdio::null());
-        configured(&mut command, &endpoint2, r#"["/usr/bin/true"]"#);
+        write_config_with_database(
+            &command,
+            &endpoint2,
+            r#"["/usr/bin/true"]"#,
+            "state/deny.db",
+        );
+        command.env("TEST_OPENAI_KEY", "secret");
         preserve_coverage_profiles(&mut command);
         command.output().unwrap()
     };
@@ -300,6 +361,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     deny_command
         .args(["--json", "resume", &run_id2, "--deny"])
         .current_dir(root2.path())
+        .env("HOME", root2.path().join("home"))
         .env_remove("LATTE_OPENAI_ENDPOINT")
         .env_remove("LATTE_OPENAI_MODEL")
         .env_remove("LATTE_OPENAI_API_KEY")
@@ -325,7 +387,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     assert!(json(&shown_denied)["data"]["run"]["pending_permission"].is_null());
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(root2.path())
-        .database_path(root2.path().join(".latte/lattecode.db"))
+        .database_path(root2.path().join("state/deny.db"))
         .build()
         .unwrap();
     assert_eq!(
@@ -346,7 +408,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
 #[test]
 fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     let root = tempfile::tempdir().unwrap();
-    let binary = env!("CARGO_BIN_EXE_lattecode");
+    let binary = env!("CARGO_BIN_EXE_latte-code");
     let mut command = Command::new("/usr/bin/script");
     #[cfg(target_os = "macos")]
     command.args(["-q", "/dev/null", binary, "tui"]);
@@ -354,9 +416,11 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     command.args(["-qec", &format!("{binary} tui"), "/dev/null"]);
     command
         .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    write_config(&command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
     preserve_coverage_profiles(&mut command);
     let mut child = command.spawn().unwrap();
     child.stdin.take().unwrap().write_all(b"?\tq").unwrap();
@@ -375,7 +439,7 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
 #[test]
 fn tui_dispatches_prompt_and_consumes_runtime_feedback() {
     let root = tempfile::tempdir().unwrap();
-    let binary = env!("CARGO_BIN_EXE_lattecode");
+    let binary = env!("CARGO_BIN_EXE_latte-code");
     let endpoint = completion_server();
     let mut command = Command::new("/usr/bin/script");
     #[cfg(target_os = "macos")]
@@ -384,6 +448,7 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback() {
     command.args(["-qec", &format!("{binary} tui"), "/dev/null"]);
     command
         .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -402,5 +467,5 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(root.path().join(".latte/lattecode.db").exists());
+    assert!(root.path().join(".latte/latte-code.db").exists());
 }

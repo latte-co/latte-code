@@ -2,15 +2,23 @@
 use crate::VerificationEvidence;
 use latte_core::{
     CompletionPolicy, EventEnvelope, EventId, Evidence, FailureCode, Handoff, PROTOCOL_VERSION,
-    Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, Transition,
-    VerificationStatus,
+    Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, ThreadEvent,
+    ThreadEventEnvelope, ThreadEventId, ThreadLifecycle, ThreadPendingRequest,
+    ThreadProviderBindingV2, ThreadRunStatus, ThreadRunSummary, ThreadSnapshot, TranscriptEntry,
+    TranscriptEntryId, TranscriptKind, TranscriptPage, Transition, VerificationStatus,
+    redact_thread_text, redact_thread_value,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
+/// The interactive session list carries a recent, bounded transcript per
+/// thread.  The bound prevents a single long-running conversation from
+/// allocating an unbounded amount of terminal projection memory while still
+/// being large enough to cover normal active conversations.
+const THREAD_PROJECTION_TRANSCRIPT_LIMIT: usize = 500;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -30,12 +38,192 @@ pub enum StorageError {
     LeaseLost,
     #[error("effect terminal write was fenced")]
     EffectFenced,
+    #[error("thread {0} was not found")]
+    ThreadNotFound(latte_core::ThreadId),
+    #[error("thread revision is stale: expected {expected}, actual {actual}")]
+    StaleThreadRevision { expected: u64, actual: u64 },
+    #[error("linked thread runs must use CommitThreadRunUpdate")]
+    LinkedRunRequiresThreadCommit,
+    #[error("thread command id was reused with different content")]
+    ThreadCommandReplayMismatch,
+    #[error("thread does not have the requested active run")]
+    ThreadActiveRunMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredEvent {
     pub sequence: u64,
     pub envelope: EventEnvelope,
+}
+
+/// Durable thread event returned only after its containing `SQLite` transaction
+/// has committed.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredThreadEvent {
+    pub sequence: u64,
+    pub envelope: ThreadEventEnvelope,
+}
+
+/// Engine-only mutation variants for a linked v2 child run.  The legacy
+/// engine APIs reject these run IDs so every state/event/transcript write is
+/// kept in one fenced transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommitThreadRunUpdate {
+    Start {
+        source_key: String,
+    },
+    AppendTranscript {
+        source_key: String,
+        kind: TranscriptKind,
+        text: String,
+        payload: Option<serde_json::Value>,
+    },
+    /// Persists a fully validated v2 effect before an external operation can
+    /// begin.  The descriptor is already redacted by the engine wrapper.
+    PrepareEffect {
+        source_key: String,
+        effect_id: String,
+        operation_digest: String,
+        /// Redacted projection. This is the only descriptor shape that may
+        /// enter the effect ledger, transcript, event stream, or command
+        /// deduplication record.
+        descriptor_json: String,
+        /// Exact engine-private descriptor. It is written only to the
+        /// restricted v2 descriptor table in the same transaction as the
+        /// preparation record, and is never returned by a thread snapshot.
+        canonical_descriptor_json: String,
+        policy: ThreadEffectPolicy,
+        description: String,
+        checkpoint_json: String,
+    },
+    /// Fenced, single-use transition from durable preparation to external
+    /// authority.  This is the only v2 path which can make an effect started.
+    StartEffect {
+        source_key: String,
+        effect_id: String,
+        operation_digest: String,
+        checkpoint_json: String,
+    },
+    /// Records a certified terminal observation and its redacted provider
+    /// result before the caller may re-enter the provider loop.
+    ObserveEffect {
+        source_key: String,
+        effect_id: String,
+        operation_digest: String,
+        success: bool,
+        result: String,
+        payload: Option<serde_json::Value>,
+        checkpoint_json: String,
+    },
+    /// Conservative terminal path once an effect has started but its outcome
+    /// can no longer be certified.
+    UnknownEffect {
+        source_key: String,
+        effect_id: String,
+        operation_digest: String,
+        checkpoint_json: String,
+    },
+    /// Explicit reconciliation acknowledgement for a previously unknown v2
+    /// effect.  This is deliberately a v2 terminal path, never a legacy run
+    /// mutation.
+    ReconcileUnknownEffect {
+        source_key: String,
+        effect_id: String,
+        checkpoint_json: String,
+    },
+    RequestPermission {
+        source_key: String,
+        request: latte_core::PendingPermission,
+    },
+    ResolvePermission {
+        source_key: String,
+        request_id: String,
+        allow: bool,
+    },
+    RequestInput {
+        source_key: String,
+        request: latte_core::PendingInput,
+    },
+    ProvideInput {
+        source_key: String,
+        request_id: String,
+        value: String,
+    },
+    Complete {
+        source_key: String,
+        handoff: Handoff,
+    },
+    /// Completes only after the engine has recorded a passing verification
+    /// result for this exact linked-child revision/effect epoch.  The caller
+    /// can construct this variant only through the engine-owned verified
+    /// completion method, which supplies a stable current manifest digest.
+    CompleteVerified {
+        source_key: String,
+        summary: String,
+        verification_effect_id: String,
+        verified_manifest_digest: String,
+        files_changed: Vec<String>,
+    },
+    Fail {
+        source_key: String,
+        failure: RunFailure,
+    },
+    Interrupt {
+        source_key: String,
+        reconciliation_effect_id: Option<String>,
+    },
+}
+
+impl CommitThreadRunUpdate {
+    fn source_key(&self) -> &str {
+        match self {
+            Self::Start { source_key }
+            | Self::AppendTranscript { source_key, .. }
+            | Self::PrepareEffect { source_key, .. }
+            | Self::StartEffect { source_key, .. }
+            | Self::ObserveEffect { source_key, .. }
+            | Self::UnknownEffect { source_key, .. }
+            | Self::ReconcileUnknownEffect { source_key, .. }
+            | Self::RequestPermission { source_key, .. }
+            | Self::ResolvePermission { source_key, .. }
+            | Self::RequestInput { source_key, .. }
+            | Self::ProvideInput { source_key, .. }
+            | Self::Complete { source_key, .. }
+            | Self::CompleteVerified { source_key, .. }
+            | Self::Fail { source_key, .. }
+            | Self::Interrupt { source_key, .. } => source_key,
+        }
+    }
+}
+
+/// Policy result captured durably during v2 preparation.  It is intentionally
+/// separate from the legacy policy module: storage only accepts the result
+/// which the engine computed from its private registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadEffectPolicy {
+    Allow,
+    Ask,
+}
+
+/// Exact mutation preconditions.  `command_id` is deduplicated using a
+/// canonical redacted digest; replaying it with different content fails
+/// closed before any write.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThreadCommitRequest {
+    pub thread_id: latte_core::ThreadId,
+    pub run_id: RunId,
+    pub expected_thread_revision: u64,
+    pub expected_run_revision: u64,
+    pub command_id: latte_core::ThreadCommandId,
+    pub request_id: Option<String>,
+    pub effect_id: Option<String>,
+    pub update: CommitThreadRunUpdate,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadCommitResponse {
+    pub snapshot: ThreadSnapshot,
+    pub thread_event: StoredThreadEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +251,16 @@ pub enum LeaseLossRecovery {
     Interrupted(RunState),
     FencedNoop,
     AlreadyTerminal(RunState),
+}
+
+/// Result of recovering a stale v2 linked child.  Unlike the legacy result,
+/// a thread recovery includes the durable v2 event that was committed with
+/// the v1 interruption and effect ledger changes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ThreadLeaseLossRecovery {
+    Recovered(ThreadCommitResponse),
+    FencedNoop,
+    AlreadyTerminal(ThreadSnapshot),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +416,93 @@ impl Storage {
             let tx = connection.unchecked_transaction()?;
             tx.execute_batch(r"CREATE TABLE run_baselines(run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,manifest_json TEXT NOT NULL);INSERT INTO schema_migrations(version,applied_at_ms) VALUES(6,CAST(strftime('%s','now') AS INTEGER)*1000);PRAGMA user_version=6;")?;
             tx.commit()?;
+            version = 6;
+        }
+        if version == 6 {
+            let tx = connection.unchecked_transaction()?;
+            // V2 deliberately has its own tables and event stream.  In
+            // particular, `thread_active_runs_v2` is the sole active-run
+            // authority; no v1 table is overloaded with a second meaning.
+            tx.execute_batch(r"
+              CREATE TABLE threads_v2(
+                thread_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                last_seq INTEGER NOT NULL DEFAULT 0,
+                lifecycle TEXT NOT NULL,
+                binding_json TEXT NOT NULL,
+                latest_run_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+              );
+              CREATE TABLE thread_runs_v2(
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+                thread_id TEXT NOT NULL REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
+                parent_run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+                ordinal INTEGER NOT NULL,
+                completed_at_ms INTEGER,
+                UNIQUE(thread_id, ordinal)
+              );
+              CREATE TABLE thread_active_runs_v2(
+                thread_id TEXT PRIMARY KEY REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL UNIQUE REFERENCES thread_runs_v2(run_id) ON DELETE RESTRICT,
+                lease_token INTEGER NOT NULL DEFAULT 0
+              );
+              CREATE TABLE thread_transcript_v2(
+                thread_id TEXT NOT NULL REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                entry_id TEXT NOT NULL UNIQUE,
+                run_id TEXT REFERENCES thread_runs_v2(run_id) ON DELETE RESTRICT,
+                kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                entry_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(thread_id, seq),
+                UNIQUE(thread_id, source_key)
+              );
+              CREATE TABLE thread_events_v2(
+                thread_id TEXT NOT NULL REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL UNIQUE,
+                revision INTEGER NOT NULL,
+                event_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(thread_id, seq)
+              );
+              CREATE TABLE thread_command_dedup_v2(
+                command_id TEXT PRIMARY KEY,
+                digest TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+              );
+              CREATE TABLE thread_commit_sources_v2(
+                thread_id TEXT NOT NULL REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
+                source_key TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                PRIMARY KEY(thread_id, source_key)
+              );
+              INSERT INTO schema_migrations(version,applied_at_ms) VALUES(7,CAST(strftime('%s','now') AS INTEGER)*1000);
+              PRAGMA user_version=7;
+            ")?;
+            tx.commit()?;
+            version = 7;
+        }
+        if version == 7 {
+            // The effects ledger and transcript deliberately retain only a
+            // redacted descriptor. Exact tool/process inputs live in this
+            // engine-private table so an approved operation can be resumed
+            // without treating display data as executable authority.
+            let tx = connection.unchecked_transaction()?;
+            tx.execute_batch(r"
+              CREATE TABLE thread_effect_canonical_v2(
+                effect_id TEXT PRIMARY KEY REFERENCES effects(effect_id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL REFERENCES thread_runs_v2(run_id) ON DELETE RESTRICT,
+                descriptor_json TEXT NOT NULL
+              );
+              INSERT INTO schema_migrations(version,applied_at_ms) VALUES(8,CAST(strftime('%s','now') AS INTEGER)*1000);
+              PRAGMA user_version=8;
+            ")?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -288,6 +573,1115 @@ impl Storage {
             .into_iter()
             .map(|v| serde_json::from_str(&v).map_err(invalid_json))
             .collect()
+    }
+
+    pub(crate) fn is_thread_linked_run(&self, run_id: RunId) -> Result<bool, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_runs_v2 WHERE run_id=?1)",
+            [run_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn create_thread_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        binding: &ThreadProviderBindingV2,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        binding.validate().map_err(StorageError::InvalidData)?;
+        let prompt = redact_thread_text(prompt);
+        if prompt.trim().is_empty() {
+            return Err(StorageError::InvalidData(
+                "thread prompt must not be empty".into(),
+            ));
+        }
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = RunState::queued(run_id);
+        let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
+        tx.execute(
+            "INSERT INTO runs(run_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,'queued',0,0,?3,?3)",
+            params![run_id.to_string(), state_json, to_i64(now_ms)?],
+        )?;
+        tx.execute(
+            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,0,0,?2)",
+            params![
+                run_id.to_string(),
+                serde_json::to_string(&state).map_err(invalid_json)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO run_baselines(run_id,manifest_json) VALUES(?1,?2)",
+            params![
+                run_id.to_string(),
+                serde_json::to_string(baseline).map_err(invalid_json)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms) VALUES(?1,0,0,'running',?2,?3,?4,?4)",
+            params![thread_id.to_string(), serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
+            params![run_id.to_string(), thread_id.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,0)",
+            params![thread_id.to_string(), run_id.to_string()],
+        )?;
+        let entry = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            // Transcript paging has an unsigned cursor, so reserve zero as
+            // the initial cursor and put the first user card at one.
+            sequence: 1,
+            run_id: Some(run_id),
+            kind: TranscriptKind::User,
+            text: prompt,
+            payload: None,
+            source_key: "thread:create:user".into(),
+            created_at_ms: now_ms,
+        };
+        tx.execute(
+            "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
+            params![thread_id.to_string(), entry.entry_id.to_string(), run_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
+        )?;
+        let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn create_thread_follow_up_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let prompt = redact_thread_text(prompt);
+        if prompt.trim().is_empty() {
+            return Err(StorageError::InvalidData(
+                "thread follow-up must not be empty".into(),
+            ));
+        }
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (revision, lifecycle, latest): (i64, String, Option<String>) = tx
+            .query_row(
+                "SELECT revision,lifecycle,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+        let revision = from_i64(revision)?;
+        if revision != expected_thread_revision {
+            return Err(StorageError::StaleThreadRevision {
+                expected: expected_thread_revision,
+                actual: revision,
+            });
+        }
+        if lifecycle != "ready"
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_active_runs_v2 WHERE thread_id=?1)",
+                [thread_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(StorageError::InvalidData(
+                "follow-up requires a ready thread with no active child".into(),
+            ));
+        }
+        let parent = latest.ok_or_else(|| {
+            StorageError::InvalidData("ready thread has no completed child".into())
+        })?;
+        let parent_state: String = tx.query_row(
+            "SELECT state_json FROM runs WHERE run_id=?1",
+            [parent.clone()],
+            |row| row.get(0),
+        )?;
+        let parent_state: RunState = serde_json::from_str(&parent_state).map_err(invalid_json)?;
+        if parent_state.status != RunStatus::Completed {
+            return Err(StorageError::InvalidData(
+                "follow-up parent must be completed".into(),
+            ));
+        }
+        let ordinal: u64 = from_i64(tx.query_row(
+            "SELECT COALESCE(MAX(ordinal),-1)+1 FROM thread_runs_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        let state = RunState::queued(run_id);
+        tx.execute("INSERT INTO runs(run_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,'queued',0,0,?3,?3)",params![run_id.to_string(),serde_json::to_string(&state).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute(
+            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,0,0,?2)",
+            params![
+                run_id.to_string(),
+                serde_json::to_string(&state).map_err(invalid_json)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO run_baselines(run_id,manifest_json) VALUES(?1,?2)",
+            params![
+                run_id.to_string(),
+                serde_json::to_string(baseline).map_err(invalid_json)?
+            ],
+        )?;
+        tx.execute("INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,?3,?4)",params![run_id.to_string(),thread_id.to_string(),parent,to_i64(ordinal)?])?;
+        tx.execute(
+            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,0)",
+            params![thread_id.to_string(), run_id.to_string()],
+        )?;
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("thread revision overflow".into()))?;
+        let seq: u64 = from_i64(tx.query_row(
+            "SELECT last_seq FROM threads_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )?)?
+        .checked_add(1)
+        .ok_or_else(|| StorageError::InvalidData("thread sequence overflow".into()))?;
+        let entry = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: seq,
+            run_id: Some(run_id),
+            kind: TranscriptKind::User,
+            text: prompt,
+            payload: None,
+            source_key: format!("follow-up:{run_id}:user"),
+            created_at_ms: now_ms,
+        };
+        tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'user',?5,?6,?7)",params![thread_id.to_string(),to_i64(seq)?,entry.entry_id.to_string(),run_id.to_string(),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        let summary = ThreadRunSummary {
+            run_id,
+            parent_run_id: Some(parent_state.run_id),
+            ordinal,
+            status: ThreadRunStatus::Queued,
+            run_revision: 0,
+            completed_at_ms: None,
+        };
+        let event = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+            thread_id,
+            revision: next_revision,
+            sequence: seq,
+            event: ThreadEvent::RunLinked { run: summary },
+        };
+        tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![thread_id.to_string(),to_i64(seq)?,event.event_id.to_string(),to_i64(next_revision)?,serde_json::to_string(&event).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE threads_v2 SET revision=?1,last_seq=?2,lifecycle='running',latest_run_id=?3,updated_at_ms=?4 WHERE thread_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,run_id.to_string(),to_i64(now_ms)?,thread_id.to_string()])?;
+        let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn thread_snapshot_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        thread_snapshot(&conn, thread_id, after, limit)
+    }
+
+    pub(crate) fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn
+            .prepare("SELECT thread_id FROM threads_v2 ORDER BY updated_at_ms DESC, rowid DESC")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|value| {
+                let id = parse_thread_id(&value)?;
+                // `thread_snapshot` pages forward for history reconstruction.
+                // The TUI instead needs the current end of a conversation: a
+                // first-20 ascending page made a completed 21+ card thread
+                // look stale while silently hiding its newest work.
+                let mut snapshot = thread_snapshot(&conn, id, None, 1)?;
+                snapshot.transcript =
+                    thread_transcript_tail(&conn, id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+                Ok(snapshot)
+            })
+            .collect()
+    }
+
+    /// Computes the exact workspace paths changed since this linked child was
+    /// created.  The engine supplies the fresh manifest; the baseline never
+    /// leaves durable storage except as this checked display list.
+    pub(crate) fn thread_changed_files(
+        &self,
+        run_id: RunId,
+        current_manifest: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<String>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let baseline_json: String = conn
+            .query_row(
+                "SELECT manifest_json FROM run_baselines WHERE run_id=?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::InvalidData("linked child has no engine-owned baseline".into())
+            })?;
+        let baseline: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&baseline_json).map_err(invalid_json)?;
+        let mut changed = std::collections::BTreeSet::new();
+        for key in baseline.keys().chain(current_manifest.keys()) {
+            if baseline.get(key) != current_manifest.get(key) {
+                changed.insert(key.clone());
+            }
+        }
+        let mut displayed = std::collections::BTreeMap::<String, String>::new();
+        for encoded in changed {
+            let components: Vec<String> = serde_json::from_str(&encoded).map_err(invalid_json)?;
+            if components.is_empty()
+                || components.iter().any(|component| {
+                    component.is_empty()
+                        || component.contains('/')
+                        || component
+                            .chars()
+                            .any(|value| value == '\0' || value.is_control())
+                })
+            {
+                return Err(StorageError::InvalidData(
+                    "invalid manifest component key".into(),
+                ));
+            }
+            let display = components.join("/");
+            if displayed.insert(display, encoded).is_some() {
+                return Err(StorageError::InvalidData(
+                    "manifest display path collision".into(),
+                ));
+            }
+        }
+        Ok(displayed.into_keys().collect())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn commit_thread_run_update(
+        &self,
+        request: &ThreadCommitRequest,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        validate_thread_source(request.update.source_key())?;
+        let digest = thread_command_digest(request)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_command: Option<(String, String)> = tx
+            .query_row(
+                "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [request.command_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_digest, result)) = previous_command {
+            if stored_digest != digest {
+                return Err(StorageError::ThreadCommandReplayMismatch);
+            }
+            let replay = serde_json::from_str(&result).map_err(invalid_json)?;
+            tx.commit()?;
+            return Ok(replay);
+        }
+        let previous_source: Option<(String, String)> = tx.query_row("SELECT digest,result_json FROM thread_commit_sources_v2 WHERE thread_id=?1 AND source_key=?2",params![request.thread_id.to_string(),request.update.source_key()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        if let Some((stored_digest, result)) = previous_source {
+            if stored_digest != digest {
+                return Err(StorageError::ThreadCommandReplayMismatch);
+            }
+            let replay = serde_json::from_str(&result).map_err(invalid_json)?;
+            tx.execute("INSERT INTO thread_command_dedup_v2(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",params![request.command_id.to_string(),digest,result,to_i64(now_ms)?])?;
+            tx.commit()?;
+            return Ok(replay);
+        }
+        let lease_ok: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
+        if !lease_ok {
+            return Err(StorageError::LeaseLost);
+        }
+        let (thread_revision, last_seq, lifecycle, latest_run): (i64, i64, String, Option<String>) = tx
+            .query_row(
+                "SELECT revision,last_seq,lifecycle,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+                [request.thread_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or(StorageError::ThreadNotFound(request.thread_id))?;
+        let thread_revision = from_i64(thread_revision)?;
+        if thread_revision != request.expected_thread_revision {
+            return Err(StorageError::StaleThreadRevision {
+                expected: request.expected_thread_revision,
+                actual: thread_revision,
+            });
+        }
+        let active: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT run_id,lease_token FROM thread_active_runs_v2 WHERE thread_id=?1",
+                [request.thread_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        // Unknown-effect reconciliation happens only after the conservative
+        // terminal path has removed the active child.  It is still fenced by
+        // the exact thread/run/revision binding below, but must not require a
+        // row that recovery deliberately cleared.
+        let recovered_reconciliation = active.is_none()
+            && matches!(
+                &request.update,
+                CommitThreadRunUpdate::ReconcileUnknownEffect { .. }
+            )
+            && lifecycle == "reconciliation_required"
+            && latest_run.as_deref() == Some(request.run_id.to_string().as_str());
+        if let Some((active_run, active_token)) = active {
+            if active_run != request.run_id.to_string()
+                || from_i64(active_token)? > lease.fencing_token
+            {
+                return Err(StorageError::ThreadActiveRunMismatch);
+            }
+        } else if !recovered_reconciliation {
+            return Err(StorageError::ThreadActiveRunMismatch);
+        }
+        let (state_json, run_seq, run_token): (String, i64, i64) = tx.query_row(
+            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
+            [request.run_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if from_i64(run_token)? > lease.fencing_token {
+            return Err(StorageError::LeaseLost);
+        }
+        let current: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+        if current.revision != request.expected_run_revision {
+            return Err(StorageError::StaleRevision {
+                expected: request.expected_run_revision,
+                actual: current.revision,
+            });
+        }
+
+        let mut next = current.clone();
+        let mut run_changed = false;
+        let mut next_lifecycle = lifecycle;
+        let mut card: Option<(TranscriptKind, String, Option<serde_json::Value>, String)> = None;
+        let mut terminal = false;
+        let mut reconciliation_effect = None;
+        let mut checkpoint: Option<String> = None;
+        match &request.update {
+            CommitThreadRunUpdate::Start { .. } => {
+                next = current
+                    .transition(current.revision, Transition::Start)
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                next_lifecycle = "running".into();
+            }
+            CommitThreadRunUpdate::AppendTranscript {
+                source_key,
+                kind,
+                text,
+                payload,
+            } => {
+                card = Some((
+                    *kind,
+                    redact_thread_text(text),
+                    payload.clone().map(redact_thread_value),
+                    source_key.clone(),
+                ));
+            }
+            CommitThreadRunUpdate::PrepareEffect {
+                source_key,
+                effect_id,
+                operation_digest,
+                descriptor_json,
+                canonical_descriptor_json,
+                policy,
+                description,
+                checkpoint_json,
+            } => {
+                validate_thread_effect_id(effect_id)?;
+                validate_thread_digest(operation_digest)?;
+                serde_json::from_str::<serde_json::Value>(descriptor_json).map_err(invalid_json)?;
+                serde_json::from_str::<crate::ThreadEffectDescriptor>(canonical_descriptor_json)
+                    .map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                if current.status != RunStatus::Running {
+                    return Err(StorageError::InvalidData(
+                        "only a running linked child can prepare an effect".into(),
+                    ));
+                }
+                let pre_evidence = match policy {
+                    ThreadEffectPolicy::Allow => r#"{"thread_policy":"allow"}"#,
+                    ThreadEffectPolicy::Ask => r#"{"thread_policy":"ask"}"#,
+                };
+                tx.execute("INSERT INTO effects(effect_id,run_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,1,?4,?5,?6,?3)",params![effect_id,request.run_id.to_string(),to_i64(now_ms)?,descriptor_json,operation_digest,pre_evidence])?;
+                tx.execute(
+                    "INSERT INTO thread_effect_canonical_v2(effect_id,run_id,descriptor_json) VALUES(?1,?2,?3)",
+                    params![effect_id, request.run_id.to_string(), canonical_descriptor_json],
+                )?;
+                if *policy == ThreadEffectPolicy::Ask {
+                    let pending = latte_core::PendingPermission {
+                        request_id: redact_thread_text(effect_id),
+                        operation_digest: redact_thread_text(operation_digest),
+                        description: redact_thread_text(description),
+                    };
+                    next = current
+                        .transition(current.revision, Transition::RequestPermission(pending))
+                        .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                    run_changed = true;
+                    next_lifecycle = "waiting_permission".into();
+                    let post_approval_revision = current
+                        .revision
+                        .checked_add(2)
+                        .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
+                    tx.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,request.run_id.to_string(),to_i64(post_approval_revision)?,lease.owner,to_i64(lease.fencing_token)?,operation_digest])?;
+                }
+                card = Some((
+                    TranscriptKind::ToolCall,
+                    redact_thread_text(description),
+                    Some(redact_thread_value(serde_json::json!({
+                        "descriptor": serde_json::from_str::<serde_json::Value>(descriptor_json)
+                            .map_err(invalid_json)?,
+                        "operation_digest": operation_digest,
+                    }))),
+                    format!("{source_key}:card"),
+                ));
+                checkpoint = Some(checkpoint_json.clone());
+            }
+            CommitThreadRunUpdate::StartEffect {
+                source_key,
+                effect_id,
+                operation_digest,
+                checkpoint_json,
+            } => {
+                validate_thread_effect_id(effect_id)?;
+                validate_thread_digest(operation_digest)?;
+                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                if current.status != RunStatus::Running
+                    || current.pending_permission.is_some()
+                    || current.pending_input.is_some()
+                {
+                    return Err(StorageError::InvalidData(
+                        "effect start requires a running child without a pending request".into(),
+                    ));
+                }
+                let prepared: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT approval_digest,pre_evidence_json FROM effects WHERE effect_id=?1 AND run_id=?2 AND status='prepared'",
+                        params![effect_id, request.run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((stored_digest, policy_marker)) = prepared else {
+                    return Err(StorageError::InvalidData(
+                        "effect is not a prepared linked effect".into(),
+                    ));
+                };
+                if stored_digest != *operation_digest {
+                    return Err(StorageError::InvalidData("effect digest mismatch".into()));
+                }
+                let pending: Option<(i64, String, i64, Option<i64>)> = tx
+                    .query_row(
+                        "SELECT run_revision,lease_owner,lease_token,consumed_at_ms FROM pending_permissions WHERE effect_id=?1 AND run_id=?2",
+                        params![effect_id, request.run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                if let Some((bound_revision, owner, token, consumed)) = pending {
+                    if from_i64(bound_revision)? != current.revision
+                        || owner != lease.owner
+                        || from_i64(token)? != lease.fencing_token
+                        || consumed.is_some()
+                    {
+                        return Err(StorageError::InvalidData(
+                            "prepared permission is stale, mismatched, or consumed".into(),
+                        ));
+                    }
+                    tx.execute(
+                        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND consumed_at_ms IS NULL",
+                        params![to_i64(now_ms)?, effect_id],
+                    )?;
+                } else if policy_marker != r#"{"thread_policy":"allow"}"# {
+                    return Err(StorageError::InvalidData(
+                        "prepared effect has no durable allow authorization".into(),
+                    ));
+                }
+                let started = tx.execute(
+                    "UPDATE effects SET status='started',started_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared' AND approval_digest=?4",
+                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                )?;
+                if started != 1 {
+                    return Err(StorageError::EffectFenced);
+                }
+                let bumped = tx.execute(
+                    "UPDATE runs SET effect_epoch=effect_epoch+1,lease_token=?1,updated_at_ms=?2 WHERE run_id=?3 AND revision=?4 AND lease_token<=?1",
+                    params![to_i64(lease.fencing_token)?,to_i64(now_ms)?,request.run_id.to_string(),to_i64(current.revision)?],
+                )?;
+                if bumped != 1 {
+                    return Err(StorageError::LeaseLost);
+                }
+                card = Some((
+                    TranscriptKind::System,
+                    "tool started".into(),
+                    Some(
+                        serde_json::json!({"effect_id":redact_thread_text(effect_id),"status":"started"}),
+                    ),
+                    format!("{source_key}:card"),
+                ));
+                checkpoint = Some(checkpoint_json.clone());
+            }
+            CommitThreadRunUpdate::ObserveEffect {
+                source_key,
+                effect_id,
+                operation_digest,
+                success,
+                result,
+                payload,
+                checkpoint_json,
+            } => {
+                validate_thread_effect_id(effect_id)?;
+                validate_thread_digest(operation_digest)?;
+                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                if current.status != RunStatus::Running {
+                    return Err(StorageError::InvalidData(
+                        "effect observation requires a running linked child".into(),
+                    ));
+                }
+                let changed = tx.execute(
+                    "UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND run_id=?5 AND status='started' AND approval_digest=?6",
+                    params![if *success { "observed_success" } else { "observed_failed" },serde_json::to_string(&redact_thread_value(serde_json::json!({"result":result,"payload":payload.clone()}))).map_err(invalid_json)?,to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::EffectFenced);
+                }
+                card = Some((
+                    TranscriptKind::ToolResult,
+                    redact_thread_text(result),
+                    payload.clone().map(redact_thread_value),
+                    format!("{source_key}:card"),
+                ));
+                checkpoint = Some(checkpoint_json.clone());
+            }
+            CommitThreadRunUpdate::UnknownEffect {
+                source_key,
+                effect_id,
+                operation_digest,
+                checkpoint_json,
+            } => {
+                validate_thread_effect_id(effect_id)?;
+                validate_thread_digest(operation_digest)?;
+                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                let changed = tx.execute(
+                    r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"uncertain"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started' AND approval_digest=?4"#,
+                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::EffectFenced);
+                }
+                let cancelling = current
+                    .transition(current.revision, Transition::Cancel)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                next = cancelling
+                    .transition(cancelling.revision, Transition::Interrupt)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                run_changed = true;
+                terminal = true;
+                reconciliation_effect = Some(redact_thread_text(effect_id));
+                next_lifecycle = "reconciliation_required".into();
+                card = Some((
+                    TranscriptKind::Failure,
+                    "effect outcome unknown; reconciliation required".into(),
+                    Some(
+                        serde_json::json!({"effect_id":redact_thread_text(effect_id),"status":"unknown"}),
+                    ),
+                    format!("{source_key}:card"),
+                ));
+                checkpoint = Some(checkpoint_json.clone());
+            }
+            CommitThreadRunUpdate::ReconcileUnknownEffect {
+                source_key,
+                effect_id,
+                checkpoint_json,
+            } => {
+                validate_thread_effect_id(effect_id)?;
+                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                let changed = tx.execute(
+                    r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"reconciliation":"acknowledged_failed"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='unknown'"#,
+                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::InvalidData(
+                        "unknown effect does not belong to linked child".into(),
+                    ));
+                }
+                if recovered_reconciliation {
+                    // Recovery first records the v1 Interrupted state so no
+                    // observer can infer the external result.  A later
+                    // explicit acknowledgement terminalizes that exact
+                    // interrupted child without fabricating a legal v1
+                    // transition that the state machine does not expose.
+                    if current.status != RunStatus::Interrupted {
+                        return Err(StorageError::InvalidData(
+                            "recovered reconciliation requires an interrupted child".into(),
+                        ));
+                    }
+                    next.status = RunStatus::Failed;
+                    next.revision = current
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
+                    next.failure = Some(RunFailure {
+                        code: FailureCode::RuntimeFailed,
+                        message: format!(
+                            "unknown effect {} acknowledged failed; run aborted",
+                            redact_thread_text(effect_id)
+                        ),
+                        retryability: Retryability::Terminal,
+                    });
+                    next.pending_input = None;
+                    next.pending_permission = None;
+                } else {
+                    next = current
+                        .transition(
+                            current.revision,
+                            Transition::Fail(RunFailure {
+                                code: FailureCode::RuntimeFailed,
+                                message: format!(
+                                    "unknown effect {} acknowledged failed; run aborted",
+                                    redact_thread_text(effect_id)
+                                ),
+                                retryability: Retryability::Terminal,
+                            }),
+                        )
+                        .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                }
+                run_changed = true;
+                terminal = true;
+                next_lifecycle = "failed".into();
+                card = Some((
+                    TranscriptKind::Failure,
+                    "unknown effect acknowledged failed; run aborted".into(),
+                    Some(
+                        serde_json::json!({"effect_id":redact_thread_text(effect_id),"status":"reconciled"}),
+                    ),
+                    format!("{source_key}:card"),
+                ));
+                checkpoint = Some(checkpoint_json.clone());
+            }
+            CommitThreadRunUpdate::RequestPermission {
+                source_key,
+                request: pending,
+            } => {
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::RequestPermission(redact_permission(pending)),
+                    )
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                next_lifecycle = "waiting_permission".into();
+                card = Some((
+                    TranscriptKind::Permission,
+                    next.pending_permission.as_ref().map_or_else(
+                        || "permission requested".into(),
+                        |value| redact_thread_text(&value.description),
+                    ),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::ResolvePermission {
+                source_key,
+                request_id,
+                allow,
+            } => {
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::ResolvePermission {
+                            request_id: redact_thread_text(request_id),
+                            allowed: *allow,
+                        },
+                    )
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                terminal = !allow;
+                next_lifecycle = if *allow {
+                    "running".into()
+                } else {
+                    "failed".into()
+                };
+                card = Some((
+                    if *allow {
+                        TranscriptKind::System
+                    } else {
+                        TranscriptKind::Failure
+                    },
+                    if *allow {
+                        "permission allowed".into()
+                    } else {
+                        "permission denied".into()
+                    },
+                    None,
+                    format!("{source_key}:card"),
+                ));
+                if !allow {
+                    // A prepared ask effect has never crossed the Started
+                    // boundary.  Denial consumes its approval capability and
+                    // records a terminal non-execution observation in the
+                    // same transaction which removes the active child.
+                    tx.execute(
+                        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND consumed_at_ms IS NULL",
+                        params![to_i64(now_ms)?, request_id, request.run_id.to_string()],
+                    )?;
+                    tx.execute(
+                        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"permission":"denied_before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared'"#,
+                        params![to_i64(now_ms)?, request_id, request.run_id.to_string()],
+                    )?;
+                }
+            }
+            CommitThreadRunUpdate::RequestInput {
+                source_key,
+                request: pending,
+            } => {
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::RequestInput(redact_input(pending)),
+                    )
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                next_lifecycle = "waiting_input".into();
+                card = Some((
+                    TranscriptKind::Input,
+                    next.pending_input.as_ref().map_or_else(
+                        || "input requested".into(),
+                        |value| redact_thread_text(&value.prompt),
+                    ),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::ProvideInput {
+                source_key,
+                request_id,
+                value,
+            } => {
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::ProvideInput {
+                            request_id: redact_thread_text(request_id),
+                        },
+                    )
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                next_lifecycle = "running".into();
+                card = Some((
+                    TranscriptKind::User,
+                    redact_thread_text(value),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::Complete {
+                source_key,
+                handoff,
+            } => {
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::Complete {
+                            handoff: redact_handoff(handoff),
+                            policy: CompletionPolicy::VerificationNotRequired,
+                        },
+                    )
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                terminal = true;
+                next_lifecycle = "ready".into();
+                card = Some((
+                    TranscriptKind::Completion,
+                    next.handoff.as_ref().map_or_else(
+                        || "completed".into(),
+                        |value| redact_thread_text(&value.summary),
+                    ),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::CompleteVerified {
+                source_key,
+                summary,
+                verification_effect_id,
+                verified_manifest_digest,
+                files_changed,
+            } => {
+                let effect_epoch = from_i64(tx.query_row(
+                    "SELECT effect_epoch FROM runs WHERE run_id=?1",
+                    [request.run_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )?)?;
+                let metadata: Option<String> = tx
+                    .query_row(
+                        "SELECT metadata_json FROM evidence WHERE run_id=?1 ORDER BY rowid DESC LIMIT 1",
+                        [request.run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let record = metadata
+                    .map(|raw| {
+                        serde_json::from_str::<VerificationRecord>(&raw).map_err(invalid_json)
+                    })
+                    .transpose()?
+                    .filter(|record| {
+                        record.revision == current.revision
+                            && record.effect_epoch == effect_epoch
+                            && record.effect_id == *verification_effect_id
+                            && record.passed
+                            && record.workspace_manifest_digest == *verified_manifest_digest
+                    })
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(
+                            "missing current passing verification evidence for linked child".into(),
+                        )
+                    })?;
+                let handoff = Handoff {
+                    summary: redact_thread_text(summary),
+                    files_changed: files_changed
+                        .iter()
+                        .map(|path| redact_thread_text(path))
+                        .collect(),
+                    evidence: vec![Evidence {
+                        name: format!(
+                            "verification: {}",
+                            redact_thread_text(verification_effect_id)
+                        ),
+                        status: VerificationStatus::Passed,
+                        summary: format!(
+                            "{}; verified_manifest_sha256={}; verified_at_ms={now_ms}; change_source=manifest_v1",
+                            redact_thread_text(&record.summary),
+                            redact_thread_text(verified_manifest_digest),
+                        ),
+                    }],
+                };
+                next = current
+                    .transition(
+                        current.revision,
+                        Transition::Complete {
+                            handoff,
+                            policy: CompletionPolicy::VerificationRequired,
+                        },
+                    )
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                run_changed = true;
+                terminal = true;
+                next_lifecycle = "ready".into();
+                card = Some((
+                    TranscriptKind::Completion,
+                    next.handoff.as_ref().map_or_else(
+                        || "completed".into(),
+                        |value| redact_thread_text(&value.summary),
+                    ),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::Fail {
+                source_key,
+                failure,
+            } => {
+                next = current
+                    .transition(current.revision, Transition::Fail(redact_failure(failure)))
+                    .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                run_changed = true;
+                terminal = true;
+                next_lifecycle = "failed".into();
+                card = Some((
+                    TranscriptKind::Failure,
+                    next.failure.as_ref().map_or_else(
+                        || "failed".into(),
+                        |value| redact_thread_text(&value.message),
+                    ),
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+            CommitThreadRunUpdate::Interrupt {
+                source_key,
+                reconciliation_effect_id,
+            } => {
+                reconciliation_effect = reconciliation_effect_id
+                    .as_ref()
+                    .map(|value| redact_thread_text(value));
+                if matches!(
+                    current.status,
+                    RunStatus::WaitingPermission | RunStatus::WaitingInput
+                ) {
+                    // Waiting requests have not started an external effect. The
+                    // mandatory cancellation mapping is terminal Cancelled,
+                    // not an ambiguous interruption.
+                    next.revision = current
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
+                    next.status = RunStatus::Failed;
+                    next.pending_input = None;
+                    next.pending_permission = None;
+                    next.failure = Some(RunFailure {
+                        code: FailureCode::Cancelled,
+                        message: "run cancelled while waiting".into(),
+                        retryability: Retryability::Terminal,
+                    });
+                    reconciliation_effect = None;
+                    next_lifecycle = "failed".into();
+                    if let Some(permission) = current.pending_permission.as_ref() {
+                        tx.execute(
+                            "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND consumed_at_ms IS NULL",
+                            params![to_i64(now_ms)?, permission.request_id, request.run_id.to_string()],
+                        )?;
+                        tx.execute(
+                            r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"cancelled":"before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared'"#,
+                            params![to_i64(now_ms)?, permission.request_id, request.run_id.to_string()],
+                        )?;
+                    }
+                } else {
+                    // A durable Started record is proof that an external
+                    // call may already have happened.  A generic cancellation
+                    // must therefore discover it and turn the thread into a
+                    // reconciliation case rather than claiming interruption.
+                    if reconciliation_effect.is_none() {
+                        reconciliation_effect = tx
+                            .query_row(
+                                "SELECT effect_id FROM effects WHERE run_id=?1 AND status='started' ORDER BY rowid DESC LIMIT 1",
+                                [request.run_id.to_string()],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?;
+                    }
+                    if let Some(effect_id) = reconciliation_effect.as_ref() {
+                        tx.execute(
+                            r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"cancelled_after_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started'"#,
+                            params![to_i64(now_ms)?, effect_id, request.run_id.to_string()],
+                        )?;
+                    }
+                    let cancelling = current
+                        .transition(current.revision, Transition::Cancel)
+                        .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                    next = cancelling
+                        .transition(cancelling.revision, Transition::Interrupt)
+                        .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+                    next_lifecycle = if reconciliation_effect.is_some() {
+                        "reconciliation_required".into()
+                    } else {
+                        "interrupted".into()
+                    };
+                }
+                run_changed = true;
+                terminal = true;
+                card = Some((
+                    TranscriptKind::Failure,
+                    if reconciliation_effect.is_some() {
+                        "effect outcome unknown; reconciliation required".into()
+                    } else {
+                        "run interrupted".into()
+                    },
+                    None,
+                    format!("{source_key}:card"),
+                ));
+            }
+        }
+        let next_thread_revision = thread_revision
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("thread revision overflow".into()))?;
+        let next_sequence = from_i64(last_seq)?
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("thread sequence overflow".into()))?;
+        if run_changed {
+            append_linked_run_transition(&tx, &current, &next, from_i64(run_seq)?, lease, now_ms)?;
+        }
+        if let Some(payload) = checkpoint {
+            tx.execute(
+                "INSERT INTO runtime_checkpoints(run_id,payload_json,updated_at_ms) VALUES(?1,?2,?3) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",
+                params![request.run_id.to_string(), payload, to_i64(now_ms)?],
+            )?;
+        }
+        let transcript = if let Some((kind, text, payload, source_key)) = card {
+            let entry = TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: next_sequence,
+                run_id: Some(request.run_id),
+                kind,
+                text,
+                payload,
+                source_key,
+                created_at_ms: now_ms,
+            };
+            tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![request.thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),request.run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+            Some(entry)
+        } else {
+            None
+        };
+        if terminal {
+            tx.execute(
+                "UPDATE thread_runs_v2 SET completed_at_ms=?1 WHERE run_id=?2",
+                params![to_i64(now_ms)?, request.run_id.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM thread_active_runs_v2 WHERE thread_id=?1 AND run_id=?2",
+                params![request.thread_id.to_string(), request.run_id.to_string()],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE thread_active_runs_v2 SET lease_token=?1 WHERE thread_id=?2 AND run_id=?3",
+                params![
+                    to_i64(lease.fencing_token)?,
+                    request.thread_id.to_string(),
+                    request.run_id.to_string()
+                ],
+            )?;
+        }
+        tx.execute("UPDATE threads_v2 SET revision=?1,last_seq=?2,lifecycle=?3,latest_run_id=?4,updated_at_ms=?5 WHERE thread_id=?6",params![to_i64(next_thread_revision)?,to_i64(next_sequence)?,next_lifecycle,request.run_id.to_string(),to_i64(now_ms)?,request.thread_id.to_string()])?;
+        let event = if let Some(entry) = transcript {
+            ThreadEvent::TranscriptAppended { entry }
+        } else if let Some(effect_id) = reconciliation_effect {
+            ThreadEvent::ReconciliationRequired {
+                run_id: request.run_id,
+                effect_id,
+            }
+        } else {
+            ThreadEvent::LifecycleChanged {
+                lifecycle: parse_lifecycle(&next_lifecycle)?,
+                run_id: Some(request.run_id),
+            }
+        };
+        let envelope = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+            thread_id: request.thread_id,
+            revision: next_thread_revision,
+            sequence: next_sequence,
+            event,
+        };
+        tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![request.thread_id.to_string(),to_i64(next_sequence)?,envelope.event_id.to_string(),to_i64(next_thread_revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        let response = ThreadCommitResponse {
+            snapshot: thread_snapshot(&tx, request.thread_id, None, 100)?,
+            thread_event: StoredThreadEvent {
+                sequence: next_sequence,
+                envelope,
+            },
+        };
+        let response_json = serde_json::to_string(&response).map_err(invalid_json)?;
+        tx.execute("INSERT INTO thread_command_dedup_v2(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",params![request.command_id.to_string(),digest,response_json,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO thread_commit_sources_v2(thread_id,source_key,digest,result_json) VALUES(?1,?2,?3,?4)",params![request.thread_id.to_string(),request.update.source_key(),thread_command_digest(request)?,serde_json::to_string(&response).map_err(invalid_json)?])?;
+        tx.commit()?;
+        Ok(response)
     }
 
     #[cfg(test)]
@@ -763,6 +2157,31 @@ impl Storage {
             ))),
         }
     }
+    pub(crate) fn thread_effect_digest(&self, effect_id: &str) -> Result<String, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.query_row(
+            "SELECT approval_digest FROM effects WHERE effect_id=?1",
+            [effect_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+    /// Returns an exact descriptor only to the engine module. The public
+    /// thread snapshot and all event/transcript readers use the independently
+    /// redacted projection in `effects.descriptor_json` instead.
+    pub(crate) fn thread_effect_canonical_descriptor(
+        &self,
+        effect_id: &str,
+        run_id: RunId,
+    ) -> Result<crate::ThreadEffectDescriptor, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let json: String = conn.query_row(
+            "SELECT descriptor_json FROM thread_effect_canonical_v2 WHERE effect_id=?1 AND run_id=?2",
+            params![effect_id, run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str(&json).map_err(invalid_json)
+    }
     pub(crate) fn unknown_effects_for_run(
         &self,
         run_id: RunId,
@@ -774,6 +2193,69 @@ impl Storage {
         Ok(stmt
             .query_map([run_id.to_string()], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fences a stale v2 coordinator and atomically leaves its linked child
+    /// in the same conservative state used by startup recovery.  The caller
+    /// must have just failed a renewal; no write here relies on that stale
+    /// lease being authoritative.
+    pub(crate) fn recover_thread_after_lease_loss(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        lost_lease: &Lease,
+        expected_run_revision: u64,
+        now_ms: u64,
+    ) -> Result<ThreadLeaseLossRecovery, StorageError> {
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let still_authoritative: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",
+            params![
+                lost_lease.owner,
+                to_i64(lost_lease.fencing_token)?,
+                to_i64(now_ms)?
+            ],
+            |row| row.get(0),
+        )?;
+        if still_authoritative {
+            return Err(StorageError::InvalidData(
+                "lease is still authoritative".into(),
+            ));
+        }
+        let state_json: Option<String> = tx
+            .query_row(
+                "SELECT state_json FROM runs WHERE run_id=?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state_json) = state_json else {
+            return Err(StorageError::RunNotFound(run_id));
+        };
+        let state: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+        if matches!(
+            state.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+        ) {
+            let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+            tx.commit()?;
+            return Ok(ThreadLeaseLossRecovery::AlreadyTerminal(snapshot));
+        }
+        let response = recover_linked_thread_run(
+            &tx,
+            thread_id,
+            run_id,
+            lost_lease.fencing_token,
+            Some(expected_run_revision),
+            now_ms,
+        )?;
+        let Some(response) = response else {
+            tx.commit()?;
+            return Ok(ThreadLeaseLossRecovery::FencedNoop);
+        };
+        tx.commit()?;
+        Ok(ThreadLeaseLossRecovery::Recovered(response))
     }
     pub(crate) fn interrupt_after_lease_loss(
         &self,
@@ -1256,8 +2738,39 @@ impl Storage {
     fn recover_at(&self, now_ms: u64) -> Result<(), StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Linked children must recover their v1 run, effect ledger, thread
+        // projection, transcript, and thread event together.  In particular
+        // never let the legacy loop interrupt a v2 child by itself: doing so
+        // leaves an active-row/lifecycle pair that no v2 command can safely
+        // reconcile.
+        let linked_rows = {
+            let mut stmt = tx.prepare(
+                "SELECT ar.thread_id,ar.run_id,r.lease_token FROM thread_active_runs_v2 ar \
+                 JOIN runs r ON r.run_id=ar.run_id \
+                 WHERE r.status IN ('queued','running','cancelling','waiting_permission','waiting_input') \
+                 AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.singleton=1 AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
+            )?;
+            stmt.query_map([to_i64(now_ms)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for (thread, run, token) in linked_rows {
+            let thread_id = parse_thread_id(&thread)?;
+            let run_id = uuid::Uuid::parse_str(&run)
+                .map(RunId::from_uuid)
+                .map_err(|error| {
+                    StorageError::InvalidData(format!("invalid stored run id: {error}"))
+                })?;
+            let _ =
+                recover_linked_thread_run(&tx, thread_id, run_id, from_i64(token)?, None, now_ms)?;
+        }
         let mut stmt = tx.prepare(
-            "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.singleton=1 AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
+            "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 tr WHERE tr.run_id=r.run_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.singleton=1 AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
         )?;
         let rows = stmt
             .query_map([to_i64(now_ms)?], |r| {
@@ -1337,6 +2850,716 @@ fn status_name(status: RunStatus) -> &'static str {
         RunStatus::Failed => "failed",
         RunStatus::Completed => "completed",
     }
+}
+
+fn parse_thread_id(value: &str) -> Result<latte_core::ThreadId, StorageError> {
+    uuid::Uuid::parse_str(value)
+        .map(latte_core::ThreadId::from_uuid)
+        .map_err(|error| StorageError::InvalidData(format!("invalid stored thread id: {error}")))
+}
+
+fn parse_lifecycle(value: &str) -> Result<ThreadLifecycle, StorageError> {
+    match value {
+        "ready" => Ok(ThreadLifecycle::Ready),
+        "running" => Ok(ThreadLifecycle::Running),
+        "waiting_permission" => Ok(ThreadLifecycle::WaitingPermission),
+        "waiting_input" => Ok(ThreadLifecycle::WaitingInput),
+        "interrupted" => Ok(ThreadLifecycle::Interrupted),
+        "failed" => Ok(ThreadLifecycle::Failed),
+        "reconciliation_required" => Ok(ThreadLifecycle::ReconciliationRequired),
+        _ => Err(StorageError::InvalidData(format!(
+            "invalid thread lifecycle {value}"
+        ))),
+    }
+}
+
+fn thread_run_status(status: RunStatus) -> ThreadRunStatus {
+    match status {
+        RunStatus::Queued => ThreadRunStatus::Queued,
+        RunStatus::Running => ThreadRunStatus::Running,
+        RunStatus::Cancelling => ThreadRunStatus::Cancelling,
+        RunStatus::WaitingPermission => ThreadRunStatus::WaitingPermission,
+        RunStatus::WaitingInput => ThreadRunStatus::WaitingInput,
+        RunStatus::Interrupted => ThreadRunStatus::Interrupted,
+        RunStatus::Failed => ThreadRunStatus::Failed,
+        RunStatus::Completed => ThreadRunStatus::Completed,
+    }
+}
+
+fn transcript_kind_name(kind: TranscriptKind) -> &'static str {
+    match kind {
+        TranscriptKind::User => "user",
+        TranscriptKind::Assistant => "assistant",
+        TranscriptKind::ToolCall => "tool_call",
+        TranscriptKind::ToolResult => "tool_result",
+        TranscriptKind::Permission => "permission",
+        TranscriptKind::Input => "input",
+        TranscriptKind::Failure => "failure",
+        TranscriptKind::Completion => "completion",
+        TranscriptKind::System => "system",
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn thread_snapshot(
+    connection: &Connection,
+    thread_id: latte_core::ThreadId,
+    after: Option<u64>,
+    limit: usize,
+) -> Result<ThreadSnapshot, StorageError> {
+    let (revision, sequence, lifecycle, binding_json, latest): (i64, i64, String, String, Option<String>) = connection
+        .query_row(
+            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?
+        .ok_or(StorageError::ThreadNotFound(thread_id))?;
+    let binding = serde_json::from_str(&binding_json).map_err(invalid_json)?;
+    let latest_run_id = latest
+        .as_deref()
+        .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+        .transpose()
+        .map_err(|error| StorageError::InvalidData(format!("invalid stored run id: {error}")))?;
+    let active_run_id: Option<String> = connection
+        .query_row(
+            "SELECT run_id FROM thread_active_runs_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let active_run_id = active_run_id
+        .as_deref()
+        .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+        .transpose()
+        .map_err(|error| StorageError::InvalidData(format!("invalid active run id: {error}")))?;
+    let mut statement = connection.prepare(
+        "SELECT tr.run_id,tr.parent_run_id,tr.ordinal,tr.completed_at_ms,r.state_json
+         FROM thread_runs_v2 tr JOIN runs r ON r.run_id=tr.run_id
+         WHERE tr.thread_id=?1 ORDER BY tr.ordinal ASC",
+    )?;
+    let runs = statement
+        .query_map([thread_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .map(|row| {
+            let (run, parent, ordinal, completed, state_json) = row?;
+            let state: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+            let run_id = uuid::Uuid::parse_str(&run)
+                .map(RunId::from_uuid)
+                .map_err(|error| {
+                    StorageError::InvalidData(format!("invalid stored run id: {error}"))
+                })?;
+            let parent_run_id = parent
+                .as_deref()
+                .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+                .transpose()
+                .map_err(|error| {
+                    StorageError::InvalidData(format!("invalid parent run id: {error}"))
+                })?;
+            Ok(ThreadRunSummary {
+                run_id,
+                parent_run_id,
+                ordinal: from_i64(ordinal)?,
+                status: thread_run_status(state.status),
+                run_revision: state.revision,
+                completed_at_ms: completed.map(from_i64).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    let bounded_limit = limit.clamp(1, 500);
+    let query_after = after.unwrap_or(0);
+    let mut entries = connection
+        .prepare(
+            "SELECT entry_json FROM thread_transcript_v2 WHERE thread_id=?1 AND seq>?2 ORDER BY seq ASC LIMIT ?3",
+        )?
+        .query_map(
+            params![thread_id.to_string(), to_i64(query_after)?, i64::try_from(bounded_limit + 1).map_err(|_| StorageError::InvalidData("page limit overflow".into()))?],
+            |row| row.get::<_, String>(0),
+        )?
+        .map(|row| row.map_err(StorageError::from).and_then(|json| serde_json::from_str(&json).map_err(invalid_json)))
+        .collect::<Result<Vec<TranscriptEntry>, StorageError>>()?;
+    let has_more = entries.len() > bounded_limit;
+    entries.truncate(bounded_limit);
+    let next_after = entries.last().map(|entry| entry.sequence);
+    let pending = active_run_id.and_then(|active| {
+        runs.iter()
+            .find(|run| run.run_id == active)
+            .and_then(|summary| {
+                let state_json: Option<String> = connection
+                    .query_row(
+                        "SELECT state_json FROM runs WHERE run_id=?1",
+                        [active.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let state =
+                    state_json.and_then(|json| serde_json::from_str::<RunState>(&json).ok())?;
+                if let Some(permission) = state.pending_permission {
+                    Some(ThreadPendingRequest::Permission {
+                        run_id: active,
+                        request_id: redact_thread_text(&permission.request_id),
+                        description: redact_thread_text(&permission.description),
+                        expected_run_revision: summary.run_revision,
+                    })
+                } else {
+                    state
+                        .pending_input
+                        .map(|input| ThreadPendingRequest::Input {
+                            run_id: active,
+                            request_id: redact_thread_text(&input.request_id),
+                            prompt: redact_thread_text(&input.prompt),
+                            expected_run_revision: summary.run_revision,
+                        })
+                }
+            })
+    });
+    Ok(ThreadSnapshot {
+        thread_id,
+        revision: from_i64(revision)?,
+        sequence: from_i64(sequence)?,
+        lifecycle: parse_lifecycle(&lifecycle)?,
+        binding,
+        latest_run_id,
+        active_run_id,
+        pending,
+        runs,
+        transcript: TranscriptPage {
+            entries,
+            next_after,
+            has_more,
+        },
+    })
+}
+
+/// Loads the newest bounded transcript page for a presentation projection.
+///
+/// `has_more` here means that older cards were deliberately omitted. The
+/// normal forward `thread_snapshot` paging API remains unchanged for durable
+/// history/restart reconstruction. Presentation consumers must render an
+/// explicit truncation notice whenever this returns `has_more`.
+fn thread_transcript_tail(
+    connection: &Connection,
+    thread_id: latte_core::ThreadId,
+    limit: usize,
+) -> Result<TranscriptPage, StorageError> {
+    let bounded_limit = limit.clamp(1, THREAD_PROJECTION_TRANSCRIPT_LIMIT);
+    let mut newest_first = connection
+        .prepare(
+            "SELECT entry_json FROM thread_transcript_v2 WHERE thread_id=?1 ORDER BY seq DESC LIMIT ?2",
+        )?
+        .query_map(
+            params![
+                thread_id.to_string(),
+                i64::try_from(bounded_limit + 1)
+                    .map_err(|_| StorageError::InvalidData("page limit overflow".into()))?
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(|json| serde_json::from_str(&json).map_err(invalid_json))
+        })
+        .collect::<Result<Vec<TranscriptEntry>, StorageError>>()?;
+    let has_more = newest_first.len() > bounded_limit;
+    newest_first.truncate(bounded_limit);
+    newest_first.reverse();
+    let next_after = newest_first.last().map(|entry| entry.sequence);
+    Ok(TranscriptPage {
+        entries: newest_first,
+        next_after,
+        has_more,
+    })
+}
+
+fn append_linked_run_transition(
+    tx: &rusqlite::Transaction<'_>,
+    current: &RunState,
+    next: &RunState,
+    run_last_seq: u64,
+    lease: &Lease,
+    now_ms: u64,
+) -> Result<(), StorageError> {
+    if next.revision <= current.revision {
+        return Err(StorageError::InvalidData(
+            "linked run transition did not advance".into(),
+        ));
+    }
+    // Cancellation is intentionally represented as the two v1 transitions so
+    // a v1 reader never observes a revision jump without its cancelling event.
+    let mut states = Vec::new();
+    if next.revision == current.revision + 2 && next.status == RunStatus::Interrupted {
+        states.push(
+            current
+                .transition(current.revision, Transition::Cancel)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?,
+        );
+    }
+    states.push(next.clone());
+    let mut last_seq = run_last_seq;
+    for state in states {
+        last_seq = last_seq
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("run event sequence overflow".into()))?;
+        let event = if let Some(handoff) = state.handoff.clone() {
+            RuntimeEvent::HandoffProduced { handoff }
+        } else {
+            RuntimeEvent::StateChanged {
+                status: state.status,
+            }
+        };
+        let envelope = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: EventId::from_uuid(Uuid::now_v7()),
+            run_id: state.run_id,
+            revision: state.revision,
+            event,
+        };
+        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![state.run_id.to_string(),to_i64(last_seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE runs SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE run_id=?7 AND revision<?3",params![serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(last_seq)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,state.run_id.to_string()])?;
+        tx.execute(
+            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            params![
+                to_i64(state.revision)?,
+                to_i64(last_seq)?,
+                serde_json::to_string(&state).map_err(invalid_json)?,
+                state.run_id.to_string()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Performs the v2 half of stale-run recovery inside the same immediate
+/// transaction as the v1 interruption.  `expected_lease_token` is a stale
+/// fencing token, not authority to mutate: it is used only to prove that this
+/// active row and run still belong to the caller/restart being recovered.
+#[allow(clippy::too_many_lines)]
+fn recover_linked_thread_run(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: latte_core::ThreadId,
+    run_id: RunId,
+    expected_lease_token: u64,
+    expected_run_revision: Option<u64>,
+    now_ms: u64,
+) -> Result<Option<ThreadCommitResponse>, StorageError> {
+    let active: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT run_id,lease_token FROM thread_active_runs_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((active_run_id, active_token)) = active else {
+        return Ok(None);
+    };
+    if active_run_id != run_id.to_string() || from_i64(active_token)? != expected_lease_token {
+        return Ok(None);
+    }
+    let (state_json, run_last_seq, run_token): (String, i64, i64) = tx.query_row(
+        "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if from_i64(run_token)? != expected_lease_token {
+        return Ok(None);
+    }
+    let current: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+    if expected_run_revision.is_some_and(|expected| expected != current.revision)
+        || matches!(
+            current.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+        )
+    {
+        return Ok(None);
+    }
+    let (thread_revision, thread_last_seq): (i64, i64) = tx
+        .query_row(
+            "SELECT revision,last_seq FROM threads_v2 WHERE thread_id=?1",
+            [thread_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(StorageError::ThreadNotFound(thread_id))?;
+
+    let started_effect_ids = {
+        let mut statement = tx.prepare(
+            "SELECT effect_id FROM effects WHERE run_id=?1 AND status='started' ORDER BY rowid ASC",
+        )?;
+        statement
+            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let prepared_effect_ids = {
+        let mut statement = tx.prepare(
+            "SELECT effect_id FROM effects WHERE run_id=?1 AND status='prepared' ORDER BY rowid ASC",
+        )?;
+        statement
+            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    // A Prepared record has not crossed the external-effect boundary.  It is
+    // terminalized as a non-execution, never labelled Unknown.  Started is
+    // the sole proof that an external outcome may exist, so every such effect
+    // becomes Unknown before the active child is cleared.
+    tx.execute(
+        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE run_id=?2 AND consumed_at_ms IS NULL",
+        params![to_i64(now_ms)?, run_id.to_string()],
+    )?;
+    tx.execute(
+        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"recovery":"not_started"}',observed_at_ms=?1 WHERE run_id=?2 AND status='prepared'"#,
+        params![to_i64(now_ms)?, run_id.to_string()],
+    )?;
+    tx.execute(
+        r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"lease_lost_after_start"}',observed_at_ms=?1 WHERE run_id=?2 AND status='started'"#,
+        params![to_i64(now_ms)?, run_id.to_string()],
+    )?;
+
+    // Keep the checkpoint intact: it is the only restart evidence we may
+    // retain without asserting an effect outcome.  The v1 interruption is
+    // deliberately one event/revision, matching the legacy recovery path.
+    let mut interrupted = current.clone();
+    interrupted.status = RunStatus::Interrupted;
+    interrupted.revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| StorageError::InvalidData("revision overflow during recovery".into()))?;
+    interrupted.pending_input = None;
+    interrupted.pending_permission = None;
+    let stale_fence = Lease {
+        owner: "recovery".into(),
+        fencing_token: expected_lease_token,
+        expires_at_ms: 0,
+    };
+    append_linked_run_transition(
+        tx,
+        &current,
+        &interrupted,
+        from_i64(run_last_seq)?,
+        &stale_fence,
+        now_ms,
+    )?;
+    tx.execute(
+        "UPDATE thread_runs_v2 SET completed_at_ms=?1 WHERE thread_id=?2 AND run_id=?3",
+        params![to_i64(now_ms)?, thread_id.to_string(), run_id.to_string()],
+    )?;
+    tx.execute(
+        "DELETE FROM thread_active_runs_v2 WHERE thread_id=?1 AND run_id=?2 AND lease_token=?3",
+        params![
+            thread_id.to_string(),
+            run_id.to_string(),
+            to_i64(expected_lease_token)?
+        ],
+    )?;
+
+    let next_thread_revision = from_i64(thread_revision)?.checked_add(1).ok_or_else(|| {
+        StorageError::InvalidData("thread revision overflow during recovery".into())
+    })?;
+    let mut next_sequence = from_i64(thread_last_seq)?;
+    let lifecycle = if started_effect_ids.is_empty() {
+        "interrupted"
+    } else {
+        "reconciliation_required"
+    };
+
+    let mut append_card = |kind: TranscriptKind,
+                           text: String,
+                           payload: Option<serde_json::Value>,
+                           source_key: String|
+     -> Result<(), StorageError> {
+        next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+            StorageError::InvalidData("thread sequence overflow during recovery".into())
+        })?;
+        let entry = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: next_sequence,
+            run_id: Some(run_id),
+            kind,
+            text: redact_thread_text(&text),
+            payload: payload.map(redact_thread_value),
+            source_key,
+            created_at_ms: now_ms,
+        };
+        tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        let envelope = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+            thread_id,
+            revision: next_thread_revision,
+            sequence: next_sequence,
+            event: ThreadEvent::TranscriptAppended { entry },
+        };
+        tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![thread_id.to_string(),to_i64(next_sequence)?,envelope.event_id.to_string(),to_i64(next_thread_revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        Ok(())
+    };
+    append_card(
+        TranscriptKind::System,
+        "lease authority lost; linked run interrupted".into(),
+        Some(serde_json::json!({"recovery":"lease_lost"})),
+        format!("recovery:{run_id}:{}:interrupted", current.revision),
+    )?;
+    for (ordinal, effect_id) in started_effect_ids.iter().enumerate() {
+        append_card(
+            TranscriptKind::Failure,
+            "effect outcome unknown; reconciliation required".into(),
+            Some(serde_json::json!({
+                "effect_id": redact_thread_text(effect_id),
+                "status":"unknown"
+            })),
+            format!("recovery:{run_id}:{}:unknown:{ordinal}", current.revision),
+        )?;
+    }
+    for (ordinal, effect_id) in prepared_effect_ids.iter().enumerate() {
+        append_card(
+            TranscriptKind::Failure,
+            "prepared effect terminalized before external execution".into(),
+            Some(serde_json::json!({
+                "effect_id": redact_thread_text(effect_id),
+                "status":"not_started"
+            })),
+            format!("recovery:{run_id}:{}:prepared:{ordinal}", current.revision),
+        )?;
+    }
+    next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
+        StorageError::InvalidData("thread sequence overflow during recovery".into())
+    })?;
+    let final_event = if let Some(effect_id) = started_effect_ids.first() {
+        ThreadEvent::ReconciliationRequired {
+            run_id,
+            effect_id: redact_thread_text(effect_id),
+        }
+    } else {
+        ThreadEvent::LifecycleChanged {
+            lifecycle: ThreadLifecycle::Interrupted,
+            run_id: Some(run_id),
+        }
+    };
+    let envelope = ThreadEventEnvelope {
+        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+        event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+        thread_id,
+        revision: next_thread_revision,
+        sequence: next_sequence,
+        event: final_event,
+    };
+    tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![thread_id.to_string(),to_i64(next_sequence)?,envelope.event_id.to_string(),to_i64(next_thread_revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+    tx.execute(
+        "UPDATE threads_v2 SET revision=?1,last_seq=?2,lifecycle=?3,latest_run_id=?4,updated_at_ms=?5 WHERE thread_id=?6",
+        params![
+            to_i64(next_thread_revision)?,
+            to_i64(next_sequence)?,
+            lifecycle,
+            run_id.to_string(),
+            to_i64(now_ms)?,
+            thread_id.to_string()
+        ],
+    )?;
+    let snapshot = thread_snapshot(tx, thread_id, None, 100)?;
+    Ok(Some(ThreadCommitResponse {
+        snapshot,
+        thread_event: StoredThreadEvent {
+            sequence: next_sequence,
+            envelope,
+        },
+    }))
+}
+
+fn redact_permission(value: &latte_core::PendingPermission) -> latte_core::PendingPermission {
+    latte_core::PendingPermission {
+        request_id: redact_thread_text(&value.request_id),
+        operation_digest: redact_thread_text(&value.operation_digest),
+        description: redact_thread_text(&value.description),
+    }
+}
+fn redact_input(value: &latte_core::PendingInput) -> latte_core::PendingInput {
+    latte_core::PendingInput {
+        request_id: redact_thread_text(&value.request_id),
+        prompt: redact_thread_text(&value.prompt),
+    }
+}
+fn redact_failure(value: &RunFailure) -> RunFailure {
+    RunFailure {
+        code: value.code,
+        message: redact_thread_text(&value.message),
+        retryability: value.retryability,
+    }
+}
+fn redact_handoff(value: &Handoff) -> Handoff {
+    Handoff {
+        summary: redact_thread_text(&value.summary),
+        files_changed: value
+            .files_changed
+            .iter()
+            .map(|path| redact_thread_text(path))
+            .collect(),
+        evidence: value
+            .evidence
+            .iter()
+            .map(|evidence| Evidence {
+                name: redact_thread_text(&evidence.name),
+                status: evidence.status,
+                summary: redact_thread_text(&evidence.summary),
+            })
+            .collect(),
+    }
+}
+
+fn validate_thread_source(source: &str) -> Result<(), StorageError> {
+    if source.is_empty() || source.len() > 256 || source.chars().any(char::is_control) {
+        return Err(StorageError::InvalidData(
+            "invalid thread source key".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn thread_command_digest(request: &ThreadCommitRequest) -> Result<String, StorageError> {
+    use sha2::{Digest, Sha256};
+    let update = match &request.update {
+        CommitThreadRunUpdate::Start { source_key } => {
+            serde_json::json!({"kind":"start","source_key":redact_thread_text(source_key)})
+        }
+        CommitThreadRunUpdate::AppendTranscript {
+            source_key,
+            kind,
+            text,
+            payload,
+        } => {
+            serde_json::json!({"kind":"append_transcript","source_key":redact_thread_text(source_key),"card":format!("{kind:?}"),"text":redact_thread_text(text),"payload":payload.clone().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::PrepareEffect {
+            source_key,
+            effect_id,
+            operation_digest,
+            descriptor_json,
+            canonical_descriptor_json: _,
+            policy,
+            description,
+            checkpoint_json,
+        } => {
+            serde_json::json!({"kind":"prepare_effect","source_key":redact_thread_text(source_key),"effect_id":redact_thread_text(effect_id),"operation_digest":redact_thread_text(operation_digest),"descriptor":serde_json::from_str::<serde_json::Value>(descriptor_json).ok().map(redact_thread_value),"policy":match policy { ThreadEffectPolicy::Allow=>"allow", ThreadEffectPolicy::Ask=>"ask"},"description":redact_thread_text(description),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::StartEffect {
+            source_key,
+            effect_id,
+            operation_digest,
+            checkpoint_json,
+        } => {
+            serde_json::json!({"kind":"start_effect","source_key":redact_thread_text(source_key),"effect_id":redact_thread_text(effect_id),"operation_digest":redact_thread_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::ObserveEffect {
+            source_key,
+            effect_id,
+            operation_digest,
+            success,
+            result,
+            payload,
+            checkpoint_json,
+        } => {
+            serde_json::json!({"kind":"observe_effect","source_key":redact_thread_text(source_key),"effect_id":redact_thread_text(effect_id),"operation_digest":redact_thread_text(operation_digest),"success":success,"result":redact_thread_text(result),"payload":payload.clone().map(redact_thread_value),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::UnknownEffect {
+            source_key,
+            effect_id,
+            operation_digest,
+            checkpoint_json,
+        } => {
+            serde_json::json!({"kind":"unknown_effect","source_key":redact_thread_text(source_key),"effect_id":redact_thread_text(effect_id),"operation_digest":redact_thread_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::ReconcileUnknownEffect {
+            source_key,
+            effect_id,
+            checkpoint_json,
+        } => {
+            serde_json::json!({"kind":"reconcile_unknown_effect","source_key":redact_thread_text(source_key),"effect_id":redact_thread_text(effect_id),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_thread_value)})
+        }
+        CommitThreadRunUpdate::RequestPermission {
+            source_key,
+            request,
+        } => {
+            serde_json::json!({"kind":"request_permission","source_key":redact_thread_text(source_key),"request":redact_permission(request)})
+        }
+        CommitThreadRunUpdate::ResolvePermission {
+            source_key,
+            request_id,
+            allow,
+        } => {
+            serde_json::json!({"kind":"resolve_permission","source_key":redact_thread_text(source_key),"request_id":redact_thread_text(request_id),"allow":allow})
+        }
+        CommitThreadRunUpdate::RequestInput {
+            source_key,
+            request,
+        } => {
+            serde_json::json!({"kind":"request_input","source_key":redact_thread_text(source_key),"request":redact_input(request)})
+        }
+        CommitThreadRunUpdate::ProvideInput {
+            source_key,
+            request_id,
+            value,
+        } => {
+            serde_json::json!({"kind":"provide_input","source_key":redact_thread_text(source_key),"request_id":redact_thread_text(request_id),"value":redact_thread_text(value)})
+        }
+        CommitThreadRunUpdate::Complete {
+            source_key,
+            handoff,
+        } => {
+            serde_json::json!({"kind":"complete","source_key":redact_thread_text(source_key),"handoff":redact_handoff(handoff)})
+        }
+        CommitThreadRunUpdate::CompleteVerified {
+            source_key,
+            summary,
+            verification_effect_id,
+            verified_manifest_digest,
+            files_changed,
+        } => {
+            serde_json::json!({"kind":"complete_verified","source_key":redact_thread_text(source_key),"summary":redact_thread_text(summary),"verification_effect_id":redact_thread_text(verification_effect_id),"verified_manifest_digest":redact_thread_text(verified_manifest_digest),"files_changed":files_changed.iter().map(|path|redact_thread_text(path)).collect::<Vec<_>>()})
+        }
+        CommitThreadRunUpdate::Fail {
+            source_key,
+            failure,
+        } => {
+            serde_json::json!({"kind":"fail","source_key":redact_thread_text(source_key),"failure":redact_failure(failure)})
+        }
+        CommitThreadRunUpdate::Interrupt {
+            source_key,
+            reconciliation_effect_id,
+        } => {
+            serde_json::json!({"kind":"interrupt","source_key":redact_thread_text(source_key),"effect_id":reconciliation_effect_id.as_deref().map(redact_thread_text)})
+        }
+    };
+    let canonical = serde_json::json!({
+        "thread_id":request.thread_id.to_string(), "command_id":request.command_id.to_string(), "run_id":request.run_id.to_string(),
+        "expected_thread_revision":request.expected_thread_revision, "expected_run_revision":request.expected_run_revision,
+        "request_id":request.request_id.as_deref().map(redact_thread_text), "effect_id":request.effect_id.as_deref().map(redact_thread_text), "update":update
+    });
+    let bytes = serde_json::to_vec(&canonical).map_err(invalid_json)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_thread_effect_id(value: &str) -> Result<(), StorageError> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(StorageError::InvalidData("invalid thread effect id".into()));
+    }
+    Ok(())
+}
+
+fn validate_thread_digest(value: &str) -> Result<(), StorageError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StorageError::InvalidData(
+            "invalid thread effect operation digest".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1976,6 +4199,36 @@ mod tests {
     }
 
     #[test]
+    fn v7_database_upgrades_to_private_canonical_descriptor_boundary() {
+        let (_dir, path) = db();
+        drop(Storage::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE thread_effect_canonical_v2; \
+                 DELETE FROM schema_migrations WHERE version=8; \
+                 PRAGMA user_version=7;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(Storage::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let descriptor_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_effect_canonical_v2')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 8);
+        assert!(descriptor_table);
+    }
+
+    #[test]
     fn required_connection_pragmas_are_active() {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
@@ -1996,5 +4249,189 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert_eq!(synchronous, 2);
         assert_eq!(timeout, 5_000);
+    }
+
+    #[test]
+    fn v2_thread_child_is_fenced_idempotent_and_parent_is_immutable() {
+        use latte_core::{ThreadCommandId, ThreadId, ThreadProviderBindingV2};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread = ThreadId::from_uuid(ids.next_uuid_v7());
+        let first = RunId::from_uuid(ids.next_uuid_v7());
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let initial = store
+            .create_thread_v2(
+                thread,
+                first,
+                &binding,
+                "hello sk-this-is-a-secret-123456789",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(initial.lifecycle, ThreadLifecycle::Running);
+        assert!(!initial.transcript.entries[0].text.contains("sk-this"));
+        assert!(store.is_thread_linked_run(first).unwrap());
+        let lease = store.acquire_lease("thread", 2, 100).unwrap();
+        let start = ThreadCommitRequest {
+            thread_id: thread,
+            run_id: first,
+            expected_thread_revision: 0,
+            expected_run_revision: 0,
+            command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitThreadRunUpdate::Start {
+                source_key: "start".into(),
+            },
+        };
+        let started = store.commit_thread_run_update(&start, &lease, 3).unwrap();
+        assert_eq!(started.snapshot.runs[0].run_revision, 1);
+        let replay = store.commit_thread_run_update(&start, &lease, 4).unwrap();
+        assert_eq!(replay, started);
+        let changed = ThreadCommitRequest {
+            update: CommitThreadRunUpdate::AppendTranscript {
+                source_key: "other".into(),
+                kind: TranscriptKind::Assistant,
+                text: "different".into(),
+                payload: None,
+            },
+            ..start.clone()
+        };
+        assert!(matches!(
+            store.commit_thread_run_update(&changed, &lease, 5),
+            Err(StorageError::ThreadCommandReplayMismatch)
+        ));
+        let completed = ThreadCommitRequest {
+            thread_id: thread,
+            run_id: first,
+            expected_thread_revision: 1,
+            expected_run_revision: 1,
+            command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitThreadRunUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec![],
+                    evidence: vec![],
+                },
+            },
+        };
+        let completed = store
+            .commit_thread_run_update(&completed, &lease, 6)
+            .unwrap();
+        assert_eq!(completed.snapshot.lifecycle, ThreadLifecycle::Ready);
+        let parent = store.load_run(first).unwrap();
+        assert_eq!(parent.status, RunStatus::Completed);
+        let child = RunId::from_uuid(ids.next_uuid_v7());
+        let followup = store
+            .create_thread_follow_up_v2(
+                thread,
+                child,
+                completed.snapshot.revision,
+                "next",
+                &std::collections::BTreeMap::new(),
+                7,
+            )
+            .unwrap();
+        assert_eq!(followup.runs.len(), 2);
+        assert_eq!(followup.runs[1].parent_run_id, Some(first));
+        assert_eq!(store.load_run(first).unwrap(), parent);
+    }
+
+    #[test]
+    fn v2_session_projection_uses_current_tail_and_marks_bounded_history() {
+        use latte_core::{ThreadId, ThreadProviderBindingV2};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &binding,
+                "oldest prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+
+        // Insert enough durable cards to exceed the presentation bound. This
+        // models a long lived conversation without using private UI state.
+        let conn = store.connection.lock().unwrap();
+        for sequence in 2..=502_u64 {
+            let entry = TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+                sequence,
+                run_id: Some(run_id),
+                kind: TranscriptKind::Assistant,
+                text: format!("card-{sequence}"),
+                payload: None,
+                source_key: format!("fixture:{sequence}"),
+                created_at_ms: sequence,
+            };
+            conn.execute(
+                "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
+                params![
+                    thread_id.to_string(),
+                    to_i64(sequence).unwrap(),
+                    entry.entry_id.to_string(),
+                    run_id.to_string(),
+                    entry.source_key,
+                    serde_json::to_string(&entry).unwrap(),
+                    to_i64(sequence).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE threads_v2 SET last_seq=502,updated_at_ms=502 WHERE thread_id=?1",
+            [thread_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = store.list_threads_v2().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let transcript = &sessions[0].transcript;
+        assert_eq!(transcript.entries.len(), THREAD_PROJECTION_TRANSCRIPT_LIMIT);
+        assert!(transcript.has_more, "the bounded tail must be explicit");
+        assert_eq!(transcript.entries.first().unwrap().sequence, 3);
+        assert_eq!(transcript.entries.last().unwrap().text, "card-502");
+        assert!(
+            transcript
+                .entries
+                .iter()
+                .all(|entry| entry.text != "oldest prompt"),
+            "a truncated current view must not misleadingly start at the oldest card"
+        );
     }
 }

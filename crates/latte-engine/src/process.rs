@@ -1,6 +1,10 @@
-use crate::{EngineHandle, Lease};
+use crate::{
+    EngineHandle, Lease, ThreadEffectDescriptor, ThreadEffectExecutionError,
+    ThreadEffectObservedValue,
+};
 use latte_core::RunId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -167,7 +171,7 @@ struct Binding<'a> {
     lease_token: u64,
     version: u32,
 }
-fn digest(i: &ProcessInvocation<'_>) -> String {
+pub(crate) fn digest(i: &ProcessInvocation<'_>) -> String {
     let b = Binding {
         argv: i.argv,
         shell: i.shell,
@@ -190,6 +194,178 @@ fn digest(i: &ProcessInvocation<'_>) -> String {
     )
 }
 
+/// Owned process fields reconstructed from a redacted durable v2 descriptor.
+/// They are converted to the borrowed legacy supervisor invocation only after
+/// the Started transaction has committed.
+#[derive(Clone, Debug)]
+pub(crate) struct ThreadProcessSpec {
+    pub argv: Vec<String>,
+    pub shell: Option<String>,
+    pub cwd: String,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub grace_ms: u64,
+    pub stdout_cap: usize,
+    pub stderr_cap: usize,
+}
+
+impl ThreadProcessSpec {
+    pub(crate) fn from_input(input: &Value) -> Result<Self, ProcessError> {
+        let object = input
+            .as_object()
+            .ok_or_else(|| ProcessError::Invalid("process input must be an object".into()))?;
+        let argv = object
+            .get("argv")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| ProcessError::Invalid("argv must be an array".into()))?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            ProcessError::Invalid("argv entries must be strings".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let shell = object
+            .get("shell")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| ProcessError::Invalid("shell must be a string".into()))
+            })
+            .transpose()?;
+        let cwd = object
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or(".")
+            .to_owned();
+        let env = object
+            .get("env")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| ProcessError::Invalid(format!("invalid env: {error}")))?
+            .unwrap_or_default();
+        let number = |key: &str, default: u64, maximum: u64| -> Result<u64, ProcessError> {
+            let value = object.get(key).map_or(Ok(default), |value| {
+                value.as_u64().ok_or_else(|| {
+                    ProcessError::Invalid(format!("{key} must be an unsigned integer"))
+                })
+            })?;
+            if value == 0 || value > maximum {
+                return Err(ProcessError::Invalid(format!("{key} is out of range")));
+            }
+            Ok(value)
+        };
+        let timeout_ms = number("timeout_ms", 30_000, 600_000)?;
+        let grace_ms = object.get("grace_ms").map_or(Ok(250), |value| {
+            value
+                .as_u64()
+                .ok_or_else(|| ProcessError::Invalid("grace_ms must be an unsigned integer".into()))
+        })?;
+        if grace_ms > 30_000 {
+            return Err(ProcessError::Invalid("grace_ms is out of range".into()));
+        }
+        let stdout_cap = usize::try_from(number("stdout_cap", 64 * 1024, 1_048_576)?)
+            .map_err(|_| ProcessError::Invalid("stdout_cap overflows usize".into()))?;
+        let stderr_cap = usize::try_from(number("stderr_cap", 64 * 1024, 1_048_576)?)
+            .map_err(|_| ProcessError::Invalid("stderr_cap overflows usize".into()))?;
+        if argv.is_empty() == shell.is_none() {
+            return Err(ProcessError::Invalid(
+                "provide exactly one of argv or shell".into(),
+            ));
+        }
+        Ok(Self {
+            argv,
+            shell,
+            cwd,
+            env,
+            timeout_ms,
+            grace_ms,
+            stdout_cap,
+            stderr_cap,
+        })
+    }
+    pub(crate) fn invocation<'a>(
+        &'a self,
+        run_revision: u64,
+        descriptor: &'a ThreadEffectDescriptor,
+        lease: &'a Lease,
+    ) -> ProcessInvocation<'a> {
+        ProcessInvocation {
+            argv: &self.argv,
+            shell: self.shell.as_deref(),
+            cwd: &self.cwd,
+            env: &self.env,
+            timeout_ms: self.timeout_ms,
+            grace_ms: self.grace_ms,
+            stdout_cap: self.stdout_cap,
+            stderr_cap: self.stderr_cap,
+            run_revision,
+            effect_id: &descriptor.effect_id,
+            attempt: descriptor.attempt,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        }
+    }
+}
+
+impl EngineHandle {
+    pub(crate) async fn execute_started_thread_process(
+        &self,
+        descriptor: &ThreadEffectDescriptor,
+        run_revision: u64,
+        lease: &Lease,
+        cancellation: &CancellationToken,
+    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+        if !self.process_supervision_supported {
+            return Err(ThreadEffectExecutionError::Certified(
+                ProcessError::Unsupported.to_string(),
+            ));
+        }
+        let spec = ThreadProcessSpec::from_input(&descriptor.input)
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        let invocation = spec.invocation(run_revision, descriptor, lease);
+        let cwd = self
+            .tools
+            .resolve_cwd(&spec.cwd)
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        let _operation = std::sync::Arc::clone(&self.operation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| ThreadEffectExecutionError::Uncertain("operation gate closed".into()))?;
+        match supervise(
+            &invocation,
+            &cwd,
+            cancellation,
+            self.process_group_probe_override,
+        )
+        .await
+        {
+            Ok(output) if output.termination == ProcessTermination::Cancelled => {
+                Err(ThreadEffectExecutionError::Uncertain(
+                    "process cancelled after its external outcome may have happened".into(),
+                ))
+            }
+            Ok(output) => Ok(ThreadEffectObservedValue {
+                result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
+                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                    "tool_call_id":descriptor.tool_call_id,
+                    "name":descriptor.name,
+                    "output":output,
+                }))),
+                success: true,
+            }),
+            Err(error) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
+        }
+    }
+}
+
 impl EngineHandle {
     /// Executes and durably records an actual verification process outcome.
     pub async fn execute_verification(
@@ -201,6 +377,8 @@ impl EngineHandle {
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
@@ -252,6 +430,8 @@ impl EngineHandle {
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
     ) -> Result<String, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         if classify(invocation) != ProcessDecision::Ask {
             return Err(ProcessError::Invalid(
                 "only ask operations can be reissued".into(),
@@ -299,6 +479,8 @@ impl EngineHandle {
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await

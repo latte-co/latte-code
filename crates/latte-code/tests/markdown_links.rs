@@ -8,7 +8,7 @@ fn local_markdown_links_resolve() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("lattecode crate must be inside the workspace")
+        .expect("latte-code crate must be inside the workspace")
         .to_path_buf();
     let mut markdown = vec![root.join("README.md"), root.join("AGENTS.md")];
     collect_markdown(&root.join("docs"), &mut markdown);

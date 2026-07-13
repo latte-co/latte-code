@@ -7,7 +7,11 @@ mod storage;
 mod tools;
 mod workspace;
 
-use latte_core::{EventEnvelope, RunId, RunState, Transition};
+pub(crate) use latte_core::wall_time_ms as wall_now_ms;
+use latte_core::{
+    EventEnvelope, RunId, RunState, ThreadEventEnvelope, ThreadId, ThreadProviderBindingV2,
+    ThreadSnapshot, Transition,
+};
 pub use process::{
     CancellationToken, ProcessDecision, ProcessError, ProcessInvocation, ProcessOutput,
     ProcessTermination, classify,
@@ -17,18 +21,13 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-pub use storage::{EffectStatus, Lease, LeaseLossRecovery, StorageError, StoredEvent};
+pub use storage::{
+    CommitThreadRunUpdate, EffectStatus, Lease, LeaseLossRecovery, StorageError, StoredEvent,
+    StoredThreadEvent, ThreadCommitRequest, ThreadCommitResponse, ThreadEffectPolicy,
+    ThreadLeaseLossRecovery,
+};
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
-pub(crate) fn wall_now_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
 fn manifest_map_digest(
     manifest: &std::collections::BTreeMap<String, String>,
 ) -> Result<String, StorageError> {
@@ -37,10 +36,292 @@ fn manifest_map_digest(
         .map_err(|error| StorageError::InvalidData(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
+
+fn validate_thread_effect_descriptor(
+    descriptor: &ThreadEffectDescriptor,
+) -> Result<(), StorageError> {
+    for value in [&descriptor.effect_id, &descriptor.name] {
+        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(StorageError::InvalidData(
+                "invalid thread effect descriptor identifier".into(),
+            ));
+        }
+    }
+    if !latte_core::valid_openai_chat_tool_call_id(&descriptor.tool_call_id) {
+        return Err(StorageError::InvalidData(
+            "invalid provider tool call identifier".into(),
+        ));
+    }
+    if descriptor.attempt == 0 || !descriptor.input.is_object() {
+        return Err(StorageError::InvalidData(
+            "invalid thread effect descriptor input".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn thread_effect_checkpoint(
+    phase: &str,
+    descriptor: &ThreadEffectDescriptor,
+    operation_digest: &str,
+) -> String {
+    serde_json::json!({
+        "thread_effect": {
+            "phase": phase,
+            "effect_id": latte_core::redact_thread_text(&descriptor.effect_id),
+            "tool_call_id": latte_core::redact_thread_text(&descriptor.tool_call_id),
+            "name": latte_core::redact_thread_text(&descriptor.name),
+            "operation_digest": latte_core::redact_thread_text(operation_digest),
+        }
+    })
+    .to_string()
+}
+
+const PERMISSION_SUMMARY_CAP: usize = 360;
+
+fn summary_text(value: &str) -> String {
+    let sanitized = latte_core::redact_thread_text(value);
+    let mut output = String::with_capacity(sanitized.len().min(PERMISSION_SUMMARY_CAP));
+    for ch in sanitized.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if output.len() + ch.len_utf8() > PERMISSION_SUMMARY_CAP {
+            output.push('…');
+            break;
+        }
+        output.push(ch);
+    }
+    if output.is_empty() {
+        "[unspecified]".into()
+    } else {
+        output
+    }
+}
+
+fn input_string(input: &Value, key: &str, fallback: &str) -> String {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .map_or_else(|| fallback.into(), summary_text)
+}
+
+fn summary_argv(value: &str) -> String {
+    let safe = summary_text(value);
+    let Some((key, _value)) = safe.split_once('=') else {
+        return safe;
+    };
+    let key_lower = key.to_ascii_lowercase();
+    if [
+        "secret",
+        "token",
+        "password",
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| key_lower.contains(needle))
+    {
+        format!("{key}=[REDACTED]")
+    } else {
+        safe
+    }
+}
+
+/// Produces the durable, redacted operation context shown before explicit
+/// approval. It intentionally summarizes content shape rather than rendering
+/// raw content, while preserving enough target/invocation detail for a user
+/// to distinguish the requested operation.
+fn thread_effect_permission_summary(descriptor: &ThreadEffectDescriptor) -> String {
+    let input = &descriptor.input;
+    let summary = match descriptor.name.as_str() {
+        "write_file" => {
+            let path = input_string(input, "path", "[unknown path]");
+            let content_bytes = input
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+            let intent = if input
+                .get("create_intent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "create or replace"
+            } else {
+                "replace existing"
+            };
+            format!("Write {path} ({intent}; {content_bytes} bytes of content)")
+        }
+        "edit_file" => {
+            let path = input_string(input, "path", "[unknown path]");
+            let before = input
+                .get("before")
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+            let after = input
+                .get("after")
+                .and_then(Value::as_str)
+                .map_or(0, str::len);
+            format!("Edit {path} (replace one match; {before} bytes → {after} bytes)")
+        }
+        "process" => {
+            let cwd = input_string(input, "cwd", ".");
+            let argv = input.get("argv").and_then(Value::as_array).map(|argv| {
+                argv.iter()
+                    .filter_map(Value::as_str)
+                    .map(summary_argv)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            match argv.filter(|argv| !argv.is_empty()) {
+                Some(argv) => format!("Run argv: {argv} (cwd: {cwd})"),
+                None => format!("Run shell command (cwd: {cwd})"),
+            }
+        }
+        "read_file" | "list_directory" => {
+            let verb = if descriptor.name == "read_file" {
+                "Read"
+            } else {
+                "List"
+            };
+            format!("{verb} {}", input_string(input, "path", "[unknown path]"))
+        }
+        "search" => format!(
+            "Search workspace for {}",
+            input_string(input, "query", "[unspecified query]")
+        ),
+        _ => format!("Run {} invocation", summary_text(&descriptor.name)),
+    };
+    summary_text(&summary)
+}
+
+fn run_revision(snapshot: &ThreadSnapshot, _effect_id: &str) -> Option<u64> {
+    snapshot.active_run_id.and_then(|run_id| {
+        snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .map(|run| run.run_revision)
+    })
+}
 #[cfg(test)]
 type CompletionHook = Arc<std::sync::Mutex<Option<Arc<dyn Fn(u8) + Send + Sync>>>>;
 type CompletionSnapshot = (String, std::collections::BTreeMap<String, String>);
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 pub use tools::{ToolDescriptor, ToolError, ToolInvocation, ToolOutput};
+
+/// Exact engine-private description of one provider-issued v2 tool call.
+///
+/// This value is accepted at preparation and then retained only in the
+/// engine's private descriptor store. It must never be reconstructed from a
+/// transcript card, checkpoint, event, or provider-history message.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThreadEffectDescriptor {
+    pub effect_id: String,
+    pub tool_call_id: String,
+    pub name: String,
+    pub input: Value,
+    pub attempt: u64,
+}
+
+/// Exact fenced inputs for an engine-owned v2 effect operation.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectRequest {
+    pub thread_id: ThreadId,
+    pub run_id: RunId,
+    pub expected_thread_revision: u64,
+    pub expected_run_revision: u64,
+    pub command_id: latte_core::ThreadCommandId,
+    pub source_key: String,
+    pub descriptor: ThreadEffectDescriptor,
+}
+
+/// Fenced start request for a previously prepared v2 effect. The caller names
+/// the durable effect but cannot supply or alter its executable descriptor.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectStartRequest {
+    pub thread_id: ThreadId,
+    pub run_id: RunId,
+    pub expected_thread_revision: u64,
+    pub expected_run_revision: u64,
+    pub command_id: latte_core::ThreadCommandId,
+    pub source_key: String,
+    pub effect_id: String,
+}
+
+/// Result of preparing an effect. Ask is returned only after a durable
+/// pending permission has been committed.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectPrepared {
+    pub snapshot: ThreadSnapshot,
+    pub policy: ThreadEffectPolicy,
+    pub operation_digest: String,
+}
+
+/// Safe display projection accompanying an engine-started v2 effect. This is
+/// intentionally distinct from the exact descriptor held by `ThreadEffectStarted`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThreadEffectPresentation {
+    pub effect_id: String,
+    pub tool_call_id: String,
+    pub name: String,
+    pub input: Value,
+    pub attempt: u64,
+}
+
+impl ThreadEffectPresentation {
+    fn from_descriptor(descriptor: &ThreadEffectDescriptor) -> Self {
+        Self {
+            effect_id: latte_core::redact_thread_text(&descriptor.effect_id),
+            tool_call_id: latte_core::redact_thread_text(&descriptor.tool_call_id),
+            name: latte_core::redact_thread_text(&descriptor.name),
+            input: latte_core::redact_thread_value(descriptor.input.clone()),
+            attempt: descriptor.attempt,
+        }
+    }
+}
+
+/// Durable authority returned after the Started transaction. Holding this
+/// value does not itself execute anything; callers must explicitly invoke the
+/// engine external execution method. Its exact descriptor is private to the
+/// engine; coordinators receive only `presentation`.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectStarted {
+    pub snapshot: ThreadSnapshot,
+    pub presentation: ThreadEffectPresentation,
+    pub operation_digest: String,
+    descriptor: ThreadEffectDescriptor,
+}
+
+/// Certified result delivered to a provider as a tool message only after the
+/// observation transaction succeeds.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectObserved {
+    pub snapshot: ThreadSnapshot,
+    pub result: String,
+    pub success: bool,
+}
+
+/// Uncommitted external execution output.  It is intentionally not exposed to
+/// a provider until `observe_thread_effect` has committed it.
+#[derive(Clone, Debug)]
+pub struct ThreadEffectObservedValue {
+    pub result: String,
+    pub payload: Option<Value>,
+    pub success: bool,
+}
+
+/// An execution error is deliberately classified before the v2 caller chooses
+/// whether it may write an observed failure or must conservatively write
+/// Unknown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadEffectExecutionError {
+    Certified(String),
+    Uncertain(String),
+}
 
 /// Verifier-produced evidence payload persisted under fenced run authority.
 #[derive(Clone, Copy, Debug)]
@@ -114,8 +395,10 @@ impl EngineBuilder {
             None => storage::Storage::memory()?,
         };
         let (events, _) = broadcast::channel(32);
+        let (thread_events, _) = broadcast::channel(64);
         Ok(EngineHandle {
             events,
+            thread_events,
             storage: Arc::new(storage),
             tools: Arc::new(tools),
             process_supervision_supported: cfg!(unix),
@@ -217,6 +500,7 @@ impl EngineBuilder {
 #[derive(Clone)]
 pub struct EngineHandle {
     events: broadcast::Sender<EventEnvelope>,
+    thread_events: broadcast::Sender<ThreadEventEnvelope>,
     storage: Arc<storage::Storage>,
     tools: Arc<tools::ToolRegistry>,
     process_supervision_supported: bool,
@@ -233,6 +517,13 @@ impl std::fmt::Debug for EngineHandle {
     }
 }
 impl EngineHandle {
+    fn reject_linked_run(&self, run_id: RunId) -> Result<(), StorageError> {
+        if self.storage.is_thread_linked_run(run_id)? {
+            Err(StorageError::LinkedRunRequiresThreadCommit)
+        } else {
+            Ok(())
+        }
+    }
     fn operation_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
         loop {
             if let Ok(permit) = Arc::clone(&self.operation_gate).try_acquire_owned() {
@@ -298,6 +589,8 @@ impl EngineHandle {
         if self.process_supervision_supported {
             tools.push(ToolDescriptor {
                 name: "process".into(),
+                description: "Engine-owned supervised process operation".into(),
+                input_schema: crate::tools::tool_schema("process"),
                 version: 1,
                 effect: "process".into(),
             });
@@ -324,6 +617,8 @@ impl EngineHandle {
         invocation: &ToolInvocation<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let _operation = self.operation_permit();
+        self.reject_linked_run(run_id)
+            .map_err(|error| ToolError::Input(error.to_string()))?;
         if lease.owner != invocation.lease_owner || lease.fencing_token != invocation.lease_token {
             return Err(ToolError::InvalidApproval);
         }
@@ -410,6 +705,8 @@ impl EngineHandle {
         now_ms: u64,
         invocation: &ToolInvocation<'_>,
     ) -> Result<String, ToolError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ToolError::Input(error.to_string()))?;
         let (_prepared, decision, digest) = self.tools.prepare_for_engine(invocation)?;
         if decision != policy::PolicyDecision::Ask {
             return Err(ToolError::Input(
@@ -441,6 +738,650 @@ impl EngineHandle {
             receiver: self.events.subscribe(),
         }
     }
+    /// Subscribes to v2 durable thread events. A lag is a signal to reload a
+    /// snapshot; events are not a second source of truth.
+    #[must_use]
+    pub fn subscribe_threads(&self) -> ThreadSubscription {
+        ThreadSubscription {
+            receiver: self.thread_events.subscribe(),
+        }
+    }
+    /// Creates a durable v2 thread and its initial linked child. This performs
+    /// no provider call or credential resolution.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn create_thread_v2(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        binding: ThreadProviderBindingV2,
+        prompt: &str,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let baseline = self
+            .workspace_manifest()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        self.storage
+            .create_thread_v2(thread_id, run_id, &binding, prompt, &baseline, now_ms)
+    }
+    /// Creates an immutable child run for a ready completed thread.
+    pub fn create_thread_follow_up_v2(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        prompt: &str,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let baseline = self
+            .workspace_manifest()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        self.storage.create_thread_follow_up_v2(
+            thread_id,
+            run_id,
+            expected_thread_revision,
+            prompt,
+            &baseline,
+            now_ms,
+        )
+    }
+    /// Reads one paged thread projection.
+    pub fn thread_snapshot_v2(
+        &self,
+        thread_id: ThreadId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        self.storage.thread_snapshot_v2(thread_id, after, limit)
+    }
+    /// Lists thread sessions with bounded recent transcript cards.
+    pub fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
+        self.storage.list_threads_v2()
+    }
+    /// The only public mutation path for a linked v2 child run.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_thread_run_update(
+        &self,
+        request: ThreadCommitRequest,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        if matches!(&request.update, CommitThreadRunUpdate::Complete { .. }) {
+            // `VerificationNotRequired` is legal only for a child whose
+            // engine-owned baseline still equals a stable current workspace
+            // snapshot.  This keeps the public v2 commit entrypoint from
+            // becoming a bypass around configured verification.
+            let _operation = self.operation_permit();
+            let (_, current_manifest) = self.stable_completion_snapshot()?;
+            if !self
+                .storage
+                .thread_changed_files(request.run_id, &current_manifest)?
+                .is_empty()
+            {
+                return Err(StorageError::InvalidData(
+                    "linked child changed the workspace; use verified completion".into(),
+                ));
+            }
+        }
+        let response = self
+            .storage
+            .commit_thread_run_update(&request, lease, now_ms)?;
+        let _ = self
+            .thread_events
+            .send(response.thread_event.envelope.clone());
+        Ok(response)
+    }
+    /// Returns the exact files changed since this linked v2 child began.
+    /// The comparison is against an engine-owned baseline captured before the
+    /// provider can receive effect authority.
+    pub fn thread_run_changed_files(&self, run_id: RunId) -> Result<Vec<String>, StorageError> {
+        let current = self
+            .workspace_manifest()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        self.storage.thread_changed_files(run_id, &current)
+    }
+    /// Persists the actual configured verification result under the linked
+    /// child's current fenced revision/effect epoch.  This is deliberately
+    /// separate from transcript output: a provider cannot fabricate it.
+    pub fn record_thread_verification(
+        &self,
+        run_id: RunId,
+        expected_revision: u64,
+        effect_id: &str,
+        output: &ProcessOutput,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let (workspace_manifest_digest, _) = self.stable_completion_snapshot()?;
+        let effect_epoch = self.storage.effect_epoch(run_id)?;
+        let summary = serde_json::to_string(output)
+            .map(|value| latte_core::redact_thread_text(&value))
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let metadata = serde_json::to_string(&storage::VerificationRecord {
+            revision: expected_revision,
+            effect_epoch,
+            effect_id: effect_id.to_owned(),
+            passed: output.command_succeeded(),
+            workspace_manifest_digest,
+            summary,
+        })
+        .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        self.storage.record_verification_evidence(
+            run_id,
+            expected_revision,
+            lease,
+            &VerificationEvidence {
+                id: effect_id,
+                metadata_json: &metadata,
+                blob_ref: None,
+            },
+            now_ms,
+        )
+    }
+    /// Atomically transitions a linked v2 child to completed only when its
+    /// current engine-recorded verification evidence matches a stable current
+    /// workspace manifest.
+    pub fn complete_thread_verified(
+        &self,
+        snapshot: &ThreadSnapshot,
+        summary: String,
+        verification_effect_id: String,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let _operation = self.operation_permit();
+        let run_id = snapshot
+            .active_run_id
+            .ok_or(StorageError::ThreadActiveRunMismatch)?;
+        let expected_run_revision = run_revision(snapshot, &verification_effect_id)
+            .ok_or_else(|| StorageError::InvalidData("linked child is missing".into()))?;
+        let (verified_manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
+        let files_changed = self
+            .storage
+            .thread_changed_files(run_id, &current_manifest)?;
+        self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id: snapshot.thread_id,
+                run_id,
+                expected_thread_revision: snapshot.revision,
+                expected_run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
+                request_id: None,
+                effect_id: Some(verification_effect_id.clone()),
+                update: CommitThreadRunUpdate::CompleteVerified {
+                    source_key: format!("{run_id}:complete-verified"),
+                    summary,
+                    verification_effect_id,
+                    verified_manifest_digest,
+                    files_changed,
+                },
+            },
+            lease,
+            now_ms,
+        )
+        .map(|response| response.snapshot)
+    }
+    /// Validates policy and effect preconditions, then durably records a
+    /// prepared v2 descriptor.  It never executes the descriptor.
+    pub fn prepare_thread_effect(
+        &self,
+        request: ThreadEffectRequest,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadEffectPrepared, StorageError> {
+        validate_thread_effect_descriptor(&request.descriptor)?;
+        let (policy, mut operation_digest) = self.thread_effect_policy_and_digest(
+            &request.descriptor,
+            request.expected_run_revision,
+            lease,
+        )?;
+        if policy == ThreadEffectPolicy::Ask {
+            let post_approval_revision = request
+                .expected_run_revision
+                .checked_add(2)
+                .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
+            let (_same_policy, rebound_digest) = self.thread_effect_policy_and_digest(
+                &request.descriptor,
+                post_approval_revision,
+                lease,
+            )?;
+            operation_digest = rebound_digest;
+        }
+        let persisted = ThreadEffectDescriptor {
+            input: latte_core::redact_thread_value(request.descriptor.input.clone()),
+            ..request.descriptor.clone()
+        };
+        let descriptor_json = serde_json::to_string(&persisted)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let canonical_descriptor_json = serde_json::to_string(&request.descriptor)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let checkpoint_json = thread_effect_checkpoint("prepared", &persisted, &operation_digest);
+        let description = thread_effect_permission_summary(&request.descriptor);
+        let response = self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id: request.thread_id,
+                run_id: request.run_id,
+                expected_thread_revision: request.expected_thread_revision,
+                expected_run_revision: request.expected_run_revision,
+                command_id: request.command_id,
+                request_id: None,
+                effect_id: Some(persisted.effect_id.clone()),
+                update: CommitThreadRunUpdate::PrepareEffect {
+                    source_key: request.source_key,
+                    effect_id: persisted.effect_id,
+                    operation_digest: operation_digest.clone(),
+                    descriptor_json,
+                    canonical_descriptor_json,
+                    policy,
+                    description,
+                    checkpoint_json,
+                },
+            },
+            lease,
+            now_ms,
+        )?;
+        Ok(ThreadEffectPrepared {
+            snapshot: response.snapshot,
+            policy,
+            operation_digest,
+        })
+    }
+    /// Atomically consumes a durable ask approval (or the durable allow
+    /// marker) and records Started before returning executable authority.
+    pub fn start_thread_effect(
+        &self,
+        request: ThreadEffectStartRequest,
+        operation_digest: String,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadEffectStarted, StorageError> {
+        let descriptor = self
+            .storage
+            .thread_effect_canonical_descriptor(&request.effect_id, request.run_id)?;
+        validate_thread_effect_descriptor(&descriptor)?;
+        if descriptor.effect_id != request.effect_id {
+            return Err(StorageError::InvalidData(
+                "canonical thread effect identifier mismatch".into(),
+            ));
+        }
+        let (_policy, exact_digest) = self.thread_effect_policy_and_digest(
+            &descriptor,
+            request.expected_run_revision,
+            lease,
+        )?;
+        if exact_digest != operation_digest {
+            return Err(StorageError::InvalidData(
+                "canonical thread effect digest mismatch".into(),
+            ));
+        }
+        let checkpoint_json = thread_effect_checkpoint("started", &descriptor, &operation_digest);
+        let response = self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id: request.thread_id,
+                run_id: request.run_id,
+                expected_thread_revision: request.expected_thread_revision,
+                expected_run_revision: request.expected_run_revision,
+                command_id: request.command_id,
+                request_id: Some(request.effect_id.clone()),
+                effect_id: Some(request.effect_id.clone()),
+                update: CommitThreadRunUpdate::StartEffect {
+                    source_key: request.source_key,
+                    effect_id: request.effect_id,
+                    operation_digest: operation_digest.clone(),
+                    checkpoint_json,
+                },
+            },
+            lease,
+            now_ms,
+        )?;
+        Ok(ThreadEffectStarted {
+            snapshot: response.snapshot,
+            presentation: ThreadEffectPresentation::from_descriptor(&descriptor),
+            operation_digest,
+            descriptor,
+        })
+    }
+    /// Runs a descriptor only after a successful Started transaction.  The
+    /// effect ledger is intentionally not finalized here; observation is a
+    /// separate fenced commit so a crash in between remains Unknown-safe.
+    pub async fn execute_started_thread_effect(
+        &self,
+        started: &ThreadEffectStarted,
+        lease: &Lease,
+        cancellation: &CancellationToken,
+    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+        let descriptor = &started.descriptor;
+        let (_policy, digest) = self
+            .thread_effect_policy_and_digest(
+                descriptor,
+                run_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                    || ThreadEffectExecutionError::Uncertain("started run is missing".into()),
+                )?,
+                lease,
+            )
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        if digest != started.operation_digest {
+            return Err(ThreadEffectExecutionError::Uncertain(
+                "prepared descriptor no longer has the exact operation digest".into(),
+            ));
+        }
+        if descriptor.name == "process" {
+            self.execute_started_thread_process(
+                descriptor,
+                run_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                    || ThreadEffectExecutionError::Uncertain("started run is missing".into()),
+                )?,
+                lease,
+                cancellation,
+            )
+            .await
+        } else {
+            let revision = run_revision(&started.snapshot, descriptor.effect_id.as_str())
+                .ok_or_else(|| {
+                    ThreadEffectExecutionError::Uncertain("started run is missing".into())
+                })?;
+            let engine = self.clone();
+            let descriptor = descriptor.clone();
+            let operation_digest = started.operation_digest.clone();
+            let lease = lease.clone();
+            let cancellation = cancellation.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.execute_started_thread_tool(
+                    &descriptor,
+                    revision,
+                    &operation_digest,
+                    &lease,
+                    &cancellation,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ThreadEffectExecutionError::Uncertain(format!(
+                    "started tool worker terminated before observation: {error}"
+                ))
+            })?
+        }
+    }
+
+    /// Runs a non-process descriptor away from the async lease heartbeat.  A
+    /// filesystem stall must not block the coordinator reactor and silently
+    /// let a Started effect outlive its authority window.
+    fn execute_started_thread_tool(
+        &self,
+        descriptor: &ThreadEffectDescriptor,
+        revision: u64,
+        operation_digest: &str,
+        lease: &Lease,
+        cancellation: &CancellationToken,
+    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+        if cancellation.is_cancelled() {
+            return Err(ThreadEffectExecutionError::Uncertain(
+                "tool cancelled after Started".into(),
+            ));
+        }
+        let invocation = ToolInvocation {
+            name: &descriptor.name,
+            input: &descriptor.input,
+            run_revision: revision,
+            effect_id: &descriptor.effect_id,
+            attempt: descriptor.attempt,
+            precondition: descriptor.input.get("precondition").and_then(Value::as_str),
+            timeout_ms: 30_000,
+            output_cap: 64 * 1024,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        };
+        let (prepared, decision, exact) =
+            self.tools
+                .prepare_for_engine(&invocation)
+                .map_err(|error| {
+                    ThreadEffectExecutionError::Uncertain(format!(
+                        "effect precondition changed: {error}"
+                    ))
+                })?;
+        if exact != operation_digest || decision == policy::PolicyDecision::Deny {
+            return Err(ThreadEffectExecutionError::Uncertain(
+                "effect authorization changed before execution".into(),
+            ));
+        }
+        let _operation = self.operation_permit();
+        match self.tools.execute_prepared(prepared) {
+            Ok(output) => Ok(ThreadEffectObservedValue {
+                result: serde_json::to_string(&output.value).unwrap_or_else(|_| "null".into()),
+                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                    "tool_call_id": descriptor.tool_call_id,
+                    "name": descriptor.name,
+                    "output": output.value,
+                    "truncated": output.truncated,
+                }))),
+                success: true,
+            }),
+            Err(
+                error @ (ToolError::Io(_) | ToolError::Path(_) | ToolError::WorkspaceUnsafe(_)),
+            ) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
+            Err(error) => Ok(ThreadEffectObservedValue {
+                result: serde_json::json!({"error":error.to_string()}).to_string(),
+                payload: Some(serde_json::json!({
+                    "tool_call_id":descriptor.tool_call_id,
+                    "name":descriptor.name,
+                    "error":error.to_string(),
+                })),
+                success: false,
+            }),
+        }
+    }
+    /// Durably observes an already started effect and returns the next
+    /// authoritative thread snapshot.
+    pub fn observe_thread_effect(
+        &self,
+        started: &ThreadEffectStarted,
+        source_key: String,
+        command_id: latte_core::ThreadCommandId,
+        value: ThreadEffectObservedValue,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadEffectObserved, StorageError> {
+        let revision = run_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+            .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
+        let response = self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id: started.snapshot.thread_id,
+                run_id: started
+                    .snapshot
+                    .active_run_id
+                    .ok_or(StorageError::ThreadActiveRunMismatch)?,
+                expected_thread_revision: started.snapshot.revision,
+                expected_run_revision: revision,
+                command_id,
+                request_id: Some(started.descriptor.effect_id.clone()),
+                effect_id: Some(started.descriptor.effect_id.clone()),
+                update: CommitThreadRunUpdate::ObserveEffect {
+                    source_key,
+                    effect_id: started.descriptor.effect_id.clone(),
+                    operation_digest: started.operation_digest.clone(),
+                    success: value.success,
+                    result: value.result.clone(),
+                    payload: value.payload,
+                    checkpoint_json: thread_effect_checkpoint(
+                        if value.success {
+                            "observed_success"
+                        } else {
+                            "observed_failed"
+                        },
+                        &started.descriptor,
+                        &started.operation_digest,
+                    ),
+                },
+            },
+            lease,
+            now_ms,
+        )?;
+        Ok(ThreadEffectObserved {
+            snapshot: response.snapshot,
+            result: value.result,
+            success: value.success,
+        })
+    }
+    /// Maps an uncertain post-Started boundary to Unknown and removes the
+    /// active child through the v2 transaction path.
+    pub fn mark_thread_effect_unknown(
+        &self,
+        started: &ThreadEffectStarted,
+        source_key: String,
+        command_id: latte_core::ThreadCommandId,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let revision = run_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+            .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
+        self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id: started.snapshot.thread_id,
+                run_id: started
+                    .snapshot
+                    .active_run_id
+                    .ok_or(StorageError::ThreadActiveRunMismatch)?,
+                expected_thread_revision: started.snapshot.revision,
+                expected_run_revision: revision,
+                command_id,
+                request_id: Some(started.descriptor.effect_id.clone()),
+                effect_id: Some(started.descriptor.effect_id.clone()),
+                update: CommitThreadRunUpdate::UnknownEffect {
+                    source_key,
+                    effect_id: started.descriptor.effect_id.clone(),
+                    operation_digest: started.operation_digest.clone(),
+                    checkpoint_json: thread_effect_checkpoint(
+                        "unknown",
+                        &started.descriptor,
+                        &started.operation_digest,
+                    ),
+                },
+            },
+            lease,
+            now_ms,
+        )
+        .map(|response| response.snapshot)
+    }
+    /// Explicitly acknowledges an unknown v2 effect and terminalizes the
+    /// linked child without reaching a legacy reconciliation entrypoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_thread_effect_unknown(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        expected_run_revision: u64,
+        effect_id: String,
+        source_key: String,
+        command_id: latte_core::ThreadCommandId,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision,
+                expected_run_revision,
+                command_id,
+                request_id: Some(effect_id.clone()),
+                effect_id: Some(effect_id.clone()),
+                update: CommitThreadRunUpdate::ReconcileUnknownEffect {
+                    source_key,
+                    effect_id,
+                    checkpoint_json: serde_json::json!({"thread_effect":"reconciled_unknown"})
+                        .to_string(),
+                },
+            },
+            lease,
+            now_ms,
+        )
+        .map(|response| response.snapshot)
+    }
+    /// Conservatively recovers a linked v2 child after its lease renewal has
+    /// failed.  The storage transaction updates the legacy run/effects and
+    /// the v2 thread projection together; only the committed final thread
+    /// event is broadcast to connected clients.
+    pub fn recover_thread_after_lease_loss(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        stale: &Lease,
+        expected_run_revision: u64,
+        now_ms: u64,
+    ) -> Result<ThreadLeaseLossRecovery, StorageError> {
+        let result = self.storage.recover_thread_after_lease_loss(
+            thread_id,
+            run_id,
+            stale,
+            expected_run_revision,
+            now_ms,
+        )?;
+        if let ThreadLeaseLossRecovery::Recovered(response) = &result {
+            let _ = self
+                .thread_events
+                .send(response.thread_event.envelope.clone());
+        }
+        Ok(result)
+    }
+    fn thread_effect_policy_and_digest(
+        &self,
+        descriptor: &ThreadEffectDescriptor,
+        run_revision: u64,
+        lease: &Lease,
+    ) -> Result<(ThreadEffectPolicy, String), StorageError> {
+        if descriptor.name == "process" {
+            if !self.process_supervision_supported {
+                return Err(StorageError::InvalidData(
+                    "process supervision is unsupported on this platform".into(),
+                ));
+            }
+            let spec = process::ThreadProcessSpec::from_input(&descriptor.input)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+            self.tools
+                .resolve_cwd(&spec.cwd)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+            let invocation = spec.invocation(run_revision, descriptor, lease);
+            let decision = process::classify(&invocation);
+            let policy = match decision {
+                ProcessDecision::Allow => ThreadEffectPolicy::Allow,
+                ProcessDecision::Ask => ThreadEffectPolicy::Ask,
+                ProcessDecision::Deny => {
+                    return Err(StorageError::InvalidData(
+                        "process policy denied operation".into(),
+                    ));
+                }
+            };
+            return Ok((policy, process::digest(&invocation)));
+        }
+        let invocation = ToolInvocation {
+            name: &descriptor.name,
+            input: &descriptor.input,
+            run_revision,
+            effect_id: &descriptor.effect_id,
+            attempt: descriptor.attempt,
+            precondition: descriptor.input.get("precondition").and_then(Value::as_str),
+            timeout_ms: 30_000,
+            output_cap: 64 * 1024,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        };
+        let (_prepared, decision, digest) = self
+            .tools
+            .prepare_for_engine(&invocation)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let policy = match decision {
+            policy::PolicyDecision::Allow => ThreadEffectPolicy::Allow,
+            policy::PolicyDecision::Ask => ThreadEffectPolicy::Ask,
+            policy::PolicyDecision::Deny => {
+                return Err(StorageError::InvalidData(
+                    "tool policy denied operation".into(),
+                ));
+            }
+        };
+        Ok((policy, digest))
+    }
     /// Persists a new queued run.
     pub fn create_run(&self, run_id: RunId, now_ms: u64) -> Result<RunState, StorageError> {
         let state = RunState::queued(run_id);
@@ -468,6 +1409,7 @@ impl EngineHandle {
         now_ms: u64,
         lease: &Lease,
     ) -> Result<RunState, StorageError> {
+        self.reject_linked_run(run_id)?;
         if matches!(transition, Transition::Complete { .. }) {
             return Err(StorageError::InvalidData(
                 "Complete is engine-owned; use complete_verified_run".into(),
@@ -489,6 +1431,7 @@ impl EngineHandle {
         now_ms: u64,
     ) -> Result<RunState, StorageError> {
         let _operation = self.operation_permit();
+        self.reject_linked_run(run_id)?;
         let (manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
         let (next, stored) = self.storage.complete_verified(
             run_id,
@@ -510,6 +1453,7 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<RunState, StorageError> {
+        self.reject_linked_run(run_id)?;
         let (state, event) =
             self.storage
                 .cancel_waiting(run_id, expected_revision, lease, now_ms, false)?;
@@ -526,6 +1470,7 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<RunState, StorageError> {
+        self.reject_linked_run(run_id)?;
         let (state, event) =
             self.storage
                 .cancel_waiting(run_id, expected_revision, lease, now_ms, true)?;
@@ -560,8 +1505,15 @@ impl EngineHandle {
     pub fn effect_status(&self, effect_id: &str) -> Result<EffectStatus, StorageError> {
         self.storage.effect_status(effect_id)
     }
+    /// Reads the private durable digest for a v2 prepared effect.  The value
+    /// is returned only to the engine-owned thread coordinator so transcript
+    /// redaction never becomes an approval transport.
+    pub fn thread_effect_digest(&self, effect_id: &str) -> Result<String, StorageError> {
+        self.storage.thread_effect_digest(effect_id)
+    }
     /// Lists every unknown effect for a run, including allow-path effects without approval rows.
     pub fn unknown_effects_for_run(&self, run_id: RunId) -> Result<Vec<String>, StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage.unknown_effects_for_run(run_id)
     }
     /// Fences a stale owner and durably interrupts its run after heartbeat loss.
@@ -572,6 +1524,7 @@ impl EngineHandle {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<LeaseLossRecovery, StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage
             .interrupt_after_lease_loss(run_id, stale, expected_revision, now_ms)
     }
@@ -584,6 +1537,7 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<RunState, StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage.reconcile_unknown_and_abort(
             run_id,
             effect_id,
@@ -601,11 +1555,13 @@ impl EngineHandle {
         payload_json: &str,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage
             .put_checkpoint(run_id, expected_revision, lease, payload_json, now_ms)
     }
     /// Loads renderer-neutral agent runtime state.
     pub fn runtime_checkpoint(&self, run_id: RunId) -> Result<Option<String>, StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage.checkpoint(run_id)
     }
     /// Validates a durable permission without consuming it or starting the effect.
@@ -618,6 +1574,7 @@ impl EngineHandle {
         digest: &str,
         now_ms: u64,
     ) -> Result<bool, StorageError> {
+        self.reject_linked_run(run_id)?;
         self.storage
             .permission_matches(effect_id, run_id, expected_revision, lease, digest, now_ms)
     }
@@ -626,6 +1583,33 @@ impl EngineHandle {
 #[derive(Debug)]
 pub struct Subscription {
     receiver: broadcast::Receiver<EventEnvelope>,
+}
+
+/// V2 thread event subscription. It intentionally shares the same lag/closed
+/// semantics as the legacy run stream while carrying only v2 envelopes.
+#[derive(Debug)]
+pub struct ThreadSubscription {
+    receiver: broadcast::Receiver<ThreadEventEnvelope>,
+}
+impl ThreadSubscription {
+    /// Polls without blocking a terminal renderer.
+    pub fn try_recv(&mut self) -> Result<Option<ThreadEventEnvelope>, SubscriptionError> {
+        match self.receiver.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => Err(SubscriptionError::Closed),
+            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                Err(SubscriptionError::Lagged(count))
+            }
+        }
+    }
+    /// Receives the next thread event.
+    pub async fn recv(&mut self) -> Result<ThreadEventEnvelope, SubscriptionError> {
+        self.receiver.recv().await.map_err(|error| match error {
+            broadcast::error::RecvError::Closed => SubscriptionError::Closed,
+            broadcast::error::RecvError::Lagged(count) => SubscriptionError::Lagged(count),
+        })
+    }
 }
 impl Subscription {
     /// Polls an event without blocking the terminal renderer.
@@ -666,6 +1650,43 @@ mod tool_effect_tests {
     use super::*;
     use latte_core::{IdSource, SystemIdSource};
     use serde_json::json;
+
+    #[test]
+    fn permission_summaries_show_operation_context_without_values_or_controls() {
+        let write = ThreadEffectDescriptor {
+            effect_id: "write".into(),
+            tool_call_id: "call-write".into(),
+            name: "write_file".into(),
+            input: json!({
+                "path": "src/generated.rs",
+                "content": "const token=value;\napi_key=live-secret-value",
+                "create_intent": true,
+            }),
+            attempt: 1,
+        };
+        let write_summary = thread_effect_permission_summary(&write);
+        assert!(write_summary.contains("Write src/generated.rs"));
+        assert!(write_summary.contains("create or replace"));
+        assert!(write_summary.contains("bytes of content"));
+        assert!(!write_summary.contains("live-secret-value"));
+        assert!(!write_summary.contains("token=value"));
+
+        let process = ThreadEffectDescriptor {
+            effect_id: "process".into(),
+            tool_call_id: "call-process".into(),
+            name: "process".into(),
+            input: json!({
+                "argv": ["cargo", "test", "--token=live-secret-value"],
+                "cwd": "crates/latte-engine\n\u{1b}[31m",
+            }),
+            attempt: 1,
+        };
+        let process_summary = thread_effect_permission_summary(&process);
+        assert!(process_summary.contains("Run argv: cargo test"));
+        assert!(process_summary.contains("cwd: crates/latte-engine"));
+        assert!(!process_summary.contains("live-secret-value"));
+        assert!(!process_summary.chars().any(char::is_control));
+    }
 
     #[test]
     fn public_api_matrix_is_complete_and_legacy_mutators_are_absent() {

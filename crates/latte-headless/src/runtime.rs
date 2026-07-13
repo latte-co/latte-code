@@ -1,10 +1,14 @@
 use crate::{
     context,
-    provider::{InputRequest, Message, Provider, ProviderError, ToolCall, valid_tool_call_id},
+    provider::{
+        InputRequest, Message, Provider, ProviderContext, ProviderError, ProviderRequest, ToolCall,
+        valid_tool_call_id,
+    },
+    registry::ProviderBinding,
 };
 use latte_core::{
     FailureCode, IdSource, PendingPermission, Retryability, RunFailure, RunId, RunState,
-    RuntimeEvent, SystemIdSource, Transition, VerificationStatus,
+    RuntimeEvent, SystemIdSource, Transition, VerificationStatus, wall_time_ms as now_ms,
 };
 use latte_engine::{
     CancellationToken, EngineHandle, Lease, ProcessDecision, ProcessError, ProcessInvocation,
@@ -35,6 +39,8 @@ pub enum RuntimeError {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Checkpoint {
+    #[serde(default)]
+    binding: Option<ProviderBinding>,
     messages: Vec<Message>,
     pending: Option<PendingCall>,
     #[serde(default)]
@@ -310,9 +316,10 @@ enum PendingPhase {
     Tool,
     Verification,
 }
-pub struct AgentRuntime<P> {
+pub struct AgentRuntime {
     engine: EngineHandle,
-    provider: P,
+    provider: std::sync::Arc<dyn Provider>,
+    binding: ProviderBinding,
     root: PathBuf,
     ids: SystemIdSource,
     cancellation: CancellationToken,
@@ -328,22 +335,71 @@ pub struct VerificationPlan {
     pub stdout_cap: usize,
     pub stderr_cap: usize,
 }
-impl<P: Provider> AgentRuntime<P> {
-    pub fn new(
+impl AgentRuntime {
+    pub fn new<P: Provider>(
         engine: EngineHandle,
         provider: P,
         root: impl AsRef<Path>,
         verification: VerificationPlan,
     ) -> Self {
+        let binding = ProviderBinding::direct(&engine.tool_descriptors());
         Self {
             engine,
-            provider,
+            provider: std::sync::Arc::new(provider),
+            binding,
             root: root.as_ref().to_owned(),
             ids: SystemIdSource::default(),
             cancellation: CancellationToken::new(),
             verification,
             lease_ttl_ms: 60_000,
         }
+    }
+    pub fn from_provider(
+        engine: EngineHandle,
+        provider: std::sync::Arc<dyn Provider>,
+        root: impl AsRef<Path>,
+        verification: VerificationPlan,
+    ) -> Self {
+        let binding = ProviderBinding::direct(&engine.tool_descriptors());
+        Self {
+            engine,
+            provider,
+            binding,
+            root: root.as_ref().to_owned(),
+            ids: SystemIdSource::default(),
+            cancellation: CancellationToken::new(),
+            verification,
+            lease_ttl_ms: 60_000,
+        }
+    }
+    pub fn from_bound_provider(
+        engine: EngineHandle,
+        provider: std::sync::Arc<dyn Provider>,
+        binding: ProviderBinding,
+        root: impl AsRef<Path>,
+        verification: VerificationPlan,
+    ) -> Self {
+        Self {
+            engine,
+            provider,
+            binding,
+            root: root.as_ref().to_owned(),
+            ids: SystemIdSource::default(),
+            cancellation: CancellationToken::new(),
+            verification,
+            lease_ttl_ms: 60_000,
+        }
+    }
+    fn enforce_binding(&self, checkpoint: &Checkpoint) -> Result<(), RuntimeError> {
+        let pinned = checkpoint.binding.as_ref().ok_or_else(|| RuntimeError::CheckpointInvalid(
+            "active checkpoint has no provider binding; legacy/versionless runs cannot be resumed; start a new run".into(),
+        ))?;
+        if pinned != &self.binding {
+            return Err(RuntimeError::CheckpointInvalid(
+                "provider binding changed (provider/type/protocol/model/config/tools); restore the original configuration or start a new run".into(),
+            ));
+        }
+        Ok(())
     }
     #[must_use]
     pub fn with_verification(mut self, plan: VerificationPlan) -> Self {
@@ -416,6 +472,7 @@ impl<P: Provider> AgentRuntime<P> {
         let context = context::build(&self.root, focus, 64 * 1024)
             .map_err(|e| RuntimeError::Engine(e.to_string()))?;
         let checkpoint = Checkpoint {
+            binding: Some(self.binding.clone()),
             messages: vec![
                 Message::System {
                     content: context.text,
@@ -443,6 +500,7 @@ impl<P: Provider> AgentRuntime<P> {
             .ok_or(RuntimeError::NotWaiting)?;
         let checkpoint: Checkpoint =
             serde_json::from_str(&payload).map_err(|e| RuntimeError::Engine(e.to_string()))?;
+        self.enforce_binding(&checkpoint)?;
         let (mut checkpoint, normalized) = match validate_and_normalize(checkpoint, &state)? {
             CheckpointDisposition::Ready {
                 checkpoint,
@@ -677,6 +735,7 @@ impl<P: Provider> AgentRuntime<P> {
             .ok_or(RuntimeError::NotWaiting)?;
         let checkpoint: Checkpoint =
             serde_json::from_str(&payload).map_err(|e| RuntimeError::Engine(e.to_string()))?;
+        self.enforce_binding(&checkpoint)?;
         let (mut checkpoint, normalized) = match validate_and_normalize(checkpoint, &state)? {
             CheckpointDisposition::Ready {
                 checkpoint,
@@ -805,7 +864,25 @@ impl<P: Provider> AgentRuntime<P> {
             self.persist(state.run_id, &checkpoint, lease)?;
             let response = {
                 let tools = self.engine.tool_descriptors();
-                let completion = self.provider.complete(&checkpoint.messages, &tools);
+                let capabilities = self.provider.capabilities();
+                if !tools.is_empty() && !capabilities.tools {
+                    return self.fail(
+                        &state,
+                        "provider does not support tool declarations".into(),
+                        lease,
+                    );
+                }
+                let completion = self.provider.complete(
+                    ProviderRequest {
+                        messages: checkpoint.messages.clone(),
+                        tools,
+                    },
+                    ProviderContext {
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                        cancellation: self.cancellation.clone(),
+                        events: None,
+                    },
+                );
                 tokio::pin!(completion);
                 let heartbeat = tokio::time::sleep(std::time::Duration::from_millis(
                     (self.lease_ttl_ms / 3).max(1),
@@ -831,17 +908,56 @@ impl<P: Provider> AgentRuntime<P> {
                 Ok(value) => value,
                 Err(error) => return self.fail(&state, error.to_string(), lease),
             };
+            if response.provider_state.is_some() {
+                return self.fail(
+                    &state,
+                    "provider state is unsupported by this runtime/provider protocol".into(),
+                    lease,
+                );
+            }
+            let known_tools: std::collections::BTreeSet<_> = self
+                .engine
+                .tool_descriptors()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
             let mut call_ids = std::collections::BTreeSet::new();
-            if response
-                .tool_calls
-                .iter()
-                .any(|call| !valid_tool_call_id(&call.id) || !call_ids.insert(call.id.clone()))
-            {
+            if response.tool_calls.iter().any(|call| {
+                !valid_tool_call_id(&call.id)
+                    || !call_ids.insert(call.id.clone())
+                    || !known_tools.contains(&call.name)
+                    || !call.input.is_object()
+            }) {
                 return self.fail(
                     &state,
                     "provider tool call ids must be nonempty and unique".into(),
                     lease,
                 );
+            }
+            if response.input_request.is_some()
+                && (response.message.is_some() || !response.tool_calls.is_empty())
+            {
+                return self.fail(
+                    &state,
+                    "provider outcome must be either assistant or input-required".into(),
+                    lease,
+                );
+            }
+            if response.input_request.is_some() && !self.provider.capabilities().input_request {
+                return self.fail(
+                    &state,
+                    "provider returned an undeclared input-request capability".into(),
+                    lease,
+                );
+            }
+            if response.input_request.is_none()
+                && response.tool_calls.is_empty()
+                && response
+                    .message
+                    .as_ref()
+                    .is_none_or(|message| message.trim().is_empty())
+            {
+                return self.fail(&state, "provider assistant outcome is empty".into(), lease);
             }
             checkpoint.messages.push(Message::Assistant {
                 content: response.message.clone(),
@@ -1263,18 +1379,47 @@ impl<P: Provider> AgentRuntime<P> {
         if approval.is_none() && classify(&invocation) == ProcessDecision::Ask {
             invocation.run_revision = state.revision.saturating_add(2);
         }
-        match self
-            .engine
-            .execute_verification(
-                run_id,
-                invocation.run_revision,
-                lease,
-                now_ms(),
-                &invocation,
-                &self.cancellation,
-            )
-            .await
-        {
+        // Verification is an engine-owned Started effect just like a provider
+        // tool call.  It may run for much longer than a coordinator lease, so
+        // it must keep the lease alive until its terminal evidence write has
+        // completed.  Without this loop a healthy verification process can
+        // correctly be fenced at its terminal write merely because it ran
+        // past the initial lease window.
+        let execution = self.engine.execute_verification(
+            run_id,
+            invocation.run_revision,
+            lease,
+            now_ms(),
+            &invocation,
+            &self.cancellation,
+        );
+        tokio::pin!(execution);
+        let heartbeat = tokio::time::sleep(std::time::Duration::from_millis(
+            (self.lease_ttl_ms / 3).max(1),
+        ));
+        tokio::pin!(heartbeat);
+        let result = loop {
+            tokio::select! { biased;
+                () = &mut heartbeat => {
+                    if self.engine.renew_lease(lease, now_ms(), self.authority_ttl()).is_err() {
+                        self.cancellation.cancel();
+                        let _ = execution.await;
+                        return Err(self.recover_lease_loss(
+                            run_id,
+                            invocation.run_revision,
+                            lease,
+                            "verification",
+                        ));
+                    }
+                    heartbeat.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_millis((self.lease_ttl_ms / 3).max(1)),
+                    );
+                }
+                output = &mut execution => break output,
+            }
+        };
+        match result {
             Ok(output) => serde_json::to_string(&output).map_err(engine),
             Err(ProcessError::PermissionRequired { digest }) => {
                 Err(RuntimeError::Engine(format!("permission:{digest}")))
@@ -1298,9 +1443,9 @@ impl<P: Provider> AgentRuntime<P> {
             VerificationStatus::Failed
         };
         if status != VerificationStatus::Passed {
-            return self
-                .fail(state, "verification failed".into(), lease)
-                .and_then(|_| Err(RuntimeError::Engine("verification failed".into())));
+            // Persist the terminal failure before returning the verification error to the caller.
+            self.fail(state, "verification failed".into(), lease)?;
+            return Err(RuntimeError::Engine("verification failed".into()));
         }
         let summary = checkpoint.final_message.clone().ok_or_else(|| {
             RuntimeError::Engine("provider final response content was null".into())
@@ -1364,16 +1509,6 @@ impl<P: Provider> AgentRuntime<P> {
 fn engine(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Engine(error.to_string())
 }
-fn now_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1393,6 +1528,7 @@ mod tests {
             input: json!({"path":"a"}),
         };
         let base = Checkpoint {
+            binding: None,
             messages: vec![Message::Assistant {
                 content: None,
                 tool_calls: vec![call.clone()],
@@ -1451,6 +1587,7 @@ mod tests {
         };
         assert!(validate_checkpoint(&bad_assistant).is_err());
         let resolved_crash = Checkpoint {
+            binding: None,
             messages: vec![
                 Message::Assistant {
                     content: None,
@@ -1516,6 +1653,7 @@ mod tests {
             CheckpointDisposition::RequiresUnknown { .. }
         ));
         let final_interrupt = Checkpoint {
+            binding: None,
             messages: vec![],
             pending: None,
             final_message: Some("done".into()),
@@ -1529,6 +1667,7 @@ mod tests {
             CheckpointDisposition::Ready { .. }
         ));
         let interrupted_input = Checkpoint {
+            binding: None,
             messages: vec![],
             pending: None,
             final_message: None,
@@ -1550,6 +1689,7 @@ mod tests {
             CheckpointDisposition::Ready { .. }
         ));
         let interrupted_verification = Checkpoint {
+            binding: None,
             messages: vec![],
             pending: Some(PendingCall {
                 effect_id: "verify-effect".into(),
@@ -1587,6 +1727,7 @@ mod tests {
         });
         assert!(validate_and_normalize(mixed, &waiting).is_err());
         let input_final = Checkpoint {
+            binding: None,
             messages: vec![],
             pending: None,
             final_message: Some("bad".into()),
@@ -1604,6 +1745,7 @@ mod tests {
         input_state.status = latte_core::RunStatus::WaitingInput;
         assert!(validate_and_normalize(input_final, &input_state).is_err());
         let empty = Checkpoint {
+            binding: None,
             messages: vec![],
             pending: None,
             final_message: None,
@@ -1691,6 +1833,7 @@ mod tests {
         });
         assert!(validate_checkpoint(&duplicate_result).is_err());
         let complete = Checkpoint {
+            binding: None,
             messages: vec![
                 Message::System {
                     content: "s".into(),
@@ -1769,12 +1912,14 @@ mod tests {
     async fn final_only_interrupted_resumes_verification_without_provider() {
         struct PanicProvider;
         impl Provider for PanicProvider {
-            async fn complete(
+            fn complete(
                 &self,
-                _: &[Message],
-                _: &[latte_engine::ToolDescriptor],
-            ) -> Result<crate::provider::ProviderResponse, ProviderError> {
-                panic!("provider must not be called for final-only interrupted recovery")
+                _: ProviderRequest,
+                _: ProviderContext,
+            ) -> crate::provider::ProviderFuture<'_> {
+                Box::pin(async {
+                    panic!("provider must not be called for final-only interrupted recovery")
+                })
             }
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1797,6 +1942,7 @@ mod tests {
             .apply_transition(run, cancelling.revision, Transition::Interrupt, 5, &lease)
             .unwrap();
         let checkpoint = Checkpoint {
+            binding: Some(ProviderBinding::direct(&engine.tool_descriptors())),
             messages: vec![],
             pending: None,
             final_message: Some("done".into()),
@@ -1856,6 +2002,7 @@ mod tests {
             .apply_transition(run, cancelling.revision, Transition::Interrupt, 5, &lease)
             .unwrap();
         let checkpoint = Checkpoint {
+            binding: Some(ProviderBinding::direct(&engine.tool_descriptors())),
             messages: vec![],
             pending: None,
             final_message: Some("done".into()),
@@ -1903,6 +2050,7 @@ mod tests {
         let payload = runtime.engine.runtime_checkpoint(run).unwrap().unwrap();
         let mut corrupt: Checkpoint = serde_json::from_str(&payload).unwrap();
         corrupt.final_message = None;
+        corrupt.binding = None;
         drop(runtime);
         let connection = rusqlite::Connection::open(&db).unwrap();
         let before_effects: i64 = connection
@@ -1918,12 +2066,12 @@ mod tests {
         drop(connection);
         struct PanicProvider;
         impl Provider for PanicProvider {
-            async fn complete(
+            fn complete(
                 &self,
-                _: &[Message],
-                _: &[latte_engine::ToolDescriptor],
-            ) -> Result<crate::provider::ProviderResponse, ProviderError> {
-                panic!("provider called for corrupt checkpoint")
+                _: ProviderRequest,
+                _: ProviderContext,
+            ) -> crate::provider::ProviderFuture<'_> {
+                Box::pin(async { panic!("provider called for corrupt checkpoint") })
             }
         }
         let reopened = latte_engine::EngineBuilder::new()
@@ -1944,31 +2092,53 @@ mod tests {
                 stderr_cap: 1024,
             },
         );
-        assert!(matches!(
-            runtime.resume(run, true).await,
-            Err(RuntimeError::CheckpointInvalid(_))
-        ));
+        let error = runtime.resume(run, true).await.unwrap_err();
+        assert!(matches!(error, RuntimeError::CheckpointInvalid(_)));
+        assert!(error.to_string().contains("legacy/versionless"));
         let connection = rusqlite::Connection::open(&db).unwrap();
         let after_effects: i64 = connection
             .query_row("SELECT COUNT(*) FROM effects", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before_effects, after_effects);
+
+        // A bound checkpoint must also fail closed on semantic configuration drift,
+        // before a provider turn or any new effect is recorded.
+        let mut drifted = corrupt;
+        let mut binding = ProviderBinding::direct(&runtime.engine.tool_descriptors());
+        binding.config_fingerprint = "changed-semantic-config".into();
+        drifted.binding = Some(binding);
+        connection
+            .execute(
+                "UPDATE runtime_checkpoints SET payload_json=?1 WHERE run_id=?2",
+                rusqlite::params![serde_json::to_string(&drifted).unwrap(), run.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        let error = runtime.resume(run, true).await.unwrap_err();
+        assert!(matches!(error, RuntimeError::CheckpointInvalid(_)));
+        assert!(error.to_string().contains("provider binding changed"));
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn interrupted_resolved_crash_queue_normalizes_before_single_provider_turn() {
         struct OneProvider(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl Provider for OneProvider {
-            async fn complete(
+            fn complete(
                 &self,
-                _: &[Message],
-                _: &[latte_engine::ToolDescriptor],
-            ) -> Result<crate::provider::ProviderResponse, ProviderError> {
-                assert_eq!(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
-                Ok(crate::provider::ProviderResponse {
-                    message: Some("done".into()),
-                    tool_calls: vec![],
-                    input_request: None,
+                _: ProviderRequest,
+                _: ProviderContext,
+            ) -> crate::provider::ProviderFuture<'_> {
+                Box::pin(async move {
+                    assert_eq!(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                    Ok(crate::provider::ProviderResponse {
+                        message: Some("done".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
                 })
             }
         }
@@ -1998,6 +2168,7 @@ mod tests {
             input: json!({}),
         };
         let checkpoint = Checkpoint {
+            binding: Some(ProviderBinding::direct(&engine.tool_descriptors())),
             messages: vec![
                 Message::Assistant {
                     content: None,
@@ -2067,192 +2238,251 @@ mod tests {
     #[derive(Default)]
     struct StatelessProvider;
     impl Provider for StatelessProvider {
-        async fn complete(
+        fn complete(
             &self,
-            messages: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages.iter().any(|message| message.is_role("tool")) {
-                Ok(ProviderResponse {
-                    message: Some("created fresh.txt".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("create".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "create-1".into(),
-                        name: "write_file".into(),
-                        input: json!({"path":"fresh.txt","content":"durable","create_intent":true}),
-                    }],
-                    input_request: None,
-                })
-            }
+            request: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages.iter().any(|message| message.is_role("tool")) {
+                    Ok(ProviderResponse {
+                        message: Some("created fresh.txt".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: Some("create".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "create-1".into(),
+                            name: "write_file".into(),
+                            input: json!({"path":"fresh.txt","content":"durable","create_intent":true}),
+                        }],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
     struct FinalProvider;
     impl Provider for FinalProvider {
-        async fn complete(
+        fn complete(
             &self,
-            _: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            Ok(ProviderResponse {
-                message: Some("ready to verify".into()),
-                tool_calls: vec![],
-                input_request: None,
+            _: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async {
+                Ok(ProviderResponse {
+                    message: Some("ready to verify".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
             })
         }
     }
     struct EnvProcessProvider;
     impl Provider for EnvProcessProvider {
-        async fn complete(
+        fn complete(
             &self,
-            messages: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages.iter().any(|message| message.is_role("tool")) {
-                Ok(ProviderResponse {
-                    message: Some("env checked".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("check env".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "env-process".into(),
-                        name: "process".into(),
-                        input: json!({"argv":["/usr/bin/env"],"cwd":".","env":{"LATTE_EXACT":"bound"},"timeout_ms":1234,"grace_ms":111,"stdout_cap":4096,"stderr_cap":2048}),
-                    }],
-                    input_request: None,
-                })
-            }
+            request: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages.iter().any(|message| message.is_role("tool")) {
+                    Ok(ProviderResponse {
+                        message: Some("env checked".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: Some("check env".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "env-process".into(),
+                            name: "process".into(),
+                            input: json!({"argv":["/usr/bin/env"],"cwd":".","env":{"LATTE_EXACT":"bound"},"timeout_ms":1234,"grace_ms":111,"stdout_cap":4096,"stderr_cap":2048}),
+                        }],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
     struct BatchProvider;
     impl Provider for BatchProvider {
-        async fn complete(
+        fn complete(
             &self,
-            messages: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages
-                .iter()
-                .filter(|message| message.is_role("tool"))
-                .count()
-                == 3
-            {
-                Ok(ProviderResponse {
-                    message: Some("batch complete".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("three calls".into()),
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "batch-read".into(),
-                            name: "read_file".into(),
-                            input: json!({"path":"seed.txt"}),
-                        },
-                        ToolCall {
-                            id: "batch-write".into(),
-                            name: "write_file".into(),
-                            input: json!({"path":"batch.txt","content":"once","create_intent":true}),
-                        },
-                        ToolCall {
-                            id: "batch-list".into(),
-                            name: "list_directory".into(),
-                            input: json!({"path":"."}),
-                        },
-                    ],
-                    input_request: None,
-                })
-            }
+            request: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages
+                    .iter()
+                    .filter(|message| message.is_role("tool"))
+                    .count()
+                    == 3
+                {
+                    Ok(ProviderResponse {
+                        message: Some("batch complete".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: Some("three calls".into()),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "batch-read".into(),
+                                name: "read_file".into(),
+                                input: json!({"path":"seed.txt"}),
+                            },
+                            ToolCall {
+                                id: "batch-write".into(),
+                                name: "write_file".into(),
+                                input: json!({"path":"batch.txt","content":"once","create_intent":true}),
+                            },
+                            ToolCall {
+                                id: "batch-list".into(),
+                                name: "list_directory".into(),
+                                input: json!({"path":"."}),
+                            },
+                        ],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
     struct SlowFinalProvider;
     impl Provider for SlowFinalProvider {
-        async fn complete(
+        fn complete(
             &self,
-            _: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            tokio::time::sleep(std::time::Duration::from_millis(220)).await;
-            Ok(ProviderResponse {
-                message: Some("slow done".into()),
-                tool_calls: vec![],
-                input_request: None,
+            _: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+                Ok(ProviderResponse {
+                    message: Some("slow done".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
             })
         }
     }
     struct SlowProcessProvider;
     impl Provider for SlowProcessProvider {
-        async fn complete(
+        fn complete(
             &self,
-            messages: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages.iter().any(|message| message.is_role("tool")) {
-                Ok(ProviderResponse {
-                    message: Some("slow process done".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("sleep".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "slow-process".into(),
-                        name: "process".into(),
-                        input: json!({"argv":["/bin/sleep","0.22"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":100,"stdout_cap":1024,"stderr_cap":1024}),
-                    }],
-                    input_request: None,
-                })
-            }
+            request: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages.iter().any(|message| message.is_role("tool")) {
+                    Ok(ProviderResponse {
+                        message: Some("slow process done".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: Some("sleep".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "slow-process".into(),
+                            name: "process".into(),
+                            input: json!({"argv":["/bin/sleep","0.22"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":100,"stdout_cap":1024,"stderr_cap":1024}),
+                        }],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
     impl Provider for EditingProvider {
-        async fn complete(
+        fn complete(
             &self,
-            messages: &[Message],
-            _: &[latte_engine::ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            let mut step = self.step.lock().unwrap();
-            let response = match *step {
-                0 => ProviderResponse {
-                    message: Some("read".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "read-1".into(),
-                        name: "read_file".into(),
-                        input: json!({"path":"a.txt"}),
-                    }],
-                    input_request: None,
-                },
-                1 => {
-                    let value: serde_json::Value =
-                        serde_json::from_str(messages.last().unwrap().content().unwrap()).unwrap();
-                    ProviderResponse {
-                        message: Some("edit".into()),
+            request: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                let mut step = self.step.lock().unwrap();
+                let response = match *step {
+                    0 => ProviderResponse {
+                        message: Some("read".into()),
                         tool_calls: vec![ToolCall {
-                            id: "edit-1".into(),
-                            name: "edit_file".into(),
-                            input: json!({"path":"a.txt","anchor":"old","after":"new","precondition":value["sha256"]}),
+                            id: "read-1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path":"a.txt"}),
                         }],
                         input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    },
+                    1 => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(messages.last().unwrap().content().unwrap())
+                                .unwrap();
+                        ProviderResponse {
+                            message: Some("edit".into()),
+                            tool_calls: vec![ToolCall {
+                                id: "edit-1".into(),
+                                name: "edit_file".into(),
+                                input: json!({"path":"a.txt","anchor":"old","after":"new","precondition":value["sha256"]}),
+                            }],
+                            input_request: None,
+                            usage: crate::provider::ProviderUsage::default(),
+                            finish_reason: None,
+                            provider_state: None,
+                        }
                     }
-                }
-                _ => ProviderResponse {
-                    message: Some("changed a.txt".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                },
-            };
-            *step += 1;
-            Ok(response)
+                    _ => ProviderResponse {
+                        message: Some("changed a.txt".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    },
+                };
+                *step += 1;
+                Ok(response)
+            })
         }
     }
     #[tokio::test]
@@ -2510,19 +2740,24 @@ mod tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
+        // The terminal verification effect must also outlive the original
+        // authority window. This keeps a provider-only heartbeat from
+        // masking a missing verification heartbeat.
         let plan = VerificationPlan {
-            argv: vec!["/bin/pwd".into()],
+            argv: vec!["/bin/sleep".into(), "0.22".into()],
             cwd: ".".into(),
             timeout_ms: 1_000,
             grace_ms: 250,
             stdout_cap: 1024,
             stderr_cap: 1024,
         };
-        let completed = AgentRuntime::new(engine, SlowFinalProvider, dir.path(), plan)
-            .with_lease_ttl(60)
-            .run("slow")
-            .await
-            .unwrap();
+        let runtime =
+            AgentRuntime::new(engine, SlowFinalProvider, dir.path(), plan).with_lease_ttl(60);
+        let run_id = match runtime.run("slow").await.unwrap_err() {
+            RuntimeError::PermissionRequired { run_id } => run_id,
+            error => panic!("{error}"),
+        };
+        let completed = runtime.resume(run_id, true).await.unwrap();
         assert_eq!(completed.status, latte_core::RunStatus::Completed);
         assert_eq!(completed.handoff.unwrap().evidence.len(), 1);
     }
@@ -2534,8 +2769,10 @@ mod tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
+        // Exercise the verification phase after the Started process phase;
+        // both must maintain the same coordinator lease.
         let plan = VerificationPlan {
-            argv: vec!["/bin/pwd".into()],
+            argv: vec!["/bin/sleep".into(), "0.22".into()],
             cwd: ".".into(),
             timeout_ms: 1_000,
             grace_ms: 250,
@@ -2545,6 +2782,10 @@ mod tests {
         let runtime = AgentRuntime::new(engine.clone(), SlowProcessProvider, dir.path(), plan)
             .with_lease_ttl(60);
         let run_id = match runtime.run("slow process").await.unwrap_err() {
+            RuntimeError::PermissionRequired { run_id } => run_id,
+            error => panic!("{error}"),
+        };
+        let run_id = match runtime.resume(run_id, true).await.unwrap_err() {
             RuntimeError::PermissionRequired { run_id } => run_id,
             error => panic!("{error}"),
         };

@@ -5,7 +5,7 @@ members = [
   "crates/latte-engine",
   "crates/latte-headless",
   "crates/latte-tui",
-  "crates/lattecode",
+  "crates/latte-code",
 ]
 
 [workspace.package]
@@ -36,6 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ratatui = "0.30"
 crossterm = "0.29"
 signal-hook = "0.3"
+unicode-segmentation = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

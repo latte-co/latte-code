@@ -10,7 +10,7 @@ English counterpart: [English architecture](../../en-US/design/architecture-over
 ## 组成
 
 ```text
-lattecode CLI/TUI
+latte-code CLI/TUI
   |-- latte-tui -------- 投影与类型化 UI 动作
   |-- latte-headless --- Provider、上下文、Agent Loop 与验证
         |-- latte-engine -- 存储、策略、Effect、工具与进程
@@ -19,9 +19,15 @@ lattecode CLI/TUI
 
 `latte-core` 不依赖存储、Provider 或 UI。`latte-engine` 是所有特权副作用的唯一执行主体，只暴露受限句柄。前端读取持久化投影并提交类型化命令，不直接修改仓库或运行时状态。
 
+`latte-code` 按顺序递归合并内置默认值、`$HOME/.latte/latte-code.jsonc` 和工作区 `.latte/latte-code.jsonc`；配置文件缺失是合法状态，相同 key 由工作区值覆盖。新运行使用命名的默认 Provider，CLI 与 TUI 共用 headless Provider 注册表。Thread binding 会在解析 secret 或发送 history 前，结构化固定所有 v1 语义 binding 字段（包括 alias），以及非 secret credential reference、credential generation 与 data scope；不匹配会关闭失败，避免静默漂移。
+
+配置 `streaming` 后，OpenAI Chat Completions 支持有边界的 SSE：可处理 CRLF、注释、多 data 行、UTF-8 分块、tool 聚合、`[DONE]` 和取消。只有真实 delta 会被呈现；内联 JSON 只呈现最终结果，不伪造 delta。仅当 streaming 请求以零 body 的不支持响应失败时，才允许一次非流式回退；Responses API 仍不在范围内。
+
 ## 持久化状态
 
-每个工作区使用 `.latte/lattecode.db`。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。
+每个工作区使用配置的 `database.path`，默认值为 `.latte/latte-code.db`。相对路径以工作区根目录为基准，也支持绝对路径。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。
+
+Thread v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitThreadRunUpdate` 原子提交。旧 run 仍可由 CLI 读取，绝不回填为 thread。
 
 运行写入必须携带有效 owner lease 与单调递增的 fencing token。lease 过期后即使同一 owner 重新获取也会推进 epoch；接管后旧 owner 不能再写入。
 
@@ -33,13 +39,19 @@ Effect 状态为：
 Declared -> Prepared -> Started -> ObservedSuccess | ObservedFailed | Unknown
 ```
 
-执行前持久化意图与 pre-effect hash。批准精确绑定 effect ID、run revision、lease 和请求摘要，且只能使用一次。消费批准和 `Prepared -> Started` 在同一事务完成。崩溃或观察不明确时记录 `Unknown`，必须先协调，不能猜测成功后自动重试。
+执行前持久化意图与 pre-effect hash。批准精确绑定 effect ID、run revision、lease 和请求摘要，且只能使用一次。消费批准和 `Prepared -> Started` 在同一事务完成。精确 descriptor 只保存在 engine 私有表；effect ledger、checkpoint、transcript、事件、Provider history 重建和 TUI 只能获得独立的脱敏投影。崩溃或观察不明确时记录 `Unknown`，必须先协调，不能猜测成功后自动重试。
 
 文件工具执行工作区边界、deny glob、内容过期检查和精确 edit/create 约束。变更在支持的平台通过已持有目录句柄和同目录原子 rename 完成；缺少安全原语的平台会在消费权限和进入 `Started` 前失败。
 
 ## 进程监管
 
 命令默认使用 argv，不经过 shell；shell 语法单独分类并视为高风险。stdout/stderr 并发读取且有容量上限，超时与取消具有有限 grace period。Unix 创建并监管整个进程组，依次发送 `TERM`、`KILL` 并确认子孙进程退出。当前非 Unix 平台在创建 effect 前 fail closed；CI 会编译检查 Windows，但不宣称支持 Windows 进程执行。
+
+## Transcript 运行时
+
+终端以中心 transcript 和固定多行 composer 为主，session 列表为次级界面。session 投影携带最近的、最多 500 条 card，而不是最早的一页；若更早 card 被省略，transcript 会明确提示。Enter 只插入换行；Ctrl+Enter 或 F5 发送。待决权限会以内联 card 展示有边界、过滤控制字符且脱敏的操作摘要（写入目标/内容意图、进程 argv/cwd 或读取/调用目标）。权限只可由聚焦卡片上的 `d` 或 Ctrl+A 明确决定，Enter 永远不能批准。事件缺口或重连会清空瞬态进度，并由 projection adapter 内部重新加载权威 snapshot。每个客户端最多保留一条本地 follow-up 队列，且只在新读取到 `Ready` snapshot 后派发。
+
+当前 thread 协调器支持 Provider 对话、类型化 user/assistant/input/failure/completion card、不可变 follow-up child 和精确有界 history。Provider 发出的 tool-call 与 input-request ID 必须先满足小型 opaque 语法 `[A-Za-z0-9_-]{1,256}`，才可以成为持久化 source、request 或 deduplication key。Provider 和 TUI 没有直接 effect authority。Provider 请求的 v2 tool 只能由 engine 以带 fencing 的持久化 effect 执行：`Prepare -> Started -> Observe`。engine 会在执行前持久化 descriptor，在 Provider 调用或 effect 已 `Started` 时续租；重启或 `Started` 后失去 lease 会记录为 `Unknown`，且只能由显式 reconciliation 解决。TUI 将该确认作为独立流程：Ctrl+R 打开已脱敏的 unknown-effect card，Ctrl+A 确认；Enter 永远不能确认。确认会把 effect 记为失败，并终结精确关联的 child。
 
 ## Agent 运行时
 

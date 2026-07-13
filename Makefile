@@ -13,11 +13,11 @@ setup: ## Install rustfmt, Clippy, cargo-llvm-cov, and cargo-deny
 build: ## Build the complete workspace
 	cargo build --workspace --all-features
 
-release: ## Build the lattecode release binary
-	cargo build --release -p lattecode
+release: ## Build the latte-code release binary
+	cargo build --release -p latte-code
 
-install: ## Install lattecode from the local checkout
-	cargo install --path crates/lattecode
+install: ## Install latte-code from the local checkout
+	cargo install --path crates/latte-code
 
 fmt: ## Format Rust source
 	cargo fmt --all
@@ -48,10 +48,10 @@ ci: ## Reproduce the complete local CI gate
 	./scripts/ci-local.sh
 
 run: ## Run the headless CLI; pass arguments with ARGS='...'
-	cargo run -p lattecode -- $(ARGS)
+	cargo run -p latte-code -- $(ARGS)
 
 tui: ## Start the Ratatui interface
-	cargo run -p lattecode -- tui
+	cargo run -p latte-code -- tui
 
 clean: ## Remove Cargo build and coverage output
 	cargo llvm-cov clean --workspace 2>/dev/null || true
