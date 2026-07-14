@@ -55,7 +55,7 @@ OpenAI Chat Completions can use bounded SSE when `streaming` is true. Only actua
 - Effect state is persisted before execution. Ambiguous interruption becomes `Unknown` and requires explicit reconciliation; it is never silently retried.
 - File writes use handle-relative replacement on supported platforms and fail before starting on unsupported platforms.
 - Process execution is argv-first, drains bounded output, and terminates Unix process groups on timeout or cancellation. Process supervision fails closed on non-Unix targets; Windows is compile-checked in CI but execution is unsupported.
-- TUI permission prompts default to deny and show a bounded redacted operation summary before approval; Enter inserts a composer newline and never approves.
+- TUI Enter sends a nonblank composer or pending-input value, while Shift+Enter inserts a newline. Permission and reconciliation prompts consume both keys without approving or acknowledging anything; those protected actions require their explicit chords.
 
 ## Configuration library
 

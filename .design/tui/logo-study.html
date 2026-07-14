@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Latte Code · TUI Logo Study</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./logo-study.css" />
+  </head>
+  <body>
+    <header class="study-header">
+      <a href="./index.html#idle">← 返回主原型</a>
+      <p class="eyebrow">LATTE CODE · TUI LOGO STUDY</p>
+      <h1>从原 Logo 轮廓采样，而不是重新画一只杯子</h1>
+      <p class="lede">
+        三个方案共用同一份 20 × 24 像素轮廓；每个终端字符用一个
+        <code>▀</code> 同时承载上下两个像素。差别只在配色与承载方式。
+      </p>
+    </header>
+
+    <main class="study-grid">
+      <article class="study-card study-card--recommended">
+        <header>
+          <div>
+            <span class="recommendation">推荐</span>
+            <h2>A · 深色终端自适应</h2>
+          </div>
+          <span class="cell-count">20 × 12 cells</span>
+        </header>
+        <div class="terminal-sample">
+          <div class="terminal-title">latte-code · first run</div>
+          <div class="lockup">
+            <div
+              class="pixel-logo pixel-logo--adaptive"
+              data-pixel-logo
+              role="img"
+              aria-label="Latte Code block-pixel cup and steam logo"
+            ></div>
+            <div class="wordmark">
+              <strong>Latte Code</strong>
+              <span>Scoped repository changes, with evidence.</span>
+            </div>
+          </div>
+          <div class="compact-preview">
+            <span>窄终端 / 小字号</span>
+            <div class="pixel-logo pixel-logo--adaptive pixel-logo--small" data-pixel-logo aria-hidden="true"></div>
+          </div>
+        </div>
+        <p class="rationale">保留淡绿液体和灰色蒸汽，深色杯沿反转为高亮轮廓，最适合当前 Latte Code 主题。</p>
+      </article>
+
+      <article class="study-card">
+        <header>
+          <div><h2>B · 单色品牌版</h2></div>
+          <span class="cell-count">20 × 12 cells</span>
+        </header>
+        <div class="terminal-sample terminal-sample--centered">
+          <div class="pixel-logo pixel-logo--mono" data-pixel-logo role="img" aria-label="Monochrome Latte Code block-pixel logo"></div>
+        </div>
+        <p class="rationale">像 Claude Code 一样使用单一品牌色，辨识度强，但会丢失原 Logo 的淡绿色内芯。</p>
+      </article>
+
+      <article class="study-card">
+        <header>
+          <div><h2>C · 原始配色徽章</h2></div>
+          <span class="cell-count">20 × 12 cells</span>
+        </header>
+        <div class="terminal-sample terminal-sample--centered">
+          <div class="badge">
+            <div class="pixel-logo pixel-logo--original" data-pixel-logo role="img" aria-label="Original-palette Latte Code block-pixel logo"></div>
+          </div>
+        </div>
+        <p class="rationale">最接近 PNG 的黑色杯沿与浅色底板，但更像应用图标，不够像原生终端界面。</p>
+      </article>
+    </main>
+
+    <footer class="study-footer">
+      主原型已经回退到上一版 Logo；这里的三个方案不会自动进入 Latte Code。
+    </footer>
+    <script src="./logo-study.js"></script>
+  </body>
+</html>

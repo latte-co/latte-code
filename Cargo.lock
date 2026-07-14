@@ -1024,6 +1024,7 @@ dependencies = [
  "latte-engine",
  "latte-headless",
  "latte-tui",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "tempfile",
@@ -1093,6 +1094,7 @@ dependencies = [
  "signal-hook",
  "thiserror 2.0.18",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

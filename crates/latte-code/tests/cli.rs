@@ -3,7 +3,9 @@ use std::process::{Command, Output, Stdio};
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 fn invoke(args: &[&str], configure: impl FnOnce(&mut Command)) -> Output {
@@ -44,7 +46,7 @@ fn write_config_with_database(
 ) {
     let root = command.get_current_dir().unwrap();
     std::fs::create_dir_all(root.join(".latte")).unwrap();
-    std::fs::write(root.join(".latte/latte-code.jsonc"), format!(r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#)).unwrap();
+    std::fs::write(root.join(".latte/latte-code.jsonc"), format!(r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#)).unwrap();
 }
 
 fn json(output: &Output) -> Value {
@@ -267,6 +269,48 @@ fn configured(command: &mut Command, endpoint: &str, verification: &str) {
     command.env("TEST_OPENAI_KEY", "secret");
 }
 
+#[cfg(unix)]
+fn capture_stream(
+    mut stream: impl Read + Send + 'static,
+) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&capture);
+    let handle = thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&buffer[..read]),
+            }
+        }
+    });
+    (capture, handle)
+}
+
+#[cfg(unix)]
+fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    predicate()
+}
+
+#[cfg(unix)]
+fn capture_contains(capture: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) -> bool {
+    capture
+        .lock()
+        .unwrap()
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
@@ -409,30 +453,206 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
 fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     let root = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_latte-code");
-    let mut command = Command::new("/usr/bin/script");
-    #[cfg(target_os = "macos")]
-    command.args(["-q", "/dev/null", binary, "tui"]);
-    #[cfg(target_os = "linux")]
-    command.args(["-qec", &format!("{binary} tui"), "/dev/null"]);
+    let endpoint = completion_server();
+    let pty = nix::pty::openpty(
+        Some(&nix::pty::Winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        None::<&nix::sys::termios::Termios>,
+    )
+    .unwrap();
+    let master = std::fs::File::from(pty.master);
+    let mut input = master.try_clone().unwrap();
+    let slave_stdout = pty.slave.try_clone().unwrap();
+    let slave_stderr = pty.slave.try_clone().unwrap();
+    let mut command = Command::new(binary);
     command
+        .arg("tui")
         .current_dir(root.path())
         .env("HOME", root.path().join("home"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::from(pty.slave))
+        .stdout(Stdio::from(slave_stdout))
+        .stderr(Stdio::from(slave_stderr));
+    configured(&mut command, &endpoint, r#"["/usr/bin/true"]"#);
+    preserve_coverage_profiles(&mut command);
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    let (output, output_reader) = capture_stream(master);
+
+    // The keyboard-protocol push is the final-binary readiness boundary: the
+    // engine and projection already exist, raw mode is active, and CSI-u input
+    // can now distinguish Shift+Enter from Enter.
+    assert!(
+        wait_until(Duration::from_secs(5), || capture_contains(
+            &output,
+            b"\x1b[>3u"
+        )),
+        "TUI never enabled keyboard disambiguation: {}",
+        String::from_utf8_lossy(&output.lock().unwrap())
+    );
+
+    input.write_all(b"first").unwrap();
+    input.write_all(b"\x1b[13;2u").unwrap();
+    input.write_all(b"second").unwrap();
+    input.write_all(b"\r").unwrap();
+    let durable_reader = latte_engine::EngineBuilder::new()
+        .workspace_root(root.path())
+        .database_path(root.path().join(".latte/latte-code.db"))
+        .build()
+        .unwrap();
+
+    // This is the earliest durable authoritative submission boundary. It
+    // proves the final binary decoded CSI-u Shift+Enter as a newline and the
+    // following plain Enter as exactly one submit, independent of provider
+    // completion timing.
+    let submitted = wait_until(Duration::from_secs(5), || {
+        let Ok(threads) = durable_reader.list_threads_v2() else {
+            return false;
+        };
+        let user_entries = threads
+            .iter()
+            .flat_map(|thread| thread.transcript.entries.iter())
+            .filter(|entry| entry.kind == latte_core::TranscriptKind::User)
+            .collect::<Vec<_>>();
+        user_entries.len() == 1 && user_entries[0].text == "first\nsecond"
+    });
+    let observed_prompts = durable_reader.list_threads_v2().map(|threads| {
+        threads
+            .into_iter()
+            .flat_map(|thread| thread.transcript.entries)
+            .filter(|entry| entry.kind == latte_core::TranscriptKind::User)
+            .map(|entry| entry.text)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        submitted,
+        "final TUI did not durably submit exactly one multiline prompt; observed={observed_prompts:?}; terminal={}",
+        String::from_utf8_lossy(&output.lock().unwrap())
+    );
+
+    // F10 keeps this restoration assertion separate from signal delivery.
+    // Double Ctrl+C remains covered by the reducer and signal-edge tests.
+    input.write_all(b"\x1b[21~").unwrap();
+    drop(input);
+    let status = child.wait().unwrap();
+    output_reader.join().unwrap();
+    assert!(status.success());
+    let output = output.lock().unwrap();
+    let terminal = String::from_utf8_lossy(&output);
+    assert!(terminal.contains("first"));
+    assert!(terminal.contains("second"));
+    assert!(terminal.contains("\u{1b}[>3u"));
+    assert!(terminal.contains("\u{1b}[?1049h"));
+    assert!(terminal.contains("\u{1b}[?1049l"));
+    assert!(terminal.contains("\u{1b}[<1u"));
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_commits_prompt_before_a_provider_configuration_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_latte-code");
+    let pty = nix::pty::openpty(
+        Some(&nix::pty::Winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        None::<&nix::sys::termios::Termios>,
+    )
+    .unwrap();
+    let master = std::fs::File::from(pty.master);
+    let mut input = master.try_clone().unwrap();
+    let slave_stdout = pty.slave.try_clone().unwrap();
+    let slave_stderr = pty.slave.try_clone().unwrap();
+    let mut command = Command::new(binary);
+    command
+        .arg("tui")
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env_remove("TEST_OPENAI_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .stdin(Stdio::from(pty.slave))
+        .stdout(Stdio::from(slave_stdout))
+        .stderr(Stdio::from(slave_stderr));
     write_config(&command, "http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
     preserve_coverage_profiles(&mut command);
     let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"?\tq").unwrap();
-    let output = child.wait_with_output().unwrap();
+    drop(command);
+    let (output, output_reader) = capture_stream(master);
+    assert!(wait_until(Duration::from_secs(5), || capture_contains(
+        &output,
+        b"\x1b[>3u"
+    )));
+
+    let sentinel = b"failed-start-visible-sentinel";
+    input.write_all(sentinel).unwrap();
+    input.write_all(b"\r").unwrap();
+
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(root.path())
+        .database_path(root.path().join(".latte/latte-code.db"))
+        .build()
+        .unwrap();
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        wait_until(Duration::from_secs(5), || {
+            engine.list_threads_v2().is_ok_and(|threads| {
+                threads.len() == 1
+                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
+                    && threads[0].transcript.entries.iter().any(|entry| {
+                        entry.kind == latte_core::TranscriptKind::User
+                            && entry.text.as_bytes() == sentinel
+                    })
+                    && threads[0]
+                        .transcript
+                        .entries
+                        .iter()
+                        .any(|entry| entry.kind == latte_core::TranscriptKind::Failure)
+            })
+        }),
+        "provider configuration failure was not durably projected: {}",
+        String::from_utf8_lossy(&output.lock().unwrap())
     );
-    let terminal = String::from_utf8_lossy(&output.stdout);
-    assert!(terminal.contains("\u{1b}[?1049h"));
-    assert!(terminal.contains("\u{1b}[?1049l"));
+    assert!(wait_until(Duration::from_secs(5), || capture_contains(
+        &output,
+        b"selected model could not be started"
+    )));
+
+    let threads = engine.list_threads_v2().unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].lifecycle, latte_core::ThreadLifecycle::Failed);
+    assert_eq!(threads[0].runs.len(), 1);
+    assert_eq!(
+        threads[0].runs[0].status,
+        latte_core::ThreadRunStatus::Failed
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    let terminal = output.lock().unwrap();
+    assert!(
+        !terminal
+            .windows(b"prompt has been restored".len())
+            .any(|value| value == b"prompt has been restored")
+    );
+    assert!(
+        !terminal
+            .windows(b"Unable to submit".len())
+            .any(|value| value == b"Unable to submit")
+    );
+    assert!(
+        !terminal
+            .windows(b"TEST_OPENAI_KEY".len())
+            .any(|value| value == b"TEST_OPENAI_KEY")
+    );
+    drop(terminal);
+
+    input.write_all(b"\x1b[21~").unwrap();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    output_reader.join().unwrap();
 }
 
 #[cfg(unix)]
@@ -456,10 +676,13 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback() {
     configured(&mut command, &endpoint, r#"["/usr/bin/true"]"#);
     let mut child = command.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
-    // Runs -> Timeline -> Details -> Prompt, then submit a real runtime command.
-    input.write_all(b"\t\t\tcheck\r").unwrap();
-    thread::sleep(std::time::Duration::from_millis(700));
-    input.write_all(b"q").unwrap();
+    // Composer starts focused. F5 remains a compatibility submit key and F10
+    // exits after feedback is consumed. The sibling direct-PTY test exercises
+    // final-binary Shift+Enter/Enter semantics and durable transcript evidence.
+    thread::sleep(std::time::Duration::from_millis(500));
+    input.write_all(b"check\x1b[15~").unwrap();
+    thread::sleep(std::time::Duration::from_millis(1_500));
+    input.write_all(b"\x1b[21~").unwrap();
     drop(input);
     let output = child.wait_with_output().unwrap();
     assert!(

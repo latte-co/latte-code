@@ -37,6 +37,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 signal-hook = "0.3"
 unicode-segmentation = "1.12"
+unicode-width = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

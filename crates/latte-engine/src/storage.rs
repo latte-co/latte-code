@@ -624,7 +624,7 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms) VALUES(?1,0,0,'running',?2,?3,?4,?4)",
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms) VALUES(?1,0,1,'running',?2,?3,?4,?4)",
             params![thread_id.to_string(), serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?],
         )?;
         tx.execute(
@@ -1412,7 +1412,9 @@ impl Storage {
                         || "completed".into(),
                         |value| redact_thread_text(&value.summary),
                     ),
-                    None,
+                    next.handoff
+                        .as_ref()
+                        .map(|handoff| serde_json::json!({"handoff": redact_handoff(handoff)})),
                     format!("{source_key}:card"),
                 ));
             }
@@ -1489,7 +1491,9 @@ impl Storage {
                         || "completed".into(),
                         |value| redact_thread_text(&value.summary),
                     ),
-                    None,
+                    next.handoff
+                        .as_ref()
+                        .map(|handoff| serde_json::json!({"handoff": redact_handoff(handoff)})),
                     format!("{source_key}:card"),
                 ));
             }
@@ -4282,6 +4286,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(initial.lifecycle, ThreadLifecycle::Running);
+        assert_eq!(initial.sequence, 1);
+        assert_eq!(initial.transcript.entries[0].sequence, 1);
         assert!(!initial.transcript.entries[0].text.contains("sk-this"));
         assert!(store.is_thread_linked_run(first).unwrap());
         let lease = store.acquire_lease("thread", 2, 100).unwrap();
@@ -4351,6 +4357,75 @@ mod tests {
         assert_eq!(followup.runs.len(), 2);
         assert_eq!(followup.runs[1].parent_run_id, Some(first));
         assert_eq!(store.load_run(first).unwrap(), parent);
+    }
+
+    #[test]
+    fn initial_thread_cursor_allows_a_queued_run_to_fail_with_a_durable_card() {
+        use latte_core::{ThreadCommandId, ThreadId, ThreadProviderBindingV2};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let initial = store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &binding,
+                "durable prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(initial.sequence, 1);
+        assert_eq!(initial.transcript.entries[0].sequence, 1);
+
+        let lease = store.acquire_lease("thread", 2, 100).unwrap();
+        let failed = store
+            .commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: 0,
+                    expected_run_revision: 0,
+                    command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Fail {
+                        source_key: "provider-configuration-failure".into(),
+                        failure: RunFailure {
+                            code: FailureCode::RuntimeFailed,
+                            message: "provider configuration failed".into(),
+                            retryability: Retryability::Terminal,
+                        },
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(failed.snapshot.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(failed.snapshot.sequence, 2);
+        assert_eq!(failed.snapshot.transcript.entries.len(), 2);
+        assert_eq!(failed.snapshot.transcript.entries[0].sequence, 1);
+        assert_eq!(failed.snapshot.transcript.entries[1].sequence, 2);
+        assert_eq!(
+            failed.snapshot.transcript.entries[1].kind,
+            TranscriptKind::Failure
+        );
     }
 
     #[test]

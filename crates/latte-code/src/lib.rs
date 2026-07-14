@@ -206,6 +206,25 @@ fn discover_workspace_root(start: &Path) -> PathBuf {
         .to_owned()
 }
 
+fn workspace_display_path(root: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    workspace_display_path_with_home(root, home.as_deref())
+}
+
+fn workspace_display_path_with_home(root: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return root.display().to_string();
+    };
+    let Ok(relative) = root.strip_prefix(home) else {
+        return root.display().to_string();
+    };
+    if relative.as_os_str().is_empty() {
+        "~".into()
+    } else {
+        format!("~/{}", relative.display())
+    }
+}
+
 struct ThreadEngineProjection {
     engine: latte_engine::EngineHandle,
     subscription: latte_engine::ThreadSubscription,
@@ -549,6 +568,19 @@ fn execute_tui() -> i32 {
             return EXIT_INTERNAL;
         }
     };
+    let startup_binding =
+        match registry.thread_binding_for(registry.default_name(), &engine.tool_descriptors()) {
+            Ok(binding) => binding,
+            Err(error) => {
+                eprintln!("configuration: {error}");
+                return EXIT_USAGE;
+            }
+        };
+    let startup = latte_tui::thread::ThreadStartupPresentation {
+        default_model: startup_binding.model.clone(),
+        workspace_display: workspace_display_path(&root),
+        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
+    };
     let resolver_registry = registry.clone();
     let resolver_engine = engine.clone();
     let factory: latte_headless::thread::ThreadProviderFactory =
@@ -570,40 +602,37 @@ fn execute_tui() -> i32 {
         engine: engine.clone(),
         subscription: engine.subscribe_threads(),
     };
-    let binding_registry = registry.clone();
-    let binding_engine = engine.clone();
-    let (feedback_tx, feedback_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let (feedback_tx, feedback_rx) =
+        std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
     match latte_tui::thread::run_with_feedback_and_progress(
         &mut projection,
+        startup,
         move |action| {
             match action {
-                latte_tui::thread::ThreadUiAction::Start { prompt } => {
-                    let binding = binding_registry.thread_binding_for(
-                        binding_registry.default_name(),
-                        &binding_engine.tool_descriptors(),
-                    );
+                latte_tui::thread::ThreadUiAction::Start {
+                    submission_id,
+                    prompt,
+                } => {
+                    let binding = startup_binding.clone();
                     let service = service.clone();
                     let feedback = feedback_tx.clone();
-                    match binding {
-                        Ok(binding) => {
-                            tokio::spawn(async move {
-                                let thread_id = ThreadId::from_uuid(
-                                    latte_core::SystemIdSource::default().next_uuid_v7(),
-                                );
-                                let result = service
-                                    .start(thread_id, prompt, binding)
-                                    .await
-                                    .map(|_| "conversation completed".into())
-                                    .map_err(|error| error.to_string());
-                                let _ = feedback.send(result);
-                            });
-                        }
-                        Err(error) => {
-                            let _ = feedback.send(Err(error.to_string()));
-                        }
-                    }
+                    tokio::spawn(async move {
+                        let thread_id = ThreadId::from_uuid(
+                            latte_core::SystemIdSource::default().next_uuid_v7(),
+                        );
+                        let result = service
+                            .start(thread_id, prompt, binding)
+                            .await
+                            .map(|_| "conversation completed".into())
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
+                            submission_id,
+                            result,
+                        ));
+                    });
                 }
                 latte_tui::thread::ThreadUiAction::FollowUp {
+                    submission_id,
                     thread_id,
                     expected_thread_revision,
                     prompt,
@@ -616,7 +645,10 @@ fn execute_tui() -> i32 {
                             .await
                             .map(|_| "follow-up completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(result);
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
+                            submission_id,
+                            result,
+                        ));
                     });
                 }
                 latte_tui::thread::ThreadUiAction::Cancel { thread_id } => {
@@ -627,7 +659,7 @@ fn execute_tui() -> i32 {
                             .cancel_durable(thread_id)
                             .map(|_| "interruption requested".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(result);
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
                     });
                 }
                 latte_tui::thread::ThreadUiAction::ProvideInput {
@@ -648,11 +680,13 @@ fn execute_tui() -> i32 {
                                     .await
                                     .map(|_| "input accepted".into())
                                     .map_err(|error| error.to_string());
-                                let _ = feedback.send(result);
+                                let _ = feedback
+                                    .send(latte_tui::thread::ThreadUiFeedback::command(result));
                             });
                         }
                         Err(error) => {
-                            let _ = feedback.send(Err(error));
+                            let _ = feedback
+                                .send(latte_tui::thread::ThreadUiFeedback::command(Err(error)));
                         }
                     }
                 }
@@ -685,11 +719,13 @@ fn execute_tui() -> i32 {
                                         }
                                     })
                                     .map_err(|error| error.to_string());
-                                let _ = feedback.send(result);
+                                let _ = feedback
+                                    .send(latte_tui::thread::ThreadUiFeedback::command(result));
                             });
                         }
                         Err(error) => {
-                            let _ = feedback_tx.send(Err(error));
+                            let _ = feedback_tx
+                                .send(latte_tui::thread::ThreadUiFeedback::command(Err(error)));
                         }
                     }
                 }
@@ -706,7 +742,7 @@ fn execute_tui() -> i32 {
                         // path; its emitted thread event refreshes the TUI
                         // projection after the terminal transition.
                         let result = reconcile_thread_action(&service, thread_id, &effect_id);
-                        let _ = feedback.send(result);
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
                     });
                 }
                 latte_tui::thread::ThreadUiAction::RefreshSnapshots
@@ -802,6 +838,7 @@ mod tests {
     use super::{
         AppConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED, EXIT_INTERRUPTED, EXIT_WAITING,
         discover_workspace_root, outcome, reconcile_thread_action,
+        workspace_display_path_with_home,
     };
     use latte_core::{
         FailureCode, IdSource, Retryability, RunFailure, RunId, RunState, RunStatus,
@@ -812,7 +849,7 @@ mod tests {
         ThreadEffectRequest, ThreadEffectStartRequest,
     };
     use latte_headless::thread::{ThreadHistoryPolicy, ThreadRuntimeService};
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     fn state(status: RunStatus) -> RunState {
         let mut state =
@@ -926,6 +963,23 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(discover_workspace_root(&nested), root.path());
+    }
+
+    #[test]
+    fn startup_workspace_path_is_compact_without_losing_the_resolved_root() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            workspace_display_path_with_home(
+                Path::new("/Users/example/projects/latte-code"),
+                Some(home)
+            ),
+            "~/projects/latte-code"
+        );
+        assert_eq!(
+            workspace_display_path_with_home(Path::new("/opt/latte-code"), Some(home)),
+            "/opt/latte-code"
+        );
+        assert_eq!(workspace_display_path_with_home(home, Some(home)), "~");
     }
 
     #[test]
