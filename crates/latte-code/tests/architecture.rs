@@ -46,7 +46,9 @@ fn workspace_dependency_matrix_is_exact() {
 
 #[test]
 fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
-    let workflow = include_str!("../../../.github/workflows/ci.yml");
+    // Git may materialize the workflow with CRLF on Windows. Normalize the
+    // fixture so the contract checks its YAML semantics, not checkout EOLs.
+    let workflow = include_str!("../../../.github/workflows/ci.yml").replace("\r\n", "\n");
 
     let trigger_contract = "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n    types: [opened, synchronize, reopened, edited, ready_for_review]\n  merge_group:\n  workflow_dispatch:\n\npermissions:";
     assert!(workflow.contains(trigger_contract));

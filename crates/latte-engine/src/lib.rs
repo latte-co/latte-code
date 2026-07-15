@@ -567,7 +567,7 @@ impl EngineHandle {
             "workspace remained unstable across completion sampling".into(),
         ))
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn set_completion_hook(&self, hook: impl Fn(u8) + Send + Sync + 'static) {
         *self.completion_hook.lock().expect("hook mutex poisoned") = Some(Arc::new(hook));
     }

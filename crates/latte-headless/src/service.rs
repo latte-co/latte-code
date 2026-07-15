@@ -525,6 +525,7 @@ mod tests {
         RuntimeCommandService::new(engine, dir.path(), plan(), provider)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn typed_start_permission_allow_completes() {
         let dir = tempfile::tempdir().unwrap();
@@ -561,6 +562,7 @@ mod tests {
         assert!(matches!(completed,CommandResult::Run(run) if run.status==RunStatus::Completed));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_deny_fails_and_stale_command_is_visible() {
         let dir = tempfile::tempdir().unwrap();
@@ -605,6 +607,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn deny_does_not_construct_provider() {
         let dir = tempfile::tempdir().unwrap();
@@ -721,6 +724,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn input_request_survives_reopen_and_exact_value_resumes_once() {
         let dir = tempfile::tempdir().unwrap();

@@ -2000,6 +2000,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_asked_write_waits_then_consumes_exact_permission() {
         let root = tempfile::tempdir().unwrap();
@@ -2082,6 +2083,7 @@ mod tests {
         assert_eq!(projected_handoff["evidence"][0]["status"], "passed");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_private_descriptor_executes_approved_code_without_transcript_or_history_secret_egress()
      {
@@ -2216,6 +2218,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_ask_first_tool_round_continues_all_calls_in_provider_order() {
         let root = tempfile::tempdir().unwrap();
@@ -2271,6 +2274,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_allowed_first_tool_round_waits_then_replays_remaining_call_in_order() {
         let root = tempfile::tempdir().unwrap();
@@ -2357,6 +2361,7 @@ mod tests {
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_tool_round_resume_after_restart_uses_durable_assistant_queue() {
         let root = tempfile::tempdir().unwrap();
@@ -2486,6 +2491,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_failed_verification_blocks_completion_after_mutation() {
         let root = tempfile::tempdir().unwrap();
@@ -2535,6 +2541,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn v2_verification_permission_is_durable_and_completion_waits_for_approval() {
         let root = tempfile::tempdir().unwrap();

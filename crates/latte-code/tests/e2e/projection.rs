@@ -355,7 +355,9 @@ fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
     let provider = ScriptedProvider::start([
         ProviderReply::json(503, &serde_json::json!({"error":"retry matrix"}))
             .header("Retry-After", "0"),
-        ProviderReply::completion("retry matrix completed").delayed(Duration::from_millis(250)),
+        // Keep the second request in flight long enough for an instrumented,
+        // contended PTY renderer to expose the retry progress frame.
+        ProviderReply::completion("retry matrix completed").delayed(Duration::from_secs(1)),
     ]);
     retry.write_config_with_provider_fields(
         provider.endpoint(),

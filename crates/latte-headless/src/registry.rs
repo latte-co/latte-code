@@ -747,13 +747,14 @@ mod tests {
 
     #[test]
     fn resolved_binding_is_exact_and_uses_nonsecret_semantics_only() {
-        // HOME is guaranteed by the test runner and is used only to construct
-        // a provider object; this test never opens a network connection. It
-        // proves binding equality is checked after the normal resolution path.
+        // PATH is guaranteed by the cross-platform test runners and is used
+        // only to construct a provider object; this test never opens a network
+        // connection. It proves binding equality is checked after the normal
+        // resolution path.
         let registry = ProviderRegistry::parse_jsonc(
             r"{version:1,default_provider:'main',providers:{main:{
                 type:'openai-chat',model:'m',base_url:'https://example.invalid/v1',
-                api_key:{source:'env',name:'HOME'},
+                api_key:{source:'env',name:'PATH'},
                 credential_ref_id:'ref',data_scope_id:'scope',credential_generation:1
             }}}",
         )

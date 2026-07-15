@@ -2067,6 +2067,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn final_only_interrupted_resumes_verification_without_provider() {
         struct PanicProvider;
@@ -2138,6 +2139,7 @@ mod tests {
         assert_eq!(completed.handoff.unwrap().summary, "done");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     async fn final_only_interrupted_verifier_ask_becomes_verification_permission() {
@@ -2278,6 +2280,7 @@ mod tests {
         assert!(error.to_string().contains("provider binding changed"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn interrupted_resolved_crash_queue_normalizes_before_single_provider_turn() {
@@ -2667,6 +2670,7 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn fake_provider_read_edit_permission_resume_and_handoff() {
         let dir = tempfile::tempdir().unwrap();
@@ -2737,6 +2741,7 @@ mod tests {
         assert!(state.handoff.is_some());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn git_handoff_reports_created_untracked_file_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -2820,6 +2825,7 @@ mod tests {
         assert_eq!(completed.handoff.unwrap().files_changed, vec!["fresh.txt"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn expired_process_permission_reissues_exact_nonempty_env_and_limits() {
         let dir = tempfile::tempdir().unwrap();
@@ -2854,6 +2860,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn persisted_tool_batch_resumes_middle_permission_and_executes_each_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -2915,6 +2922,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn lease_heartbeat_keeps_long_provider_alive_past_initial_ttl() {
         let dir = tempfile::tempdir().unwrap();
@@ -2944,6 +2952,7 @@ mod tests {
         assert_eq!(completed.handoff.unwrap().evidence.len(), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn lease_heartbeat_keeps_started_process_alive_to_one_terminal() {
         let dir = tempfile::tempdir().unwrap();
@@ -2979,6 +2988,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn openai_http_e2e_sends_exact_tools_and_resumes_permission() {
@@ -3091,6 +3101,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn verifier_ask_waits_and_records_evidence_only_after_resume() {
         let dir = tempfile::tempdir().unwrap();
