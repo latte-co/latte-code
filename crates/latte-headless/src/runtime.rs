@@ -419,7 +419,7 @@ impl AgentRuntime {
         self.verification = plan;
         self
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_lease_ttl(mut self, ttl_ms: u64) -> Self {
         self.lease_ttl_ms = ttl_ms;
         self
@@ -2391,14 +2391,18 @@ mod tests {
         assert!(stored.tool_queue.is_empty());
         assert_eq!(stored.tool_cursor, 0);
     }
+    #[cfg(unix)]
     use std::io::{Read, Write};
     use std::sync::Mutex;
+    #[cfg(unix)]
     #[derive(Default)]
     struct EditingProvider {
         step: Mutex<u8>,
     }
+    #[cfg(unix)]
     #[derive(Default)]
     struct StatelessProvider;
+    #[cfg(unix)]
     impl Provider for StatelessProvider {
         fn complete(
             &self,
@@ -2475,7 +2479,9 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     struct EnvProcessProvider;
+    #[cfg(unix)]
     impl Provider for EnvProcessProvider {
         fn complete(
             &self,
@@ -2510,7 +2516,9 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     struct BatchProvider;
+    #[cfg(unix)]
     impl Provider for BatchProvider {
         fn complete(
             &self,
@@ -2562,7 +2570,9 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     struct SlowFinalProvider;
+    #[cfg(unix)]
     impl Provider for SlowFinalProvider {
         fn complete(
             &self,
@@ -2582,7 +2592,9 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     struct SlowProcessProvider;
+    #[cfg(unix)]
     impl Provider for SlowProcessProvider {
         fn complete(
             &self,
@@ -2617,6 +2629,7 @@ mod tests {
             })
         }
     }
+    #[cfg(unix)]
     impl Provider for EditingProvider {
         fn complete(
             &self,

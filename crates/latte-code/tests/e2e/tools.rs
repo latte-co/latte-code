@@ -150,8 +150,17 @@ fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
     );
 
     pty.write(b"\x1b[21~");
-    let (status, _) = pty.finish(Duration::from_secs(5));
-    assert!(status.success());
+    assert!(
+        pty.wait_for_output(b"\x1b[?1049l", Duration::from_secs(5)),
+        "TUI did not restore the terminal after F10: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    let (status, output) = pty.finish(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "TUI exited with {status}: {}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]

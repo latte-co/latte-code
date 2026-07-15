@@ -496,6 +496,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn provider() -> Result<FakeProvider, String> {
         Ok(FakeProvider::scripted([ProviderResponse {
             message: Some("done".into()),
@@ -516,6 +517,7 @@ mod tests {
             stderr_cap: 1024,
         }
     }
+    #[cfg(unix)]
     fn service(dir: &tempfile::TempDir) -> RuntimeCommandService {
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(dir.path())

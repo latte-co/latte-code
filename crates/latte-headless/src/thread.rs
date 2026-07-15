@@ -1818,6 +1818,7 @@ mod tests {
         ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
     }
 
+    #[cfg(unix)]
     fn passing_verification() -> VerificationPlan {
         VerificationPlan {
             // `process::classify` recognizes this argv-only probe as an
@@ -1832,6 +1833,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn failing_verification() -> VerificationPlan {
         VerificationPlan {
             // This exact argv shape is engine-allowed but exits one for the
@@ -2208,6 +2210,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn tool_result_ids(messages: &[Message]) -> Vec<String> {
         messages
             .iter()
