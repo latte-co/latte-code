@@ -22,6 +22,10 @@
         <button type="button" data-state="working"><kbd>2</kbd> 执行中</button>
         <button type="button" data-state="permission"><kbd>3</kbd> 权限确认</button>
         <button type="button" data-state="complete"><kbd>4</kbd> 完成态</button>
+        <button type="button" data-state="todo"><kbd>5</kbd> Todo</button>
+        <button type="button" data-state="subagent"><kbd>6</kbd> Subagents</button>
+        <button type="button" data-state="team"><kbd>7</kbd> Agent Team</button>
+        <button type="button" data-state="agents"><kbd>8</kbd> Agents</button>
       </nav>
     </header>
 
@@ -39,7 +43,7 @@
 
     <footer class="review-footer">
       <span id="state-caption">执行中 · 主流程与工具活动</span>
-      <span>原型控制不属于最终 TUI · 数字键 1–4 切换</span>
+      <span>原型控制不属于最终 TUI · 数字键 1–8 切换</span>
     </footer>
 
     <template id="state-idle">
@@ -103,63 +107,90 @@
 
           <p class="thinking"><span class="spinner">✦</span> Thought for 9s</p>
 
-          <section class="activity-group" aria-label="Agent activity">
-            <div class="activity-heading"><span>●</span><strong>Inspecting input handling</strong></div>
-
-            <article class="tool-row" data-tool>
-              <button class="tool-summary" type="button" aria-expanded="true">
-                <span class="tool-tree">├─</span>
-                <span class="tool-status tool-status--success">✓</span>
-                <span><strong>Search</strong> <code>reduce_key</code> in <code>crates/latte-tui</code></span>
-                <span class="tool-time">18 matches</span>
+          <section class="activity-flow" aria-label="Agent activity">
+            <section class="activity-phase activity-phase--complete" data-phase>
+              <button class="phase-summary" type="button" aria-expanded="false">
+                <span class="phase-marker">✓</span>
+                <strong>Inspected input handling</strong>
+                <span class="phase-meta">2 actions</span>
+                <span class="phase-chevron">›</span>
               </button>
-              <div class="tool-detail">
-                <code>crates/latte-tui/src/thread.rs:263</code>
-                <code>crates/latte-tui/src/thread.rs:361</code>
-              </div>
-            </article>
+              <div class="phase-detail" hidden>
+                <article class="tool-row" data-tool>
+                  <button class="tool-summary" type="button" aria-expanded="false">
+                    <span class="tool-tree">├─</span>
+                    <span class="tool-status tool-status--success">✓</span>
+                    <span><strong>Search</strong> <code>reduce_key</code> in <code>crates/latte-tui</code></span>
+                    <span class="tool-time">18 matches</span>
+                  </button>
+                  <div class="tool-detail" hidden>
+                    <code>crates/latte-tui/src/thread.rs:263</code>
+                    <code>crates/latte-tui/src/thread.rs:361</code>
+                  </div>
+                </article>
 
-            <article class="tool-row" data-tool>
-              <button class="tool-summary" type="button" aria-expanded="false">
-                <span class="tool-tree">├─</span>
-                <span class="tool-status tool-status--success">✓</span>
-                <span><strong>Read</strong> <code>crates/latte-tui/src/thread.rs</code></span>
-                <span class="tool-time">1,385 lines</span>
-              </button>
-              <div class="tool-detail" hidden>
-                <p>Reducer, renderer, terminal loop, and existing TestBackend coverage.</p>
+                <article class="tool-row" data-tool>
+                  <button class="tool-summary" type="button" aria-expanded="false">
+                    <span class="tool-tree">└─</span>
+                    <span class="tool-status tool-status--success">✓</span>
+                    <span><strong>Read</strong> <code>crates/latte-tui/src/thread.rs</code></span>
+                    <span class="tool-time">1,385 lines</span>
+                  </button>
+                  <div class="tool-detail" hidden>
+                    <p>Reducer, renderer, terminal loop, and existing TestBackend coverage.</p>
+                  </div>
+                </article>
               </div>
-            </article>
+            </section>
 
-            <article class="tool-row" data-tool>
-              <button class="tool-summary" type="button" aria-expanded="true">
-                <span class="tool-tree">├─</span>
-                <span class="tool-status tool-status--success">✓</span>
-                <span><strong>Edit</strong> <code>crates/latte-tui/src/thread.rs</code></span>
-                <span class="tool-time tone-amber">+74 −29</span>
+            <section class="activity-phase activity-phase--complete" data-phase>
+              <button class="phase-summary" type="button" aria-expanded="false">
+                <span class="phase-marker">✓</span>
+                <strong>Applied the fix</strong>
+                <span class="phase-meta">1 action · +74 −29</span>
+                <span class="phase-chevron">›</span>
               </button>
-              <div class="tool-detail tool-detail--diff">
-                <span class="diff-add">+ Composer owns every printable character</span>
-                <span class="diff-add">+ Esc enters transcript navigation</span>
-                <span class="diff-remove">− Global j/k/q/s shortcuts while composing</span>
+              <div class="phase-detail" hidden>
+                <article class="tool-row" data-tool>
+                  <button class="tool-summary" type="button" aria-expanded="false">
+                    <span class="tool-tree">└─</span>
+                    <span class="tool-status tool-status--success">✓</span>
+                    <span><strong>Edit</strong> <code>crates/latte-tui/src/thread.rs</code></span>
+                    <span class="tool-time tone-amber">+74 −29</span>
+                  </button>
+                  <div class="tool-detail tool-detail--diff" hidden>
+                    <span class="diff-add">+ Composer owns every printable character</span>
+                    <span class="diff-add">+ Esc enters transcript navigation</span>
+                    <span class="diff-remove">− Global j/k/q/s shortcuts while composing</span>
+                  </div>
+                </article>
               </div>
-            </article>
+            </section>
 
-            <article class="tool-row" data-tool>
-              <button class="tool-summary" type="button" aria-expanded="true">
-                <span class="tool-tree">└─</span>
-                <span class="tool-status tool-status--running">◌</span>
-                <span><strong>Running</strong> <code>cargo test -p latte-tui</code></span>
-                <span class="tool-time">8.2s</span>
+            <section class="activity-phase activity-phase--active" data-phase>
+              <button class="phase-summary" type="button" aria-expanded="true">
+                <span class="phase-marker">●</span>
+                <strong>Verifying behavior</strong>
+                <span class="phase-meta">running</span>
+                <span class="phase-chevron">›</span>
               </button>
-              <div class="tool-detail">
-                <span class="terminal-output">test composer_accepts_reserved_characters ... ok</span>
-                <span class="terminal-output tone-muted">test paste_preserves_multiline_text ... running</span>
+              <div class="phase-detail">
+                <article class="tool-row" data-tool>
+                  <button class="tool-summary" type="button" aria-expanded="true">
+                    <span class="tool-tree">└─</span>
+                    <span class="tool-status tool-status--running">◌</span>
+                    <span><strong>Run</strong> <code>cargo test -p latte-tui</code></span>
+                    <span class="tool-time">8.2s</span>
+                  </button>
+                  <div class="tool-detail">
+                    <span class="terminal-output">test composer_accepts_reserved_characters ... ok</span>
+                    <span class="terminal-output tone-muted">test paste_preserves_multiline_text ... running</span>
+                  </div>
+                </article>
               </div>
-            </article>
+            </section>
           </section>
 
-          <p class="assistant-stream"><span class="assistant-bullet">●</span> 输入焦点已经调整完成；我正在等待最后一组 TUI 测试结束。</p>
         </div>
 
         <footer class="composer">
@@ -171,6 +202,472 @@
             <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
             <span>Working · <kbd>Ctrl+C</kbd> interrupt · <kbd>Ctrl+P</kbd> commands</span>
           </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-todo">
+      <div class="tui tui--todo">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Latte Code</strong>
+            <span>Planning</span>
+          </div>
+          <div class="repository-context">
+            <span>~/projects/latte-code</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>修复提交失败时用户消息消失的问题，补充失败态和真实 PTY 回归测试。</p>
+          </article>
+
+          <p class="thinking"><span class="spinner">✦</span> Thought for 7s</p>
+        </div>
+
+        <section class="todo-block" data-todo aria-label="Current todo list">
+          <button class="todo-summary" type="button" aria-expanded="false">
+            <span class="todo-title">Todo</span>
+            <span class="todo-current"><span class="todo-current-status">●</span> Persist user message before provider setup</span>
+            <span class="todo-progress">1/5 done</span>
+            <span class="todo-chevron">›</span>
+          </button>
+
+          <ol class="todo-list" hidden>
+            <li class="todo-item todo-item--done">
+              <span class="todo-status">✓</span>
+              <span>Trace the submit and provider initialization path</span>
+            </li>
+            <li class="todo-item todo-item--active">
+              <span class="todo-status">●</span>
+              <span><strong>Persist the user message before provider setup</strong><small>Current task</small></span>
+            </li>
+            <li class="todo-item todo-item--pending">
+              <span class="todo-status">○</span>
+              <span>Map provider failures into the transcript</span>
+            </li>
+            <li class="todo-item todo-item--blocked">
+              <span class="todo-status">!</span>
+              <span>Add real PTY regression coverage<small>Blocked · PTY access unavailable</small></span>
+            </li>
+            <li class="todo-item todo-item--skipped">
+              <span class="todo-status">–</span>
+              <span>Retain the legacy composer restore behavior<small>Skipped · superseded by durable failure rendering</small></span>
+            </li>
+          </ol>
+        </section>
+
+        <footer class="composer">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <span class="fake-caret" aria-hidden="true"></span>
+            <span class="placeholder">Add guidance while Latte Code works…</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span>Working · <kbd>Ctrl+C</kbd> interrupt · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-subagent">
+      <div class="tui tui--subagent">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Latte Code</strong>
+            <span>Main · 2 subagents active</span>
+          </div>
+          <div class="repository-context">
+            <span>~/projects/latte-code</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>调查提交失败的原因，补充真实 PTY 回归测试，并修复失败投影。</p>
+          </article>
+
+          <p class="thinking"><span class="spinner">✦</span> Spawned after 8s</p>
+          <p class="assistant-note">我会继续处理失败投影，同时启动两个临时后台任务；它们完成后只把 handoff 返回主 Session。</p>
+
+          <section class="team-delegation" aria-label="Background task delegation">
+            <div class="team-event"><span>◆</span><strong>Spawned 2 background tasks</strong><small>Main session</small></div>
+            <div class="team-assignment"><span>├─</span><span class="tone-cyan">◈</span><strong>Explore</strong><span>Trace persistence path</span></div>
+            <div class="team-assignment"><span>└─</span><span class="tone-cyan">◈</span><strong>Test</strong><span>Reproduce PTY failure</span></div>
+          </section>
+
+          <p class="agent-milestone"><span>◆</span> Explore spawned Migration Scout · Search provider-failure fixtures</p>
+          <p class="agent-milestone agent-milestone--handoff"><span>✓</span> Migration Scout handoff · Existing fixture lacks a durability assertion.</p>
+
+          <article class="message message--user message--followup">
+            <span class="message-glyph">›</span>
+            <p>先覆盖当前平台，跨平台 fixture 可以后续再补。</p>
+          </article>
+
+          <p class="assistant-note">收到。这条 steering 会由 Main 处理；Test 继续当前平台验证，不需要单独进入它的会话。</p>
+        </div>
+
+        <section class="agents-dock" data-agents aria-label="Background subagents">
+          <button class="agents-summary" type="button" aria-expanded="false">
+            <span class="agents-title">Agents</span>
+            <span class="agents-current"><span>◈</span> Explore · <span>◈</span> Test</span>
+            <span class="agents-count">3 instances · 2 active</span>
+            <span class="agents-chevron">›</span>
+          </button>
+          <div class="agents-list" hidden>
+            <button class="agent-dock-row" type="button" data-open-agent="explore" data-agent-context="lineage"><span class="tone-cyan">◈</span><strong>Explore</strong><span>Trace persistence path</span><small>gpt-5.6 · high</small></button>
+            <button class="agent-dock-row agent-dock-row--child" type="button" data-open-agent="scout" data-agent-context="lineage"><span class="tone-green">└✓</span><strong>Scout</strong><span>Search failure fixtures</span><small>gpt-5.6-mini · medium</small></button>
+            <button class="agent-dock-row" type="button" data-open-agent="test" data-agent-context="lineage"><span class="tone-cyan">◈</span><strong>Test</strong><span>Reproduce PTY failure</span><small>gpt-5.4-mini · high</small></button>
+          </div>
+        </section>
+
+        <section class="todo-block" data-todo aria-label="Main session todo list">
+          <button class="todo-summary" type="button" aria-expanded="false">
+            <span class="todo-title">Todo</span>
+            <span class="todo-current"><span class="todo-current-status">●</span> Persist user message <span class="todo-owner">@Main</span></span>
+            <span class="todo-progress">1/4 done</span>
+            <span class="todo-chevron">›</span>
+          </button>
+
+          <ol class="todo-list" hidden>
+            <li class="todo-item todo-item--done"><span class="todo-status">✓</span><span>Find provider-failure fixtures <small class="todo-owner">@Scout</small></span></li>
+            <li class="todo-item todo-item--active"><span class="todo-status">●</span><span><strong>Trace the persistence path</strong><small class="todo-owner">@Explore</small></span></li>
+            <li class="todo-item todo-item--active"><span class="todo-status">●</span><span><strong>Persist the user message</strong><small class="todo-owner">@Main</small></span></li>
+            <li class="todo-item todo-item--active"><span class="todo-status">●</span><span><strong>Add real PTY coverage</strong><small class="todo-owner">@Test</small></span></li>
+          </ol>
+        </section>
+
+        <footer class="composer">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <span class="fake-caret" aria-hidden="true"></span>
+            <span class="placeholder">Guide Main while background tasks run…</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span>2 subagents active · <kbd>Ctrl+C</kbd> interrupt Main · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-agent-team">
+      <div class="tui tui--team">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Latte Code</strong>
+            <span>Lead · Team auth-refresh</span>
+          </div>
+          <div class="repository-context">
+            <span>4 members · 2 active</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>修复提交失败时用户消息消失的问题，并覆盖真实 PTY 失败流程。</p>
+          </article>
+
+          <p class="thinking"><span class="spinner">✦</span> Team started after 11s</p>
+          <p class="assistant-note">我会作为 Lead 处理服务层修复，同时把持久化调查、PTY 回归和边界评审交给团队成员。</p>
+
+          <section class="team-delegation" aria-label="Team delegation">
+            <div class="team-event"><span>◆</span><strong>Delegated 3 tasks</strong><small>Team auth-refresh</small></div>
+            <div class="team-assignment"><span>├─</span><span class="tone-cyan">◈</span><strong>Explore</strong><span>Trace persistence path</span></div>
+            <div class="team-assignment"><span>├─</span><span class="tone-cyan">◈</span><strong>Test</strong><span>Reproduce PTY failure</span></div>
+            <div class="team-assignment"><span>└─</span><span class="tone-muted">○</span><strong>Reviewer</strong><span>Review service boundary</span></div>
+          </section>
+
+          <p class="agent-milestone agent-milestone--handoff"><span>✓</span> Explore handoff · Provider setup returns before the user entry becomes durable.</p>
+
+          <article class="message message--user message--followup">
+            <span class="message-glyph">›</span>
+            <p>同时确认配置错误不会再把 prompt 塞回输入框。</p>
+          </article>
+
+          <p class="assistant-note">收到。这条 steering 已加入 Lead 的当前工作；Test 会继续在后台运行，完成后由我统一汇总。</p>
+        </div>
+
+        <section class="agents-dock" data-agents aria-label="Agent team status">
+          <button class="agents-summary" type="button" aria-expanded="false">
+            <span class="agents-title">Team</span>
+            <span class="agents-current"><span>●</span> Lead · <span>◈</span> Test</span>
+            <span class="agents-count">4 members · 2 active</span>
+            <span class="agents-chevron">›</span>
+          </button>
+          <div class="agents-list" hidden>
+            <button class="agent-dock-row" type="button" data-open-agent="lead" data-agent-context="team"><span class="tone-cyan">●</span><strong>Lead</strong><span>Implement failure projection</span><small>gpt-5.6 · xhigh</small></button>
+            <button class="agent-dock-row" type="button" data-open-agent="explore" data-agent-context="team"><span class="tone-green">✓</span><strong>Explore</strong><span>Trace persistence path</span><small>gpt-5.6 · high</small></button>
+            <button class="agent-dock-row" type="button" data-open-agent="test" data-agent-context="team"><span class="tone-cyan">◈</span><strong>Test</strong><span>Reproduce PTY failure</span><small>gpt-5.4-mini · high</small></button>
+            <button class="agent-dock-row" type="button" data-open-agent="reviewer" data-agent-context="team"><span class="tone-amber">!</span><strong>Reviewer</strong><span>Waiting for implementation</span><small>gpt-5.6 · xhigh</small></button>
+          </div>
+        </section>
+
+        <section class="todo-block" data-todo aria-label="Current todo list">
+          <button class="todo-summary" type="button" aria-expanded="false">
+            <span class="todo-title">Todo</span>
+            <span class="todo-current"><span class="todo-current-status">●</span> Persist user message <span class="todo-owner">@Lead</span></span>
+            <span class="todo-progress">1/4 done</span>
+            <span class="todo-chevron">›</span>
+          </button>
+
+          <ol class="todo-list" hidden>
+            <li class="todo-item todo-item--done">
+              <span class="todo-status">✓</span>
+              <span>Trace the submit path <small class="todo-owner">@Explore</small></span>
+            </li>
+            <li class="todo-item todo-item--active">
+              <span class="todo-status">●</span>
+              <span><strong>Persist the user message</strong><small class="todo-owner">@Lead</small></span>
+            </li>
+            <li class="todo-item todo-item--active">
+              <span class="todo-status">●</span>
+              <span><strong>Add real PTY coverage</strong><small class="todo-owner">@Test</small></span>
+            </li>
+            <li class="todo-item todo-item--pending">
+              <span class="todo-status">○</span>
+              <span>Review failure and permission boundaries <small class="todo-owner">@Reviewer</small></span>
+            </li>
+          </ol>
+        </section>
+
+        <footer class="composer">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <button class="composer-target" type="button" data-target-cycle aria-label="Change message target">Lead <span>▾</span></button>
+            <span class="fake-caret" aria-hidden="true"></span>
+            <span class="placeholder" data-target-placeholder>Message Lead while the team works…</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span>Team 4 · 2 active · <kbd>Ctrl+C</kbd> interrupt Lead · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-agent-sessions">
+      <div class="tui tui--agent-sessions">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Subagents</strong>
+            <span>Main session lineage</span>
+          </div>
+          <div class="repository-context">
+            <span>3 instances · 2 active</span>
+            <span>Esc main</span>
+          </div>
+        </header>
+
+        <div class="agent-inspector">
+          <aside class="agent-session-list" aria-label="Subagent session tree">
+            <div class="agent-session-list-title"><strong>Run tree</strong><span>Main + 3</span></div>
+
+            <button class="agent-session-item is-selected" type="button" data-agent-session="main">
+              <span class="agent-tree-space"></span><span class="tone-cyan">●</span>
+              <span class="agent-session-copy"><span class="agent-session-name"><strong>Main</strong><em>gpt-5.6 · xhigh</em></span><small>Fix failure projection</small></span>
+            </button>
+
+            <div class="agent-tree-branch" data-agent-branch>
+              <div class="agent-tree-parent-row">
+                <button class="agent-tree-toggle" type="button" data-agent-tree-toggle aria-expanded="true" aria-label="Collapse Explore children">›</button>
+                <button class="agent-session-item agent-session-item--branch" type="button" data-agent-session="explore">
+                  <span class="tone-cyan">◈</span>
+                  <span class="agent-session-copy"><span class="agent-session-name"><strong>Explore</strong><em>gpt-5.6 · high</em></span><small>Trace persistence path</small></span>
+                </button>
+              </div>
+              <div class="agent-tree-children">
+                <button class="agent-session-item agent-session-item--child" type="button" data-agent-session="scout">
+                  <span class="agent-tree-elbow">└─</span><span class="tone-green">✓</span>
+                  <span class="agent-session-copy"><span class="agent-session-name"><strong>Migration Scout</strong><em>gpt-5.6-mini · medium</em></span><small>Search provider-failure fixtures</small></span>
+                </button>
+              </div>
+            </div>
+
+            <button class="agent-session-item" type="button" data-agent-session="test">
+              <span class="agent-tree-space"></span><span class="tone-cyan">◈</span>
+              <span class="agent-session-copy"><span class="agent-session-name"><strong>Test</strong><em>gpt-5.4-mini · high</em></span><small>Reproduce PTY failure</small></span>
+            </button>
+          </aside>
+
+          <main class="agent-session-view">
+            <section class="agent-session-panel" data-session-panel="main">
+              <header><div><strong>Main · Fix failure projection</strong><small>gpt-5.6 · xhigh · Ask mode</small></div><span class="tone-cyan">working · 49s</span></header>
+              <article class="session-task"><span>Task</span><p>Investigate submission failure, preserve the user message, and add PTY coverage.</p></article>
+              <p class="session-assistant">I spawned two bounded background tasks and continued the state-projection change in the main session.</p>
+              <div class="session-tool"><span>◆</span><p><strong>Spawn</strong> Explore, Test<small>task-scoped background sessions</small></p></div>
+              <div class="session-tool"><span>✎</span><p><strong>Edit</strong> <code>crates/latte-headless/src/service.rs</code><small>persist visible input before provider setup</small></p></div>
+              <article class="session-handoff"><span>Inbox</span><p>Migration Scout found a missing fixture assertion.</p><span>Next</span><p>Wait for Explore's synthesized handoff, then finish the patch.</p></article>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="explore" hidden>
+              <header><div><strong>Explore · Trace persistence path</strong><small>Child of Main · gpt-5.6 · high</small></div><span class="tone-cyan">working · 34s</span></header>
+              <article class="session-task"><span>Task</span><p>Find where submitted user input becomes durable.</p></article>
+              <p class="session-assistant">I split out fixture discovery, then traced the runtime ordering while that child task ran.</p>
+              <div class="session-tool"><span>◆</span><p><strong>Spawn</strong> Migration Scout<small>search provider-failure fixtures</small></p></div>
+              <div class="session-tool"><span>⌕</span><p><strong>Search</strong> <code>create_thread|append_user|provider</code><small>12 matches</small></p></div>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="scout" hidden>
+              <header><div><strong>Migration Scout · Search failure fixtures</strong><small>Child of Explore · gpt-5.6-mini · medium</small></div><span class="tone-green">done · 19s</span></header>
+              <article class="session-task"><span>Task</span><p>Locate provider-failure fixtures that should assert durable user input.</p></article>
+              <div class="session-tool"><span>⌕</span><p><strong>Search</strong> <code>provider_failure|missing_api_key</code><small>5 matches</small></p></div>
+              <article class="session-handoff"><span>Handoff</span><p>The existing missing-provider fixture does not assert the persisted user entry.</p><span>To</span><p>Explore</p></article>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="test" hidden>
+              <header><div><strong>Test · Reproduce PTY failure</strong><small>Child of Main · gpt-5.4-mini · high</small></div><span class="tone-cyan">working · 31s</span></header>
+              <article class="session-task"><span>Task</span><p>Reproduce submission failure in a real PTY on the current platform.</p></article>
+              <div class="session-tool"><span>▤</span><p><strong>Read</strong> <code>crates/latte-code/tests/cli.rs</code><small>existing PTY harness</small></p></div>
+              <div class="session-tool"><span>◌</span><p><strong>Run</strong> <code>cargo test -p latte-code tui_dispatches_prompt</code><small>running</small></p></div>
+            </section>
+          </main>
+        </div>
+
+        <footer class="agent-inspector-footer">
+          <span>Read-only · task-scoped sessions return handoffs to Main</span>
+          <span><kbd>Esc</kbd> main · click select · <kbd>c</kbd> cancel selected</span>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-team-agent-sessions">
+      <div class="tui tui--agent-sessions">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Agents</strong>
+            <span>Team auth-refresh</span>
+          </div>
+          <nav class="agent-view-switcher" aria-label="Agent inspector view">
+            <button class="is-active" type="button" data-agent-view="sessions">Sessions</button>
+            <button type="button" data-agent-view="tasks">Tasks</button>
+            <button type="button" data-agent-view="activity">Activity</button>
+          </nav>
+          <div class="repository-context">
+            <span>4 members · 1 child · 2 active</span>
+            <span>Esc main</span>
+          </div>
+        </header>
+
+        <div class="agent-inspector" data-agent-view-panel="sessions">
+          <aside class="agent-session-list" aria-label="Agent sessions">
+            <div class="agent-session-list-title"><strong>Team</strong><span>4 members</span></div>
+
+            <button class="agent-session-item is-selected" type="button" data-agent-session="lead">
+              <span class="agent-tree-space"></span><span class="tone-cyan">●</span>
+              <span class="agent-session-copy"><span class="agent-session-name"><strong>Lead</strong><em>gpt-5.6 · xhigh</em></span><small>Implement failure projection</small></span>
+            </button>
+
+            <div class="agent-tree-branch" data-agent-branch>
+              <div class="agent-tree-parent-row">
+                <button class="agent-tree-toggle" type="button" data-agent-tree-toggle aria-expanded="true" aria-label="Collapse Explore children">›</button>
+                <button class="agent-session-item agent-session-item--branch" type="button" data-agent-session="explore">
+                  <span class="tone-green">✓</span>
+                  <span class="agent-session-copy"><span class="agent-session-name"><strong>Explore</strong><em>gpt-5.6 · high</em></span><small>Trace persistence path</small></span>
+                </button>
+              </div>
+              <div class="agent-tree-children">
+                <button class="agent-session-item agent-session-item--child" type="button" data-agent-session="scout">
+                  <span class="agent-tree-elbow">└─</span><span class="tone-green">✓</span>
+                  <span class="agent-session-copy"><span class="agent-session-name"><strong>Migration Scout</strong><em>gpt-5.6-mini · medium</em></span><small>Search migration fixtures</small></span>
+                </button>
+              </div>
+            </div>
+
+            <button class="agent-session-item" type="button" data-agent-session="test">
+              <span class="agent-tree-space"></span><span class="tone-cyan">◈</span>
+              <span class="agent-session-copy"><span class="agent-session-name"><strong>Test</strong><em>gpt-5.4-mini · high</em></span><small>Reproduce PTY failure</small></span>
+            </button>
+            <button class="agent-session-item" type="button" data-agent-session="reviewer">
+              <span class="agent-tree-space"></span><span class="tone-amber">!</span>
+              <span class="agent-session-copy"><span class="agent-session-name"><strong>Reviewer</strong><em>gpt-5.6 · xhigh</em></span><small>Waiting for implementation</small></span>
+            </button>
+          </aside>
+
+          <main class="agent-session-view">
+            <section class="agent-session-panel" data-session-panel="lead">
+              <header><div><strong>Lead · Implement failure projection</strong><small>gpt-5.6 · xhigh · Ask mode</small></div><span class="tone-cyan">working · 52s</span></header>
+              <article class="session-task"><span>Task</span><p>Persist visible user input before provider-dependent work and render correlated failures.</p></article>
+              <p class="session-assistant">I delegated independent tracing and PTY verification, then started changing the service boundary in the main session.</p>
+              <div class="session-tool"><span>◆</span><p><strong>Delegate</strong> Explore, Test, Reviewer<small>3 team tasks created</small></p></div>
+              <div class="session-tool"><span>✎</span><p><strong>Edit</strong> <code>crates/latte-headless/src/service.rs</code><small>persist thread and user entry before provider setup</small></p></div>
+              <article class="session-handoff"><span>Inbox</span><p>Explore found the failing initialization order.</p><span>Next</span><p>Apply the ordering fix, then unblock Reviewer.</p></article>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="explore" hidden>
+              <header><strong>Explore · Trace persistence path</strong><span class="tone-green">done · 1m12s</span></header>
+              <article class="session-task"><span>Task</span><p>Find where the submitted user message becomes durable.</p></article>
+              <p class="session-assistant">I’ll trace thread creation, provider setup, and transcript persistence without changing files.</p>
+              <div class="session-tool"><span>◆</span><p><strong>Delegated</strong> Migration Scout<small>Search migration and failure fixtures</small></p></div>
+              <div class="session-tool"><span>⌕</span><p><strong>Search</strong> <code>create_thread|provider|append_user</code><small>12 matches</small></p></div>
+              <div class="session-tool"><span>▤</span><p><strong>Read</strong> <code>crates/latte-headless/src/service.rs</code><small>service initialization and start path</small></p></div>
+              <p class="session-assistant">Provider setup returns before thread creation when credentials are missing. The user entry therefore never reaches durable storage.</p>
+              <article class="session-handoff"><span>Finding</span><p>Persist the thread and user entry before constructing the provider.</p><span>Evidence</span><p><code>service.rs:184</code> · <code>latte-code/src/lib.rs:231</code></p></article>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="scout" hidden>
+              <header><div><strong>Migration Scout · Search migration fixtures</strong><small>Child of Explore · gpt-5.6-mini · medium</small></div><span class="tone-green">done · 21s</span></header>
+              <article class="session-task"><span>Task</span><p>Locate fixtures that exercise durable thread creation and provider failures.</p></article>
+              <div class="session-tool"><span>⌕</span><p><strong>Search</strong> <code>migration|provider_failure|thread_entry</code><small>7 matches</small></p></div>
+              <p class="session-assistant">The migration fixture already models an empty provider configuration, but it does not assert that the user entry survives.</p>
+              <article class="session-handoff"><span>Handoff</span><p>Add the durability assertion to the existing provider-failure fixture.</p><span>To</span><p>Explore</p></article>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="test" hidden>
+              <header><div><strong>Test · Reproduce PTY failure</strong><small>gpt-5.4-mini · high · Ask mode</small></div><span class="tone-cyan">working · 38s</span></header>
+              <article class="session-task"><span>Task</span><p>Exercise missing-provider submission inside a real PTY.</p></article>
+              <p class="session-assistant">I’m preparing a PTY fixture that submits once, observes the transcript, and keeps the composer empty.</p>
+              <div class="session-tool"><span>▤</span><p><strong>Read</strong> <code>crates/latte-code/tests/cli.rs</code><small>existing PTY harness</small></p></div>
+              <div class="session-tool"><span>◌</span><p><strong>Run</strong> <code>cargo test -p latte-code tui_dispatches_prompt</code><small>running</small></p></div>
+            </section>
+
+            <section class="agent-session-panel" data-session-panel="reviewer" hidden>
+              <header><div><strong>Reviewer · Service boundary review</strong><small>gpt-5.6 · xhigh · inherited</small></div><span class="tone-amber">waiting</span></header>
+              <article class="session-task"><span>Task</span><p>Review the proposed persistence ordering and failure semantics.</p></article>
+              <p class="session-assistant">Waiting for Lead to finish the implementation before reviewing ordering, failure correlation, and permission boundaries.</p>
+            </section>
+          </main>
+        </div>
+
+        <section class="team-panel" data-agent-view-panel="tasks" hidden>
+          <header><div><strong>Team tasks</strong><span>Shared ownership and dependencies</span></div><span>1/4 done</span></header>
+          <div class="team-task-table" role="table" aria-label="Team tasks">
+            <div class="team-task-row team-task-row--header" role="row"><span>State</span><span>Task</span><span>Owner</span><span>Depends on</span></div>
+            <div class="team-task-row" role="row"><span class="tone-green">✓</span><strong>Trace the submit path</strong><span>@Explore</span><span>—</span></div>
+            <div class="team-task-row team-task-row--active" role="row"><span class="tone-cyan">●</span><strong>Persist the user message</strong><span>@Lead</span><span>Explore handoff</span></div>
+            <div class="team-task-row team-task-row--active" role="row"><span class="tone-cyan">◈</span><strong>Add real PTY regression</strong><span>@Test</span><span>Implementation</span></div>
+            <div class="team-task-row" role="row"><span class="tone-muted">○</span><strong>Review failure boundaries</strong><span>@Reviewer</span><span>Lead + Test</span></div>
+          </div>
+        </section>
+
+        <section class="team-panel" data-agent-view-panel="activity" hidden>
+          <header><div><strong>Team activity</strong><span>Milestones, handoffs, questions, and control events</span></div><span>live</span></header>
+          <div class="team-activity-list">
+            <article><time>12:41</time><span class="tone-cyan">◆</span><p><strong>Lead</strong> delegated three team tasks.</p></article>
+            <article><time>12:42</time><span class="tone-cyan">◆</span><p><strong>Explore</strong> delegated fixture search to <strong>Migration Scout</strong>.</p></article>
+            <article><time>12:43</time><span class="tone-green">✓</span><p><strong>Migration Scout</strong> handed one fixture finding to Explore.</p></article>
+            <article><time>12:44</time><span class="tone-green">✓</span><p><strong>Explore</strong> handed the persistence ordering finding to Lead.</p></article>
+            <article><time>12:45</time><span class="tone-cyan">◈</span><p><strong>Test</strong> started the real PTY regression.</p></article>
+            <article><time>12:46</time><span class="tone-muted">○</span><p><strong>Reviewer</strong> is waiting for the implementation handoff.</p></article>
+          </div>
+        </section>
+
+        <footer class="agent-inspector-footer">
+          <span>Team Inspector · public sessions, shared tasks, and live activity</span>
+          <span><kbd>Esc</kbd> main · <kbd>m</kbd> message · <kbd>c</kbd> cancel selected</span>
         </footer>
       </div>
     </template>
