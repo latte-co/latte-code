@@ -47,9 +47,9 @@ Measured baseline on 2026-07-15:
 | Crate-local tests | 245 | Independent `--lib --bins` profile; existing inline tests still contain some component behavior to purify |
 | Contract / component | 15 | Five contract targets protected by the inventory check |
 | Final-binary E2E | 78 | Three portable CLI/Provider/SQLite scenarios on all platforms plus 75 Unix headless, Provider, tool/recovery, public-boundary, and real-PTY scenarios |
-| UT-only line coverage | 95.06% | Current macOS working tree measured `26829 / 28224` from `make coverage-unit` |
-| Final-binary E2E line coverage | 80.79% | Current macOS working tree measured `10688 / 13230` across both E2E targets |
-| Total line coverage | 96.65% | Current macOS working tree measured `27278 / 28224` from `make coverage-total` |
+| UT-only line coverage | 95.05% | Current macOS working tree measured `26837 / 28234` from `make coverage-unit` |
+| Final-binary E2E line coverage | 80.78% | Current macOS working tree measured `10687 / 13230` across both E2E targets |
+| Total line coverage | 96.64% | Current macOS working tree measured `27286 / 28234` from `make coverage-total` |
 
 ### 2.2 Current remaining gaps
 
@@ -465,9 +465,9 @@ This first makes the test gates visible, accurate, and complete before adding ea
 
 The design builds on working test seams rather than hypothetical infrastructure:
 
-- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the current UT-only profile reaches 95.06%.
+- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the current UT-only profile reaches 95.05%.
 - The independent contract and E2E targets contain 93 integration tests: 15 Contract, 3 portable final-binary E2E, and 75 Unix final-binary E2E tests.
-- The current macOS profiles pass independently at 95.06% UT-only, 80.79% E2E, and 96.65% all-target coverage.
+- The current macOS profiles pass independently at 95.05% UT-only, 80.78% E2E, and 96.64% all-target coverage.
 - Final-binary execution, a loopback Provider, a real PTY, cross-process SQLite resume, and terminal-mode restoration already have reusable implementations.
 - The Provider endpoint already targets a loopback harness, so cassette replay can reuse the same final-binary path without a production backdoor.
 - The runtime already has component tests for process `Started`, Unknown, restart recovery, and reconciliation. The external-barrier E2E lifts existing semantics to the final-binary boundary and does not require a production backdoor.

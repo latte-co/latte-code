@@ -2396,6 +2396,19 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
     #[cfg(unix)]
+    fn expire_runtime_lease(database: &std::path::Path) {
+        assert_eq!(
+            rusqlite::Connection::open(database)
+                .unwrap()
+                .execute(
+                    "UPDATE runtime_lease SET expires_at_ms=0 WHERE singleton=1",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    #[cfg(unix)]
     #[derive(Default)]
     struct EditingProvider {
         step: Mutex<u8>,
@@ -2799,14 +2812,16 @@ mod tests {
                 stderr_cap: 16 * 1024,
             },
         )
-        .with_lease_ttl(20);
+        .with_lease_ttl(10_000);
         let run_id = match runtime.run("create").await.unwrap_err() {
             RuntimeError::PermissionRequired { run_id } => run_id,
             error => panic!("{error}"),
         };
+        // Simulate an expired coordinator explicitly. A tiny TTL makes this
+        // recovery boundary depend on host load before permission is durable.
+        expire_runtime_lease(&db);
         drop(runtime);
         drop(engine);
-        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
         let reopened = latte_engine::EngineBuilder::new()
             .workspace_root(dir.path())
             .database_path(&db)
@@ -2844,9 +2859,10 @@ mod tests {
     async fn expired_process_permission_reissues_exact_nonempty_env_and_limits() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".latte")).unwrap();
+        let db = dir.path().join(".latte/state.db");
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(dir.path())
-            .database_path(dir.path().join(".latte/state.db"))
+            .database_path(&db)
             .build()
             .unwrap();
         let plan = VerificationPlan {
@@ -2858,12 +2874,12 @@ mod tests {
             stderr_cap: 1024,
         };
         let runtime =
-            AgentRuntime::new(engine, EnvProcessProvider, dir.path(), plan).with_lease_ttl(1_000);
+            AgentRuntime::new(engine, EnvProcessProvider, dir.path(), plan).with_lease_ttl(10_000);
         let run_id = match runtime.run("env").await.unwrap_err() {
             RuntimeError::PermissionRequired { run_id } => run_id,
             error => panic!("{error}"),
         };
-        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        expire_runtime_lease(&db);
         assert!(matches!(
             runtime.resume(run_id, true).await,
             Err(RuntimeError::PermissionRequired { .. })

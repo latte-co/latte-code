@@ -199,6 +199,8 @@ make coverage-unit # --lib --bins --fail-under-lines 95
 make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
 ```
 
+The Makefile and CI run Unix PTY/process E2E with one test thread so independent scenarios cannot contend for terminal, signal, and process-group resources. Each scenario must still synchronize on observable events with bounded timeouts rather than fixed sleeps.
+
 Generate HTML to inspect uncovered lines:
 
 ```bash

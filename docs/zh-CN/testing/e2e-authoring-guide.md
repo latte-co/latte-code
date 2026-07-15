@@ -199,6 +199,8 @@ make coverage-unit # --lib --bins --fail-under-lines 95
 make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
 ```
 
+Unix PTY/process E2E 在 Makefile 和 CI 中固定使用单测试线程，避免不同场景争用终端、signal 和 process-group 资源；单个场景内部仍必须使用可观测事件同步和有界超时，不能改回固定 sleep。
+
 需要定位未覆盖行时生成 HTML：
 
 ```bash

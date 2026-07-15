@@ -50,7 +50,7 @@ test-e2e-portable: ## Run portable final-binary headless/Provider/SQLite E2E
 	cargo test -p latte-code --test e2e_portable --all-features --locked
 
 test-e2e-unix: ## Run Unix-only final-binary PTY/process E2E
-	cargo test -p latte-code --test e2e_unix --all-features --locked
+	cargo test -p latte-code --test e2e_unix --all-features --locked -- --test-threads=1
 
 test-doc: ## Run workspace documentation tests
 	cargo test --workspace --doc --all-features --locked
@@ -72,11 +72,11 @@ coverage-unit: ## Run UT-only coverage with the 95% line gate
 
 coverage-e2e: ## Run final-binary E2E coverage with the 80% line gate
 	cargo llvm-cov clean --workspace
-	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 80
+	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 80 -- --test-threads=1
 
 coverage-total: ## Run all-target coverage with the 90% line gate
 	cargo llvm-cov clean --workspace
-	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90
+	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90 -- --test-threads=1
 
 deny: ## Audit advisories, licenses, bans, and sources
 	cargo deny --locked check

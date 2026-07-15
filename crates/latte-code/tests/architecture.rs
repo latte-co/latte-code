@@ -142,6 +142,7 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
     assert!(portable.contains("--test e2e_portable"));
     let unix = section("e2e-unix", "release-build");
     assert!(unix.contains("--test e2e_unix"));
+    assert!(unix.contains("-- --test-threads=1"));
     assert!(unix.contains("ubuntu-latest"));
     assert!(unix.contains("macos-latest"));
     assert!(!unix.contains("windows-latest"));
@@ -197,6 +198,7 @@ fn portable_and_unix_e2e_targets_have_explicit_platform_boundaries() {
     let unix = include_str!("e2e_unix.rs");
     let portable_scenarios = include_str!("e2e/portable.rs");
     let support = include_str!("e2e/support.rs");
+    let makefile = include_str!("../../../Makefile");
 
     assert!(!portable.contains("cfg(unix)"));
     assert!(portable.contains("e2e/portable.rs"));
@@ -205,4 +207,16 @@ fn portable_and_unix_e2e_targets_have_explicit_platform_boundaries() {
     assert!(portable_scenarios.contains("database_path"));
     assert!(unix.starts_with("#![cfg(unix)]"));
     assert!(unix.contains("e2e/mod.rs"));
+    for target in ["test-e2e-unix", "coverage-e2e", "coverage-total"] {
+        let start = makefile.find(&format!("{target}:")).unwrap();
+        let recipe = makefile[start..]
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            recipe.contains("-- --test-threads=1"),
+            "{target} must serialize scheduler-sensitive final-binary tests"
+        );
+    }
 }
