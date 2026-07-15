@@ -93,12 +93,15 @@ fn legacy_process_argv_approval_preserves_bounded_dual_stream_result() {
 fn legacy_process_timeout_reaps_group_then_reenters_provider_once() {
     let scenario = Scenario::new();
     let pgid_file = scenario.root().join("legacy-timeout-pgid");
-    let shell = format!("echo $$ > {}; exec sleep 30", pgid_file.display());
+    let pgid_path = pgid_file.to_str().unwrap().to_owned();
+    let shell = r#"echo $$ > "$LATTE_E2E_PGID_FILE"; exec sleep 30"#;
     let process = serde_json::json!({
         "shell": shell,
         "cwd": ".",
-        "env": {},
-        "timeout_ms": 100,
+        "env": {"LATTE_E2E_PGID_FILE": pgid_path},
+        // This scenario proves timeout cleanup, not a 100 ms scheduling SLA. Leave
+        // enough time for a loaded CI runner to start the shell and publish its PID.
+        "timeout_ms": 1_000,
         "grace_ms": 50,
         "stdout_cap": 1_024,
         "stderr_cap": 1_024

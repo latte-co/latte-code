@@ -28,11 +28,14 @@ make setup
 make build       # 编译整个 workspace
 make test-unit   # 执行 crate-local UT（含 bin 测试编译）
 make test-contract # 执行公开 contract/component targets
-make test-e2e    # 执行最终二进制 headless/PTY E2E
+make test-e2e-portable # 执行三平台 final-binary CLI/Provider/SQLite E2E
+make test-e2e-unix # 执行 Linux/macOS PTY/process E2E
+make test-e2e    # 在 Unix 上组合以上两套 E2E
 make test-doc    # 执行 doc tests
 make test-all    # 执行 inventory 和以上全部测试层
 make test        # test-all 的兼容入口
 make check       # fmt + check + Clippy + Rustdoc
+make lint-ci     # actionlint workflow syntax + ShellCheck shell analysis
 make coverage-unit # UT-only 行覆盖率 >= 95%
 make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 80%
 make coverage-total # 全 targets 行覆盖率 >= 90%
@@ -83,7 +86,8 @@ export OPENAI_API_KEY='...'
 
 - crate 内单元测试：状态机、存储、权限、工具、进程监督和 TUI reducer，通过 `make test-unit` 运行。
 - contract/component：公开 Engine 生命周期、协议与 repo contract，通过 `make test-contract` 运行。
-- 最终二进制 E2E：CLI、多轮 loopback Provider、跨进程恢复和 PTY 终端行为，通过 `make test-e2e` 运行。
+- portable 最终二进制 E2E：三平台执行真实 CLI、loopback Provider 和 SQLite 持久化，通过 `make test-e2e-portable` 运行；Windows 不跳过整个 target。
+- Unix 最终二进制 E2E：保留 75 个包含 PTY、process group、signal、symlink 和 Unix verification 的场景，通过 `make test-e2e-unix` 运行。
 - doc tests：验证公开 authority API 的 compile-fail 边界。
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
 - 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、80%、90%。
@@ -105,18 +109,20 @@ make coverage-e2e
 
 GitHub Actions 在 `main` push、面向 `main` 的 PR、merge queue 和手工触发时运行。PR 新提交会取消同一 PR 的旧运行，`main` 和 merge queue 的运行不会被新运行取消。底层 job 保持独立可见，包括：
 
-- Ubuntu 与 macOS 的 Static、UT、Contract 和最终二进制 E2E；
-- Documentation tests 和 Dependency audit；
+- Linux、macOS、Windows 各自的 Cargo check、Clippy `-D warnings`、UT、Contract、portable 最终二进制 E2E 和 `latte-code` release build；
+- Linux、macOS 的 75 个 Unix PTY/process 最终二进制 E2E；
+- Rust 1.93 MSRV、actionlint 1.7.12、ShellCheck、Documentation tests 和 Dependency audit；
 - `Coverage - UT (95%)`、`Coverage - E2E (80%)`、`Coverage - total (90%)` 三个独立状态；
-- Windows compile。
 
 稳定聚合状态 `PR Gate` 使用 fail-closed 语义检查上述每个 job 的结果；失败、取消或跳过任何一个依赖都不会产生假绿。仓库的 branch protection 或 ruleset 应只把 `PR Gate` 配置为 required check，底层 job 仍可用于定位失败。
 
 `.github/workflows/ci.yml` 只实现了检查和聚合逻辑；branch protection/ruleset 是 GitHub 远端设置。在远端实际要求 `PR Gate` 之前，不能宣称 required 卡点已经激活。
 
-release artifact 构建只在 `main` push 或手工触发时运行，不属于 PR/merge queue 的 `PR Gate`。当前 job 只证明产物构建成功，不等同于尚未实现的 G5 release smoke。
+三平台 release build 属于 `PR Gate`，但当前只证明产物可构建，不等同于尚未实现的 G5 release smoke。Cargo CI 命令均在适用处使用 `--locked`。
 
-Windows 上的进程监督和安全文件变更目前运行时 fail-closed；CI 只保证 Windows 编译通过。
+Windows 上的进程监督和安全文件变更目前运行时 fail-closed；portable E2E 因此覆盖 CLI、SQLite、HTTP 200 input request 和 terminal Provider failure，不伪造“验证成功”。完整成功 verification、PTY 和 process 场景仍由 Linux/macOS 卡点承担。
+
+`make ci` 会调用 `scripts/lint-ci.sh`。本机已安装 actionlint/ShellCheck 时直接使用；否则使用 pinned Docker image（actionlint 1.7.12、ShellCheck 0.11.0）。Hosted CI 的 `Repository quality` job 直接执行同样的两类静态审计。
 
 ## 本地状态与清理
 

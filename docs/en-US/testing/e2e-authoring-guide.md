@@ -24,10 +24,12 @@ E2E does not replace UT, and Contract/Component tests must not be presented as E
 | --- | --- | --- |
 | UT | `#[cfg(test)]` modules beside the owning `src/**/*.rs` code | `make test-unit` |
 | Contract/Component | `crates/*/tests/*.rs` | `make test-contract` |
-| Final-binary E2E | `crates/latte-code/tests/e2e/` | `make test-e2e` |
+| Portable final-binary E2E | `crates/latte-code/tests/e2e/portable.rs` | `make test-e2e-portable` |
+| Unix final-binary E2E | `crates/latte-code/tests/e2e/*.rs` registered by `e2e/mod.rs` | `make test-e2e-unix` |
 
 Place E2E tests by user journey:
 
+- `portable.rs`: cross-platform CLI, loopback Provider, and SQLite journeys that must execute on Linux, macOS, and Windows;
 - `headless.rs`, `headless_matrix.rs`, and `runtime_convergence.rs`: CLI, configuration, JSON envelopes, multi-round read-only tools, cross-process convergence, and secret non-egress.
 - `provider.rs`: HTTP statuses, retries, timeouts, SSE, stream fallback, and wire-compatibility failures.
 - `tools.rs`, `permission_chain.rs`, and `runtime.rs`: final-binary tool matrices, aliases, permission chains, process supervision, and durable tool rounds.
@@ -37,7 +39,7 @@ Place E2E tests by user journey:
 - `support.rs`: `Scenario`, `ScriptedProvider`, `PtySession`, bounded waits, and process cleanup.
 - `mod.rs`: module registration only; do not accumulate scenarios here.
 
-Add a scenario to the closest existing file. Create a new module only for a stable new user-journey category, and register it in `e2e/mod.rs`.
+Add a scenario to the closest existing file. A scenario belongs in `portable.rs` only when its entire behavior is supported on all three platforms. PTY, Unix signals/process groups, symlink semantics, executable verification, and any other Unix-only assumption belong in the Unix suite. Create a new Unix module only for a stable new user-journey category, and register it in `e2e/mod.rs`.
 
 Use a public Engine fixture only to create a valid lifecycle state that the current final binary cannot create through a command. The fixture must call public authority APIs and must not write private SQLite tables; a fresh final CLI/TUI process and its user-visible output must still provide the acceptance result. A legacy-schema migration fixture may create historical schema data only for compatibility scenarios and must not bypass current authority rules.
 
@@ -91,7 +93,13 @@ UT should directly cover:
 
 Do not put SQLite, sockets, real child processes, or PTYs into UT merely to raise coverage. Those belong to Contract/Component or E2E.
 
-### 4.3 Add the final-binary E2E
+### 4.3 Select the platform boundary
+
+Prefer the portable suite when the journey can be proved through CLI JSON, SQLite, and loopback HTTP alone. Portable Provider scenarios must terminate before process verification on Windows—for example with a durable input request or a typed terminal Provider failure—because non-Unix process supervision deliberately fails closed. Never hide a portable target failure with `cfg`, an ignored test, or a runtime skip.
+
+Use the Unix suite when the behavior itself requires PTY, signals, process groups, symlinks, or executable verification. The following completion example is therefore Unix-only because it executes `/usr/bin/true` as verification.
+
+### 4.4 Add the final-binary E2E
 
 A basic headless scenario looks like this:
 
@@ -184,11 +192,11 @@ Failure messages should include redacted stdout, stderr, or PTY transcripts so l
 
 ### 7.1 Measurement
 
-UT coverage runs crate-local lib/bin tests only and excludes Contract, E2E, and documentation tests. E2E coverage runs only the final-binary `e2e` target. Each profile is cleaned and collected independently:
+UT coverage runs crate-local lib/bin tests only and excludes Contract, E2E, and documentation tests. E2E coverage runs only the portable and Unix final-binary targets. Each profile is cleaned and collected independently:
 
 ```bash
 make coverage-unit # --lib --bins --fail-under-lines 95
-make coverage-e2e  # --test e2e --fail-under-lines 80
+make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
 ```
 
 Generate HTML to inspect uncovered lines:
@@ -220,7 +228,7 @@ Review evidence must include the UT-only summary and an HTML inspection of new o
 - Use events, public projections, file appearance, or Provider calls as barriers.
 - Bound every wait and emit sufficient evidence on failure.
 - Required E2E must not use `#[ignore]`, conditional skips, real networks, or real credentials.
-- Before promotion to required, a new E2E should pass ten consecutive runs on both Linux and macOS without a flake.
+- Before promotion to required, a portable E2E should pass ten consecutive runs on Linux, macOS, and Windows without a flake; a Unix E2E should do so on Linux and macOS.
 
 ## 9. Completion checklist
 
@@ -235,6 +243,6 @@ A feature is complete only when every applicable item is satisfied:
 - [ ] Permission, security, recovery, and verification behavior has explicit negative assertions.
 - [ ] E2E does not depend on public networking, real keys, fixed sleeps, or `#[ignore]`.
 - [ ] Child/process-group, PTY, and Provider fixtures clean up on failure.
-- [ ] `make test-unit`, `make test-contract`, and `make test-e2e` pass.
+- [ ] `make test-unit`, `make test-contract`, and the applicable portable/Unix E2E targets pass.
 - [ ] `make coverage` and `make ci` pass.
 - [ ] English and Chinese behavior documentation is synchronized.

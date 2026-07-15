@@ -20,7 +20,7 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 
 - 每个 PR 都必须通过 UT、Contract、P0 E2E，以及 UT-only >= 95%、最终二进制 E2E >= 80%、全 targets >= 90% 三项独立行覆盖率卡点；新增或修改的功能代码还必须由对应 UT 和 E2E 直接覆盖；
 - 阻断 CI 不访问真实 Provider，不依赖公网，不消耗真实 API key；
-- Linux 与 macOS 在 PR 运行完整 E2E；Windows 在运行时能力仍 fail-closed 的阶段作为 PR 卡点只做编译；release build 仅在 `main` push 或手工触发时运行，不属于 PR 卡点；
+- Linux、macOS、Windows 在每个 PR 都运行 check、Clippy、UT、Contract、portable 最终二进制 E2E 和 release build；Linux/macOS 另外运行 Unix PTY/process E2E。这样验证各平台适用表面，同时不虚构 Windows 进程监督能力；
 - 安全、权限、恢复、验证类行为不能只靠覆盖率，必须有显式正向和负向断言；
 - 新卡点按 `draft -> shadow -> required` 激活，不能把尚未执行的设计写成“已保护”。
 
@@ -34,8 +34,8 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 - `cargo fmt`、Clippy、Rustdoc、`cargo deny`；
 - `cargo test --workspace --all-targets --all-features`；
 - `cargo llvm-cov ... --fail-under-lines 90`；
-- Ubuntu、macOS 原生测试，Windows 编译检查；
-- 面向 `main` 的 PR/merge queue 触发、三项独立 coverage job，以及聚合所有 G0-G4/Windows 必需 job 的 `PR Gate`；
+- Linux、macOS、Windows 原生 check、Clippy、UT、Contract、portable E2E 和 release build，以及 Linux/macOS Unix PTY/process E2E；
+- actionlint、ShellCheck、Rust 1.93 MSRV、依赖审计、locked 依赖解析、三项独立 coverage job，以及聚合全部必需 job 的 `PR Gate`；
 - 最终二进制 CLI 测试、loopback mock HTTP、真实 PTY 测试；
 - 真实 SQLite/temp workspace、进程组、权限、恢复和 TUI reducer 测试。
 
@@ -43,13 +43,13 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 
 | 指标 | 当前值 | 说明 |
 | --- | ---: | --- |
-| Cargo 可发现测试 | 348 | 245 个 crate-local、13 个 contract、75 个最终二进制 E2E、15 个 doc tests |
+| Cargo 可发现测试 | 353 | 245 个 crate-local、15 个 contract、3 个 portable E2E、75 个 Unix E2E、15 个 doc tests |
 | crate-local 测试 | 245 | 独立 `--lib --bins` profile；其中既有 inline tests 仍有待继续纯化的 component 行为 |
-| Contract / component | 13 | 5 个 contract targets，由 inventory 防漏 |
-| 最终二进制 E2E | 75 | 单一 `e2e` target；headless、Provider、tool/recovery、公开边界和真实 PTY |
-| UT-only 行覆盖率 | 95.11% | Hosted Ubuntu CI 的 `make coverage-unit` 实测为 `26847 / 28226` |
-| 最终二进制 E2E 行覆盖率 | 80.10%–80.79% | Hosted Ubuntu 为 `10688 / 13344`；macOS 为 `10688 / 13230` |
-| 总行覆盖率 | 96.70% | Hosted Ubuntu CI 的 `make coverage-total` 实测为 `27295 / 28226` |
+| Contract / component | 15 | 5 个 contract targets，由 inventory 防漏 |
+| 最终二进制 E2E | 78 | 三平台运行 3 个 portable CLI/Provider/SQLite 场景，Linux/macOS 运行 75 个 Unix headless、Provider、tool/recovery、公开边界和真实 PTY 场景 |
+| UT-only 行覆盖率 | 95.05% | 当前 macOS 工作区 `make coverage-unit` 实测 `26830 / 28226` |
+| 最终二进制 E2E 行覆盖率 | 80.78% | 当前 macOS 工作区两个 E2E target 合计实测 `10687 / 13230` |
+| 总行覆盖率 | 96.65% | 当前 macOS 工作区 `make coverage-total` 实测 `27280 / 28226` |
 
 ### 2.2 当前剩余问题
 
@@ -58,7 +58,7 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 3. **Provider 协议保真层未落地**：scripted Provider 已能证明产品行为，但 cassette replay 与 live canary 仍待实现。
 4. **release 只构建不启动**：artifact 存在不等于产物可以启动、解析配置和输出稳定 JSON。
 5. **失败证据尚未打包成 artifact**：harness 已持有 stdout、stderr、PTY transcript、Provider request log 和最终投影，但 CI 还没有在失败时统一上传。
-6. **required 激活仍是外部动作**：workflow 已配置 Linux/macOS E2E 和 fail-closed `PR Gate`，但还需要两平台各连续 10 次零 flake，并在 GitHub branch protection/ruleset 中实际把 `PR Gate` 设为 required；仓库内文件不能证明远端设置已启用。
+6. **required 激活仍是外部动作**：workflow 已配置完整三平台矩阵和 fail-closed `PR Gate`，但各适用平台仍需连续 10 次零 flake，并在 GitHub branch protection/ruleset 中实际把 `PR Gate` 设为 required；仓库内文件不能证明远端设置已启用。
 
 ## 3. 三层测试边界
 
@@ -113,10 +113,10 @@ Provider E2E 的判定标准是生产 Provider adapter、序列化、HTTP/SSE pa
 
 | 卡点 | 触发时机 | 阻断 | 内容 | 目标预算 |
 | --- | --- | --- | --- | ---: |
-| G0 Static | 每个 PR | 是 | fmt、check、Clippy、Rustdoc、architecture/repo checks | 3 min |
+| G0 Static | 每个 PR | 是 | fmt、三平台 check/Clippy、Rustdoc、actionlint、ShellCheck、MSRV、architecture/repo checks、依赖审计 | 3 min |
 | G1 UT | 每个 PR | 是 | 所有纯 crate-local UT；全仓 UT-only 行覆盖率 >= 95% | 2 min |
 | G2 Contract | 每个 PR | 是 | SQLite、FS、process、scripted/cassette Provider、公开 API、doc tests | 5 min |
-| G3 E2E | 每个 PR | 是 | 最终二进制 + loopback Provider 的 P0 headless，以及 TUI/PTY，Linux/macOS；独立行覆盖率 >= 80% | 5 min/OS |
+| G3 E2E | 每个 PR | 是 | 三平台 portable 最终二进制 CLI/Provider/SQLite；Linux/macOS 完整 headless + TUI/PTY；独立行覆盖率 >= 80% | 5 min/OS |
 | G4 Coverage | 每个 PR | 是 | workspace/all-features/all-targets，总行覆盖率 >= 90% | 5 min |
 | G5 Release smoke | release workflow | 是 | 各平台 release artifact 启动、help、JSON list | 2 min/OS |
 | Extended | nightly/manual | 否于 PR | 重复运行、长时取消、边界尺寸矩阵、live canary | 15 min |
@@ -127,11 +127,12 @@ Provider E2E 的判定标准是生产 Provider adapter、序列化、HTTP/SSE pa
 
 `.github/workflows/ci.yml` 仅由 `main` push、面向 `main` 的 PR（`opened`、`synchronize`、`reopened`、`edited`、`ready_for_review`）、`merge_group` 和手工触发。`edited` 防止 PR 修改目标分支并重新指向 `main` 后缺失 required check。每个底层 job 都有稳定名称和超时，required 路径没有 path filter、条件 skip 或自动 rerun：
 
-- Linux/macOS 分别运行 Static、UT、Contract 和 E2E；Documentation、Dependency audit 和 Windows compile 也独立可见；
+- Linux、macOS、Windows 分别运行 check、Clippy、UT、Contract、portable E2E 和 release build；Linux/macOS 另外运行 Unix PTY/process E2E target；
+- Repository quality 运行 fmt、Rustdoc、inventory、actionlint 和 ShellCheck；Rust 1.93 MSRV、Documentation tests 和 Dependency audit 独立可见；
 - `Coverage - UT (95%)`、`Coverage - E2E (80%)`、`Coverage - total (90%)` 是三个独立 job，不能互相补足；
-- 稳定状态 `PR Gate` 以 job-level `always()` 等待所有 G0-G4/Windows 必需 job，并逐个要求 `needs.<job>.result == success`；任何 failure、cancelled 或 skipped 都失败；
+- 稳定状态 `PR Gate` 以 job-level `always()` 等待全部 14 个必需 job，并逐个要求 `needs.<job>.result == success`；任何 failure、cancelled 或 skipped 都失败；
 - PR 的新提交取消同一 PR 的旧运行，`main` 和 merge queue 运行不取消，以免丢失主干/合并队列证据；
-- release build 只在 `main` push 或手工触发时运行，不进入 `PR Gate`。它目前不是 G5 release smoke。
+- 三平台 release build 是 `PR Gate` 依赖；它证明 artifact 可构建并上传，但目前仍不是 G5 release smoke。
 
 推荐 branch protection/ruleset 只要求稳定的 `PR Gate`，同时保留底层状态用于定位。该远端设置不由 workflow 文件创建；只有在 GitHub 实际配置 required check 后，本设计中的 PR 阻断才算激活。
 
@@ -142,7 +143,10 @@ Makefile 当前提供以下稳定入口：
 ```text
 make test-unit
 make test-contract
+make test-e2e-portable
+make test-e2e-unix
 make test-e2e
+make lint-ci
 make test-doc
 make test-all
 make coverage
@@ -156,8 +160,10 @@ crates/latte-code/tests/
   contract.rs
   contract/
     cli.rs
-  e2e.rs
+  e2e_portable.rs
+  e2e_unix.rs
   e2e/
+    portable.rs
     support.rs
     headless.rs
     provider.rs
@@ -168,9 +174,12 @@ crates/latte-code/tests/
   markdown_links.rs
 ```
 
-- `test-unit`：`cargo test --workspace --lib --bins --all-features`；
+- `test-unit`：`cargo test --workspace --lib --bins --all-features --locked`；
 - `test-contract`：运行各 crate 的公开 contract/component targets；
-- `test-e2e`：运行单一 `e2e` target；每个 headless、recovery 和 PTY 场景完全隔离，可由 Rust test harness 并行调度；
+- `test-e2e-portable`：在 Linux、macOS、Windows 运行 3 个跨平台 CLI/Provider/SQLite 旅程；
+- `test-e2e-unix`：在 Linux/macOS 运行 75 个 Unix headless、recovery、process 和 PTY 场景；
+- `test-e2e`：在 Unix 组合两个 E2E target；
+- `lint-ci`：本地运行 actionlint 和 ShellCheck；本机没有工具时使用固定版本容器；
 - `test-doc`：运行 workspace doc tests；
 - `test-all`：组合以上所有层；
 - `test-inventory`（由 repo check 承担）：保证新增 `tests/*.rs` target 被归入已知层，禁止悄悄遗漏。
@@ -361,15 +370,15 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 ### 8.2 Flake
 
 - required gate 不自动 rerun；第一次失败即失败；
-- 新 E2E 在进入 required 前，Linux/macOS 各连续运行至少 10 次且零 flake；
+- 新 portable E2E 在进入 required 前，Linux、macOS、Windows 各连续运行至少 10 次且零 flake；新 Unix E2E 则在 Linux/macOS 各连续运行至少 10 次且零 flake；
 - quarantine 必须带 issue、owner、失效日期和替代保护，安全/权限/恢复 P0 场景不得 quarantine；
 - 任何 hang 都按测试失败处理，不能无限等待；
 - 禁止以扩大 sleep 作为默认 flake 修复。
 
 ### 8.3 平台
 
-- Linux/macOS：UT、Contract、完整 headless/TUI E2E；
-- Windows：目标状态运行纯 UT；当前 PR/merge queue 保留 all-target compile，release build 仅在 `main` push 或手工触发；
+- Linux/macOS：check、Clippy、UT、Contract、portable E2E、完整 Unix headless/TUI E2E 和 release build；
+- Windows：check、Clippy、UT、Contract、portable 最终二进制 E2E 和 release build；进程监督仍 fail closed，不宣称已支持；
 - Unix-only process/PTY 场景必须明确 `cfg(unix)`，并分别在 Linux/macOS 执行；
 - 平台未测试的能力不能在文档中宣称支持。
 
@@ -397,7 +406,7 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 4. 对 integration target 做 inventory check；
 5. 保持 `make ci` 为唯一完整本地卡点。
 
-完成状态：仓库内实现已完成。测试 target 已按层拆分并由 inventory 防漏；最终二进制 E2E 和三项 coverage 已进入独立 job，`PR Gate` 严格聚合所有 G0-G4/Windows 必需状态，`make ci` 保持完整本地卡点。GitHub branch protection/ruleset 仍需在远端实际启用 `PR Gate`，不能仅凭本文件宣称 required 已激活。当前测试数与覆盖率以本节上方的最新实测基线为准。
+完成状态：仓库内实现已完成。测试 target 已按层和平台边界拆分并由 inventory 防漏；三平台 portable E2E、Linux/macOS Unix E2E、release build、静态分析、MSRV 和三项 coverage 都是独立 job。`PR Gate` 严格聚合全部 14 个必需状态，`make ci` 保持完整 Unix 本地卡点。GitHub branch protection/ruleset 仍需在远端实际启用 `PR Gate`，不能仅凭本文件宣称 required 已激活。当前测试数与覆盖率以本节上方的最新实测基线为准。
 
 ### Phase 2：补齐 P0 用户旅程
 
@@ -427,7 +436,7 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 一个测试或 job 只有同时满足以下条件，才能从 shadow 变成 required：
 
 1. 本地有稳定、文档化的单命令入口；
-2. Linux/macOS 目标平台各连续运行至少 10 次无 flake；
+2. 每个适用目标平台连续运行至少 10 次无 flake：portable E2E 为 Linux/macOS/Windows，Unix E2E 为 Linux/macOS；
 3. 超时、child cleanup 和 PTY drain 有明确上限；
 4. 失败时能给出足够的脱敏证据；
 5. 不依赖公网、真实 Provider 或开发者个人配置；
@@ -441,6 +450,8 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 
 - 已重组测试目录并增加 Scenario、严格 scripted Provider 和 Drop-safe PTY harness；
 - 已增加 Makefile/CI 分层入口和 integration target inventory；
+- 已把最终二进制 E2E 拆成三平台 portable target 和 Linux/macOS Unix PTY/process target，原 75 个 Unix 场景没有丢失；
+- 已增加三平台 check、Clippy、UT、Contract、portable E2E、release build，以及 Rust 1.93 MSRV、actionlint、ShellCheck 和 locked Cargo 解析；
 - 已将 CI coverage 拆为三个独立状态，并增加 fail-closed `PR Gate`、PR 并发取消与 merge queue 触发契约；远端 required 设置仍待实际配置；
 - 已迁移现有测试且保留断言；最终二进制场景现覆盖配置、Provider、工具、权限链、跨进程 resume、验证、公开 lifecycle/boundary、legacy migration 和真实 PTY；
 - 只读工具循环暴露出 v1 checkpoint 会把文件 secret 原样回传 Provider；现已在持久化和 Provider 重入前复用统一 redactor，并增加 legacy checkpoint normalization 回归 UT；
@@ -454,9 +465,9 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 
 本设计不是从空白假设测试能力：
 
-- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，Hosted Ubuntu 的 UT-only profile 为 95.11%；
-- 当前独立 `contract` 与 `e2e` targets 共 88 个 integration tests，其中最终二进制 E2E 75 个；
-- 三个 Hosted llvm-cov profile 均通过：UT-only 95.11%、Ubuntu 最终二进制 E2E 80.10%、全 targets 96.70%；macOS E2E profile 为 80.79%；
+- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，当前 UT-only profile 为 95.05%；
+- 当前独立 Contract 与 E2E targets 共 93 个 integration tests：15 个 Contract、3 个 portable 最终二进制 E2E 和 75 个 Unix 最终二进制 E2E；
+- 当前 macOS 三项 profile 独立通过：UT-only 95.05%、E2E 80.78%、全 targets 96.65%；
 - 最终二进制、loopback Provider、真实 PTY、跨进程 SQLite resume 和 terminal mode restore 都已有可复用实现；
 - Provider endpoint 已可指向 loopback harness，因此 cassette replay 可以复用同一最终二进制路径，不要求生产后门；
 - runtime 已有 process `Started`、Unknown、restart recovery 和 reconciliation 的 component tests，外部 barrier E2E 是把既有语义提升到最终二进制边界，不要求新增生产后门；

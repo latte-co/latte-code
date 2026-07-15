@@ -17,68 +17,190 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  static:
-    name: Static (${{ matrix.os }})
+  repository-quality:
+    name: Repository quality
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - run: make test-inventory
+      - name: ShellCheck
+        run: docker run --rm -v "${PWD}:/repo" -w /repo koalaman/shellcheck:v0.11.0 scripts/*.sh
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+
+  platform-check:
+    name: Check (${{ matrix.label }})
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  platform-clippy:
+    name: Clippy (${{ matrix.label }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, llvm-tools-preview
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   unit-tests:
-    name: UT (${{ matrix.os }})
-    timeout-minutes: 20
+    name: UT (${{ matrix.label }})
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: make test-unit
+      - run: cargo test --workspace --lib --bins --all-features --locked
 
   contract-tests:
-    name: Contract (${{ matrix.os }})
-    timeout-minutes: 20
+    name: Contract (${{ matrix.label }})
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: make test-inventory
-      - run: make test-contract
+      - run: cargo test -p latte-core --test contracts --all-features --locked
+      - run: cargo test -p latte-engine --test public_lifecycle --all-features --locked
+      - run: cargo test -p latte-code --test architecture --test contract --test markdown_links --all-features --locked
 
-  e2e-tests:
-    name: E2E (${{ matrix.os }})
-    timeout-minutes: 30
+  e2e-portable:
+    name: E2E portable (${{ matrix.label }})
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: make test-e2e
+      - run: cargo test -p latte-code --test e2e_portable --all-features --locked
+
+  e2e-unix:
+    name: E2E Unix PTY/process (${{ matrix.label }})
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+          - os: macos-latest
+            label: macOS
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p latte-code --test e2e_unix --all-features --locked
+
+  release-build:
+    name: Release build (${{ matrix.label }})
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+            artifact: latte-code-linux-x86_64
+            binary: target/release/latte-code
+          - os: macos-latest
+            label: macOS
+            artifact: latte-code-macos-arm64
+            binary: target/release/latte-code
+          - os: windows-latest
+            label: Windows
+            artifact: latte-code-windows-x86_64
+            binary: target/release/latte-code.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p latte-code --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+
+  msrv:
+    name: MSRV (Rust 1.93)
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-1.93
+      - run: cargo check --workspace --all-targets --all-features --locked
 
   doc-tests:
     name: Documentation tests
@@ -88,11 +210,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: make test-doc
+      - run: cargo test --workspace --doc --all-features --locked
 
   coverage-unit:
     name: Coverage - UT (95%)
-    timeout-minutes: 30
+    timeout-minutes: 35
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +227,7 @@ jobs:
 
   coverage-e2e:
     name: Coverage - E2E (80%)
-    timeout-minutes: 30
+    timeout-minutes: 40
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +240,7 @@ jobs:
 
   coverage-total:
     name: Coverage - total (90%)
-    timeout-minutes: 40
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,18 +259,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-deny
-      - run: cargo deny check
-
-  windows-compile:
-    name: Windows compile
-    timeout-minutes: 20
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Process supervision and safe mutation fail closed at runtime on non-Unix.
-      - run: cargo check --workspace --all-targets --all-features
+      - run: cargo deny --locked check
 
   pr-gate:
     name: PR Gate
@@ -156,43 +267,55 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     needs:
-      - static
+      - repository-quality
+      - platform-check
+      - platform-clippy
       - unit-tests
       - contract-tests
-      - e2e-tests
+      - e2e-portable
+      - e2e-unix
+      - release-build
+      - msrv
       - doc-tests
       - coverage-unit
       - coverage-e2e
       - coverage-total
       - dependency-audit
-      - windows-compile
     steps:
       - name: Require every merge gate to succeed
         shell: bash
         env:
-          STATIC_RESULT: ${{ needs.static.result }}
+          REPOSITORY_QUALITY_RESULT: ${{ needs.repository-quality.result }}
+          PLATFORM_CHECK_RESULT: ${{ needs.platform-check.result }}
+          PLATFORM_CLIPPY_RESULT: ${{ needs.platform-clippy.result }}
           UNIT_RESULT: ${{ needs.unit-tests.result }}
           CONTRACT_RESULT: ${{ needs.contract-tests.result }}
-          E2E_RESULT: ${{ needs.e2e-tests.result }}
+          E2E_PORTABLE_RESULT: ${{ needs.e2e-portable.result }}
+          E2E_UNIX_RESULT: ${{ needs.e2e-unix.result }}
+          RELEASE_BUILD_RESULT: ${{ needs.release-build.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
           DOC_RESULT: ${{ needs.doc-tests.result }}
           COVERAGE_UNIT_RESULT: ${{ needs.coverage-unit.result }}
           COVERAGE_E2E_RESULT: ${{ needs.coverage-e2e.result }}
           COVERAGE_TOTAL_RESULT: ${{ needs.coverage-total.result }}
           DEPENDENCY_AUDIT_RESULT: ${{ needs.dependency-audit.result }}
-          WINDOWS_COMPILE_RESULT: ${{ needs.windows-compile.result }}
         run: |
           failed=0
           for result_name in \
-            STATIC_RESULT \
+            REPOSITORY_QUALITY_RESULT \
+            PLATFORM_CHECK_RESULT \
+            PLATFORM_CLIPPY_RESULT \
             UNIT_RESULT \
             CONTRACT_RESULT \
-            E2E_RESULT \
+            E2E_PORTABLE_RESULT \
+            E2E_UNIX_RESULT \
+            RELEASE_BUILD_RESULT \
+            MSRV_RESULT \
             DOC_RESULT \
             COVERAGE_UNIT_RESULT \
             COVERAGE_E2E_RESULT \
             COVERAGE_TOTAL_RESULT \
-            DEPENDENCY_AUDIT_RESULT \
-            WINDOWS_COMPILE_RESULT
+            DEPENDENCY_AUDIT_RESULT
           do
             result="${!result_name}"
             if [[ "$result" != "success" ]]; then
@@ -201,32 +324,3 @@ jobs:
             fi
           done
           exit "$failed"
-
-  release-build:
-    name: Release build (${{ matrix.os }})
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: latte-code-linux-x86_64
-            binary: target/release/latte-code
-          - os: macos-latest
-            artifact: latte-code-macos-arm64
-            binary: target/release/latte-code
-          - os: windows-latest
-            artifact: latte-code-windows-x86_64
-            binary: target/release/latte-code.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p latte-code
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.binary }}
-          if-no-files-found: error

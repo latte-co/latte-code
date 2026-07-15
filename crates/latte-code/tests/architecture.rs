@@ -60,16 +60,20 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
     assert!(workflow.contains("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"));
 
     for (job, name) in [
-        ("static", "Static (${{ matrix.os }})"),
-        ("unit-tests", "UT (${{ matrix.os }})"),
-        ("contract-tests", "Contract (${{ matrix.os }})"),
-        ("e2e-tests", "E2E (${{ matrix.os }})"),
+        ("repository-quality", "Repository quality"),
+        ("platform-check", "Check (${{ matrix.label }})"),
+        ("platform-clippy", "Clippy (${{ matrix.label }})"),
+        ("unit-tests", "UT (${{ matrix.label }})"),
+        ("contract-tests", "Contract (${{ matrix.label }})"),
+        ("e2e-portable", "E2E portable (${{ matrix.label }})"),
+        ("e2e-unix", "E2E Unix PTY/process (${{ matrix.label }})"),
+        ("release-build", "Release build (${{ matrix.label }})"),
+        ("msrv", "MSRV (Rust 1.93)"),
         ("doc-tests", "Documentation tests"),
         ("coverage-unit", "Coverage - UT (95%)"),
         ("coverage-e2e", "Coverage - E2E (80%)"),
         ("coverage-total", "Coverage - total (90%)"),
         ("dependency-audit", "Dependency audit"),
-        ("windows-compile", "Windows compile"),
     ] {
         let header = format!("  {job}:\n    name: {name}\n    timeout-minutes:");
         assert!(
@@ -85,28 +89,80 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
     ] {
         assert!(workflow.contains(command), "missing independent {command}");
     }
+    assert!(workflow.contains("uses: docker://rhysd/actionlint:1.7.12"));
+    assert!(workflow.contains("koalaman/shellcheck:v0.11.0 scripts/*.sh"));
+    assert!(workflow.contains("toolchain: 1.93.0"));
+
+    for line in workflow.lines().filter(|line| line.contains("run: cargo ")) {
+        if !line.contains("cargo fmt") {
+            assert!(
+                line.contains("--locked"),
+                "unlocked Cargo CI command: {line}"
+            );
+        }
+    }
+
+    let section = |job: &str, next: &str| {
+        let start = workflow
+            .find(&format!("  {job}:\n"))
+            .unwrap_or_else(|| panic!("missing {job}"));
+        let end = workflow[start..]
+            .find(&format!("\n  {next}:\n"))
+            .map_or(workflow.len(), |offset| start + offset);
+        &workflow[start..end]
+    };
+    for job in [
+        "platform-check",
+        "platform-clippy",
+        "unit-tests",
+        "contract-tests",
+        "e2e-portable",
+        "release-build",
+    ] {
+        let next = match job {
+            "platform-check" => "platform-clippy",
+            "platform-clippy" => "unit-tests",
+            "unit-tests" => "contract-tests",
+            "contract-tests" => "e2e-portable",
+            "e2e-portable" => "e2e-unix",
+            "release-build" => "msrv",
+            _ => unreachable!(),
+        };
+        let platform_job = section(job, next);
+        for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
+            assert!(platform_job.contains(os), "{job} does not run on {os}");
+        }
+    }
+    let portable = section("e2e-portable", "e2e-unix");
+    assert!(portable.contains("--test e2e_portable"));
+    let unix = section("e2e-unix", "release-build");
+    assert!(unix.contains("--test e2e_unix"));
+    assert!(unix.contains("ubuntu-latest"));
+    assert!(unix.contains("macos-latest"));
+    assert!(!unix.contains("windows-latest"));
 
     let pr_gate_start = workflow.find("  pr-gate:\n").expect("PR Gate job");
     assert!(!workflow[..pr_gate_start].contains("\n    if:"));
-    let release_start = workflow
-        .find("  release-build:\n")
-        .expect("release build job");
-    let pr_gate = &workflow[pr_gate_start..release_start];
+    let pr_gate = &workflow[pr_gate_start..];
     assert!(pr_gate.contains("    name: PR Gate\n"));
     assert!(pr_gate.contains("    if: ${{ always() }}\n"));
     assert!(pr_gate.contains("    timeout-minutes: 5\n"));
 
     let required_jobs = [
-        "static",
+        "repository-quality",
+        "platform-check",
+        "platform-clippy",
         "unit-tests",
         "contract-tests",
-        "e2e-tests",
+        "e2e-portable",
+        "e2e-unix",
+        "release-build",
+        "msrv",
         "doc-tests",
         "coverage-unit",
         "coverage-e2e",
         "coverage-total",
         "dependency-audit",
-        "windows-compile",
     ];
     let needs_start = pr_gate.find("    needs:\n").expect("PR Gate needs");
     let steps_start = pr_gate.find("    steps:\n").expect("PR Gate steps");
@@ -127,12 +183,21 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
         );
     }
     assert!(pr_gate.contains("if [[ \"$result\" != \"success\" ]]"));
-    assert!(!pr_gate.contains("release-build"));
+    assert!(pr_gate.contains("${{ needs.release-build.result }}"));
+}
 
-    let release = &workflow[release_start..];
-    assert!(release.contains("    name: Release build (${{ matrix.os }})\n"));
-    assert!(release.contains("    timeout-minutes: 30\n"));
-    assert!(release.contains(
-        "    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}\n"
-    ));
+#[test]
+fn portable_and_unix_e2e_targets_have_explicit_platform_boundaries() {
+    let portable = include_str!("e2e_portable.rs");
+    let unix = include_str!("e2e_unix.rs");
+    let portable_scenarios = include_str!("e2e/portable.rs");
+    let support = include_str!("e2e/support.rs");
+
+    assert!(!portable.contains("cfg(unix)"));
+    assert!(portable.contains("e2e/portable.rs"));
+    assert!(support.contains("CARGO_BIN_EXE_latte-code"));
+    assert!(portable_scenarios.contains("ScriptedProvider"));
+    assert!(portable_scenarios.contains("database_path"));
+    assert!(unix.starts_with("#![cfg(unix)]"));
+    assert!(unix.contains("e2e/mod.rs"));
 }

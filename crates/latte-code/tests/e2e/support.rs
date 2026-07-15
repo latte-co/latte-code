@@ -162,6 +162,7 @@ fn bounded_output(mut command: Command, timeout: Duration) -> Output {
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
+    #[cfg(unix)]
     let process_group = i32::try_from(child.id()).unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();

@@ -24,10 +24,12 @@ E2E 不能代替 UT，Contract/Component 测试也不能冒充 E2E。没有对�
 | --- | --- | --- |
 | UT | 对应 crate 的 `src/**/*.rs` 内 `#[cfg(test)]` 模块 | `make test-unit` |
 | Contract/Component | `crates/*/tests/*.rs` | `make test-contract` |
-| 最终二进制 E2E | `crates/latte-code/tests/e2e/` | `make test-e2e` |
+| portable 最终二进制 E2E | `crates/latte-code/tests/e2e/portable.rs` | `make test-e2e-portable` |
+| Unix 最终二进制 E2E | 由 `e2e/mod.rs` 注册的 `crates/latte-code/tests/e2e/*.rs` | `make test-e2e-unix` |
 
 E2E 按用户旅程放置：
 
+- `portable.rs`：必须在 Linux、macOS、Windows 执行的跨平台 CLI、loopback Provider 和 SQLite 旅程；
 - `headless.rs`、`headless_matrix.rs`、`runtime_convergence.rs`：CLI、配置、JSON envelope、多轮只读工具、跨进程收敛和 secret non-egress；
 - `provider.rs`：HTTP 状态、重试、超时、SSE、stream fallback 和 wire 兼容失败；
 - `tools.rs`、`permission_chain.rs`、`runtime.rs`：最终二进制驱动的工具矩阵、alias、权限链、进程监督和 durable tool round；
@@ -37,7 +39,7 @@ E2E 按用户旅程放置：
 - `support.rs`：`Scenario`、`ScriptedProvider`、`PtySession`、有界等待和进程清理；
 - `mod.rs`：模块注册，不在这里堆叠场景实现。
 
-新增场景应放入最接近的现有文件。只有形成新的稳定用户旅程类别时才新增模块，并同步 `e2e/mod.rs`。
+新增场景应放入最接近的现有文件。只有整个行为都受三平台支持时才能放入 `portable.rs`；PTY、Unix signal/process group、symlink 语义、可执行 verification 或其他 Unix 假设必须进入 Unix suite。只有形成新的稳定 Unix 用户旅程类别时才新增模块，并同步 `e2e/mod.rs`。
 
 公开 Engine fixture 只用于制造当前最终二进制尚无命令可创建的合法生命周期状态。fixture 必须只调用公开 authority API，不能写私有 SQLite 表；测试结论仍必须由新的最终 CLI/TUI 进程及其用户可见输出验收。旧 schema migration fixture 可以创建历史 schema 数据，但只能用于兼容性场景，不能用来绕过当前 authority 规则。
 
@@ -91,7 +93,13 @@ UT 应直接覆盖：
 
 不要为了提高覆盖率把 SQLite、socket、真实子进程或 PTY 塞进 UT；这些属于 Contract/Component 或 E2E。
 
-### 4.3 再补最终二进制 E2E
+### 4.3 先选择平台边界
+
+只依赖 CLI JSON、SQLite 和 loopback HTTP 即可证明的旅程优先进入 portable suite。由于非 Unix 进程监督会主动 fail closed，portable Provider 场景必须在 Windows 进入进程 verification 前结束，例如持久化 input request 或 typed terminal Provider failure。禁止用 `cfg`、ignored test 或运行时 skip 隐藏 portable target 的失败。
+
+行为本身依赖 PTY、signal、process group、symlink 或可执行 verification 时进入 Unix suite。下面的 completion 示例会执行 `/usr/bin/true` 作为 verification，因此属于 Unix-only 场景。
+
+### 4.4 再补最终二进制 E2E
 
 Headless 场景的基本结构：
 
@@ -184,11 +192,11 @@ TUI E2E 使用 `PtySession`：
 
 ### 7.1 统计口径
 
-UT 覆盖率只运行 crate-local lib/bin tests，不包含 Contract、E2E 或 doc tests；E2E 覆盖率只运行最终二进制 `e2e` target。两个 profile 每次独立清理和采集：
+UT 覆盖率只运行 crate-local lib/bin tests，不包含 Contract、E2E 或 doc tests；E2E 覆盖率只运行 portable 与 Unix 两个最终二进制 target。两个 profile 每次独立清理和采集：
 
 ```bash
 make coverage-unit # --lib --bins --fail-under-lines 95
-make coverage-e2e  # --test e2e --fail-under-lines 80
+make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
 ```
 
 需要定位未覆盖行时生成 HTML：
@@ -220,7 +228,7 @@ E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内
 - 使用事件、公开 projection、文件出现或 Provider call 作为 barrier；
 - 每个等待都有上限，失败时输出足够证据；
 - required E2E 不允许 `#[ignore]`、条件 skip、真实网络和真实凭证；
-- 新增 E2E 在升级为 required 前，应在 Linux/macOS 各连续运行 10 次零 flake。
+- 新增 portable E2E 在升级为 required 前，应在 Linux、macOS、Windows 各连续运行 10 次零 flake；新增 Unix E2E 则在 Linux/macOS 各连续运行 10 次零 flake。
 
 ## 9. 完成前检查清单
 
@@ -235,6 +243,6 @@ E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内
 - [ ] 权限、安全、恢复、验证行为有显式负向断言；
 - [ ] E2E 不依赖公网、真实 key、固定 sleep 或 `#[ignore]`；
 - [ ] child/process group、PTY 和 Provider fixture 能在失败时清理；
-- [ ] `make test-unit`、`make test-contract`、`make test-e2e` 通过；
+- [ ] `make test-unit`、`make test-contract` 与适用的 portable/Unix E2E target 通过；
 - [ ] `make coverage` 和 `make ci` 通过；
 - [ ] 中英文行为文档同步更新。

@@ -20,7 +20,7 @@ Final rules:
 
 - Every PR must pass UT, Contract, P0 E2E, and three independent line-coverage gates: UT-only >= 95%, final-binary E2E >= 80%, and all-target >= 90%. New or modified functional code must also be reached directly by its corresponding UT and E2E.
 - Blocking CI must not contact a real Provider, depend on the public network, or consume real API keys.
-- Linux and macOS run complete E2E on PRs. While Windows runtime capabilities remain fail-closed, Windows compilation is a PR gate. Release builds run only for `main` pushes or manual dispatch and are outside the PR gate.
+- Linux, macOS, and Windows run check, Clippy, UT, Contract, portable final-binary E2E, and release-build gates on every PR. Linux and macOS additionally run the Unix PTY/process E2E suite. This validates every applicable surface without claiming unsupported Windows process supervision.
 - Safety, permission, recovery, and verification behavior require explicit positive and negative assertions; coverage alone is insufficient.
 - New gates move through `draft -> shadow -> required`; planned protection must never be reported as active protection.
 
@@ -34,8 +34,8 @@ The repository and CI already provide:
 - `cargo fmt`, Clippy, Rustdoc, and `cargo deny`;
 - `cargo test --workspace --all-targets --all-features`;
 - `cargo llvm-cov ... --fail-under-lines 90`;
-- native Ubuntu and macOS tests plus Windows compilation;
-- `main` PR/merge-queue triggers, three independent coverage jobs, and a `PR Gate` aggregating every required G0-G4/Windows job;
+- native Linux, macOS, and Windows check, Clippy, UT, Contract, portable E2E, and release builds, plus Linux/macOS Unix PTY/process E2E;
+- actionlint, ShellCheck, Rust 1.93 MSRV, dependency audit, locked dependency resolution, three independent coverage jobs, and a `PR Gate` aggregating every required job;
 - final-binary CLI tests, loopback mock HTTP, and real PTY tests;
 - real SQLite/temp workspaces, process groups, permission, recovery, and TUI reducer tests.
 
@@ -43,13 +43,13 @@ Measured baseline on 2026-07-15:
 
 | Metric | Current value | Notes |
 | --- | ---: | --- |
-| Cargo-discovered tests | 348 | 245 crate-local, 13 contract, 75 final-binary E2E, and 15 documentation tests |
+| Cargo-discovered tests | 353 | 245 crate-local, 15 contract, 3 portable E2E, 75 Unix E2E, and 15 documentation tests |
 | Crate-local tests | 245 | Independent `--lib --bins` profile; existing inline tests still contain some component behavior to purify |
-| Contract / component | 13 | Five contract targets protected by the inventory check |
-| Final-binary E2E | 75 | One `e2e` target covering headless, Provider, tool/recovery, public boundaries, and real PTYs |
-| UT-only line coverage | 95.11% | Hosted Ubuntu CI measured `26847 / 28226` from `make coverage-unit` |
-| Final-binary E2E line coverage | 80.10%-80.79% | Hosted Ubuntu measured `10688 / 13344`; macOS measured `10688 / 13230` |
-| Total line coverage | 96.70% | Hosted Ubuntu CI measured `27295 / 28226` from `make coverage-total` |
+| Contract / component | 15 | Five contract targets protected by the inventory check |
+| Final-binary E2E | 78 | Three portable CLI/Provider/SQLite scenarios on all platforms plus 75 Unix headless, Provider, tool/recovery, public-boundary, and real-PTY scenarios |
+| UT-only line coverage | 95.05% | Current macOS working tree measured `26830 / 28226` from `make coverage-unit` |
+| Final-binary E2E line coverage | 80.78% | Current macOS working tree measured `10687 / 13230` across both E2E targets |
+| Total line coverage | 96.65% | Current macOS working tree measured `27280 / 28226` from `make coverage-total` |
 
 ### 2.2 Current remaining gaps
 
@@ -58,7 +58,7 @@ Measured baseline on 2026-07-15:
 3. **The Provider fidelity layer is not implemented**: the scripted Provider proves product behavior, while cassette replay and a live canary remain planned.
 4. **Release jobs build without starting artifacts**: file existence does not prove that the artifact starts, resolves configuration, or emits stable JSON.
 5. **Failure evidence is not packaged as an artifact**: the harness now holds stdout, stderr, PTY transcripts, Provider request logs, and final projections, but CI does not upload them together on failure yet.
-6. **Required activation remains an external action**: the workflow has Linux/macOS E2E and a fail-closed `PR Gate`, but each platform still needs ten consecutive flake-free runs and GitHub branch protection/rulesets must actually require `PR Gate`. Repository files cannot prove that remote setting is active.
+6. **Required activation remains an external action**: the workflow has the full three-platform matrix and a fail-closed `PR Gate`, but each applicable platform still needs ten consecutive flake-free runs and GitHub branch protection/rulesets must actually require `PR Gate`. Repository files cannot prove that remote setting is active.
 
 ## 3. Test-layer boundaries
 
@@ -113,10 +113,10 @@ A Provider E2E test is defined by running the production Provider adapter, seria
 
 | Gate | Trigger | Blocking | Content | Target budget |
 | --- | --- | --- | --- | ---: |
-| G0 Static | Every PR | Yes | fmt, check, Clippy, Rustdoc, architecture/repo checks | 3 min |
+| G0 Static | Every PR | Yes | fmt, three-platform check/Clippy, Rustdoc, actionlint, ShellCheck, MSRV, architecture/repo checks, dependency audit | 3 min |
 | G1 UT | Every PR | Yes | All pure crate-local UT; workspace UT-only line coverage >= 95% | 2 min |
 | G2 Contract | Every PR | Yes | SQLite, FS, process, scripted/cassette Provider, public API, doc tests | 5 min |
-| G3 E2E | Every PR | Yes | Final binary + loopback Provider for P0 headless, plus TUI/PTY on Linux/macOS; independent line coverage >= 80% | 5 min/OS |
+| G3 E2E | Every PR | Yes | Portable final-binary CLI/Provider/SQLite on all three platforms; complete headless + TUI/PTY on Linux/macOS; independent line coverage >= 80% | 5 min/OS |
 | G4 Coverage | Every PR | Yes | workspace/all-features/all-targets, total lines >= 90% | 5 min |
 | G5 Release smoke | Release workflow | Yes | Start each release artifact, help, JSON list | 2 min/OS |
 | Extended | Nightly/manual | No for PRs | Repetition, long cancellation, boundary-size matrix, live canary | 15 min |
@@ -127,11 +127,12 @@ Budgets are upper bounds, not time to consume with `sleep`. Jobs should run in p
 
 `.github/workflows/ci.yml` runs only for `main` pushes, PRs targeting `main` (`opened`, `synchronize`, `reopened`, `edited`, and `ready_for_review`), `merge_group`, and manual dispatch. The `edited` event prevents a missing required check when a PR is retargeted to `main`. Every underlying job has a stable name and timeout; required paths have no path filter, conditional skip, or automatic rerun:
 
-- Linux and macOS independently run Static, UT, Contract, and E2E; Documentation, Dependency audit, and Windows compile remain independently visible.
+- Linux, macOS, and Windows independently run check, Clippy, UT, Contract, portable E2E, and release build. Linux and macOS additionally run the Unix PTY/process E2E target.
+- Repository quality runs fmt, Rustdoc, inventory, actionlint, and ShellCheck; Rust 1.93 MSRV, documentation tests, and dependency audit remain independently visible.
 - `Coverage - UT (95%)`, `Coverage - E2E (80%)`, and `Coverage - total (90%)` are separate jobs and cannot compensate for one another.
-- The stable `PR Gate` status uses job-level `always()` to wait for every required G0-G4/Windows job, then explicitly requires every `needs.<job>.result` to equal `success`. A failure, cancellation, or skip fails the gate.
+- The stable `PR Gate` status uses job-level `always()` to wait for all 14 required jobs, then explicitly requires every `needs.<job>.result` to equal `success`. A failure, cancellation, or skip fails the gate.
 - A new PR commit cancels the older run for that PR. `main` and merge-queue runs are never cancelled, preserving trunk and queue evidence.
-- Release builds run only for `main` pushes or manual dispatch and are not dependencies of `PR Gate`. They are not yet G5 release smoke.
+- Three-platform release builds are dependencies of `PR Gate`. They prove artifact compilation and upload, but are not yet G5 release smoke.
 
 Branch protection or a ruleset should require only the stable `PR Gate` status while leaving underlying statuses visible for diagnosis. The workflow cannot create that remote setting; PR blocking is active only after GitHub is actually configured to require the check.
 
@@ -142,7 +143,10 @@ The Makefile now provides these stable entry points:
 ```text
 make test-unit
 make test-contract
+make test-e2e-portable
+make test-e2e-unix
 make test-e2e
+make lint-ci
 make test-doc
 make test-all
 make coverage
@@ -156,8 +160,10 @@ crates/latte-code/tests/
   contract.rs
   contract/
     cli.rs
-  e2e.rs
+  e2e_portable.rs
+  e2e_unix.rs
   e2e/
+    portable.rs
     support.rs
     headless.rs
     provider.rs
@@ -168,9 +174,12 @@ crates/latte-code/tests/
   markdown_links.rs
 ```
 
-- `test-unit`: `cargo test --workspace --lib --bins --all-features`;
+- `test-unit`: `cargo test --workspace --lib --bins --all-features --locked`;
 - `test-contract`: run each crate's public contract/component targets;
-- `test-e2e`: run one `e2e` target; every headless, recovery, and PTY scenario is fully isolated and may be scheduled in parallel by the Rust test harness;
+- `test-e2e-portable`: run three cross-platform CLI/Provider/SQLite journeys on Linux, macOS, and Windows;
+- `test-e2e-unix`: run the 75 Unix headless, recovery, process, and PTY scenarios on Linux and macOS;
+- `test-e2e`: compose both E2E targets on Unix;
+- `lint-ci`: run actionlint and ShellCheck locally, using pinned containers when local tools are unavailable;
 - `test-doc`: run workspace doc tests;
 - `test-all`: compose every layer above;
 - `test-inventory` (implemented as a repo check): ensure every new `tests/*.rs` target belongs to a known layer and cannot be silently omitted.
@@ -361,15 +370,15 @@ See the [E2E authoring guide](../testing/e2e-authoring-guide.md) for the authori
 ### 8.2 Flakes
 
 - Required gates do not rerun automatically; the first failure fails the gate.
-- Before becoming required, a new E2E must pass at least ten consecutive runs on both Linux and macOS with zero flakes.
+- Before becoming required, a portable E2E must pass at least ten consecutive runs on Linux, macOS, and Windows with zero flakes; a Unix E2E must do so on Linux and macOS.
 - Quarantine requires an issue, owner, expiry date, and replacement protection. Safety/permission/recovery P0 scenarios cannot be quarantined.
 - Any hang is a test failure; waits are never unbounded.
 - Increasing sleeps is not the default flake fix.
 
 ### 8.3 Platforms
 
-- Linux/macOS: UT, Contract, and complete headless/TUI E2E.
-- Windows: pure UT is the target state. PR and merge-queue runs currently retain all-target compilation; release builds run only for `main` pushes or manual dispatch.
+- Linux/macOS: check, Clippy, UT, Contract, portable E2E, complete Unix headless/TUI E2E, and release build.
+- Windows: check, Clippy, UT, Contract, portable final-binary E2E, and release build. Process supervision still fails closed and is not claimed as supported.
 - Unix-only process/PTY scenarios use explicit `cfg(unix)` and run on both Linux and macOS.
 - Documentation must not claim support for capabilities that are not tested on a platform.
 
@@ -397,7 +406,7 @@ See the [E2E authoring guide](../testing/e2e-authoring-guide.md) for the authori
 4. Add an inventory check for integration targets.
 5. Keep `make ci` as the single complete local gate.
 
-Completion status: repository implementation is complete. Test targets are split by layer and protected by the inventory check. Final-binary E2E and all three coverage profiles run as independent jobs, `PR Gate` strictly aggregates every required G0-G4/Windows status, and `make ci` remains the complete local gate. GitHub branch protection/rulesets must still be configured remotely to require `PR Gate`; this document does not claim that enforcement is active. Use the latest measured baseline above for current test and coverage counts.
+Completion status: repository implementation is complete. Test targets are split by layer and platform boundary and protected by the inventory check. Three-platform portable E2E, Linux/macOS Unix E2E, release builds, static analysis, MSRV, and all three coverage profiles run as independent jobs. `PR Gate` strictly aggregates all 14 required statuses, and `make ci` remains the complete local Unix gate. GitHub branch protection/rulesets must still be configured remotely to require `PR Gate`; this document does not claim that enforcement is active. Use the latest measured baseline above for current test and coverage counts.
 
 ### Phase 2: close P0 user journeys
 
@@ -427,7 +436,7 @@ Completion criteria: E2E-H-009, E2E-H-012, E2E-T-005, and E2E-R-001 through R-00
 A test or job moves from shadow to required only when all criteria hold:
 
 1. It has a stable, documented, single-command local entry point.
-2. It passes at least ten consecutive runs on each target platform, Linux and macOS, without a flake.
+2. It passes at least ten consecutive runs on every applicable target platform: Linux/macOS/Windows for portable E2E, or Linux/macOS for Unix E2E.
 3. Timeout, child cleanup, and PTY drain are explicitly bounded.
 4. Failures produce sufficient redacted evidence.
 5. It does not depend on the public network, a real Provider, or developer-specific configuration.
@@ -441,6 +450,8 @@ This implementation completes Phase 1, the Phase 2 scenario implementation, and 
 
 - reorganized the test tree and added Scenario, strict scripted Provider, and Drop-safe PTY harnesses;
 - added layered Makefile/CI entry points and integration-target inventory;
+- split final-binary E2E into a three-platform portable target and a Linux/macOS Unix PTY/process target without dropping the existing 75 Unix scenarios;
+- added three-platform check, Clippy, UT, Contract, portable E2E, and release-build jobs plus Rust 1.93 MSRV, actionlint, ShellCheck, and locked Cargo resolution;
 - split CI coverage into three independent statuses and added the fail-closed `PR Gate`, PR cancellation semantics, and merge-queue trigger contract; remote required-check configuration remains pending;
 - migrated existing tests without losing assertions; final-binary scenarios now cover configuration, Provider behavior, tools, permission chains, cross-process resume, verification, public lifecycle/boundary behavior, legacy migration, and real PTYs;
 - the read-only tool loop exposed that v1 checkpoints returned file secrets to the Provider verbatim; tool results now reuse the common redactor before persistence and Provider re-entry, with a legacy-checkpoint normalization regression UT;
@@ -454,9 +465,9 @@ This first makes the test gates visible, accurate, and complete before adding ea
 
 The design builds on working test seams rather than hypothetical infrastructure:
 
-- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the hosted Ubuntu UT-only profile reaches 95.11%.
-- The independent `contract` and `e2e` targets contain 88 integration tests, including 75 final-binary E2E tests.
-- All three hosted llvm-cov profiles pass: 95.11% UT-only, 80.10% final-binary E2E on Ubuntu, and 96.70% all-target coverage; the macOS E2E profile reaches 80.79%.
+- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the current UT-only profile reaches 95.05%.
+- The independent contract and E2E targets contain 93 integration tests: 15 Contract, 3 portable final-binary E2E, and 75 Unix final-binary E2E tests.
+- The current macOS profiles pass independently at 95.05% UT-only, 80.78% E2E, and 96.65% all-target coverage.
 - Final-binary execution, a loopback Provider, a real PTY, cross-process SQLite resume, and terminal-mode restoration already have reusable implementations.
 - The Provider endpoint already targets a loopback harness, so cassette replay can reuse the same final-binary path without a production backdoor.
 - The runtime already has component tests for process `Started`, Unknown, restart recovery, and reconciliation. The external-barrier E2E lifts existing semantics to the final-binary boundary and does not require a production backdoor.

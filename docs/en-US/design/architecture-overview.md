@@ -41,7 +41,7 @@ Filesystem tools enforce workspace containment, denied globs, stale-content chec
 
 ## Process supervision
 
-Commands are argv-first. Shell syntax is classified separately and treated as high-risk. Output is drained concurrently with byte caps; timeout and cancellation use a bounded grace period. Unix execution creates and supervises a process group, sends `TERM`, then `KILL`, and certifies descendant shutdown. Non-Unix process execution currently fails closed before creating an effect. CI compile-checks Windows but does not claim Windows process execution support.
+Commands are argv-first. Shell syntax is classified separately and treated as high-risk. Output is drained concurrently with byte caps; timeout and cancellation use a bounded grace period. Unix execution creates and supervises a process group, sends `TERM`, then `KILL`, and certifies descendant shutdown. Non-Unix process execution currently fails closed before creating an effect. CI runs Windows check, Clippy, UT, Contract, portable final-binary E2E, and release-build gates without claiming Windows process execution support.
 
 ## Transcript runtime
 

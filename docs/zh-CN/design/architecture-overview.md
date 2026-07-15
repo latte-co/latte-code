@@ -45,7 +45,7 @@ Declared -> Prepared -> Started -> ObservedSuccess | ObservedFailed | Unknown
 
 ## 进程监管
 
-命令默认使用 argv，不经过 shell；shell 语法单独分类并视为高风险。stdout/stderr 并发读取且有容量上限，超时与取消具有有限 grace period。Unix 创建并监管整个进程组，依次发送 `TERM`、`KILL` 并确认子孙进程退出。当前非 Unix 平台在创建 effect 前 fail closed；CI 会编译检查 Windows，但不宣称支持 Windows 进程执行。
+命令默认使用 argv，不经过 shell；shell 语法单独分类并视为高风险。stdout/stderr 并发读取且有容量上限，超时与取消具有有限 grace period。Unix 创建并监管整个进程组，依次发送 `TERM`、`KILL` 并确认子孙进程退出。当前非 Unix 平台在创建 effect 前 fail closed；CI 会在 Windows 运行 check、Clippy、UT、Contract、portable 最终二进制 E2E 和 release build 卡点，但不宣称支持 Windows 进程执行。
 
 ## Transcript 运行时
 

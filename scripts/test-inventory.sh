@@ -6,7 +6,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 expected="$(printf '%s\n' \
   'crates/latte-code/tests/architecture.rs contract' \
   'crates/latte-code/tests/contract.rs contract' \
-  'crates/latte-code/tests/e2e.rs e2e' \
+  'crates/latte-code/tests/e2e_portable.rs e2e-portable' \
+  'crates/latte-code/tests/e2e_unix.rs e2e-unix' \
   'crates/latte-code/tests/markdown_links.rs contract' \
   'crates/latte-core/tests/contracts.rs contract' \
   'crates/latte-engine/tests/public_lifecycle.rs contract')"
@@ -18,7 +19,13 @@ actual="$({
     fi
   done
 } | sort | awk '{
-  layer = ($0 == "crates/latte-code/tests/e2e.rs") ? "e2e" : "contract"
+  if ($0 == "crates/latte-code/tests/e2e_portable.rs") {
+    layer = "e2e-portable"
+  } else if ($0 == "crates/latte-code/tests/e2e_unix.rs") {
+    layer = "e2e-unix"
+  } else {
+    layer = "contract"
+  }
   print $0, layer
 }')"
 
@@ -33,4 +40,4 @@ if rg -n '#\[ignore' crates --glob '*.rs'; then
   exit 1
 fi
 
-echo "Test inventory passed: 5 contract targets, 1 E2E target, no ignored tests."
+echo "Test inventory passed: 5 contract targets, portable + Unix E2E targets, no ignored tests."
