@@ -91,6 +91,9 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
     }
     assert!(workflow.contains("uses: docker://rhysd/actionlint:1.7.12"));
     assert!(workflow.contains("koalaman/shellcheck:v0.11.0 scripts/*.sh"));
+    assert!(workflow.contains("uses: actions/checkout@v7"));
+    assert!(workflow.contains("uses: actions/upload-artifact@v7"));
+    assert!(!workflow.contains("uses: actions/checkout@v4"));
     assert!(workflow.contains("toolchain: 1.93.0"));
 
     for line in workflow.lines().filter(|line| line.contains("run: cargo ")) {
