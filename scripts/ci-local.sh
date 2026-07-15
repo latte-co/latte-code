@@ -4,9 +4,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ./scripts/check.sh
+./scripts/lint-ci.sh
 ./scripts/test.sh
-cargo llvm-cov clean --workspace
-cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 90
-cargo deny check
+make coverage
+cargo deny --locked check
 
 echo "All local CI checks passed."

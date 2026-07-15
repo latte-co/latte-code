@@ -22,6 +22,8 @@ const DEFAULT_CAP: usize = 64 * 1024;
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ToolDescriptor {
     pub name: String,
+    pub description: String,
+    pub input_schema: Value,
     pub version: u32,
     pub effect: String,
 }
@@ -136,6 +138,8 @@ impl Tool for Builtin {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: self.name.into(),
+            description: format!("Engine-owned {} operation", self.name.replace('_', " ")),
+            input_schema: tool_schema(self.name),
             version: 1,
             effect: format!("{:?}", self.effect).to_lowercase(),
         }
@@ -219,6 +223,36 @@ impl Tool for Builtin {
             action,
             expected_hash: None,
         })
+    }
+}
+
+pub(crate) fn tool_schema(name: &str) -> Value {
+    let path = || json!({"type":"string","minLength":1,"maxLength":4096});
+    let cap = || json!({"type":"integer","minimum":1,"maximum":65536});
+    let digest = || json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    match name {
+        "read_file" => {
+            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_output":cap()},"additionalProperties":false})
+        }
+        "list_directory" => {
+            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_entries":{"type":"integer","minimum":1,"maximum":10000}},"additionalProperties":false})
+        }
+        "search" => {
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10000},"max_output":cap()},"additionalProperties":false})
+        }
+        "read_project_manifest" | "git_diff" => {
+            json!({"type":"object","required":[],"properties":{"max_output":cap()},"additionalProperties":false})
+        }
+        "edit_file" => {
+            json!({"type":"object","required":["path","after","precondition"],"properties":{"path":path(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"precondition":digest()},"anyOf":[{"required":["before"]},{"required":["anchor"]}],"additionalProperties":false})
+        }
+        "write_file" => {
+            json!({"type":"object","required":["path","content","create_intent"],"properties":{"path":path(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest()},"additionalProperties":false})
+        }
+        "process" => {
+            json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"oneOf":[{"required":["argv"]},{"required":["shell"]}],"additionalProperties":false})
+        }
+        _ => json!({"type":"object","required":[],"properties":{},"additionalProperties":false}),
     }
 }
 
@@ -882,7 +916,7 @@ mod tests {
             .unwrap();
         assert!(read.truncated);
         assert_eq!(read.value["content"], "one");
-        assert!(read.value["sha256"].as_str().unwrap().len() == 64);
+        assert_eq!(read.value["sha256"].as_str().unwrap().len(), 64);
         assert!(
             registry
                 .invoke(&call(
@@ -1077,17 +1111,24 @@ mod tests {
                 .success()
         );
         fs::write(dir.path().join("a.txt"), "a substantially changed file\n").unwrap();
-        let output = registry
-            .invoke(&call("git_diff", &json!({"max_output":8}), None))
-            .unwrap();
-        assert!(output.truncated);
-        assert!(output.value["summary"].as_str().is_some());
+        let result = registry.invoke(&call("git_diff", &json!({"max_output":8}), None));
         #[cfg(unix)]
-        assert!(!dir.path().join("textconv-ran").exists());
+        {
+            let output = result.unwrap();
+            assert!(output.truncated);
+            assert!(output.value["summary"].as_str().is_some());
+            assert!(!dir.path().join("textconv-ran").exists());
+        }
+        #[cfg(not(unix))]
+        assert!(matches!(
+            result,
+            Err(ToolError::Git(message)) if message.contains("unsupported on this platform")
+        ));
     }
 
     #[cfg(unix)]
     #[test]
+    #[rustfmt::skip]
     fn manifest_tracks_internal_symlink_topology_and_rejects_unsafe_links() {
         use std::os::unix::fs::symlink;
 
@@ -1116,7 +1157,7 @@ mod tests {
             registry.workspace_manifest(),
             Err(ToolError::WorkspaceUnsafe(_))
         ));
-        fs::remove_file(dir.path().join("link")).unwrap();
+        fs::remove_file(dir.path().join("link")).unwrap(); symlink("/tmp", dir.path().join("inside")).unwrap(); symlink("inside", dir.path().join("link")).unwrap(); assert!(matches!(registry.workspace_manifest(), Err(ToolError::WorkspaceUnsafe(_)))); fs::remove_file(dir.path().join("link")).unwrap(); fs::remove_file(dir.path().join("inside")).unwrap();
         symlink("../outside", dir.path().join("link")).unwrap();
         assert!(matches!(
             registry.workspace_manifest(),
@@ -1214,5 +1255,217 @@ mod tests {
             registry.invoke(&call("read_file", &json!({"path":"outside/x"}), None)),
             Err(ToolError::Path(_))
         ));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn typed_input_helpers_and_builtin_preparation_enforce_schema_boundaries() {
+        assert!(matches!(
+            string(&json!({}), "path"),
+            Err(ToolError::Input(_))
+        ));
+        assert!(matches!(
+            string(&json!({"path":""}), "path"),
+            Err(ToolError::Input(_))
+        ));
+        assert!(bool_field(&json!({}), "flag", true).unwrap());
+        assert!(matches!(
+            bool_field(&json!({"flag":"yes"}), "flag", false),
+            Err(ToolError::Input(_))
+        ));
+        assert_eq!(usize_field(&json!({}), "cap", 3, 1, 4).unwrap(), 3);
+        for value in [json!("3"), json!(-1), json!(5)] {
+            assert!(matches!(
+                usize_field(&json!({"cap":value}), "cap", 3, 1, 4),
+                Err(ToolError::Input(_))
+            ));
+        }
+        assert_eq!(bounded("short", 5), ("short".into(), false));
+        assert_eq!(bounded("éx", 1), (String::new(), true));
+
+        let (dir, registry) = setup();
+        assert!(format!("{registry:?}").contains("ToolRegistry"));
+        let link = registry.workspace.root().join("link");
+        assert!(registry.safe_symlink_target(&link, Path::new("/absolute")).is_err());
+        assert_eq!(registry.safe_symlink_target(&link, Path::new("./a.txt")).unwrap(), vec!["a.txt"]);
+        assert!(registry.safe_symlink_target(&link, Path::new("../../outside")).is_err());
+        assert!(registry.safe_symlink_target(Path::new("/tmp/outside-link"), Path::new("child")).is_err());
+        assert_eq!(ToolRegistry::normal_components(Path::new("./a")).unwrap(), vec!["a"]);
+        assert!(ToolRegistry::normal_components(Path::new("/absolute")).is_err());
+        assert_eq!(ToolRegistry::raw_target_components(Path::new("./a/../b")).unwrap().len(), 4);
+        assert!(ToolRegistry::raw_target_components(Path::new("/absolute")).is_err());
+        let context = Context {
+            workspace: &registry.workspace,
+        };
+        let unknown = Builtin {
+            name: "not_registered",
+            effect: EffectClass::Read,
+        };
+        assert!(matches!(
+            unknown.prepare(&json!({}), &context),
+            Err(ToolError::Unknown(name)) if name == "not_registered"
+        ));
+        let edit = Builtin {
+            name: "edit_file",
+            effect: EffectClass::Modify,
+        };
+        assert!(matches!(
+            edit.prepare(
+                &json!({"path":"a.txt","before":"","after":"next"}),
+                &context
+            ),
+            Err(ToolError::Input(message)) if message.contains("before or anchor")
+        ));
+        let search = Builtin {
+            name: "search",
+            effect: EffectClass::Read,
+        };
+        assert!(matches!(
+            search.prepare(&json!({"query":"x","regex":"yes"}), &context),
+            Err(ToolError::Input(message)) if message.contains("regex must be boolean")
+        ));
+        drop(dir);
+
+        let process_schema = tool_schema("process");
+        assert_eq!(process_schema["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(tool_schema("not_registered")["additionalProperties"], false);
+    }
+
+    #[test]
+    fn database_artifacts_and_process_cwd_stay_workspace_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-shm",
+            "state.db-journal",
+            "state.db-other",
+        ] {
+            fs::write(dir.path().join(name), name).unwrap();
+        }
+        let registry = ToolRegistry::new(dir.path(), None, &[], Some(&database)).unwrap();
+        let manifest = registry.workspace_manifest().unwrap();
+        for private in [
+            r#"["state.db"]"#,
+            r#"["state.db-wal"]"#,
+            r#"["state.db-shm"]"#,
+            r#"["state.db-journal"]"#,
+        ] {
+            assert!(!manifest.contains_key(private), "leaked {private}");
+        }
+        assert!(manifest.contains_key(r#"["state.db-other"]"#));
+
+        assert_eq!(
+            registry.resolve_cwd(".").unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
+        assert!(matches!(
+            registry.resolve_cwd("state.db-other"),
+            Err(ToolError::Input(message)) if message.contains("must be a directory")
+        ));
+        assert!(matches!(
+            registry.resolve_cwd(".."),
+            Err(ToolError::Path(_))
+        ));
+    }
+
+    #[test]
+    fn engine_preparation_binds_policy_preconditions_and_safe_mutation_support() {
+        let (dir, registry) = setup();
+        let read_input = json!({"path":"a.txt"});
+        let (read, decision, digest) = registry
+            .prepare_for_engine(&call("read_file", &read_input, None))
+            .unwrap();
+        assert_eq!(decision, PolicyDecision::Allow);
+        assert_eq!(digest.len(), 64);
+        registry.execute_prepared(read).unwrap();
+
+        let identity = WorkspacePath::identity(&dir.path().join("a.txt")).unwrap();
+        let edit_input = json!({
+            "path":"a.txt",
+            "before":"two",
+            "after":"second",
+            "precondition":identity.hash
+        });
+        let edit_call = ToolInvocation {
+            precondition: edit_input["precondition"].as_str(),
+            ..call("edit_file", &edit_input, None)
+        };
+        let (prepared, decision, _) = registry.prepare_for_engine(&edit_call).unwrap();
+        assert_eq!(decision, PolicyDecision::Ask);
+        registry.execute_prepared(prepared).unwrap();
+        assert!(
+            fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .contains("second")
+        );
+
+        let missing_precondition = json!({"path":"a.txt","content":"next"});
+        assert!(matches!(
+            registry.prepare_for_engine(&call("write_file", &missing_precondition, None)),
+            Err(ToolError::ReadRequired(target)) if target == "a.txt"
+        ));
+
+        let denied = ToolRegistry::new(dir.path(), None, &["a.txt".into()], None).unwrap();
+        let (prepared, decision, _) = denied
+            .prepare_for_engine(&ToolInvocation {
+                precondition: Some(&identity.hash),
+                ..call(
+                    "write_file",
+                    &json!({"path":"a.txt","content":"blocked"}),
+                    None,
+                )
+            })
+            .unwrap();
+        assert_eq!(decision, PolicyDecision::Deny);
+        drop(prepared);
+
+        let unsupported =
+            ToolRegistry::new_with_safe_support(dir.path(), None, &[], false).unwrap();
+        assert!(matches!(
+            unsupported.prepare_for_engine(&ToolInvocation {
+                precondition: Some(&identity.hash),
+                ..call(
+                    "write_file",
+                    &json!({"path":"a.txt","content":"blocked"}),
+                    None
+                )
+            }),
+            Err(ToolError::Path(_))
+        ));
+    }
+
+    #[test]
+    fn literal_search_skips_non_utf8_and_reports_regex_and_output_boundaries() {
+        let (dir, registry) = setup();
+        fs::write(dir.path().join("binary.bin"), [0xff, 0xfe, 0xfd]).unwrap();
+        fs::write(dir.path().join("many.txt"), "needle one\nneedle two\n").unwrap();
+
+        let literal = registry
+            .invoke(&call(
+                "search",
+                &json!({"query":"needle","max_output":5}),
+                None,
+            ))
+            .unwrap();
+        assert!(literal.truncated);
+        assert!(literal.value["matches"].as_array().unwrap().is_empty());
+        assert!(matches!(
+            registry.invoke(&call("search", &json!({"query":"[","regex":true}), None)),
+            Err(ToolError::Regex(_))
+        ));
+
+        fs::write(dir.path().join("package.json"), "{\"name\":\"long\"}").unwrap();
+        let manifests = registry
+            .invoke(&call(
+                "read_project_manifest",
+                &json!({"max_output":1}),
+                None,
+            ))
+            .unwrap();
+        assert!(manifests.truncated);
+        assert_eq!(manifests.value["Cargo.toml"], "[");
+        assert_eq!(manifests.value["package.json"], "{");
     }
 }

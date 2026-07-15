@@ -4,9 +4,8 @@
 *.profraw
 lcov.info
 
-# Lattecode workspace state (SQLite, WAL, logs, caches)
+# Latte Code workspace state (SQLite, WAL, logs, caches)
 /.latte/
-/.lattecode/
 
 # Secrets
 .env

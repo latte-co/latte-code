@@ -142,6 +142,18 @@ mod tests {
         );
         assert!(bundle.text.find("root").unwrap() < bundle.text.find("near").unwrap());
         assert!(build(dir.path(), None, 8).unwrap().truncated);
+        assert!(build(&dir.path().join("missing"), None, 8).is_err());
+        assert_eq!(
+            build(dir.path(), Some(Path::new("")), 8)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        fs::create_dir_all(dir.path().join("folder")).unwrap();
+        fs::write(dir.path().join("folder/AGENTS.md"), "éé").unwrap();
+        let unicode = build(dir.path(), Some(Path::new("folder")), 33).unwrap();
+        assert!(unicode.truncated);
+        assert!(unicode.text.is_char_boundary(unicode.text.len()));
     }
 
     #[test]

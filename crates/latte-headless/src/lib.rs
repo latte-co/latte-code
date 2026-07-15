@@ -9,8 +9,10 @@ use latte_engine::EngineHandle;
 use std::path::PathBuf;
 pub mod context;
 pub mod provider;
+pub mod registry;
 pub mod runtime;
 pub mod service;
+pub mod thread;
 /// Parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeadlessCommand {
@@ -89,7 +91,7 @@ pub fn render_placeholder(c: &HeadlessCommand, _engine: &EngineHandle) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{HeadlessCommand, parse};
+    use super::{HeadlessCommand, parse, render_placeholder};
     use std::path::PathBuf;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -117,5 +119,73 @@ mod tests {
             parse(&args(&["run", "fix", "--focus", "src"])),
             Err("--focus must appear immediately after run".into())
         );
+    }
+
+    #[test]
+    fn parses_every_public_shape_and_rejects_invalid_ids_and_decisions() {
+        let id = "01900000-0000-7000-8000-000000000001";
+        assert_eq!(
+            parse(&args(&["run", "inspect", "the", "workspace"])),
+            Ok(HeadlessCommand::Run {
+                prompt: "inspect the workspace".into(),
+                focus: None,
+            })
+        );
+        assert!(matches!(
+            parse(&args(&["resume", id, "--allow"])),
+            Ok(HeadlessCommand::Resume { allow: true, .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["resume", id, "--deny"])),
+            Ok(HeadlessCommand::Resume { allow: false, .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["show", id])),
+            Ok(HeadlessCommand::Show { .. })
+        ));
+        assert_eq!(parse(&args(&["list"])), Ok(HeadlessCommand::List));
+        assert_eq!(parse(&args(&["run"])), Err("run requires a prompt".into()));
+        assert_eq!(
+            parse(&args(&["show", "not-a-run"])),
+            Err("invalid run id".into())
+        );
+        assert!(parse(&args(&["resume", id, "maybe"])).is_err());
+        assert!(parse(&args(&["unknown"])).is_err());
+    }
+
+    #[test]
+    fn placeholder_text_is_truthful_for_every_command_variant() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let run_id = match parse(&args(&["show", "01900000-0000-7000-8000-000000000001"])).unwrap()
+        {
+            HeadlessCommand::Show { run_id } => run_id,
+            command => panic!("unexpected command: {command:?}"),
+        };
+        let commands = [
+            HeadlessCommand::List,
+            HeadlessCommand::Run {
+                prompt: "work".into(),
+                focus: None,
+            },
+            HeadlessCommand::Resume {
+                run_id,
+                allow: true,
+            },
+            HeadlessCommand::Show { run_id },
+        ];
+        let rendered = commands
+            .iter()
+            .map(|command| render_placeholder(command, &engine))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 4);
+        assert!(rendered.iter().all(|text| !text.is_empty()));
+        assert!(rendered[0].contains("No runs"));
+        assert!(rendered[1].contains("not implemented"));
+        assert!(rendered[2].contains("resume"));
+        assert!(rendered[3].contains("lookup"));
     }
 }

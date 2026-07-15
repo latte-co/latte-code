@@ -1,20 +1,26 @@
-use crate::{EngineHandle, Lease};
+use crate::{
+    EngineHandle, Lease, ThreadEffectDescriptor, ThreadEffectExecutionError,
+    ThreadEffectObservedValue,
+};
 use latte_core::RunId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     collections::BTreeMap,
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
 use thiserror::Error;
+use tokio::sync::Notify;
+#[cfg(unix)]
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    sync::Notify,
     time::{Duration, sleep, timeout},
 };
 
@@ -26,11 +32,14 @@ pub enum ProcessDecision {
     Deny,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 pub(crate) enum GroupProbe {
     Absent,
     Present,
     Uncertain,
 }
+#[cfg(not(unix))]
+pub(crate) type GroupProbe = ();
 
 #[derive(Clone, Debug)]
 pub struct ProcessInvocation<'a> {
@@ -167,7 +176,7 @@ struct Binding<'a> {
     lease_token: u64,
     version: u32,
 }
-fn digest(i: &ProcessInvocation<'_>) -> String {
+pub(crate) fn digest(i: &ProcessInvocation<'_>) -> String {
     let b = Binding {
         argv: i.argv,
         shell: i.shell,
@@ -190,6 +199,178 @@ fn digest(i: &ProcessInvocation<'_>) -> String {
     )
 }
 
+/// Owned process fields reconstructed from a redacted durable v2 descriptor.
+/// They are converted to the borrowed legacy supervisor invocation only after
+/// the Started transaction has committed.
+#[derive(Clone, Debug)]
+pub(crate) struct ThreadProcessSpec {
+    pub argv: Vec<String>,
+    pub shell: Option<String>,
+    pub cwd: String,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub grace_ms: u64,
+    pub stdout_cap: usize,
+    pub stderr_cap: usize,
+}
+
+impl ThreadProcessSpec {
+    pub(crate) fn from_input(input: &Value) -> Result<Self, ProcessError> {
+        let object = input
+            .as_object()
+            .ok_or_else(|| ProcessError::Invalid("process input must be an object".into()))?;
+        let argv = object
+            .get("argv")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| ProcessError::Invalid("argv must be an array".into()))?
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            ProcessError::Invalid("argv entries must be strings".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let shell = object
+            .get("shell")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| ProcessError::Invalid("shell must be a string".into()))
+            })
+            .transpose()?;
+        let cwd = object
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or(".")
+            .to_owned();
+        let env = object
+            .get("env")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| ProcessError::Invalid(format!("invalid env: {error}")))?
+            .unwrap_or_default();
+        let number = |key: &str, default: u64, maximum: u64| -> Result<u64, ProcessError> {
+            let value = object.get(key).map_or(Ok(default), |value| {
+                value.as_u64().ok_or_else(|| {
+                    ProcessError::Invalid(format!("{key} must be an unsigned integer"))
+                })
+            })?;
+            if value == 0 || value > maximum {
+                return Err(ProcessError::Invalid(format!("{key} is out of range")));
+            }
+            Ok(value)
+        };
+        let timeout_ms = number("timeout_ms", 30_000, 600_000)?;
+        let grace_ms = object.get("grace_ms").map_or(Ok(250), |value| {
+            value
+                .as_u64()
+                .ok_or_else(|| ProcessError::Invalid("grace_ms must be an unsigned integer".into()))
+        })?;
+        if grace_ms > 30_000 {
+            return Err(ProcessError::Invalid("grace_ms is out of range".into()));
+        }
+        let stdout_cap = usize::try_from(number("stdout_cap", 64 * 1024, 1_048_576)?)
+            .map_err(|_| ProcessError::Invalid("stdout_cap overflows usize".into()))?;
+        let stderr_cap = usize::try_from(number("stderr_cap", 64 * 1024, 1_048_576)?)
+            .map_err(|_| ProcessError::Invalid("stderr_cap overflows usize".into()))?;
+        if argv.is_empty() == shell.is_none() {
+            return Err(ProcessError::Invalid(
+                "provide exactly one of argv or shell".into(),
+            ));
+        }
+        Ok(Self {
+            argv,
+            shell,
+            cwd,
+            env,
+            timeout_ms,
+            grace_ms,
+            stdout_cap,
+            stderr_cap,
+        })
+    }
+    pub(crate) fn invocation<'a>(
+        &'a self,
+        run_revision: u64,
+        descriptor: &'a ThreadEffectDescriptor,
+        lease: &'a Lease,
+    ) -> ProcessInvocation<'a> {
+        ProcessInvocation {
+            argv: &self.argv,
+            shell: self.shell.as_deref(),
+            cwd: &self.cwd,
+            env: &self.env,
+            timeout_ms: self.timeout_ms,
+            grace_ms: self.grace_ms,
+            stdout_cap: self.stdout_cap,
+            stderr_cap: self.stderr_cap,
+            run_revision,
+            effect_id: &descriptor.effect_id,
+            attempt: descriptor.attempt,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        }
+    }
+}
+
+impl EngineHandle {
+    pub(crate) async fn execute_started_thread_process(
+        &self,
+        descriptor: &ThreadEffectDescriptor,
+        run_revision: u64,
+        lease: &Lease,
+        cancellation: &CancellationToken,
+    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+        if !self.process_supervision_supported {
+            return Err(ThreadEffectExecutionError::Certified(
+                ProcessError::Unsupported.to_string(),
+            ));
+        }
+        let spec = ThreadProcessSpec::from_input(&descriptor.input)
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        let invocation = spec.invocation(run_revision, descriptor, lease);
+        let cwd = self
+            .tools
+            .resolve_cwd(&spec.cwd)
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        let _operation = std::sync::Arc::clone(&self.operation_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| ThreadEffectExecutionError::Uncertain("operation gate closed".into()))?;
+        match supervise(
+            &invocation,
+            &cwd,
+            cancellation,
+            self.process_group_probe_override,
+        )
+        .await
+        {
+            Ok(output) if output.termination == ProcessTermination::Cancelled => {
+                Err(ThreadEffectExecutionError::Uncertain(
+                    "process cancelled after its external outcome may have happened".into(),
+                ))
+            }
+            Ok(output) => Ok(ThreadEffectObservedValue {
+                result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
+                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                    "tool_call_id":descriptor.tool_call_id,
+                    "name":descriptor.name,
+                    "output":output,
+                }))),
+                success: true,
+            }),
+            Err(error) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
+        }
+    }
+}
+
 impl EngineHandle {
     /// Executes and durably records an actual verification process outcome.
     pub async fn execute_verification(
@@ -201,6 +382,8 @@ impl EngineHandle {
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
@@ -252,6 +435,8 @@ impl EngineHandle {
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
     ) -> Result<String, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         if classify(invocation) != ProcessDecision::Ask {
             return Err(ProcessError::Invalid(
                 "only ask operations can be reissued".into(),
@@ -299,6 +484,8 @@ impl EngineHandle {
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
+        self.reject_linked_run(run_id)
+            .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
@@ -583,6 +770,7 @@ fn supervise_git(
     .map_err(|_| ProcessError::Supervision("git supervisor thread panicked".into()))?
 }
 
+#[cfg(unix)]
 async fn drain(
     mut reader: impl AsyncRead + Unpin,
     cap: usize,
@@ -788,13 +976,63 @@ async fn await_group_absent(
     }
 }
 #[cfg(not(unix))]
-async fn supervise(
+fn supervise(
     _i: &ProcessInvocation<'_>,
     _cwd: &std::path::Path,
     _cancel: &CancellationToken,
     _probe_override: Option<GroupProbe>,
-) -> Result<ProcessOutput, ProcessError> {
-    Err(ProcessError::Unsupported)
+) -> std::future::Ready<Result<ProcessOutput, ProcessError>> {
+    std::future::ready(Err(ProcessError::Unsupported))
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+    use crate::EngineBuilder;
+    use latte_core::{IdSource, SystemIdSource};
+
+    #[tokio::test]
+    async fn process_capability_is_absent_and_execution_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        assert!(
+            engine
+                .tool_descriptors()
+                .iter()
+                .all(|tool| tool.name != "process")
+        );
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let argv = vec!["echo".into(), "x".into()];
+        let env = BTreeMap::new();
+        let request = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 1_000,
+            grace_ms: 10,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+            run_revision: 0,
+            effect_id: "unsupported-process",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &request, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Unsupported)
+        ));
+        assert!(engine.effect_status("unsupported-process").is_err());
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -871,6 +1109,44 @@ mod tests {
             classify(&invocation(Some("rm -rf /"), &empty, "c", &lease, None)),
             ProcessDecision::Deny
         );
+        assert_eq!(
+            classify(&invocation(None, &empty, "empty", &lease, None)),
+            ProcessDecision::Deny
+        );
+        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test"] {
+            assert_eq!(
+                classify(&invocation(
+                    Some(dangerous),
+                    &empty,
+                    dangerous,
+                    &lease,
+                    None
+                )),
+                ProcessDecision::Deny
+            );
+        }
+        let safe_grep = vec![
+            "/usr/bin/grep".into(),
+            "-q".into(),
+            "needle".into(),
+            "relative.txt".into(),
+        ];
+        assert_eq!(
+            classify(&invocation(None, &safe_grep, "grep", &lease, None)),
+            ProcessDecision::Allow
+        );
+        for unsafe_path in ["/absolute.txt", "../escape.txt"] {
+            let unsafe_grep = vec![
+                "/usr/bin/grep".into(),
+                "-q".into(),
+                "needle".into(),
+                unsafe_path.into(),
+            ];
+            assert_eq!(
+                classify(&invocation(None, &unsafe_grep, unsafe_path, &lease, None)),
+                ProcessDecision::Ask
+            );
+        }
         let git_hook = vec!["git".into(), "diff".into(), "--ext-diff".into()];
         let hooked_env = BTreeMap::from([("GIT_EXTERNAL_DIFF".into(), "evil".into())]);
         let hooked = ProcessInvocation {
@@ -885,6 +1161,292 @@ mod tests {
             ..invocation(None, &pwd, "loader", &lease, None)
         };
         assert_eq!(classify(&hooked), ProcessDecision::Ask);
+
+        let successful = ProcessOutput {
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            termination: ProcessTermination::Exited,
+        };
+        assert!(successful.command_succeeded());
+        assert!(
+            !ProcessOutput {
+                termination: ProcessTermination::Cancelled,
+                ..successful.clone()
+            }
+            .command_succeeded()
+        );
+        assert!(
+            !ProcessOutput {
+                exit_code: Some(1),
+                ..successful
+            }
+            .command_succeeded()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn thread_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
+        let defaults = ThreadProcessSpec::from_input(&serde_json::json!({
+            "argv": ["/bin/pwd"]
+        }))
+        .unwrap();
+        assert_eq!(defaults.argv, ["/bin/pwd"]);
+        assert_eq!(defaults.shell, None);
+        assert_eq!(defaults.cwd, ".");
+        assert!(defaults.env.is_empty());
+        assert_eq!(defaults.timeout_ms, 30_000);
+        assert_eq!(defaults.grace_ms, 250);
+        assert_eq!(defaults.stdout_cap, 64 * 1024);
+        assert_eq!(defaults.stderr_cap, 64 * 1024);
+
+        let configured = ThreadProcessSpec::from_input(&serde_json::json!({
+            "shell": "printf ok",
+            "cwd": "subdir",
+            "env": {"LANG": "C"},
+            "timeout_ms": 600_000,
+            "grace_ms": 0,
+            "stdout_cap": 1_048_576,
+            "stderr_cap": 1
+        }))
+        .unwrap();
+        assert_eq!(configured.shell.as_deref(), Some("printf ok"));
+        assert_eq!(configured.cwd, "subdir");
+        assert_eq!(configured.env["LANG"], "C");
+        assert_eq!(configured.timeout_ms, 600_000);
+        assert_eq!(configured.grace_ms, 0);
+        assert_eq!(configured.stdout_cap, 1_048_576);
+        assert_eq!(configured.stderr_cap, 1);
+
+        let lease = Lease {
+            owner: "owner".into(),
+            fencing_token: 7,
+            expires_at_ms: 99,
+        };
+        let descriptor = ThreadEffectDescriptor {
+            effect_id: "effect".into(),
+            tool_call_id: "call_1".into(),
+            name: "process".into(),
+            input: serde_json::json!({}),
+            attempt: 3,
+        };
+        let invocation = configured.invocation(11, &descriptor, &lease);
+        assert_eq!(invocation.run_revision, 11);
+        assert_eq!(invocation.effect_id, "effect");
+        assert_eq!(invocation.attempt, 3);
+        assert_eq!(invocation.lease_owner, "owner");
+        assert_eq!(invocation.lease_token, 7);
+
+        let invalid = [
+            (serde_json::json!(null), "process input must be an object"),
+            (serde_json::json!({"argv":"pwd"}), "argv must be an array"),
+            (
+                serde_json::json!({"argv":[1]}),
+                "argv entries must be strings",
+            ),
+            (serde_json::json!({"shell":1}), "shell must be a string"),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"env":[]}),
+                "invalid env:",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":-1}),
+                "timeout_ms must be an unsigned integer",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":0}),
+                "timeout_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":600_001}),
+                "timeout_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"grace_ms":"soon"}),
+                "grace_ms must be an unsigned integer",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"grace_ms":30_001}),
+                "grace_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"stdout_cap":0}),
+                "stdout_cap is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"stderr_cap":1_048_577}),
+                "stderr_cap is out of range",
+            ),
+            (
+                serde_json::json!({}),
+                "provide exactly one of argv or shell",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"shell":"pwd"}),
+                "provide exactly one of argv or shell",
+            ),
+        ];
+        for (input, expected) in invalid {
+            let error = ThreadProcessSpec::from_input(&input).unwrap_err();
+            assert!(
+                matches!(error, ProcessError::Invalid(message) if message.contains(expected)),
+                "input {input} did not produce {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_waiters_and_remains_cancelled() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        let waiter = token.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+        tokio::task::yield_now().await;
+        token.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(token.is_cancelled());
+        timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn execute_process_rejects_invalid_requests_before_creating_effect_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("not-a-directory"), "x").unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let empty = Vec::new();
+        let pwd = vec!["/bin/pwd".into()];
+
+        let both = invocation(Some("pwd"), &pwd, "both", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &both, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("exactly one")
+        ));
+        let neither = invocation(None, &empty, "neither", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &neither, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("exactly one")
+        ));
+
+        let zero_cap = ProcessInvocation {
+            stdout_cap: 0,
+            ..invocation(None, &pwd, "zero-cap", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &zero_cap, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("nonzero")
+        ));
+
+        let wrong_owner = ProcessInvocation {
+            lease_owner: "other",
+            ..invocation(None, &pwd, "wrong-owner", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &wrong_owner, &CancellationToken::new())
+                .await,
+            Err(ProcessError::InvalidApproval)
+        ));
+
+        let file_cwd = ProcessInvocation {
+            cwd: "not-a-directory",
+            ..invocation(None, &pwd, "file-cwd", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &file_cwd, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("must be a directory")
+        ));
+
+        let dangerous = invocation(Some("mkfs /dev/example"), &empty, "denied", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &dangerous, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Denied)
+        ));
+        let ask_with_unissued_digest =
+            invocation(Some("printf ok"), &empty, "unissued", &lease, Some("wrong"));
+        assert!(matches!(
+            engine
+                .execute_process(
+                    run,
+                    &lease,
+                    3,
+                    &ask_with_unissued_digest,
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(ProcessError::InvalidApproval)
+        ));
+
+        for effect in [
+            "both",
+            "neither",
+            "zero-cap",
+            "wrong-owner",
+            "file-cwd",
+            "denied",
+            "unissued",
+        ] {
+            assert!(
+                engine.effect_status(effect).is_err(),
+                "{effect} created a ledger row"
+            );
+        }
+
+        let descriptor = ThreadEffectDescriptor {
+            effect_id: "thread-process".into(),
+            tool_call_id: "call".into(),
+            name: "process".into(),
+            input: serde_json::json!({"argv":["/bin/echo","ok"]}),
+            attempt: 1,
+        };
+        let mut unsupported = engine.clone();
+        unsupported.process_supervision_supported = false;
+        assert!(matches!(
+            unsupported
+                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(ThreadEffectExecutionError::Certified(_))
+        ));
+        let gated = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        gated.operation_gate.close();
+        assert!(matches!(
+            gated
+                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(ThreadEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
+        ));
+        assert!(
+            storage(crate::StorageError::LeaseLost)
+                .to_string()
+                .contains("durable sequencing")
+        );
     }
 
     #[tokio::test]
@@ -1116,6 +1678,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn uncertain_group_probe_makes_started_effect_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -1140,6 +1703,16 @@ mod tests {
         assert_eq!(
             engine.effect_status("uncertain-probe").unwrap(),
             EffectStatus::Unknown
+        );
+
+        assert!(group_pid(u32::MAX).is_err());
+        for probe in [GroupProbe::Absent, GroupProbe::Uncertain] {
+            assert_eq!(group_probe(0, Some(probe)).unwrap(), probe);
+        }
+        assert!(
+            await_group_absent(0, 0, Some(GroupProbe::Absent))
+                .await
+                .unwrap()
         );
     }
 }

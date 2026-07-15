@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Claude Code-inspired single-session TUI prototypes for Latte Code."
+    />
+    <title>Latte Code · Single-session TUI prototypes</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="review-bar">
+      <div>
+        <p class="eyebrow">LATTE CODE · STATIC UI PROTOTYPE</p>
+        <h1>Single-session conversation flow</h1>
+      </div>
+      <nav class="state-switcher" aria-label="Prototype state">
+        <button type="button" data-state="idle"><kbd>1</kbd> 空状态</button>
+        <button type="button" data-state="working"><kbd>2</kbd> 执行中</button>
+        <button type="button" data-state="permission"><kbd>3</kbd> 权限确认</button>
+        <button type="button" data-state="complete"><kbd>4</kbd> 完成态</button>
+      </nav>
+    </header>
+
+    <main class="prototype-stage">
+      <section class="terminal" aria-label="Latte Code terminal prototype">
+        <div class="terminal-chrome" aria-hidden="true">
+          <span class="traffic-light traffic-light--red"></span>
+          <span class="traffic-light traffic-light--yellow"></span>
+          <span class="traffic-light traffic-light--green"></span>
+          <span class="terminal-title">latte-code</span>
+        </div>
+        <div id="prototype-screen" class="terminal-screen" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="review-footer">
+      <span id="state-caption">执行中 · 主流程与工具活动</span>
+      <span>原型控制不属于最终 TUI · 数字键 1–4 切换</span>
+    </footer>
+
+    <template id="state-idle">
+      <div class="tui tui--idle">
+        <header class="tui-header tui-header--welcome">
+          <div class="brand-lockup">
+            <div class="latte-mark" aria-hidden="true">
+              <span></span><span></span><span></span>
+            </div>
+            <div>
+              <div class="brand-line">
+                <strong>Latte Code</strong>
+                <span>v0.1.0</span>
+              </div>
+            </div>
+          </div>
+          <dl class="environment-card">
+            <div><dt>model:</dt><dd>gpt-5.6 · xhigh</dd></div>
+            <div><dt>directory:</dt><dd>~/projects/latte-code</dd></div>
+            <div><dt>permissions:</dt><dd class="tone-amber">Ask mode</dd></div>
+          </dl>
+        </header>
+
+        <section class="welcome-content">
+          <p class="tip"><strong>Tip:</strong> Describe an outcome. Latte Code will inspect, edit, and verify the repository.</p>
+        </section>
+
+        <footer class="composer composer--welcome">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <span class="fake-caret" aria-hidden="true"></span>
+            <span class="placeholder">Ask Latte Code to change this repository…</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span><kbd>Ctrl+Enter</kbd> send · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-working">
+      <div class="tui">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--working"></span>
+            <strong>Latte Code</strong>
+            <span>v0.1.0</span>
+          </div>
+          <div class="repository-context">
+            <span>~/projects/latte-code</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>修复 TUI 中普通的 q、s、j、k 被快捷键截获的问题，并补充回归测试。</p>
+          </article>
+
+          <p class="thinking"><span class="spinner">✦</span> Thought for 9s</p>
+
+          <section class="activity-group" aria-label="Agent activity">
+            <div class="activity-heading"><span>●</span><strong>Inspecting input handling</strong></div>
+
+            <article class="tool-row" data-tool>
+              <button class="tool-summary" type="button" aria-expanded="true">
+                <span class="tool-tree">├─</span>
+                <span class="tool-status tool-status--success">✓</span>
+                <span><strong>Search</strong> <code>reduce_key</code> in <code>crates/latte-tui</code></span>
+                <span class="tool-time">18 matches</span>
+              </button>
+              <div class="tool-detail">
+                <code>crates/latte-tui/src/thread.rs:263</code>
+                <code>crates/latte-tui/src/thread.rs:361</code>
+              </div>
+            </article>
+
+            <article class="tool-row" data-tool>
+              <button class="tool-summary" type="button" aria-expanded="false">
+                <span class="tool-tree">├─</span>
+                <span class="tool-status tool-status--success">✓</span>
+                <span><strong>Read</strong> <code>crates/latte-tui/src/thread.rs</code></span>
+                <span class="tool-time">1,385 lines</span>
+              </button>
+              <div class="tool-detail" hidden>
+                <p>Reducer, renderer, terminal loop, and existing TestBackend coverage.</p>
+              </div>
+            </article>
+
+            <article class="tool-row" data-tool>
+              <button class="tool-summary" type="button" aria-expanded="true">
+                <span class="tool-tree">├─</span>
+                <span class="tool-status tool-status--success">✓</span>
+                <span><strong>Edit</strong> <code>crates/latte-tui/src/thread.rs</code></span>
+                <span class="tool-time tone-amber">+74 −29</span>
+              </button>
+              <div class="tool-detail tool-detail--diff">
+                <span class="diff-add">+ Composer owns every printable character</span>
+                <span class="diff-add">+ Esc enters transcript navigation</span>
+                <span class="diff-remove">− Global j/k/q/s shortcuts while composing</span>
+              </div>
+            </article>
+
+            <article class="tool-row" data-tool>
+              <button class="tool-summary" type="button" aria-expanded="true">
+                <span class="tool-tree">└─</span>
+                <span class="tool-status tool-status--running">◌</span>
+                <span><strong>Running</strong> <code>cargo test -p latte-tui</code></span>
+                <span class="tool-time">8.2s</span>
+              </button>
+              <div class="tool-detail">
+                <span class="terminal-output">test composer_accepts_reserved_characters ... ok</span>
+                <span class="terminal-output tone-muted">test paste_preserves_multiline_text ... running</span>
+              </div>
+            </article>
+          </section>
+
+          <p class="assistant-stream"><span class="assistant-bullet">●</span> 输入焦点已经调整完成；我正在等待最后一组 TUI 测试结束。</p>
+        </div>
+
+        <footer class="composer">
+          <div class="composer-input composer-input--multiline">
+            <span class="prompt-glyph">›</span>
+            <span class="composer-draft">顺便检查粘贴多行文本后的光标位置，<br>并确认 Shift+Enter 换行不会触发发送。<span class="fake-caret" aria-hidden="true"></span></span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span>Working · <kbd>Ctrl+C</kbd> interrupt · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-permission">
+      <div class="tui">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--attention"></span>
+            <strong>Latte Code</strong>
+            <span>Waiting for approval</span>
+          </div>
+          <div class="repository-context">
+            <span>~/projects/latte-code</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>把新的单 Session TUI 实现到现有的 Ratatui 前端。</p>
+          </article>
+
+          <p class="thinking"><span>✦</span> Thought for 14s</p>
+
+          <section class="activity-group">
+            <div class="activity-heading"><span>●</span><strong>Implementing conversation layout</strong></div>
+            <div class="compact-step"><span>├─</span><span class="tool-status--success">✓</span><span>Read current projection and safety contracts</span></div>
+            <div class="compact-step"><span>├─</span><span class="tool-status--success">✓</span><span>Prepare replacement renderer</span></div>
+            <div class="compact-step"><span>└─</span><span class="tool-status--attention">!</span><span>Write requires approval</span></div>
+          </section>
+
+          <aside class="permission-card" aria-label="Permission required">
+            <div class="permission-title">
+              <span class="permission-icon">!</span>
+              <div>
+                <strong>Permission required</strong>
+                <p>Latte Code wants to modify a repository file.</p>
+              </div>
+            </div>
+            <dl class="permission-operation">
+              <div><dt>Operation</dt><dd>Edit one file</dd></div>
+              <div><dt>Target</dt><dd><code>crates/latte-tui/src/thread.rs</code></dd></div>
+              <div><dt>Scope</dt><dd>Replace renderer and input focus handling · +218 −91</dd></div>
+            </dl>
+            <div class="permission-actions">
+              <span><kbd>d</kbd> Deny</span>
+              <span><kbd>Ctrl+A</kbd> Allow once</span>
+              <span class="permission-safe">Enter does nothing</span>
+            </div>
+          </aside>
+        </div>
+
+        <footer class="composer composer--disabled">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <span>Resolve the permission request to continue</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Ask mode</strong> · write blocked</span>
+            <span><kbd>d</kbd> deny · <kbd>Ctrl+A</kbd> allow once</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <template id="state-complete">
+      <div class="tui">
+        <header class="tui-header tui-header--compact">
+          <div class="product-context">
+            <span class="status-dot status-dot--ready"></span>
+            <strong>Latte Code</strong>
+            <span>Ready</span>
+          </div>
+          <div class="repository-context">
+            <span>~/projects/latte-code</span>
+            <span class="branch">main*</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <article class="message message--user">
+            <span class="message-glyph">›</span>
+            <p>修复 TUI 中普通的 q、s、j、k 被快捷键截获的问题，并补充回归测试。</p>
+          </article>
+
+          <p class="thinking"><span>✦</span> Worked for 1m 34s</p>
+
+          <section class="activity-group activity-group--complete">
+            <div class="activity-heading"><span class="tool-status--success">●</span><strong>Completed</strong></div>
+            <div class="compact-step"><span>├─</span><span class="tool-status--success">✓</span><span>Inspected reducer and terminal event loop</span></div>
+            <div class="compact-step"><span>├─</span><span class="tool-status--success">✓</span><span>Updated composer focus and paste handling</span></div>
+            <div class="compact-step"><span>└─</span><span class="tool-status--success">✓</span><span><code>cargo test -p latte-tui</code> · 38 passed</span></div>
+          </section>
+
+          <article class="assistant-answer">
+            <span class="assistant-bullet">●</span>
+            <div>
+              <p>已修复 Composer 的输入焦点问题。现在所有可打印字符都会进入输入框，只有进入导航模式后，<code>j/k</code> 才用于滚动。</p>
+              <p>同时补上了 bracketed paste 和多行输入的回归测试。</p>
+              <div class="handoff-summary">
+                <div>
+                  <span class="handoff-label">Changed</span>
+                  <span><code>crates/latte-tui/src/thread.rs</code></span>
+                  <span><code>crates/latte-tui/tests/input.rs</code></span>
+                </div>
+                <div>
+                  <span class="handoff-label">Verified</span>
+                  <span class="tone-green">✓ cargo test -p latte-tui</span>
+                  <span class="tone-green">✓ cargo fmt --all -- --check</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <footer class="composer">
+          <div class="composer-input">
+            <span class="prompt-glyph">›</span>
+            <span class="fake-caret" aria-hidden="true"></span>
+            <span class="placeholder">Ask a follow-up…</span>
+          </div>
+          <div class="composer-meta">
+            <span><strong>Build</strong> · gpt-5.6 · xhigh · Ask</span>
+            <span><kbd>Ctrl+Enter</kbd> send · <kbd>Ctrl+P</kbd> commands</span>
+          </div>
+        </footer>
+      </div>
+    </template>
+
+    <script src="./prototype.js"></script>
+  </body>
+</html>

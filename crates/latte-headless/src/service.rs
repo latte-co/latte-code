@@ -1,9 +1,12 @@
 //! Typed command execution service shared by interactive frontends.
 use crate::{
     provider::Provider,
+    registry::{ProviderBinding, ResolvedProvider},
     runtime::{AgentRuntime, RuntimeError, VerificationPlan},
 };
-use latte_core::{IdSource, PermissionDecision, RunId, RunState, RuntimeCommand, SystemIdSource};
+use latte_core::{
+    IdSource, PermissionDecision, RunId, RunState, RuntimeCommand, SystemIdSource, wall_time_ms,
+};
 use latte_engine::{CancellationToken, EngineHandle};
 use std::{
     collections::HashMap,
@@ -38,13 +41,14 @@ pub enum CommandError {
 }
 
 /// Runtime authority adapter. It owns provider construction and active cancellation handles.
-pub struct RuntimeCommandService<F, P> {
+type ProviderFactory =
+    Arc<dyn Fn() -> Result<(Arc<dyn Provider>, ProviderBinding), String> + Send + Sync>;
+pub struct RuntimeCommandService {
     engine: EngineHandle,
     root: PathBuf,
     verification: VerificationPlan,
-    provider: F,
+    provider: ProviderFactory,
     active: Arc<Mutex<HashMap<RunId, CancellationToken>>>,
-    _provider: std::marker::PhantomData<fn() -> P>,
 }
 struct ActiveGuard {
     active: Arc<Mutex<HashMap<RunId, CancellationToken>>>,
@@ -56,7 +60,7 @@ impl Drop for ActiveGuard {
     }
 }
 
-impl<F: Clone, P> Clone for RuntimeCommandService<F, P> {
+impl Clone for RuntimeCommandService {
     fn clone(&self) -> Self {
         Self {
             engine: self.engine.clone(),
@@ -64,30 +68,55 @@ impl<F: Clone, P> Clone for RuntimeCommandService<F, P> {
             verification: self.verification.clone(),
             provider: self.provider.clone(),
             active: Arc::clone(&self.active),
-            _provider: std::marker::PhantomData,
         }
     }
 }
 
-impl<F, P> RuntimeCommandService<F, P>
-where
-    F: Fn() -> Result<P, String> + Send + Sync + Clone + 'static,
-    P: Provider + 'static,
-{
+impl RuntimeCommandService {
     #[must_use]
-    pub fn new(
+    pub fn new<F, P>(
         engine: EngineHandle,
         root: impl AsRef<Path>,
         verification: VerificationPlan,
         provider: F,
-    ) -> Self {
+    ) -> Self
+    where
+        F: Fn() -> Result<P, String> + Send + Sync + 'static,
+        P: Provider,
+    {
+        let provider_engine = engine.clone();
         Self {
             engine,
             root: root.as_ref().to_owned(),
             verification,
-            provider,
+            provider: Arc::new(move || {
+                provider().map(|p| {
+                    (
+                        Arc::new(p) as Arc<dyn Provider>,
+                        ProviderBinding::direct(&provider_engine.tool_descriptors()),
+                    )
+                })
+            }),
             active: Arc::new(Mutex::new(HashMap::new())),
-            _provider: std::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn new_bound<F>(
+        engine: EngineHandle,
+        root: impl AsRef<Path>,
+        verification: VerificationPlan,
+        provider: F,
+    ) -> Self
+    where
+        F: Fn() -> Result<ResolvedProvider, String> + Send + Sync + 'static,
+    {
+        Self {
+            engine,
+            root: root.as_ref().to_owned(),
+            verification,
+            provider: Arc::new(move || provider().map(|value| (value.provider, value.binding))),
+            active: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -96,7 +125,7 @@ where
         match command {
             RuntimeCommand::Run { prompt } => {
                 let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-                let provider = (self.provider)()
+                let (provider, binding) = (self.provider)()
                     .map_err(|e| CommandError::Storage(format!("provider configuration: {e}")))?;
                 let cancellation = CancellationToken::new();
                 self.active
@@ -107,9 +136,10 @@ where
                     active: Arc::clone(&self.active),
                     run_id,
                 };
-                let runtime = AgentRuntime::new(
+                let runtime = AgentRuntime::from_bound_provider(
                     self.engine.clone(),
                     provider,
+                    binding,
                     &self.root,
                     self.verification.clone(),
                 )
@@ -173,13 +203,7 @@ where
                         | latte_core::RunStatus::Failed
                         | latte_core::RunStatus::Interrupted
                 ) {
-                    let now = u64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis(),
-                    )
-                    .unwrap_or(u64::MAX);
+                    let now = wall_time_ms();
                     let lease = self
                         .engine
                         .acquire_lease(&format!("agent-{run_id}"), now, 60_000)
@@ -215,7 +239,7 @@ where
                 {
                     return Err(CommandError::RequestMismatch);
                 }
-                let provider = (self.provider)()
+                let (provider, binding) = (self.provider)()
                     .map_err(|e| CommandError::Storage(format!("provider configuration: {e}")))?;
                 let cancellation = CancellationToken::new();
                 self.active
@@ -226,9 +250,10 @@ where
                     active: Arc::clone(&self.active),
                     run_id,
                 };
-                AgentRuntime::new(
+                AgentRuntime::from_bound_provider(
                     self.engine.clone(),
                     provider,
+                    binding,
                     &self.root,
                     self.verification.clone(),
                 )
@@ -278,7 +303,7 @@ where
         Ok(state)
     }
     async fn resume(&self, run_id: RunId, allow: bool) -> Result<CommandResult, CommandError> {
-        let provider = (self.provider)()
+        let (provider, binding) = (self.provider)()
             .map_err(|e| CommandError::Storage(format!("provider configuration: {e}")))?;
         let cancellation = CancellationToken::new();
         self.active
@@ -289,9 +314,10 @@ where
             active: Arc::clone(&self.active),
             run_id,
         };
-        AgentRuntime::new(
+        AgentRuntime::from_bound_provider(
             self.engine.clone(),
             provider,
+            binding,
             &self.root,
             self.verification.clone(),
         )
@@ -301,16 +327,6 @@ where
         .map(|run| CommandResult::Run(Box::new(run)))
         .map_err(Into::into)
     }
-}
-
-fn wall_time_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
 }
 
 struct ActorRequest {
@@ -324,11 +340,8 @@ pub struct RuntimeCommandActor {
     cancel_tx: mpsc::Sender<ActorRequest>,
 }
 impl RuntimeCommandActor {
-    pub fn start<F, P>(service: RuntimeCommandService<F, P>, capacity: usize) -> Self
-    where
-        F: Fn() -> Result<P, String> + Send + Sync + Clone + 'static,
-        P: Provider + 'static,
-    {
+    #[must_use]
+    pub fn start(service: RuntimeCommandService, capacity: usize) -> Self {
         let (tx, mut rx) = mpsc::channel::<ActorRequest>(capacity.max(1));
         let (cancel_tx, mut cancel_rx) = mpsc::channel::<ActorRequest>(capacity.max(1));
         let cancel_service = service.clone();
@@ -373,23 +386,23 @@ impl RuntimeCommandActor {
 mod tests {
     use super::*;
     use crate::provider::{FakeProvider, ProviderResponse};
-    use crate::provider::{Message, Provider, ProviderError};
+    use crate::provider::{Provider, ProviderContext, ProviderFuture, ProviderRequest};
     use latte_core::{RunStatus, RuntimeCommand};
-    use latte_engine::ToolDescriptor;
 
     #[derive(Clone)]
     struct SlowProvider;
     impl Provider for SlowProvider {
-        async fn complete(
-            &self,
-            _: &[Message],
-            _: &[ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            Ok(ProviderResponse {
-                message: Some("late".into()),
-                tool_calls: vec![],
-                input_request: None,
+        fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(ProviderResponse {
+                    message: Some("late".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
             })
         }
     }
@@ -397,86 +410,101 @@ mod tests {
     #[derive(Clone)]
     struct InputProvider;
     impl Provider for InputProvider {
-        async fn complete(
-            &self,
-            messages: &[Message],
-            _: &[ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages
-                .iter()
-                .any(|m| m.is_role("user") && m.content() == Some("answer42"))
-            {
-                Ok(ProviderResponse {
-                    message: Some("used answer42".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("need input".into()),
-                    tool_calls: vec![],
-                    input_request: Some(crate::provider::InputRequest {
-                        id: "input-1".into(),
-                        prompt: "answer?".into(),
-                        secret: false,
-                    }),
-                })
-            }
+        fn complete(&self, request: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages
+                    .iter()
+                    .any(|m| m.is_role("user") && m.content() == Some("answer42"))
+                {
+                    Ok(ProviderResponse {
+                        message: Some("used answer42".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: None,
+                        tool_calls: vec![],
+                        input_request: Some(crate::provider::InputRequest {
+                            id: "input-1".into(),
+                            prompt: "answer?".into(),
+                            secret: false,
+                        }),
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
     #[derive(Clone)]
     struct SecretProvider;
     impl Provider for SecretProvider {
-        async fn complete(
-            &self,
-            _: &[Message],
-            _: &[ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            Ok(ProviderResponse {
-                message: Some("credential needed".into()),
-                tool_calls: vec![],
-                input_request: Some(crate::provider::InputRequest {
-                    id: "secret-id".into(),
-                    prompt: "secret-value".into(),
-                    secret: true,
-                }),
+        fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+            Box::pin(async {
+                Ok(ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(crate::provider::InputRequest {
+                        id: "secret-id".into(),
+                        prompt: "secret-value".into(),
+                        secret: true,
+                    }),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
             })
         }
     }
     #[derive(Clone)]
     struct SlowInputProvider;
     impl Provider for SlowInputProvider {
-        async fn complete(
-            &self,
-            messages: &[Message],
-            _: &[ToolDescriptor],
-        ) -> Result<ProviderResponse, ProviderError> {
-            if messages.iter().any(|m| m.content() == Some("go")) {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                Ok(ProviderResponse {
-                    message: Some("late".into()),
-                    tool_calls: vec![],
-                    input_request: None,
-                })
-            } else {
-                Ok(ProviderResponse {
-                    message: Some("input".into()),
-                    tool_calls: vec![],
-                    input_request: Some(crate::provider::InputRequest {
-                        id: "slow-input".into(),
-                        prompt: "go?".into(),
-                        secret: false,
-                    }),
-                })
-            }
+        fn complete(&self, request: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+            Box::pin(async move {
+                let messages = &request.messages;
+                if messages.iter().any(|m| m.content() == Some("go")) {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    Ok(ProviderResponse {
+                        message: Some("late".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                } else {
+                    Ok(ProviderResponse {
+                        message: None,
+                        tool_calls: vec![],
+                        input_request: Some(crate::provider::InputRequest {
+                            id: "slow-input".into(),
+                            prompt: "go?".into(),
+                            secret: false,
+                        }),
+                        usage: crate::provider::ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                }
+            })
         }
     }
 
+    #[cfg(unix)]
     fn provider() -> Result<FakeProvider, String> {
         Ok(FakeProvider::scripted([ProviderResponse {
             message: Some("done".into()),
             tool_calls: vec![],
             input_request: None,
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
         }]))
     }
     fn plan() -> VerificationPlan {
@@ -489,9 +517,8 @@ mod tests {
             stderr_cap: 1024,
         }
     }
-    fn service(
-        dir: &tempfile::TempDir,
-    ) -> RuntimeCommandService<fn() -> Result<FakeProvider, String>, FakeProvider> {
+    #[cfg(unix)]
+    fn service(dir: &tempfile::TempDir) -> RuntimeCommandService {
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(dir.path())
             .database_path(dir.path().join("state.db"))
@@ -500,6 +527,7 @@ mod tests {
         RuntimeCommandService::new(engine, dir.path(), plan(), provider)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn typed_start_permission_allow_completes() {
         let dir = tempfile::tempdir().unwrap();
@@ -536,6 +564,7 @@ mod tests {
         assert!(matches!(completed,CommandResult::Run(run) if run.status==RunStatus::Completed));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_deny_fails_and_stale_command_is_visible() {
         let dir = tempfile::tempdir().unwrap();
@@ -580,6 +609,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn deny_does_not_construct_provider() {
         let dir = tempfile::tempdir().unwrap();
@@ -696,6 +726,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn input_request_survives_reopen_and_exact_value_resumes_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -899,5 +930,116 @@ mod tests {
                 CommandResult::Runs(_)
             ));
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn command_service_and_actor_fail_closed_at_configuration_and_channel_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let unavailable =
+            RuntimeCommandService::new_bound(engine.clone(), dir.path(), plan(), || {
+                Err("binding unavailable".into())
+            });
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::Run {
+                    prompt: "cannot start".into()
+                })
+                .await,
+            Err(CommandError::Storage(message))
+                if message.contains("provider configuration")
+                    && message.contains("binding unavailable")
+        ));
+
+        let missing = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Show { run_id: missing }).await,
+            Err(CommandError::Storage(message)) if message.contains("was not found")
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::List).await.unwrap(),
+            CommandResult::Runs(runs) if runs.is_empty()
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Shutdown).await.unwrap(),
+            CommandResult::Accepted
+        ));
+
+        let queued = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(queued, 1).unwrap();
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::Cancel {
+                    run_id: queued,
+                    expected_revision: 0
+                })
+                .await,
+            Err(CommandError::NotActive(id)) if id == queued
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Resume { run_id: queued, expected_revision: 0 }).await,
+            Err(CommandError::Storage(message)) if message.contains("provider configuration")
+        ));
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::ResolvePermission {
+                    run_id: queued,
+                    request_id: "wrong".into(),
+                    expected_revision: 0,
+                    decision: PermissionDecision::Allow,
+                })
+                .await,
+            Err(CommandError::RequestMismatch)
+        ));
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::ProvideInput {
+                    run_id: queued,
+                    request_id: "wrong".into(),
+                    expected_revision: 0,
+                    value: "value".into(),
+                })
+                .await,
+            Err(CommandError::RequestMismatch)
+        ));
+        let held = engine
+            .acquire_lease("foreign", wall_time_ms(), 60_000)
+            .unwrap();
+        assert!(matches!(
+            unavailable.reconcile_unknown_and_abort(queued, "missing"),
+            Err(CommandError::Storage(_))
+        ));
+        engine.release_lease(&held).unwrap();
+
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        let (closed_cancel_tx, closed_cancel_rx) = mpsc::channel(1);
+        drop(closed_cancel_rx);
+        let closed = RuntimeCommandActor {
+            tx: closed_tx,
+            cancel_tx: closed_cancel_tx,
+        };
+        assert!(matches!(
+            closed.execute(RuntimeCommand::List).await,
+            Err(CommandError::Storage(message)) if message.contains("actor closed")
+        ));
+
+        let (drop_tx, mut drop_rx) = mpsc::channel::<ActorRequest>(1);
+        let (drop_cancel_tx, _drop_cancel_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = drop_rx.recv().await;
+        });
+        let dropped = RuntimeCommandActor {
+            tx: drop_tx,
+            cancel_tx: drop_cancel_tx,
+        };
+        assert!(matches!(
+            dropped.execute(RuntimeCommand::List).await,
+            Err(CommandError::Storage(message)) if message.contains("result dropped")
+        ));
     }
 }
