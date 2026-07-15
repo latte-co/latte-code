@@ -123,6 +123,19 @@ fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
         tool_messages[4]["content"]
     );
 
+    pty.write(b"\x1b[21~");
+    assert!(
+        pty.wait_for_output(b"\x1b[?1049l", Duration::from_secs(15)),
+        "TUI did not restore the terminal after F10: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    let (status, output) = pty.finish(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "TUI exited with {status}: {}",
+        String::from_utf8_lossy(&output)
+    );
+
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
         .database_path(scenario.database_path())
@@ -147,19 +160,6 @@ fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("notes.txt")).unwrap(),
         "needle after\n"
-    );
-
-    pty.write(b"\x1b[21~");
-    assert!(
-        pty.wait_for_output(b"\x1b[?1049l", Duration::from_secs(15)),
-        "TUI did not restore the terminal after F10: {}",
-        String::from_utf8_lossy(&pty.output())
-    );
-    let (status, output) = pty.finish(Duration::from_secs(5));
-    assert!(
-        status.success(),
-        "TUI exited with {status}: {}",
-        String::from_utf8_lossy(&output)
     );
 }
 
