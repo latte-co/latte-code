@@ -43,12 +43,12 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 
 | 指标 | 当前值 | 说明 |
 | --- | ---: | --- |
-| Cargo 可发现测试 | 344 | 245 个 crate-local、13 个 contract、71 个最终二进制 E2E、15 个 doc tests |
+| Cargo 可发现测试 | 348 | 245 个 crate-local、13 个 contract、75 个最终二进制 E2E、15 个 doc tests |
 | crate-local 测试 | 245 | 独立 `--lib --bins` profile；其中既有 inline tests 仍有待继续纯化的 component 行为 |
 | Contract / component | 13 | 5 个 contract targets，由 inventory 防漏 |
-| 最终二进制 E2E | 71 | 单一 `e2e` target；headless、Provider、tool/recovery、公开边界和真实 PTY |
+| 最终二进制 E2E | 75 | 单一 `e2e` target；headless、Provider、tool/recovery、公开边界和真实 PTY |
 | UT-only 行覆盖率 | 95.06% | 最新完整 CI 为 `26828 / 28223`，`make coverage-unit`；独立复跑的 missed lines 有 2 行波动，但显示值均为 95.06% |
-| 最终二进制 E2E 行覆盖率 | 80.55% | `10657 / 13230`，独立运行均通过 80% 卡点；观测值为 80.54%–80.55% |
+| 最终二进制 E2E 行覆盖率 | 80.79% | macOS 为 `10688 / 13230`；CI 在 macOS 与 Ubuntu 上分别执行并强制 80% 卡点 |
 | 总行覆盖率 | 96.57%–96.58% | fresh `make coverage-total` 的独立运行观测为 `27256–27257 / 28223` |
 
 ### 2.2 当前剩余问题
@@ -455,8 +455,8 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 本设计不是从空白假设测试能力：
 
 - `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，UT-only profile 为 95.06%；
-- 当前独立 `contract` 与 `e2e` targets 共 84 个 integration tests，其中最终二进制 E2E 71 个；
-- 三个 fresh llvm-cov profile 均通过：UT-only 95.06%、最终二进制 E2E 80.55%、全 targets 96.57%–96.58%；
+- 当前独立 `contract` 与 `e2e` targets 共 88 个 integration tests，其中最终二进制 E2E 75 个；
+- 三个 fresh llvm-cov profile 均通过：UT-only 95.06%、macOS 最终二进制 E2E 80.79%、全 targets 96.57%–96.58%；
 - 最终二进制、loopback Provider、真实 PTY、跨进程 SQLite resume 和 terminal mode restore 都已有可复用实现；
 - Provider endpoint 已可指向 loopback harness，因此 cassette replay 可以复用同一最终二进制路径，不要求生产后门；
 - runtime 已有 process `Started`、Unknown、restart recovery 和 reconciliation 的 component tests，外部 barrier E2E 是把既有语义提升到最终二进制边界，不要求新增生产后门；

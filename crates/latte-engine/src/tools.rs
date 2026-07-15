@@ -916,7 +916,7 @@ mod tests {
             .unwrap();
         assert!(read.truncated);
         assert_eq!(read.value["content"], "one");
-        assert!(read.value["sha256"].as_str().unwrap().len() == 64);
+        assert_eq!(read.value["sha256"].as_str().unwrap().len(), 64);
         assert!(
             registry
                 .invoke(&call(

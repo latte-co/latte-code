@@ -46,6 +46,137 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
 }
 
 #[test]
+fn text_mode_run_show_and_list_preserve_the_user_visible_summary() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("plain-text handoff")]);
+    let run = scenario.output(&["run", "complete in text mode"], |command| {
+        scenario.configure_provider(
+            command,
+            provider.endpoint(),
+            r#"["/bin/pwd"]"#,
+            "latte-e2e-text-mode-key",
+        );
+    });
+    assert!(run.status.success());
+    let rendered = String::from_utf8(run.stdout).unwrap();
+    assert!(rendered.contains(": Completed (revision "));
+    assert!(rendered.contains("plain-text handoff"));
+    let run_id = rendered
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|value| value.trim_end_matches(':'))
+        .unwrap();
+
+    let shown = scenario.output(&["show", run_id], |_| {});
+    assert!(shown.status.success());
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains(&format!("run {run_id}: Completed")));
+    assert!(shown.contains("plain-text handoff"));
+
+    let listed = scenario.output(&["list"], |_| {});
+    assert!(listed.status.success());
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains(run_id));
+    assert!(listed.contains("Completed"));
+    provider.assert_consumed();
+}
+
+#[test]
+fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_thread_budgets() {
+    for (config, expected) in [
+        ("[]", "top-level configuration must be an object"),
+        ("{unknown_key:true}", "unknown field `unknown_key`"),
+        (
+            "{thread:{max_input_bytes:5,reserved_output_bytes:5}}",
+            "reserved output must be smaller than input budget",
+        ),
+    ] {
+        let output = isolated_output(&["--json", "list"], |scenario, _| {
+            std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+            std::fs::write(scenario.root().join(".latte/latte-code.jsonc"), config).unwrap();
+        });
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(json(&output)["error"]["code"], "configuration");
+        assert!(
+            json(&output)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let parentless_database = isolated_output(&["--json", "list"], |scenario, _| {
+        scenario.write_config_with_database("http://127.0.0.1:1", r#"["/usr/bin/true"]"#, "/");
+    });
+    assert_eq!(parentless_database.status.code(), Some(2));
+    assert_eq!(json(&parentless_database)["error"]["code"], "configuration");
+    assert!(
+        json(&parentless_database)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("database.path must have a parent directory")
+    );
+}
+
+#[test]
+fn filesystem_startup_failures_are_typed_before_command_execution() {
+    let unreadable_config = isolated_output(&["--json", "list"], |scenario, _| {
+        std::fs::create_dir_all(scenario.root().join(".latte/latte-code.jsonc")).unwrap();
+    });
+    assert_eq!(unreadable_config.status.code(), Some(2));
+    assert_eq!(json(&unreadable_config)["error"]["code"], "configuration");
+    assert!(
+        json(&unreadable_config)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot read")
+    );
+
+    let blocked_database_parent = isolated_output(&["--json", "list"], |scenario, _| {
+        std::fs::write(scenario.root().join("blocked-parent"), "not a directory").unwrap();
+        scenario.write_config_with_database(
+            "http://127.0.0.1:1",
+            r#"["/usr/bin/true"]"#,
+            "blocked-parent/state.db",
+        );
+    });
+    assert_eq!(blocked_database_parent.status.code(), Some(70));
+    assert_eq!(
+        json(&blocked_database_parent)["error"]["code"],
+        "database_directory"
+    );
+    assert!(
+        json(&blocked_database_parent)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot create")
+    );
+
+    let database_is_directory = isolated_output(&["--json", "list"], |scenario, _| {
+        std::fs::create_dir(scenario.root().join("database-directory")).unwrap();
+        scenario.write_config_with_database(
+            "http://127.0.0.1:1",
+            r#"["/usr/bin/true"]"#,
+            "database-directory",
+        );
+    });
+    assert_eq!(database_is_directory.status.code(), Some(70));
+    assert_eq!(
+        json(&database_is_directory)["error"]["code"],
+        "engine_initialization"
+    );
+    assert!(
+        json(&database_is_directory)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
+}
+
+#[test]
 fn nested_build_directory_discovers_workspace_and_uses_defaults() {
     let scenario = Scenario::new();
     let nested = scenario.root().join("target/debug");

@@ -68,6 +68,17 @@ impl Scenario {
         self.write_config_with_provider_fields(endpoint, verification, database_path, "");
     }
 
+    pub fn write_config_with_base_url(&self, base_url: &str, verification: &str) {
+        std::fs::create_dir_all(self.root.path().join(".latte")).unwrap();
+        std::fs::write(
+            self.root.path().join(".latte/latte-code.jsonc"),
+            format!(
+                r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
     pub fn write_config_with_provider_fields(
         &self,
         endpoint: &str,

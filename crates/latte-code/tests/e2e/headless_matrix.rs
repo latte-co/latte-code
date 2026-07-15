@@ -50,6 +50,10 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             "default_provider must name a configured provider",
         ),
         (
+            r#"{default_provider:"",providers:{"":{type:"openai-chat",model:"mock",base_url:"http://127.0.0.1:9",api_key:{source:"env",name:"OPENAI_API_KEY"}}}}"#,
+            "provider names must not be empty",
+        ),
+        (
             r#"{providers:{primary:{model:" "}}}"#,
             "model must not be empty",
         ),
@@ -353,7 +357,7 @@ fn fragmented_sse_tool_call_executes_and_reenters_stream_with_ordered_history() 
 
 #[test]
 fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
-    let cases = [
+    let mut cases = [
         (
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
             "ended without [DONE]",
@@ -371,14 +375,58 @@ fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
             ),
             "stream tool id changed",
         ),
-    ];
+    ]
+    .into_iter()
+    .map(|(stream, expected)| (stream.as_bytes().to_vec(), expected))
+    .collect::<Vec<_>>();
+
+    cases.push((
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"stable\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"write_file\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+        "stream tool name changed",
+    ));
+
+    let argument_chunk = "x".repeat(100_000);
+    let argument_start = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "oversized-arguments",
+            "function": {"name": "read_file", "arguments": argument_chunk}
+        }]}}]
+    });
+    let argument_continuation = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"arguments": "x".repeat(100_000)}
+        }]}}]
+    });
+    let oversized_arguments = format!(
+        "data: {argument_start}\n\ndata: {argument_continuation}\n\ndata: {argument_continuation}\n\n"
+    );
+    cases.push((
+        oversized_arguments.into_bytes(),
+        "stream tool arguments exceed limit",
+    ));
+    cases.push((
+        format!("data: {}\n\n", "x".repeat(256 * 1024 + 1)).into_bytes(),
+        "SSE event exceeds limit",
+    ));
+    cases.push((b"data: \xff\n\n".to_vec(), "SSE data is not UTF-8"));
+    cases.push((vec![b'x'; 4 * 1024 * 1024 + 1], "SSE body exceeds limit"));
+    cases.push((
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"unterminated\"}}]}\n".to_vec(),
+        "ended without [DONE]",
+    ));
+
     for (stream, expected) in cases {
         let scenario = Scenario::new();
-        let provider = ScriptedProvider::start([ProviderReply::raw(
-            200,
-            "text/event-stream",
-            stream.as_bytes(),
-        )]);
+        let provider =
+            ScriptedProvider::start([ProviderReply::raw(200, "text/event-stream", stream)]);
         scenario.write_config_with_provider_fields(
             provider.endpoint(),
             r#"["/bin/pwd"]"#,

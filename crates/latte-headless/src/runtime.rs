@@ -894,7 +894,7 @@ impl AgentRuntime {
                         tools,
                     },
                     ProviderContext {
-                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                        deadline: std::time::Instant::now() + std::time::Duration::from_mins(1),
                         cancellation: self.cancellation.clone(),
                         events: None,
                     },

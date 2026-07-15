@@ -1059,7 +1059,7 @@ impl ThreadRuntimeService {
                     tools: self.engine.tool_descriptors(),
                 },
                 ProviderContext {
-                    deadline: Instant::now() + Duration::from_secs(60),
+                    deadline: Instant::now() + Duration::from_mins(1),
                     cancellation: cancellation.clone(),
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
@@ -2743,7 +2743,11 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
-        let service = delayed_service(root.path(), engine, [(Duration::from_secs(60), response(Some("unused"), vec![]))]);
+        let service = delayed_service(
+            root.path(),
+            engine,
+            [(Duration::from_mins(1), response(Some("unused"), vec![]))],
+        );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let cancel = async { wait_until(|| service.active.lock().unwrap().contains_key(&thread_id), "provider registration").await; service.cancel(thread_id); };
         let (cancelled, ()) = tokio::join!(service.start(thread_id, "cancel provider".into(), binding()), cancel);

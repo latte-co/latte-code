@@ -21,6 +21,36 @@ fn run_with_provider(
 }
 
 #[test]
+fn base_url_is_normalized_to_the_production_chat_completions_endpoint() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("base URL completed")]);
+    let base_url = provider
+        .endpoint()
+        .strip_suffix("/chat/completions")
+        .unwrap();
+    scenario.write_config_with_base_url(&format!("{base_url}///"), r#"["/bin/pwd"]"#);
+    let output = scenario.output(
+        &["--json", "run", "exercise base URL normalization"],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "latte-provider-e2e-secret");
+        },
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        json(&output)["data"]["run"]["handoff"]["summary"],
+        "base URL completed"
+    );
+    provider.assert_consumed();
+    assert_eq!(provider.requests()[0].path, "/chat/completions");
+}
+
+#[test]
 fn retryable_http_is_retried_exactly_once_then_completes_durably() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([

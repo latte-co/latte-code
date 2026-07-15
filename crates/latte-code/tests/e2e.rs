@@ -1,2 +1,4 @@
+#![cfg(unix)]
+
 #[path = "e2e/mod.rs"]
 mod e2e_suite;
