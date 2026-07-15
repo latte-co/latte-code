@@ -1620,4 +1620,146 @@ mod tests {
         assert!(!valid_tool_call_id("token=value"));
         assert!(!valid_tool_call_id("call:unsafe"));
     }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn local_provider_boundaries_fail_closed_before_network_and_preserve_wire_roles() {
+        let request = ProviderRequest {
+            messages: vec![],
+            tools: vec![],
+        };
+        let fake = FakeProvider::default();
+        fake.push_error("offline");
+        assert!(matches!(
+            fake.complete(request.clone(), context()).await,
+            Err(ProviderError::Transport(message)) if message == "offline"
+        ));
+        assert!(matches!(
+            fake.complete(request.clone(), context()).await,
+            Err(ProviderError::Malformed(message)) if message == "fake provider exhausted"
+        ));
+        assert_eq!(
+            fake.capabilities(),
+            ProviderCapabilities {
+                tools: true,
+                parallel_tool_calls: true,
+                input_request: true,
+            }
+        );
+
+        let provider = OpenAiProvider::new(
+            "http://127.0.0.1:1",
+            "model",
+            "private-key",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let cancelled = latte_engine::CancellationToken::new();
+        cancelled.cancel();
+        let cancelled_context = ProviderContext {
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancellation: cancelled,
+            events: None,
+        };
+        assert!(matches!(
+            provider
+                .complete(request.clone(), cancelled_context.clone())
+                .await,
+            Err(ProviderError::Cancelled)
+        ));
+        assert!(matches!(
+            complete_inline_once(&provider, serde_json::json!({}), &cancelled_context).await,
+            Err(ProviderError::Cancelled)
+        ));
+        assert!(matches!(
+            retry_pause(&cancelled_context, 1, Some(Duration::from_millis(10))).await,
+            Err(ProviderError::Cancelled)
+        ));
+
+        let expired_context = ProviderContext {
+            deadline: Instant::now(),
+            cancellation: latte_engine::CancellationToken::new(),
+            events: None,
+        };
+        assert!(matches!(
+            provider.complete(request, expired_context.clone()).await,
+            Err(ProviderError::Timeout)
+        ));
+        assert!(matches!(
+            complete_inline_once(&provider, serde_json::json!({}), &expired_context).await,
+            Err(ProviderError::Timeout)
+        ));
+        assert!(matches!(
+            retry_pause(&expired_context, 5, None).await,
+            Err(ProviderError::Timeout)
+        ));
+
+        for message in [
+            Message::System {
+                content: "system".into(),
+            },
+            Message::User {
+                content: "user".into(),
+            },
+            Message::Assistant {
+                content: Some("assistant".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path":"a.txt"}),
+                }],
+            },
+            Message::Tool {
+                tool_call_id: "call_1".into(),
+                name: Some("read_file".into()),
+                content: "contents".into(),
+            },
+        ] {
+            let role = match &message {
+                Message::System { .. } => "system",
+                Message::User { .. } => "user",
+                Message::Assistant { .. } => "assistant",
+                Message::Tool { .. } => "tool",
+            };
+            assert!(message.is_role(role));
+            assert_eq!(
+                serde_json::to_value(wire_message(&message).unwrap()).unwrap()["role"],
+                role
+            );
+        }
+
+        let missing: Wire = serde_json::from_value(serde_json::json!({"choices":[]})).unwrap();
+        assert!(matches!(
+            decode_wire(missing, false),
+            Err(ProviderError::Malformed(message)) if message == "missing choices"
+        ));
+        let input_wire = || {
+            serde_json::from_value::<Wire>(serde_json::json!({
+                "choices":[{"message":{"input_request":{
+                    "id":"question-1","prompt":"continue?","secret":false
+                }}}]
+            }))
+            .unwrap()
+        };
+        assert!(matches!(
+            decode_wire(input_wire(), false),
+            Err(ProviderError::Malformed(message)) if message.contains("compatibility_input_request")
+        ));
+        assert_eq!(
+            decode_wire(input_wire(), true)
+                .unwrap()
+                .input_request
+                .unwrap()
+                .id,
+            "question-1"
+        );
+        assert!(!format!("{provider:?}").contains("private-key"));
+        assert!(!provider.capabilities().input_request);
+        assert!(
+            provider
+                .with_compatibility_input_request(true)
+                .capabilities()
+                .input_request
+        );
+    }
 }

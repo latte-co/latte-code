@@ -260,3 +260,306 @@ impl HeadlessOutcome {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Evidence, IdSource, SystemIdSource};
+
+    fn queued() -> RunState {
+        RunState::queued(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()))
+    }
+
+    fn permission(id: &str) -> PendingPermission {
+        PendingPermission {
+            request_id: id.into(),
+            operation_digest: "digest".into(),
+            description: "write a file".into(),
+        }
+    }
+
+    fn input(id: &str) -> PendingInput {
+        PendingInput {
+            request_id: id.into(),
+            prompt: "value".into(),
+        }
+    }
+
+    fn failure(retryability: Retryability) -> RunFailure {
+        RunFailure {
+            code: FailureCode::RuntimeFailed,
+            message: "failed".into(),
+            retryability,
+        }
+    }
+
+    fn handoff(statuses: &[VerificationStatus]) -> Handoff {
+        Handoff {
+            summary: "done".into(),
+            files_changed: vec!["src/lib.rs".into()],
+            evidence: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| Evidence {
+                    name: format!("check-{index}"),
+                    status: *status,
+                    summary: "result".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn permission_and_input_transitions_require_exact_durable_identity() {
+        let running = queued().transition(0, Transition::Start).unwrap();
+        let waiting = running
+            .transition(
+                running.revision,
+                Transition::RequestPermission(permission("permission-1")),
+            )
+            .unwrap();
+        assert_eq!(waiting.status, RunStatus::WaitingPermission);
+        assert_eq!(
+            waiting.transition(
+                waiting.revision,
+                Transition::ResolvePermission {
+                    request_id: "wrong".into(),
+                    allowed: true,
+                }
+            ),
+            Err(TransitionError::MismatchedRequest)
+        );
+        let refreshed = waiting
+            .transition(
+                waiting.revision,
+                Transition::RefreshPermission(permission("permission-2")),
+            )
+            .unwrap();
+        assert_eq!(
+            refreshed.pending_permission.as_ref().unwrap().request_id,
+            "permission-2"
+        );
+        let allowed = refreshed
+            .transition(
+                refreshed.revision,
+                Transition::ResolvePermission {
+                    request_id: "permission-2".into(),
+                    allowed: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(allowed.status, RunStatus::Running);
+        assert!(allowed.pending_permission.is_none());
+
+        let waiting_input = allowed
+            .transition(allowed.revision, Transition::RequestInput(input("input-1")))
+            .unwrap();
+        assert_eq!(
+            waiting_input.transition(
+                waiting_input.revision,
+                Transition::ProvideInput {
+                    request_id: "wrong".into()
+                }
+            ),
+            Err(TransitionError::MismatchedRequest)
+        );
+        let resumed = waiting_input
+            .transition(
+                waiting_input.revision,
+                Transition::ProvideInput {
+                    request_id: "input-1".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resumed.status, RunStatus::Running);
+        assert!(resumed.pending_input.is_none());
+
+        let denied_waiting = running
+            .transition(
+                running.revision,
+                Transition::RequestPermission(permission("deny")),
+            )
+            .unwrap();
+        let denied = denied_waiting
+            .transition(
+                denied_waiting.revision,
+                Transition::ResolvePermission {
+                    request_id: "deny".into(),
+                    allowed: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(denied.status, RunStatus::Failed);
+        assert_eq!(denied.failure.unwrap().code, FailureCode::PermissionDenied);
+    }
+
+    #[test]
+    fn cancellation_failure_resume_and_revision_guards_are_total() {
+        let initial = queued();
+        assert_eq!(
+            initial.transition(9, Transition::Start),
+            Err(TransitionError::StaleRevision {
+                expected: 9,
+                actual: 0
+            })
+        );
+        let cancelling = initial.transition(0, Transition::Cancel).unwrap();
+        assert_eq!(cancelling.status, RunStatus::Cancelling);
+        let interrupted = cancelling
+            .transition(cancelling.revision, Transition::Interrupt)
+            .unwrap();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        let resumed = interrupted
+            .transition(interrupted.revision, Transition::Resume)
+            .unwrap();
+        assert_eq!(resumed.status, RunStatus::Queued);
+
+        for state in [
+            queued().transition(0, Transition::Start).unwrap(),
+            queued()
+                .transition(0, Transition::Start)
+                .unwrap()
+                .transition(1, Transition::RequestPermission(permission("p")))
+                .unwrap(),
+            queued()
+                .transition(0, Transition::Start)
+                .unwrap()
+                .transition(1, Transition::RequestInput(input("i")))
+                .unwrap(),
+        ] {
+            let cancelled = state
+                .transition(state.revision, Transition::Cancel)
+                .unwrap();
+            assert_eq!(cancelled.status, RunStatus::Cancelling);
+            assert!(cancelled.pending_permission.is_none());
+            assert!(cancelled.pending_input.is_none());
+        }
+
+        let running = queued().transition(0, Transition::Start).unwrap();
+        let failed = running
+            .transition(
+                running.revision,
+                Transition::Fail(failure(Retryability::Retryable)),
+            )
+            .unwrap();
+        let retried = failed
+            .transition(failed.revision, Transition::Resume)
+            .unwrap();
+        assert_eq!(retried.status, RunStatus::Queued);
+        assert!(retried.failure.is_none());
+
+        let terminal = queued()
+            .transition(0, Transition::Fail(failure(Retryability::Terminal)))
+            .unwrap();
+        assert_eq!(
+            terminal.transition(terminal.revision, Transition::Resume),
+            Err(TransitionError::Invalid {
+                from: RunStatus::Failed
+            })
+        );
+
+        let mut overflow = queued();
+        overflow.revision = u64::MAX;
+        assert_eq!(
+            overflow.transition(u64::MAX, Transition::Start),
+            Err(TransitionError::RevisionOverflow)
+        );
+    }
+
+    #[test]
+    fn completion_policy_fails_closed_and_completed_runs_are_immutable() {
+        let running = queued().transition(0, Transition::Start).unwrap();
+        let no_verification = running
+            .transition(
+                running.revision,
+                Transition::Complete {
+                    handoff: handoff(&[]),
+                    policy: CompletionPolicy::VerificationNotRequired,
+                },
+            )
+            .unwrap();
+        assert_eq!(no_verification.status, RunStatus::Completed);
+        assert!(no_verification.handoff.is_some());
+        assert_eq!(
+            no_verification.transition(no_verification.revision, Transition::Cancel),
+            Err(TransitionError::CompletedImmutable)
+        );
+
+        for statuses in [
+            Vec::new(),
+            vec![VerificationStatus::NotRun],
+            vec![VerificationStatus::Passed, VerificationStatus::Failed],
+        ] {
+            let running = queued().transition(0, Transition::Start).unwrap();
+            let failed = running
+                .transition(
+                    running.revision,
+                    Transition::Complete {
+                        handoff: handoff(&statuses),
+                        policy: CompletionPolicy::VerificationRequired,
+                    },
+                )
+                .unwrap();
+            assert_eq!(failed.status, RunStatus::Failed);
+            assert_eq!(
+                failed.failure.unwrap().code,
+                FailureCode::VerificationFailed
+            );
+        }
+
+        let running = queued().transition(0, Transition::Start).unwrap();
+        let completed = running
+            .transition(
+                running.revision,
+                Transition::Complete {
+                    handoff: handoff(&[VerificationStatus::Passed]),
+                    policy: CompletionPolicy::VerificationRequired,
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn malformed_waiting_states_and_invalid_transitions_are_rejected() {
+        let mut missing_permission = queued();
+        missing_permission.status = RunStatus::WaitingPermission;
+        assert_eq!(
+            missing_permission.transition(
+                0,
+                Transition::ResolvePermission {
+                    request_id: "p".into(),
+                    allowed: true,
+                }
+            ),
+            Err(TransitionError::MissingPending)
+        );
+        let mut missing_input = queued();
+        missing_input.status = RunStatus::WaitingInput;
+        assert_eq!(
+            missing_input.transition(
+                0,
+                Transition::ProvideInput {
+                    request_id: "i".into()
+                }
+            ),
+            Err(TransitionError::MissingPending)
+        );
+        assert_eq!(
+            queued().transition(0, Transition::Interrupt),
+            Err(TransitionError::Invalid {
+                from: RunStatus::Queued
+            })
+        );
+    }
+
+    #[test]
+    fn all_headless_outcomes_have_stable_process_exit_codes() {
+        assert_eq!(HeadlessOutcome::Success.exit_code(), 0);
+        assert_eq!(HeadlessOutcome::Failed.exit_code(), 1);
+        assert_eq!(HeadlessOutcome::UsageError.exit_code(), 2);
+        assert_eq!(HeadlessOutcome::Interrupted.exit_code(), 130);
+        assert_eq!(HeadlessOutcome::Cancelled.exit_code(), 130);
+        assert_eq!(HeadlessOutcome::InternalError.exit_code(), 70);
+    }
+}

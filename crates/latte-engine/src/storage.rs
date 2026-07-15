@@ -4509,4 +4509,1790 @@ mod tests {
             "a truncated current view must not misleadingly start at the oldest card"
         );
     }
+
+    #[test]
+    fn scalar_status_and_lifecycle_conversions_are_total_and_fail_closed() {
+        assert_eq!(to_i64(i64::MAX as u64).unwrap(), i64::MAX);
+        assert!(matches!(
+            to_i64(u64::MAX),
+            Err(StorageError::InvalidData(message)) if message.contains("sqlite range")
+        ));
+        assert_eq!(from_i64(0).unwrap(), 0);
+        assert!(matches!(
+            from_i64(-1),
+            Err(StorageError::InvalidData(message)) if message.contains("negative sqlite integer")
+        ));
+
+        for (status, stored, projected) in [
+            (RunStatus::Queued, "queued", ThreadRunStatus::Queued),
+            (RunStatus::Running, "running", ThreadRunStatus::Running),
+            (
+                RunStatus::WaitingPermission,
+                "waiting_permission",
+                ThreadRunStatus::WaitingPermission,
+            ),
+            (
+                RunStatus::WaitingInput,
+                "waiting_input",
+                ThreadRunStatus::WaitingInput,
+            ),
+            (
+                RunStatus::Cancelling,
+                "cancelling",
+                ThreadRunStatus::Cancelling,
+            ),
+            (
+                RunStatus::Interrupted,
+                "interrupted",
+                ThreadRunStatus::Interrupted,
+            ),
+            (RunStatus::Failed, "failed", ThreadRunStatus::Failed),
+            (
+                RunStatus::Completed,
+                "completed",
+                ThreadRunStatus::Completed,
+            ),
+        ] {
+            assert_eq!(status_name(status), stored);
+            assert_eq!(thread_run_status(status), projected);
+        }
+
+        for (stored, lifecycle) in [
+            ("ready", ThreadLifecycle::Ready),
+            ("running", ThreadLifecycle::Running),
+            ("waiting_permission", ThreadLifecycle::WaitingPermission),
+            ("waiting_input", ThreadLifecycle::WaitingInput),
+            ("interrupted", ThreadLifecycle::Interrupted),
+            ("failed", ThreadLifecycle::Failed),
+            (
+                "reconciliation_required",
+                ThreadLifecycle::ReconciliationRequired,
+            ),
+        ] {
+            assert_eq!(parse_lifecycle(stored).unwrap(), lifecycle);
+        }
+        assert!(matches!(
+            parse_lifecycle("completed"),
+            Err(StorageError::InvalidData(message)) if message.contains("invalid thread lifecycle")
+        ));
+
+        let id = SystemIdSource::default().next_uuid_v7();
+        assert_eq!(
+            parse_thread_id(&id.to_string()).unwrap().to_string(),
+            id.to_string()
+        );
+        assert!(matches!(
+            parse_thread_id("not-a-uuid"),
+            Err(StorageError::InvalidData(message)) if message.contains("invalid stored thread id")
+        ));
+
+        for (kind, stored) in [
+            (TranscriptKind::User, "user"),
+            (TranscriptKind::Assistant, "assistant"),
+            (TranscriptKind::ToolCall, "tool_call"),
+            (TranscriptKind::ToolResult, "tool_result"),
+            (TranscriptKind::Permission, "permission"),
+            (TranscriptKind::Input, "input"),
+            (TranscriptKind::Failure, "failure"),
+            (TranscriptKind::Completion, "completion"),
+            (TranscriptKind::System, "system"),
+        ] {
+            assert_eq!(transcript_kind_name(kind), stored);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn thread_command_digest_covers_every_variant_and_excludes_private_descriptor_secrets() {
+        use latte_core::{PendingInput, PendingPermission, ThreadCommandId, ThreadId};
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let command_id = ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        let source_key = "source".to_owned();
+        let updates = vec![
+            CommitThreadRunUpdate::Start {
+                source_key: source_key.clone(),
+            },
+            CommitThreadRunUpdate::AppendTranscript {
+                source_key: source_key.clone(),
+                kind: TranscriptKind::Assistant,
+                text: "assistant text".into(),
+                payload: Some(serde_json::json!({"value":"payload"})),
+            },
+            CommitThreadRunUpdate::PrepareEffect {
+                source_key: source_key.clone(),
+                effect_id: "effect".into(),
+                operation_digest: "a".repeat(64),
+                descriptor_json: r#"{"name":"write_file"}"#.into(),
+                canonical_descriptor_json: r#"{"api_key":"sk-private-secret-123456789"}"#.into(),
+                policy: ThreadEffectPolicy::Ask,
+                description: "prepare".into(),
+                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+            },
+            CommitThreadRunUpdate::StartEffect {
+                source_key: source_key.clone(),
+                effect_id: "effect".into(),
+                operation_digest: "a".repeat(64),
+                checkpoint_json: r#"{"phase":"started"}"#.into(),
+            },
+            CommitThreadRunUpdate::ObserveEffect {
+                source_key: source_key.clone(),
+                effect_id: "effect".into(),
+                operation_digest: "a".repeat(64),
+                success: true,
+                result: "observed".into(),
+                payload: Some(serde_json::json!({"result":"ok"})),
+                checkpoint_json: r#"{"phase":"observed"}"#.into(),
+            },
+            CommitThreadRunUpdate::UnknownEffect {
+                source_key: source_key.clone(),
+                effect_id: "effect".into(),
+                operation_digest: "a".repeat(64),
+                checkpoint_json: r#"{"phase":"unknown"}"#.into(),
+            },
+            CommitThreadRunUpdate::ReconcileUnknownEffect {
+                source_key: source_key.clone(),
+                effect_id: "effect".into(),
+                checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
+            },
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: source_key.clone(),
+                request: PendingPermission {
+                    request_id: "permission".into(),
+                    operation_digest: "b".repeat(64),
+                    description: "allow write".into(),
+                },
+            },
+            CommitThreadRunUpdate::ResolvePermission {
+                source_key: source_key.clone(),
+                request_id: "permission".into(),
+                allow: true,
+            },
+            CommitThreadRunUpdate::RequestInput {
+                source_key: source_key.clone(),
+                request: PendingInput {
+                    request_id: "input".into(),
+                    prompt: "value?".into(),
+                },
+            },
+            CommitThreadRunUpdate::ProvideInput {
+                source_key: source_key.clone(),
+                request_id: "input".into(),
+                value: "answer".into(),
+            },
+            CommitThreadRunUpdate::Complete {
+                source_key: source_key.clone(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec!["a.txt".into()],
+                    evidence: vec![Evidence {
+                        name: "test".into(),
+                        status: VerificationStatus::Passed,
+                        summary: "passed".into(),
+                    }],
+                },
+            },
+            CommitThreadRunUpdate::CompleteVerified {
+                source_key: source_key.clone(),
+                summary: "verified".into(),
+                verification_effect_id: "verification".into(),
+                verified_manifest_digest: "c".repeat(64),
+                files_changed: vec!["a.txt".into()],
+            },
+            CommitThreadRunUpdate::Fail {
+                source_key: source_key.clone(),
+                failure: RunFailure {
+                    code: FailureCode::RuntimeFailed,
+                    message: "failed".into(),
+                    retryability: Retryability::Terminal,
+                },
+            },
+            CommitThreadRunUpdate::Interrupt {
+                source_key: source_key.clone(),
+                reconciliation_effect_id: Some("effect".into()),
+            },
+        ];
+
+        let mut digests = std::collections::BTreeSet::new();
+        for update in &updates {
+            assert_eq!(update.source_key(), source_key);
+            let request = ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 2,
+                expected_run_revision: 3,
+                command_id,
+                request_id: Some("request".into()),
+                effect_id: Some("effect".into()),
+                update: update.clone(),
+            };
+            let digest = thread_command_digest(&request).unwrap();
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digests.insert(digest),
+                "variant digest collision: {update:?}"
+            );
+        }
+
+        let CommitThreadRunUpdate::PrepareEffect { .. } = &updates[2] else {
+            unreachable!()
+        };
+        let mut changed_private = updates[2].clone();
+        let CommitThreadRunUpdate::PrepareEffect {
+            canonical_descriptor_json,
+            ..
+        } = &mut changed_private
+        else {
+            unreachable!()
+        };
+        *canonical_descriptor_json = r#"{"api_key":"sk-a-different-private-secret"}"#.into();
+        let request = |update| ThreadCommitRequest {
+            thread_id,
+            run_id,
+            expected_thread_revision: 2,
+            expected_run_revision: 3,
+            command_id,
+            request_id: Some("request".into()),
+            effect_id: Some("effect".into()),
+            update,
+        };
+        assert_eq!(
+            thread_command_digest(&request(updates[2].clone())).unwrap(),
+            thread_command_digest(&request(changed_private)).unwrap(),
+            "engine-private canonical content must not enter the replay digest"
+        );
+    }
+
+    #[test]
+    fn thread_identifiers_sources_and_redaction_helpers_reject_unsafe_durable_values() {
+        use latte_core::{PendingInput, PendingPermission};
+        for invalid in ["", "line\nbreak"] {
+            assert!(validate_thread_source(invalid).is_err());
+            assert!(validate_thread_effect_id(invalid).is_err());
+        }
+        assert!(validate_thread_source(&"s".repeat(257)).is_err());
+        assert!(validate_thread_effect_id(&"e".repeat(513)).is_err());
+        validate_thread_source(&"s".repeat(256)).unwrap();
+        validate_thread_effect_id(&"e".repeat(512)).unwrap();
+
+        for invalid in ["a".repeat(63), "g".repeat(64), "a".repeat(65)] {
+            assert!(validate_thread_digest(&invalid).is_err());
+        }
+        validate_thread_digest(&"aB09".repeat(16)).unwrap();
+
+        let secret = "sk-this-is-a-secret-123456789";
+        let permission = redact_permission(&PendingPermission {
+            request_id: secret.into(),
+            operation_digest: secret.into(),
+            description: secret.into(),
+        });
+        let input = redact_input(&PendingInput {
+            request_id: secret.into(),
+            prompt: secret.into(),
+        });
+        let failure = redact_failure(&RunFailure {
+            code: FailureCode::RuntimeFailed,
+            message: secret.into(),
+            retryability: Retryability::Retryable,
+        });
+        let handoff = redact_handoff(&Handoff {
+            summary: secret.into(),
+            files_changed: vec![secret.into()],
+            evidence: vec![Evidence {
+                name: secret.into(),
+                status: VerificationStatus::Failed,
+                summary: secret.into(),
+            }],
+        });
+        let durable = serde_json::to_string(&(permission, input, failure, handoff)).unwrap();
+        assert!(!durable.contains(secret));
+        assert!(durable.contains("[REDACTED]"));
+    }
+
+    fn thread_binding() -> ThreadProviderBindingV2 {
+        ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "provider".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "model".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:PROVIDER_KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        }
+    }
+
+    fn create_linked_fixture(
+        store: &Storage,
+        ids: &SystemIdSource,
+        prompt: &str,
+        now_ms: u64,
+    ) -> (latte_core::ThreadId, RunId, ThreadSnapshot) {
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let snapshot = store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                prompt,
+                &std::collections::BTreeMap::new(),
+                now_ms,
+            )
+            .unwrap();
+        (thread_id, run_id, snapshot)
+    }
+
+    fn commit_linked(
+        store: &Storage,
+        ids: &SystemIdSource,
+        lease: &Lease,
+        snapshot: &ThreadSnapshot,
+        run_id: RunId,
+        update: CommitThreadRunUpdate,
+        now_ms: u64,
+    ) -> ThreadCommitResponse {
+        let run_revision = snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .unwrap()
+            .run_revision;
+        store
+            .commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id: snapshot.thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update,
+                },
+                lease,
+                now_ms,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linked_thread_waits_replays_and_terminal_resolutions_are_atomic() {
+        use latte_core::{PendingInput, PendingPermission, ThreadCommandId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let lease = store.acquire_lease("thread-matrix", 10, 10_000).unwrap();
+        let (thread_id, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "initial", 11);
+
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        assert_eq!(snapshot.runs[0].status, ThreadRunStatus::Running);
+
+        let append = ThreadCommitRequest {
+            thread_id,
+            run_id,
+            expected_thread_revision: snapshot.revision,
+            expected_run_revision: snapshot.runs[0].run_revision,
+            command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitThreadRunUpdate::AppendTranscript {
+                source_key: "assistant-card".into(),
+                kind: TranscriptKind::Assistant,
+                text: "safe card".into(),
+                payload: Some(serde_json::json!({"status":"ok"})),
+            },
+        };
+        let appended = store.commit_thread_run_update(&append, &lease, 13).unwrap();
+        // The source ledger is the second durable idempotency key. Simulate a
+        // lost command-index row and prove that the source record still
+        // returns the exact committed projection without applying twice.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [append.command_id.to_string()],
+            )
+            .unwrap();
+        let source_replay = append.clone();
+        assert_eq!(
+            store
+                .commit_thread_run_update(&source_replay, &lease, 14)
+                .unwrap(),
+            appended,
+            "the source ledger must replay the exact committed result"
+        );
+        let mut mismatched_source = source_replay;
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [mismatched_source.command_id.to_string()],
+            )
+            .unwrap();
+        let CommitThreadRunUpdate::AppendTranscript { text, .. } = &mut mismatched_source.update
+        else {
+            unreachable!()
+        };
+        *text = "different card".into();
+        assert!(matches!(
+            store.commit_thread_run_update(&mismatched_source, &lease, 15),
+            Err(StorageError::ThreadCommandReplayMismatch)
+        ));
+        snapshot = appended.snapshot;
+
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::RequestInput {
+                source_key: "request-input".into(),
+                request: PendingInput {
+                    request_id: "input-1".into(),
+                    prompt: "value?".into(),
+                },
+            },
+            16,
+        )
+        .snapshot;
+        assert!(matches!(
+            snapshot.pending,
+            Some(ThreadPendingRequest::Input { .. })
+        ));
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::ProvideInput {
+                source_key: "provide-input".into(),
+                request_id: "input-1".into(),
+                value: "answer".into(),
+            },
+            17,
+        )
+        .snapshot;
+        assert_eq!(snapshot.lifecycle, ThreadLifecycle::Running);
+
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: "request-permission".into(),
+                request: PendingPermission {
+                    request_id: "permission-1".into(),
+                    operation_digest: "a".repeat(64),
+                    description: "continue?".into(),
+                },
+            },
+            18,
+        )
+        .snapshot;
+        assert!(matches!(
+            snapshot.pending,
+            Some(ThreadPendingRequest::Permission { .. })
+        ));
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::ResolvePermission {
+                source_key: "allow-permission".into(),
+                request_id: "permission-1".into(),
+                allow: true,
+            },
+            19,
+        )
+        .snapshot;
+        let completed = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec!["a.txt".into()],
+                    evidence: vec![],
+                },
+            },
+            20,
+        );
+        assert_eq!(completed.snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.snapshot.active_run_id, None);
+
+        let (_, denied_run, mut denied) = create_linked_fixture(&store, &ids, "deny", 21);
+        denied = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &denied,
+            denied_run,
+            CommitThreadRunUpdate::Start {
+                source_key: "deny:start".into(),
+            },
+            22,
+        )
+        .snapshot;
+        denied = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &denied,
+            denied_run,
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: "deny:request".into(),
+                request: PendingPermission {
+                    request_id: "permission-denied".into(),
+                    operation_digest: "b".repeat(64),
+                    description: "deny this".into(),
+                },
+            },
+            23,
+        )
+        .snapshot;
+        let denied = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &denied,
+            denied_run,
+            CommitThreadRunUpdate::ResolvePermission {
+                source_key: "deny:resolve".into(),
+                request_id: "permission-denied".into(),
+                allow: false,
+            },
+            24,
+        );
+        assert_eq!(denied.snapshot.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(
+            store.load_run(denied_run).unwrap().status,
+            RunStatus::Failed
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linked_effect_started_interrupt_requires_exact_reconciliation() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let lease = store.acquire_lease("effect-matrix", 100, 10_000).unwrap();
+        let (_, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "effect", 101);
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "effect:start-run".into(),
+            },
+            102,
+        )
+        .snapshot;
+
+        let effect_id = "effect-1";
+        let digest = "c".repeat(64);
+        let canonical_descriptor = crate::ThreadEffectDescriptor {
+            effect_id: effect_id.into(),
+            tool_call_id: "provider-call-1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+            attempt: 1,
+        };
+        let canonical = serde_json::to_string(&canonical_descriptor).unwrap();
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::PrepareEffect {
+                source_key: "effect:prepare".into(),
+                effect_id: effect_id.into(),
+                operation_digest: digest.clone(),
+                descriptor_json: r#"{"name":"read_file","input":{"path":"a.txt"}}"#.into(),
+                canonical_descriptor_json: canonical.clone(),
+                policy: ThreadEffectPolicy::Allow,
+                description: "read a.txt".into(),
+                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+            },
+            103,
+        )
+        .snapshot;
+        assert_eq!(
+            store.effect_status(effect_id).unwrap(),
+            EffectStatus::Prepared
+        );
+        assert_eq!(
+            store
+                .thread_effect_canonical_descriptor(effect_id, run_id)
+                .unwrap(),
+            canonical_descriptor
+        );
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::StartEffect {
+                source_key: "effect:start".into(),
+                effect_id: effect_id.into(),
+                operation_digest: digest,
+                checkpoint_json: r#"{"phase":"started"}"#.into(),
+            },
+            104,
+        )
+        .snapshot;
+        assert_eq!(
+            store.effect_status(effect_id).unwrap(),
+            EffectStatus::Started
+        );
+
+        let interrupted = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            run_id,
+            CommitThreadRunUpdate::Interrupt {
+                source_key: "effect:interrupt".into(),
+                reconciliation_effect_id: None,
+            },
+            105,
+        );
+        assert_eq!(
+            interrupted.snapshot.lifecycle,
+            ThreadLifecycle::ReconciliationRequired
+        );
+        assert_eq!(
+            store.effect_status(effect_id).unwrap(),
+            EffectStatus::Unknown
+        );
+        assert_eq!(
+            store.unknown_effects_for_run(run_id).unwrap(),
+            vec![effect_id.to_owned()]
+        );
+        let reconciled = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &interrupted.snapshot,
+            run_id,
+            CommitThreadRunUpdate::ReconcileUnknownEffect {
+                source_key: "effect:reconcile".into(),
+                effect_id: effect_id.into(),
+                checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
+            },
+            106,
+        );
+        assert_eq!(reconciled.snapshot.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(
+            store.effect_status(effect_id).unwrap(),
+            EffectStatus::ObservedFailed
+        );
+        assert!(store.unknown_effects_for_run(run_id).unwrap().is_empty());
+
+        for (suffix, success, expected) in [
+            ("success", true, EffectStatus::ObservedSuccess),
+            ("failure", false, EffectStatus::ObservedFailed),
+        ] {
+            let (_, observed_run, mut observed) = create_linked_fixture(&store, &ids, suffix, 110);
+            observed = commit_linked(
+                &store,
+                &ids,
+                &lease,
+                &observed,
+                observed_run,
+                CommitThreadRunUpdate::Start {
+                    source_key: format!("{suffix}:start-run"),
+                },
+                111,
+            )
+            .snapshot;
+            let observed_effect = format!("effect-{suffix}");
+            let observed_digest = if success {
+                "d".repeat(64)
+            } else {
+                "e".repeat(64)
+            };
+            let observed_canonical = serde_json::to_string(&crate::ThreadEffectDescriptor {
+                effect_id: observed_effect.clone(),
+                tool_call_id: format!("call-{suffix}"),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"a.txt"}),
+                attempt: 1,
+            })
+            .unwrap();
+            observed = commit_linked(
+                &store,
+                &ids,
+                &lease,
+                &observed,
+                observed_run,
+                CommitThreadRunUpdate::PrepareEffect {
+                    source_key: format!("{suffix}:prepare"),
+                    effect_id: observed_effect.clone(),
+                    operation_digest: observed_digest.clone(),
+                    descriptor_json: r#"{"name":"read_file"}"#.into(),
+                    canonical_descriptor_json: observed_canonical,
+                    policy: ThreadEffectPolicy::Allow,
+                    description: "read".into(),
+                    checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                },
+                112,
+            )
+            .snapshot;
+            observed = commit_linked(
+                &store,
+                &ids,
+                &lease,
+                &observed,
+                observed_run,
+                CommitThreadRunUpdate::StartEffect {
+                    source_key: format!("{suffix}:start-effect"),
+                    effect_id: observed_effect.clone(),
+                    operation_digest: observed_digest.clone(),
+                    checkpoint_json: r#"{"phase":"started"}"#.into(),
+                },
+                113,
+            )
+            .snapshot;
+            let observed = commit_linked(
+                &store,
+                &ids,
+                &lease,
+                &observed,
+                observed_run,
+                CommitThreadRunUpdate::ObserveEffect {
+                    source_key: format!("{suffix}:observe"),
+                    effect_id: observed_effect.clone(),
+                    operation_digest: observed_digest,
+                    success,
+                    result: suffix.into(),
+                    payload: Some(serde_json::json!({"case":suffix})),
+                    checkpoint_json: r#"{"phase":"observed"}"#.into(),
+                },
+                114,
+            );
+            assert_eq!(store.effect_status(&observed_effect).unwrap(), expected);
+            assert_eq!(observed.snapshot.lifecycle, ThreadLifecycle::Running);
+            assert_eq!(
+                observed.snapshot.transcript.entries.last().unwrap().kind,
+                TranscriptKind::ToolResult
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[rustfmt::skip]
+    fn linked_creation_and_effect_commit_error_matrix_is_atomic() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let baseline = std::collections::BTreeMap::new();
+        let empty_thread = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let empty_run = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            store
+                .create_thread_v2(
+                    empty_thread,
+                    empty_run,
+                    &thread_binding(),
+                    " \n ",
+                    &baseline,
+                    1,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("prompt must not be empty")
+        );
+
+        let lease = store.acquire_lease("matrix", 10, 10_000).unwrap();
+        let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "initial", 11);
+        let follow_up = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            store
+                .create_thread_follow_up_v2(
+                    thread_id,
+                    follow_up,
+                    queued.revision,
+                    " ",
+                    &baseline,
+                    12,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("follow-up must not be empty")
+        );
+        assert!(matches!(
+            store.create_thread_follow_up_v2(
+                thread_id,
+                follow_up,
+                queued.revision + 1,
+                "next",
+                &baseline,
+                12,
+            ),
+            Err(StorageError::StaleThreadRevision { .. })
+        ));
+        assert!(
+            store
+                .create_thread_follow_up_v2(
+                    thread_id,
+                    follow_up,
+                    queued.revision,
+                    "next",
+                    &baseline,
+                    12,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("ready thread")
+        );
+
+        let start = |command_id, thread_revision, run_revision, run_id| ThreadCommitRequest {
+            thread_id,
+            run_id,
+            expected_thread_revision: thread_revision,
+            expected_run_revision: run_revision,
+            command_id,
+            request_id: None,
+            effect_id: None,
+            update: CommitThreadRunUpdate::Start {
+                source_key: format!("start:{command_id}"),
+            },
+        };
+        let fenced = Lease {
+            owner: "fenced".into(),
+            fencing_token: lease.fencing_token + 1,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &start(
+                    latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    queued.revision,
+                    0,
+                    run_id,
+                ),
+                &fenced,
+                13,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &start(
+                    latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    queued.revision + 1,
+                    0,
+                    run_id,
+                ),
+                &lease,
+                13,
+            ),
+            Err(StorageError::StaleThreadRevision { .. })
+        ));
+        let other_run = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &start(
+                    latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    queued.revision,
+                    0,
+                    other_run,
+                ),
+                &lease,
+                13,
+            ),
+            Err(StorageError::ThreadActiveRunMismatch)
+        ));
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &start(
+                    latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    queued.revision,
+                    1,
+                    run_id,
+                ),
+                &lease,
+                13,
+            ),
+            Err(StorageError::StaleRevision { .. })
+        ));
+
+        let canonical = crate::ThreadEffectDescriptor {
+            effect_id: "effect-matrix".into(),
+            tool_call_id: "call_matrix".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+            attempt: 1,
+        };
+        let prepare = |snapshot: &ThreadSnapshot,
+                       command_id: latte_core::ThreadCommandId,
+                       source: &str| ThreadCommitRequest {
+            thread_id,
+            run_id,
+            expected_thread_revision: snapshot.revision,
+            expected_run_revision: snapshot.runs[0].run_revision,
+            command_id,
+            request_id: None,
+            effect_id: Some("effect-matrix".into()),
+            update: CommitThreadRunUpdate::PrepareEffect {
+                source_key: source.into(),
+                effect_id: "effect-matrix".into(),
+                operation_digest: "a".repeat(64),
+                descriptor_json: r#"{"name":"read_file","input":{"path":"a.txt"}}"#.into(),
+                canonical_descriptor_json: serde_json::to_string(&canonical).unwrap(),
+                policy: ThreadEffectPolicy::Allow,
+                description: "read a.txt".into(),
+                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+            },
+        };
+        assert!(
+            store
+                .commit_thread_run_update(
+                    &prepare(
+                        &queued,
+                        latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        "prepare-queued",
+                    ),
+                    &lease,
+                    14,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("only a running linked child")
+        );
+        let mut running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "matrix:start".into(),
+            },
+            15,
+        )
+        .snapshot;
+        assert!(
+            store
+                .commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: running.revision,
+                        expected_run_revision: running.runs[0].run_revision,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some("missing-effect".into()),
+                        update: CommitThreadRunUpdate::StartEffect {
+                            source_key: "missing:start".into(),
+                            effect_id: "missing-effect".into(),
+                            operation_digest: "b".repeat(64),
+                            checkpoint_json: "{}".into(),
+                        },
+                    },
+                    &lease,
+                    16,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("not a prepared linked effect")
+        );
+        running = store
+            .commit_thread_run_update(
+                &prepare(
+                    &running,
+                    latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    "matrix:prepare",
+                ),
+                &lease,
+                17,
+            )
+            .unwrap()
+            .snapshot;
+        let start_effect =
+            |snapshot: &ThreadSnapshot, digest: String, source: &str| ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: snapshot.revision,
+                expected_run_revision: snapshot.runs[0].run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: Some("effect-matrix".into()),
+                effect_id: Some("effect-matrix".into()),
+                update: CommitThreadRunUpdate::StartEffect {
+                    source_key: source.into(),
+                    effect_id: "effect-matrix".into(),
+                    operation_digest: digest,
+                    checkpoint_json: r#"{"phase":"started"}"#.into(),
+                },
+            };
+        assert!(
+            store
+                .commit_thread_run_update(
+                    &start_effect(&running, "b".repeat(64), "matrix:wrong-digest"),
+                    &lease,
+                    18,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+        running = store
+            .commit_thread_run_update(
+                &start_effect(&running, "a".repeat(64), "matrix:start-effect"),
+                &lease,
+                19,
+            )
+            .unwrap()
+            .snapshot;
+        let observe = |snapshot: &ThreadSnapshot, effect: &str, digest: String, source: &str| {
+            ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: snapshot.revision,
+                expected_run_revision: snapshot.runs[0].run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: Some(effect.into()),
+                effect_id: Some(effect.into()),
+                update: CommitThreadRunUpdate::ObserveEffect {
+                    source_key: source.into(),
+                    effect_id: effect.into(),
+                    operation_digest: digest,
+                    success: true,
+                    result: "ok".into(),
+                    payload: Some(serde_json::json!({"safe":true})),
+                    checkpoint_json: r#"{"phase":"observed"}"#.into(),
+                },
+            }
+        };
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &observe(
+                    &running,
+                    "effect-matrix",
+                    "b".repeat(64),
+                    "matrix:observe-wrong",
+                ),
+                &lease,
+                20,
+            ),
+            Err(StorageError::EffectFenced)
+        ));
+        let observed = store
+            .commit_thread_run_update(
+                &observe(&running, "effect-matrix", "a".repeat(64), "matrix:observe"),
+                &lease,
+                21,
+            )
+            .unwrap();
+        assert_eq!(
+            store.effect_status("effect-matrix").unwrap(),
+            EffectStatus::ObservedSuccess
+        );
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &observe(
+                    &observed.snapshot,
+                    "effect-matrix",
+                    "a".repeat(64),
+                    "matrix:observe-twice",
+                ),
+                &lease,
+                22,
+            ),
+            Err(StorageError::EffectFenced)
+        ));
+        assert!(matches!(
+            store.thread_snapshot_v2(
+                latte_core::ThreadId::from_uuid(ids.next_uuid_v7()),
+                None,
+                10,
+            ),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+        assert!(
+            store
+                .list_threads_v2()
+                .unwrap()
+                .iter()
+                .any(|s| s.thread_id == thread_id)
+        );
+        let boundary = |snapshot: &ThreadSnapshot, update: CommitThreadRunUpdate| store.commit_thread_run_update(&ThreadCommitRequest { thread_id, run_id, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_run(run_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = RunStatus::Failed; store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&failed_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&running_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitThreadRunUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, ThreadLifecycle::Failed); let (ask_thread, ask_run, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::ThreadEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
+        let ask = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: ThreadEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
+        let start_ask = |snapshot: &ThreadSnapshot, source: &str| store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitThreadRunUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &lease, 33);
+        assert!(start_ask(&ask, "ask:while-pending").unwrap_err().to_string().contains("without a pending request"));
+        let allowed = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true }, 34).snapshot;
+        store.connection.lock().unwrap().execute("UPDATE pending_permissions SET run_revision=999 WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:stale").unwrap_err().to_string().contains("stale, mismatched, or consumed"));
+        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM thread_active_runs_v2 WHERE thread_id=?1", [ask_thread.to_string()]).unwrap(); conn.execute("UPDATE threads_v2 SET lifecycle='reconciliation_required',latest_run_id=?1 WHERE thread_id=?2", params![ask_run.to_string(), ask_thread.to_string()]).unwrap(); } assert!(store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: allowed.revision, expected_run_revision: allowed.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[rustfmt::skip]
+    fn projections_and_manifest_boundaries_fail_closed_on_corrupt_durable_rows() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let valid_key = serde_json::to_string(&vec!["src", "lib.rs"]).unwrap();
+        let baseline = std::collections::BTreeMap::from([(valid_key.clone(), "old".into())]);
+        let queued = RunState::queued(run_id);
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "inspect projection",
+                &baseline,
+                1,
+            )
+            .unwrap();
+        { let conn = store.connection.lock().unwrap(); conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); conn.execute("UPDATE threads_v2 SET latest_run_id='bad' WHERE thread_id=?1", [thread_id.to_string()]).unwrap(); }
+        assert!(store.thread_snapshot_v2(thread_id, None, 10).unwrap_err().to_string().contains("invalid stored run id"));
+        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE threads_v2 SET latest_run_id=?1 WHERE thread_id=?2", params![run_id.to_string(), thread_id.to_string()]).unwrap(); conn.execute("UPDATE thread_active_runs_v2 SET run_id='bad' WHERE thread_id=?1", [thread_id.to_string()]).unwrap(); }
+        assert!(store.thread_snapshot_v2(thread_id, None, 10).unwrap_err().to_string().contains("invalid active run id"));
+        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE thread_active_runs_v2 SET run_id=?1 WHERE thread_id=?2", params![run_id.to_string(), thread_id.to_string()]).unwrap(); conn.execute("UPDATE thread_runs_v2 SET parent_run_id='bad' WHERE run_id=?1", [run_id.to_string()]).unwrap(); }
+        assert!(store.thread_snapshot_v2(thread_id, None, 10).unwrap_err().to_string().contains("invalid parent run id"));
+        store.connection.lock().unwrap().execute("UPDATE thread_runs_v2 SET parent_run_id=NULL WHERE run_id=?1", [run_id.to_string()]).unwrap();
+
+        assert!(
+            store
+                .thread_changed_files(run_id, &baseline)
+                .unwrap()
+                .is_empty()
+        );
+        let current = std::collections::BTreeMap::from([(valid_key, "new".into())]);
+        assert_eq!(
+            store.thread_changed_files(run_id, &current).unwrap(),
+            vec!["src/lib.rs"]
+        );
+        let missing = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            store
+                .thread_changed_files(missing, &std::collections::BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("no engine-owned baseline")
+        );
+
+        for key in [
+            "not-json".to_owned(),
+            serde_json::to_string(&Vec::<String>::new()).unwrap(),
+            serde_json::to_string(&vec![""]).unwrap(),
+            serde_json::to_string(&vec!["a/b"]).unwrap(),
+            serde_json::to_string(&vec!["line\nbreak"]).unwrap(),
+        ] {
+            let manifest =
+                serde_json::to_string(&std::collections::BTreeMap::from([(key, "digest")]))
+                    .unwrap();
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE run_baselines SET manifest_json=?1 WHERE run_id=?2",
+                    params![manifest, run_id.to_string()],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.thread_changed_files(run_id, &std::collections::BTreeMap::new()),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE run_baselines SET manifest_json='{' WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.thread_changed_files(run_id, &std::collections::BTreeMap::new()),
+            Err(StorageError::InvalidData(_))
+        ));
+
+        let binding_json = serde_json::to_string(&thread_binding()).unwrap();
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE threads_v2 SET binding_json='{' WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, None, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE threads_v2 SET binding_json=?1,lifecycle='invalid' WHERE thread_id=?2",
+                params![binding_json, thread_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .thread_snapshot_v2(thread_id, None, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid thread lifecycle")
+        );
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE threads_v2 SET lifecycle='running' WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE runs SET state_json='{' WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, None, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE runs SET state_json=?1 WHERE run_id=?2",
+                params![serde_json::to_string(&queued).unwrap(), run_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE thread_runs_v2 SET ordinal=-1 WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, None, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE thread_runs_v2 SET ordinal=0,completed_at_ms=-1 WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, None, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE thread_runs_v2 SET completed_at_ms=NULL WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE thread_transcript_v2 SET entry_json='{' WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, Some(0), 0),
+            Err(StorageError::InvalidData(_))
+        ));
+
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "DELETE FROM thread_active_runs_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE threads_v2 SET lifecycle='ready',latest_run_id=NULL WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .create_thread_follow_up_v2(
+                    thread_id,
+                    missing,
+                    0,
+                    "next",
+                    &std::collections::BTreeMap::new(),
+                    2,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("no completed child")
+        );
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE threads_v2 SET latest_run_id=?1 WHERE thread_id=?2",
+                params![run_id.to_string(), thread_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .create_thread_follow_up_v2(
+                    thread_id,
+                    missing,
+                    0,
+                    "next",
+                    &std::collections::BTreeMap::new(),
+                    2,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("parent must be completed")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn verified_completion_requires_current_passing_evidence_and_exact_manifest() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let lease = store.acquire_lease("verify", 1, 1_000).unwrap();
+        let valid_key = serde_json::to_string(&vec!["src", "main.rs"]).unwrap();
+        let baseline = std::collections::BTreeMap::from([(valid_key.clone(), "old".into())]);
+
+        let start = |baseline: Option<&std::collections::BTreeMap<String, String>>, now_ms| {
+            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            let queued = RunState::queued(run_id);
+            store
+                .create_run_with_baseline(&queued, now_ms, baseline)
+                .unwrap();
+            let running = queued.transition(0, Transition::Start).unwrap();
+            store
+                .append_event(
+                    &running,
+                    0,
+                    EventId::from_uuid(ids.next_uuid_v7()),
+                    &RuntimeEvent::StateChanged {
+                        status: RunStatus::Running,
+                    },
+                    now_ms + 1,
+                    &lease,
+                )
+                .unwrap();
+            running
+        };
+        let record = |run: RunId, id: &str, passed: bool, manifest_digest: &str, now_ms: u64| {
+            let metadata = serde_json::to_string(&VerificationRecord {
+                revision: 1,
+                effect_epoch: 0,
+                effect_id: id.into(),
+                passed,
+                workspace_manifest_digest: manifest_digest.into(),
+                summary: format!("{id} summary"),
+            })
+            .unwrap();
+            store
+                .record_verification_evidence(
+                    run,
+                    1,
+                    &lease,
+                    &VerificationEvidence {
+                        id,
+                        metadata_json: &metadata,
+                        blob_ref: None,
+                    },
+                    now_ms,
+                )
+                .unwrap();
+        };
+
+        let running = start(Some(&baseline), 10);
+        let wrong_lease = Lease {
+            owner: "other".into(),
+            fencing_token: lease.fencing_token,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.complete_verified(
+                running.run_id,
+                running.revision,
+                &wrong_lease,
+                "summary".into(),
+                &baseline,
+                "manifest",
+                20,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        assert!(matches!(
+            store.complete_verified(
+                running.run_id,
+                99,
+                &lease,
+                "summary".into(),
+                &baseline,
+                "manifest",
+                20,
+            ),
+            Err(StorageError::StaleRevision { .. })
+        ));
+        assert!(
+            store
+                .complete_verified(
+                    running.run_id,
+                    1,
+                    &lease,
+                    "summary".into(),
+                    &baseline,
+                    "manifest",
+                    20,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("missing current verification evidence")
+        );
+
+        record(running.run_id, "failed", false, "manifest", 21);
+        assert!(
+            store
+                .complete_verified(
+                    running.run_id,
+                    1,
+                    &lease,
+                    "summary".into(),
+                    &baseline,
+                    "manifest",
+                    22,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("verification failed")
+        );
+        record(running.run_id, "stale-workspace", true, "before", 23);
+        assert!(
+            store
+                .complete_verified(
+                    running.run_id,
+                    1,
+                    &lease,
+                    "summary".into(),
+                    &baseline,
+                    "after",
+                    24,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("workspace changed after verification")
+        );
+        record(running.run_id, "passing", true, "manifest", 25);
+        let current = std::collections::BTreeMap::from([(valid_key.clone(), "new".into())]);
+        let (completed, event) = store
+            .complete_verified(
+                running.run_id,
+                1,
+                &lease,
+                "verified summary".into(),
+                &current,
+                "manifest",
+                26,
+            )
+            .unwrap();
+        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(event.sequence, 2);
+        let handoff = completed.handoff.unwrap();
+        assert_eq!(handoff.summary, "verified summary");
+        assert_eq!(handoff.files_changed, vec!["src/main.rs"]);
+        assert_eq!(handoff.evidence[0].status, VerificationStatus::Passed);
+
+        let without_baseline = start(None, 30);
+        record(without_baseline.run_id, "no-baseline", true, "manifest", 32);
+        assert!(
+            store
+                .complete_verified(
+                    without_baseline.run_id,
+                    1,
+                    &lease,
+                    "summary".into(),
+                    &std::collections::BTreeMap::new(),
+                    "manifest",
+                    33,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("missing engine-owned run baseline")
+        );
+
+        let invalid_key = serde_json::to_string(&vec!["bad/path"]).unwrap();
+        let invalid_baseline = std::collections::BTreeMap::from([(invalid_key, "digest".into())]);
+        let invalid = start(Some(&invalid_baseline), 40);
+        record(invalid.run_id, "invalid-path", true, "manifest", 42);
+        assert!(
+            store
+                .complete_verified(
+                    invalid.run_id,
+                    1,
+                    &lease,
+                    "summary".into(),
+                    &std::collections::BTreeMap::new(),
+                    "manifest",
+                    43,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid manifest component key")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[rustfmt::skip]
+    fn lease_loss_checkpoint_and_waiting_cancellation_matrix_is_fail_closed() {
+        use latte_core::{PendingInput, PendingPermission};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        assert!(
+            store
+                .acquire_lease("overflow", u64::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("lease expiry overflow")
+        );
+        let live = store.acquire_lease("live", 10, 10).unwrap();
+        assert!(
+            store
+                .renew_lease(&live, u64::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("lease expiry overflow")
+        );
+        let forged = Lease {
+            owner: "forged".into(),
+            fencing_token: live.fencing_token,
+            expires_at_ms: live.expires_at_ms,
+        };
+        assert!(matches!(
+            store.release_lease(&forged),
+            Err(StorageError::LeaseLost)
+        ));
+
+        let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "recover", 11);
+        let running = commit_linked(
+            &store,
+            &ids,
+            &live,
+            &queued,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "recover:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        assert!(
+            store
+                .recover_thread_after_lease_loss(
+                    thread_id,
+                    run_id,
+                    &live,
+                    running.runs[0].run_revision,
+                    13,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("still authoritative")
+        );
+        assert!(
+            store
+                .put_checkpoint(run_id, 1, &live, "{", 13)
+                .unwrap_err()
+                .to_string()
+                .contains("EOF")
+        );
+        assert_eq!(
+            store
+                .checkpoint(RunId::from_uuid(ids.next_uuid_v7()))
+                .unwrap(),
+            None
+        );
+
+        let missing = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(matches!(
+            store.recover_thread_after_lease_loss(thread_id, missing, &live, 0, 21),
+            Err(StorageError::RunNotFound(id)) if id == missing
+        ));
+        assert!(matches!(
+            store
+                .recover_thread_after_lease_loss(
+                    thread_id,
+                    run_id,
+                    &live,
+                    running.runs[0].run_revision + 1,
+                    21,
+                )
+                .unwrap(),
+            ThreadLeaseLossRecovery::FencedNoop
+        ));
+        let recovered = store
+            .recover_thread_after_lease_loss(
+                thread_id,
+                run_id,
+                &live,
+                running.runs[0].run_revision,
+                21,
+            )
+            .unwrap();
+        assert!(matches!(
+            recovered,
+            ThreadLeaseLossRecovery::Recovered(response)
+                if response.snapshot.lifecycle == ThreadLifecycle::Interrupted
+        ));
+        let recovered_run = store.load_run(run_id).unwrap(); assert!(matches!(store.recover_thread_after_lease_loss(thread_id, run_id, &live, recovered_run.revision, 22).unwrap(), ThreadLeaseLossRecovery::AlreadyTerminal(_)));
+        assert!(matches!(
+            store
+                .interrupt_after_lease_loss(run_id, &live, recovered_run.revision, 22)
+                .unwrap(),
+            LeaseLossRecovery::AlreadyTerminal(state)
+                if state.status == RunStatus::Interrupted
+        ));
+        assert!(matches!(
+            store
+                .interrupt_after_lease_loss(run_id, &live, recovered_run.revision + 1, 22)
+                .unwrap(),
+            LeaseLossRecovery::FencedNoop
+        ));
+
+        let next = store.acquire_lease("next", 22, 100).unwrap();
+        let legacy = RunId::from_uuid(ids.next_uuid_v7());
+        let queued = RunState::queued(legacy);
+        store.create_run(&queued, 23).unwrap();
+        let running = queued.transition(0, Transition::Start).unwrap();
+        store
+            .append_event(
+                &running,
+                0,
+                EventId::from_uuid(ids.next_uuid_v7()),
+                &RuntimeEvent::StateChanged {
+                    status: RunStatus::Running,
+                },
+                24,
+                &next,
+            )
+            .unwrap();
+        let (waiting, _) = store
+            .apply_transition(
+                legacy,
+                1,
+                Transition::RequestPermission(PendingPermission {
+                    request_id: "unprepared".into(),
+                    operation_digest: "digest".into(),
+                    description: "needs permission".into(),
+                }),
+                25,
+                &next,
+            )
+            .unwrap();
+        assert!(
+            store
+                .cancel_waiting(legacy, waiting.revision, &next, 26, true)
+                .unwrap_err()
+                .to_string()
+                .contains("binding is not prepared")
+        );
+
+        let input_run = RunId::from_uuid(ids.next_uuid_v7());
+        let input_queued = RunState::queued(input_run);
+        store.create_run(&input_queued, 30).unwrap();
+        let (input_running, _) = store
+            .apply_transition(input_run, 0, Transition::Start, 31, &next)
+            .unwrap();
+        let (waiting_input, _) = store
+            .apply_transition(
+                input_run,
+                input_running.revision,
+                Transition::RequestInput(PendingInput {
+                    request_id: "input".into(),
+                    prompt: "value?".into(),
+                }),
+                32,
+                &next,
+            )
+            .unwrap();
+        assert!(
+            store
+                .cancel_waiting(input_run, waiting_input.revision, &next, 33, true)
+                .unwrap_err()
+                .to_string()
+                .contains("not waiting for permission")
+        );
+        let (cancelled, event) = store
+            .cancel_waiting(input_run, waiting_input.revision, &next, 34, false)
+            .unwrap();
+        assert_eq!(cancelled.status, RunStatus::Failed);
+        assert_eq!(cancelled.failure.unwrap().code, FailureCode::Cancelled);
+        assert!(event.is_some());
+        let (terminal, duplicate) = store
+            .cancel_waiting(input_run, cancelled.revision, &next, 35, false)
+            .unwrap();
+        assert_eq!(terminal.status, RunStatus::Failed);
+        assert!(duplicate.is_none());
+
+        let running_only = RunId::from_uuid(ids.next_uuid_v7());
+        let queued = RunState::queued(running_only);
+        store.create_run(&queued, 40).unwrap();
+        let (running, _) = store
+            .apply_transition(running_only, 0, Transition::Start, 41, &next)
+            .unwrap();
+        assert!(
+            store
+                .cancel_waiting(running_only, running.revision, &next, 42, false)
+                .unwrap_err()
+                .to_string()
+                .contains("run is not waiting")
+        );
+        assert!(store.append_event(&running, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Running }, 43, &next).unwrap_err().to_string().contains("must increment once"));
+        assert!(matches!(store.apply_transition(running_only, 0, Transition::Cancel, 43, &next), Err(StorageError::StaleRevision { .. }))); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &forged), Err(StorageError::LeaseLost)));
+        store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
+        store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { run_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
+    }
 }

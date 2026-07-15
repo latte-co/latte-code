@@ -8,7 +8,8 @@ use crate::{
 };
 use latte_core::{
     FailureCode, IdSource, PendingPermission, Retryability, RunFailure, RunId, RunState,
-    RuntimeEvent, SystemIdSource, Transition, VerificationStatus, wall_time_ms as now_ms,
+    RuntimeEvent, SystemIdSource, Transition, VerificationStatus, redact_thread_text,
+    wall_time_ms as now_ms,
 };
 use latte_engine::{
     CancellationToken, EngineHandle, Lease, ProcessDecision, ProcessError, ProcessInvocation,
@@ -66,6 +67,7 @@ enum CheckpointDisposition {
     Ready {
         checkpoint: Box<Checkpoint>,
         normalized: bool,
+        resolved_tool_queue: bool,
     },
     RequiresUnknown {
         effect_id: String,
@@ -271,10 +273,20 @@ fn validate_and_normalize(
             "final message is incompatible with wait state".into(),
         ));
     }
-    let normalize = round.is_none() && !checkpoint.tool_queue.is_empty();
-    if normalize {
+    let resolved_tool_queue = round.is_none() && !checkpoint.tool_queue.is_empty();
+    let mut normalize = resolved_tool_queue;
+    if resolved_tool_queue {
         checkpoint.tool_queue.clear();
         checkpoint.tool_cursor = 0;
+    }
+    for message in &mut checkpoint.messages {
+        if let Message::Tool { content, .. } = message {
+            let redacted = redact_thread_text(content);
+            if redacted != *content {
+                *content = redacted;
+                normalize = true;
+            }
+        }
     }
     if let Some(pending) = checkpoint.pending.as_ref()
         && run_state.status == latte_core::RunStatus::Interrupted
@@ -287,6 +299,7 @@ fn validate_and_normalize(
     Ok(CheckpointDisposition::Ready {
         checkpoint: Box::new(checkpoint),
         normalized: normalize,
+        resolved_tool_queue,
     })
 }
 #[cfg(test)]
@@ -505,6 +518,7 @@ impl AgentRuntime {
             CheckpointDisposition::Ready {
                 checkpoint,
                 normalized,
+                ..
             } => (*checkpoint, normalized),
             CheckpointDisposition::RequiresUnknown { effect_id } => {
                 if self
@@ -711,7 +725,7 @@ impl AgentRuntime {
         checkpoint.messages.push(Message::Tool {
             tool_call_id: result_call.id,
             name: Some(result_call.name),
-            content: output,
+            content: redact_thread_text(&output),
         });
         checkpoint.tool_cursor = checkpoint.tool_cursor.saturating_add(1);
         self.persist(run_id, &checkpoint, &lease)?;
@@ -736,18 +750,20 @@ impl AgentRuntime {
         let checkpoint: Checkpoint =
             serde_json::from_str(&payload).map_err(|e| RuntimeError::Engine(e.to_string()))?;
         self.enforce_binding(&checkpoint)?;
-        let (mut checkpoint, normalized) = match validate_and_normalize(checkpoint, &state)? {
-            CheckpointDisposition::Ready {
-                checkpoint,
-                normalized,
-            } => (*checkpoint, normalized),
-            CheckpointDisposition::RequiresUnknown { .. } => {
-                return Err(RuntimeError::CheckpointInvalid(
-                    "input checkpoint requires effect reconciliation".into(),
-                ));
-            }
-        };
-        if normalized {
+        let (mut checkpoint, resolved_tool_queue) =
+            match validate_and_normalize(checkpoint, &state)? {
+                CheckpointDisposition::Ready {
+                    checkpoint,
+                    resolved_tool_queue,
+                    ..
+                } => (*checkpoint, resolved_tool_queue),
+                CheckpointDisposition::RequiresUnknown { .. } => {
+                    return Err(RuntimeError::CheckpointInvalid(
+                        "input checkpoint requires effect reconciliation".into(),
+                    ));
+                }
+            };
+        if resolved_tool_queue {
             return Err(RuntimeError::CheckpointInvalid(
                 "input wait cannot normalize a resolved tool queue".into(),
             ));
@@ -822,7 +838,7 @@ impl AgentRuntime {
                         checkpoint.messages.push(Message::Tool {
                             tool_call_id: call.id,
                             name: Some(call.name),
-                            content: output,
+                            content: redact_thread_text(&output),
                         });
                         checkpoint.tool_cursor = checkpoint.tool_cursor.saturating_add(1);
                         self.persist(state.run_id, &checkpoint, lease)?;
@@ -1612,11 +1628,13 @@ mod tests {
         let CheckpointDisposition::Ready {
             checkpoint: normalized,
             normalized: changed,
+            resolved_tool_queue,
         } = validate_and_normalize(resolved_crash, &interrupted).unwrap()
         else {
             panic!()
         };
         assert!(changed);
+        assert!(resolved_tool_queue);
         assert!(normalized.tool_queue.is_empty());
         assert_eq!(normalized.tool_cursor, 0);
         let mut bad_suffix = base.clone();
@@ -1906,6 +1924,147 @@ mod tests {
             phase: PendingPhase::Verification,
         });
         assert!(validate_checkpoint(&invalid_pending).is_err());
+    }
+
+    #[test]
+    fn checkpoint_normalization_redacts_legacy_tool_results_before_replay() {
+        let secret = "sk-proj-legacy-checkpoint-secret-0123456789";
+        let call = ToolCall {
+            id: "legacy-read".into(),
+            name: "read_file".into(),
+            input: json!({"path":"provider.env"}),
+        };
+        let checkpoint = Checkpoint {
+            binding: None,
+            messages: vec![
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![call.clone()],
+                },
+                Message::Tool {
+                    tool_call_id: call.id,
+                    name: Some(call.name),
+                    content: format!("OPENAI_API_KEY={secret}"),
+                },
+            ],
+            pending: None,
+            final_message: None,
+            baseline: std::collections::BTreeMap::default(),
+            tool_queue: vec![],
+            tool_cursor: 0,
+            pending_input: None,
+        };
+        let mut running =
+            RunState::queued(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
+        running.status = latte_core::RunStatus::Running;
+        let CheckpointDisposition::Ready {
+            checkpoint,
+            normalized,
+            resolved_tool_queue,
+        } = validate_and_normalize(checkpoint, &running).unwrap()
+        else {
+            panic!("expected a replayable checkpoint")
+        };
+        assert!(normalized);
+        assert!(!resolved_tool_queue);
+        let replay = serde_json::to_string(&checkpoint.messages).unwrap();
+        assert!(!replay.contains(secret));
+        assert!(replay.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn legacy_tool_redaction_does_not_block_waiting_input_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(dir.path().join("state.db"))
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("setup", 2, 100).unwrap();
+        let running = engine
+            .apply_transition(run, 0, Transition::Start, 3, &lease)
+            .unwrap();
+        let waiting = engine
+            .apply_transition(
+                run,
+                running.revision,
+                Transition::RequestInput(latte_core::PendingInput {
+                    request_id: "input-1".into(),
+                    prompt: "answer".into(),
+                }),
+                4,
+                &lease,
+            )
+            .unwrap();
+        let secret = "sk-proj-waiting-input-secret-0123456789";
+        let call = ToolCall {
+            id: "legacy-read".into(),
+            name: "read_file".into(),
+            input: json!({"path":"provider.env"}),
+        };
+        let checkpoint = Checkpoint {
+            binding: Some(ProviderBinding::direct(&engine.tool_descriptors())),
+            messages: vec![
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![call.clone()],
+                },
+                Message::Tool {
+                    tool_call_id: call.id,
+                    name: Some(call.name),
+                    content: format!("OPENAI_API_KEY={secret}"),
+                },
+            ],
+            pending: None,
+            final_message: None,
+            baseline: std::collections::BTreeMap::default(),
+            tool_queue: vec![],
+            tool_cursor: 0,
+            pending_input: Some(InputRequest {
+                id: "input-1".into(),
+                prompt: "answer".into(),
+                secret: false,
+            }),
+        };
+        engine
+            .persist_runtime_checkpoint(
+                run,
+                waiting.revision,
+                &lease,
+                &serde_json::to_string(&checkpoint).unwrap(),
+                5,
+            )
+            .unwrap();
+        engine.release_lease(&lease).unwrap();
+        let runtime = AgentRuntime::new(
+            engine.clone(),
+            NextInputProvider,
+            dir.path(),
+            VerificationPlan {
+                argv: vec!["verification-must-not-run".into()],
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                grace_ms: 10,
+                stdout_cap: 1_024,
+                stderr_cap: 1_024,
+            },
+        );
+
+        let result = runtime.provide_input(run, "input-1", "value").await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::InputRequired { run_id }) if run_id == run
+        ));
+        let stored = engine.runtime_checkpoint(run).unwrap().unwrap();
+        assert!(!stored.contains(secret));
+        assert!(stored.contains("[REDACTED]"));
+        assert!(stored.contains("input-2"));
+        assert_eq!(
+            engine.show(run).unwrap().status,
+            latte_core::RunStatus::WaitingInput
+        );
     }
 
     #[tokio::test]
@@ -2283,6 +2442,29 @@ mod tests {
                     message: Some("ready to verify".into()),
                     tool_calls: vec![],
                     input_request: None,
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
+            })
+        }
+    }
+    struct NextInputProvider;
+    impl Provider for NextInputProvider {
+        fn complete(
+            &self,
+            _: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            Box::pin(async {
+                Ok(ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(InputRequest {
+                        id: "input-2".into(),
+                        prompt: "next answer".into(),
+                        secret: false,
+                    }),
                     usage: crate::provider::ProviderUsage::default(),
                     finish_reason: None,
                     provider_state: None,
@@ -2994,6 +3176,348 @@ mod tests {
         assert_eq!(
             cancelled.run("cancel").await.unwrap().status,
             latte_core::RunStatus::Interrupted
+        );
+    }
+
+    #[derive(Clone)]
+    struct BoundaryProvider {
+        response: ProviderResponse,
+        capabilities: crate::provider::ProviderCapabilities,
+    }
+
+    impl Provider for BoundaryProvider {
+        fn complete(
+            &self,
+            _: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            let response = self.response.clone();
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+            self.capabilities.clone()
+        }
+    }
+
+    fn boundary_response() -> ProviderResponse {
+        ProviderResponse {
+            message: Some("done".into()),
+            tool_calls: vec![],
+            input_request: None,
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
+        }
+    }
+
+    fn boundary_plan() -> VerificationPlan {
+        VerificationPlan {
+            argv: vec!["/bin/true".into()],
+            cwd: ".".into(),
+            timeout_ms: 1_000,
+            grace_ms: 100,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provider_protocol_violations_fail_durably_before_effect_authority() {
+        use crate::provider::ProviderCapabilities;
+
+        let all = ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: true,
+        };
+        let mut cases = Vec::new();
+
+        cases.push((
+            "tools-not-declared",
+            BoundaryProvider {
+                response: boundary_response(),
+                capabilities: ProviderCapabilities {
+                    tools: false,
+                    ..all.clone()
+                },
+            },
+            "does not support tool declarations",
+        ));
+
+        let mut provider_state = boundary_response();
+        provider_state.provider_state = Some(json!({"opaque":"state"}));
+        cases.push((
+            "provider-state",
+            BoundaryProvider {
+                response: provider_state,
+                capabilities: all.clone(),
+            },
+            "provider state is unsupported",
+        ));
+
+        let mut invalid_call = boundary_response();
+        invalid_call.tool_calls = vec![ToolCall {
+            id: String::new(),
+            name: "read_file".into(),
+            input: json!({"path":"a.txt"}),
+        }];
+        cases.push((
+            "invalid-tool-call",
+            BoundaryProvider {
+                response: invalid_call,
+                capabilities: all.clone(),
+            },
+            "tool call ids must be nonempty and unique",
+        ));
+
+        let mut mixed = boundary_response();
+        mixed.input_request = Some(InputRequest {
+            id: "input-1".into(),
+            prompt: "value?".into(),
+            secret: false,
+        });
+        cases.push((
+            "mixed-outcome",
+            BoundaryProvider {
+                response: mixed,
+                capabilities: all.clone(),
+            },
+            "outcome must be either assistant or input-required",
+        ));
+
+        let mut undeclared_input = boundary_response();
+        undeclared_input.message = None;
+        undeclared_input.input_request = Some(InputRequest {
+            id: "input-2".into(),
+            prompt: "value?".into(),
+            secret: false,
+        });
+        cases.push((
+            "undeclared-input",
+            BoundaryProvider {
+                response: undeclared_input,
+                capabilities: ProviderCapabilities {
+                    input_request: false,
+                    ..all.clone()
+                },
+            },
+            "undeclared input-request capability",
+        ));
+
+        let mut empty = boundary_response();
+        empty.message = Some(" \n ".into());
+        cases.push((
+            "empty-assistant",
+            BoundaryProvider {
+                response: empty,
+                capabilities: all.clone(),
+            },
+            "assistant outcome is empty",
+        ));
+
+        let mut invalid_input = boundary_response();
+        invalid_input.message = None;
+        invalid_input.input_request = Some(InputRequest {
+            id: String::new(),
+            prompt: "value?".into(),
+            secret: false,
+        });
+        cases.push((
+            "invalid-input",
+            BoundaryProvider {
+                response: invalid_input,
+                capabilities: all,
+            },
+            "invalid provider input request",
+        ));
+
+        for (name, provider, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = latte_engine::EngineBuilder::new()
+                .workspace_root(dir.path())
+                .build()
+                .unwrap();
+            let runtime = AgentRuntime::from_provider(
+                engine.clone(),
+                std::sync::Arc::new(provider),
+                dir.path(),
+                boundary_plan(),
+            )
+            .with_verification(boundary_plan());
+            let failed = runtime.run(name).await.unwrap();
+            assert_eq!(failed.status, latte_core::RunStatus::Failed, "{name}");
+            assert!(
+                failed
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.message.contains(expected)),
+                "{name}: {failed:?}"
+            );
+            assert!(
+                engine
+                    .unknown_effects_for_run(failed.run_id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_input_and_reconciliation_reject_invalid_authority_before_provider_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let runtime = AgentRuntime::new(engine.clone(), FinalProvider, dir.path(), boundary_plan());
+        let missing = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(matches!(
+            runtime.provide_input(missing, "input", "").await,
+            Err(RuntimeError::Engine(message)) if message.contains("1..=16384")
+        ));
+        assert!(matches!(
+            runtime
+                .provide_input(missing, "input", &"x".repeat(16 * 1024 + 1))
+                .await,
+            Err(RuntimeError::Engine(message)) if message.contains("1..=16384")
+        ));
+
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run_id, 1).unwrap();
+        assert!(matches!(
+            runtime.reconcile_unknown_and_abort(run_id, "missing-effect"),
+            Err(RuntimeError::Engine(_))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checkpoint_validation_rejects_extra_results_and_conflicting_wait_phases() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            input: json!({"path":"a.txt"}),
+        };
+        let extra_result = Checkpoint {
+            binding: None,
+            messages: vec![
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![call.clone()],
+                },
+                Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    name: Some(call.name.clone()),
+                    content: "ok".into(),
+                },
+                Message::Tool {
+                    tool_call_id: "extra".into(),
+                    name: Some(call.name.clone()),
+                    content: "extra".into(),
+                },
+            ],
+            pending: None,
+            final_message: None,
+            baseline: std::collections::BTreeMap::default(),
+            tool_queue: vec![],
+            tool_cursor: 0,
+            pending_input: None,
+        };
+        assert!(matches!(
+            validate_checkpoint(&extra_result),
+            Err(RuntimeError::CheckpointInvalid(message)) if message.contains("orphan tool result")
+        ));
+
+        let premature_verification = Checkpoint {
+            binding: None,
+            messages: vec![Message::Assistant {
+                content: None,
+                tool_calls: vec![call.clone()],
+            }],
+            pending: Some(PendingCall {
+                call: call.clone(),
+                effect_id: "verification".into(),
+                operation_digest: "digest".into(),
+                phase: PendingPhase::Verification,
+            }),
+            final_message: Some("done".into()),
+            baseline: std::collections::BTreeMap::default(),
+            tool_queue: vec![call],
+            tool_cursor: 0,
+            pending_input: None,
+        };
+        assert!(matches!(
+            validate_checkpoint(&premature_verification),
+            Err(RuntimeError::CheckpointInvalid(message)) if message.contains("premature verification")
+        ));
+
+        let multiple_waits = Checkpoint {
+            binding: None,
+            messages: vec![],
+            pending: Some(PendingCall {
+                call: ToolCall {
+                    id: "verify".into(),
+                    name: "process".into(),
+                    input: json!({}),
+                },
+                effect_id: "verification".into(),
+                operation_digest: "digest".into(),
+                phase: PendingPhase::Verification,
+            }),
+            final_message: Some("done".into()),
+            baseline: std::collections::BTreeMap::default(),
+            tool_queue: vec![],
+            tool_cursor: 0,
+            pending_input: Some(InputRequest {
+                id: "input".into(),
+                prompt: "value?".into(),
+                secret: false,
+            }),
+        };
+        assert!(matches!(
+            validate_checkpoint(&multiple_waits),
+            Err(RuntimeError::CheckpointInvalid(message)) if message.contains("multiple wait payloads")
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let runs = std::array::from_fn::<_, 4, _>(|_| RunId::from_uuid(ids.next_uuid_v7()));
+        for run_id in runs {
+            engine.create_run(run_id, 1).unwrap();
+        }
+        let expired_at = now_ms().saturating_sub(1_000);
+        let expired = engine.acquire_lease("expired", expired_at, 10).unwrap();
+        let interrupted = engine
+            .apply_transition(runs[0], 0, Transition::Start, expired_at + 1, &expired)
+            .unwrap();
+        let fenced = engine
+            .apply_transition(runs[1], 0, Transition::Start, expired_at + 2, &expired)
+            .unwrap();
+        let runtime = AgentRuntime::new(engine.clone(), FinalProvider, dir.path(), boundary_plan());
+        for (run_id, revision, expected) in [
+            (runs[0], interrupted.revision, "run interrupted"),
+            (runs[1], fenced.revision + 1, "newer owner fenced"),
+            (runs[2], 0, "already terminal"),
+        ] {
+            assert!(
+                runtime
+                    .recover_lease_loss(run_id, revision, &expired, "test")
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+        let live = engine.acquire_lease("live", now_ms(), 60_000).unwrap();
+        assert!(
+            runtime
+                .recover_lease_loss(runs[3], 0, &live, "test")
+                .to_string()
+                .contains("recovery failed")
         );
     }
 }

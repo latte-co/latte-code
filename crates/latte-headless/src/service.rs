@@ -925,4 +925,115 @@ mod tests {
             ));
         }
     }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn command_service_and_actor_fail_closed_at_configuration_and_channel_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let unavailable =
+            RuntimeCommandService::new_bound(engine.clone(), dir.path(), plan(), || {
+                Err("binding unavailable".into())
+            });
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::Run {
+                    prompt: "cannot start".into()
+                })
+                .await,
+            Err(CommandError::Storage(message))
+                if message.contains("provider configuration")
+                    && message.contains("binding unavailable")
+        ));
+
+        let missing = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Show { run_id: missing }).await,
+            Err(CommandError::Storage(message)) if message.contains("was not found")
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::List).await.unwrap(),
+            CommandResult::Runs(runs) if runs.is_empty()
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Shutdown).await.unwrap(),
+            CommandResult::Accepted
+        ));
+
+        let queued = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(queued, 1).unwrap();
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::Cancel {
+                    run_id: queued,
+                    expected_revision: 0
+                })
+                .await,
+            Err(CommandError::NotActive(id)) if id == queued
+        ));
+        assert!(matches!(
+            unavailable.execute(RuntimeCommand::Resume { run_id: queued, expected_revision: 0 }).await,
+            Err(CommandError::Storage(message)) if message.contains("provider configuration")
+        ));
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::ResolvePermission {
+                    run_id: queued,
+                    request_id: "wrong".into(),
+                    expected_revision: 0,
+                    decision: PermissionDecision::Allow,
+                })
+                .await,
+            Err(CommandError::RequestMismatch)
+        ));
+        assert!(matches!(
+            unavailable
+                .execute(RuntimeCommand::ProvideInput {
+                    run_id: queued,
+                    request_id: "wrong".into(),
+                    expected_revision: 0,
+                    value: "value".into(),
+                })
+                .await,
+            Err(CommandError::RequestMismatch)
+        ));
+        let held = engine
+            .acquire_lease("foreign", wall_time_ms(), 60_000)
+            .unwrap();
+        assert!(matches!(
+            unavailable.reconcile_unknown_and_abort(queued, "missing"),
+            Err(CommandError::Storage(_))
+        ));
+        engine.release_lease(&held).unwrap();
+
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        let (closed_cancel_tx, closed_cancel_rx) = mpsc::channel(1);
+        drop(closed_cancel_rx);
+        let closed = RuntimeCommandActor {
+            tx: closed_tx,
+            cancel_tx: closed_cancel_tx,
+        };
+        assert!(matches!(
+            closed.execute(RuntimeCommand::List).await,
+            Err(CommandError::Storage(message)) if message.contains("actor closed")
+        ));
+
+        let (drop_tx, mut drop_rx) = mpsc::channel::<ActorRequest>(1);
+        let (drop_cancel_tx, _drop_cancel_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = drop_rx.recv().await;
+        });
+        let dropped = RuntimeCommandActor {
+            tx: drop_tx,
+            cancel_tx: drop_cancel_tx,
+        };
+        assert!(matches!(
+            dropped.execute(RuntimeCommand::List).await,
+            Err(CommandError::Storage(message)) if message.contains("result dropped")
+        ));
+    }
 }

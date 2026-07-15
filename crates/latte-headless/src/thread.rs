@@ -2684,6 +2684,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[rustfmt::skip]
     async fn v2_invalid_provider_outcomes_fail_closed_without_effect_execution() {
         let invalid = [
             ProviderResponse {
@@ -2733,6 +2734,20 @@ mod tests {
                     .any(|entry| entry.kind == TranscriptKind::ToolResult)
             );
         }
+
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
+        let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
+        let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
+        let service = delayed_service(root.path(), engine, [(Duration::from_secs(60), response(Some("unused"), vec![]))]);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let cancel = async { wait_until(|| service.active.lock().unwrap().contains_key(&thread_id), "provider registration").await; service.cancel(thread_id); };
+        let (cancelled, ()) = tokio::join!(service.start(thread_id, "cancel provider".into(), binding()), cancel);
+        assert_eq!(cancelled.unwrap().lifecycle, ThreadLifecycle::Interrupted);
     }
 
     #[tokio::test]
@@ -2961,6 +2976,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[rustfmt::skip]
     async fn history_replays_durable_tool_exchange_and_rejects_oversized_newest_segment() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), "history fixture").unwrap();
@@ -3020,6 +3036,10 @@ mod tests {
             },
             Arc::new(|_| Err("not used".into())),
         );
+        let mut bounded = completed.clone(); bounded.transcript.entries.iter_mut().find(|entry| entry.kind == TranscriptKind::User).unwrap().text = "word ".repeat(1_000);
+        assert!(constrained.history_with_prompt(&bounded, "small").unwrap().iter().any(|message| matches!(message, Message::User { content } if content == "small")));
+        assert!(constrained.enforce_budget(vec![Message::User { content: "word ".repeat(1_000) }]).is_err());
+        let mut orphan = completed.clone(); orphan.transcript.entries.retain(|entry| entry.kind != TranscriptKind::User); assert!(constrained.history_with_prompt(&orphan, "small").is_ok());
         let error = constrained
             .history_with_prompt(&completed, &"word ".repeat(1_000))
             .unwrap_err();
@@ -3677,5 +3697,245 @@ mod tests {
             latte_core::RunStatus::Interrupted
         );
         assert!(!root.path().join("must-not-exist.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_wrong_lifecycle_and_cancels_only_registered_active_work() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = ThreadRuntimeService::new(
+            engine.clone(),
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            Arc::new(|_| Err("provider must not be constructed".into())),
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let running = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .follow_up(thread_id, running.revision, "too early".into())
+                .await,
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        assert!(matches!(
+            service
+                .provide_input(
+                    thread_id,
+                    running.revision,
+                    "missing".into(),
+                    "value".into()
+                )
+                .await,
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        assert!(matches!(
+            service
+                .resolve_permission(thread_id, running.revision, "missing".into(), true)
+                .await,
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        assert!(matches!(
+            service.reconcile_unknown_effect(thread_id, "missing"),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn ThreadProgressSink> = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |progress| observed.lock().unwrap().push(progress))
+        };
+        let service = service.with_progress_sink(sink);
+        let token = CancellationToken::new();
+        service
+            .active
+            .lock()
+            .unwrap()
+            .insert(thread_id, token.clone());
+        service.cancel(thread_id);
+        assert!(token.is_cancelled());
+        assert_eq!(
+            service.cancel_durable(thread_id).unwrap().thread_id,
+            thread_id,
+            "registered in-flight work is cancelled transiently without forging a durable terminal"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[rustfmt::skip]
+    fn verification_and_transcript_helpers_fail_closed_on_missing_authority() {
+        use latte_core::{ThreadRunStatus, ThreadRunSummary, TranscriptEntry, TranscriptEntryId};
+
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let base = ThreadRuntimeService::new(
+            engine,
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            Arc::new(|_| Err("not used".into())),
+        );
+        assert!(matches!(
+            base.verification_descriptor(&snapshot, "done"),
+            Err(ThreadRuntimeError::Effect(message)) if message.contains("no configured verification")
+        ));
+        let empty = base.clone().with_verification(VerificationPlan {
+            argv: vec![],
+            cwd: ".".into(),
+            timeout_ms: 1,
+            grace_ms: 1,
+            stdout_cap: 1,
+            stderr_cap: 1,
+        });
+        assert!(matches!(
+            empty.verification_descriptor(&snapshot, "done"),
+            Err(ThreadRuntimeError::Effect(message)) if message.contains("argv is empty")
+        ));
+        let verified = base.with_verification(VerificationPlan {
+            argv: vec!["/bin/true".into()],
+            cwd: ".".into(),
+            timeout_ms: 1_000,
+            grace_ms: 100,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+        });
+        let descriptor = verified
+            .verification_descriptor(&snapshot, "done\napi_key=secret")
+            .unwrap();
+        assert_eq!(descriptor.name, "process");
+        assert!(!descriptor.input.to_string().contains("api_key=secret"));
+
+        snapshot.active_run_id = None;
+        assert!(matches!(
+            active_run_revision(&snapshot),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        assert!(
+            thread_effect_request(&snapshot, descriptor.clone(), "missing-run".into()).is_err()
+        );
+        assert!(
+            thread_effect_start_request(
+                &snapshot,
+                descriptor.effect_id.clone(),
+                "missing-run".into()
+            )
+            .is_err()
+        );
+        let live = verified.acquire(thread_id).unwrap();
+        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("active linked run is unavailable"));
+
+        snapshot.active_run_id = Some(run_id);
+        snapshot.runs = vec![ThreadRunSummary {
+            run_id: new_run_id(),
+            parent_run_id: None,
+            ordinal: 0,
+            status: ThreadRunStatus::Running,
+            run_revision: 1,
+            completed_at_ms: None,
+        }];
+        assert!(matches!(
+            active_run_revision(&snapshot),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("linked run revision is unavailable"));
+        snapshot.runs[0].run_id = run_id;
+        let presentation = ThreadEffectPresentation { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
+        assert!(verified.finish_verification(&snapshot, &presentation, &live).unwrap_err().to_string().contains("observation is missing"));
+
+        let call = crate::provider::ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+        };
+        snapshot.transcript.entries = vec![
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 2,
+                run_id: Some(run_id),
+                kind: TranscriptKind::Assistant,
+                text: "call".into(),
+                payload: Some(serde_json::json!({"tool_calls":[call.clone()]})),
+                source_key: "assistant".into(),
+                created_at_ms: 2,
+            },
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 3,
+                run_id: Some(run_id),
+                kind: TranscriptKind::System,
+                text: "ignore".into(),
+                payload: None,
+                source_key: "system".into(),
+                created_at_ms: 3,
+            },
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 4,
+                run_id: Some(run_id),
+                kind: TranscriptKind::ToolResult,
+                text: "missing payload".into(),
+                payload: None,
+                source_key: "result-empty".into(),
+                created_at_ms: 4,
+            },
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 5,
+                run_id: Some(run_id),
+                kind: TranscriptKind::ToolResult,
+                text: "result".into(),
+                payload: Some(serde_json::json!({
+                    "tool_call_id":"call-1",
+                    "provider_content":"provider-safe-result"
+                })),
+                source_key: "result".into(),
+                created_at_ms: 5,
+            },
+        ];
+        let (sequence, calls, ordinal) = tool_round_for_call(&snapshot, "call-1").unwrap();
+        assert_eq!((sequence, calls, ordinal), (2, vec![call], 0));
+        assert!(tool_round_for_call(&snapshot, "missing").is_err());
+        assert_eq!(
+            effect_provider_result(&snapshot, "call-1").as_deref(),
+            Some("provider-safe-result")
+        );
+        assert_eq!(effect_provider_result(&snapshot, "missing"), None);
+
+        let mut running = verified.commit(thread_id, run_id, 0, 0, CommitThreadRunUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
+        assert!(verified.recover_lease_loss(&running, &live, "test").to_string().contains("recovery failed"));
+        verified.engine.release_lease(&live).unwrap(); let mut mismatched = running.clone(); mismatched.runs[0].run_revision += 1; assert!(verified.recover_lease_loss(&mismatched, &live, "test").to_string().contains("newer owner fenced"));
+        let live = verified.acquire(thread_id).unwrap();
+        for index in 0..501 { running = verified.commit(thread_id, run_id, running.revision, 1, CommitThreadRunUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
+        assert_eq!(verified.load_full(thread_id).unwrap().transcript.entries.len(), 502);
+        let mut observed = running.clone();
+        observed.transcript = snapshot.transcript.clone();
+        let mut presentation = presentation;
+        presentation.tool_call_id = "call-1".into();
+        assert!(verified.finish_verification(&observed, &presentation, &live).unwrap_err().to_string().contains("not a process result"));
+        let mut output = latte_engine::ProcessOutput { exit_code: Some(0), stdout: String::new(), stderr: String::new(), stdout_truncated: false, stderr_truncated: false, termination: latte_engine::ProcessTermination::Exited };
+        observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
+        presentation.effect_id = "missing-summary".into();
+        presentation.input = serde_json::json!({});
+        assert!(verified.finish_verification(&observed, &presentation, &live).unwrap_err().to_string().contains("completion summary is missing"));
+        output.exit_code = Some(1);
+        observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
+        presentation.effect_id = "failed-verification".into();
+        presentation.input = descriptor.input;
+        assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, ThreadLifecycle::Failed);
+        verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
     }
 }

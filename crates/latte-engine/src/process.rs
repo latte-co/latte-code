@@ -1053,6 +1053,44 @@ mod tests {
             classify(&invocation(Some("rm -rf /"), &empty, "c", &lease, None)),
             ProcessDecision::Deny
         );
+        assert_eq!(
+            classify(&invocation(None, &empty, "empty", &lease, None)),
+            ProcessDecision::Deny
+        );
+        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test"] {
+            assert_eq!(
+                classify(&invocation(
+                    Some(dangerous),
+                    &empty,
+                    dangerous,
+                    &lease,
+                    None
+                )),
+                ProcessDecision::Deny
+            );
+        }
+        let safe_grep = vec![
+            "/usr/bin/grep".into(),
+            "-q".into(),
+            "needle".into(),
+            "relative.txt".into(),
+        ];
+        assert_eq!(
+            classify(&invocation(None, &safe_grep, "grep", &lease, None)),
+            ProcessDecision::Allow
+        );
+        for unsafe_path in ["/absolute.txt", "../escape.txt"] {
+            let unsafe_grep = vec![
+                "/usr/bin/grep".into(),
+                "-q".into(),
+                "needle".into(),
+                unsafe_path.into(),
+            ];
+            assert_eq!(
+                classify(&invocation(None, &unsafe_grep, unsafe_path, &lease, None)),
+                ProcessDecision::Ask
+            );
+        }
         let git_hook = vec!["git".into(), "diff".into(), "--ext-diff".into()];
         let hooked_env = BTreeMap::from([("GIT_EXTERNAL_DIFF".into(), "evil".into())]);
         let hooked = ProcessInvocation {
@@ -1067,6 +1105,292 @@ mod tests {
             ..invocation(None, &pwd, "loader", &lease, None)
         };
         assert_eq!(classify(&hooked), ProcessDecision::Ask);
+
+        let successful = ProcessOutput {
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            termination: ProcessTermination::Exited,
+        };
+        assert!(successful.command_succeeded());
+        assert!(
+            !ProcessOutput {
+                termination: ProcessTermination::Cancelled,
+                ..successful.clone()
+            }
+            .command_succeeded()
+        );
+        assert!(
+            !ProcessOutput {
+                exit_code: Some(1),
+                ..successful
+            }
+            .command_succeeded()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn thread_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
+        let defaults = ThreadProcessSpec::from_input(&serde_json::json!({
+            "argv": ["/bin/pwd"]
+        }))
+        .unwrap();
+        assert_eq!(defaults.argv, ["/bin/pwd"]);
+        assert_eq!(defaults.shell, None);
+        assert_eq!(defaults.cwd, ".");
+        assert!(defaults.env.is_empty());
+        assert_eq!(defaults.timeout_ms, 30_000);
+        assert_eq!(defaults.grace_ms, 250);
+        assert_eq!(defaults.stdout_cap, 64 * 1024);
+        assert_eq!(defaults.stderr_cap, 64 * 1024);
+
+        let configured = ThreadProcessSpec::from_input(&serde_json::json!({
+            "shell": "printf ok",
+            "cwd": "subdir",
+            "env": {"LANG": "C"},
+            "timeout_ms": 600_000,
+            "grace_ms": 0,
+            "stdout_cap": 1_048_576,
+            "stderr_cap": 1
+        }))
+        .unwrap();
+        assert_eq!(configured.shell.as_deref(), Some("printf ok"));
+        assert_eq!(configured.cwd, "subdir");
+        assert_eq!(configured.env["LANG"], "C");
+        assert_eq!(configured.timeout_ms, 600_000);
+        assert_eq!(configured.grace_ms, 0);
+        assert_eq!(configured.stdout_cap, 1_048_576);
+        assert_eq!(configured.stderr_cap, 1);
+
+        let lease = Lease {
+            owner: "owner".into(),
+            fencing_token: 7,
+            expires_at_ms: 99,
+        };
+        let descriptor = ThreadEffectDescriptor {
+            effect_id: "effect".into(),
+            tool_call_id: "call_1".into(),
+            name: "process".into(),
+            input: serde_json::json!({}),
+            attempt: 3,
+        };
+        let invocation = configured.invocation(11, &descriptor, &lease);
+        assert_eq!(invocation.run_revision, 11);
+        assert_eq!(invocation.effect_id, "effect");
+        assert_eq!(invocation.attempt, 3);
+        assert_eq!(invocation.lease_owner, "owner");
+        assert_eq!(invocation.lease_token, 7);
+
+        let invalid = [
+            (serde_json::json!(null), "process input must be an object"),
+            (serde_json::json!({"argv":"pwd"}), "argv must be an array"),
+            (
+                serde_json::json!({"argv":[1]}),
+                "argv entries must be strings",
+            ),
+            (serde_json::json!({"shell":1}), "shell must be a string"),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"env":[]}),
+                "invalid env:",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":-1}),
+                "timeout_ms must be an unsigned integer",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":0}),
+                "timeout_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"timeout_ms":600_001}),
+                "timeout_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"grace_ms":"soon"}),
+                "grace_ms must be an unsigned integer",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"grace_ms":30_001}),
+                "grace_ms is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"stdout_cap":0}),
+                "stdout_cap is out of range",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"stderr_cap":1_048_577}),
+                "stderr_cap is out of range",
+            ),
+            (
+                serde_json::json!({}),
+                "provide exactly one of argv or shell",
+            ),
+            (
+                serde_json::json!({"argv":["/bin/pwd"],"shell":"pwd"}),
+                "provide exactly one of argv or shell",
+            ),
+        ];
+        for (input, expected) in invalid {
+            let error = ThreadProcessSpec::from_input(&input).unwrap_err();
+            assert!(
+                matches!(error, ProcessError::Invalid(message) if message.contains(expected)),
+                "input {input} did not produce {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_waiters_and_remains_cancelled() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        let waiter = token.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+        tokio::task::yield_now().await;
+        token.cancel();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(token.is_cancelled());
+        timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn execute_process_rejects_invalid_requests_before_creating_effect_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("not-a-directory"), "x").unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let empty = Vec::new();
+        let pwd = vec!["/bin/pwd".into()];
+
+        let both = invocation(Some("pwd"), &pwd, "both", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &both, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("exactly one")
+        ));
+        let neither = invocation(None, &empty, "neither", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &neither, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("exactly one")
+        ));
+
+        let zero_cap = ProcessInvocation {
+            stdout_cap: 0,
+            ..invocation(None, &pwd, "zero-cap", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &zero_cap, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("nonzero")
+        ));
+
+        let wrong_owner = ProcessInvocation {
+            lease_owner: "other",
+            ..invocation(None, &pwd, "wrong-owner", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &wrong_owner, &CancellationToken::new())
+                .await,
+            Err(ProcessError::InvalidApproval)
+        ));
+
+        let file_cwd = ProcessInvocation {
+            cwd: "not-a-directory",
+            ..invocation(None, &pwd, "file-cwd", &lease, None)
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &file_cwd, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Invalid(message)) if message.contains("must be a directory")
+        ));
+
+        let dangerous = invocation(Some("mkfs /dev/example"), &empty, "denied", &lease, None);
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &dangerous, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Denied)
+        ));
+        let ask_with_unissued_digest =
+            invocation(Some("printf ok"), &empty, "unissued", &lease, Some("wrong"));
+        assert!(matches!(
+            engine
+                .execute_process(
+                    run,
+                    &lease,
+                    3,
+                    &ask_with_unissued_digest,
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(ProcessError::InvalidApproval)
+        ));
+
+        for effect in [
+            "both",
+            "neither",
+            "zero-cap",
+            "wrong-owner",
+            "file-cwd",
+            "denied",
+            "unissued",
+        ] {
+            assert!(
+                engine.effect_status(effect).is_err(),
+                "{effect} created a ledger row"
+            );
+        }
+
+        let descriptor = ThreadEffectDescriptor {
+            effect_id: "thread-process".into(),
+            tool_call_id: "call".into(),
+            name: "process".into(),
+            input: serde_json::json!({"argv":["/bin/echo","ok"]}),
+            attempt: 1,
+        };
+        let mut unsupported = engine.clone();
+        unsupported.process_supervision_supported = false;
+        assert!(matches!(
+            unsupported
+                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(ThreadEffectExecutionError::Certified(_))
+        ));
+        let gated = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        gated.operation_gate.close();
+        assert!(matches!(
+            gated
+                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(ThreadEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
+        ));
+        assert!(
+            storage(crate::StorageError::LeaseLost)
+                .to_string()
+                .contains("durable sequencing")
+        );
     }
 
     #[tokio::test]
@@ -1298,6 +1622,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn uncertain_group_probe_makes_started_effect_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -1322,6 +1647,16 @@ mod tests {
         assert_eq!(
             engine.effect_status("uncertain-probe").unwrap(),
             EffectStatus::Unknown
+        );
+
+        assert!(group_pid(u32::MAX).is_err());
+        for probe in [GroupProbe::Absent, GroupProbe::Uncertain] {
+            assert_eq!(group_probe(0, Some(probe)).unwrap(), probe);
+        }
+        assert!(
+            await_group_absent(0, 0, Some(GroupProbe::Absent))
+                .await
+                .unwrap()
         );
     }
 }

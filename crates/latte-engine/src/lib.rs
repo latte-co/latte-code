@@ -1651,6 +1651,124 @@ mod tool_effect_tests {
     use latte_core::{IdSource, SystemIdSource};
     use serde_json::json;
 
+    fn descriptor(name: &str, input: Value) -> ThreadEffectDescriptor {
+        ThreadEffectDescriptor {
+            effect_id: format!("effect-{name}"),
+            tool_call_id: format!("call-{name}"),
+            name: name.into(),
+            input,
+            attempt: 1,
+        }
+    }
+
+    fn test_thread_binding() -> ThreadProviderBindingV2 {
+        ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test-model".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST_KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        }
+    }
+
+    #[test]
+    fn descriptor_validation_checkpoint_and_safe_presentations_fail_closed() {
+        let valid = descriptor(
+            "write_file",
+            json!({"path":"safe.txt","content":"ok","create_intent":false}),
+        );
+        assert!(validate_thread_effect_descriptor(&valid).is_ok());
+        let checkpoint =
+            thread_effect_checkpoint("prepared", &valid, "authorization=Bearer live-secret-value");
+        assert!(checkpoint.contains("prepared"));
+        assert!(!checkpoint.contains("live-secret-value"));
+        let presentation = ThreadEffectPresentation::from_descriptor(&ThreadEffectDescriptor {
+            input: json!({"token":"live-secret-value","path":"safe.txt"}),
+            ..valid.clone()
+        });
+        assert_eq!(presentation.input["path"], "safe.txt");
+        assert_ne!(presentation.input["token"], "live-secret-value");
+
+        for invalid in [
+            ThreadEffectDescriptor {
+                effect_id: String::new(),
+                ..valid.clone()
+            },
+            ThreadEffectDescriptor {
+                name: "bad\nname".into(),
+                ..valid.clone()
+            },
+            ThreadEffectDescriptor {
+                tool_call_id: "bad id".into(),
+                ..valid.clone()
+            },
+            ThreadEffectDescriptor {
+                attempt: 0,
+                ..valid.clone()
+            },
+            ThreadEffectDescriptor {
+                input: json!([]),
+                ..valid.clone()
+            },
+        ] {
+            assert!(matches!(
+                validate_thread_effect_descriptor(&invalid),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn every_permission_summary_is_bounded_specific_and_secret_safe() {
+        let cases = [
+            (
+                descriptor(
+                    "write_file",
+                    json!({"path":"a.txt","content":"abc","create_intent":false}),
+                ),
+                "replace existing",
+            ),
+            (
+                descriptor(
+                    "edit_file",
+                    json!({"path":"a.txt","before":"old","after":"newer"}),
+                ),
+                "replace one match; 3 bytes → 5 bytes",
+            ),
+            (
+                descriptor("process", json!({"shell":"echo unsafe","cwd":"."})),
+                "Run shell command",
+            ),
+            (descriptor("read_file", json!({})), "Read [unknown path]"),
+            (
+                descriptor("list_directory", json!({"path":"src"})),
+                "List src",
+            ),
+            (descriptor("search", json!({})), "[unspecified query]"),
+            (
+                descriptor("custom_tool", json!({})),
+                "custom_tool invocation",
+            ),
+        ];
+        for (descriptor, expected) in cases {
+            let summary = thread_effect_permission_summary(&descriptor);
+            assert!(summary.contains(expected), "summary={summary}");
+            assert!(summary.len() <= PERMISSION_SUMMARY_CAP + '…'.len_utf8());
+            assert!(!summary.chars().any(char::is_control));
+        }
+        assert_eq!(summary_text("\n\r\t"), "[unspecified]");
+        assert_eq!(summary_argv("MODE=release"), "MODE=release");
+        assert_eq!(summary_argv("api_key=secret"), "api_key=[REDACTED]");
+        let long = "x".repeat(PERMISSION_SUMMARY_CAP + 100);
+        assert!(summary_text(&long).ends_with('…'));
+    }
+
     #[test]
     fn permission_summaries_show_operation_context_without_values_or_controls() {
         let write = ThreadEffectDescriptor {
@@ -2245,5 +2363,589 @@ mod tool_effect_tests {
             engine.effect_status("unsupported").unwrap(),
             EffectStatus::ObservedSuccess
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn public_authority_fences_lease_checkpoint_recovery_and_linked_run_bypasses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(dir.path().join("state.db"))
+            .enabled_tools(["read_file", "write_file", "edit_file"])
+            .deny_globs(["blocked/**"])
+            .build()
+            .unwrap();
+        assert_eq!(format!("{engine:?}"), "EngineHandle { .. }");
+        let names = engine
+            .tool_descriptors()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(names.contains(&"read_file".to_owned()));
+        #[cfg(unix)]
+        assert!(names.contains(&"process".to_owned()));
+        let manifest = engine.workspace_manifest().unwrap();
+        assert!(!manifest.is_empty());
+        assert!(manifest.keys().all(|path| !path.contains("state.db")));
+        assert!(engine.changed_files().is_err());
+
+        let ids = SystemIdSource::default();
+        let run = RunId::from_uuid(ids.next_uuid_v7());
+        assert_eq!(
+            engine.create_run(run, 1).unwrap().status,
+            latte_core::RunStatus::Queued
+        );
+        assert_eq!(engine.show(run).unwrap().run_id, run);
+        assert_eq!(engine.list().unwrap().len(), 1);
+
+        let lease = engine.acquire_lease("owner-a", 2, 5).unwrap();
+        assert_eq!(lease.owner(), "owner-a");
+        assert_eq!(lease.expires_at_ms(), 7);
+        assert!(matches!(
+            engine.acquire_lease("owner-b", 3, 5),
+            Err(StorageError::EngineUnavailable)
+        ));
+        let lease = engine.acquire_lease("owner-a", 4, 8).unwrap();
+        assert_eq!(lease.fencing_token(), 1);
+        assert_eq!(lease.expires_at_ms(), 12);
+        let renewed = engine.renew_lease(&lease, 5, 10).unwrap();
+        assert_eq!(renewed.expires_at_ms(), 15);
+
+        let mut events = engine.subscribe();
+        let running = engine
+            .apply_transition(run, 0, Transition::Start, 6, &renewed)
+            .unwrap();
+        assert_eq!(running.status, latte_core::RunStatus::Running);
+        assert_eq!(events.try_recv().unwrap().unwrap().run_id, run);
+        assert!(events.try_recv().unwrap().is_none());
+        engine
+            .persist_runtime_checkpoint(
+                run,
+                running.revision,
+                &renewed,
+                r#"{"phase":"running"}"#,
+                7,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.runtime_checkpoint(run).unwrap().as_deref(),
+            Some(r#"{"phase":"running"}"#)
+        );
+        assert!(matches!(
+            engine.persist_runtime_checkpoint(
+                run,
+                running.revision + 1,
+                &renewed,
+                r#"{"phase":"stale"}"#,
+                8,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        assert!(engine.unknown_effects_for_run(run).unwrap().is_empty());
+        assert!(engine.effect_status("missing-effect").is_err());
+        assert!(
+            !engine
+                .permission_matches(
+                    "missing-effect",
+                    run,
+                    running.revision,
+                    &renewed,
+                    "missing-digest",
+                    9,
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            engine.cancel_waiting_run(run, running.revision, &renewed, 9),
+            Err(StorageError::InvalidData(_))
+        ));
+        assert!(matches!(
+            engine.deny_waiting_permission(run, running.revision, &renewed, 9),
+            Err(StorageError::InvalidData(_))
+        ));
+        assert!(matches!(
+            engine.interrupt_after_lease_loss(run, &renewed, running.revision, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+
+        let takeover = engine.acquire_lease("owner-b", 15, 10).unwrap();
+        assert_eq!(takeover.fencing_token(), renewed.fencing_token() + 1);
+        assert!(matches!(
+            engine.renew_lease(&renewed, 16, 10),
+            Err(StorageError::LeaseLost)
+        ));
+        assert!(matches!(
+            engine.release_lease(&renewed),
+            Err(StorageError::LeaseLost)
+        ));
+        let interrupted = engine
+            .interrupt_after_lease_loss(run, &renewed, running.revision, 16)
+            .unwrap();
+        let interrupted_revision = match interrupted {
+            LeaseLossRecovery::Interrupted(state) => {
+                assert_eq!(state.status, latte_core::RunStatus::Interrupted);
+                state.revision
+            }
+            other => panic!("expected interruption, got {other:?}"),
+        };
+        assert_eq!(
+            engine
+                .interrupt_after_lease_loss(run, &renewed, running.revision, 17)
+                .unwrap(),
+            LeaseLossRecovery::FencedNoop
+        );
+        assert!(matches!(
+            engine
+                .interrupt_after_lease_loss(run, &renewed, interrupted_revision, 18)
+                .unwrap(),
+            LeaseLossRecovery::AlreadyTerminal(state)
+                if state.status == latte_core::RunStatus::Interrupted
+        ));
+        engine.release_lease(&takeover).unwrap();
+        assert!(matches!(
+            engine.release_lease(&takeover),
+            Err(StorageError::LeaseLost)
+        ));
+
+        let overflow = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        assert!(matches!(
+            overflow.acquire_lease("overflow", u64::MAX, 1),
+            Err(StorageError::InvalidData(_))
+        ));
+
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let linked_run = RunId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(thread_id, linked_run, test_thread_binding(), "linked", 20)
+            .unwrap();
+        let linked_lease = engine.acquire_lease("linked-owner", 21, 100).unwrap();
+        for result in [
+            engine.runtime_checkpoint(linked_run).map(|_| ()),
+            engine.unknown_effects_for_run(linked_run).map(|_| ()),
+            engine.persist_runtime_checkpoint(linked_run, 0, &linked_lease, "{}", 22),
+            engine
+                .interrupt_after_lease_loss(linked_run, &linked_lease, 0, 22)
+                .map(|_| ()),
+            engine
+                .resolve_unknown_effect_and_abort(linked_run, "missing", 0, &linked_lease, 22)
+                .map(|_| ()),
+            engine
+                .cancel_waiting_run(linked_run, 0, &linked_lease, 22)
+                .map(|_| ()),
+            engine
+                .deny_waiting_permission(linked_run, 0, &linked_lease, 22)
+                .map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StorageError::LinkedRunRequiresThreadCommit)
+            ));
+        }
+        assert!(matches!(
+            engine.apply_transition(linked_run, 0, Transition::Start, 22, &linked_lease),
+            Err(StorageError::LinkedRunRequiresThreadCommit)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn subscriptions_report_empty_event_lag_and_closed_without_becoming_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let mut sync_events = engine.subscribe();
+        let mut async_events = engine.subscribe();
+        assert!(sync_events.try_recv().unwrap().is_none());
+        let mut runs = Vec::new();
+        for index in 0..40 {
+            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            engine
+                .create_run(run_id, u64::try_from(index).unwrap())
+                .unwrap();
+            runs.push(run_id);
+        }
+        let lease = engine.acquire_lease("event-producer", 100, 10_000).unwrap();
+        for (index, run_id) in runs.into_iter().enumerate() {
+            engine
+                .apply_transition(
+                    run_id,
+                    0,
+                    Transition::Start,
+                    u64::try_from(index + 101).unwrap(),
+                    &lease,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            sync_events.try_recv(),
+            Err(SubscriptionError::Lagged(count)) if count > 0
+        ));
+        assert!(matches!(
+            async_events.recv().await,
+            Err(SubscriptionError::Lagged(count)) if count > 0
+        ));
+        assert!(sync_events.try_recv().unwrap().is_some());
+
+        let mut sync_threads = engine.subscribe_threads();
+        let mut async_threads = engine.subscribe_threads();
+        for index in 0..70 {
+            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            engine
+                .create_thread_v2(
+                    thread_id,
+                    run_id,
+                    test_thread_binding(),
+                    &format!("thread-{index}"),
+                    u64::try_from(index + 1_000).unwrap(),
+                )
+                .unwrap();
+            engine
+                .commit_thread_run_update(
+                    ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: 0,
+                        expected_run_revision: 0,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitThreadRunUpdate::Start {
+                            source_key: format!("start-{index}"),
+                        },
+                    },
+                    &lease,
+                    u64::try_from(index + 2_000).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            sync_threads.try_recv(),
+            Err(SubscriptionError::Lagged(count)) if count > 0
+        ));
+        assert!(matches!(
+            async_threads.recv().await,
+            Err(SubscriptionError::Lagged(count)) if count > 0
+        ));
+        assert!(sync_threads.try_recv().unwrap().is_some());
+
+        let closed = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let mut legacy_events_receiver = closed.subscribe();
+        let mut async_events_receiver = closed.subscribe();
+        let mut legacy_threads_receiver = closed.subscribe_threads();
+        let mut async_threads_receiver = closed.subscribe_threads();
+        drop(closed);
+        assert_eq!(
+            legacy_events_receiver.try_recv(),
+            Err(SubscriptionError::Closed)
+        );
+        assert_eq!(
+            async_events_receiver.recv().await,
+            Err(SubscriptionError::Closed)
+        );
+        assert_eq!(
+            legacy_threads_receiver.try_recv(),
+            Err(SubscriptionError::Closed)
+        );
+        assert_eq!(
+            async_threads_receiver.recv().await,
+            Err(SubscriptionError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn started_effect_workers_revalidate_exact_policy_and_classify_observed_failures() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
+        std::fs::write(dir.path().join("duplicate.txt"), "same\nsame\n").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let lease = engine.acquire_lease("worker", 1, 10_000).unwrap();
+
+        let read = descriptor("read_file", json!({"path":"read.txt"}));
+        let (policy, read_digest) = engine
+            .thread_effect_policy_and_digest(&read, 1, &lease)
+            .unwrap();
+        assert_eq!(policy, ThreadEffectPolicy::Allow);
+        let observed = engine
+            .execute_started_thread_tool(&read, 1, &read_digest, &lease, &CancellationToken::new())
+            .unwrap();
+        assert!(observed.success);
+        assert!(observed.result.contains("read-value"));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            engine.execute_started_thread_tool(&read, 1, &read_digest, &lease, &cancelled),
+            Err(ThreadEffectExecutionError::Uncertain(message))
+                if message.contains("cancelled")
+        ));
+        assert!(matches!(
+            engine.execute_started_thread_tool(
+                &read,
+                1,
+                "wrong-digest",
+                &lease,
+                &CancellationToken::new(),
+            ),
+            Err(ThreadEffectExecutionError::Uncertain(message))
+                if message.contains("authorization changed")
+        ));
+
+        let disappearing = descriptor("read_file", json!({"path":"disappearing.txt"}));
+        std::fs::write(dir.path().join("disappearing.txt"), "present").unwrap();
+        let (_, disappearing_digest) = engine
+            .thread_effect_policy_and_digest(&disappearing, 1, &lease)
+            .unwrap();
+        std::fs::remove_file(dir.path().join("disappearing.txt")).unwrap();
+        assert!(matches!(
+            engine.execute_started_thread_tool(
+                &disappearing,
+                1,
+                &disappearing_digest,
+                &lease,
+                &CancellationToken::new(),
+            ),
+            Err(ThreadEffectExecutionError::Uncertain(message))
+                if message.contains("precondition changed")
+        ));
+
+        let duplicate_hash = format!("{:x}", Sha256::digest(b"same\nsame\n"));
+        let edit = descriptor(
+            "edit_file",
+            json!({
+                "path":"duplicate.txt",
+                "before":"same",
+                "after":"changed",
+                "precondition":duplicate_hash,
+            }),
+        );
+        let (policy, edit_digest) = engine
+            .thread_effect_policy_and_digest(&edit, 2, &lease)
+            .unwrap();
+        assert_eq!(policy, ThreadEffectPolicy::Ask);
+        let observed_failure = engine
+            .execute_started_thread_tool(&edit, 2, &edit_digest, &lease, &CancellationToken::new())
+            .unwrap();
+        assert!(!observed_failure.success);
+        assert!(observed_failure.result.contains("match"));
+
+        let denied = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .deny_globs(["duplicate.txt"])
+            .build()
+            .unwrap();
+        assert!(
+            denied
+                .thread_effect_policy_and_digest(&edit, 2, &lease)
+                .unwrap_err()
+                .to_string()
+                .contains("denied")
+        );
+        let dangerous_process = descriptor("process", json!({"shell":"rm -rf /","cwd":"."}));
+        assert!(
+            engine
+                .thread_effect_policy_and_digest(&dangerous_process, 2, &lease)
+                .unwrap_err()
+                .to_string()
+                .contains("process policy denied")
+        );
+        let mut unsupported = engine.clone();
+        unsupported.process_supervision_supported = false;
+        assert!(
+            unsupported
+                .thread_effect_policy_and_digest(
+                    &descriptor("process", json!({"argv":["/bin/pwd"]})),
+                    2,
+                    &lease,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let snapshot = engine
+            .create_thread_v2(thread_id, run_id, test_thread_binding(), "worker", 10)
+            .unwrap();
+        let snapshot = engine
+            .commit_thread_run_update(
+                ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Start {
+                        source_key: "worker:start".into(),
+                    },
+                },
+                &lease,
+                11,
+            )
+            .unwrap()
+            .snapshot;
+        let run_revision = snapshot.runs[0].run_revision;
+
+        let read = descriptor("read_file", json!({"path":"read.txt"}));
+        let (_, read_digest) = engine
+            .thread_effect_policy_and_digest(&read, run_revision, &lease)
+            .unwrap();
+        let read_started = ThreadEffectStarted {
+            snapshot: snapshot.clone(),
+            presentation: ThreadEffectPresentation::from_descriptor(&read),
+            operation_digest: read_digest,
+            descriptor: read,
+        };
+        assert!(
+            engine
+                .execute_started_thread_effect(&read_started, &lease, &CancellationToken::new(),)
+                .await
+                .unwrap()
+                .success
+        );
+        let completion_descriptor = read_started.descriptor.clone();
+        let mut missing_run = read_started.clone();
+        missing_run.snapshot.active_run_id = None;
+        assert!(matches!(
+            engine
+                .execute_started_thread_effect(
+                    &missing_run,
+                    &lease,
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(ThreadEffectExecutionError::Uncertain(message))
+                if message.contains("started run is missing")
+        ));
+        let mut stale_digest = read_started;
+        stale_digest.operation_digest = "stale".into();
+        assert!(matches!(
+            engine
+                .execute_started_thread_effect(
+                    &stale_digest,
+                    &lease,
+                    &CancellationToken::new(),
+                )
+                .await,
+            Err(ThreadEffectExecutionError::Uncertain(message))
+                if message.contains("exact operation digest")
+        ));
+
+        let prepared = engine
+            .prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "worker:prepare-read".into(),
+                    descriptor: completion_descriptor,
+                },
+                &lease,
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.thread_effect_digest("effect-read_file").unwrap(),
+            prepared.operation_digest
+        );
+        let started = engine
+            .start_thread_effect(
+                ThreadEffectStartRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: prepared.snapshot.revision,
+                    expected_run_revision: prepared.snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "worker:start-read".into(),
+                    effect_id: "effect-read_file".into(),
+                },
+                prepared.operation_digest,
+                &lease,
+                13,
+            )
+            .unwrap();
+        let value = engine
+            .execute_started_thread_effect(&started, &lease, &CancellationToken::new())
+            .await
+            .unwrap();
+        let verification = ProcessOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            termination: ProcessTermination::Exited,
+        };
+        let observed = engine
+            .observe_thread_effect(
+                &started,
+                "worker:observe-read".into(),
+                latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                value,
+                &lease,
+                14,
+            )
+            .unwrap();
+        let observed_revision = observed.snapshot.runs[0].run_revision;
+        engine
+            .record_thread_verification(
+                run_id,
+                observed_revision,
+                "effect-read_file",
+                &verification,
+                &lease,
+                15,
+            )
+            .unwrap();
+        let completed = engine
+            .complete_thread_verified(
+                &observed.snapshot,
+                "verified worker".into(),
+                "effect-read_file".into(),
+                &lease,
+                16,
+            )
+            .unwrap();
+        assert_eq!(completed.lifecycle, latte_core::ThreadLifecycle::Ready);
+        assert_eq!(engine.list_threads_v2().unwrap()[0], completed);
+        assert_eq!(
+            engine.thread_snapshot_v2(thread_id, None, 100).unwrap(),
+            completed
+        );
+        let follow_up_run = RunId::from_uuid(ids.next_uuid_v7());
+        let follow_up = engine
+            .create_thread_follow_up_v2(
+                thread_id,
+                follow_up_run,
+                completed.revision,
+                "follow up",
+                17,
+            )
+            .unwrap();
+        assert_eq!(follow_up.active_run_id, Some(follow_up_run));
     }
 }

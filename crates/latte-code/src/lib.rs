@@ -836,19 +836,29 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED, EXIT_INTERRUPTED, EXIT_WAITING,
-        discover_workspace_root, outcome, reconcile_thread_action,
+        AppConfig, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED, EXIT_INTERNAL,
+        EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
+        ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root, dot,
+        emit_data, emit_error, execute_tui, merge_optional_config, merge_value, outcome,
+        reconcile_thread_action, render_run, verify_timeout, workspace_display_path,
         workspace_display_path_with_home,
     };
     use latte_core::{
-        FailureCode, IdSource, Retryability, RunFailure, RunId, RunState, RunStatus,
-        SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle, ThreadProviderBindingV2,
+        Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
+        RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
+        ThreadProviderBindingV2, VerificationStatus,
     };
     use latte_engine::{
         CommitThreadRunUpdate, EngineBuilder, ThreadCommitRequest, ThreadEffectDescriptor,
         ThreadEffectRequest, ThreadEffectStartRequest,
     };
-    use latte_headless::thread::{ThreadHistoryPolicy, ThreadRuntimeService};
+    use latte_headless::{
+        provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall},
+        runtime::{AgentRuntime, RuntimeError},
+        thread::{ThreadHistoryPolicy, ThreadRuntimeService},
+    };
+    use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
+    use serde_json::json;
     use std::{path::Path, sync::Arc};
 
     fn state(status: RunStatus) -> RunState {
@@ -878,6 +888,337 @@ mod tests {
             retryability: Retryability::Terminal,
         });
         assert_eq!(outcome(&run).1, EXIT_DENIED);
+    }
+
+    #[test]
+    fn remaining_run_statuses_and_config_value_objects_are_exact() {
+        assert_eq!(outcome(&state(RunStatus::WaitingInput)).1, EXIT_WAITING);
+        assert_eq!(outcome(&state(RunStatus::Cancelling)).1, EXIT_INTERRUPTED);
+        assert_eq!(outcome(&state(RunStatus::Queued)).1, EXIT_INTERNAL);
+        assert_eq!(outcome(&state(RunStatus::Running)).1, EXIT_INTERNAL);
+
+        let threads = ThreadConfig::default();
+        let policy = ThreadHistoryPolicy::default();
+        assert_eq!(threads.max_request_bytes, policy.max_request_bytes);
+        assert_eq!(threads.max_input_bytes, policy.max_input_bytes);
+        assert_eq!(threads.reserved_output_bytes, policy.reserved_output_bytes);
+        assert_eq!(threads.context_cap_bytes, policy.context_cap_bytes);
+        assert_eq!(DatabaseConfig::default().path, ".latte/latte-code.db");
+
+        let absolute = tempfile::tempdir().unwrap().path().join("absolute.db");
+        let config = AppConfig {
+            version: 1,
+            default_provider: "primary".into(),
+            providers: json!({}),
+            database: DatabaseConfig {
+                path: absolute.display().to_string(),
+            },
+            verification: VerificationConfig {
+                argv: vec!["cargo".into(), "test".into()],
+                cwd: "checks".into(),
+                timeout_ms: 42,
+            },
+            thread: threads,
+        };
+        assert_eq!(config.database_path(Path::new("/ignored")), absolute);
+        let plan = config.plan();
+        assert_eq!(plan.argv, ["cargo", "test"]);
+        assert_eq!(plan.cwd, "checks");
+        assert_eq!(plan.timeout_ms, 42);
+        assert_eq!(plan.grace_ms, 250);
+        assert_eq!(plan.stdout_cap, 16 * 1024);
+        assert_eq!(plan.stderr_cap, 16 * 1024);
+        let derived = config.thread_policy();
+        assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
+        assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
+    }
+
+    #[test]
+    fn config_merge_and_validation_cover_scalar_array_and_typed_failure_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        let config_path = root.path().join(".latte/latte-code.jsonc");
+
+        std::fs::write(&config_path, "[]").unwrap();
+        assert!(
+            AppConfig::load_with_home(root.path(), Some(home.path()))
+                .unwrap_err()
+                .contains("top-level configuration must be an object")
+        );
+        std::fs::write(&config_path, r"{ verification: { argv: [] } }").unwrap();
+        assert_eq!(
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap_err(),
+            "verification.argv must not be empty"
+        );
+        std::fs::write(&config_path, r#"{ database: { path: " " } }"#).unwrap();
+        assert_eq!(
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap_err(),
+            "database.path must not be empty"
+        );
+        std::fs::write(
+            &config_path,
+            r"{ thread: { max_input_bytes: 8, reserved_output_bytes: 8 } }",
+        )
+        .unwrap();
+        assert!(
+            AppConfig::load_with_home(root.path(), Some(home.path()))
+                .unwrap_err()
+                .contains("invalid thread configuration")
+        );
+        std::fs::write(&config_path, r"{ unexpected: true }").unwrap();
+        assert!(
+            AppConfig::load_with_home(root.path(), Some(home.path()))
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let directory = root.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            merge_optional_config(&mut json!({}), &directory)
+                .unwrap_err()
+                .contains("cannot read")
+        );
+        assert!(merge_optional_config(&mut json!({}), &root.path().join("missing")).is_ok());
+
+        let mut merged = json!({"nested":{"kept":1,"array":[1]},"scalar":1});
+        merge_value(
+            &mut merged,
+            json!({"nested":{"added":2,"array":[2,3]},"scalar":{"now":true}}),
+        );
+        assert_eq!(
+            merged,
+            json!({
+                "nested":{"kept":1,"added":2,"array":[2,3]},
+                "scalar":{"now":true}
+            })
+        );
+    }
+
+    #[test]
+    fn verification_defaults_and_output_contracts_are_stable_for_humans_and_json() {
+        let config: AppConfig = serde_json::from_value(json!({
+            "version": 1,
+            "default_provider": "primary",
+            "providers": {},
+            "verification": { "argv": ["true"] }
+        }))
+        .unwrap();
+        assert_eq!(config.verification.cwd, dot());
+        assert_eq!(config.verification.timeout_ms, verify_timeout());
+        assert_eq!(config.database.path, ".latte/latte-code.db");
+
+        let mut completed = state(RunStatus::Completed);
+        completed.revision = 4;
+        completed.handoff = Some(Handoff {
+            summary: "verified handoff".into(),
+            files_changed: vec!["src/lib.rs".into()],
+            evidence: vec![Evidence {
+                name: "unit".into(),
+                status: VerificationStatus::Passed,
+                summary: "all green".into(),
+            }],
+        });
+        assert_eq!(render_run(&completed, false), EXIT_COMPLETED);
+        assert_eq!(render_run(&completed, true), EXIT_COMPLETED);
+
+        let waiting = state(RunStatus::WaitingInput);
+        assert_eq!(render_run(&waiting, false), EXIT_WAITING);
+        assert_eq!(render_run(&waiting, true), EXIT_WAITING);
+        emit_data("completed", &json!({"kind":"contract-probe"}));
+        assert_eq!(
+            emit_error(true, "usage", "bad_argument", "bad", EXIT_USAGE, true),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            emit_error(false, "usage", "bad_argument", "bad", EXIT_USAGE, true),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            emit_error(
+                false,
+                "internal",
+                "storage",
+                "storage failed",
+                EXIT_INTERNAL,
+                false,
+            ),
+            EXIT_INTERNAL
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_headless_distinguishes_missing_invalid_and_prepared_permission_states() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "original").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(root.path().join("state.db"))
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let missing = RunId::from_uuid(ids.next_uuid_v7());
+        assert_eq!(deny_headless(&engine, missing, true), EXIT_NOT_FOUND);
+
+        let queued_id = RunId::from_uuid(ids.next_uuid_v7());
+        engine.create_run(queued_id, 1).unwrap();
+        assert_eq!(deny_headless(&engine, queued_id, false), EXIT_FAILED);
+
+        let runtime = AgentRuntime::new(
+            engine.clone(),
+            FakeProvider::scripted([
+                ProviderResponse {
+                    message: Some("I will inspect the current file first".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_read_1".into(),
+                        name: "read_file".into(),
+                        input: json!({"path":"note.txt"}),
+                    }],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                ProviderResponse {
+                    message: Some("I need permission to update the file".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_write_1".into(),
+                        name: "write_file".into(),
+                        input: json!({
+                            "path":"note.txt",
+                            "content":"updated",
+                            "create_intent":false,
+                            "precondition":"0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
+                        }),
+                    }],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ]),
+            root.path(),
+            latte_headless::runtime::VerificationPlan {
+                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                grace_ms: 100,
+                stdout_cap: 1_024,
+                stderr_cap: 1_024,
+            },
+        );
+        let run_id = match runtime.run("update note.txt").await.unwrap_err() {
+            RuntimeError::PermissionRequired { run_id } => run_id,
+            error => panic!("expected permission boundary, got {error}"),
+        };
+        let waiting = engine.show(run_id).unwrap();
+        assert_eq!(waiting.status, RunStatus::WaitingPermission);
+        assert!(waiting.pending_permission.is_some());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+            "original"
+        );
+
+        assert_eq!(deny_headless(&engine, run_id, true), EXIT_DENIED);
+        let denied = engine.show(run_id).unwrap();
+        assert_eq!(denied.status, RunStatus::Failed);
+        assert_eq!(
+            denied.failure.as_ref().map(|failure| failure.code),
+            Some(FailureCode::PermissionDenied)
+        );
+        assert!(denied.pending_permission.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(deny_headless(&engine, run_id, false), EXIT_FAILED);
+    }
+
+    #[test]
+    fn tui_entrypoint_rejects_non_terminal_processes_before_loading_authority() {
+        assert_eq!(execute_tui(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn workspace_and_projection_adapters_cover_empty_event_and_lagged_states() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("no/git/here");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(discover_workspace_root(&nested), nested);
+        assert_eq!(
+            workspace_display_path_with_home(root.path(), None),
+            root.path().display().to_string()
+        );
+        assert!(!workspace_display_path(root.path()).is_empty());
+
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut projection = ThreadEngineProjection {
+            subscription: engine.subscribe_threads(),
+            engine: engine.clone(),
+        };
+        assert!(projection.snapshots().unwrap().is_empty());
+        assert_eq!(projection.poll(), ThreadProjectionPoll::Empty);
+
+        let ids = SystemIdSource::default();
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let mut created = Vec::new();
+        for index in 0..70 {
+            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            engine
+                .create_thread_v2(
+                    thread_id,
+                    run_id,
+                    binding.clone(),
+                    &format!("thread-{index}"),
+                    u64::try_from(index + 1).unwrap(),
+                )
+                .unwrap();
+            created.push((thread_id, run_id));
+        }
+        let lease = engine
+            .acquire_lease("projection-test", 100, 10_000)
+            .unwrap();
+        for (index, (thread_id, run_id)) in created.into_iter().enumerate() {
+            engine
+                .commit_thread_run_update(
+                    ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: 0,
+                        expected_run_revision: 0,
+                        command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitThreadRunUpdate::Start {
+                            source_key: format!("projection:start:{index}"),
+                        },
+                    },
+                    &lease,
+                    u64::try_from(index + 200).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Lagged(count) if count > 0));
+        assert_eq!(projection.poll(), ThreadProjectionPoll::Event);
+        let refreshed = projection.snapshots().unwrap();
+        assert_eq!(refreshed.len(), 70);
     }
 
     #[test]

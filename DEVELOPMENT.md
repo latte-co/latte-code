@@ -26,9 +26,17 @@ make setup
 
 ```bash
 make build       # 编译整个 workspace
-make test        # 执行单元、集成和 doc tests
+make test-unit   # 执行 crate-local UT（含 bin 测试编译）
+make test-contract # 执行公开 contract/component targets
+make test-e2e    # 执行最终二进制 headless/PTY E2E
+make test-doc    # 执行 doc tests
+make test-all    # 执行 inventory 和以上全部测试层
+make test        # test-all 的兼容入口
 make check       # fmt + check + Clippy + Rustdoc
-make coverage    # 执行测试并检查行覆盖率 >= 90%
+make coverage-unit # UT-only 行覆盖率 >= 95%
+make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 80%
+make coverage-total # 全 targets 行覆盖率 >= 90%
+make coverage    # 串行执行以上三个独立覆盖率卡点
 make deny        # 检查安全公告、许可证和依赖来源
 make ci          # 完整复现本地 CI
 make release     # 构建 release 二进制
@@ -73,19 +81,40 @@ export OPENAI_API_KEY='...'
 
 ## 测试层次
 
-- crate 内单元测试：状态机、存储、权限、工具、进程监督和 TUI reducer。
-- workspace 集成测试：公开 Engine 生命周期、CLI、多轮 Provider、恢复和 PTY 终端行为。
+- crate 内单元测试：状态机、存储、权限、工具、进程监督和 TUI reducer，通过 `make test-unit` 运行。
+- contract/component：公开 Engine 生命周期、协议与 repo contract，通过 `make test-contract` 运行。
+- 最终二进制 E2E：CLI、多轮 loopback Provider、跨进程恢复和 PTY 终端行为，通过 `make test-e2e` 运行。
 - doc tests：验证公开 authority API 的 compile-fail 边界。
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
-- 覆盖率：对全部 workspace、features 和 targets 执行，行覆盖率不得低于 90%。
+- 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、80%、90%。
+
+任何新增或修改产品行为的功能都必须同时增加最低责任层 UT 和至少一个最终二进制 E2E。具体目录、Harness、同步方式、断言清单和反例见 [E2E 编写手册](docs/zh-CN/testing/e2e-authoring-guide.md)。
+
+UT 和 E2E 覆盖率使用互相独立的统计口径，不能合并或互相替代：
+
+```bash
+make coverage-unit
+make coverage-e2e
+```
+
+全仓 UT-only 行覆盖率必须 `>= 95%`，最终二进制 E2E 行覆盖率必须 `>= 80%`。新增或修改的功能代码还必须由对应责任层测试直接覆盖，不能仅依赖既有测试维持全仓数字。全 targets 的 `>= 90%` 卡点继续保留；`make coverage` 会串行执行三项卡点并在每项前清理 profile，避免跨层数据污染。
 
 ## 与 CI 的关系
 
-`make ci` 是本地最完整的提交前检查，对应 `.github/workflows/ci.yml` 中的格式、Clippy、测试、文档、覆盖率和依赖审计。GitHub Actions 还会额外执行：
+`make ci` 是本地最完整的提交前检查，对应 `.github/workflows/ci.yml` 中的格式、Clippy、测试、文档、三项独立覆盖率和依赖审计。所有变更必须从功能分支通过面向 `main` 的 PR 提交，禁止直接推送 `main`。
 
-- Ubuntu 与 macOS 原生检查。
-- Windows 编译检查。
-- Linux、macOS 和 Windows release artifact 构建。
+GitHub Actions 在 `main` push、面向 `main` 的 PR、merge queue 和手工触发时运行。PR 新提交会取消同一 PR 的旧运行，`main` 和 merge queue 的运行不会被新运行取消。底层 job 保持独立可见，包括：
+
+- Ubuntu 与 macOS 的 Static、UT、Contract 和最终二进制 E2E；
+- Documentation tests 和 Dependency audit；
+- `Coverage - UT (95%)`、`Coverage - E2E (80%)`、`Coverage - total (90%)` 三个独立状态；
+- Windows compile。
+
+稳定聚合状态 `PR Gate` 使用 fail-closed 语义检查上述每个 job 的结果；失败、取消或跳过任何一个依赖都不会产生假绿。仓库的 branch protection 或 ruleset 应只把 `PR Gate` 配置为 required check，底层 job 仍可用于定位失败。
+
+`.github/workflows/ci.yml` 只实现了检查和聚合逻辑；branch protection/ruleset 是 GitHub 远端设置。在远端实际要求 `PR Gate` 之前，不能宣称 required 卡点已经激活。
+
+release artifact 构建只在 `main` push 或手工触发时运行，不属于 PR/merge queue 的 `PR Gate`。当前 job 只证明产物构建成功，不等同于尚未实现的 G5 release smoke。
 
 Windows 上的进程监督和安全文件变更目前运行时 fail-closed；CI 只保证 Windows 编译通过。
 

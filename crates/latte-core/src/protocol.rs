@@ -191,3 +191,19 @@ pub struct Handoff {
 }
 
 use crate::RunState;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IdSource, SystemIdSource};
+
+    #[test]
+    fn command_envelope_pins_the_current_version_without_changing_payload() {
+        let ids = SystemIdSource::default();
+        let command_id = CommandId::from_uuid(ids.next_uuid_v7());
+        let envelope = CommandEnvelope::new(command_id, RuntimeCommand::List);
+        assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(envelope.command_id, command_id);
+        assert_eq!(envelope.command, RuntimeCommand::List);
+    }
+}

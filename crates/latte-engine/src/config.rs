@@ -197,4 +197,111 @@ mod tests {
             Err(ConfigError::Validation(_))
         ));
     }
+
+    #[test]
+    fn load_uses_root_relative_path_and_reports_read_and_parse_failures() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".latte")).unwrap();
+        fs::write(
+            root.path().join(".latte/latte-engine.jsonc"),
+            r#"{database:{path:"state.db"},runtime:{command_buffer:1,event_buffer:2}}"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(root.path()).unwrap();
+        assert_eq!(loaded.database.path, "state.db");
+        assert_eq!(loaded.runtime.command_buffer, 1);
+        assert_eq!(loaded.runtime.event_buffer, 2);
+
+        let missing = root.path().join("missing.jsonc");
+        assert!(matches!(
+            Config::load_path(&missing),
+            Err(ConfigError::Read { path, .. }) if path == missing.display().to_string()
+        ));
+        let malformed = root.path().join("malformed.jsonc");
+        fs::write(&malformed, "{").unwrap();
+        assert!(matches!(
+            Config::load_path(&malformed),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn environment_resolution_covers_every_secret_bearing_field_and_rejects_bad_placeholders() {
+        let mut config: Config = json5::from_str(
+            r#"{
+                database:{path:"${DB_PATH}"},
+                providers:{p:{base_url:"${BASE_URL}",api_key:"literal-key"}}
+            }"#,
+        )
+        .unwrap();
+        config
+            .resolve_environment_with(|name| match name {
+                "DB_PATH" => Some("resolved.db".into()),
+                "BASE_URL" => Some("http://provider.invalid".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.database.path, "resolved.db");
+        assert_eq!(config.providers["p"].base_url, "http://provider.invalid");
+        assert_eq!(config.providers["p"].api_key, "literal-key");
+
+        for placeholder in ["${}", "${OUTER${INNER}"] {
+            assert!(matches!(
+                resolve_placeholder(placeholder, "field", &|_| Some("value".into())),
+                Err(ConfigError::Validation(message))
+                    if message == "field has an invalid environment placeholder"
+            ));
+        }
+        assert_eq!(
+            resolve_placeholder("prefix-${NAME}", "field", &|_| None).unwrap(),
+            "prefix-${NAME}"
+        );
+    }
+
+    #[test]
+    fn validation_names_empty_database_provider_and_each_zero_buffer() {
+        let mut config = Config::default();
+        config.database.path = "  ".into();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation(message)) if message == "database.path must not be empty"
+        ));
+
+        for (command_buffer, event_buffer) in [(0, 1), (1, 0)] {
+            let config = Config {
+                runtime: RuntimeConfig {
+                    command_buffer,
+                    event_buffer,
+                },
+                ..Config::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::Validation(message))
+                    if message == "runtime buffer sizes must be greater than zero"
+            ));
+        }
+
+        for provider in [
+            ProviderConfig {
+                base_url: " ".into(),
+                api_key: "key".into(),
+            },
+            ProviderConfig {
+                base_url: "http://provider.invalid".into(),
+                api_key: " ".into(),
+            },
+        ] {
+            let config = Config {
+                providers: BTreeMap::from([("broken".into(), provider)]),
+                ..Config::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::Validation(message))
+                    if message == "provider broken requires base_url and api_key"
+            ));
+        }
+    }
 }

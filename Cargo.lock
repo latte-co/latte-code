@@ -1025,6 +1025,7 @@ dependencies = [
  "latte-headless",
  "latte-tui",
  "nix 0.30.1",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

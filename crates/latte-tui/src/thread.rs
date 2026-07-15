@@ -3396,6 +3396,431 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn feedback_projection_inputs_and_all_event_variants_preserve_authority() {
+        assert_eq!(
+            ThreadUiFeedback::submission(7, Ok("accepted".into())),
+            ThreadUiFeedback {
+                submission_id: Some(7),
+                result: Ok("accepted".into())
+            }
+        );
+        assert_eq!(
+            ThreadUiFeedback::command(Err("offline".into())),
+            ThreadUiFeedback {
+                submission_id: None,
+                result: Err("offline".into())
+            }
+        );
+
+        let ids = SystemIdSource::default();
+        let mut thread = snapshot(ThreadLifecycle::Running);
+        let thread_id = thread.thread_id;
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let mut model = ThreadUiModel::default();
+        reduce(&mut model, ThreadUiInput::Resize(99, 31));
+        assert_eq!(model.size, (99, 31));
+        reduce(&mut model, ThreadUiInput::Disconnected);
+        assert!(!model.authority_enabled());
+        reduce(
+            &mut model,
+            ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
+                run_id,
+                text: "discarded while disconnected".into(),
+            }),
+        );
+        assert!(model.progress.is_empty());
+        reduce(&mut model, ThreadUiInput::Connected);
+        assert!(model.authority_enabled());
+        reduce(&mut model, ThreadUiInput::CommandError("stale".into()));
+        assert_eq!(model.status, "Command rejected: stale");
+        reduce(&mut model, ThreadUiInput::CommandCompleted("done".into()));
+        assert_eq!(model.status, "done");
+        assert!(reduce(&mut model, ThreadUiInput::Tick).is_empty());
+
+        thread.pending = Some(ThreadPendingRequest::Permission {
+            run_id,
+            request_id: "permission".into(),
+            description: "write".into(),
+            expected_run_revision: 1,
+        });
+        model.command_palette = true;
+        model.help = true;
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        assert!(!model.command_palette);
+        assert!(!model.help);
+
+        let unknown = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
+            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+            revision: 2,
+            sequence: 2,
+            event: ThreadEvent::LifecycleChanged {
+                lifecycle: ThreadLifecycle::Ready,
+                run_id: None,
+            },
+        };
+        assert_eq!(
+            reduce(&mut model, ThreadUiInput::Event(unknown)),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+
+        model.sessions[0].pending = None;
+        let lifecycle = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
+            thread_id,
+            revision: 2,
+            sequence: 2,
+            event: ThreadEvent::LifecycleChanged {
+                lifecycle: ThreadLifecycle::Ready,
+                run_id: None,
+            },
+        };
+        assert!(reduce(&mut model, ThreadUiInput::Event(lifecycle)).is_empty());
+        assert_eq!(model.sessions[0].lifecycle, ThreadLifecycle::Ready);
+
+        let run = latte_core::ThreadRunSummary {
+            run_id,
+            parent_run_id: None,
+            ordinal: 1,
+            status: ThreadRunStatus::Running,
+            run_revision: 1,
+            completed_at_ms: None,
+        };
+        let linked = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
+            thread_id,
+            revision: 3,
+            sequence: 3,
+            event: ThreadEvent::RunLinked { run: run.clone() },
+        };
+        assert!(reduce(&mut model, ThreadUiInput::Event(linked)).is_empty());
+        assert_eq!(model.sessions[0].active_run_id, Some(run_id));
+        assert_eq!(model.sessions[0].runs, vec![run]);
+
+        let reconciliation = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
+            thread_id,
+            revision: 4,
+            sequence: 4,
+            event: ThreadEvent::ReconciliationRequired {
+                run_id,
+                effect_id: "effect-1".into(),
+            },
+        };
+        assert!(reduce(&mut model, ThreadUiInput::Event(reconciliation)).is_empty());
+        assert_eq!(
+            model.reconciliation_hint,
+            Some((thread_id, "effect-1".into()))
+        );
+    }
+
+    #[test]
+    fn progress_editor_and_submission_boundaries_are_bounded_and_correlated() {
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let mut model = ThreadUiModel::default();
+        for text in ["one", " two"] {
+            record_progress(
+                &mut model,
+                ThreadTransientProgress::AssistantDelta {
+                    run_id,
+                    text: text.into(),
+                },
+            );
+        }
+        for number in [1, 2] {
+            record_progress(
+                &mut model,
+                ThreadTransientProgress::ProviderAttempt { run_id, number },
+            );
+        }
+        for detail in ["starting", "complete"] {
+            record_progress(
+                &mut model,
+                ThreadTransientProgress::ToolProgress {
+                    run_id,
+                    name: "read_file".into(),
+                    detail: detail.into(),
+                },
+            );
+        }
+        assert_eq!(model.progress.len(), 3);
+        assert!(matches!(
+            &model.progress[0],
+            ThreadTransientProgress::AssistantDelta { text, .. } if text == "one two"
+        ));
+        assert!(matches!(
+            &model.progress[1],
+            ThreadTransientProgress::ProviderAttempt { number: 2, .. }
+        ));
+        assert!(matches!(
+            &model.progress[2],
+            ThreadTransientProgress::ToolProgress { detail, .. } if detail == "complete"
+        ));
+
+        let mut editor = String::new();
+        append_editor_text(&mut editor, "safe\u{1b}[31mred\u{7}\n\tend", 12);
+        assert!(!editor.contains('\u{1b}'));
+        assert!(!editor.contains('\u{7}'));
+        assert!(editor.len() <= 12);
+        let mut bounded = "ab".into();
+        append_bounded(&mut bounded, "éz", 4);
+        assert_eq!(bounded, "abé");
+
+        model.composer = "first".into();
+        assert!(matches!(
+            submit_composer(&mut model).as_slice(),
+            [ThreadUiAction::Start { .. }]
+        ));
+        let first_id = model.pending_submission.as_ref().unwrap().submission_id;
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionCompleted {
+                submission_id: first_id,
+            },
+        );
+        assert!(model.status.contains("synchronizing"));
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionError {
+                submission_id: first_id + 1,
+            },
+        );
+        assert!(model.pending_submission.is_some());
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionError {
+                submission_id: first_id,
+            },
+        );
+        assert_eq!(model.composer, "first");
+        assert!(model.pending_submission.is_none());
+    }
+
+    #[test]
+    fn projection_helpers_reject_private_or_malformed_payloads_and_keep_safe_metadata() {
+        let ids = SystemIdSource::default();
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let mut thread = snapshot(ThreadLifecycle::Running);
+        thread.active_run_id = Some(run_id);
+        thread.transcript.entries = vec![
+            transcript_entry(
+                &ids,
+                1,
+                Some(run_id),
+                TranscriptKind::ToolCall,
+                "run",
+                Some(serde_json::json!({
+                    "descriptor": {
+                        "effect_id": "effect-process",
+                        "tool_call_id": "call-process",
+                        "name": "process",
+                        "input": {
+                            "path": "src/lib.rs",
+                            "query": "needle",
+                            "cwd": ".",
+                            "argv": ["cargo", "test", 7]
+                        }
+                    }
+                })),
+            ),
+            transcript_entry(
+                &ids,
+                2,
+                Some(run_id),
+                TranscriptKind::System,
+                "started",
+                Some(serde_json::json!({"status":"started","effect_id":"effect-process"})),
+            ),
+            transcript_entry(
+                &ids,
+                3,
+                Some(run_id),
+                TranscriptKind::ToolResult,
+                "orphan failed",
+                Some(serde_json::json!({"tool_call_id":"other","name":"fallback","error":{}})),
+            ),
+            transcript_entry(
+                &ids,
+                4,
+                Some(run_id),
+                TranscriptKind::Completion,
+                "done",
+                Some(serde_json::json!({"handoff":"invalid"})),
+            ),
+            transcript_entry(
+                &ids,
+                5,
+                None,
+                TranscriptKind::System,
+                "standalone started",
+                Some(serde_json::json!({"status":"started","effect_id":"unmatched"})),
+            ),
+        ];
+        let groups = project_transcript(&thread);
+        assert_eq!(groups.len(), 2);
+        let actions = groups
+            .iter()
+            .flat_map(|group| &group.items)
+            .filter(|item| matches!(item, PresentationItem::Action { .. }))
+            .count();
+        assert_eq!(actions, 2);
+        let metadata = tool_metadata(&thread.transcript.entries[0]);
+        assert!(
+            metadata
+                .iter()
+                .any(|(label, value)| label == "Target" && value == "src/lib.rs")
+        );
+        assert!(
+            metadata
+                .iter()
+                .any(|(label, value)| label == "Query" && value == "needle")
+        );
+        assert!(
+            metadata
+                .iter()
+                .any(|(label, value)| label == "Directory" && value == ".")
+        );
+        assert!(
+            metadata
+                .iter()
+                .any(|(label, value)| label == "Command" && value == "cargo test")
+        );
+        assert!(completion_handoff(&thread.transcript.entries[3]).is_none());
+
+        let invalid = transcript_entry(
+            &ids,
+            6,
+            None,
+            TranscriptKind::Failure,
+            "invalid",
+            Some(serde_json::json!({"value":"bad\nidentifier"})),
+        );
+        assert!(payload_string(&invalid, &["missing"]).is_none());
+        assert!(payload_string(&invalid, &["value"]).is_none());
+        assert_eq!(run_heading(&thread, None), "Conversation");
+        assert_eq!(run_heading(&thread, Some(run_id)), "Run activity");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn adapter_helpers_cover_refresh_errors_feedback_and_safe_reconciliation_parsing() {
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::new(),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let mut model = ThreadUiModel::default();
+        let mut sink = |_| Ok(());
+        assert!(matches!(
+            apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::RefreshSnapshots]
+            ),
+            Err(TuiError::Action(error)) if error == "no scripted snapshot"
+        ));
+        assert!(
+            apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::Quit]
+            )
+            .unwrap()
+        );
+        let thread_id = snapshot(ThreadLifecycle::Ready).thread_id;
+        let mut failing_sink = |_| Err("rejected".into());
+        assert!(matches!(
+            apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut failing_sink,
+                vec![ThreadUiAction::Cancel { thread_id }]
+            ),
+            Err(TuiError::Action(error)) if error == "rejected"
+        ));
+
+        let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        model.pending_submission = Some(PendingSubmission {
+            submission_id: 7,
+            prompt: "restore this prompt".into(),
+            thread_id: None,
+            after_sequence: 0,
+        });
+        feedback_tx
+            .send(ThreadUiFeedback::submission(7, Ok("accepted".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::submission(7, Err("rejected".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::command(Ok("command done".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::command(Err("command failed".into())))
+            .unwrap();
+        progress_tx
+            .send(ThreadTransientProgress::ProviderAttempt {
+                run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                number: 1,
+            })
+            .unwrap();
+        assert!(drain_runtime_updates(
+            &mut model,
+            &feedback_rx,
+            &progress_rx
+        ));
+        assert_eq!(model.status, "Command rejected: command failed");
+        assert!(model.pending_submission.is_none());
+        assert_eq!(model.composer, "restore this prompt");
+        assert_eq!(model.progress.len(), 1);
+        assert!(!drain_runtime_updates(
+            &mut model,
+            &feedback_rx,
+            &progress_rx
+        ));
+
+        let mut safe = snapshot(ThreadLifecycle::ReconciliationRequired);
+        safe.transcript.entries.push(transcript_entry(
+            &SystemIdSource::default(),
+            2,
+            None,
+            TranscriptKind::Failure,
+            "unknown",
+            Some(serde_json::json!({"status":"unknown","effect_id":"safe-effect"})),
+        ));
+        assert_eq!(
+            reconciliation_effect_from_snapshot(&safe).as_deref(),
+            Some("safe-effect")
+        );
+        safe.transcript.entries.last_mut().unwrap().payload =
+            Some(serde_json::json!({"status":"unknown","effect_id":"bad\neffect"}));
+        assert!(reconciliation_effect_from_snapshot(&safe).is_none());
+        safe.lifecycle = ThreadLifecycle::Ready;
+        assert!(reconciliation_effect_from_snapshot(&safe).is_none());
+        assert_eq!(
+            permission_context("\n\r"),
+            "[operation summary unavailable]"
+        );
+        assert!(permission_context(&"x".repeat(500)).ends_with('…'));
+        assert_eq!(connection_label(ConnectionState::Connected), "Connected");
+        assert_eq!(
+            connection_label(ConnectionState::Disconnected),
+            "Disconnected"
+        );
+        assert_eq!(
+            connection_label(ConnectionState::SnapshotRequired),
+            "Snapshot required"
+        );
+    }
+
+    #[test]
     fn lagged_projection_refreshes_current_snapshot_without_command_sink_help() {
         let mut stale = snapshot(ThreadLifecycle::Running);
         stale.transcript.entries[0].text = "stale card".into();
@@ -5425,6 +5850,733 @@ mod tests {
             assert_eq!(buffer[(x, y)].symbol(), symbol);
             assert_eq!(buffer[(x, y)].fg, expected, "{symbol}");
         }
+    }
+
+    #[test]
+    fn snapshot_refresh_invalidates_stale_reconciliation_and_dispatches_one_queued_follow_up() {
+        let mut model = ThreadUiModel::default();
+        let mut ready = snapshot(ThreadLifecycle::Ready);
+        ready.revision = 9;
+        let thread_id = ready.thread_id;
+        model.sessions = vec![snapshot(ThreadLifecycle::ReconciliationRequired)];
+        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "stale".into()));
+        model.queued_follow_up = Some("continue from durable state".into());
+        model.pending_submission = Some(PendingSubmission {
+            submission_id: 41,
+            prompt: "continue from durable state".into(),
+            thread_id: Some(thread_id),
+            after_sequence: u64::MAX,
+        });
+
+        let actions = reduce(&mut model, ThreadUiInput::Snapshot(vec![ready]));
+        assert_eq!(
+            actions,
+            vec![ThreadUiAction::FollowUp {
+                submission_id: 41,
+                thread_id,
+                expected_thread_revision: 9,
+                prompt: "continue from durable state".into(),
+            }]
+        );
+        assert!(model.reconciliation_confirmation.is_none());
+        assert!(model.queued_follow_up.is_none());
+        assert_eq!(model.selected_thread().unwrap().thread_id, thread_id);
+
+        let mut reconciling = snapshot(ThreadLifecycle::ReconciliationRequired);
+        reconciling.transcript.entries.push(transcript_entry(
+            &SystemIdSource::default(),
+            2,
+            None,
+            TranscriptKind::Failure,
+            "unknown",
+            Some(serde_json::json!({"status":"unknown","effect_id":"effect-current"})),
+        ));
+        let reconciling_id = reconciling.thread_id;
+        model.reconciliation_confirmation = Some((reconciling_id, "effect-current".into()));
+        assert!(reduce(&mut model, ThreadUiInput::Snapshot(vec![reconciling])).is_empty());
+        assert_eq!(
+            model.reconciliation_confirmation,
+            Some((reconciling_id, "effect-current".into()))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reducer_key_matrix_keeps_every_mode_scoped_and_non_authoritative_keys_inert() {
+        let now = Instant::now();
+        let mut model = ThreadUiModel {
+            sessions: vec![snapshot(ThreadLifecycle::Running)],
+            connection: ConnectionState::Disconnected,
+            ..ThreadUiModel::default()
+        };
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                now,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                now + Duration::from_secs(1),
+            ),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+        assert_eq!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+                now + Duration::from_secs(2),
+            ),
+            vec![ThreadUiAction::Quit]
+        );
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ),
+                now,
+            )
+            .is_empty()
+        );
+
+        model.connection = ConnectionState::Connected;
+        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "effect".into()));
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                now,
+            )
+            .is_empty()
+        );
+        assert!(model.reconciliation_confirmation.is_none());
+        assert!(model.status.contains("cancelled"));
+        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "effect".into()));
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                now,
+            )
+            .is_empty()
+        );
+        assert!(model.reconciliation_confirmation.is_none());
+
+        let mut waiting = snapshot(ThreadLifecycle::WaitingInput);
+        waiting.pending = Some(ThreadPendingRequest::Input {
+            run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            request_id: "input-matrix".into(),
+            prompt: "value?".into(),
+            expected_run_revision: 2,
+        });
+        model.sessions = vec![waiting];
+        model.input.clear();
+        assert!(reduce(&mut model, ThreadUiInput::Paste("pasted\nvalue".into())).is_empty());
+        assert_eq!(model.input, "pasted\nvalue");
+        model.input = "é".into();
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                now,
+            )
+            .is_empty()
+        );
+        assert!(model.input.is_empty());
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                now,
+            )
+            .is_empty()
+        );
+        assert_eq!(model.input, "\n");
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('值'), KeyModifiers::NONE),
+                now,
+            )
+            .is_empty()
+        );
+        assert_eq!(model.input, "\n值");
+        assert!(
+            reduce_key_at(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+                now,
+            )
+            .is_empty()
+        );
+
+        model.sessions.clear();
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        ] {
+            model.command_palette = true;
+            let _ = reduce_palette_key(&mut model, key);
+        }
+        model.command_palette = true;
+        model.command_index = PaletteCommand::ALL.len() - 1;
+        assert_eq!(
+            reduce_palette_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            vec![ThreadUiAction::Quit]
+        );
+
+        model.pending_submission = Some(PendingSubmission {
+            submission_id: 1,
+            prompt: "locked".into(),
+            thread_id: None,
+            after_sequence: 0,
+        });
+        model.composer = "locked".into();
+        assert!(
+            reduce_composer_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert_eq!(model.composer, "locked");
+        model.pending_submission = None;
+        let _ = reduce_composer_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(model.composer, "locke");
+        let _ = reduce_composer_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(model.focus, ThreadFocus::Navigation);
+
+        model.sessions = vec![snapshot(ThreadLifecycle::Ready)];
+        model.focus = ThreadFocus::Navigation;
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('?'),
+            KeyCode::Char('x'),
+        ] {
+            let _ = reduce_navigation_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        let mut actionable = working_model();
+        actionable.focus = ThreadFocus::Navigation;
+        actionable.expanded_actions.clear();
+        let action_key = action_keys(actionable.selected_thread())[0].clone();
+        let _ = reduce_navigation_key(
+            &mut actionable,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(actionable.expanded_actions.contains(&action_key));
+        let _ = reduce_navigation_key(
+            &mut actionable,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!actionable.expanded_actions.contains(&action_key));
+        let _ = reduce_navigation_key(
+            &mut actionable,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert!(actionable.expanded_actions.contains(&action_key));
+        let _ = reduce_navigation_key(
+            &mut actionable,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert!(!actionable.expanded_actions.contains(&action_key));
+        assert_eq!(
+            reduce_navigation_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
+            vec![ThreadUiAction::Quit]
+        );
+        let _ = reduce_navigation_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert_eq!(model.focus, ThreadFocus::Composer);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn layout_state_and_text_helpers_are_total_at_zero_narrow_and_unicode_boundaries() {
+        assert_eq!(ThreadPermissionMode::Ask.label(), "Ask");
+        assert_eq!(ThreadPermissionMode::Ask.card_label(), "Ask mode");
+        let startup = test_startup();
+        let model = ThreadUiModel::with_startup(startup.clone());
+        assert_eq!(model.startup.as_ref(), Some(&startup));
+        assert!(model.selected_thread().is_none());
+        assert!(model.authority_enabled());
+
+        assert_eq!(app_rect(Rect::new(10, 2, 200, 5)), Rect::new(30, 2, 160, 5));
+        assert_eq!(bounded_inset(0, 9), 0);
+        assert_eq!(bounded_inset(5, 9), 2);
+        for (width, tier) in [
+            (110, ViewportTier::Wide),
+            (78, ViewportTier::Medium),
+            (20, ViewportTier::Narrow),
+        ] {
+            assert_eq!(ViewportTier::for_width(width), tier);
+            assert!(tier.compact_inset() > 0);
+            assert!(tier.transcript_inset() > 0);
+            assert!(tier.idle_inset() > 0);
+            assert!(tier.idle_composer_inset() > 0);
+        }
+        for (area, tier, expected) in [
+            (
+                Rect::new(0, 0, 120, 52),
+                ViewportTier::Wide,
+                IdleComposition::Expanded,
+            ),
+            (
+                Rect::new(0, 0, 120, 20),
+                ViewportTier::Wide,
+                IdleComposition::Wide,
+            ),
+            (
+                Rect::new(0, 0, 80, 20),
+                ViewportTier::Medium,
+                IdleComposition::Stacked,
+            ),
+            (
+                Rect::new(0, 0, 20, 20),
+                ViewportTier::Narrow,
+                IdleComposition::Compact,
+            ),
+        ] {
+            assert_eq!(IdleComposition::for_area(area, tier), expected);
+            assert!(expected.header_height() > 0);
+        }
+        for state in [
+            VisualState::Idle,
+            VisualState::Active,
+            VisualState::Permission,
+            VisualState::Reconciliation,
+            VisualState::Complete,
+        ] {
+            for area in [
+                Rect::new(0, 0, 0, 0),
+                Rect::new(0, 0, 20, 2),
+                Rect::new(0, 0, 40, 8),
+                Rect::new(0, 0, 120, 40),
+            ] {
+                let layout = viewport_layout(area, state, &model);
+                assert_eq!(layout.app, area);
+                assert_eq!(
+                    layout.header.height + layout.transcript.height + layout.composer.height,
+                    area.height
+                );
+            }
+        }
+
+        assert_eq!(wrap_text("", 0), vec![String::new()]);
+        assert_eq!(wrap_text("a\tb", 4), vec!["a   ", "b"]);
+        assert_eq!(clip_to_width("ignored", 0), "");
+        assert_eq!(clip_to_width("a\tb", 4), "a   ");
+        assert_eq!(clip_to_width("first\nsecond", 20), "first");
+        assert_eq!(display_width("wide界"), 6);
+        assert_eq!(display_width("reset\n界"), 2);
+        assert_eq!(grapheme_width_at("\t", 1), 3);
+        assert_eq!(wrapped_line_count("", 0), 1);
+        assert_eq!(composer_text_layout("1234", 4).caret_row, 1);
+
+        for (status, label) in [
+            (ThreadRunStatus::Queued, "Queued"),
+            (ThreadRunStatus::Running, "Running"),
+            (ThreadRunStatus::Cancelling, "Cancelling"),
+            (ThreadRunStatus::WaitingPermission, "Waiting permission"),
+            (ThreadRunStatus::WaitingInput, "Waiting input"),
+            (ThreadRunStatus::Interrupted, "Interrupted"),
+            (ThreadRunStatus::Failed, "Failed"),
+            (ThreadRunStatus::Completed, "Completed"),
+        ] {
+            assert_eq!(run_status_label(status), label);
+            let _ = run_status_color(status);
+        }
+        for lifecycle in [
+            ThreadLifecycle::Ready,
+            ThreadLifecycle::Running,
+            ThreadLifecycle::WaitingPermission,
+            ThreadLifecycle::WaitingInput,
+            ThreadLifecycle::Interrupted,
+            ThreadLifecycle::Failed,
+            ThreadLifecycle::ReconciliationRequired,
+        ] {
+            assert!(!lifecycle_label(lifecycle).is_empty());
+            let _ = lifecycle_color(lifecycle);
+        }
+        for state in [
+            ActivityState::Recorded,
+            ActivityState::Running,
+            ActivityState::Waiting,
+            ActivityState::Succeeded,
+            ActivityState::Failed,
+        ] {
+            assert!(!activity_style(state).0.is_empty());
+        }
+        for connection in [
+            ConnectionState::Connected,
+            ConnectionState::Disconnected,
+            ConnectionState::SnapshotRequired,
+        ] {
+            assert!(!connection_label(connection).is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn permission_progress_visual_state_and_tiny_rendering_matrix_remains_secret_safe() {
+        let ids = SystemIdSource::default();
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        for (name, input, operation, target) in [
+            (
+                "write_file",
+                serde_json::json!({"path":"a.txt"}),
+                "Write file",
+                "a.txt",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path":"b.txt"}),
+                "Edit file",
+                "b.txt",
+            ),
+            (
+                "process",
+                serde_json::json!({"cwd":"crates"}),
+                "Run process",
+                "crates",
+            ),
+            (
+                "read_file",
+                serde_json::json!({"path":"c.txt"}),
+                "Read file",
+                "c.txt",
+            ),
+            (
+                "list_directory",
+                serde_json::json!({"path":"src"}),
+                "List directory",
+                "src",
+            ),
+            (
+                "search",
+                serde_json::json!({"query":"needle"}),
+                "Search workspace",
+                "needle",
+            ),
+            (
+                "custom_tool",
+                serde_json::json!({}),
+                "custom tool",
+                "Not exposed by runtime",
+            ),
+        ] {
+            let request_id = format!("request-{name}");
+            let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
+            thread.transcript.entries.push(transcript_entry(
+                &ids,
+                2,
+                Some(run_id),
+                TranscriptKind::ToolCall,
+                "operation",
+                Some(serde_json::json!({"descriptor":{
+                    "effect_id":request_id,"name":name,"input":input
+                }})),
+            ));
+            let presentation = permission_presentation(
+                &thread,
+                &format!("request-{name}"),
+                "scope\napi_key=live-secret-value",
+            );
+            assert_eq!(presentation.operation, operation);
+            assert_eq!(presentation.target, target);
+            assert!(!presentation.scope.contains("live-secret-value"));
+            assert!(!presentation.scope.chars().any(char::is_control));
+        }
+
+        for progress in [
+            ThreadTransientProgress::ProviderAttempt { run_id, number: 3 },
+            ThreadTransientProgress::AssistantDelta {
+                run_id,
+                text: "answer".into(),
+            },
+            ThreadTransientProgress::ToolProgress {
+                run_id,
+                name: "read_file".into(),
+                detail: "reading".into(),
+            },
+        ] {
+            assert_eq!(progress_run_id(&progress), run_id);
+            assert!(progress_text(&progress).starts_with('…'));
+        }
+
+        let mut idle = ThreadUiModel::default();
+        assert_eq!(visual_state(&idle), VisualState::Idle);
+        idle.pending_submission = Some(PendingSubmission {
+            submission_id: 1,
+            prompt: "pending".into(),
+            thread_id: None,
+            after_sequence: 0,
+        });
+        assert_eq!(visual_state(&idle), VisualState::Active);
+        for (lifecycle, expected) in [
+            (ThreadLifecycle::Running, VisualState::Active),
+            (ThreadLifecycle::WaitingPermission, VisualState::Permission),
+            (
+                ThreadLifecycle::ReconciliationRequired,
+                VisualState::Reconciliation,
+            ),
+        ] {
+            let model = ThreadUiModel {
+                sessions: vec![snapshot(lifecycle)],
+                ..ThreadUiModel::default()
+            };
+            assert_eq!(visual_state(&model), expected);
+        }
+        let mut complete = snapshot(ThreadLifecycle::Ready);
+        complete.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(run_id),
+            TranscriptKind::Completion,
+            "done",
+            None,
+        ));
+        let complete_model = ThreadUiModel {
+            sessions: vec![complete],
+            help: true,
+            command_palette: true,
+            ..ThreadUiModel::default()
+        };
+        assert_eq!(visual_state(&complete_model), VisualState::Complete);
+        for (width, height) in [(1, 1), (2, 2), (8, 3), (40, 8)] {
+            let buffer = rendered_buffer(&complete_model, width, height);
+            assert_eq!(buffer.area.width, width);
+            assert_eq!(buffer.area.height, height);
+        }
+        let none =
+            permission_presentation(&snapshot(ThreadLifecycle::WaitingPermission), "none", "");
+        assert_eq!(none.operation, "Repository operation");
+        assert_eq!(none.target, "Not exposed by runtime");
+        assert_eq!(none.scope, "[operation summary unavailable]");
+    }
+
+    #[test]
+    fn standalone_transcript_rendering_distinguishes_roles_evidence_and_connection_state() {
+        let lines_text = |lines: &[Line<'static>]| {
+            lines.iter().fold(String::new(), |mut text, line| {
+                for span in &line.spans {
+                    text.push_str(span.content.as_ref());
+                }
+                text.push('\n');
+                text
+            })
+        };
+
+        let mut lines = Vec::new();
+        render_message_lines(
+            &mut lines,
+            TranscriptKind::Completion,
+            "completed response wraps",
+            12,
+        );
+        let completion = lines_text(&lines);
+        assert!(completion.contains(" • completed"));
+        assert!(completion.contains("   response"));
+
+        lines.clear();
+        for (kind, expected) in [
+            (TranscriptKind::Permission, " ! Permission · "),
+            (TranscriptKind::Input, " ? Input · "),
+            (TranscriptKind::System, " · "),
+            (TranscriptKind::ToolCall, " · "),
+            (TranscriptKind::ToolResult, " · "),
+        ] {
+            render_message_lines(&mut lines, kind, "detail", 40);
+            assert!(lines_text(&lines).contains(expected));
+            lines.clear();
+        }
+
+        let empty_handoff = latte_core::Handoff {
+            summary: "done".into(),
+            files_changed: vec![],
+            evidence: vec![],
+        };
+        render_completion_lines(&mut lines, "done", Some(&empty_handoff), 40);
+        assert!(!lines_text(&lines).contains("VERIFIED"));
+        lines.clear();
+        let nonpassing_handoff = latte_core::Handoff {
+            summary: "not yet verified".into(),
+            files_changed: vec![],
+            evidence: vec![
+                latte_core::Evidence {
+                    name: "cargo test".into(),
+                    status: latte_core::VerificationStatus::Failed,
+                    summary: String::new(),
+                },
+                latte_core::Evidence {
+                    name: "cargo clippy".into(),
+                    status: latte_core::VerificationStatus::NotRun,
+                    summary: "blocked".into(),
+                },
+            ],
+        };
+        render_completion_lines(
+            &mut lines,
+            "not yet verified",
+            Some(&nonpassing_handoff),
+            40,
+        );
+        let evidence = lines_text(&lines);
+        assert!(evidence.contains("× cargo test"));
+        assert!(evidence.contains("· cargo clippy · blocked"));
+
+        lines.clear();
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        render_progress(
+            &mut lines,
+            &ThreadTransientProgress::ProviderAttempt { run_id, number: 2 },
+        );
+        assert!(lines_text(&lines).contains("provider attempt 2"));
+        assert_eq!(surface_line("x", 4, TERMINAL, None).spans[0].content, " ");
+        assert_eq!(wrap_text("abcdef", 3), ["abc", "def"]);
+
+        let mut disconnected = idle_model();
+        disconnected.connection = ConnectionState::Disconnected;
+        assert!(
+            rendered(&disconnected, 120, 40)
+                .contains("actions disabled until the transcript can be refreshed")
+        );
+        let mut active = working_model();
+        active.connection = ConnectionState::Disconnected;
+        assert_eq!(
+            composer_meta(&active, visual_state(&active)).1,
+            "Ctrl+R refresh"
+        );
+        let mut reconciliation = reconciliation_model();
+        reconciliation.reconciliation_confirmation = Some((
+            reconciliation.sessions[0].thread_id,
+            "effect-authoritative-matrix".into(),
+        ));
+        assert!(
+            composer_meta(&reconciliation, VisualState::Reconciliation)
+                .1
+                .starts_with("Ctrl+A confirm failed")
+        );
+    }
+
+    #[test]
+    fn projection_boundaries_reject_malformed_reconciliation_and_keep_editors_scoped() {
+        let ids = SystemIdSource::default();
+        let malformed_effect = |payload| {
+            let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
+            thread.transcript.entries.push(transcript_entry(
+                &ids,
+                1,
+                None,
+                TranscriptKind::Failure,
+                "unknown outcome",
+                payload,
+            ));
+            reconciliation_effect_from_snapshot(&thread)
+        };
+        assert!(malformed_effect(None).is_none());
+        assert!(
+            malformed_effect(Some(serde_json::json!({
+                "status": "failed",
+                "effect_id": "effect-1"
+            })))
+            .is_none()
+        );
+        assert!(malformed_effect(Some(serde_json::json!({"status": "unknown"}))).is_none());
+
+        let mut permission = snapshot(ThreadLifecycle::WaitingPermission);
+        permission.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            None,
+            TranscriptKind::ToolCall,
+            "opaque operation",
+            None,
+        ));
+        let presentation = permission_presentation(&permission, "missing", "safe scope");
+        assert_eq!(presentation.operation, "Repository operation");
+        assert_eq!(presentation.target, "Not exposed by runtime");
+
+        let mut reconciliation = reconciliation_model();
+        reconciliation.reconciliation_confirmation = Some((
+            reconciliation.sessions[0].thread_id,
+            "effect-authoritative-matrix".into(),
+        ));
+        assert!(rendered(&reconciliation, 120, 40).contains("Ctrl+A confirm failed"));
+
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let mut waiting = snapshot(ThreadLifecycle::WaitingInput);
+        waiting.pending = Some(ThreadPendingRequest::Input {
+            run_id,
+            request_id: "input-prompt".into(),
+            prompt: "enter the durable value".into(),
+            expected_run_revision: 2,
+        });
+        let input_model = ThreadUiModel {
+            startup: Some(test_startup()),
+            sessions: vec![waiting],
+            ..Default::default()
+        };
+        assert!(rendered(&input_model, 120, 40).contains("enter the durable value"));
+
+        let active = ThreadUiModel {
+            startup: Some(test_startup()),
+            sessions: vec![snapshot(ThreadLifecycle::Running)],
+            composer: "scoped follow-up draft".into(),
+            ..Default::default()
+        };
+        assert!(rendered(&active, 120, 40).contains("scoped follow-up draft"));
+        assert_eq!(wrap_text("ab界", 3), ["ab", "界"]);
+
+        let mut submitting = ThreadUiModel {
+            pending_submission: Some(PendingSubmission {
+                submission_id: 9,
+                prompt: "pending".into(),
+                thread_id: None,
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            reduce(
+                &mut submitting,
+                ThreadUiInput::SubmissionCompleted { submission_id: 9 }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            submitting.status,
+            "Submission accepted; synchronizing transcript"
+        );
     }
 
     fn permission_model() -> ThreadUiModel {

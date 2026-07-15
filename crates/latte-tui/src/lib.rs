@@ -548,4 +548,65 @@ mod tests {
         assert!(!guard.take_interrupted());
         assert!(!guard.interrupted());
     }
+
+    #[test]
+    fn explicit_restoration_and_interrupt_checks_share_one_idempotent_guard_contract() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+        });
+        let restored = Arc::new(Mutex::new(false));
+        let stages = Arc::new(Mutex::new(TerminalStages {
+            raw: true,
+            keyboard: true,
+            alternate: true,
+            paste: true,
+        }));
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let terminal_lock = TERMINAL_LOCK.lock().unwrap();
+        let mut guard = TerminalGuard {
+            restored: Arc::clone(&restored),
+            stages,
+            ops,
+            previous_hook: Arc::new(Mutex::new(None)),
+            _terminal_lock: terminal_lock,
+            interrupted,
+            signal_id: None,
+        };
+
+        assert!(matches!(
+            guard.check_interrupted(),
+            Err(TuiError::Interrupted)
+        ));
+        assert!(guard.interrupted());
+        assert!(guard.take_interrupted());
+        assert!(!guard.interrupted());
+        assert!(guard.check_interrupted().is_ok());
+
+        let mut cleanup = Vec::new();
+        guard.restore_with_hook(|stage| cleanup.push(stage));
+        assert_eq!(
+            cleanup,
+            vec![
+                TerminalCleanupStage::Paste,
+                TerminalCleanupStage::Alternate,
+                TerminalCleanupStage::Keyboard,
+                TerminalCleanupStage::Raw,
+            ]
+        );
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                MockOperation::DisablePaste,
+                MockOperation::LeaveAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
+        guard.restore_with_hook(|_| panic!("cleanup must be idempotent"));
+        drop(guard);
+        assert!(*restored.lock().unwrap());
+        assert_eq!(operations.lock().unwrap().len(), 4);
+    }
 }
