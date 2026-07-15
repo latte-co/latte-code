@@ -3215,14 +3215,14 @@ mod tests {
         let service = delayed_service(
             root.path(),
             engine.clone(),
-            [(Duration::from_millis(220), response(Some("done"), vec![]))],
+            [(Duration::from_millis(900), response(Some("done"), vec![]))],
         )
-        .with_lease_ttl_ms(60);
+        .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
         let run =
             tokio::spawn(async move { runner.start(thread_id, "wait".into(), binding()).await });
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
             engine.acquire_lease("competing-owner", now_ms(), 60),
             Err(StorageError::EngineUnavailable)
@@ -3246,11 +3246,11 @@ mod tests {
             root.path(),
             engine.clone(),
             [(
-                Duration::from_secs(1),
+                Duration::from_secs(2),
                 response(Some("must not commit"), vec![]),
             )],
         )
-        .with_lease_ttl_ms(60);
+        .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
         let run = tokio::spawn(async move {
@@ -3279,7 +3279,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("lease heartbeat lost during provider call")
+                .contains("lease heartbeat lost during provider call"),
+            "unexpected provider lease-loss error: {error}"
         );
         let terminal = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
         assert_eq!(terminal.lifecycle, ThreadLifecycle::Interrupted);
@@ -3532,7 +3533,7 @@ mod tests {
             .create_thread_v2(thread_id, run_id, binding(), "recover", 1)
             .unwrap();
         let lease = engine
-            .acquire_lease("thread-recovery", now_ms(), 100)
+            .acquire_lease("thread-recovery", now_ms(), 10_000)
             .unwrap();
         let running = engine
             .commit_thread_run_update(
@@ -3591,9 +3592,11 @@ mod tests {
                 )
                 .unwrap()
         );
+        // Model a crashed owner deterministically. Recovery depends on the
+        // absence of live authority, not scheduler timing around a tiny TTL.
+        force_lease_renewal_failure(&db);
         drop(started);
         drop(engine);
-        tokio::time::sleep(Duration::from_millis(125)).await;
         let reopened = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&db)

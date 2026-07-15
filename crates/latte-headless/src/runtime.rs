@@ -2393,6 +2393,7 @@ mod tests {
     }
     #[cfg(unix)]
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::sync::Mutex;
     #[cfg(unix)]
     #[derive(Default)]
