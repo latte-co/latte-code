@@ -1111,13 +1111,19 @@ mod tests {
                 .success()
         );
         fs::write(dir.path().join("a.txt"), "a substantially changed file\n").unwrap();
-        let output = registry
-            .invoke(&call("git_diff", &json!({"max_output":8}), None))
-            .unwrap();
-        assert!(output.truncated);
-        assert!(output.value["summary"].as_str().is_some());
+        let result = registry.invoke(&call("git_diff", &json!({"max_output":8}), None));
         #[cfg(unix)]
-        assert!(!dir.path().join("textconv-ran").exists());
+        {
+            let output = result.unwrap();
+            assert!(output.truncated);
+            assert!(output.value["summary"].as_str().is_some());
+            assert!(!dir.path().join("textconv-ran").exists());
+        }
+        #[cfg(not(unix))]
+        assert!(matches!(
+            result,
+            Err(ToolError::Git(message)) if message.contains("unsupported on this platform")
+        ));
     }
 
     #[cfg(unix)]

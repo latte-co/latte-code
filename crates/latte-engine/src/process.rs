@@ -6,19 +6,21 @@ use latte_core::RunId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     collections::BTreeMap,
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
 use thiserror::Error;
+use tokio::sync::Notify;
+#[cfg(unix)]
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    sync::Notify,
     time::{Duration, sleep, timeout},
 };
 
@@ -30,11 +32,14 @@ pub enum ProcessDecision {
     Deny,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
 pub(crate) enum GroupProbe {
     Absent,
     Present,
     Uncertain,
 }
+#[cfg(not(unix))]
+pub(crate) type GroupProbe = ();
 
 #[derive(Clone, Debug)]
 pub struct ProcessInvocation<'a> {
@@ -765,6 +770,7 @@ fn supervise_git(
     .map_err(|_| ProcessError::Supervision("git supervisor thread panicked".into()))?
 }
 
+#[cfg(unix)]
 async fn drain(
     mut reader: impl AsyncRead + Unpin,
     cap: usize,
@@ -970,13 +976,63 @@ async fn await_group_absent(
     }
 }
 #[cfg(not(unix))]
-async fn supervise(
+fn supervise(
     _i: &ProcessInvocation<'_>,
     _cwd: &std::path::Path,
     _cancel: &CancellationToken,
     _probe_override: Option<GroupProbe>,
-) -> Result<ProcessOutput, ProcessError> {
-    Err(ProcessError::Unsupported)
+) -> std::future::Ready<Result<ProcessOutput, ProcessError>> {
+    std::future::ready(Err(ProcessError::Unsupported))
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use super::*;
+    use crate::EngineBuilder;
+    use latte_core::{IdSource, SystemIdSource};
+
+    #[tokio::test]
+    async fn process_capability_is_absent_and_execution_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        assert!(
+            engine
+                .tool_descriptors()
+                .iter()
+                .all(|tool| tool.name != "process")
+        );
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let argv = vec!["echo".into(), "x".into()];
+        let env = BTreeMap::new();
+        let request = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 1_000,
+            grace_ms: 10,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+            run_revision: 0,
+            effect_id: "unsupported-process",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine
+                .execute_process(run, &lease, 3, &request, &CancellationToken::new())
+                .await,
+            Err(ProcessError::Unsupported)
+        ));
+        assert!(engine.effect_status("unsupported-process").is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

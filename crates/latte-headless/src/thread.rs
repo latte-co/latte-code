@@ -3330,7 +3330,10 @@ mod tests {
                 ),
             ],
         )
-        .with_lease_ttl_ms(60);
+        // The assertion below crosses the initial lease boundary. Keep the
+        // boundary comfortably above instrumented CI startup time, then wait
+        // past it so the heartbeat—not scheduler speed—proves renewal.
+        .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let waiting = service
             .start(thread_id, "sleep".into(), binding())
@@ -3364,7 +3367,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
         assert!(matches!(
             engine.acquire_lease("competing-owner", now_ms(), 60),
             Err(StorageError::EngineUnavailable)
@@ -3422,7 +3425,10 @@ mod tests {
                 ),
             ],
         )
-        .with_lease_ttl_ms(60);
+        // Fault injection removes the durable lease after the process starts;
+        // a sub-100 ms TTL only makes pre-permission setup scheduler-sensitive
+        // under coverage instrumentation and is not part of this test's claim.
+        .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let waiting = service
             .start(thread_id, "sleep until fenced".into(), binding())

@@ -108,11 +108,21 @@ async fn public_storage_effect_event_and_subscription_lifecycle() {
     let engine = EngineBuilder::new()
         .workspace_root(dir.path())
         .database_path(dir.path().join("state.db"))
-        .enabled_tools(["read_file", "list_files"])
+        .enabled_tools(["read_file", "list_directory"])
         .deny_globs(["secret/**"])
         .build()
         .unwrap();
-    assert_eq!(engine.tool_descriptors().len(), 2);
+    let tool_names = engine
+        .tool_descriptors()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"read_file".to_owned()));
+    assert!(tool_names.contains(&"list_directory".to_owned()));
+    #[cfg(unix)]
+    assert!(tool_names.contains(&"process".to_owned()));
+    #[cfg(not(unix))]
+    assert!(!tool_names.contains(&"process".to_owned()));
     assert!(engine.changed_files().is_err());
     assert!(
         !engine

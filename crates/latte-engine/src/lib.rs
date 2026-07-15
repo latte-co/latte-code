@@ -1920,6 +1920,7 @@ mod tool_effect_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn waiting_permission_cancel_revokes_prepared_effect() {
         let dir = tempfile::tempdir().unwrap();
@@ -1990,6 +1991,7 @@ mod tool_effect_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn completion_requires_current_engine_executed_passing_verification() {
@@ -2760,13 +2762,14 @@ mod tool_effect_tests {
                 .contains("denied")
         );
         let dangerous_process = descriptor("process", json!({"shell":"rm -rf /","cwd":"."}));
-        assert!(
-            engine
-                .thread_effect_policy_and_digest(&dangerous_process, 2, &lease)
-                .unwrap_err()
-                .to_string()
-                .contains("process policy denied")
-        );
+        let dangerous_error = engine
+            .thread_effect_policy_and_digest(&dangerous_process, 2, &lease)
+            .unwrap_err()
+            .to_string();
+        #[cfg(unix)]
+        assert!(dangerous_error.contains("process policy denied"));
+        #[cfg(not(unix))]
+        assert!(dangerous_error.contains("unsupported on this platform"));
         let mut unsupported = engine.clone();
         unsupported.process_supervision_supported = false;
         assert!(

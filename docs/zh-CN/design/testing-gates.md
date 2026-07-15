@@ -47,9 +47,9 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 | crate-local 测试 | 245 | 独立 `--lib --bins` profile；其中既有 inline tests 仍有待继续纯化的 component 行为 |
 | Contract / component | 15 | 5 个 contract targets，由 inventory 防漏 |
 | 最终二进制 E2E | 78 | 三平台运行 3 个 portable CLI/Provider/SQLite 场景，Linux/macOS 运行 75 个 Unix headless、Provider、tool/recovery、公开边界和真实 PTY 场景 |
-| UT-only 行覆盖率 | 95.05% | 当前 macOS 工作区 `make coverage-unit` 实测 `26830 / 28226` |
-| 最终二进制 E2E 行覆盖率 | 80.78% | 当前 macOS 工作区两个 E2E target 合计实测 `10687 / 13230` |
-| 总行覆盖率 | 96.65% | 当前 macOS 工作区 `make coverage-total` 实测 `27280 / 28226` |
+| UT-only 行覆盖率 | 95.06% | 当前 macOS 工作区 `make coverage-unit` 实测 `26829 / 28224` |
+| 最终二进制 E2E 行覆盖率 | 80.79% | 当前 macOS 工作区两个 E2E target 合计实测 `10688 / 13230` |
+| 总行覆盖率 | 96.65% | 当前 macOS 工作区 `make coverage-total` 实测 `27278 / 28224` |
 
 ### 2.2 当前剩余问题
 
@@ -465,9 +465,9 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 
 本设计不是从空白假设测试能力：
 
-- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，当前 UT-only profile 为 95.05%；
+- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，当前 UT-only profile 为 95.06%；
 - 当前独立 Contract 与 E2E targets 共 93 个 integration tests：15 个 Contract、3 个 portable 最终二进制 E2E 和 75 个 Unix 最终二进制 E2E；
-- 当前 macOS 三项 profile 独立通过：UT-only 95.05%、E2E 80.78%、全 targets 96.65%；
+- 当前 macOS 三项 profile 独立通过：UT-only 95.06%、E2E 80.79%、全 targets 96.65%；
 - 最终二进制、loopback Provider、真实 PTY、跨进程 SQLite resume 和 terminal mode restore 都已有可复用实现；
 - Provider endpoint 已可指向 loopback harness，因此 cassette replay 可以复用同一最终二进制路径，不要求生产后门；
 - runtime 已有 process `Started`、Unknown、restart recovery 和 reconciliation 的 component tests，外部 barrier E2E 是把既有语义提升到最终二进制边界，不要求新增生产后门；
