@@ -120,14 +120,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        8
+        9
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        8
+        9
     );
     assert_eq!(
         sqlite_integer(
@@ -164,7 +164,7 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
             r"
             PRAGMA foreign_keys=ON;
             DROP TABLE thread_effect_canonical_v2;
-            DELETE FROM schema_migrations WHERE version=8;
+            DELETE FROM schema_migrations WHERE version IN (8,9);
             PRAGMA user_version=7;
             INSERT INTO runs(
               run_id, state_json, status, revision, last_seq, lease_token,
@@ -220,12 +220,12 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
     provider.assert_consumed();
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        8
+        9
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=8;"
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=9;"
         ),
         1
     );
@@ -243,6 +243,6 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "engine_initialization");
     assert_eq!(
         json(&output)["error"]["message"],
-        "database schema version 99 is newer than supported version 8"
+        "database schema version 99 is newer than supported version 9"
     );
 }

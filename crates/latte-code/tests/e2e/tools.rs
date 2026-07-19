@@ -719,6 +719,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
         ProviderReply::completion("both queued writes verified"),
     ]);
     scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+    std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())

@@ -1,11 +1,12 @@
 # Slash command design
 
-Status: **Proposed; not yet implemented.**
+Status: **First built-in slice implemented.**
 
-Latte Code currently has a local `Ctrl+P` command palette with four actions,
-but composer text beginning with `/` is submitted as an ordinary prompt. This
-document defines the target slash-command contract for the transcript TUI. It
-does not claim that the commands described here are already available.
+Latte Code now shares one built-in catalog between `Ctrl+P` and exact composer
+slash resolution. The Session command slice described in the current-status
+section and a minimal built-in suggestions popup are implemented. Fuzzy
+matching, prompt-command extensions, `/cancel`, and later catalog sources
+remain target design.
 
 ## 1. Reference findings
 
@@ -442,7 +443,53 @@ Final-binary E2E must cover at least:
 These tests are part of the existing independent UT 95%, final-binary E2E 80%,
 and all-target 90% coverage gates.
 
-## 15. Delivery phases
+## 15. Current implementation status
+
+`latte-tui::command::BUILTINS` is the sole catalog used by composer slash
+resolution and the `Ctrl+P` palette. It contains identifiers and secret-free
+metadata rather than arbitrary callbacks or engine capabilities.
+
+| Command | Aliases | Kind | Current result |
+| --- | --- | --- | --- |
+| `/new` | – | `LocalUi` | Starts a new transient draft. |
+| `/sessions [id or exact title]` | `/resume` | `TypedAction` | Opens the Session picker or resumes one exact match. |
+| `/help` | – | `LocalUi` | Opens keyboard help. |
+| `/navigation` | `/nav` | `LocalUi` | Enters transcript navigation. |
+| `/refresh` | – | `TypedAction` | Reloads the authoritative projection. |
+| `/quit` | `/exit`, `/q` | `LocalUi` | Exits the terminal UI. |
+
+Only a first-byte `/` creates a command candidate. Built-in names and aliases
+are lower-case ASCII and matched exactly. Arguments retain internal newlines
+and trim only outer whitespace. A known command with forbidden arguments
+produces a local validation error and preserves the draft; unknown or invalid
+candidates remain ordinary prompts. Local commands do not call a Provider or
+write command text to a transcript.
+
+The TUI resumes the newest Session for the current canonical workspace on
+startup. `/new` selects a transient draft. `/sessions` opens a picker without
+an argument and otherwise resolves a UUID or exact title. A Session from a
+different persisted workspace is not opened implicitly. Session switching is
+disabled during a submission, active work, or a pending request, and that
+availability is checked again at dispatch.
+
+The composer now opens an anchored built-in suggestions popup for `/` and
+single-token prefixes. It matches canonical and alias prefixes with stable
+exact/canonical/alias ordering. Up/Down changes the bounded selection, Enter
+dispatches after the normal availability recheck, and Esc dismisses the popup
+without changing the draft; later edits reopen it. Blocking request states and
+their key events; other overlays also hide the popup.
+
+Fuzzy matching, dynamic prompt commands, workspace command files, MCP prompts,
+Skills, executable plugins, explicit cross-workspace rebinding, and slash
+`/cancel` are not implemented.
+
+Reducer tests cover popup filtering, keyboard selection, dismissal, blocking,
+local, typed, and ordinary-prompt paths, aliases, exact arguments, disabled
+switching, and draft preservation. Final-binary PTY E2E covers popup rendering,
+arrow navigation, prefix filtering, Session creation, `/resume <thread-id>`,
+`/new`, and the absence of an additional Provider request on those local paths.
+
+## 16. Delivery phases
 
 1. Add the single built-in command catalog, parser, availability evaluation,
    aliases, and an explicit `ActiveConversation` target that can represent a

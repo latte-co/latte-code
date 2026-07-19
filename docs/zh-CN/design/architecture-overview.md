@@ -25,9 +25,9 @@ latte-code CLI/TUI
 
 ## 持久化状态
 
-每个工作区使用配置的 `database.path`，默认值为 `.latte/latte-code.db`。相对路径以工作区根目录为基准，也支持绝对路径。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。
+CLI 和 TUI 共用一个产品级 SQLite 数据库：`$HOME/.latte/latte-code/state.db`；当 `LATTE_CODE_HOME` 是绝对路径时，使用 `LATTE_CODE_HOME/state.db`。Workspace 只提供 Provider 和 Verification 配置，绝不拥有产品状态。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。遗留的 `database.path` 仅为迁移兼容而接受，不能选择状态数据库。
 
-Thread v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitThreadRunUpdate` 原子提交。旧 run 仍可由 CLI 读取，绝不回填为 thread。
+Thread v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitThreadRunUpdate` 原子提交。旧 run 仍可由 CLI 读取，绝不回填为 thread。
 
 运行写入必须携带有效 owner lease 与单调递增的 fencing token。lease 过期后即使同一 owner 重新获取也会推进 epoch；接管后旧 owner 不能再写入。
 

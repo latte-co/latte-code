@@ -1,11 +1,12 @@
 # Global session and data storage design
 
-Status: **Proposed; not yet implemented.**
+Status: **Partially implemented.**
 
-The current implementation stores runtime state and thread transcripts in the
-configured workspace-relative SQLite database, whose default is
-`.latte/latte-code.db`. This document defines the target storage contract. The
-migration must preserve the existing engine invariants around effects,
+The global product state database, workspace-scoped Session catalog, schema 9
+metadata, startup resume, and Provider-configuration failure boundary are
+implemented. Conversation cards still live in SQLite. The per-Session JSONL
+transcript, recovery, and migration portions of this document remain target
+design. They must preserve the existing engine invariants around effects,
 permissions, leases, fencing, deduplication, and `Unknown` reconciliation.
 
 ## 1. Decisions
@@ -387,7 +388,35 @@ Implementation is incomplete until UT and final-binary E2E prove at least:
 These scenarios follow the repository's independent UT 95%, final-binary E2E
 80%, and all-target 90% coverage gates.
 
-## 15. Delivery phases
+## 15. Current implementation status
+
+Latte Code currently uses one product state database at
+`$HOME/.latte/latte-code/state.db`. An absolute `LATTE_CODE_HOME` overrides the
+product home. The former `database.path` JSONC value remains accepted for
+configuration compatibility but no longer redirects product state.
+
+Migration 9 adds a bounded, redacted title and canonical `workspace_root` to
+the v2 Session metadata. Catalog reads do not deserialize transcript rows. The
+TUI filters Sessions by the current canonical workspace, resumes the newest
+matching Session on startup, starts a transient draft for `/new`, and exposes
+explicit selection through `/sessions` and `/resume`.
+
+A new conversation remains process-local until Provider binding resolves.
+Missing credentials, invalid binding/configuration, or Provider construction
+failure creates no `threads_v2` row, linked run, transcript entry, or persisted
+error record; the TUI restores the composer draft with a secret-safe error.
+Already durable engine safety state is not erased.
+
+The JSONL transcript layout, repair, Session-scoped writers, and removal of
+SQLite transcript duplication are not implemented. The global database also
+retains existing v1 run/control records for the headless CLI.
+
+Unit tests cover product-home resolution, migration 9, catalog metadata, and
+Provider-configuration non-materialization. Final-binary E2E covers the global
+database, `/resume`, `/new` without another Provider request, and failed
+Provider setup with an empty catalog.
+
+## 16. Delivery phases
 
 1. Add the global product home, Workspace storage keys, global catalog, and
    per-Session leases.

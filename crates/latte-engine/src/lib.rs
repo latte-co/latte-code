@@ -382,6 +382,14 @@ impl EngineBuilder {
         let root = self.workspace_root.unwrap_or(
             std::env::current_dir().map_err(|e| StorageError::InvalidData(e.to_string()))?,
         );
+        // Persist a stable identity rather than a presentation spelling. On
+        // macOS `/var` and `/private/var` can name the same workspace; a TUI
+        // started through the other spelling must still find its Sessions.
+        let workspace_identity = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let workspace_root = workspace_identity
+            .to_str()
+            .ok_or_else(|| StorageError::InvalidData("workspace root is not valid UTF-8".into()))?
+            .to_owned();
         let database_path = self.database_path;
         let tools = tools::ToolRegistry::new(
             &root,
@@ -401,6 +409,7 @@ impl EngineBuilder {
             thread_events,
             storage: Arc::new(storage),
             tools: Arc::new(tools),
+            workspace_root: Arc::from(workspace_root),
             process_supervision_supported: cfg!(unix),
             process_group_probe_override: None,
             operation_gate: Arc::new(Semaphore::new(1)),
@@ -503,6 +512,7 @@ pub struct EngineHandle {
     thread_events: broadcast::Sender<ThreadEventEnvelope>,
     storage: Arc<storage::Storage>,
     tools: Arc<tools::ToolRegistry>,
+    workspace_root: Arc<str>,
     process_supervision_supported: bool,
     process_group_probe_override: Option<process::GroupProbe>,
     operation_gate: Arc<Semaphore>,
@@ -760,8 +770,15 @@ impl EngineHandle {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage
-            .create_thread_v2(thread_id, run_id, &binding, prompt, &baseline, now_ms)
+        self.storage.create_thread_v2(
+            thread_id,
+            run_id,
+            &binding,
+            &self.workspace_root,
+            prompt,
+            &baseline,
+            now_ms,
+        )
     }
     /// Creates an immutable child run for a ready completed thread.
     pub fn create_thread_follow_up_v2(
@@ -796,6 +813,13 @@ impl EngineHandle {
     /// Lists thread sessions with bounded recent transcript cards.
     pub fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
         self.storage.list_threads_v2()
+    }
+    /// Lists bounded global Session metadata without loading transcripts.
+    pub fn list_thread_sessions_v2(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage.list_thread_sessions_v2(limit)
     }
     /// The only public mutation path for a linked v2 child run.
     #[allow(clippy::needless_pass_by_value)]

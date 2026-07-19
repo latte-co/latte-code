@@ -85,7 +85,7 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     );
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     let user_entries = engine
@@ -111,7 +111,7 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
 }
 
 #[test]
-fn tui_commits_prompt_before_a_provider_configuration_failure() {
+fn tui_provider_configuration_failure_restores_draft_without_creating_a_session() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
@@ -120,54 +120,25 @@ fn tui_commits_prompt_before_a_provider_configuration_failure() {
     let sentinel = b"failed-start-visible-sentinel";
     pty.write(sentinel);
     pty.write(b"\r");
-    assert!(pty.wait_for_output(
-        b"selected model could not be started",
-        Duration::from_secs(5)
-    ));
+    assert!(pty.wait_for_output(b"Unable to submit", Duration::from_secs(5)));
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
-                    && threads[0].transcript.entries.iter().any(|entry| {
-                        entry.kind == latte_core::TranscriptKind::User
-                            && entry.text.as_bytes() == sentinel
-                    })
-                    && threads[0]
-                        .transcript
-                        .entries
-                        .iter()
-                        .any(|entry| entry.kind == latte_core::TranscriptKind::Failure)
-            })
-        }),
-        "provider configuration failure was not durably projected: {}",
-        String::from_utf8_lossy(&pty.output())
-    );
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].lifecycle, latte_core::ThreadLifecycle::Failed);
-    assert_eq!(threads[0].runs.len(), 1);
-    assert_eq!(
-        threads[0].runs[0].status,
-        latte_core::ThreadRunStatus::Failed
-    );
+    assert!(engine.list_threads_v2().unwrap().is_empty());
     assert!(pty.is_running());
     let terminal = pty.output();
     assert!(
-        !terminal
-            .windows(b"prompt has been restored".len())
-            .any(|value| value == b"prompt has been restored")
-    );
-    assert!(
-        !terminal
+        terminal
             .windows(b"Unable to submit".len())
             .any(|value| value == b"Unable to submit")
+    );
+    assert!(
+        terminal
+            .windows(sentinel.len())
+            .any(|value| value == sentinel)
     );
     assert!(
         !terminal
@@ -178,6 +149,67 @@ fn tui_commits_prompt_before_a_provider_configuration_failure() {
     pty.write(F10);
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
+}
+
+#[test]
+fn tui_new_and_resume_use_global_session_catalog_without_calling_provider() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("stored session")]);
+    let mut first_command = scenario.command(&["tui"]);
+    scenario.configure_provider(
+        &mut first_command,
+        provider.endpoint(),
+        r#"["/usr/bin/true"]"#,
+        "session-e2e-secret",
+    );
+    let mut first = PtySession::spawn(first_command);
+    assert!(first.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    first.write(b"seed session\r");
+    assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
+    assert!(wait_until(Duration::from_secs(5), || {
+        latte_engine::EngineBuilder::new()
+            .workspace_root(scenario.root())
+            .database_path(scenario.tui_database_path())
+            .build()
+            .ok()
+            .and_then(|engine| engine.list_threads_v2().ok())
+            .is_some_and(|sessions| {
+                sessions.len() == 1 && sessions[0].lifecycle == latte_core::ThreadLifecycle::Ready
+            })
+    }));
+    first.write(F10);
+    assert!(first.finish(Duration::from_secs(5)).0.success());
+
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.tui_database_path())
+        .build()
+        .unwrap();
+    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+    assert_eq!(engine.list_thread_sessions_v2(10).unwrap().len(), 1);
+
+    let mut resumed_command = scenario.command(&["tui"]);
+    resumed_command.env("TEST_OPENAI_KEY", "session-e2e-secret");
+    let mut resumed = PtySession::spawn(resumed_command);
+    assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    resumed.write(format!("/resume {thread_id}\r").as_bytes());
+    assert!(
+        resumed.wait_for_output(b"stored session", Duration::from_secs(5)),
+        "TUI did not render resumed Session: {}",
+        String::from_utf8_lossy(&resumed.output())
+    );
+    assert_eq!(provider.requests().len(), 1);
+
+    resumed.write(b"/new\r");
+    assert!(wait_until(Duration::from_secs(2), || provider
+        .requests()
+        .len()
+        == 1));
+    assert_eq!(engine.list_threads_v2().unwrap().len(), 1);
+    assert_eq!(provider.requests().len(), 1);
+    resumed.write(F10);
+    assert!(resumed.finish(Duration::from_secs(5)).0.success());
+    provider.assert_consumed();
 }
 
 #[test]
@@ -207,7 +239,7 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback_without_fixed_sleeps() {
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     let threads = engine.list_threads_v2().unwrap();
@@ -221,7 +253,7 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback_without_fixed_sleeps() {
     pty.write(F10);
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
-    assert!(scenario.database_path().exists());
+    assert!(scenario.tui_database_path().exists());
 }
 
 #[test]
@@ -246,7 +278,7 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     assert!(
@@ -333,7 +365,7 @@ fn invalid_input_request_id_fails_before_any_pending_card_is_persisted() {
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     assert!(
@@ -384,7 +416,7 @@ fn completed_tui_thread_accepts_a_follow_up_as_an_immutable_child_with_history()
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     let first = engine.list_threads_v2().unwrap();
@@ -456,7 +488,7 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
     let assert_still_waiting = || {
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(denied_scenario.root())
-            .database_path(denied_scenario.database_path())
+            .database_path(denied_scenario.tui_database_path())
             .build()
             .unwrap();
         let threads = engine.list_threads_v2().unwrap();
@@ -587,7 +619,7 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     let threads = engine.list_threads_v2().unwrap();
@@ -744,7 +776,7 @@ fn process_timeout_reaps_the_group_and_returns_one_terminal_tool_result() {
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
+        .database_path(scenario.tui_database_path())
         .build()
         .unwrap();
     assert!(

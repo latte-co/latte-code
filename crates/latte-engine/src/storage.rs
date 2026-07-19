@@ -4,16 +4,16 @@ use latte_core::{
     CompletionPolicy, EventEnvelope, EventId, Evidence, FailureCode, Handoff, PROTOCOL_VERSION,
     Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, ThreadEvent,
     ThreadEventEnvelope, ThreadEventId, ThreadLifecycle, ThreadPendingRequest,
-    ThreadProviderBindingV2, ThreadRunStatus, ThreadRunSummary, ThreadSnapshot, TranscriptEntry,
-    TranscriptEntryId, TranscriptKind, TranscriptPage, Transition, VerificationStatus,
-    redact_thread_text, redact_thread_value,
+    ThreadProviderBindingV2, ThreadRunStatus, ThreadRunSummary, ThreadSessionSummary,
+    ThreadSnapshot, TranscriptEntry, TranscriptEntryId, TranscriptKind, TranscriptPage, Transition,
+    VerificationStatus, redact_thread_text, redact_thread_value,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// The interactive session list carries a recent, bounded transcript per
 /// thread.  The bound prevents a single long-running conversation from
 /// allocating an unbounded amount of terminal projection memory while still
@@ -503,6 +503,34 @@ impl Storage {
               PRAGMA user_version=8;
             ")?;
             tx.commit()?;
+            version = 8;
+        }
+        if version == 8 {
+            let tx = connection.unchecked_transaction()?;
+            let has_title: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name=?1)",
+                ["title"],
+                |row| row.get(0),
+            )?;
+            if !has_title {
+                tx.execute_batch(
+                    "ALTER TABLE threads_v2 ADD COLUMN title TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            let has_workspace_root: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name=?1)",
+                ["workspace_root"],
+                |row| row.get(0),
+            )?;
+            if !has_workspace_root {
+                tx.execute_batch(
+                    "ALTER TABLE threads_v2 ADD COLUMN workspace_root TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            tx.execute_batch(
+                "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(9,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=9;",
+            )?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -585,11 +613,13 @@ impl Storage {
         .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_thread_v2(
         &self,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         binding: &ThreadProviderBindingV2,
+        workspace_root: &str,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
         now_ms: u64,
@@ -601,6 +631,8 @@ impl Storage {
                 "thread prompt must not be empty".into(),
             ));
         }
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let title = session_title(&prompt);
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = RunState::queued(run_id);
@@ -624,8 +656,8 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms) VALUES(?1,0,1,'running',?2,?3,?4,?4)",
-            params![thread_id.to_string(), serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root) VALUES(?1,0,1,'running',?2,?3,?4,?4,?5,?6)",
+            params![thread_id.to_string(), serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root],
         )?;
         tx.execute(
             "INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
@@ -814,6 +846,51 @@ impl Storage {
                 Ok(snapshot)
             })
             .collect()
+    }
+
+    pub(crate) fn list_thread_sessions_v2(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ThreadSessionSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(500);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+             FROM threads_v2 ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?1",
+        )?;
+        let limit = u64::try_from(limit)
+            .map_err(|_| StorageError::InvalidData("session list limit exceeds u64".into()))?;
+        let rows = statement.query_map([to_i64(limit)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
+                row?;
+            let binding: ThreadProviderBindingV2 =
+                serde_json::from_str(&binding_json).map_err(invalid_json)?;
+            Ok(ThreadSessionSummary {
+                thread_id: parse_thread_id(&thread_id)?,
+                title,
+                workspace_root,
+                lifecycle: parse_lifecycle(&lifecycle)?,
+                provider_name: binding.provider_name,
+                model: binding.model,
+                created_at_ms: from_i64(created)?,
+                updated_at_ms: from_i64(updated)?,
+            })
+        })
+        .collect()
     }
 
     /// Computes the exact workspace paths changed since this linked child was
@@ -2862,6 +2939,33 @@ fn parse_thread_id(value: &str) -> Result<latte_core::ThreadId, StorageError> {
         .map_err(|error| StorageError::InvalidData(format!("invalid stored thread id: {error}")))
 }
 
+fn validate_workspace_root(value: &str) -> Result<&str, StorageError> {
+    if value.is_empty() || value.len() > 4 * 1024 || value.chars().any(char::is_control) {
+        return Err(StorageError::InvalidData(
+            "invalid canonical workspace root".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn session_title(prompt: &str) -> String {
+    const LIMIT: usize = 120;
+    let first_line = prompt.lines().next().unwrap_or_default().trim();
+    let mut title = String::with_capacity(first_line.len().min(LIMIT));
+    for value in first_line.chars().filter(|value| !value.is_control()) {
+        if title.len() + value.len_utf8() > LIMIT {
+            title.push('…');
+            break;
+        }
+        title.push(value);
+    }
+    if title.is_empty() {
+        "Untitled session".into()
+    } else {
+        title
+    }
+}
+
 fn parse_lifecycle(value: &str) -> Result<ThreadLifecycle, StorageError> {
     match value {
         "ready" => Ok(ThreadLifecycle::Ready),
@@ -4210,7 +4314,7 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE thread_effect_canonical_v2; \
-                 DELETE FROM schema_migrations WHERE version=8; \
+                 DELETE FROM schema_migrations WHERE version IN (8,9); \
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -4228,7 +4332,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert!(descriptor_table);
     }
 
@@ -4256,6 +4360,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn v2_thread_child_is_fenced_idempotent_and_parent_is_immutable() {
         use latte_core::{ThreadCommandId, ThreadId, ThreadProviderBindingV2};
         let store = Storage::memory().unwrap();
@@ -4280,6 +4385,7 @@ mod tests {
                 thread,
                 first,
                 &binding,
+                "/workspace",
                 "hello sk-this-is-a-secret-123456789",
                 &std::collections::BTreeMap::new(),
                 1,
@@ -4384,6 +4490,7 @@ mod tests {
                 thread_id,
                 run_id,
                 &binding,
+                "/workspace",
                 "durable prompt",
                 &std::collections::BTreeMap::new(),
                 1,
@@ -4453,6 +4560,7 @@ mod tests {
                 thread_id,
                 run_id,
                 &binding,
+                "/workspace",
                 "oldest prompt",
                 &std::collections::BTreeMap::new(),
                 1,
@@ -4508,6 +4616,44 @@ mod tests {
                 .all(|entry| entry.text != "oldest prompt"),
             "a truncated current view must not misleadingly start at the oldest card"
         );
+    }
+
+    #[test]
+    fn session_catalog_reads_bounded_metadata_without_deserializing_transcripts() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace/catalog",
+                "First session title\nwith more context",
+                &std::collections::BTreeMap::new(),
+                42,
+            )
+            .unwrap();
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE thread_transcript_v2 SET entry_json='{' WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+        }
+
+        let catalog = store.list_thread_sessions_v2(1).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].thread_id, thread_id);
+        assert_eq!(catalog[0].title, "First session title");
+        assert_eq!(catalog[0].workspace_root, "/workspace/catalog");
+        assert_eq!(catalog[0].model, "model");
+        assert_eq!(catalog[0].created_at_ms, 42);
+        assert_eq!(catalog[0].updated_at_ms, 42);
     }
 
     #[test]
@@ -4839,6 +4985,7 @@ mod tests {
                 thread_id,
                 run_id,
                 &thread_binding(),
+                "/workspace",
                 prompt,
                 &std::collections::BTreeMap::new(),
                 now_ms,
@@ -5330,6 +5477,7 @@ mod tests {
                     empty_thread,
                     empty_run,
                     &thread_binding(),
+                    "/workspace",
                     " \n ",
                     &baseline,
                     1,
@@ -5677,6 +5825,7 @@ mod tests {
                 thread_id,
                 run_id,
                 &thread_binding(),
+                "/workspace",
                 "inspect projection",
                 &baseline,
                 1,

@@ -1,7 +1,6 @@
 {
   "version": 1,
   "default_provider": "primary",
-  "database": { "path": ".latte/latte-code.db" },
   "thread": {
     "max_request_bytes": 524288,
     "max_input_bytes": 393216,

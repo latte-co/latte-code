@@ -178,24 +178,18 @@ impl ThreadRuntimeService {
             .validate()
             .map_err(ThreadRuntimeError::ProviderConfiguration)?;
         let messages = self.initial_messages(&prompt)?;
+        // Resolve credentials and provider configuration while the new
+        // conversation is still an in-memory draft. A rejected binding must
+        // not manufacture a durable failed Session.
+        let provider = (self.provider)(&binding).map_err(|_| {
+            ThreadRuntimeError::ProviderConfiguration(provider_configuration_failure_message())
+        })?;
         let run_id = new_run_id();
         let now = now_ms();
         let lease = self.acquire(thread_id)?;
-        let created =
-            self.engine
-                .create_thread_v2(thread_id, run_id, binding.clone(), &prompt, now)?;
-        // `resolve_thread_bound` checks every semantic field before this point
-        // reaches a network-capable provider or credential lookup.
-        let Ok(provider) = (self.provider)(&binding) else {
-            return self.fail(
-                thread_id,
-                run_id,
-                created.revision,
-                0,
-                provider_configuration_failure_message(),
-                &lease,
-            );
-        };
+        let created = self
+            .engine
+            .create_thread_v2(thread_id, run_id, binding, &prompt, now)?;
         let started = self.commit(
             thread_id,
             run_id,
@@ -224,6 +218,9 @@ impl ThreadRuntimeService {
             return Err(ThreadRuntimeError::InvalidState);
         }
         let messages = self.history_with_prompt(&snapshot, &prompt)?;
+        let provider = (self.provider)(&snapshot.binding).map_err(|_| {
+            ThreadRuntimeError::ProviderConfiguration(provider_configuration_failure_message())
+        })?;
         let run_id = new_run_id();
         let lease = self.acquire(thread_id)?;
         let created = self.engine.create_thread_follow_up_v2(
@@ -233,16 +230,6 @@ impl ThreadRuntimeService {
             &prompt,
             now_ms(),
         )?;
-        let Ok(provider) = (self.provider)(&snapshot.binding) else {
-            return self.fail(
-                thread_id,
-                run_id,
-                created.revision,
-                0,
-                provider_configuration_failure_message(),
-                &lease,
-            );
-        };
         let started = self.commit(
             thread_id,
             run_id,
@@ -1604,7 +1591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_persists_user_and_terminal_failure_when_provider_factory_rejects_binding() {
+    async fn start_provider_configuration_failure_leaves_new_session_transient() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -1620,34 +1607,20 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
 
-        let failed = service
+        let error = service
             .start(thread_id, "durable prompt".into(), binding())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
-        assert_eq!(failed.runs.len(), 1);
-        assert_eq!(failed.runs[0].status, latte_core::ThreadRunStatus::Failed);
         assert!(
-            failed.transcript.entries.iter().any(|entry| {
-                entry.kind == TranscriptKind::User && entry.text == "durable prompt"
-            })
+            matches!(error, ThreadRuntimeError::ProviderConfiguration(message)
+            if message == provider_configuration_failure_message())
         );
-        let failure = failed
-            .transcript
-            .entries
-            .iter()
-            .find(|entry| entry.kind == TranscriptKind::Failure)
-            .expect("provider configuration failure is durably projected");
-        assert!(failure.text.contains("selected model"));
-        assert!(failure.text.contains("provider configuration"));
-        assert!(failure.text.contains("credentials"));
-        assert!(!failure.text.contains("PROVIDER_SECRET_NAME"));
-        assert_eq!(engine.list_threads_v2().unwrap().len(), 1);
+        assert!(engine.list_threads_v2().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn follow_up_persists_user_and_terminal_failure_when_provider_factory_rejects_binding() {
+    async fn follow_up_provider_configuration_failure_leaves_parent_unchanged() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -1673,37 +1646,31 @@ mod tests {
                 Err("secret reference PROVIDER_SECRET_NAME is unavailable".into())
             }
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let service = ThreadRuntimeService::new(
+            engine.clone(),
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            factory,
+        );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let complete = service
             .start(thread_id, "first".into(), binding())
             .await
             .unwrap();
 
-        let failed = service
+        let error = service
             .follow_up(thread_id, complete.revision, "durable follow-up".into())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
-        assert_eq!(failed.runs.len(), 2);
-        assert_eq!(
-            failed.runs[0].status,
-            latte_core::ThreadRunStatus::Completed
+        assert!(
+            matches!(error, ThreadRuntimeError::ProviderConfiguration(message)
+            if message == provider_configuration_failure_message())
         );
-        assert_eq!(failed.runs[1].status, latte_core::ThreadRunStatus::Failed);
-        assert!(failed.transcript.entries.iter().any(|entry| {
-            entry.kind == TranscriptKind::User && entry.text == "durable follow-up"
-        }));
-        let failure = failed
-            .transcript
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.kind == TranscriptKind::Failure)
-            .expect("follow-up provider configuration failure is durable");
-        assert!(!failure.text.contains("PROVIDER_SECRET_NAME"));
+        assert_eq!(
+            engine.thread_snapshot_v2(thread_id, None, 100).unwrap(),
+            complete
+        );
     }
 
     #[tokio::test]

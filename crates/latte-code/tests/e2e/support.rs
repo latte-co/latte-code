@@ -132,7 +132,11 @@ impl Scenario {
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {
-        self.root.path().join(".latte/latte-code.db")
+        self.tui_database_path()
+    }
+
+    pub fn tui_database_path(&self) -> std::path::PathBuf {
+        self.home().join(".latte/latte-code/state.db")
     }
 }
 

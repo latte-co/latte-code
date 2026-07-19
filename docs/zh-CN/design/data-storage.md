@@ -1,11 +1,12 @@
 # 全局 Session 与数据存储设计
 
-状态：**设计中，尚未实现。**
+状态：**部分已实现。**
 
-当前实现把运行状态和 Thread transcript 存放在配置的工作区相对 SQLite
-数据库中，默认路径是 `.latte/latte-code.db`。本文定义目标存储契约。迁移
-过程中必须保留现有 Engine 对 Effect、Permission、Lease、Fencing、去重和
-`Unknown` Reconciliation 的安全约束。
+全局 Product State Database、按 Workspace 隔离的 Session Catalog、Schema 9
+Metadata、启动恢复与 Provider Configuration 失败边界已经实现。Conversation
+Card 仍保存在 SQLite。本文中按 Session 存储的 JSONL Transcript、恢复与迁移
+部分仍是目标设计；落地时必须保留现有 Engine 对 Effect、Permission、Lease、
+Fencing、去重和 `Unknown` Reconciliation 的安全约束。
 
 ## 1. 已确定的决策
 
@@ -351,7 +352,31 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
 这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 80% 和 All-Target 90%
 覆盖率卡点。
 
-## 15. 交付阶段
+## 15. 当前实现状态
+
+Latte Code 当前使用 `$HOME/.latte/latte-code/state.db` 作为唯一 Product State
+Database。绝对路径的 `LATTE_CODE_HOME` 可以覆盖 Product Home。旧的
+`database.path` JSONC 字段为保持配置兼容仍可被解析，但不再重定向产品状态。
+
+迁移 9 为 v2 Session Metadata 增加有界、脱敏的 Title 与 Canonical
+`workspace_root`。Catalog 查询不会反序列化 Transcript Row。TUI 按当前
+Canonical Workspace 过滤 Session，启动时恢复最新匹配项，`/new` 创建瞬态
+Draft，`/sessions` 与 `/resume` 提供显式选择。
+
+新对话在 Provider Binding 解析成功前保持进程内状态。Credential 缺失、
+Binding/Configuration 非法或 Provider 构造失败时，不会创建 `threads_v2` Row、
+关联 Run、Transcript Entry 或持久化 Error Record；TUI 恢复 Composer Draft 并
+展示无密钥错误。已经持久化的 Engine 安全状态不会因此被删除。
+
+JSONL Transcript Layout、Repair、Session Scoped Writer 与移除 SQLite
+Transcript Duplication 尚未实现。全局数据库也继续保留供 Headless CLI 读取的
+既有 v1 Run/Control Record。
+
+UT 覆盖 Product Home 解析、迁移 9、Catalog Metadata 与 Provider Configuration
+不物化状态。最终二进制 E2E 覆盖全局数据库、`/resume`、不额外调用 Provider 的
+`/new`，以及 Provider Setup 失败后仍为空的 Catalog。
+
+## 16. 交付阶段
 
 1. 增加全局 Product Home、Workspace Storage Key、全局 Catalog 和 Per-Session
    Lease。

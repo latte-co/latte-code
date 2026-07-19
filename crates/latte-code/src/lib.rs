@@ -24,8 +24,9 @@ const EXIT_DENIED: i32 = 11;
 const EXIT_INTERNAL: i32 = 70;
 const EXIT_INTERRUPTED: i32 = 130;
 const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
+const PRODUCT_HOME_ENV: &str = "LATTE_CODE_HOME";
 const DEFAULT_CONFIG: &str = include_str!("../../../latte-code.config.example.jsonc");
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nConfiguration is optional. Latte Code merges built-in defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials are environment references in those files.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nConfiguration is optional. Latte Code merges built-in defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Product state is global at $HOME/.latte/latte-code/state.db (or the absolute LATTE_CODE_HOME override), never in a workspace. Provider credentials are environment references in those files.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,14 +138,6 @@ impl AppConfig {
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
         Ok((config, registry))
     }
-    fn database_path(&self, root: &std::path::Path) -> std::path::PathBuf {
-        let path = std::path::Path::new(&self.database.path);
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            root.join(path)
-        }
-    }
     fn plan(&self) -> VerificationPlan {
         VerificationPlan {
             argv: self.verification.argv.clone(),
@@ -225,14 +218,81 @@ fn workspace_display_path_with_home(root: &Path, home: Option<&Path>) -> String 
     }
 }
 
+fn workspace_identity(root: &Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    canonical
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "workspace root is not valid UTF-8".into())
+}
+
+/// Resolves the one product-wide `SQLite` catalogue. A workspace selects
+/// Provider and verification configuration, but never owns session state.
+fn state_database_path() -> Result<PathBuf, String> {
+    let override_home = std::env::var_os(PRODUCT_HOME_ENV).map(PathBuf::from);
+    let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    state_database_path_with_home(override_home.as_deref(), user_home.as_deref())
+}
+
+fn state_database_path_with_home(
+    override_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let product_home = if let Some(path) = override_home {
+        if !path.is_absolute() {
+            return Err(format!("{PRODUCT_HOME_ENV} must be an absolute path"));
+        }
+        path.to_owned()
+    } else {
+        user_home
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join(".latte/latte-code"))
+            .ok_or_else(|| {
+                format!("cannot resolve user home; set {PRODUCT_HOME_ENV} to an absolute path")
+            })?
+    };
+    Ok(product_home.join("state.db"))
+}
+
 struct ThreadEngineProjection {
     engine: latte_engine::EngineHandle,
     subscription: latte_engine::ThreadSubscription,
+    workspace_root: String,
 }
 impl latte_tui::thread::ThreadProjectionClient for ThreadEngineProjection {
     fn snapshots(&mut self) -> Result<Vec<latte_core::ThreadSnapshot>, String> {
         self.engine
             .list_threads_v2()
+            .map_err(|error| error.to_string())
+    }
+    fn session_catalog(&mut self) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+        self.engine
+            .list_thread_sessions_v2(200)
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.workspace_root == self.workspace_root)
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+    fn session(&mut self, thread_id: ThreadId) -> Result<latte_core::ThreadSnapshot, String> {
+        let metadata = self
+            .engine
+            .list_thread_sessions_v2(500)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|session| session.thread_id == thread_id)
+            .ok_or_else(|| format!("session {thread_id} was not found"))?;
+        if metadata.workspace_root != self.workspace_root {
+            return Err(format!(
+                "session {thread_id} belongs to another workspace; explicit rebinding is required"
+            ));
+        }
+        self.engine
+            .thread_snapshot_v2(thread_id, None, 500)
             .map_err(|error| error.to_string())
     }
     fn poll(&mut self) -> latte_tui::thread::ThreadProjectionPoll {
@@ -308,13 +368,16 @@ async fn execute() -> i32 {
             return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
         }
     };
-    let database_path = config.database_path(&root);
+    let database_path = match state_database_path() {
+        Ok(path) => path,
+        Err(error) => return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false),
+    };
     let Some(database_parent) = database_path.parent() else {
         return emit_error(
             json,
             "usage",
             "configuration",
-            "database.path must have a parent directory",
+            "product state path must have a parent directory",
             EXIT_USAGE,
             false,
         );
@@ -548,9 +611,15 @@ fn execute_tui() -> i32 {
             return EXIT_USAGE;
         }
     };
-    let database_path = config.database_path(&root);
+    let database_path = match state_database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("configuration: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let Some(parent) = database_path.parent() else {
-        eprintln!("configuration: database.path must have a parent directory");
+        eprintln!("configuration: product state path must have a parent directory");
         return EXIT_USAGE;
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
@@ -601,6 +670,13 @@ fn execute_tui() -> i32 {
     let mut projection = ThreadEngineProjection {
         engine: engine.clone(),
         subscription: engine.subscribe_threads(),
+        workspace_root: match workspace_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("configuration: {error}");
+                return EXIT_USAGE;
+            }
+        },
     };
     let (feedback_tx, feedback_rx) =
         std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
@@ -746,6 +822,8 @@ fn execute_tui() -> i32 {
                     });
                 }
                 latte_tui::thread::ThreadUiAction::RefreshSnapshots
+                | latte_tui::thread::ThreadUiAction::ShowSessions { .. }
+                | latte_tui::thread::ThreadUiAction::OpenSession { .. }
                 | latte_tui::thread::ThreadUiAction::Quit => {}
             }
             Ok(())
@@ -840,8 +918,8 @@ mod tests {
         EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
         ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root, dot,
         emit_data, emit_error, execute_tui, merge_optional_config, merge_value, outcome,
-        reconcile_thread_action, render_run, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home,
+        reconcile_thread_action, render_run, state_database_path_with_home, verify_timeout,
+        workspace_display_path, workspace_display_path_with_home, workspace_identity,
     };
     use latte_core::{
         Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
@@ -859,7 +937,10 @@ mod tests {
     };
     use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
     use serde_json::json;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     fn state(status: RunStatus) -> RunState {
         let mut state =
@@ -905,14 +986,11 @@ mod tests {
         assert_eq!(threads.context_cap_bytes, policy.context_cap_bytes);
         assert_eq!(DatabaseConfig::default().path, ".latte/latte-code.db");
 
-        let absolute = tempfile::tempdir().unwrap().path().join("absolute.db");
         let config = AppConfig {
             version: 1,
             default_provider: "primary".into(),
             providers: json!({}),
-            database: DatabaseConfig {
-                path: absolute.display().to_string(),
-            },
+            database: DatabaseConfig::default(),
             verification: VerificationConfig {
                 argv: vec!["cargo".into(), "test".into()],
                 cwd: "checks".into(),
@@ -920,7 +998,6 @@ mod tests {
             },
             thread: threads,
         };
-        assert_eq!(config.database_path(Path::new("/ignored")), absolute);
         let plan = config.plan();
         assert_eq!(plan.argv, ["cargo", "test"]);
         assert_eq!(plan.cwd, "checks");
@@ -931,6 +1008,37 @@ mod tests {
         let derived = config.thread_policy();
         assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
         assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
+    }
+
+    #[test]
+    fn session_state_uses_global_product_home_not_workspace_configuration() {
+        let home = PathBuf::from("/users/tester");
+        assert_eq!(
+            state_database_path_with_home(None, Some(&home)).unwrap(),
+            PathBuf::from("/users/tester/.latte/latte-code/state.db")
+        );
+        assert_eq!(
+            state_database_path_with_home(Some(Path::new("/state/latte")), Some(&home)).unwrap(),
+            PathBuf::from("/state/latte/state.db")
+        );
+        assert!(
+            state_database_path_with_home(Some(Path::new("relative")), Some(&home))
+                .unwrap_err()
+                .contains("LATTE_CODE_HOME must be an absolute path")
+        );
+        assert!(
+            state_database_path_with_home(None, None)
+                .unwrap_err()
+                .contains("cannot resolve user home")
+        );
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            workspace_identity(root.path()).unwrap(),
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1141,6 +1249,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workspace_and_projection_adapters_cover_empty_event_and_lagged_states() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("no/git/here");
@@ -1156,9 +1265,11 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
+        let canonical_root = workspace_identity(root.path()).unwrap();
         let mut projection = ThreadEngineProjection {
             subscription: engine.subscribe_threads(),
             engine: engine.clone(),
+            workspace_root: canonical_root.clone(),
         };
         assert!(projection.snapshots().unwrap().is_empty());
         assert_eq!(projection.poll(), ThreadProjectionPoll::Empty);
@@ -1192,6 +1303,38 @@ mod tests {
                 .unwrap();
             created.push((thread_id, run_id));
         }
+        let first_thread_id = created[0].0;
+        let catalog = projection.session_catalog().unwrap();
+        assert_eq!(catalog.len(), 70);
+        assert!(
+            catalog
+                .iter()
+                .all(|session| session.workspace_root == canonical_root)
+        );
+        assert_eq!(
+            projection.session(first_thread_id).unwrap().thread_id,
+            first_thread_id
+        );
+
+        let mut foreign_projection = ThreadEngineProjection {
+            subscription: engine.subscribe_threads(),
+            engine: engine.clone(),
+            workspace_root: "/another/workspace".into(),
+        };
+        assert!(foreign_projection.session_catalog().unwrap().is_empty());
+        assert!(
+            foreign_projection
+                .session(first_thread_id)
+                .unwrap_err()
+                .contains("belongs to another workspace")
+        );
+        let missing_thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            projection
+                .session(missing_thread_id)
+                .unwrap_err()
+                .contains("was not found")
+        );
         let lease = engine
             .acquire_lease("projection-test", 100, 10_000)
             .unwrap();

@@ -17,6 +17,7 @@ use crossterm::{
 };
 use thiserror::Error;
 
+pub mod command;
 pub mod thread;
 
 /// Connectivity is presentation state, never runtime truth.

@@ -1,10 +1,11 @@
 # 斜杠命令设计
 
-状态：**设计中，尚未实现。**
+状态：**第一批 Built-in 已实现。**
 
-Latte Code 当前已经有包含四个本地 Action 的 `Ctrl+P` Command Palette，但
-Composer 中以 `/` 开头的文本仍会作为普通 Prompt 提交。本文定义 Transcript
-TUI 的目标斜杠命令契约，并不表示本文列出的命令已经可用。
+Latte Code 目前由同一个 Built-in Catalog 驱动 `Ctrl+P` 与 Composer 的精确
+Slash Resolution。“当前实现状态”一节描述的 Session Command 已经落地；
+最小 Built-in Suggestion Popup 也已经实现。Fuzzy Matching、Prompt Command
+扩展、`/cancel` 与后续 Catalog Source 仍是目标设计。
 
 ## 1. 参考实现结论
 
@@ -411,7 +412,48 @@ Final-Binary E2E 至少覆盖：
 这些测试属于仓库现有的独立 UT 95%、Final-Binary E2E 80% 和 All-Target 90%
 覆盖率卡点。
 
-## 15. 交付阶段
+## 15. 当前实现状态
+
+`latte-tui::command::BUILTINS` 是 Composer Slash Resolution 与 `Ctrl+P`
+Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata，不携带
+任意 Callback 或 Engine Capability。
+
+| 命令 | Alias | Kind | 当前结果 |
+| --- | --- | --- | --- |
+| `/new` | – | `LocalUi` | 启动新的瞬态 Draft。 |
+| `/sessions [id 或精确 title]` | `/resume` | `TypedAction` | 打开 Session Picker，或恢复唯一精确匹配。 |
+| `/help` | – | `LocalUi` | 打开键盘帮助。 |
+| `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
+| `/refresh` | – | `TypedAction` | 重新加载权威 Projection。 |
+| `/quit` | `/exit`、`/q` | `LocalUi` | 退出 Terminal UI。 |
+
+只有第一个 Byte 是 `/` 的 Composer Text 才是 Command Candidate。Built-in
+Name 和 Alias 使用小写 ASCII 并精确匹配；Argument 保留内部换行，只裁剪外层
+空白。已知命令携带禁止的 Argument 时产生本地 Validation Error 并保留 Draft；
+未知或非法 Candidate 仍是普通 Prompt。Local Command 不调用 Provider，也不把
+Command Text 写入 Transcript。
+
+TUI 启动时恢复当前 Canonical Workspace 中最新的 Session。`/new` 选择瞬态
+Draft；无参数 `/sessions` 打开 Picker，携带参数时解析 UUID 或精确 Title。不会
+隐式打开持久化 Workspace 不同的 Session。存在 Submission、Active Work 或
+Pending Request 时禁用 Session 切换，并在 Dispatch 时再次检查 Availability。
+
+Composer 现在会针对 `/` 与单 Token 前缀打开锚定在 Composer 上方的 Built-in
+Suggestion Popup。它按 Canonical Name 与 Alias Prefix 匹配，并以稳定的
+Exact/Canonical/Alias 顺序排列；Up/Down 在有界结果内选择，Enter 复用正常的
+Availability 二次检查后 Dispatch，Esc 只关闭 Popup 而不修改 Draft，后续编辑会
+重新打开。Blocking Request State 继续拥有完整 Key Event；其他 Overlay 也会隐藏
+Popup。
+
+Fuzzy Matching、Dynamic Prompt Command、Workspace Command File、MCP Prompt、
+Skill、可执行 Plugin、显式 Cross-workspace Rebinding 与 Slash `/cancel` 尚未实现。
+
+Reducer Test 覆盖 Popup Filter、键盘选择、Dismiss、Blocking、Local、Typed 与
+普通 Prompt Path、Alias、精确 Argument、禁用的切换和 Draft 保留。最终二进制
+PTY E2E 覆盖 Popup Rendering、方向键 Navigation、Prefix Filter、Session 创建、
+`/resume <thread-id>`、`/new`，以及这些本地路径不会触发额外 Provider Request。
+
+## 16. 交付阶段
 
 1. 增加单一 Built-in Command Catalog、Parser、Availability Evaluation、Alias，
    以及可以表示瞬态 New Session Draft 的显式 `ActiveConversation` Target。

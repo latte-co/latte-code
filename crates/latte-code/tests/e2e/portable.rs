@@ -18,7 +18,7 @@ fn waiting_run_id(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn final_binary_creates_and_reopens_its_workspace_sqlite_database() {
+fn final_binary_creates_and_reopens_its_global_sqlite_database() {
     let scenario = Scenario::new();
     let first = scenario.output(&["--json", "list"], |_| {});
     assert!(

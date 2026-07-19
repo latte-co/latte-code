@@ -217,6 +217,20 @@ pub struct ThreadSnapshot {
     pub transcript: TranscriptPage,
 }
 
+/// Bounded, transcript-free metadata used by global Session discovery.
+/// Provider credentials and executable effect data are intentionally absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadSessionSummary {
+    pub thread_id: ThreadId,
+    pub title: String,
+    pub workspace_root: String,
+    pub lifecycle: ThreadLifecycle,
+    pub provider_name: String,
+    pub model: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 /// The active request needed for explicit in-thread UI actions. Secret values
 /// are never representable here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
