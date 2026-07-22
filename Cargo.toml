@@ -46,10 +46,16 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
+[profile.dev]
+debug = 1
+codegen-units = 256
+
+[profile.test]
+debug = 1
+codegen-units = 256
+opt-level = 0
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-
-[profile.dev]
-debug = 1
