@@ -1,5 +1,12 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
+
+# Auto-enable sccache if installed; CI/dev environments without it are unaffected
+SCCACHE := $(shell command -v sccache 2>/dev/null)
+ifneq ($(SCCACHE),)
+export RUSTC_WRAPPER := sccache
+endif
+
 .DEFAULT_GOAL := help
 
 .PHONY: help setup build release install fmt fmt-check check lint lint-ci test test-unit test-contract test-e2e test-e2e-portable test-e2e-unix test-doc test-inventory test-all doc coverage coverage-unit coverage-e2e coverage-total deny ci run tui clean
