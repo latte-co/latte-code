@@ -1091,6 +1091,7 @@ mod tests {
     #[test]
     fn classifies_argv_shell_and_high_risk() {
         let lease = Lease {
+            scope: "runtime".into(),
             owner: "o".into(),
             fencing_token: 1,
             expires_at_ms: 1,
@@ -1222,6 +1223,7 @@ mod tests {
         assert_eq!(configured.stderr_cap, 1);
 
         let lease = Lease {
+            scope: "runtime".into(),
             owner: "owner".into(),
             fencing_token: 7,
             expires_at_ms: 99,

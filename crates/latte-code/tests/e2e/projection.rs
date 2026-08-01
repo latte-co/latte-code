@@ -36,13 +36,14 @@ fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::Thre
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let lease = engine
-        .acquire_lease("projection-fixture", 1_000, 60_000)
-        .unwrap();
     let ids = SystemIdSource::default();
+    let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+    let lease = engine
+        .acquire_thread_lease(thread_id, 1_000, 60_000)
+        .unwrap();
     let snapshot = engine
         .create_thread_v2(
-            ThreadId::from_uuid(ids.next_uuid_v7()),
+            thread_id,
             latte_core::RunId::from_uuid(ids.next_uuid_v7()),
             binding(),
             "fixture prompt",
@@ -107,6 +108,7 @@ fn finish_fixture(engine: EngineHandle, lease: &Lease) {
 }
 
 fn render_fixture(scenario: &Scenario, expected: &[u8], rows: u16, columns: u16) -> PtySession {
+    scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
     assert!(
@@ -336,6 +338,21 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
         finish_fixture(engine, &lease);
 
         let mut pty = render_fixture(&scenario, expected, 28, 82);
+        if matches!(state, "failed" | "interrupted") {
+            let output_start = pty.output().len();
+            pty.write(b"/new\r");
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    let output = pty.output();
+                    output.get(output_start..).is_some_and(|tail| {
+                        tail.windows(b"Describe an outcome".len())
+                            .any(|window| window == b"Describe an outcome")
+                    })
+                }),
+                "terminal Session could not switch to /new: {}",
+                String::from_utf8_lossy(&pty.output())
+            );
+        }
         pty.write(F10);
         assert!(pty.finish(Duration::from_secs(5)).0.success());
     }
@@ -345,6 +362,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
 #[test]
 fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
     let narrow = Scenario::new();
+    narrow.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let mut narrow_pty = PtySession::spawn_with_size(narrow.command(&["tui"]), 9, 38);
     assert!(narrow_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
     assert!(narrow_pty.wait_for_output(b"Latte Code", Duration::from_secs(5)));

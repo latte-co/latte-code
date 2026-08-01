@@ -8,6 +8,7 @@
 pub enum BuiltinCommand {
     New,
     Sessions,
+    Model,
     Help,
     Navigation,
     Refresh,
@@ -64,6 +65,15 @@ pub const BUILTINS: &[CommandDescriptor] = &[
         argument_hint: Some("[session-id or exact title]"),
         kind: CommandKind::TypedAction,
         arguments: ArgumentPolicy::Optional,
+    },
+    CommandDescriptor {
+        id: BuiltinCommand::Model,
+        name: "model",
+        aliases: NO_ALIASES,
+        description: "Select a provider and model",
+        argument_hint: None,
+        kind: CommandKind::LocalUi,
+        arguments: ArgumentPolicy::None,
     },
     CommandDescriptor {
         id: BuiltinCommand::Help,
@@ -273,7 +283,7 @@ mod tests {
             vec![BuiltinCommand::Refresh, BuiltinCommand::Sessions]
         );
         assert_eq!(slash_suggestions("/resu"), vec![&BUILTINS[1]]);
-        assert_eq!(slash_suggestions("/help"), vec![&BUILTINS[2]]);
+        assert_eq!(slash_suggestions("/help"), vec![&BUILTINS[3]]);
     }
 
     #[test]

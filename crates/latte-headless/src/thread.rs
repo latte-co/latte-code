@@ -121,6 +121,25 @@ pub struct ThreadRuntimeService {
     lease_ttl_ms: u64,
 }
 
+struct ThreadLeaseGuard {
+    engine: EngineHandle,
+    lease: Lease,
+}
+
+impl std::ops::Deref for ThreadLeaseGuard {
+    type Target = Lease;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lease
+    }
+}
+
+impl Drop for ThreadLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self.engine.release_lease(&self.lease);
+    }
+}
+
 impl ThreadRuntimeService {
     #[must_use]
     pub fn new(
@@ -167,7 +186,8 @@ impl ThreadRuntimeService {
     }
 
     /// Starts a new v2 conversation. The complete non-secret binding is
-    /// validated before provider construction can resolve an environment key.
+    /// validated and the accepted user submission is persisted before
+    /// provider construction can resolve an environment key.
     pub async fn start(
         &self,
         thread_id: ThreadId,
@@ -178,28 +198,26 @@ impl ThreadRuntimeService {
             .validate()
             .map_err(ThreadRuntimeError::ProviderConfiguration)?;
         let messages = self.initial_messages(&prompt)?;
-        // Resolve credentials and provider configuration while the new
-        // conversation is still an in-memory draft. A rejected binding must
-        // not manufacture a durable failed Session.
-        let provider = (self.provider)(&binding).map_err(|_| {
-            ThreadRuntimeError::ProviderConfiguration(provider_configuration_failure_message())
-        })?;
         let run_id = new_run_id();
         let now = now_ms();
         let lease = self.acquire(thread_id)?;
-        let created = self
+        let started = self
             .engine
-            .create_thread_v2(thread_id, run_id, binding, &prompt, now)?;
-        let started = self.commit(
-            thread_id,
-            run_id,
-            created.revision,
-            0,
-            CommitThreadRunUpdate::Start {
-                source_key: format!("{run_id}:start"),
-            },
-            &lease,
-        )?;
+            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)?;
+        // Provider construction is runtime work, not submission validation.
+        // Once the user card is durable, a missing credential or invalid model
+        // becomes a visible retryable child failure instead of restoring the
+        // composer and making the accepted prompt appear to vanish.
+        let Ok(provider) = (self.provider)(&started.binding) else {
+            return self.fail_retryable(
+                thread_id,
+                run_id,
+                started.revision,
+                active_run_revision(&started)?,
+                provider_configuration_failure_message(),
+                &lease,
+            );
+        };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
     }
@@ -218,30 +236,61 @@ impl ThreadRuntimeService {
             return Err(ThreadRuntimeError::InvalidState);
         }
         let messages = self.history_with_prompt(&snapshot, &prompt)?;
-        let provider = (self.provider)(&snapshot.binding).map_err(|_| {
-            ThreadRuntimeError::ProviderConfiguration(provider_configuration_failure_message())
-        })?;
         let run_id = new_run_id();
         let lease = self.acquire(thread_id)?;
-        let created = self.engine.create_thread_follow_up_v2(
+        let started = self.engine.create_started_thread_follow_up_v2(
             thread_id,
             run_id,
             expected_thread_revision,
             &prompt,
+            &lease,
             now_ms(),
         )?;
-        let started = self.commit(
-            thread_id,
-            run_id,
-            created.revision,
-            0,
-            CommitThreadRunUpdate::Start {
-                source_key: format!("{run_id}:start"),
-            },
-            &lease,
-        )?;
+        let Ok(provider) = (self.provider)(&started.binding) else {
+            return self.fail_retryable(
+                thread_id,
+                run_id,
+                started.revision,
+                active_run_revision(&started)?,
+                provider_configuration_failure_message(),
+                &lease,
+            );
+        };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
+    }
+
+    /// Persists an explicit provider/model selection for subsequent children.
+    /// Credential resolution remains deferred until the next accepted prompt.
+    pub fn switch_model(
+        &self,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        binding: &ThreadProviderBindingV2,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        binding
+            .validate()
+            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
+        let snapshot = self.load_full(thread_id)?;
+        if snapshot.revision != expected_thread_revision
+            || !snapshot.lifecycle.accepts_follow_up()
+            || snapshot.active_run_id.is_some()
+        {
+            return Err(ThreadRuntimeError::InvalidState);
+        }
+        if snapshot.binding == *binding {
+            return Ok(snapshot);
+        }
+        let lease = self.acquire(thread_id)?;
+        self.engine
+            .switch_thread_binding_v2(
+                thread_id,
+                expected_thread_revision,
+                binding,
+                &lease,
+                now_ms(),
+            )
+            .map_err(Into::into)
     }
 
     /// Provides a non-secret request value and continues the same child.
@@ -313,26 +362,38 @@ impl ThreadRuntimeService {
         {
             return Err(ThreadRuntimeError::InvalidState);
         }
+        let verification = request_id.starts_with(THREAD_VERIFICATION_EFFECT_PREFIX);
+        // Validate the immutable Provider binding before approval can start an
+        // external effect. A configuration/model mismatch is not authority to
+        // consume permission or execute the tool; the Session remains at the
+        // same durable waiting boundary so the user can choose another path.
+        let provider = if allow && !verification {
+            Some(
+                (self.provider)(&snapshot.binding)
+                    .map_err(ThreadRuntimeError::ProviderConfiguration)?,
+            )
+        } else {
+            None
+        };
         let lease = self.acquire(thread_id)?;
-        let resolved = self.commit(
+        let resolved = self.engine.resolve_thread_effect_permission(
             thread_id,
             run_id,
             snapshot.revision,
             run_revision,
-            CommitThreadRunUpdate::ResolvePermission {
-                source_key: format!(
-                    "{run_id}:permission:{request_id}:{}",
-                    if allow { "allow" } else { "deny" }
-                ),
-                request_id: request_id.clone(),
-                allow,
-            },
+            request_id.clone(),
+            format!(
+                "{run_id}:permission:{request_id}:{}",
+                if allow { "allow" } else { "deny" }
+            ),
+            allow,
+            ThreadCommandId::from_uuid(Uuid::now_v7()),
             &lease,
+            now_ms(),
         )?;
         if !allow {
             return Ok(resolved);
         }
-        let verification = request_id.starts_with(THREAD_VERIFICATION_EFFECT_PREFIX);
         // The assistant card is the durable, ordered queue for the complete
         // provider tool round.  Do not reconstruct a new provider turn after
         // this one approved call: OpenAI-compatible history requires a tool
@@ -364,8 +425,11 @@ impl ThreadRuntimeService {
         let (round_sequence, calls, ordinal) = continuation.ok_or_else(|| {
             ThreadRuntimeError::Effect("provider tool continuation is missing".into())
         })?;
-        let provider = (self.provider)(&after_effect.binding)
-            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
+        let provider = provider.ok_or_else(|| {
+            ThreadRuntimeError::ProviderConfiguration(
+                "provider was not resolved before effect approval".into(),
+            )
+        })?;
         let messages = self.history_from_snapshot(&after_effect)?;
         self.continue_provider_tool_round(
             after_effect,
@@ -642,7 +706,7 @@ impl ThreadRuntimeService {
         &self,
         snapshot: ThreadSnapshot,
         summary: String,
-        lease: Lease,
+        lease: ThreadLeaseGuard,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let run_id = snapshot
             .active_run_id
@@ -742,7 +806,7 @@ impl ThreadRuntimeService {
         mut messages: Vec<Message>,
         response: crate::provider::ProviderResponse,
         provider: Arc<dyn Provider>,
-        lease: Lease,
+        lease: ThreadLeaseGuard,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let thread_id = snapshot.thread_id;
         let run_id = snapshot
@@ -821,7 +885,7 @@ impl ThreadRuntimeService {
         start_ordinal: usize,
         round_sequence: u64,
         provider: Arc<dyn Provider>,
-        lease: Lease,
+        lease: ThreadLeaseGuard,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let run_id = current
             .active_run_id
@@ -1019,7 +1083,7 @@ impl ThreadRuntimeService {
         snapshot: ThreadSnapshot,
         messages: Vec<Message>,
         provider: Arc<dyn Provider>,
-        lease: Lease,
+        lease: ThreadLeaseGuard,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let thread_id = snapshot.thread_id;
         let run_id = snapshot
@@ -1099,7 +1163,7 @@ impl ThreadRuntimeService {
                 },
                 &lease,
             ),
-            Err(error) => self.fail(
+            Err(error) => self.fail_retryable(
                 thread_id,
                 run_id,
                 snapshot.revision,
@@ -1216,6 +1280,49 @@ impl ThreadRuntimeService {
         message: String,
         lease: &Lease,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        self.fail_with_retryability(
+            thread_id,
+            run_id,
+            thread_revision,
+            run_revision,
+            &message,
+            Retryability::Terminal,
+            lease,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    fn fail_retryable(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        thread_revision: u64,
+        run_revision: u64,
+        message: String,
+        lease: &Lease,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        self.fail_with_retryability(
+            thread_id,
+            run_id,
+            thread_revision,
+            run_revision,
+            &message,
+            Retryability::Retryable,
+            lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_with_retryability(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        thread_revision: u64,
+        run_revision: u64,
+        message: &str,
+        retryability: Retryability,
+        lease: &Lease,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         self.commit(
             thread_id,
             run_id,
@@ -1225,8 +1332,8 @@ impl ThreadRuntimeService {
                 source_key: format!("{run_id}:failure"),
                 failure: RunFailure {
                     code: FailureCode::RuntimeFailed,
-                    message: redact_thread_text(&message),
-                    retryability: Retryability::Terminal,
+                    message: redact_thread_text(message),
+                    retryability,
                 },
             },
             lease,
@@ -1262,13 +1369,13 @@ impl ThreadRuntimeService {
             .map_err(Into::into)
     }
 
-    fn acquire(&self, thread_id: ThreadId) -> Result<Lease, ThreadRuntimeError> {
+    fn acquire(&self, thread_id: ThreadId) -> Result<ThreadLeaseGuard, ThreadRuntimeError> {
         self.engine
-            .acquire_lease(
-                &format!("thread-{thread_id}"),
-                now_ms(),
-                self.authority_ttl(),
-            )
+            .acquire_thread_lease(thread_id, now_ms(), self.authority_ttl())
+            .map(|lease| ThreadLeaseGuard {
+                engine: self.engine.clone(),
+                lease,
+            })
             .map_err(Into::into)
     }
 
@@ -1363,7 +1470,7 @@ impl ThreadRuntimeService {
 }
 
 fn provider_configuration_failure_message() -> String {
-    "The selected model could not be started. Check provider configuration and credentials before starting a new conversation."
+    "The selected model could not be started. Check provider configuration and credentials, then retry in this conversation."
         .into()
 }
 
@@ -1591,7 +1698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_provider_configuration_failure_leaves_new_session_transient() {
+    async fn start_provider_configuration_failure_is_durable_and_retryable() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -1607,20 +1714,41 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
 
-        let error = service
+        let failed = service
             .start(thread_id, "durable prompt".into(), binding())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(error, ThreadRuntimeError::ProviderConfiguration(message)
-            if message == provider_configuration_failure_message())
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready);
+        assert!(failed.active_run_id.is_none());
+        assert_eq!(failed.runs.len(), 1);
+        assert_eq!(failed.runs[0].status, latte_core::ThreadRunStatus::Failed);
+        let expected_failure = provider_configuration_failure_message();
+        assert_eq!(
+            failed
+                .transcript
+                .entries
+                .iter()
+                .map(|entry| (entry.kind, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (TranscriptKind::User, "durable prompt"),
+                (TranscriptKind::Failure, expected_failure.as_str())
+            ]
         );
-        assert!(engine.list_threads_v2().unwrap().is_empty());
+        assert_eq!(
+            engine.show(failed.runs[0].run_id).unwrap().failure,
+            Some(RunFailure {
+                code: FailureCode::RuntimeFailed,
+                message: expected_failure,
+                retryability: Retryability::Retryable,
+            })
+        );
+        assert_eq!(engine.list_threads_v2().unwrap(), [failed]);
     }
 
     #[tokio::test]
-    async fn follow_up_provider_configuration_failure_leaves_parent_unchanged() {
+    async fn follow_up_provider_configuration_failure_records_child_and_allows_retry() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -1628,22 +1756,32 @@ mod tests {
             .unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_calls = calls.clone();
-        let provider = Arc::new(FakeProvider::scripted([ProviderResponse {
-            message: Some("first complete".into()),
-            tool_calls: vec![],
-            input_request: None,
-            usage: crate::provider::ProviderUsage::default(),
-            finish_reason: None,
-            provider_state: None,
-        }]));
+        let provider = Arc::new(FakeProvider::scripted([
+            ProviderResponse {
+                message: Some("first complete".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+            ProviderResponse {
+                message: Some("retry complete".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+        ]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
-            if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err("secret reference PROVIDER_SECRET_NAME is unavailable".into())
+            } else {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
                     binding: crate::registry::ProviderBinding::direct(&[]),
                 })
-            } else {
-                Err("secret reference PROVIDER_SECRET_NAME is unavailable".into())
             }
         });
         let service = ThreadRuntimeService::new(
@@ -1658,19 +1796,42 @@ mod tests {
             .await
             .unwrap();
 
-        let error = service
+        let failed = service
             .follow_up(thread_id, complete.revision, "durable follow-up".into())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(error, ThreadRuntimeError::ProviderConfiguration(message)
-            if message == provider_configuration_failure_message())
-        );
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(failed.runs.len(), 2);
         assert_eq!(
-            engine.thread_snapshot_v2(thread_id, None, 100).unwrap(),
-            complete
+            failed.runs[0].status,
+            latte_core::ThreadRunStatus::Completed
         );
+        assert_eq!(failed.runs[1].status, latte_core::ThreadRunStatus::Failed);
+        assert!(failed.transcript.entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::User && entry.text == "durable follow-up"
+        }));
+        assert!(failed.transcript.entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::Failure
+                && entry.text == provider_configuration_failure_message()
+        }));
+
+        let retried = service
+            .follow_up(thread_id, failed.revision, "retry after config fix".into())
+            .await
+            .unwrap();
+        assert_eq!(retried.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(retried.runs.len(), 3);
+        assert_eq!(
+            retried.runs[2].status,
+            latte_core::ThreadRunStatus::Completed
+        );
+        assert!(retried.transcript.entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::User && entry.text == "retry after config fix"
+        }));
+        assert!(retried.transcript.entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::Assistant && entry.text == "retry complete"
+        }));
     }
 
     #[tokio::test]
@@ -1785,6 +1946,55 @@ mod tests {
         ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
     }
 
+    #[tokio::test]
+    async fn ready_session_model_switch_is_validated_persisted_and_revision_guarded() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("complete"), vec![])],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "initial".into(), binding())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .switch_model(thread_id, ready.revision, &ready.binding)
+                .unwrap(),
+            ready
+        );
+        let mut invalid = binding();
+        invalid.provider_name.clear();
+        assert!(matches!(
+            service.switch_model(thread_id, ready.revision, &invalid),
+            Err(ThreadRuntimeError::ProviderConfiguration(_))
+        ));
+        let mut next = binding();
+        next.provider_name = "other".into();
+        next.model = "reasoning".into();
+        next.config_fingerprint = "other-config".into();
+        assert!(matches!(
+            service.switch_model(thread_id, ready.revision + 1, &next),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+
+        let switched = service
+            .switch_model(thread_id, ready.revision, &next)
+            .unwrap();
+        assert_eq!(switched.binding, next);
+        assert!(switched.transcript.entries.iter().any(|entry| {
+            entry.kind == TranscriptKind::System
+                && entry.text == "Model switched to other/reasoning"
+        }));
+    }
+
     #[cfg(unix)]
     fn passing_verification() -> VerificationPlan {
         VerificationPlan {
@@ -1822,7 +2032,7 @@ mod tests {
     fn force_lease_renewal_failure(database: &std::path::Path) {
         let changed = rusqlite::Connection::open(database)
             .unwrap()
-            .execute("DELETE FROM runtime_lease WHERE singleton=1", [])
+            .execute("DELETE FROM runtime_lease", [])
             .unwrap();
         assert_eq!(changed, 1, "the active coordinator lease must exist");
     }
@@ -2716,7 +2926,7 @@ mod tests {
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
         let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing).is_err());
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -3191,13 +3401,53 @@ mod tests {
             tokio::spawn(async move { runner.start(thread_id, "wait".into(), binding()).await });
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
-            engine.acquire_lease("competing-owner", now_ms(), 60),
+            engine.acquire_thread_lease(thread_id, now_ms(), 60),
             Err(StorageError::EngineUnavailable)
         ));
+        let parallel = engine
+            .acquire_thread_lease(ThreadId::from_uuid(Uuid::now_v7()), now_ms(), 60)
+            .unwrap();
+        engine.release_lease(&parallel).unwrap();
         assert_eq!(
             run.await.unwrap().unwrap().lifecycle,
             ThreadLifecycle::Ready
         );
+        let resumed = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60)
+            .unwrap();
+        engine.release_lease(&resumed).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_sessions_run_concurrently_without_sharing_runtime_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let factory: ThreadProviderFactory = Arc::new(|_| {
+            Ok(ResolvedProvider {
+                provider: Arc::new(DelayedProvider::scripted([(
+                    Duration::from_millis(200),
+                    response(Some("done"), vec![]),
+                )])),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let first = service.clone();
+        let second = service.clone();
+        let first_thread = ThreadId::from_uuid(Uuid::now_v7());
+        let second_thread = ThreadId::from_uuid(Uuid::now_v7());
+
+        let (first, second) = tokio::join!(
+            first.start(first_thread, "first".into(), binding()),
+            second.start(second_thread, "second".into(), binding()),
+        );
+
+        assert_eq!(first.unwrap().lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(second.unwrap().lifecycle, ThreadLifecycle::Ready);
     }
 
     #[tokio::test]
@@ -3346,10 +3596,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         tokio::time::sleep(Duration::from_millis(450)).await;
-        assert!(matches!(
-            engine.acquire_lease("competing-owner", now_ms(), 60),
-            Err(StorageError::EngineUnavailable)
-        ));
+        let parallel = engine
+            .acquire_thread_lease(ThreadId::from_uuid(Uuid::now_v7()), now_ms(), 60)
+            .unwrap();
+        engine.release_lease(&parallel).unwrap();
         service.cancel(thread_id);
         let terminal = run.await.unwrap().unwrap();
         assert_eq!(terminal.lifecycle, ThreadLifecycle::ReconciliationRequired);
@@ -3500,7 +3750,7 @@ mod tests {
             .create_thread_v2(thread_id, run_id, binding(), "recover", 1)
             .unwrap();
         let lease = engine
-            .acquire_lease("thread-recovery", now_ms(), 10_000)
+            .acquire_thread_lease(thread_id, now_ms(), 10_000)
             .unwrap();
         let running = engine
             .commit_thread_run_update(
@@ -3624,7 +3874,7 @@ mod tests {
             .create_thread_v2(thread_id, run_id, binding(), "prepare", 1)
             .unwrap();
         let lease = engine
-            .acquire_lease("thread-prepared", now_ms(), 100)
+            .acquire_thread_lease(thread_id, now_ms(), 100)
             .unwrap();
         let running = engine
             .commit_thread_run_update(
@@ -3907,8 +4157,22 @@ mod tests {
 
         let mut running = verified.commit(thread_id, run_id, 0, 0, CommitThreadRunUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
         assert!(verified.recover_lease_loss(&running, &live, "test").to_string().contains("recovery failed"));
-        verified.engine.release_lease(&live).unwrap(); let mut mismatched = running.clone(); mismatched.runs[0].run_revision += 1; assert!(verified.recover_lease_loss(&mismatched, &live, "test").to_string().contains("newer owner fenced"));
-        let live = verified.acquire(thread_id).unwrap();
+        let takeover = verified
+            .engine
+            .acquire_thread_lease(thread_id, live.expires_at_ms(), 60_000)
+            .unwrap();
+        let mut mismatched = running.clone();
+        mismatched.runs[0].run_revision += 1;
+        assert!(
+            verified
+                .recover_lease_loss(&mismatched, &live, "test")
+                .to_string()
+                .contains("newer owner fenced")
+        );
+        let live = ThreadLeaseGuard {
+            engine: verified.engine.clone(),
+            lease: takeover,
+        };
         for index in 0..501 { running = verified.commit(thread_id, run_id, running.revision, 1, CommitThreadRunUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
         assert_eq!(verified.load_full(thread_id).unwrap().transcript.entries.len(), 502);
         let mut observed = running.clone();

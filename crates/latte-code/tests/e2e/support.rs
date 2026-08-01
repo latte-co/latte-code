@@ -73,7 +73,7 @@ impl Scenario {
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();
@@ -86,11 +86,28 @@ impl Scenario {
         database_path: &str,
         provider_fields: &str,
     ) {
+        self.write_config_with_model(
+            endpoint,
+            verification,
+            database_path,
+            "mock",
+            provider_fields,
+        );
+    }
+
+    pub fn write_config_with_model(
+        &self,
+        endpoint: &str,
+        verification: &str,
+        database_path: &str,
+        model: &str,
+        provider_fields: &str,
+    ) {
         std::fs::create_dir_all(self.root.path().join(".latte")).unwrap();
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/{model}",providers:{{main:{{type:"openai-chat",models:[{model:?}],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();
@@ -132,11 +149,7 @@ impl Scenario {
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {
-        self.tui_database_path()
-    }
-
-    pub fn tui_database_path(&self) -> std::path::PathBuf {
-        self.home().join(".latte/latte-code/state.db")
+        self.root.path().join(".latte/latte-code.db")
     }
 }
 
@@ -245,6 +258,10 @@ pub struct ProviderReply {
 }
 
 impl ProviderReply {
+    pub fn error(status: u16, message: &str) -> Self {
+        Self::json(status, &serde_json::json!({"error":{"message":message}}))
+    }
+
     pub fn completion(content: &str) -> Self {
         Self::json(
             200,

@@ -109,10 +109,17 @@ fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_thread_bud
         );
     }
 
-    let legacy_database_setting = isolated_output(&["--json", "list"], |scenario, _| {
+    let parentless_database = isolated_output(&["--json", "list"], |scenario, _| {
         scenario.write_config_with_database("http://127.0.0.1:1", r#"["/usr/bin/true"]"#, "/");
     });
-    assert!(legacy_database_setting.status.success());
+    assert_eq!(parentless_database.status.code(), Some(2));
+    assert_eq!(json(&parentless_database)["error"]["code"], "configuration");
+    assert!(
+        json(&parentless_database)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("database.path must have a parent directory")
+    );
 }
 
 #[test]
@@ -129,9 +136,13 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
             .contains("cannot read")
     );
 
-    let blocked_database_parent = isolated_output(&["--json", "list"], |scenario, command| {
+    let blocked_database_parent = isolated_output(&["--json", "list"], |scenario, _| {
         std::fs::write(scenario.root().join("blocked-parent"), "not a directory").unwrap();
-        command.env("LATTE_CODE_HOME", scenario.root().join("blocked-parent"));
+        scenario.write_config_with_database(
+            "http://127.0.0.1:1",
+            r#"["/usr/bin/true"]"#,
+            "blocked-parent/state.db",
+        );
     });
     assert_eq!(blocked_database_parent.status.code(), Some(70));
     assert_eq!(
@@ -145,10 +156,13 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
             .contains("cannot create")
     );
 
-    let database_is_directory = isolated_output(&["--json", "list"], |scenario, command| {
-        let state_home = scenario.root().join("state-home");
-        std::fs::create_dir_all(state_home.join("state.db")).unwrap();
-        command.env("LATTE_CODE_HOME", state_home);
+    let database_is_directory = isolated_output(&["--json", "list"], |scenario, _| {
+        std::fs::create_dir(scenario.root().join("database-directory")).unwrap();
+        scenario.write_config_with_database(
+            "http://127.0.0.1:1",
+            r#"["/usr/bin/true"]"#,
+            "database-directory",
+        );
     });
     assert_eq!(database_is_directory.status.code(), Some(70));
     assert_eq!(
@@ -177,8 +191,8 @@ fn nested_build_directory_discovers_workspace_and_uses_defaults() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(scenario.database_path().exists());
-    assert!(!nested.join(".latte/latte-code/state.db").exists());
+    assert!(scenario.root().join(".latte/latte-code.db").exists());
+    assert!(!nested.join(".latte/latte-code.db").exists());
 }
 
 #[test]
@@ -199,22 +213,23 @@ fn home_and_workspace_configuration_precedence_reaches_the_final_binary() {
 
     let output = scenario.output(&["--json", "list"], |_| {});
     assert!(output.status.success());
-    assert!(scenario.database_path().exists());
-    assert!(!scenario.root().join("state/from-workspace.db").exists());
+    assert!(scenario.root().join("state/from-workspace.db").exists());
     assert!(!scenario.root().join("state/from-home.db").exists());
 }
 
 #[test]
 #[allow(clippy::too_many_lines)]
 fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
-    let missing = isolated_output(&["--json", "run", "do work"], |_, _| {});
+    let missing = isolated_output(&["--json", "run", "do work"], |scenario, _| {
+        scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
+    });
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(json(&missing)["error"]["code"], "configuration");
     assert!(
         json(&missing)["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("OPENAI_API_KEY")
+            .contains("TEST_OPENAI_KEY")
     );
 
     let missing_deny = isolated_output(

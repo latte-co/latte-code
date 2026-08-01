@@ -57,8 +57,8 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     let listed = execute(&["list"], true);
     assert!(listed.status.success());
     assert!(String::from_utf8_lossy(&listed.stdout).contains(&run_id));
-    assert!(scenario.database_path().exists());
-    assert!(!scenario.root().join("state/nested/custom.db").exists());
+    assert!(scenario.root().join("state/nested/custom.db").exists());
+    assert!(!scenario.database_path().exists());
     provider.assert_consumed();
 
     let denied_scenario = Scenario::new();
@@ -100,7 +100,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     assert!(json(&shown_denied)["data"]["run"]["pending_permission"].is_null());
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(denied_scenario.root())
-        .database_path(denied_scenario.database_path())
+        .database_path(denied_scenario.root().join("state/deny.db"))
         .build()
         .unwrap();
     assert_eq!(

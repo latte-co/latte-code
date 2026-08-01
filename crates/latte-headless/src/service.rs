@@ -168,7 +168,7 @@ impl RuntimeCommandService {
                     let now = wall_time_ms();
                     let lease = self
                         .engine
-                        .acquire_lease(&format!("agent-{run_id}"), now, 60_000)
+                        .acquire_run_lease(run_id, &format!("agent-{run_id}"), now, 60_000)
                         .map_err(|e| CommandError::Storage(e.to_string()))?;
                     let denied = self
                         .engine
@@ -206,7 +206,7 @@ impl RuntimeCommandService {
                     let now = wall_time_ms();
                     let lease = self
                         .engine
-                        .acquire_lease(&format!("agent-{run_id}"), now, 60_000)
+                        .acquire_run_lease(run_id, &format!("agent-{run_id}"), now, 60_000)
                         .map_err(|e| CommandError::Storage(e.to_string()))?;
                     self.engine
                         .cancel_waiting_run(run_id, expected_revision, &lease, now)
@@ -279,7 +279,7 @@ impl RuntimeCommandService {
             .map_err(|e| CommandError::Storage(e.to_string()))?;
         let lease = self
             .engine
-            .acquire_lease(&format!("reconcile-{run_id}"), now, 60_000)
+            .acquire_run_lease(run_id, &format!("reconcile-{run_id}"), now, 60_000)
             .map_err(|e| CommandError::Storage(e.to_string()))?;
         let result = self
             .engine

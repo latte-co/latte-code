@@ -186,7 +186,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     let now = latte_core::wall_time_ms();
     let input_thread_id = thread_id();
     let lease = engine
-        .acquire_lease("v2-boundary-input-fixture", now, 120_000)
+        .acquire_thread_lease(input_thread_id, now, 120_000)
         .unwrap();
     let input_run_id = run_id();
     let input = engine
@@ -254,7 +254,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     let permission_now = latte_core::wall_time_ms();
     let permission_thread_id = thread_id();
     let lease = engine
-        .acquire_lease("v2-boundary-permission-fixture", permission_now, 120_000)
+        .acquire_thread_lease(permission_thread_id, permission_now, 120_000)
         .unwrap();
     let permission_run_id = run_id();
     let permission = engine
@@ -334,24 +334,31 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let lease = engine
-        .acquire_lease("v2-boundary-failures", now, 120_000)
+    let effect_thread_id = thread_id();
+    let effect_lease = engine
+        .acquire_thread_lease(effect_thread_id, now, 120_000)
         .unwrap();
 
     let effect_run_id = run_id();
     let effect = engine
         .create_thread_v2(
-            thread_id(),
+            effect_thread_id,
             effect_run_id,
             binding(),
             "boundary observed failure",
             now + 1,
         )
         .unwrap();
-    let effect = start(&engine, &lease, &effect, "boundary:effect:start", now + 2);
+    let effect = start(
+        &engine,
+        &effect_lease,
+        &effect,
+        "boundary:effect:start",
+        now + 2,
+    );
     let prepared = prepare_effect(
         &engine,
-        &lease,
+        &effect_lease,
         &effect,
         "boundary-observed-failure",
         "read_file",
@@ -361,7 +368,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert_eq!(prepared.policy, ThreadEffectPolicy::Allow);
     let started = start_effect(
         &engine,
-        &lease,
+        &effect_lease,
         &prepared,
         "boundary-observed-failure",
         now + 4,
@@ -380,13 +387,13 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
                 })),
                 success: false,
             },
-            &lease,
+            &effect_lease,
             now + 5,
         )
         .unwrap();
     let effect_failed = commit(
         &engine,
-        &lease,
+        &effect_lease,
         &observed.snapshot,
         CommitThreadRunUpdate::Fail {
             source_key: "boundary:effect:terminal".into(),
@@ -401,6 +408,9 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert_eq!(effect_failed.lifecycle, ThreadLifecycle::Failed);
 
     let tree_thread_id = thread_id();
+    let tree_lease = engine
+        .acquire_thread_lease(tree_thread_id, now + 7, 120_000)
+        .unwrap();
     let parent_run_id = run_id();
     let parent = engine
         .create_thread_v2(
@@ -411,10 +421,16 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
             now + 7,
         )
         .unwrap();
-    let parent = start(&engine, &lease, &parent, "boundary:parent:start", now + 8);
+    let parent = start(
+        &engine,
+        &tree_lease,
+        &parent,
+        "boundary:parent:start",
+        now + 8,
+    );
     let parent = commit(
         &engine,
-        &lease,
+        &tree_lease,
         &parent,
         CommitThreadRunUpdate::Complete {
             source_key: "boundary:parent:complete".into(),
@@ -438,10 +454,16 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
             now + 10,
         )
         .unwrap();
-    let child = start(&engine, &lease, &child, "boundary:child:start", now + 11);
+    let child = start(
+        &engine,
+        &tree_lease,
+        &child,
+        "boundary:child:start",
+        now + 11,
+    );
     let child = commit(
         &engine,
-        &lease,
+        &tree_lease,
         &child,
         CommitThreadRunUpdate::Interrupt {
             source_key: "boundary:child:interrupt".into(),
@@ -453,10 +475,14 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert_eq!(child.runs[0], immutable_parent);
     assert_eq!(child.runs[1].parent_run_id, Some(parent_run_id));
 
+    let verification_thread_id = thread_id();
+    let verification_lease = engine
+        .acquire_thread_lease(verification_thread_id, now + 13, 120_000)
+        .unwrap();
     let verification_run_id = run_id();
     let verification = engine
         .create_thread_v2(
-            thread_id(),
+            verification_thread_id,
             verification_run_id,
             binding(),
             "boundary failed verification",
@@ -465,7 +491,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         .unwrap();
     let verification = start(
         &engine,
-        &lease,
+        &verification_lease,
         &verification,
         "boundary:verification:start",
         now + 14,
@@ -484,7 +510,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
                 stderr_truncated: false,
                 termination: ProcessTermination::Exited,
             },
-            &lease,
+            &verification_lease,
             now + 15,
         )
         .unwrap();
@@ -493,7 +519,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
             &verification,
             "must not complete".into(),
             "boundary-verification-failed".into(),
-            &lease,
+            &verification_lease,
             now + 16,
         )
         .unwrap_err();
@@ -505,7 +531,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     );
     let verification_failed = commit(
         &engine,
-        &lease,
+        &verification_lease,
         &verification,
         CommitThreadRunUpdate::Fail {
             source_key: "boundary:verification:terminal".into(),
@@ -518,7 +544,9 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         now + 17,
     );
     assert_eq!(verification_failed.lifecycle, ThreadLifecycle::Failed);
-    engine.release_lease(&lease).unwrap();
+    engine.release_lease(&effect_lease).unwrap();
+    engine.release_lease(&tree_lease).unwrap();
+    engine.release_lease(&verification_lease).unwrap();
     drop(engine);
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
@@ -575,10 +603,10 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let lease = engine
-        .acquire_lease("v2-command-boundary", now, 120_000)
-        .unwrap();
     let thread_id = thread_id();
+    let lease = engine
+        .acquire_thread_lease(thread_id, now, 120_000)
+        .unwrap();
     let run_id = run_id();
     let initial = engine
         .create_thread_v2(
@@ -743,10 +771,11 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         13
     );
 
-    assert!(matches!(
-        engine.acquire_lease("v2-live-foreign", now + 100, 120_000),
-        Err(StorageError::EngineUnavailable)
-    ));
+    let independent_runtime = engine
+        .acquire_lease("v2-live-foreign", now + 100, 120_000)
+        .unwrap();
+    assert_ne!(independent_runtime.fencing_token(), lease.fencing_token());
+    engine.release_lease(&independent_runtime).unwrap();
     let expired_request = ThreadCommitRequest {
         thread_id,
         run_id,
@@ -816,10 +845,10 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let lease = engine
-        .acquire_lease("v2-effect-authority", now, 120_000)
-        .unwrap();
     let thread_id = thread_id();
+    let lease = engine
+        .acquire_thread_lease(thread_id, now, 120_000)
+        .unwrap();
     let run_id = run_id();
     let initial = engine
         .create_thread_v2(

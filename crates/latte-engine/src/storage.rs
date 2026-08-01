@@ -13,7 +13,8 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
+const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// thread.  The bound prevents a single long-running conversation from
 /// allocating an unbounded amount of terminal projection memory while still
@@ -139,6 +140,11 @@ pub enum CommitThreadRunUpdate {
         source_key: String,
         request_id: String,
         allow: bool,
+        /// Engine-computed operation digest rebound to the coordinator lease
+        /// which is resolving a previously prepared Ask effect. Generic
+        /// permission states which do not authorize an effect leave this
+        /// empty.
+        rebound_operation_digest: Option<String>,
     },
     RequestInput {
         source_key: String,
@@ -228,11 +234,16 @@ pub struct ThreadCommitResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
+    pub(crate) scope: String,
     pub(crate) owner: String,
     pub(crate) fencing_token: u64,
     pub(crate) expires_at_ms: u64,
 }
 impl Lease {
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
@@ -298,12 +309,26 @@ pub(crate) struct Storage {
 
 impl Storage {
     pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
+        Self::open_with_legacy_workspace(path, None)
+    }
+
+    pub(crate) fn open_in_workspace(
+        path: &Path,
+        workspace_root: &str,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_legacy_workspace(path, Some(workspace_root))
+    }
+
+    fn open_with_legacy_workspace(
+        path: &Path,
+        legacy_workspace_root: Option<&str>,
+    ) -> Result<Self, StorageError> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        Self::bootstrap(&connection)?;
+        Self::bootstrap(&connection, legacy_workspace_root)?;
         let storage = Self {
             connection: Mutex::new(connection),
         };
@@ -316,14 +341,17 @@ impl Storage {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        Self::bootstrap(&connection)?;
+        Self::bootstrap(&connection, None)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
     }
 
     #[allow(clippy::too_many_lines)]
-    fn bootstrap(connection: &Connection) -> Result<(), StorageError> {
+    fn bootstrap(
+        connection: &Connection,
+        legacy_workspace_root: Option<&str>,
+    ) -> Result<(), StorageError> {
         let mut version: i64 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
@@ -527,8 +555,90 @@ impl Storage {
                     "ALTER TABLE threads_v2 ADD COLUMN workspace_root TEXT NOT NULL DEFAULT '';",
                 )?;
             }
+            let legacy_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM threads_v2 WHERE workspace_root=''",
+                [],
+                |row| row.get(0),
+            )?;
+            if legacy_count > 0 {
+                let workspace_root = legacy_workspace_root
+                    .map(validate_workspace_root)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(
+                            "legacy Sessions have no workspace identity; open this database from its original workspace before sharing it"
+                                .into(),
+                        )
+                    })?;
+                tx.execute(
+                    "UPDATE threads_v2 SET workspace_root=?1 WHERE workspace_root=''",
+                    [workspace_root],
+                )?;
+                let titles = {
+                    let mut statement = tx.prepare(
+                        "SELECT t.thread_id, x.entry_json FROM threads_v2 t \
+                         LEFT JOIN thread_transcript_v2 x ON x.thread_id=t.thread_id \
+                           AND x.seq=(SELECT MIN(y.seq) FROM thread_transcript_v2 y \
+                                      WHERE y.thread_id=t.thread_id AND y.kind='user') \
+                         WHERE t.title=''",
+                    )?;
+                    statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                for (thread_id, entry_json) in titles {
+                    let title = entry_json
+                        .as_deref()
+                        .map(serde_json::from_str::<TranscriptEntry>)
+                        .transpose()
+                        .map_err(invalid_json)?
+                        .map_or_else(
+                            || "Untitled session".into(),
+                            |entry| session_title(&entry.text),
+                        );
+                    tx.execute(
+                        "UPDATE threads_v2 SET title=?1 WHERE thread_id=?2 AND title=''",
+                        params![title, thread_id],
+                    )?;
+                }
+            }
             tx.execute_batch(
                 "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(9,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=9;",
+            )?;
+            tx.commit()?;
+            version = 9;
+        }
+        if version == 9 {
+            let tx = connection.unchecked_transaction()?;
+            // Runtime authority is isolated by scope (v2 uses
+            // `thread:{thread_id}` with a unique coordinator owner). Fencing
+            // tokens remain globally monotonic so startup recovery can still
+            // identify the exact live authority from the token persisted on a
+            // run.
+            tx.execute_batch(
+                r"
+                CREATE TABLE runtime_lease_v10(
+                  scope TEXT PRIMARY KEY,
+                  owner TEXT NOT NULL UNIQUE,
+                  fencing_token INTEGER NOT NULL,
+                  expires_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO runtime_lease_v10(scope,owner,fencing_token,expires_at_ms)
+                  SELECT 'runtime',owner,fencing_token,expires_at_ms FROM runtime_lease;
+                CREATE TABLE runtime_lease_epoch(
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  last_token INTEGER NOT NULL
+                );
+                INSERT INTO runtime_lease_epoch(singleton,last_token)
+                  SELECT 1,COALESCE(MAX(fencing_token),0) FROM runtime_lease;
+                DROP TABLE runtime_lease;
+                ALTER TABLE runtime_lease_v10 RENAME TO runtime_lease;
+                INSERT INTO schema_migrations(version,applied_at_ms)
+                  VALUES(10,CAST(strftime('%s','now') AS INTEGER)*1000);
+                PRAGMA user_version=10;
+                ",
             )?;
             tx.commit()?;
         }
@@ -624,6 +734,64 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         now_ms: u64,
     ) -> Result<ThreadSnapshot, StorageError> {
+        self.create_thread_v2_inner(
+            thread_id,
+            run_id,
+            binding,
+            workspace_root,
+            prompt,
+            baseline,
+            None,
+            now_ms,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Atomically creates the Session, durable user card, linked child, and
+    /// started run under the exact thread lease. There is no committed token-0
+    /// child for a caller to strand between acceptance and `Start`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_started_thread_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        binding: &ThreadProviderBindingV2,
+        workspace_root: &str,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        let (snapshot, thread_event) = self.create_thread_v2_inner(
+            thread_id,
+            run_id,
+            binding,
+            workspace_root,
+            prompt,
+            baseline,
+            Some(lease),
+            now_ms,
+        )?;
+        Ok(ThreadCommitResponse {
+            snapshot,
+            thread_event: thread_event.ok_or_else(|| {
+                StorageError::InvalidData("atomic thread start omitted its durable event".into())
+            })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn create_thread_v2_inner(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        binding: &ThreadProviderBindingV2,
+        workspace_root: &str,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        initial_lease: Option<&Lease>,
+        now_ms: u64,
+    ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
         binding.validate().map_err(StorageError::InvalidData)?;
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
@@ -633,18 +801,45 @@ impl Storage {
         }
         let workspace_root = validate_workspace_root(workspace_root)?;
         let title = session_title(&prompt);
+        let expected_scope = thread_lease_scope(thread_id);
+        if let Some(lease) = initial_lease {
+            require_lease_scope(lease, &expected_scope)?;
+        }
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state = RunState::queued(run_id);
+        if let Some(lease) = initial_lease {
+            let authoritative: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+                params![expected_scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+                |row| row.get(0),
+            )?;
+            if !authoritative {
+                return Err(StorageError::LeaseLost);
+            }
+        }
+        let queued = RunState::queued(run_id);
+        let state = if initial_lease.is_some() {
+            queued
+                .transition(0, Transition::Start)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?
+        } else {
+            queued
+        };
+        let run_sequence = u64::from(initial_lease.is_some());
+        let thread_revision = u64::from(initial_lease.is_some());
+        let thread_sequence = if initial_lease.is_some() { 2 } else { 1 };
+        let lease_token = initial_lease.map_or(0, |lease| lease.fencing_token);
         let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
         tx.execute(
-            "INSERT INTO runs(run_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,'queued',0,0,?3,?3)",
-            params![run_id.to_string(), state_json, to_i64(now_ms)?],
+            "INSERT INTO runs(run_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![run_id.to_string(), state_json, status_name(state.status), to_i64(state.revision)?, to_i64(run_sequence)?, to_i64(lease_token)?, to_i64(now_ms)?],
         )?;
         tx.execute(
-            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,0,0,?2)",
+            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
             params![
                 run_id.to_string(),
+                to_i64(state.revision)?,
+                to_i64(run_sequence)?,
                 serde_json::to_string(&state).map_err(invalid_json)?
             ],
         )?;
@@ -656,16 +851,20 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root) VALUES(?1,0,1,'running',?2,?3,?4,?4,?5,?6)",
-            params![thread_id.to_string(), serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8)",
+            params![thread_id.to_string(), to_i64(thread_revision)?, to_i64(thread_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root],
         )?;
         tx.execute(
             "INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
             params![run_id.to_string(), thread_id.to_string()],
         )?;
         tx.execute(
-            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,0)",
-            params![thread_id.to_string(), run_id.to_string()],
+            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,?3)",
+            params![
+                thread_id.to_string(),
+                run_id.to_string(),
+                to_i64(lease_token)?
+            ],
         )?;
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
@@ -683,9 +882,45 @@ impl Storage {
             "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
             params![thread_id.to_string(), entry.entry_id.to_string(), run_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
         )?;
-        let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+        let thread_event = if initial_lease.is_some() {
+            let run_event = EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::from_uuid(Uuid::now_v7()),
+                run_id,
+                revision: state.revision,
+                event: RuntimeEvent::StateChanged {
+                    status: RunStatus::Running,
+                },
+            };
+            tx.execute(
+                "INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
+                params![run_id.to_string(), run_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&run_event).map_err(invalid_json)?, to_i64(now_ms)?],
+            )?;
+            let envelope = ThreadEventEnvelope {
+                protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+                event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+                thread_id,
+                revision: thread_revision,
+                sequence: thread_sequence,
+                event: ThreadEvent::LifecycleChanged {
+                    lifecycle: ThreadLifecycle::Running,
+                    run_id: Some(run_id),
+                },
+            };
+            tx.execute(
+                "INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![thread_id.to_string(), to_i64(thread_sequence)?, envelope.event_id.to_string(), to_i64(thread_revision)?, serde_json::to_string(&envelope).map_err(invalid_json)?, to_i64(now_ms)?],
+            )?;
+            Some(StoredThreadEvent {
+                sequence: thread_sequence,
+                envelope,
+            })
+        } else {
+            None
+        };
+        let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
         tx.commit()?;
-        Ok(snapshot)
+        Ok((snapshot, thread_event))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -698,14 +933,79 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         now_ms: u64,
     ) -> Result<ThreadSnapshot, StorageError> {
+        self.create_thread_follow_up_v2_inner(
+            thread_id,
+            run_id,
+            expected_thread_revision,
+            prompt,
+            baseline,
+            None,
+            now_ms,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_started_thread_follow_up_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        let (snapshot, thread_event) = self.create_thread_follow_up_v2_inner(
+            thread_id,
+            run_id,
+            expected_thread_revision,
+            prompt,
+            baseline,
+            Some(lease),
+            now_ms,
+        )?;
+        Ok(ThreadCommitResponse {
+            snapshot,
+            thread_event: thread_event.ok_or_else(|| {
+                StorageError::InvalidData("atomic follow-up start omitted its durable event".into())
+            })?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn create_thread_follow_up_v2_inner(
+        &self,
+        thread_id: latte_core::ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        initial_lease: Option<&Lease>,
+        now_ms: u64,
+    ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
                 "thread follow-up must not be empty".into(),
             ));
         }
+        let expected_scope = thread_lease_scope(thread_id);
+        if let Some(lease) = initial_lease {
+            require_lease_scope(lease, &expected_scope)?;
+        }
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(lease) = initial_lease {
+            let authoritative: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+                params![expected_scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+                |row| row.get(0),
+            )?;
+            if !authoritative {
+                return Err(StorageError::LeaseLost);
+            }
+        }
         let (revision, lifecycle, latest): (i64, String, Option<String>) = tx
             .query_row(
                 "SELECT revision,lifecycle,latest_run_id FROM threads_v2 WHERE thread_id=?1",
@@ -741,9 +1041,15 @@ impl Storage {
             |row| row.get(0),
         )?;
         let parent_state: RunState = serde_json::from_str(&parent_state).map_err(invalid_json)?;
-        if parent_state.status != RunStatus::Completed {
+        let parent_accepts_follow_up = parent_state.status == RunStatus::Completed
+            || (parent_state.status == RunStatus::Failed
+                && parent_state
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.retryability == Retryability::Retryable));
+        if !parent_accepts_follow_up {
             return Err(StorageError::InvalidData(
-                "follow-up parent must be completed".into(),
+                "follow-up parent must be completed or retryably failed".into(),
             ));
         }
         let ordinal: u64 = from_i64(tx.query_row(
@@ -751,12 +1057,23 @@ impl Storage {
             [thread_id.to_string()],
             |row| row.get::<_, i64>(0),
         )?)?;
-        let state = RunState::queued(run_id);
-        tx.execute("INSERT INTO runs(run_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,'queued',0,0,?3,?3)",params![run_id.to_string(),serde_json::to_string(&state).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        let queued = RunState::queued(run_id);
+        let state = if initial_lease.is_some() {
+            queued
+                .transition(0, Transition::Start)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?
+        } else {
+            queued
+        };
+        let run_sequence = u64::from(initial_lease.is_some());
+        let lease_token = initial_lease.map_or(0, |lease| lease.fencing_token);
+        tx.execute("INSERT INTO runs(run_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![run_id.to_string(),serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(run_sequence)?,to_i64(lease_token)?,to_i64(now_ms)?])?;
         tx.execute(
-            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,0,0,?2)",
+            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
             params![
                 run_id.to_string(),
+                to_i64(state.revision)?,
+                to_i64(run_sequence)?,
                 serde_json::to_string(&state).map_err(invalid_json)?
             ],
         )?;
@@ -769,8 +1086,12 @@ impl Storage {
         )?;
         tx.execute("INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,?3,?4)",params![run_id.to_string(),thread_id.to_string(),parent,to_i64(ordinal)?])?;
         tx.execute(
-            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,0)",
-            params![thread_id.to_string(), run_id.to_string()],
+            "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,?3)",
+            params![
+                thread_id.to_string(),
+                run_id.to_string(),
+                to_i64(lease_token)?
+            ],
         )?;
         let next_revision = revision
             .checked_add(1)
@@ -811,9 +1132,169 @@ impl Storage {
         };
         tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![thread_id.to_string(),to_i64(seq)?,event.event_id.to_string(),to_i64(next_revision)?,serde_json::to_string(&event).map_err(invalid_json)?,to_i64(now_ms)?])?;
         tx.execute("UPDATE threads_v2 SET revision=?1,last_seq=?2,lifecycle='running',latest_run_id=?3,updated_at_ms=?4 WHERE thread_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,run_id.to_string(),to_i64(now_ms)?,thread_id.to_string()])?;
-        let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+        let thread_event = if initial_lease.is_some() {
+            let run_event = EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::from_uuid(Uuid::now_v7()),
+                run_id,
+                revision: state.revision,
+                event: RuntimeEvent::StateChanged {
+                    status: RunStatus::Running,
+                },
+            };
+            tx.execute(
+                "INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
+                params![run_id.to_string(), run_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&run_event).map_err(invalid_json)?, to_i64(now_ms)?],
+            )?;
+            let started_revision = next_revision
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidData("thread revision overflow".into()))?;
+            let started_sequence = seq
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidData("thread sequence overflow".into()))?;
+            let envelope = ThreadEventEnvelope {
+                protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+                event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+                thread_id,
+                revision: started_revision,
+                sequence: started_sequence,
+                event: ThreadEvent::LifecycleChanged {
+                    lifecycle: ThreadLifecycle::Running,
+                    run_id: Some(run_id),
+                },
+            };
+            tx.execute(
+                "INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![thread_id.to_string(), to_i64(started_sequence)?, envelope.event_id.to_string(), to_i64(started_revision)?, serde_json::to_string(&envelope).map_err(invalid_json)?, to_i64(now_ms)?],
+            )?;
+            tx.execute(
+                "UPDATE threads_v2 SET revision=?1,last_seq=?2 WHERE thread_id=?3",
+                params![
+                    to_i64(started_revision)?,
+                    to_i64(started_sequence)?,
+                    thread_id.to_string()
+                ],
+            )?;
+            Some(StoredThreadEvent {
+                sequence: started_sequence,
+                envelope,
+            })
+        } else {
+            None
+        };
+        let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
         tx.commit()?;
-        Ok(snapshot)
+        Ok((snapshot, thread_event))
+    }
+
+    pub(crate) fn switch_thread_binding_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        expected_thread_revision: u64,
+        binding: &ThreadProviderBindingV2,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        binding.validate().map_err(StorageError::InvalidData)?;
+        let expected_scope = thread_lease_scope(thread_id);
+        require_lease_scope(lease, &expected_scope)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authoritative: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![expected_scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+            |row| row.get(0),
+        )?;
+        if !authoritative {
+            return Err(StorageError::LeaseLost);
+        }
+        let (revision, sequence, lifecycle, current_binding): (i64, i64, String, String) = tx
+            .query_row(
+                "SELECT revision,last_seq,lifecycle,binding_json FROM threads_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+        let revision = from_i64(revision)?;
+        if revision != expected_thread_revision {
+            return Err(StorageError::StaleThreadRevision {
+                expected: expected_thread_revision,
+                actual: revision,
+            });
+        }
+        if lifecycle != "ready"
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_active_runs_v2 WHERE thread_id=?1)",
+                [thread_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Err(StorageError::InvalidData(
+                "model switching requires a ready thread with no active child".into(),
+            ));
+        }
+        let current_binding: ThreadProviderBindingV2 =
+            serde_json::from_str(&current_binding).map_err(invalid_json)?;
+        if current_binding == *binding {
+            return Err(StorageError::InvalidData(
+                "selected provider and model are already active".into(),
+            ));
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("thread revision overflow".into()))?;
+        let next_sequence = from_i64(sequence)?
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("thread sequence overflow".into()))?;
+        let entry = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: next_sequence,
+            run_id: None,
+            kind: TranscriptKind::System,
+            text: format!(
+                "Model switched to {}/{}",
+                binding.provider_name, binding.model
+            ),
+            payload: Some(serde_json::json!({
+                "provider_name": binding.provider_name,
+                "model": binding.model,
+            })),
+            source_key: format!("thread:model:{next_revision}"),
+            created_at_ms: now_ms,
+        };
+        tx.execute(
+            "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,NULL,'system',?4,?5,?6)",
+            params![thread_id.to_string(), to_i64(next_sequence)?, entry.entry_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
+        )?;
+        let envelope = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
+            thread_id,
+            revision: next_revision,
+            sequence: next_sequence,
+            event: ThreadEvent::BindingChanged {
+                provider_name: binding.provider_name.clone(),
+                model: binding.model.clone(),
+            },
+        };
+        tx.execute(
+            "INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![thread_id.to_string(), to_i64(next_sequence)?, envelope.event_id.to_string(), to_i64(next_revision)?, serde_json::to_string(&envelope).map_err(invalid_json)?, to_i64(now_ms)?],
+        )?;
+        tx.execute(
+            "UPDATE threads_v2 SET revision=?1,last_seq=?2,binding_json=?3,updated_at_ms=?4 WHERE thread_id=?5",
+            params![to_i64(next_revision)?, to_i64(next_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, to_i64(now_ms)?, thread_id.to_string()],
+        )?;
+        let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+        tx.commit()?;
+        Ok(ThreadCommitResponse {
+            snapshot,
+            thread_event: StoredThreadEvent {
+                sequence: next_sequence,
+                envelope,
+            },
+        })
     }
 
     pub(crate) fn thread_snapshot_v2(
@@ -824,6 +1305,15 @@ impl Storage {
     ) -> Result<ThreadSnapshot, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         thread_snapshot(&conn, thread_id, after, limit)
+    }
+
+    pub(crate) fn thread_snapshot_tail_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+        limit: usize,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        current_thread_snapshot(&conn, thread_id, limit)
     }
 
     pub(crate) fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
@@ -840,6 +1330,30 @@ impl Storage {
                 // The TUI instead needs the current end of a conversation: a
                 // first-20 ascending page made a completed 21+ card thread
                 // look stale while silently hiding its newest work.
+                let mut snapshot = thread_snapshot(&conn, id, None, 1)?;
+                snapshot.transcript =
+                    thread_transcript_tail(&conn, id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+                Ok(snapshot)
+            })
+            .collect()
+    }
+
+    pub(crate) fn list_threads_v2_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<ThreadSnapshot>, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT thread_id FROM threads_v2 WHERE workspace_root=?1 \
+             ORDER BY updated_at_ms DESC, rowid DESC",
+        )?;
+        let ids = statement
+            .query_map([workspace_root], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|value| {
+                let id = parse_thread_id(&value)?;
                 let mut snapshot = thread_snapshot(&conn, id, None, 1)?;
                 snapshot.transcript =
                     thread_transcript_tail(&conn, id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
@@ -891,6 +1405,151 @@ impl Storage {
             })
         })
         .collect()
+    }
+
+    pub(crate) fn list_thread_sessions_v2_for_workspace(
+        &self,
+        workspace_root: &str,
+        limit: usize,
+    ) -> Result<Vec<ThreadSessionSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let limit = limit.min(500);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+             FROM threads_v2 WHERE workspace_root=?1 \
+             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?2",
+        )?;
+        let limit = u64::try_from(limit)
+            .map_err(|_| StorageError::InvalidData("session list limit exceeds u64".into()))?;
+        let rows = statement.query_map(params![workspace_root, to_i64(limit)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
+                row?;
+            let binding: ThreadProviderBindingV2 =
+                serde_json::from_str(&binding_json).map_err(invalid_json)?;
+            Ok(ThreadSessionSummary {
+                thread_id: parse_thread_id(&thread_id)?,
+                title,
+                workspace_root,
+                lifecycle: parse_lifecycle(&lifecycle)?,
+                provider_name: binding.provider_name,
+                model: binding.model,
+                created_at_ms: from_i64(created)?,
+                updated_at_ms: from_i64(updated)?,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn find_thread_sessions_v2_by_exact_title_for_workspace(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        limit: usize,
+    ) -> Result<Vec<ThreadSessionSummary>, StorageError> {
+        if title.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let limit = limit.min(500);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+             FROM threads_v2 WHERE workspace_root=?1 AND title=?2 \
+             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                workspace_root,
+                title,
+                to_i64(u64::try_from(limit).map_err(|_| {
+                    StorageError::InvalidData("session title limit exceeds u64".into())
+                })?)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
+                row?;
+            let binding: ThreadProviderBindingV2 =
+                serde_json::from_str(&binding_json).map_err(invalid_json)?;
+            Ok(ThreadSessionSummary {
+                thread_id: parse_thread_id(&thread_id)?,
+                title,
+                workspace_root,
+                lifecycle: parse_lifecycle(&lifecycle)?,
+                provider_name: binding.provider_name,
+                model: binding.model,
+                created_at_ms: from_i64(created)?,
+                updated_at_ms: from_i64(updated)?,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn thread_session_v2(
+        &self,
+        thread_id: latte_core::ThreadId,
+    ) -> Result<Option<ThreadSessionSummary>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+                 FROM threads_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(title, workspace_root, lifecycle, binding_json, created, updated)| {
+                let binding: ThreadProviderBindingV2 =
+                    serde_json::from_str(&binding_json).map_err(invalid_json)?;
+                Ok(ThreadSessionSummary {
+                    thread_id,
+                    title,
+                    workspace_root,
+                    lifecycle: parse_lifecycle(&lifecycle)?,
+                    provider_name: binding.provider_name,
+                    model: binding.model,
+                    created_at_ms: from_i64(created)?,
+                    updated_at_ms: from_i64(updated)?,
+                })
+            },
+        )
+        .transpose()
     }
 
     /// Computes the exact workspace paths changed since this linked child was
@@ -953,6 +1612,8 @@ impl Storage {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<ThreadCommitResponse, StorageError> {
+        let expected_scope = thread_lease_scope(request.thread_id);
+        require_lease_scope(lease, &expected_scope)?;
         validate_thread_source(request.update.source_key())?;
         let digest = thread_command_digest(request)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
@@ -982,7 +1643,7 @@ impl Storage {
             tx.commit()?;
             return Ok(replay);
         }
-        let lease_ok: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
+        let lease_ok: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![expected_scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
         if !lease_ok {
             return Err(StorageError::LeaseLost);
         }
@@ -1377,6 +2038,7 @@ impl Storage {
                 source_key,
                 request_id,
                 allow,
+                rebound_operation_digest,
             } => {
                 next = current
                     .transition(
@@ -1394,6 +2056,87 @@ impl Storage {
                 } else {
                     "failed".into()
                 };
+                if *allow {
+                    // A waiting Session deliberately releases its coordinator
+                    // lease before returning to the caller.  The next
+                    // coordinator therefore owns a newer fencing epoch. For
+                    // an Ask effect, transfer both the single-use capability
+                    // and its engine-computed operation digest to that epoch
+                    // in this same permission-resolution transaction.
+                    let pending: Option<(i64, String, i64, String, String)> = tx
+                        .query_row(
+                            "SELECT p.run_revision,p.lease_owner,p.lease_token,\
+                                    p.approval_digest,e.approval_digest \
+                             FROM pending_permissions p \
+                             JOIN effects e ON e.effect_id=p.effect_id AND e.run_id=p.run_id \
+                             WHERE p.effect_id=?1 AND p.run_id=?2 \
+                               AND p.consumed_at_ms IS NULL AND e.status='prepared'",
+                            params![request_id, request.run_id.to_string()],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    if let Some((bound_revision, owner, token, pending_digest, effect_digest)) =
+                        pending
+                    {
+                        if from_i64(bound_revision)? != next.revision
+                            || pending_digest != effect_digest
+                        {
+                            return Err(StorageError::InvalidData(
+                                "prepared permission binding is corrupt or stale".into(),
+                            ));
+                        }
+                        let changed_epoch =
+                            owner != lease.owner || from_i64(token)? != lease.fencing_token;
+                        let digest = rebound_operation_digest.as_deref();
+                        if changed_epoch && digest.is_none() {
+                            return Err(StorageError::LeaseLost);
+                        }
+                        if let Some(digest) = digest {
+                            validate_thread_digest(digest)?;
+                            let effect_changed = tx.execute(
+                                "UPDATE effects SET approval_digest=?1 \
+                                 WHERE effect_id=?2 AND run_id=?3 AND status='prepared' \
+                                   AND approval_digest=?4",
+                                params![
+                                    digest,
+                                    request_id,
+                                    request.run_id.to_string(),
+                                    effect_digest
+                                ],
+                            )?;
+                            let permission_changed = tx.execute(
+                                "UPDATE pending_permissions \
+                                 SET lease_owner=?1,lease_token=?2,approval_digest=?3 \
+                                 WHERE effect_id=?4 AND run_id=?5 AND run_revision=?6 \
+                                   AND approval_digest=?7 AND consumed_at_ms IS NULL",
+                                params![
+                                    lease.owner,
+                                    to_i64(lease.fencing_token)?,
+                                    digest,
+                                    request_id,
+                                    request.run_id.to_string(),
+                                    to_i64(next.revision)?,
+                                    pending_digest
+                                ],
+                            )?;
+                            if effect_changed != 1 || permission_changed != 1 {
+                                return Err(StorageError::EffectFenced);
+                            }
+                        }
+                    } else if rebound_operation_digest.is_some() {
+                        return Err(StorageError::InvalidData(
+                            "prepared permission capability is missing".into(),
+                        ));
+                    }
+                }
                 card = Some((
                     if *allow {
                         TranscriptKind::System
@@ -1578,12 +2321,18 @@ impl Storage {
                 source_key,
                 failure,
             } => {
+                let retryable = failure.retryability == Retryability::Retryable;
                 next = current
                     .transition(current.revision, Transition::Fail(redact_failure(failure)))
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
                 run_changed = true;
                 terminal = true;
-                next_lifecycle = "failed".into();
+                // A terminal child record and a usable conversation are
+                // separate concerns. Provider/configuration failures are
+                // durable but retryable, so the active child is removed while
+                // the Session returns to Ready and the composer remains
+                // available for a new immutable child.
+                next_lifecycle = if retryable { "ready" } else { "failed" }.into();
                 card = Some((
                     TranscriptKind::Failure,
                     next.failure.as_ref().map_or_else(
@@ -1686,6 +2435,19 @@ impl Storage {
             .ok_or_else(|| StorageError::InvalidData("thread sequence overflow".into()))?;
         if run_changed {
             append_linked_run_transition(&tx, &current, &next, from_i64(run_seq)?, lease, now_ms)?;
+        } else {
+            let changed = tx.execute(
+                "UPDATE runs SET lease_token=?1,updated_at_ms=?2 \
+                 WHERE run_id=?3 AND lease_token<=?1",
+                params![
+                    to_i64(lease.fencing_token)?,
+                    to_i64(now_ms)?,
+                    request.run_id.to_string()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::LeaseLost);
+            }
         }
         if let Some(payload) = checkpoint {
             tx.execute(
@@ -1752,7 +2514,11 @@ impl Storage {
         };
         tx.execute("INSERT INTO thread_events_v2(thread_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![request.thread_id.to_string(),to_i64(next_sequence)?,envelope.event_id.to_string(),to_i64(next_thread_revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
         let response = ThreadCommitResponse {
-            snapshot: thread_snapshot(&tx, request.thread_id, None, 100)?,
+            snapshot: current_thread_snapshot(
+                &tx,
+                request.thread_id,
+                THREAD_PROJECTION_TRANSCRIPT_LIMIT,
+            )?,
             thread_event: StoredThreadEvent {
                 sequence: next_sequence,
                 envelope,
@@ -1775,11 +2541,12 @@ impl Storage {
         now_ms: u64,
         lease: &Lease,
     ) -> Result<StoredEvent, StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let owns_lease: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",
-            params![lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![lease.scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
             |row| row.get(0),
         )?;
         if !owns_lease {
@@ -1854,9 +2621,10 @@ impl Storage {
         now_ms: u64,
         lease: &Lease,
     ) -> Result<(RunState, StoredEvent), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
@@ -1917,12 +2685,44 @@ impl Storage {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
+        self.acquire_scoped_lease("runtime", owner, None, now_ms, ttl_ms)
+    }
+
+    pub(crate) fn acquire_run_lease(
+        &self,
+        run_id: RunId,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Lease, StorageError> {
+        self.acquire_scoped_lease("runtime", owner, Some(run_id), now_ms, ttl_ms)
+    }
+
+    pub(crate) fn acquire_thread_lease(
+        &self,
+        thread_id: latte_core::ThreadId,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Lease, StorageError> {
+        let scope = thread_lease_scope(thread_id);
+        let owner = format!("thread-{thread_id}-{}", Uuid::now_v7());
+        self.acquire_scoped_lease(&scope, &owner, None, now_ms, ttl_ms)
+    }
+
+    fn acquire_scoped_lease(
+        &self,
+        scope: &str,
+        owner: &str,
+        run_id: Option<RunId>,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Lease, StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: Option<(String, i64, i64)> = tx
             .query_row(
-                "SELECT owner,fencing_token,expires_at_ms FROM runtime_lease WHERE singleton=1",
-                [],
+                "SELECT owner,fencing_token,expires_at_ms FROM runtime_lease WHERE scope=?1",
+                [scope],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1932,23 +2732,60 @@ impl Storage {
             })
             .transpose()?;
         let token = match current {
-            None => 1,
-            Some((_, token, expires)) if expires <= now_ms => token
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidData("fencing token overflow".into()))?,
-            Some((ref held, token, _)) if held == owner => token,
-            Some(_) => return Err(StorageError::EngineUnavailable),
+            Some((held, token, expires)) if expires > now_ms && held == owner => token,
+            Some((_, _, expires)) if expires > now_ms => {
+                return Err(StorageError::EngineUnavailable);
+            }
+            None | Some(_) => {
+                let last_token: i64 = tx.query_row(
+                    "SELECT last_token FROM runtime_lease_epoch WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let token = from_i64(last_token)?
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::InvalidData("fencing token overflow".into()))?;
+                tx.execute(
+                    "UPDATE runtime_lease_epoch SET last_token=?1 WHERE singleton=1",
+                    [to_i64(token)?],
+                )?;
+                token
+            }
         };
         let expires = now_ms
             .checked_add(ttl_ms)
             .ok_or_else(|| StorageError::InvalidData("lease expiry overflow".into()))?;
-        tx.execute("INSERT INTO runtime_lease(singleton,owner,fencing_token,expires_at_ms) VALUES(1,?1,?2,?3) ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,fencing_token=excluded.fencing_token,expires_at_ms=excluded.expires_at_ms", params![owner,to_i64(token)?,to_i64(expires)?])?;
-        tx.execute(
-            "UPDATE runs SET lease_token=?1 WHERE status='queued'",
-            [to_i64(token)?],
-        )?;
+        tx.execute("INSERT INTO runtime_lease(scope,owner,fencing_token,expires_at_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET owner=excluded.owner,fencing_token=excluded.fencing_token,expires_at_ms=excluded.expires_at_ms", params![scope,owner,to_i64(token)?,to_i64(expires)?])?;
+        if scope == "runtime" {
+            if let Some(run_id) = run_id {
+                let changed = tx.execute(
+                    "UPDATE runs SET lease_token=?1 WHERE run_id=?2 \
+                     AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 WHERE thread_runs_v2.run_id=runs.run_id)",
+                    params![to_i64(token)?, run_id.to_string()],
+                )?;
+                if changed != 1 {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1)",
+                        [run_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    return Err(if exists {
+                        StorageError::LinkedRunRequiresThreadCommit
+                    } else {
+                        StorageError::RunNotFound(run_id)
+                    });
+                }
+            } else {
+                tx.execute(
+                    "UPDATE runs SET lease_token=?1 WHERE status='queued' \
+                     AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 WHERE thread_runs_v2.run_id=runs.run_id)",
+                    [to_i64(token)?],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(Lease {
+            scope: scope.into(),
             owner: owner.into(),
             fencing_token: token,
             expires_at_ms: expires,
@@ -1965,7 +2802,7 @@ impl Storage {
             .checked_add(ttl_ms)
             .ok_or_else(|| StorageError::InvalidData("lease expiry overflow".into()))?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let changed = conn.execute("UPDATE runtime_lease SET expires_at_ms=?1 WHERE singleton=1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4", params![to_i64(expires)?,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?])?;
+        let changed = conn.execute("UPDATE runtime_lease SET expires_at_ms=?1 WHERE scope=?2 AND owner=?3 AND fencing_token=?4 AND expires_at_ms>?5", params![to_i64(expires)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?])?;
         if changed != 1 {
             return Err(StorageError::LeaseLost);
         }
@@ -1975,16 +2812,66 @@ impl Storage {
         })
     }
 
-    pub(crate) fn release_lease(&self, lease: &Lease) -> Result<(), StorageError> {
-        let conn = self.connection.lock().expect("storage mutex poisoned");
-        let changed = conn.execute(
-            "DELETE FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2",
-            params![lease.owner, to_i64(lease.fencing_token)?],
+    pub(crate) fn release_lease(
+        &self,
+        lease: &Lease,
+    ) -> Result<Option<ThreadCommitResponse>, StorageError> {
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut recovery = None;
+        if let Some(thread) = lease.scope.strip_prefix("thread:") {
+            let thread_id = parse_thread_id(thread)?;
+            let active_run: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT run_id,lease_token FROM thread_active_runs_v2 WHERE thread_id=?1",
+                    [thread_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            // Returning from a durable input/permission wait is a clean
+            // quiescence boundary, not a coordinator crash. Token zero means
+            // that no writer is authoritative and lets a later coordinator
+            // acquire a fresh global epoch immediately. Nonzero stale tokens
+            // remain distinguishable for conservative startup recovery.
+            let quiesced = tx.execute(
+                "UPDATE runs SET lease_token=0 \
+                 WHERE run_id=(SELECT run_id FROM thread_active_runs_v2 \
+                               WHERE thread_id=?1 AND lease_token=?2) \
+                   AND lease_token=?2 \
+                   AND status IN ('waiting_permission','waiting_input')",
+                params![thread_id.to_string(), to_i64(lease.fencing_token)?],
+            )?;
+            if quiesced == 1 {
+                let active_quiesced = tx.execute(
+                    "UPDATE thread_active_runs_v2 SET lease_token=0 \
+                     WHERE thread_id=?1 AND lease_token=?2",
+                    params![thread_id.to_string(), to_i64(lease.fencing_token)?],
+                )?;
+                if active_quiesced != 1 {
+                    return Err(StorageError::LeaseLost);
+                }
+            } else if let Some((run_id, active_token)) = active_run
+                && from_i64(active_token)? == lease.fencing_token
+            {
+                recovery = recover_linked_thread_run(
+                    &tx,
+                    thread_id,
+                    parse_run_id(&run_id)?,
+                    lease.fencing_token,
+                    None,
+                    crate::wall_now_ms(),
+                )?;
+            }
+        }
+        let changed = tx.execute(
+            "DELETE FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3",
+            params![lease.scope, lease.owner, to_i64(lease.fencing_token)?],
         )?;
         if changed != 1 {
             return Err(StorageError::LeaseLost);
         }
-        Ok(())
+        tx.commit()?;
+        Ok(recovery)
     }
 
     #[cfg(test)]
@@ -2054,6 +2941,7 @@ impl Storage {
         post_evidence_json: &str,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(&authority.lease)?;
         serde_json::from_str::<serde_json::Value>(post_evidence_json).map_err(invalid_json)?;
         let status = if success {
             "observed_success"
@@ -2062,7 +2950,7 @@ impl Storage {
         };
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND run_id=?5 AND status='started' AND attempt=?6 AND approval_digest=?7 AND EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?8 AND fencing_token=?9 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?5 AND revision=?10 AND lease_token=?9)",params![status,post_evidence_json,to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
+        let changed=tx.execute("UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND run_id=?5 AND status='started' AND attempt=?6 AND approval_digest=?7 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?9 AND fencing_token=?10 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?5 AND revision=?11 AND lease_token=?10)",params![status,post_evidence_json,to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::EffectFenced);
         }
@@ -2074,9 +2962,10 @@ impl Storage {
         authority: &EffectAuthority,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(&authority.lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE effects SET status='unknown',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started' AND attempt=?4 AND approval_digest=?5 AND EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?6 AND fencing_token=?7 AND expires_at_ms>?1) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?8 AND lease_token=?7)",params![to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
+        let changed=tx.execute("UPDATE effects SET status='unknown',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started' AND attempt=?4 AND approval_digest=?5 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?6 AND owner=?7 AND fencing_token=?8 AND expires_at_ms>?1) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?9 AND lease_token=?8)",params![to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::EffectFenced);
         }
@@ -2101,6 +2990,7 @@ impl Storage {
         lease: &Lease,
         digest: &str,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
         Ok(())
@@ -2118,10 +3008,11 @@ impl Storage {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         serde_json::from_str::<serde_json::Value>(descriptor).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 WHERE l.singleton=1 AND l.owner=?2 AND l.fencing_token=?3 AND l.expires_at_ms>?4 AND r.revision=?5 AND r.lease_token=?3)",params![run_id.to_string(),lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4)",params![run_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?],|r|r.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
@@ -2139,9 +3030,10 @@ impl Storage {
         digest: &str,
         now_ms: u64,
     ) -> Result<EffectAuthority, StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND run_revision=?4 AND lease_owner=?5 AND lease_token=?6 AND approval_digest=?7 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?4) AND EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?1)",params![to_i64(now_ms)?,effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
+        let changed=tx.execute("UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND run_revision=?4 AND lease_owner=?5 AND lease_token=?6 AND approval_digest=?7 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?4) AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?1)",params![to_i64(now_ms)?,effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest,lease.scope])?;
         if changed != 1 {
             return Err(StorageError::InvalidData(
                 "permission is stale, mismatched, consumed, or lease-invalid".into(),
@@ -2188,11 +3080,12 @@ impl Storage {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         serde_json::from_str::<serde_json::Value>(descriptor_json).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expected_revision = run_revision.saturating_sub(2);
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 JOIN pending_permissions p ON p.run_id=r.run_id JOIN effects e ON e.effect_id=p.effect_id AND e.run_id=p.run_id WHERE l.singleton=1 AND l.owner=?2 AND l.fencing_token=?3 AND l.expires_at_ms>?4 AND r.revision=?5 AND r.lease_token=?3 AND p.effect_id=?6 AND p.consumed_at_ms IS NULL AND e.status='prepared' AND e.approval_digest=p.approval_digest AND (p.lease_owner<>?2 OR p.lease_token<>?3))",params![run_id.to_string(),lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?,old_effect_id],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 JOIN pending_permissions p ON p.run_id=r.run_id JOIN effects e ON e.effect_id=p.effect_id AND e.run_id=p.run_id WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4 AND p.effect_id=?7 AND p.consumed_at_ms IS NULL AND e.status='prepared' AND e.approval_digest=p.approval_digest AND (p.lease_owner<>?3 OR p.lease_token<>?4))",params![run_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?,old_effect_id],|r|r.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
@@ -2217,8 +3110,9 @@ impl Storage {
         digest: &str,
         now_ms: u64,
     ) -> Result<bool, StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_permissions p JOIN runs r ON r.run_id=p.run_id JOIN runtime_lease l ON l.singleton=1 WHERE p.effect_id=?1 AND p.run_id=?2 AND p.run_revision=?3 AND p.lease_owner=?4 AND p.lease_token=?5 AND p.approval_digest=?6 AND p.consumed_at_ms IS NULL AND r.revision+1=?3 AND l.owner=?4 AND l.fencing_token=?5 AND l.expires_at_ms>?7)",params![effect_id,run_id.to_string(),to_i64(expected_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest,to_i64(now_ms)?],|r|r.get(0))?)
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_permissions p JOIN runs r ON r.run_id=p.run_id JOIN runtime_lease l ON l.scope=?4 AND l.owner=?5 WHERE p.effect_id=?1 AND p.run_id=?2 AND p.run_revision=?3 AND p.lease_owner=?5 AND p.lease_token=?6 AND p.approval_digest=?7 AND p.consumed_at_ms IS NULL AND r.revision+1=?3 AND l.fencing_token=?6 AND l.expires_at_ms>?8)",params![effect_id,run_id.to_string(),to_i64(expected_revision)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,digest,to_i64(now_ms)?],|r|r.get(0))?)
     }
     pub(crate) fn effect_status(&self, id: &str) -> Result<EffectStatus, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
@@ -2288,11 +3182,14 @@ impl Storage {
         expected_run_revision: u64,
         now_ms: u64,
     ) -> Result<ThreadLeaseLossRecovery, StorageError> {
+        let expected_scope = thread_lease_scope(thread_id);
+        require_lease_scope(lost_lease, &expected_scope)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let still_authoritative: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
             params![
+                expected_scope,
                 lost_lease.owner,
                 to_i64(lost_lease.fencing_token)?,
                 to_i64(now_ms)?
@@ -2319,7 +3216,8 @@ impl Storage {
             state.status,
             RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
         ) {
-            let snapshot = thread_snapshot(&tx, thread_id, None, 100)?;
+            let snapshot =
+                current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
             tx.commit()?;
             return Ok(ThreadLeaseLossRecovery::AlreadyTerminal(snapshot));
         }
@@ -2345,9 +3243,10 @@ impl Storage {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<LeaseLossRecovery, StorageError> {
+        require_legacy_runtime_lease(lost_lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lost_lease.owner,to_i64(lost_lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![lost_lease.scope,lost_lease.owner,to_i64(lost_lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
         if valid {
             return Err(StorageError::InvalidData(
                 "lease is still authoritative".into(),
@@ -2409,9 +3308,10 @@ impl Storage {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<RunState, StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let authoritative:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
+        let authoritative:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|r|r.get(0))?;
         if !authoritative {
             return Err(StorageError::LeaseLost);
         }
@@ -2482,23 +3382,44 @@ impl Storage {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         serde_json::from_str::<serde_json::Value>(evidence.metadata_json).map_err(invalid_json)?;
+        let record = serde_json::from_str::<VerificationRecord>(evidence.metadata_json)
+            .map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let linked_thread: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM thread_runs_v2 WHERE run_id=?1",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expected_scope = linked_thread
+            .as_deref()
+            .map(parse_thread_id)
+            .transpose()?
+            .map_or_else(|| LEGACY_RUNTIME_LEASE_SCOPE.to_owned(), thread_lease_scope);
+        require_lease_scope(lease, &expected_scope)?;
         let changed = tx.execute(
             "INSERT INTO evidence(id,run_id,metadata_json,blob_ref) \
              SELECT ?1,?2,?3,?4 \
-             WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?7) \
-             AND EXISTS(SELECT 1 FROM runs WHERE run_id=?2 AND revision=?8 AND effect_epoch=?9 AND lease_token=?6)",
+             WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?5 AND owner=?6 AND fencing_token=?7 AND expires_at_ms>?8) \
+             AND EXISTS(SELECT 1 FROM runs WHERE run_id=?2 AND revision=?9 AND effect_epoch=?10 AND lease_token=?7) \
+             AND ((?11 IS NULL AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 WHERE run_id=?2)) \
+                  OR EXISTS(SELECT 1 FROM thread_runs_v2 tr \
+                            JOIN thread_active_runs_v2 ar ON ar.thread_id=tr.thread_id AND ar.run_id=tr.run_id \
+                            WHERE tr.run_id=?2 AND tr.thread_id=?11 AND ar.lease_token=?7))",
             params![
                 evidence.id,
                 run_id.to_string(),
                 evidence.metadata_json,
                 evidence.blob_ref,
+                expected_scope,
                 lease.owner,
                 to_i64(lease.fencing_token)?,
                 to_i64(now_ms)?,
                 to_i64(expected_revision)?,
-                to_i64(serde_json::from_str::<VerificationRecord>(evidence.metadata_json).map_err(invalid_json)?.effect_epoch)?,
+                to_i64(record.effect_epoch)?,
+                linked_thread,
             ],
         )?;
         if changed != 1 {
@@ -2527,11 +3448,12 @@ impl Storage {
         manifest_digest: &str,
         now_ms: u64,
     ) -> Result<(RunState, StoredEvent), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let valid: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",
-            params![lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![lease.scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
             |row| row.get(0),
         )?;
         if !valid {
@@ -2677,10 +3599,11 @@ impl Storage {
         payload: &str,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         serde_json::from_str::<serde_json::Value>(payload).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("INSERT INTO runtime_checkpoints(run_id,payload_json,updated_at_ms) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?4 AND fencing_token=?5 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND revision=?6 AND lease_token=?5) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",params![run_id.to_string(),payload,to_i64(now_ms)?,lease.owner,to_i64(lease.fencing_token)?,to_i64(expected_revision)?])?;
+        let changed=tx.execute("INSERT INTO runtime_checkpoints(run_id,payload_json,updated_at_ms) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?4 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND revision=?7 AND lease_token=?6) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",params![run_id.to_string(),payload,to_i64(now_ms)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::LeaseLost);
         }
@@ -2706,9 +3629,10 @@ impl Storage {
         now_ms: u64,
         denied: bool,
     ) -> Result<(RunState, Option<StoredEvent>), StorageError> {
+        require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE singleton=1 AND owner=?1 AND fencing_token=?2 AND expires_at_ms>?3)",params![lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
@@ -2829,7 +3753,8 @@ impl Storage {
                 "SELECT ar.thread_id,ar.run_id,r.lease_token FROM thread_active_runs_v2 ar \
                  JOIN runs r ON r.run_id=ar.run_id \
                  WHERE r.status IN ('queued','running','cancelling','waiting_permission','waiting_input') \
-                 AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.singleton=1 AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
+                 AND r.lease_token<>0 \
+                 AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='thread:'||ar.thread_id AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
             )?;
             stmt.query_map([to_i64(now_ms)?], |row| {
                 Ok((
@@ -2851,7 +3776,7 @@ impl Storage {
                 recover_linked_thread_run(&tx, thread_id, run_id, from_i64(token)?, None, now_ms)?;
         }
         let mut stmt = tx.prepare(
-            "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 tr WHERE tr.run_id=r.run_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.singleton=1 AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
+            "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 tr WHERE tr.run_id=r.run_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='runtime' AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
         )?;
         let rows = stmt
             .query_map([to_i64(now_ms)?], |r| {
@@ -2937,6 +3862,28 @@ fn parse_thread_id(value: &str) -> Result<latte_core::ThreadId, StorageError> {
     uuid::Uuid::parse_str(value)
         .map(latte_core::ThreadId::from_uuid)
         .map_err(|error| StorageError::InvalidData(format!("invalid stored thread id: {error}")))
+}
+
+fn parse_run_id(value: &str) -> Result<RunId, StorageError> {
+    uuid::Uuid::parse_str(value)
+        .map(RunId::from_uuid)
+        .map_err(|error| StorageError::InvalidData(format!("invalid stored run id: {error}")))
+}
+
+fn thread_lease_scope(thread_id: latte_core::ThreadId) -> String {
+    format!("thread:{thread_id}")
+}
+
+fn require_lease_scope(lease: &Lease, expected: &str) -> Result<(), StorageError> {
+    if lease.scope == expected {
+        Ok(())
+    } else {
+        Err(StorageError::LeaseLost)
+    }
+}
+
+fn require_legacy_runtime_lease(lease: &Lease) -> Result<(), StorageError> {
+    require_lease_scope(lease, LEGACY_RUNTIME_LEASE_SCOPE)
 }
 
 fn validate_workspace_root(value: &str) -> Result<&str, StorageError> {
@@ -3148,6 +4095,16 @@ fn thread_snapshot(
     })
 }
 
+fn current_thread_snapshot(
+    connection: &Connection,
+    thread_id: latte_core::ThreadId,
+    transcript_limit: usize,
+) -> Result<ThreadSnapshot, StorageError> {
+    let mut snapshot = thread_snapshot(connection, thread_id, None, 1)?;
+    snapshot.transcript = thread_transcript_tail(connection, thread_id, transcript_limit)?;
+    Ok(snapshot)
+}
+
 /// Loads the newest bounded transcript page for a presentation projection.
 ///
 /// `has_more` here means that older cards were deliberately omitted. The
@@ -3344,6 +4301,7 @@ fn recover_linked_thread_run(
     interrupted.pending_input = None;
     interrupted.pending_permission = None;
     let stale_fence = Lease {
+        scope: thread_lease_scope(thread_id),
         owner: "recovery".into(),
         fencing_token: expected_lease_token,
         expires_at_ms: 0,
@@ -3601,8 +4559,9 @@ fn thread_command_digest(request: &ThreadCommitRequest) -> Result<String, Storag
             source_key,
             request_id,
             allow,
+            rebound_operation_digest,
         } => {
-            serde_json::json!({"kind":"resolve_permission","source_key":redact_thread_text(source_key),"request_id":redact_thread_text(request_id),"allow":allow})
+            serde_json::json!({"kind":"resolve_permission","source_key":redact_thread_text(source_key),"request_id":redact_thread_text(request_id),"allow":allow,"rebound_operation_digest":rebound_operation_digest})
         }
         CommitThreadRunUpdate::RequestInput {
             source_key,
@@ -4150,6 +5109,270 @@ mod tests {
     }
 
     #[test]
+    fn session_leases_are_concurrent_but_same_session_takeover_fences_stale_authority() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let first_thread = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let second_thread = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+
+        let first = store.acquire_thread_lease(first_thread, 10, 100).unwrap();
+        let second = store.acquire_thread_lease(second_thread, 11, 100).unwrap();
+        assert_eq!(first.scope(), format!("thread:{first_thread}"));
+        assert_ne!(first.scope, second.scope);
+        assert!(second.fencing_token > first.fencing_token);
+        assert!(matches!(
+            store.acquire_thread_lease(first_thread, 12, 100),
+            Err(StorageError::EngineUnavailable)
+        ));
+        assert_eq!(
+            store.renew_lease(&first, 12, 100).unwrap().fencing_token,
+            first.fencing_token
+        );
+
+        store.release_lease(&first).unwrap();
+        let takeover = store.acquire_thread_lease(first_thread, 13, 100).unwrap();
+        assert!(takeover.fencing_token > second.fencing_token);
+        assert!(matches!(
+            store.renew_lease(&first, 14, 100),
+            Err(StorageError::LeaseLost)
+        ));
+
+        let (_, linked_run, _) = create_linked_fixture(&store, &ids, "linked authority", 15);
+        assert!(matches!(
+            store.acquire_run_lease(linked_run, "legacy-linked", 16, 100),
+            Err(StorageError::LinkedRunRequiresThreadCommit)
+        ));
+        let missing_run = RunId::from_uuid(ids.next_uuid_v7());
+        assert!(matches!(
+            store.acquire_run_lease(missing_run, "legacy-missing", 17, 100),
+            Err(StorageError::RunNotFound(id)) if id == missing_run
+        ));
+
+        store.release_lease(&takeover).unwrap();
+        store.release_lease(&second).unwrap();
+    }
+
+    #[test]
+    fn releasing_a_running_thread_lease_recovers_immediately() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+        let started = store
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "accepted",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+            )
+            .unwrap();
+        assert_eq!(started.snapshot.lifecycle, ThreadLifecycle::Running);
+
+        let recovered = store
+            .release_lease(&lease)
+            .unwrap()
+            .expect("running release must recover");
+        assert_eq!(recovered.snapshot.lifecycle, ThreadLifecycle::Interrupted);
+        assert!(recovered.snapshot.active_run_id.is_none());
+        assert_eq!(
+            store.thread_snapshot_v2(thread_id, None, 100).unwrap(),
+            recovered.snapshot
+        );
+    }
+
+    #[test]
+    fn ready_session_switches_binding_durably_under_exact_thread_authority() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let (thread_id, run_id, created) = create_linked_fixture(&store, &ids, "switch model", 10);
+        let lease = store.acquire_thread_lease(thread_id, 11, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &created,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "switch:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        let ready = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            run_id,
+            CommitThreadRunUpdate::Fail {
+                source_key: "switch:retryable".into(),
+                failure: RunFailure {
+                    code: FailureCode::RuntimeFailed,
+                    message: "retry with another model".into(),
+                    retryability: Retryability::Retryable,
+                },
+            },
+            13,
+        )
+        .snapshot;
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+
+        let mut next = thread_binding();
+        next.provider_name = "other-provider".into();
+        next.model = "other-model".into();
+        next.config_fingerprint = "other-config".into();
+        let switched = store
+            .switch_thread_binding_v2(thread_id, ready.revision, &next, &lease, 14)
+            .unwrap();
+        assert_eq!(switched.snapshot.binding, next);
+        assert_eq!(switched.snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert!(matches!(
+            switched.thread_event.envelope.event,
+            ThreadEvent::BindingChanged {
+                ref provider_name,
+                ref model
+            } if provider_name == "other-provider" && model == "other-model"
+        ));
+        let card = switched.snapshot.transcript.entries.last().unwrap();
+        assert_eq!(card.kind, TranscriptKind::System);
+        assert_eq!(card.text, "Model switched to other-provider/other-model");
+
+        let foreign_thread = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let foreign = store.acquire_thread_lease(foreign_thread, 15, 100).unwrap();
+        assert!(matches!(
+            store.switch_thread_binding_v2(
+                thread_id,
+                switched.snapshot.revision,
+                &thread_binding(),
+                &foreign,
+                16
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn runtime_and_thread_lease_scopes_are_bidirectional_authority_boundaries() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let legacy_run = RunId::from_uuid(ids.next_uuid_v7());
+        store.create_run(&RunState::queued(legacy_run), 1).unwrap();
+        let runtime_lease = store
+            .acquire_run_lease(legacy_run, "legacy", 2, 1_000)
+            .unwrap();
+
+        let (thread_id, linked_run, queued_thread) =
+            create_linked_fixture(&store, &ids, "scoped", 3);
+        let thread_lease = store.acquire_thread_lease(thread_id, 4, 1_000).unwrap();
+        assert!(thread_lease.fencing_token > runtime_lease.fencing_token);
+
+        assert!(matches!(
+            store.apply_transition(legacy_run, 0, Transition::Start, 5, &thread_lease),
+            Err(StorageError::LeaseLost)
+        ));
+        assert_eq!(
+            store.load_run(legacy_run).unwrap().status,
+            RunStatus::Queued
+        );
+
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id: linked_run,
+                    expected_thread_revision: queued_thread.revision,
+                    expected_run_revision: 0,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Start {
+                        source_key: "wrong-runtime-scope".into(),
+                    },
+                },
+                &runtime_lease,
+                5,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        assert_eq!(
+            store.load_run(linked_run).unwrap().status,
+            RunStatus::Queued
+        );
+
+        store
+            .apply_transition(legacy_run, 0, Transition::Start, 6, &runtime_lease)
+            .unwrap();
+        commit_linked(
+            &store,
+            &ids,
+            &thread_lease,
+            &queued_thread,
+            linked_run,
+            CommitThreadRunUpdate::Start {
+                source_key: "correct-thread-scope".into(),
+            },
+            6,
+        );
+    }
+
+    #[test]
+    fn atomic_thread_acceptance_rolls_back_every_record_when_start_write_fails() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 10, 1_000).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER inject_atomic_start_failure \
+                 BEFORE INSERT ON thread_events_v2 \
+                 BEGIN SELECT RAISE(ABORT, 'injected atomic start failure'); END;",
+            )
+            .unwrap();
+
+        let error = store
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "accepted once",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                11,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("injected atomic start failure"));
+        assert!(matches!(
+            store.load_run(run_id),
+            Err(StorageError::RunNotFound(id)) if id == run_id
+        ));
+        assert!(matches!(
+            store.thread_snapshot_v2(thread_id, None, 10),
+            Err(StorageError::ThreadNotFound(id)) if id == thread_id
+        ));
+        let orphan_rows: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM thread_transcript_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_rows, 0);
+    }
+
+    #[test]
     fn recovery_marks_cancelling_and_started_effect_unknown() {
         let (_dir, path) = db();
         let (run, event) = ids();
@@ -4314,7 +5537,17 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE thread_effect_canonical_v2; \
-                 DELETE FROM schema_migrations WHERE version IN (8,9); \
+                 DROP TABLE runtime_lease; \
+                 DROP TABLE runtime_lease_epoch; \
+                 CREATE TABLE runtime_lease( \
+                   singleton INTEGER PRIMARY KEY CHECK(singleton=1), \
+                   owner TEXT NOT NULL, \
+                   fencing_token INTEGER NOT NULL, \
+                   expires_at_ms INTEGER NOT NULL \
+                 ); \
+                 INSERT INTO runtime_lease(singleton,owner,fencing_token,expires_at_ms) \
+                   VALUES(1,'legacy-owner',7,9999999999999); \
+                 DELETE FROM schema_migrations WHERE version IN (8,9,10); \
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -4332,8 +5565,81 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert!(descriptor_table);
+        let migrated_lease: (String, String, i64) = connection
+            .query_row(
+                "SELECT scope,owner,fencing_token FROM runtime_lease",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated_lease, ("runtime".into(), "legacy-owner".into(), 7));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_token FROM runtime_lease_epoch WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn v8_session_migration_requires_safe_workspace_adoption_and_backfills_catalog() {
+        let (_dir, path) = db();
+        let ids = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let store = Storage::open(&path).unwrap();
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/old/workspace",
+                "legacy title",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE threads_v2 SET title='',workspace_root=''; \
+                 DROP TABLE runtime_lease; \
+                 DROP TABLE runtime_lease_epoch; \
+                 CREATE TABLE runtime_lease( \
+                   singleton INTEGER PRIMARY KEY CHECK(singleton=1), \
+                   owner TEXT NOT NULL, \
+                   fencing_token INTEGER NOT NULL, \
+                   expires_at_ms INTEGER NOT NULL \
+                 ); \
+                 DELETE FROM schema_migrations WHERE version IN (9,10); \
+                 PRAGMA user_version=8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            Storage::open(&path),
+            Err(StorageError::InvalidData(message))
+                if message.contains("legacy Sessions have no workspace identity")
+        ));
+        let migrated = Storage::open_in_workspace(&path, "/adopted/workspace").unwrap();
+        let metadata = migrated.thread_session_v2(thread_id).unwrap().unwrap();
+        assert_eq!(metadata.workspace_root, "/adopted/workspace");
+        assert_eq!(metadata.title, "legacy title");
+        assert_eq!(
+            migrated
+                .list_thread_sessions_v2_for_workspace("/adopted/workspace", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4396,7 +5702,7 @@ mod tests {
         assert_eq!(initial.transcript.entries[0].sequence, 1);
         assert!(!initial.transcript.entries[0].text.contains("sk-this"));
         assert!(store.is_thread_linked_run(first).unwrap());
-        let lease = store.acquire_lease("thread", 2, 100).unwrap();
+        let lease = store.acquire_thread_lease(thread, 2, 100).unwrap();
         let start = ThreadCommitRequest {
             thread_id: thread,
             run_id: first,
@@ -4499,7 +5805,7 @@ mod tests {
         assert_eq!(initial.sequence, 1);
         assert_eq!(initial.transcript.entries[0].sequence, 1);
 
-        let lease = store.acquire_lease("thread", 2, 100).unwrap();
+        let lease = store.acquire_thread_lease(thread_id, 2, 100).unwrap();
         let failed = store
             .commit_thread_run_update(
                 &ThreadCommitRequest {
@@ -4654,6 +5960,58 @@ mod tests {
         assert_eq!(catalog[0].model, "model");
         assert_eq!(catalog[0].created_at_ms, 42);
         assert_eq!(catalog[0].updated_at_ms, 42);
+        assert_eq!(
+            store.thread_session_v2(thread_id).unwrap().unwrap(),
+            catalog[0]
+        );
+        assert_eq!(
+            store
+                .list_thread_sessions_v2_for_workspace("/workspace/catalog", 10)
+                .unwrap(),
+            catalog
+        );
+    }
+
+    #[test]
+    fn workspace_scoped_thread_projection_never_matches_an_identical_foreign_prompt() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let local_thread = ThreadId::from_uuid(ids.next_uuid_v7());
+        let foreign_thread = ThreadId::from_uuid(ids.next_uuid_v7());
+        for (thread_id, workspace_root, now_ms) in [
+            (local_thread, "/workspace/local", 1),
+            (foreign_thread, "/workspace/foreign", 2),
+        ] {
+            store
+                .create_thread_v2(
+                    thread_id,
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    &thread_binding(),
+                    workspace_root,
+                    "identical prompt",
+                    &std::collections::BTreeMap::new(),
+                    now_ms,
+                )
+                .unwrap();
+        }
+
+        let local = store
+            .list_threads_v2_for_workspace("/workspace/local")
+            .unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].thread_id, local_thread);
+        assert_eq!(local[0].transcript.entries[0].text, "identical prompt");
+        assert_eq!(
+            store
+                .list_thread_sessions_v2_for_workspace("/workspace/local", 10)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.thread_id)
+                .collect::<Vec<_>>(),
+            vec![local_thread]
+        );
     }
 
     #[test]
@@ -4814,6 +6172,7 @@ mod tests {
                 source_key: source_key.clone(),
                 request_id: "permission".into(),
                 allow: true,
+                rebound_operation_digest: None,
             },
             CommitThreadRunUpdate::RequestInput {
                 source_key: source_key.clone(),
@@ -5029,13 +6388,314 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn clean_wait_reopen_requires_atomic_permission_rebind_to_the_new_epoch() {
+        let (dir, path) = db();
+        let ids = SystemIdSource::default();
+        let store = Storage::open(&path).unwrap();
+        let (thread_id, run_id, queued) =
+            create_linked_fixture(&store, &ids, "rebind permission", 10);
+        let first = store.acquire_thread_lease(thread_id, 11, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &first,
+            &queued,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "rebind:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        let descriptor = crate::ThreadEffectDescriptor {
+            effect_id: "rebind-effect".into(),
+            tool_call_id: "rebind-call".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({
+                "path":"rebound.txt",
+                "content":"rebound",
+                "create_intent":true
+            }),
+            attempt: 1,
+        };
+        let old_digest = "a".repeat(64);
+        let waiting = commit_linked(
+            &store,
+            &ids,
+            &first,
+            &running,
+            run_id,
+            CommitThreadRunUpdate::PrepareEffect {
+                source_key: "rebind:prepare".into(),
+                effect_id: descriptor.effect_id.clone(),
+                operation_digest: old_digest.clone(),
+                descriptor_json: serde_json::to_string(&descriptor).unwrap(),
+                canonical_descriptor_json: serde_json::to_string(&descriptor).unwrap(),
+                policy: ThreadEffectPolicy::Ask,
+                description: "write rebound.txt".into(),
+                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+            },
+            13,
+        )
+        .snapshot;
+        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+
+        store.release_lease(&first).unwrap();
+        drop(store);
+        let reopened = Storage::open(&path).unwrap();
+        let preserved = reopened.thread_snapshot_v2(thread_id, None, 100).unwrap();
+        assert_eq!(preserved.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(preserved.active_run_id, Some(run_id));
+        let second = reopened.acquire_thread_lease(thread_id, 14, 100).unwrap();
+        assert!(second.fencing_token > first.fencing_token);
+
+        let mut mismatched_descriptor = descriptor.clone();
+        mismatched_descriptor.effect_id = "different-effect".into();
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE thread_effect_canonical_v2 SET descriptor_json=?1 WHERE effect_id=?2",
+                params![
+                    serde_json::to_string(&mismatched_descriptor).unwrap(),
+                    descriptor.effect_id
+                ],
+            )
+            .unwrap();
+        let engine = crate::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&path)
+            .build()
+            .unwrap();
+        let identifier_error = engine
+            .resolve_thread_effect_permission(
+                thread_id,
+                run_id,
+                preserved.revision,
+                preserved.runs[0].run_revision,
+                descriptor.effect_id.clone(),
+                "rebind:bad-identifier".into(),
+                true,
+                latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                &second,
+                15,
+            )
+            .unwrap_err();
+        assert!(
+            identifier_error
+                .to_string()
+                .contains("canonical thread effect identifier mismatch")
+        );
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE thread_effect_canonical_v2 SET descriptor_json=?1 WHERE effect_id=?2",
+                params![
+                    serde_json::to_string(&descriptor).unwrap(),
+                    descriptor.effect_id
+                ],
+            )
+            .unwrap();
+        let overflow = engine
+            .resolve_thread_effect_permission(
+                thread_id,
+                run_id,
+                preserved.revision,
+                u64::MAX,
+                descriptor.effect_id.clone(),
+                "rebind:overflow".into(),
+                true,
+                latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                &second,
+                15,
+            )
+            .unwrap_err();
+        assert!(overflow.to_string().contains("run revision overflow"));
+        drop(engine);
+
+        let resolve = |digest: Option<String>| {
+            reopened.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: preserved.revision,
+                    expected_run_revision: preserved.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: Some(descriptor.effect_id.clone()),
+                    effect_id: Some(descriptor.effect_id.clone()),
+                    update: CommitThreadRunUpdate::ResolvePermission {
+                        source_key: "rebind:allow".into(),
+                        request_id: descriptor.effect_id.clone(),
+                        allow: true,
+                        rebound_operation_digest: digest,
+                    },
+                },
+                &second,
+                15,
+            )
+        };
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pending_permissions SET approval_digest=?1 WHERE effect_id=?2",
+                params!["c".repeat(64), descriptor.effect_id],
+            )
+            .unwrap();
+        assert!(
+            resolve(Some("d".repeat(64)))
+                .unwrap_err()
+                .to_string()
+                .contains("binding is corrupt or stale")
+        );
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pending_permissions SET approval_digest=?1 WHERE effect_id=?2",
+                params![old_digest, descriptor.effect_id],
+            )
+            .unwrap();
+        assert!(matches!(resolve(None), Err(StorageError::LeaseLost)));
+        assert!(matches!(
+            resolve(Some("invalid".into())),
+            Err(StorageError::InvalidData(_))
+        ));
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_effect_digest_rebind \
+                 BEFORE UPDATE OF approval_digest ON effects \
+                 WHEN OLD.effect_id='rebind-effect' \
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            resolve(Some("e".repeat(64))),
+            Err(StorageError::EffectFenced)
+        ));
+        reopened
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER ignore_effect_digest_rebind;")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .thread_snapshot_v2(thread_id, None, 100)
+                .unwrap()
+                .lifecycle,
+            ThreadLifecycle::WaitingPermission
+        );
+
+        let rebound_digest = "b".repeat(64);
+        let allowed = resolve(Some(rebound_digest.clone())).unwrap().snapshot;
+        assert_eq!(allowed.lifecycle, ThreadLifecycle::Running);
+        assert_eq!(
+            reopened
+                .thread_effect_digest(&descriptor.effect_id)
+                .unwrap(),
+            rebound_digest
+        );
+        let started = commit_linked(
+            &reopened,
+            &ids,
+            &second,
+            &allowed,
+            run_id,
+            CommitThreadRunUpdate::StartEffect {
+                source_key: "rebind:started".into(),
+                effect_id: descriptor.effect_id.clone(),
+                operation_digest: rebound_digest,
+                checkpoint_json: r#"{"phase":"started"}"#.into(),
+            },
+            16,
+        );
+        assert_eq!(started.snapshot.lifecycle, ThreadLifecycle::Running);
+        assert_eq!(
+            reopened.effect_status(&descriptor.effect_id).unwrap(),
+            EffectStatus::Started
+        );
+
+        let (generic_thread, generic_run, generic_queued) =
+            create_linked_fixture(&reopened, &ids, "generic permission", 20);
+        let generic_lease = reopened
+            .acquire_thread_lease(generic_thread, 20, 100)
+            .unwrap();
+        let generic_running = commit_linked(
+            &reopened,
+            &ids,
+            &generic_lease,
+            &generic_queued,
+            generic_run,
+            CommitThreadRunUpdate::Start {
+                source_key: "generic:start".into(),
+            },
+            21,
+        )
+        .snapshot;
+        let generic_waiting = commit_linked(
+            &reopened,
+            &ids,
+            &generic_lease,
+            &generic_running,
+            generic_run,
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: "generic:request".into(),
+                request: latte_core::PendingPermission {
+                    request_id: "generic-permission".into(),
+                    operation_digest: "f".repeat(64),
+                    description: "generic permission".into(),
+                },
+            },
+            22,
+        )
+        .snapshot;
+        let missing_capability = reopened
+            .commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id: generic_thread,
+                    run_id: generic_run,
+                    expected_thread_revision: generic_waiting.revision,
+                    expected_run_revision: generic_waiting.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: Some("generic-permission".into()),
+                    effect_id: Some("generic-permission".into()),
+                    update: CommitThreadRunUpdate::ResolvePermission {
+                        source_key: "generic:allow".into(),
+                        request_id: "generic-permission".into(),
+                        allow: true,
+                        rebound_operation_digest: Some("f".repeat(64)),
+                    },
+                },
+                &generic_lease,
+                23,
+            )
+            .unwrap_err();
+        assert!(
+            missing_capability
+                .to_string()
+                .contains("permission capability is missing")
+        );
+        reopened.release_lease(&generic_lease).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn linked_thread_waits_replays_and_terminal_resolutions_are_atomic() {
         use latte_core::{PendingInput, PendingPermission, ThreadCommandId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let lease = store.acquire_lease("thread-matrix", 10, 10_000).unwrap();
         let (thread_id, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "initial", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
 
         snapshot = commit_linked(
             &store,
@@ -5175,6 +6835,7 @@ mod tests {
                 source_key: "allow-permission".into(),
                 request_id: "permission-1".into(),
                 allow: true,
+                rebound_operation_digest: None,
             },
             19,
         )
@@ -5198,11 +6859,15 @@ mod tests {
         assert_eq!(completed.snapshot.lifecycle, ThreadLifecycle::Ready);
         assert_eq!(completed.snapshot.active_run_id, None);
 
-        let (_, denied_run, mut denied) = create_linked_fixture(&store, &ids, "deny", 21);
+        let (denied_thread, denied_run, mut denied) =
+            create_linked_fixture(&store, &ids, "deny", 21);
+        let denied_lease = store
+            .acquire_thread_lease(denied_thread, 21, 10_000)
+            .unwrap();
         denied = commit_linked(
             &store,
             &ids,
-            &lease,
+            &denied_lease,
             &denied,
             denied_run,
             CommitThreadRunUpdate::Start {
@@ -5214,7 +6879,7 @@ mod tests {
         denied = commit_linked(
             &store,
             &ids,
-            &lease,
+            &denied_lease,
             &denied,
             denied_run,
             CommitThreadRunUpdate::RequestPermission {
@@ -5231,13 +6896,14 @@ mod tests {
         let denied = commit_linked(
             &store,
             &ids,
-            &lease,
+            &denied_lease,
             &denied,
             denied_run,
             CommitThreadRunUpdate::ResolvePermission {
                 source_key: "deny:resolve".into(),
                 request_id: "permission-denied".into(),
                 allow: false,
+                rebound_operation_digest: None,
             },
             24,
         );
@@ -5253,8 +6919,8 @@ mod tests {
     fn linked_effect_started_interrupt_requires_exact_reconciliation() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let lease = store.acquire_lease("effect-matrix", 100, 10_000).unwrap();
-        let (_, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "effect", 101);
+        let (thread_id, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "effect", 101);
+        let lease = store.acquire_thread_lease(thread_id, 100, 10_000).unwrap();
         snapshot = commit_linked(
             &store,
             &ids,
@@ -5375,11 +7041,15 @@ mod tests {
             ("success", true, EffectStatus::ObservedSuccess),
             ("failure", false, EffectStatus::ObservedFailed),
         ] {
-            let (_, observed_run, mut observed) = create_linked_fixture(&store, &ids, suffix, 110);
+            let (observed_thread, observed_run, mut observed) =
+                create_linked_fixture(&store, &ids, suffix, 110);
+            let observed_lease = store
+                .acquire_thread_lease(observed_thread, 110, 10_000)
+                .unwrap();
             observed = commit_linked(
                 &store,
                 &ids,
-                &lease,
+                &observed_lease,
                 &observed,
                 observed_run,
                 CommitThreadRunUpdate::Start {
@@ -5405,7 +7075,7 @@ mod tests {
             observed = commit_linked(
                 &store,
                 &ids,
-                &lease,
+                &observed_lease,
                 &observed,
                 observed_run,
                 CommitThreadRunUpdate::PrepareEffect {
@@ -5424,7 +7094,7 @@ mod tests {
             observed = commit_linked(
                 &store,
                 &ids,
-                &lease,
+                &observed_lease,
                 &observed,
                 observed_run,
                 CommitThreadRunUpdate::StartEffect {
@@ -5439,7 +7109,7 @@ mod tests {
             let observed = commit_linked(
                 &store,
                 &ids,
-                &lease,
+                &observed_lease,
                 &observed,
                 observed_run,
                 CommitThreadRunUpdate::ObserveEffect {
@@ -5487,8 +7157,8 @@ mod tests {
                 .contains("prompt must not be empty")
         );
 
-        let lease = store.acquire_lease("matrix", 10, 10_000).unwrap();
         let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "initial", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
         let follow_up = RunId::from_uuid(ids.next_uuid_v7());
         assert!(
             store
@@ -5543,6 +7213,7 @@ mod tests {
             },
         };
         let fenced = Lease {
+            scope: lease.scope.clone(),
             owner: "fenced".into(),
             fencing_token: lease.fencing_token + 1,
             expires_at_ms: lease.expires_at_ms,
@@ -5800,13 +7471,13 @@ mod tests {
                 .iter()
                 .any(|s| s.thread_id == thread_id)
         );
-        let boundary = |snapshot: &ThreadSnapshot, update: CommitThreadRunUpdate| store.commit_thread_run_update(&ThreadCommitRequest { thread_id, run_id, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_run(run_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = RunStatus::Failed; store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&failed_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&running_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitThreadRunUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, ThreadLifecycle::Failed); let (ask_thread, ask_run, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::ThreadEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
-        let ask = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: ThreadEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
-        let start_ask = |snapshot: &ThreadSnapshot, source: &str| store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitThreadRunUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &lease, 33);
+        let boundary = |snapshot: &ThreadSnapshot, update: CommitThreadRunUpdate| store.commit_thread_run_update(&ThreadCommitRequest { thread_id, run_id, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_run(run_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = RunStatus::Failed; store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&failed_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&running_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitThreadRunUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitThreadRunUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, ThreadLifecycle::Failed); let (ask_thread, ask_run, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask_lease = store.acquire_thread_lease(ask_thread, 30, 10_000).unwrap(); let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitThreadRunUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::ThreadEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
+        let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitThreadRunUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: ThreadEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
+        let start_ask = |snapshot: &ThreadSnapshot, source: &str| store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitThreadRunUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &ask_lease, 33);
         assert!(start_ask(&ask, "ask:while-pending").unwrap_err().to_string().contains("without a pending request"));
-        let allowed = commit_linked(&store, &ids, &lease, &ask, ask_run, CommitThreadRunUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true }, 34).snapshot;
+        let allowed = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitThreadRunUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true, rebound_operation_digest: None }, 34).snapshot;
         store.connection.lock().unwrap().execute("UPDATE pending_permissions SET run_revision=999 WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:stale").unwrap_err().to_string().contains("stale, mismatched, or consumed"));
-        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM thread_active_runs_v2 WHERE thread_id=?1", [ask_thread.to_string()]).unwrap(); conn.execute("UPDATE threads_v2 SET lifecycle='reconciliation_required',latest_run_id=?1 WHERE thread_id=?2", params![ask_run.to_string(), ask_thread.to_string()]).unwrap(); } assert!(store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: allowed.revision, expected_run_revision: allowed.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
+        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM thread_active_runs_v2 WHERE thread_id=?1", [ask_thread.to_string()]).unwrap(); conn.execute("UPDATE threads_v2 SET lifecycle='reconciliation_required',latest_run_id=?1 WHERE thread_id=?2", params![ask_run.to_string(), ask_thread.to_string()]).unwrap(); } assert!(store.commit_thread_run_update(&ThreadCommitRequest { thread_id: ask_thread, run_id: ask_run, expected_thread_revision: allowed.revision, expected_run_revision: allowed.runs[0].run_revision, command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitThreadRunUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &ask_lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
     }
 
     #[test]
@@ -6097,6 +7768,7 @@ mod tests {
 
         let running = start(Some(&baseline), 10);
         let wrong_lease = Lease {
+            scope: lease.scope.clone(),
             owner: "other".into(),
             fencing_token: lease.fencing_token,
             expires_at_ms: lease.expires_at_ms,
@@ -6256,6 +7928,7 @@ mod tests {
                 .contains("lease expiry overflow")
         );
         let forged = Lease {
+            scope: live.scope.clone(),
             owner: "forged".into(),
             fencing_token: live.fencing_token,
             expires_at_ms: live.expires_at_ms,
@@ -6266,10 +7939,11 @@ mod tests {
         ));
 
         let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "recover", 11);
+        let linked_lease = store.acquire_thread_lease(thread_id, 10, 10).unwrap();
         let running = commit_linked(
             &store,
             &ids,
-            &live,
+            &linked_lease,
             &queued,
             run_id,
             CommitThreadRunUpdate::Start {
@@ -6283,7 +7957,7 @@ mod tests {
                 .recover_thread_after_lease_loss(
                     thread_id,
                     run_id,
-                    &live,
+                    &linked_lease,
                     running.runs[0].run_revision,
                     13,
                 )
@@ -6291,9 +7965,19 @@ mod tests {
                 .to_string()
                 .contains("still authoritative")
         );
+        assert!(matches!(
+            store.put_checkpoint(run_id, 1, &linked_lease, "{}", 13),
+            Err(StorageError::LeaseLost)
+        ));
         assert!(
             store
-                .put_checkpoint(run_id, 1, &live, "{", 13)
+                .put_checkpoint(
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    1,
+                    &live,
+                    "{",
+                    13,
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("EOF")
@@ -6307,7 +7991,7 @@ mod tests {
 
         let missing = RunId::from_uuid(ids.next_uuid_v7());
         assert!(matches!(
-            store.recover_thread_after_lease_loss(thread_id, missing, &live, 0, 21),
+            store.recover_thread_after_lease_loss(thread_id, missing, &linked_lease, 0, 21),
             Err(StorageError::RunNotFound(id)) if id == missing
         ));
         assert!(matches!(
@@ -6315,7 +7999,7 @@ mod tests {
                 .recover_thread_after_lease_loss(
                     thread_id,
                     run_id,
-                    &live,
+                    &linked_lease,
                     running.runs[0].run_revision + 1,
                     21,
                 )
@@ -6326,7 +8010,7 @@ mod tests {
             .recover_thread_after_lease_loss(
                 thread_id,
                 run_id,
-                &live,
+                &linked_lease,
                 running.runs[0].run_revision,
                 21,
             )
@@ -6336,19 +8020,16 @@ mod tests {
             ThreadLeaseLossRecovery::Recovered(response)
                 if response.snapshot.lifecycle == ThreadLifecycle::Interrupted
         ));
-        let recovered_run = store.load_run(run_id).unwrap(); assert!(matches!(store.recover_thread_after_lease_loss(thread_id, run_id, &live, recovered_run.revision, 22).unwrap(), ThreadLeaseLossRecovery::AlreadyTerminal(_)));
+        let recovered_run = store.load_run(run_id).unwrap(); assert!(matches!(store.recover_thread_after_lease_loss(thread_id, run_id, &linked_lease, recovered_run.revision, 22).unwrap(), ThreadLeaseLossRecovery::AlreadyTerminal(_)));
         assert!(matches!(
             store
-                .interrupt_after_lease_loss(run_id, &live, recovered_run.revision, 22)
-                .unwrap(),
-            LeaseLossRecovery::AlreadyTerminal(state)
-                if state.status == RunStatus::Interrupted
+                .interrupt_after_lease_loss(run_id, &linked_lease, recovered_run.revision, 22),
+            Err(StorageError::LeaseLost)
         ));
         assert!(matches!(
             store
-                .interrupt_after_lease_loss(run_id, &live, recovered_run.revision + 1, 22)
-                .unwrap(),
-            LeaseLossRecovery::FencedNoop
+                .interrupt_after_lease_loss(run_id, &linked_lease, recovered_run.revision + 1, 22),
+            Err(StorageError::LeaseLost)
         ));
 
         let next = store.acquire_lease("next", 22, 100).unwrap();

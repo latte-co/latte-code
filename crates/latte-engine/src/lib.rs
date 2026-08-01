@@ -399,7 +399,26 @@ impl EngineBuilder {
         )
         .map_err(|e| StorageError::InvalidData(e.to_string()))?;
         let storage = match database_path {
-            Some(path) => storage::Storage::open(&path)?,
+            Some(path) => {
+                let absolute_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    std::env::current_dir()
+                        .map_err(|error| StorageError::InvalidData(error.to_string()))?
+                        .join(&path)
+                };
+                let canonical_parent = absolute_path
+                    .parent()
+                    .and_then(|parent| std::fs::canonicalize(parent).ok());
+                if canonical_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.starts_with(&workspace_identity))
+                {
+                    storage::Storage::open_in_workspace(&path, &workspace_root)?
+                } else {
+                    storage::Storage::open(&path)?
+                }
+            }
             None => storage::Storage::memory()?,
         };
         let (events, _) = broadcast::channel(32);
@@ -527,6 +546,14 @@ impl std::fmt::Debug for EngineHandle {
     }
 }
 impl EngineHandle {
+    fn ensure_thread_lease(thread_id: ThreadId, lease: &Lease) -> Result<(), StorageError> {
+        if lease.scope == format!("thread:{thread_id}") {
+            Ok(())
+        } else {
+            Err(StorageError::LeaseLost)
+        }
+    }
+
     fn reject_linked_run(&self, run_id: RunId) -> Result<(), StorageError> {
         if self.storage.is_thread_linked_run(run_id)? {
             Err(StorageError::LinkedRunRequiresThreadCommit)
@@ -780,6 +807,37 @@ impl EngineHandle {
             now_ms,
         )
     }
+    /// Atomically accepts a new Session submission and starts its first child
+    /// under the exact thread lease. A failure commits neither the user card nor
+    /// a token-zero active child.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn create_started_thread_v2(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        binding: ThreadProviderBindingV2,
+        prompt: &str,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let baseline = self
+            .workspace_manifest()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let response = self.storage.create_started_thread_v2(
+            thread_id,
+            run_id,
+            &binding,
+            &self.workspace_root,
+            prompt,
+            &baseline,
+            lease,
+            now_ms,
+        )?;
+        let _ = self
+            .thread_events
+            .send(response.thread_event.envelope.clone());
+        Ok(response.snapshot)
+    }
     /// Creates an immutable child run for a ready completed thread.
     pub fn create_thread_follow_up_v2(
         &self,
@@ -801,6 +859,56 @@ impl EngineHandle {
             now_ms,
         )
     }
+    /// Atomically accepts and starts a follow-up child under the exact Session
+    /// lease, preserving the completed parent if any precondition fails.
+    pub fn create_started_thread_follow_up_v2(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        prompt: &str,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let baseline = self
+            .workspace_manifest()
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let response = self.storage.create_started_thread_follow_up_v2(
+            thread_id,
+            run_id,
+            expected_thread_revision,
+            prompt,
+            &baseline,
+            lease,
+            now_ms,
+        )?;
+        let _ = self
+            .thread_events
+            .send(response.thread_event.envelope.clone());
+        Ok(response.snapshot)
+    }
+    /// Switches the provider/model binding for subsequent children of an idle
+    /// Session and publishes the durable binding-change event.
+    pub fn switch_thread_binding_v2(
+        &self,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        binding: &ThreadProviderBindingV2,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let response = self.storage.switch_thread_binding_v2(
+            thread_id,
+            expected_thread_revision,
+            binding,
+            lease,
+            now_ms,
+        )?;
+        let _ = self
+            .thread_events
+            .send(response.thread_event.envelope.clone());
+        Ok(response.snapshot)
+    }
     /// Reads one paged thread projection.
     pub fn thread_snapshot_v2(
         &self,
@@ -810,16 +918,60 @@ impl EngineHandle {
     ) -> Result<ThreadSnapshot, StorageError> {
         self.storage.thread_snapshot_v2(thread_id, after, limit)
     }
+    /// Reads the newest bounded transcript cards for presentation and resume
+    /// reconciliation. Durable history reconstruction continues to use the
+    /// forward-paged `thread_snapshot_v2` API.
+    pub fn thread_snapshot_tail_v2(
+        &self,
+        thread_id: ThreadId,
+        limit: usize,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        self.storage.thread_snapshot_tail_v2(thread_id, limit)
+    }
     /// Lists thread sessions with bounded recent transcript cards.
     pub fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
         self.storage.list_threads_v2()
     }
-    /// Lists bounded global Session metadata without loading transcripts.
+    /// Lists thread projections belonging to one exact workspace identity.
+    pub fn list_threads_v2_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<ThreadSnapshot>, StorageError> {
+        self.storage.list_threads_v2_for_workspace(workspace_root)
+    }
+    /// Lists bounded Session metadata without loading transcripts.
     pub fn list_thread_sessions_v2(
         &self,
         limit: usize,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
         self.storage.list_thread_sessions_v2(limit)
+    }
+    /// Lists bounded Session metadata for one exact workspace identity.
+    pub fn list_thread_sessions_v2_for_workspace(
+        &self,
+        workspace_root: &str,
+        limit: usize,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .list_thread_sessions_v2_for_workspace(workspace_root, limit)
+    }
+    /// Finds exact-title matches across the full workspace catalogue without
+    /// inheriting the recent-session picker window.
+    pub fn find_thread_sessions_v2_by_exact_title_for_workspace(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        limit: usize,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .find_thread_sessions_v2_by_exact_title_for_workspace(workspace_root, title, limit)
+    }
+    /// Reads exact Session metadata without applying a recent-list cap.
+    pub fn thread_session_v2(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Option<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage.thread_session_v2(thread_id)
     }
     /// The only public mutation path for a linked v2 child run.
     #[allow(clippy::needless_pass_by_value)]
@@ -1009,6 +1161,65 @@ impl EngineHandle {
             operation_digest,
         })
     }
+    /// Resolves a prepared v2 Ask effect. When permission is allowed after a
+    /// waiting Session has released its old coordinator lease, the operation
+    /// digest and single-use capability are rebound atomically to the current
+    /// fencing epoch before the effect may start.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_thread_effect_permission(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        expected_thread_revision: u64,
+        expected_run_revision: u64,
+        request_id: String,
+        source_key: String,
+        allow: bool,
+        command_id: latte_core::ThreadCommandId,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let rebound_operation_digest = if allow {
+            let descriptor = self
+                .storage
+                .thread_effect_canonical_descriptor(&request_id, run_id)?;
+            validate_thread_effect_descriptor(&descriptor)?;
+            if descriptor.effect_id != request_id {
+                return Err(StorageError::InvalidData(
+                    "canonical thread effect identifier mismatch".into(),
+                ));
+            }
+            let post_approval_revision = expected_run_revision
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
+            Some(
+                self.thread_effect_policy_and_digest(&descriptor, post_approval_revision, lease)?
+                    .1,
+            )
+        } else {
+            None
+        };
+        self.commit_thread_run_update(
+            ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision,
+                expected_run_revision,
+                command_id,
+                request_id: Some(request_id.clone()),
+                effect_id: Some(request_id.clone()),
+                update: CommitThreadRunUpdate::ResolvePermission {
+                    source_key,
+                    request_id,
+                    allow,
+                    rebound_operation_digest,
+                },
+            },
+            lease,
+            now_ms,
+        )
+        .map(|response| response.snapshot)
+    }
     /// Atomically consumes a durable ask approval (or the durable allow
     /// marker) and records Started before returning executable authority.
     pub fn start_thread_effect(
@@ -1073,6 +1284,8 @@ impl EngineHandle {
         lease: &Lease,
         cancellation: &CancellationToken,
     ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+        Self::ensure_thread_lease(started.snapshot.thread_id, lease)
+            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
         let descriptor = &started.descriptor;
         let (_policy, digest) = self
             .thread_effect_policy_and_digest(
@@ -1334,6 +1547,7 @@ impl EngineHandle {
         expected_run_revision: u64,
         now_ms: u64,
     ) -> Result<ThreadLeaseLossRecovery, StorageError> {
+        Self::ensure_thread_lease(thread_id, stale)?;
         let result = self.storage.recover_thread_after_lease_loss(
             thread_id,
             run_id,
@@ -1503,7 +1717,7 @@ impl EngineHandle {
         }
         Ok(state)
     }
-    /// Acquires or takes over the single runtime lease after expiry.
+    /// Acquires or renews one owner-scoped runtime lease.
     pub fn acquire_lease(
         &self,
         owner: &str,
@@ -1511,6 +1725,26 @@ impl EngineHandle {
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
         self.storage.acquire_lease(owner, now_ms, ttl_ms)
+    }
+    /// Acquires the legacy runtime scope and binds it to one exact unlinked run.
+    pub fn acquire_run_lease(
+        &self,
+        run_id: RunId,
+        owner: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Lease, StorageError> {
+        self.storage
+            .acquire_run_lease(run_id, owner, now_ms, ttl_ms)
+    }
+    /// Acquires the runtime lease isolated to one durable Session.
+    pub fn acquire_thread_lease(
+        &self,
+        thread_id: ThreadId,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<Lease, StorageError> {
+        self.storage.acquire_thread_lease(thread_id, now_ms, ttl_ms)
     }
     /// Renews a currently valid lease.
     pub fn renew_lease(
@@ -1523,7 +1757,12 @@ impl EngineHandle {
     }
     /// Releases a lease if its fencing token still matches.
     pub fn release_lease(&self, lease: &Lease) -> Result<(), StorageError> {
-        self.storage.release_lease(lease)
+        if let Some(response) = self.storage.release_lease(lease)? {
+            let _ = self
+                .thread_events
+                .send(response.thread_event.envelope.clone());
+        }
+        Ok(())
     }
     /// Reads the durable effect reconciliation status.
     pub fn effect_status(&self, effect_id: &str) -> Result<EffectStatus, StorageError> {
@@ -2635,6 +2874,9 @@ mod tool_effect_tests {
                     u64::try_from(index + 1_000).unwrap(),
                 )
                 .unwrap();
+            let thread_lease = engine
+                .acquire_thread_lease(thread_id, u64::try_from(index + 1_500).unwrap(), 10_000)
+                .unwrap();
             engine
                 .commit_thread_run_update(
                     ThreadCommitRequest {
@@ -2649,7 +2891,7 @@ mod tool_effect_tests {
                             source_key: format!("start-{index}"),
                         },
                     },
-                    &lease,
+                    &thread_lease,
                     u64::try_from(index + 2_000).unwrap(),
                 )
                 .unwrap();
@@ -2814,6 +3056,7 @@ mod tool_effect_tests {
         let snapshot = engine
             .create_thread_v2(thread_id, run_id, test_thread_binding(), "worker", 10)
             .unwrap();
+        let lease = engine.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
         let snapshot = engine
             .commit_thread_run_update(
                 ThreadCommitRequest {

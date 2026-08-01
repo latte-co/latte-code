@@ -120,14 +120,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        9
+        10
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        9
+        10
     );
     assert_eq!(
         sqlite_integer(
@@ -164,7 +164,13 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
             r"
             PRAGMA foreign_keys=ON;
             DROP TABLE thread_effect_canonical_v2;
-            DELETE FROM schema_migrations WHERE version IN (8,9);
+            DROP TABLE runtime_lease;
+            DROP TABLE runtime_lease_epoch;
+            CREATE TABLE runtime_lease(
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
+              fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
+            );
+            DELETE FROM schema_migrations WHERE version IN (8,9,10);
             PRAGMA user_version=7;
             INSERT INTO runs(
               run_id, state_json, status, revision, last_seq, lease_token,
@@ -220,12 +226,12 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
     provider.assert_consumed();
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        9
+        10
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=9;"
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=10;"
         ),
         1
     );
@@ -243,6 +249,6 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "engine_initialization");
     assert_eq!(
         json(&output)["error"]["message"],
-        "database schema version 99 is newer than supported version 9"
+        "database schema version 99 is newer than supported version 10"
     );
 }

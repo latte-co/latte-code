@@ -58,7 +58,8 @@ pub fn valid_openai_chat_input_request_id(id: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadLifecycle {
-    /// A thread may receive a follow-up. Its newest child completed.
+    /// A thread may receive a follow-up. Its newest child either completed or
+    /// failed with an explicitly retryable runtime error.
     Ready,
     /// The active child is talking to a provider or preparing work.
     Running,
@@ -217,7 +218,7 @@ pub struct ThreadSnapshot {
     pub transcript: TranscriptPage,
 }
 
-/// Bounded, transcript-free metadata used by global Session discovery.
+/// Bounded, transcript-free metadata used by Session catalog discovery.
 /// Provider credentials and executable effect data are intentionally absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadSessionSummary {
@@ -284,6 +285,11 @@ pub enum ThreadCommand {
         expected_thread_revision: u64,
         prompt: String,
     },
+    SwitchModel {
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        binding: ThreadProviderBindingV2,
+    },
     Cancel {
         thread_id: ThreadId,
         expected_thread_revision: u64,
@@ -329,6 +335,10 @@ pub enum ThreadEvent {
     },
     RunLinked {
         run: ThreadRunSummary,
+    },
+    BindingChanged {
+        provider_name: String,
+        model: String,
     },
     ReconciliationRequired {
         run_id: RunId,

@@ -215,6 +215,7 @@ pub struct OpenAiProvider {
     max_attempts: u32,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     streaming: bool,
 }
 impl OpenAiProvider {
@@ -238,6 +239,7 @@ impl OpenAiProvider {
             max_attempts: 1,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             streaming: false,
         })
     }
@@ -261,6 +263,11 @@ impl OpenAiProvider {
         self.max_tokens = max_tokens;
         self
     }
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
     /// Enables `OpenAI` Chat Completions SSE. The provider still accepts a valid
     /// inline JSON response without inventing deltas.
     #[must_use]
@@ -281,6 +288,8 @@ struct Request<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
 }
@@ -442,6 +451,7 @@ impl Provider for OpenAiProvider {
                 tool_choice: (!tools.is_empty()).then_some("auto"),
                 temperature: this.temperature,
                 max_tokens: this.max_tokens,
+                reasoning_effort: this.reasoning_effort.as_deref(),
                 stream: this.streaming.then_some(true),
             };
             let mut attempt = 0;
@@ -1460,12 +1470,13 @@ mod tests {
         assert!(!debug.contains("super-secret"));
     }
     #[tokio::test]
-    async fn sampling_options_are_sent_only_when_configured() {
+    async fn model_options_are_sent_only_when_configured() {
         let response = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
         let (endpoint, captured) = capturing_server(response);
         OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
             .unwrap()
             .with_sampling_options(Some(0.25), Some(321))
+            .with_reasoning_effort(Some("high".into()))
             .complete(
                 ProviderRequest {
                     messages: vec![],
@@ -1478,6 +1489,7 @@ mod tests {
         let configured = captured.recv().unwrap();
         assert_eq!(configured["temperature"], 0.25);
         assert_eq!(configured["max_tokens"], 321);
+        assert_eq!(configured["reasoning_effort"], "high");
 
         let (endpoint, captured) = capturing_server(response);
         OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
@@ -1494,6 +1506,7 @@ mod tests {
         let absent = captured.recv().unwrap();
         assert!(absent.get("temperature").is_none());
         assert!(absent.get("max_tokens").is_none());
+        assert!(absent.get("reasoning_effort").is_none());
     }
     #[tokio::test]
     async fn classifies_malformed_http_error_and_timeout() {

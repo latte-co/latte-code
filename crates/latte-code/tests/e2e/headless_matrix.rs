@@ -7,6 +7,24 @@ fn write_workspace_config(scenario: &Scenario, text: &str) {
     std::fs::write(scenario.root().join(".latte/latte-code.jsonc"), text).unwrap();
 }
 
+fn write_home_provider_config(scenario: &Scenario) {
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        r#"{
+            version: 1,
+            default_model: "primary/mock",
+            providers: { primary: {
+                type: "openai-chat",
+                models: ["mock"],
+                base_url: "http://127.0.0.1:9",
+                api_key: { source: "env", name: "TEST_OPENAI_KEY" }
+            } }
+        }"#,
+    )
+    .unwrap();
+}
+
 fn waiting_run_id(output: &std::process::Output) -> String {
     assert_eq!(
         output.status.code(),
@@ -46,16 +64,16 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
     let configuration_cases = [
         (r"{version:2}", "version must be 1"),
         (
-            r#"{default_provider:"missing"}"#,
-            "default_provider must name a configured provider",
+            r#"{default_model:"missing/mock"}"#,
+            "default_model provider must name a configured provider",
         ),
         (
-            r#"{default_provider:"",providers:{"":{type:"openai-chat",model:"mock",base_url:"http://127.0.0.1:9",api_key:{source:"env",name:"OPENAI_API_KEY"}}}}"#,
+            r#"{providers:{"":{type:"openai-chat",models:["mock"],base_url:"http://127.0.0.1:9",api_key:{source:"env",name:"OPENAI_API_KEY"}}}}"#,
             "provider names must not be empty",
         ),
         (
-            r#"{providers:{primary:{model:" "}}}"#,
-            "model must not be empty",
+            r#"{default_model:" "}"#,
+            "default_model must use provider/model",
         ),
         (
             r#"{providers:{primary:{endpoint:"http://127.0.0.1:9"}}}"#,
@@ -85,6 +103,7 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
     ];
     for (overlay, expected) in configuration_cases {
         let scenario = Scenario::new();
+        write_home_provider_config(&scenario);
         write_workspace_config(&scenario, overlay);
         let output = scenario.output(&["--json", "list"], |_| {});
         assert_eq!(
@@ -126,6 +145,7 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
     ];
     for (aliases, expected) in alias_cases {
         let scenario = Scenario::new();
+        write_home_provider_config(&scenario);
         write_workspace_config(
             &scenario,
             &format!(
@@ -135,7 +155,7 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
         let output = scenario.output(
             &["--json", "run", "must fail before transport"],
             |command| {
-                command.env("OPENAI_API_KEY", "alias-contract-secret");
+                command.env("TEST_OPENAI_KEY", "alias-contract-secret");
             },
         );
         assert_eq!(

@@ -9,6 +9,7 @@ const ESCAPE: &[u8] = b"\x1b[27u";
 #[test]
 fn final_tui_slash_suggestions_filter_navigate_and_execute_builtins() {
     let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
 
@@ -36,7 +37,7 @@ fn final_tui_slash_suggestions_filter_navigate_and_execute_builtins() {
     assert!(pty.wait_for_output(b"Single-session transcript", Duration::from_secs(5)));
 
     pty.write(CTRL_P);
-    pty.write(b"jjjjj\r");
+    pty.write(b"jjjjjj\r");
     let (status, output) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
     assert!(
@@ -50,6 +51,7 @@ fn final_tui_slash_suggestions_filter_navigate_and_execute_builtins() {
 #[test]
 fn final_tui_palette_navigation_and_bracketed_paste_are_operable() {
     let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
 
@@ -59,14 +61,14 @@ fn final_tui_palette_navigation_and_bracketed_paste_are_operable() {
         "command palette was not rendered: {}",
         String::from_utf8_lossy(&pty.output())
     );
-    pty.write(b"jj\r");
+    pty.write(b"jjj\r");
     assert!(pty.wait_for_output(b"Single-session transcript", Duration::from_secs(5)));
 
     // Enter Navigation through the palette, which also closes Help. Exercise
     // every navigation family even though the initial transcript has no
     // expandable actions, then return to the composer with `i`.
     pty.write(CTRL_P);
-    pty.write(b"jjj\r");
+    pty.write(b"jjjj\r");
     pty.write(b"?jk\x1b[6~\x1b[5~\x1b[H\x1b[C\x1b[D ?i");
 
     // Crossterm recognizes the terminal's bracketed-paste protocol as one
@@ -84,14 +86,14 @@ fn final_tui_palette_navigation_and_bracketed_paste_are_operable() {
 
     let before_refresh = pty.output().len();
     pty.write(CTRL_P);
-    pty.write(b"jjjj\r");
+    pty.write(b"jjjjj\r");
     assert!(
         pty.wait_for_growth(before_refresh, Duration::from_secs(5)),
         "Refresh did not redraw the final TUI"
     );
 
     pty.write(CTRL_P);
-    pty.write(b"jjjjj\r");
+    pty.write(b"jjjjjj\r");
     let (status, output) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
     assert!(

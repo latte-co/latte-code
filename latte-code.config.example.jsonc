@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "default_provider": "primary",
+  "default_model": "primary/model-id",
   "thread": {
     "max_request_bytes": 524288,
     "max_input_bytes": 393216,
@@ -11,8 +11,13 @@
   "providers": {
     "primary": {
       "type": "openai-chat",
-      "model": "gpt-4o",
-      "base_url": "https://api.openai.com/v1",
+      "models": {
+        "model-id": {
+          "name": "Model display name",
+          "options": { "context_window": 128000, "max_tokens": 16384 }
+        }
+      },
+      "base_url": "https://provider.example/v1",
       "api_key": { "source": "env", "name": "OPENAI_API_KEY" },
       "timeout_ms": 60000,
       "max_attempts": 1,
