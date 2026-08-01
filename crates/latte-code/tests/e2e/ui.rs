@@ -15,7 +15,7 @@ fn final_tui_slash_suggestions_filter_navigate_and_execute_builtins() {
 
     pty.write(b"/");
     assert!(
-        pty.wait_for_output(b"Find and resume a saved session", Duration::from_secs(5)),
+        pty.wait_for_output(b"/sessions", Duration::from_secs(5)),
         "slash suggestions were not rendered: {}",
         String::from_utf8_lossy(&pty.output())
     );

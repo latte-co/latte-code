@@ -370,13 +370,7 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
                 && threads[0].binding.model == "beta-reasoning"
         })
     }));
-    assert!(wait_until(Duration::from_secs(5), || {
-        let output = pty.output();
-        output.get(before_switch..).is_some_and(|tail| {
-            tail.windows(b"Ask a follow-up".len())
-                .any(|value| value == b"Ask a follow-up")
-        })
-    }));
+    assert!(pty.wait_for_growth(before_switch, Duration::from_secs(5)));
 
     pty.write(b"follow up on beta\r");
     assert!(beta.wait_for_calls(1, Duration::from_secs(5)));
