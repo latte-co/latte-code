@@ -36,7 +36,7 @@ Prompt Template 只允许文本展开；解析期间不能执行 Shell、读取�
 
 目标：
 
-- 通过瞬态 New Session Draft 与全局 Session Picker/Resume Path 完成最主要的
+- 通过瞬态 New Session Draft 与按 Workspace 过滤的 Session Picker/Resume Path 完成最主要的
   Session 闭环。
 - 在 Composer 开头输入 `/` 时发现命令。
 - 让快捷键、`Ctrl+P` 与 Slash Alias 收敛到同一套 Command Identifier 和
@@ -45,7 +45,8 @@ Prompt Template 只允许文本展开；解析期间不能执行 Shell、读取�
 - 明确区分本地控制命令与会成为模型可见 Prompt 的命令。
 - 支持确定性的匹配、参数、Alias、Disabled Reason 和未来可信 Prompt Command
   Source。
-- Command Validation Error、Popup State 与 Provider 启动失败保持瞬态。
+- Command Validation Error 与 Popup State 保持瞬态；Prompt 一旦被接受，Provider
+  启动失败使用正常的持久 Run Failure 语义展示。
 
 第一阶段不做：
 
@@ -220,7 +221,7 @@ Local 与 Typed Action Command 不会进入 Provider Follow-up Queue。Prompt Co
 
 ## 9. 持久化、History 与 Telemetry
 
-持久化契约遵守全局数据存储设计：
+持久化契约遵守数据存储设计：
 
 - Popup Filter、Selection、Validation Error、Disabled Reason 和 Local Command
   Output 都是内存中的 Presentation State。
@@ -232,7 +233,8 @@ Local 与 Typed Action Command 不会进入 Provider Follow-up Queue。Prompt Co
   不依赖当前 Template File。
 - Template Validation 或 Expansion 失败不留下 Session Content，并恢复原始
   Composer Invocation。
-- Provider 启动失败继续按照数据存储设计保持瞬态。
+- PromptTemplate Expansion 被接受后，Provider 启动失败会按照数据存储设计保留
+  展开的 User Message，并追加有界、已脱敏的 Failure。
 
 Composer Recall 可以在进程内历史中保留已提交 Invocation，但它不属于 Session
 History。Sensitive Command Argument 绝不进入 Telemetry。Telemetry 只允许记录
@@ -278,8 +280,8 @@ Trust Check。它们不会获得新的 Execution Kind。
 
 | Command | Alias | Kind | Availability | Mapping |
 | --- | --- | --- | --- | --- |
-| `/new` | – | `LocalUi` | 不存在 Active Run 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，暂不创建 Durable Session。 |
-| `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Run 或 Blocking Request | 无参数时加载并打开全局 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
+| `/new` | – | `LocalUi` | 不存在 Active Run 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，在第一条 Prompt 被接受前不创建 Durable Session。 |
+| `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Run 或 Blocking Request | 无参数时加载并打开当前 Workspace 的 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
 
 `/new` 不会 Clear、Archive 或 Delete 当前 Session。TUI 需要显式的 Active
 Conversation Target，例如：
@@ -293,14 +295,15 @@ pub enum ActiveConversation {
 
 进入 `NewSessionDraft` 只清空新 Draft Composer 与本地 Selection State；原
 Session 仍然可以发现。它的第一个 Prompt 使用正常 Start Path，并遵守数据存储
-设计的 Commit Point：第一个完整有效 Provider Outcome 到达前，不创建 Session
-Row 或 Content File。
+设计的 Commit Point：Prompt 通过本地校验并被接受时，先创建 Session Row 与 User
+Content，再构造或调用 Provider。
 
 `/sessions` 是规范 Discovery Command，`/resume` 是精确 Alias。无参数形式打开
-由全局 SQLite Session Catalog 提供数据的有界 Picker。Row 只包含 Title、
-Project、Workspace、Lifecycle、Model 与 Update Time 等 Session Metadata；只有
-用户选中后才加载 Transcript JSONL。可选参数先尝试精确 Session ID，再执行确定性
-Title Match。Title 存在歧义时继续停留在 Picker，不能静默选择。
+由当前配置的 SQLite 数据库提供、按 Canonical Workspace 过滤的有界 Picker。Row
+只包含 Title、Workspace、Lifecycle、Provider、Model 与 Timestamp；只有用户选中后
+才加载 Transcript Row。可选参数先尝试精确 Session ID，再跨完整 Workspace Catalog
+执行 Exact Title Query，而不是只搜索最近的 Picker Page。Title 存在歧义时继续停留
+在 Picker，不能静默选择。
 
 选中 Row 后发出显式 Typed Open/Resume Action。它重新加载所选 Session 的 JSONL
 Conversation 与 SQLite Control Projection，不调用 Provider，也不增加 Conversation
@@ -321,7 +324,7 @@ Active Run。
 | `/cancel` | – | `TypedAction` | 对可取消 Active Run 发出 `Cancel { thread_id }`。 |
 | `/quit` | `/exit`、`/q` | `TypedAction` | 发出 `Quit`。 |
 
-后续 Built-in 可以增加 `/status`、`/fork`、`/rename`、`/compact`、`/model`、
+后续 Built-in 可以增加 `/status`、`/fork`、`/rename`、`/compact`、
 `/permissions` 和 `/diff`，但前提是每个命令都有 Typed Service Contract 与
 Lifecycle Policy。Prompt Expansion 可用后，`/init` 和 `/review` 应作为第一批
 Built-in `PromptTemplate` Command。
@@ -387,9 +390,9 @@ UT 至少覆盖：
 Final-Binary E2E 至少覆盖：
 
 - 输入 `/` 会显示 Command Popup，且不会调用 Provider。
-- `/new` 保持原 Session 不变、切换到空的瞬态 Draft，并且在有效 Provider
-  Outcome 前不创建 Persistent Session。
-- `/sessions` 从全局 Catalog 读取有界 Metadata，且不会加载每个 Transcript 或
+- `/new` 保持原 Session 不变、切换到空的瞬态 Draft，并且在第一条 Prompt 通过
+  本地校验并被接受前不创建 Persistent Session。
+- `/sessions` 从 Workspace Catalog 读取有界 Metadata，且不会加载每个 Transcript 或
   调用 Provider。
 - `/resume <session-id>` 打开精确 Session；Title Match 存在歧义时停留在 Picker，
   要求用户显式选择。
@@ -422,6 +425,7 @@ Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata�
 | --- | --- | --- | --- |
 | `/new` | – | `LocalUi` | 启动新的瞬态 Draft。 |
 | `/sessions [id 或精确 title]` | `/resume` | `TypedAction` | 打开 Session Picker，或恢复唯一精确匹配。 |
+| `/model` | – | `TypedAction` | 打开可搜索、按 Provider 分组的 Model Picker，并切换下一个 Child 使用的 Binding。 |
 | `/help` | – | `LocalUi` | 打开键盘帮助。 |
 | `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
 | `/refresh` | – | `TypedAction` | 重新加载权威 Projection。 |
@@ -435,8 +439,23 @@ Command Text 写入 Transcript。
 
 TUI 启动时恢复当前 Canonical Workspace 中最新的 Session。`/new` 选择瞬态
 Draft；无参数 `/sessions` 打开 Picker，携带参数时解析 UUID 或精确 Title。不会
-隐式打开持久化 Workspace 不同的 Session。存在 Submission、Active Work 或
-Pending Request 时禁用 Session 切换，并在 Dispatch 时再次检查 Availability。
+隐式打开持久化 Workspace 不同的 Session。存在 Submission、Active Child、Pending
+Request 或 Reconciliation 时禁用 Session 切换，并在 Dispatch 时再次检查
+Availability。`Failed` 与 `Interrupted` 已没有 Active Child，可以执行 `/new` 或
+`/sessions`。
+`/model` 会按 Provider 分组展示各自完整的 `models` 目录。每个 map key 是实际
+发送给该 Provider 的模型 ID；可选 `name` 只用于展示与搜索，嵌套 `options` 由对应
+Provider 实现强类型解析，因此不同 Provider 不必共享 Options key。选中 Options
+会固定进 Binding，展示名不会。唯一的全局 `default_model` 使用 `provider/model`
+标识并标记初始选择，Provider 自身没有默认模型。New Draft
+仅在本地保留选择直到 Start；Ready Session 会先持久化精确 Provider/Model Binding
+与一条 System Card，Composer 在权威 Snapshot 确认切换前保持锁定。Credential
+仍只在下一个 Child 启动时解析，因此错误 Provider 会成为该 Child 的持久、可重试
+Failure，而不是让 Picker 闪屏并吞掉提交。
+在这两种 Terminal Session 中，普通 Enter 不会创建本地 Queue，也不会消费
+Composer。若 Follow-up 在 Child Active 时进入 Queue，但 Child 在它被持久接受前
+终结，则精确恢复 Draft。Submission Reconciliation 使用 Durable Card Source 与
+已脱敏 Content，而不是只比较展示文本。
 
 Composer 现在会针对 `/` 与单 Token 前缀打开锚定在 Composer 上方的 Built-in
 Suggestion Popup。它按 Canonical Name 与 Alias Prefix 匹配，并以稳定的
@@ -451,13 +470,14 @@ Skill、可执行 Plugin、显式 Cross-workspace Rebinding 与 Slash `/cancel` 
 Reducer Test 覆盖 Popup Filter、键盘选择、Dismiss、Blocking、Local、Typed 与
 普通 Prompt Path、Alias、精确 Argument、禁用的切换和 Draft 保留。最终二进制
 PTY E2E 覆盖 Popup Rendering、方向键 Navigation、Prefix Filter、Session 创建、
-`/resume <thread-id>`、`/new`，以及这些本地路径不会触发额外 Provider Request。
+`/resume <thread-id>`、`/new`、Provider/Model 切换、下一次 Wire Request 使用所选
+Model，以及纯本地路径不会触发额外 Provider Request。
 
 ## 16. 交付阶段
 
 1. 增加单一 Built-in Command Catalog、Parser、Availability Evaluation、Alias，
    以及可以表示瞬态 New Session Draft 的显式 `ActiveConversation` Target。
-2. 增加 Typed Global Session Catalog/Open Boundary 与有界 Session Picker；实现
+2. 增加 Typed Session Catalog/Open Boundary 与有界 Session Picker；实现
    `/new` 和 `/sessions`，并把 `/resume` 作为 Alias。
 3. 增加覆盖 New、Discovery、Direct Resume、Workspace Rebinding、Active Run
    Blocking 与跨平台 Popup/Picker Rendering 的 Final-Binary E2E。

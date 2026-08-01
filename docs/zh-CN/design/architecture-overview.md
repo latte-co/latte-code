@@ -19,15 +19,15 @@ latte-code CLI/TUI
 
 `latte-core` 不依赖存储、Provider 或 UI。`latte-engine` 是所有特权副作用的唯一执行主体，只暴露受限句柄。前端读取持久化投影并提交类型化命令，不直接修改仓库或运行时状态。
 
-`latte-code` 按顺序递归合并内置默认值、`$HOME/.latte/latte-code.jsonc` 和工作区 `.latte/latte-code.jsonc`；配置文件缺失是合法状态，相同 key 由工作区值覆盖。新运行使用命名的默认 Provider，CLI 与 TUI 共用 headless Provider 注册表。Thread binding 会在解析 secret 或发送 history 前，结构化固定所有 v1 语义 binding 字段（包括 alias），以及非 secret credential reference、credential generation 与 data scope；不匹配会关闭失败，避免静默漂移。
+`latte-code` 按顺序递归合并内置应用默认值、`$HOME/.latte/latte-code.jsonc` 和工作区 `.latte/latte-code.jsonc`。单个配置文件可以缺失，相同 key 由工作区值覆盖。只读状态命令允许 Provider Catalog 为空；TUI 与调用 Provider 的操作则要求合并结果显式提供唯一的全局 `default_model` 及匹配的 Provider Model。Latte Code 不内置 Provider Catalog。每个 Provider 的 `models` 会作为一份完整目录替换前一层。CLI 与 TUI 共用 headless Provider 注册表。Thread binding 会在解析 secret 或发送 history 前，结构化固定所有 v1 语义 binding 字段（包括 alias）、模型 Options，以及非 secret credential reference、credential generation 与 data scope；`context_window` 会为后续上下文管理与压缩保留在 binding 中。不匹配会关闭失败，避免静默漂移。
 
 配置 `streaming` 后，OpenAI Chat Completions 支持有边界的 SSE：可处理 CRLF、注释、多 data 行、UTF-8 分块、tool 聚合、`[DONE]` 和取消。只有真实 delta 会被呈现；内联 JSON 只呈现最终结果，不伪造 delta。仅当 streaming 请求以零 body 的不支持响应失败时，才允许一次非流式回退；Responses API 仍不在范围内。
 
 ## 持久化状态
 
-CLI 和 TUI 共用一个产品级 SQLite 数据库：`$HOME/.latte/latte-code/state.db`；当 `LATTE_CODE_HOME` 是绝对路径时，使用 `LATTE_CODE_HOME/state.db`。Workspace 只提供 Provider 和 Verification 配置，绝不拥有产品状态。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。遗留的 `database.path` 仅为迁移兼容而接受，不能选择状态数据库。
+每个工作区使用配置的 `database.path`，默认值为 `.latte/latte-code.db`。相对路径以工作区根目录为基准，也支持绝对路径。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。
 
-Thread v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitThreadRunUpdate` 原子提交。旧 run 仍可由 CLI 读取，绝不回填为 thread。
+Thread v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）；迁移 10 新增 Session Scoped Runtime Lease，同时保持 Fencing Token 全局单调。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitThreadRunUpdate` 原子提交。旧 run 仍可由 CLI 读取，绝不回填为 thread。
 
 运行写入必须携带有效 owner lease 与单调递增的 fencing token。lease 过期后即使同一 owner 重新获取也会推进 epoch；接管后旧 owner 不能再写入。
 

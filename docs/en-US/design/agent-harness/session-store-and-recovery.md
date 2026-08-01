@@ -37,16 +37,22 @@ engine-private Effect descriptors.
 
 ## 3. Materialization and recovery
 
-New Sessions and follow-ups begin as in-memory Drafts. Configuration, credential,
-model, authentication, transport, or start failure creates no Session/Run row,
-JSONL, or Provider-error record.
+New Sessions and follow-ups remain in-memory Drafts through local validation.
+Once a prompt is accepted, its Session/Run and exact user content become durable
+before credential resolution, Provider construction, or network I/O.
 
-The first complete valid Provider outcome is materialization:
+Accepted submission is materialization:
 
 1. insert non-discoverable `materializing` Session metadata;
-2. append and sync JSONL header, consumed input, and complete outcome;
-3. create the required Run/control state; and
-4. make the Session discoverable.
+2. append and sync the JSONL header and consumed input;
+3. create the child Run/control state and make the Session discoverable; and
+4. append the complete Provider outcome or a bounded, redacted failure card.
+
+Validation or storage failure before acceptance creates no Session/Run row or
+JSONL and restores the exact Draft. Configuration, credential, model,
+authentication, transport, or start failure after acceptance preserves the user
+record and appends a sanitized failure record. Provider-construction failures
+are retryable; raw Provider errors and credentials are never persisted.
 
 Startup may trim one torn final JSONL line only and must not rewrite valid
 history. It repairs catalog from the header or removes `materializing` metadata
@@ -69,5 +75,6 @@ cleanup policy; they must not be silently hidden in JSONL or Provider Attempts.
 - UT proves credentials, Provider errors, partial delta, and descriptors never
   enter JSONL.
 - E2E proves a fresh process lists, opens, and replays a completed Session; a
-  start failure leaves catalog/files byte-identical; interruption after `Started`
-  exposes reconciliation only.
+  Provider start failure preserves the accepted input, appends one bounded
+  failure, and permits retry; interruption after `Started` exposes
+  reconciliation only.

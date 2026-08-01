@@ -34,15 +34,21 @@ token 或 engine-private effect descriptor。
 
 ## 3. 物化和恢复
 
-新 Session 与 follow-up 先是内存 Draft。配置、credential、model、认证、传输或启动
-失败时，不创建 Session/Run row、JSONL 或 Provider error record。
+新 Session 与 follow-up 在本地校验阶段保持为内存 Draft。Prompt 一旦被接受，其
+Session/Run 与精确 User Content 会在解析 Credential、构造 Provider 或发起网络
+I/O 之前持久化。
 
-第一个完整有效 Provider outcome 才是物化点：
+接受提交就是物化点：
 
 1. 插入不可发现的 `materializing` Session metadata；
-2. 追加并 sync JSONL header、已消费输入与完整 outcome；
-3. 创建该 outcome 所需的 Run/control state；
-4. 将 Session 标为可发现。
+2. 追加并 sync JSONL header 与已消费输入；
+3. 创建 Child Run/Control State 并将 Session 标为可发现；
+4. 追加完整 Provider Outcome 或有界、已脱敏的 Failure Card。
+
+接受前的 Validation 或 Storage Failure 不创建 Session/Run Row 或 JSONL，并精确
+恢复 Draft。接受后的 Configuration、Credential、Model、Authentication、
+Transport 或启动失败会保留 User Record，并追加已脱敏 Failure Record。Provider
+构造失败可重试；原始 Provider Error 与 Credential 绝不持久化。
 
 启动时只能裁剪一条撕裂的 JSONL 尾行，绝不改写有效 history；随后从 header 修复
 catalog，或删除没有有效 JSONL 的 `materializing` row。已 `Started` 而观察不确定的
@@ -61,5 +67,6 @@ Session mailbox、Provider stream 和 retry 为进程内 runtime。将来若要�
 - UT：workspace bucket、materialization crash point、撕裂尾行、lease takeover 与
   fencing 均确定性验证。
 - UT：credential、Provider error、partial delta 和 descriptor 永不进入 JSONL。
-- E2E：新进程可列出、打开、replay 完成 Session；启动失败保持文件和 catalog 字节级
-  不变；`Started` effect 后中断只能显示 reconciliation。
+- E2E：新进程可列出、打开、replay 完成 Session；Provider 启动失败会保留已接受
+  Input、追加一个有界 Failure 并允许重试；`Started` Effect 后中断只能显示
+  Reconciliation。

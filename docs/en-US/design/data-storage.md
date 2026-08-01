@@ -1,13 +1,16 @@
 # Global session and data storage design
 
-Status: **Partially implemented.**
+Status: **Partially implemented; the global storage home is not enabled.**
 
-The global product state database, workspace-scoped Session catalog, schema 9
-metadata, startup resume, and Provider-configuration failure boundary are
-implemented. Conversation cards still live in SQLite. The per-Session JSONL
-transcript, recovery, and migration portions of this document remain target
-design. They must preserve the existing engine invariants around effects,
-permissions, leases, fencing, deduplication, and `Unknown` reconciliation.
+The current implementation keeps runtime state and conversation cards in the
+configured database, defaulting to workspace-relative `.latte/latte-code.db`.
+Schema 9 catalog metadata, workspace-filtered startup resume, scoped Session
+leases, and the accepted-submission/Provider-failure boundary are implemented
+inside that database. The global product home, cross-workspace catalog,
+per-Session JSONL transcript, recovery, import, and migration portions remain
+target design. They must preserve the existing engine invariants around
+effects, permissions, leases, fencing, deduplication, and `Unknown`
+reconciliation.
 
 ## 1. Decisions
 
@@ -16,7 +19,7 @@ permissions, leases, fencing, deduplication, and `Unknown` reconciliation.
 | Session conversation content | Global per-session JSONL | Append-only user, assistant, tool, and context records. |
 | Project, workspace, and session metadata | Global SQLite | Discovery, search, lifecycle, provider binding, lineage, and archive state. |
 | Run and effect control state | Global SQLite | Transactional run state, effects, permissions, leases, checkpoints, evidence, and deduplication. |
-| Drafts and Provider runtime | Process memory | Draft prompts, HTTP streams, retries, cancellation, deltas, and startup errors. |
+| Drafts and Provider runtime | Process memory | Unaccepted prompts, HTTP streams, retries, cancellation, deltas, and raw Provider diagnostics. |
 | Credentials | No persistent store | Only non-secret credential references and generations may be durable. |
 
 Additional decisions:
@@ -26,7 +29,9 @@ Additional decisions:
 - JSONL is the sole replay source for conversation content; SQLite does not
   duplicate the transcript.
 - There is no transcript outbox and no durable Provider-attempt table.
-- Provider startup failures are not Session facts and are never persisted.
+- Once a prompt is accepted, Provider startup failures are Session facts.
+  Persist only a bounded, redacted failure card; never persist credentials or
+  raw Provider diagnostics.
 - Provider streaming deltas are transient. Only complete Provider outcomes are
   eligible for persistence.
 
@@ -40,8 +45,8 @@ Additional decisions:
 - **Run** is one submitted prompt and its Provider/tool continuation loop.
 - **Effect** is an operation that may change or observe external state and is
   owned by `latte-engine`.
-- **Draft** is an in-memory new Session or follow-up that has not reached the
-  persistence commit point.
+- **Draft** is an in-memory new Session or follow-up that has not passed local
+  validation and reached the durable submission commit point.
 
 ## 3. Global storage home
 
@@ -72,9 +77,9 @@ workspace.
 
 The workspace configuration may continue to control project behavior, but it
 must not control the global storage location. A workspace-layer
-`database.path` is rejected rather than silently redirecting user history. The
-storage home may be selected only by the process environment or trusted user
-configuration.
+`database.path` is accepted only for migration compatibility and is ignored;
+it never redirects user history. The storage home may be selected only by the
+process environment or trusted user configuration.
 
 ## 4. Workspace storage key
 
@@ -169,21 +174,33 @@ misreported external effects.
 
 ## 6. Per-Session ownership
 
-The current database-wide singleton lease cannot be used after all workspaces
-share one global database. The target lease is scoped to a Session:
+The current configured database uses scoped runtime leases:
 
 ```text
-session_leases
-  session_id (primary key)
+runtime_lease
+  scope (primary key: runtime or thread:<session-id>)
   owner
   fencing_token
   expires_at_ms
 ```
 
-Different Sessions can run concurrently. A Session has at most one active
-engine owner and one JSONL writer. Reacquiring an expired lease advances the
-fencing token. A stale owner cannot begin or observe an Effect and must close
+Legacy headless runs share the `runtime` scope. Different Thread v2 Sessions
+use different scopes and can run concurrently. A Session has at most one
+active engine owner and one JSONL writer. Reacquiring an expired lease advances
+the globally monotonic fencing token. A stale owner cannot begin or observe an
+Effect and must close
 its Session writer when ownership is lost.
+
+Returning from a durable `WaitingPermission` or `WaitingInput` operation
+atomically changes the linked Run and active-row lease token to zero before the
+lease row is removed. Token zero is a clean quiescence marker: startup
+preserves the waiting child, while a later coordinator must acquire a fresh
+global fencing epoch before writing. A missing lease with a nonzero token still
+means an unclean owner loss and follows conservative interruption/`Unknown`
+recovery. When the user explicitly allows a prepared Effect in a new epoch,
+the engine revalidates the private canonical descriptor and atomically rebinds
+both the single-use permission capability and operation digest to that epoch
+before `Started`.
 
 ## 7. JSONL contract
 
@@ -235,46 +252,46 @@ A new prompt starts as an in-memory Draft:
 ```text
 prompt
 -> validate the non-secret Provider binding
+-> create the durable Session, child Run, and user card
+-> start the child under its Session lease
 -> resolve the credential reference in memory
 -> construct the Provider
 -> make the first Provider request
 ```
 
-Configuration, credential, model, authentication, transport, timeout, or other
-startup failure leaves no Session row, Run row, JSONL file, persistent log
-record, or telemetry payload. The sanitized presentation error remains in the
-current UI state, and the prompt returns to the composer for retry.
+Validation or storage failure before durable creation leaves no Session or Run
+and restores the exact draft. After creation, configuration, credential, model,
+authentication, transport, timeout, or other Provider startup failure
+terminalizes that child with a bounded, sanitized failure card. The user card
+is not removed or copied back into the composer. Provider-construction
+failures are retryable: the Session returns to `Ready`, and a later submission
+creates a new immutable child. Raw Provider diagnostics and credential values
+remain process-local.
 
-The persistence commit point is the first complete valid Provider outcome:
-
-- A complete assistant message.
-- A complete assistant tool-call envelope.
-- A valid input request.
-
-After that point the application:
+The persistence commit point is acceptance of the validated user submission,
+before Provider construction or network I/O. The application:
 
 1. Inserts a non-listable `materializing` Session metadata row.
-2. Writes and syncs the JSONL header, user message, and complete Provider
-   outcome.
-3. Creates the durable Run/control state required by the outcome.
-4. Marks the Session listable with its actual lifecycle.
+2. Writes and syncs the JSONL header and user message.
+3. Creates the durable child Run/control state.
+4. Marks the Session listable as `Running`.
+
+A complete assistant message, tool-call envelope, input request, or sanitized
+failure is appended only after that durable submission boundary.
 
 Startup removes a `materializing` row with no valid file, or repairs catalog
-metadata from a valid self-identifying file. Empty failed Sessions never appear
-in discovery.
+metadata from a valid self-identifying file. It never removes an accepted
+Session merely because Provider startup failed.
 
 ### 8.2 Follow-up
 
-A follow-up is also an in-memory Draft until its first complete Provider
-outcome. A startup failure does not create a child Run or append the user
-prompt. The existing Session remains byte-for-byte unchanged and the prompt is
-returned to the composer.
-
-Once a complete outcome arrives, the Run is materialized and the user/outcome
-records are appended together. If a later Provider request fails after durable
-tool work, only the minimum generic Run state such as `Interrupted` or
-`ReconciliationRequired` is retained. The Provider error text is still not
-persisted.
+A follow-up uses the same boundary: validate first, then atomically append its
+user card and create a child before Provider construction. A
+Provider-construction failure appends a retryable failure card; completed prior
+children remain immutable, and the Session returns to `Ready` for another
+follow-up. If a later Provider request fails after durable tool work, the
+existing `Failed`, `Interrupted`, or `ReconciliationRequired` control state is
+retained. Only bounded redacted presentation text may be durable.
 
 ## 9. Effect ordering
 
@@ -362,23 +379,24 @@ Migration from the current workspace database is additive and idempotent:
 
 New Sessions use `jsonl_v1`. Existing SQLite-backed Sessions remain readable
 during rollout or are explicitly migrated; tables are not silently dropped.
-Workspace-layer `database.path` becomes invalid after the global storage
-contract is enabled.
+Workspace-layer `database.path` remains parseable for migration compatibility
+but is ignored after the global storage contract is enabled.
 
 ## 14. Required verification
 
 Implementation is incomplete until UT and final-binary E2E prove at least:
 
-- Provider startup failure changes neither the Session count nor the JSONL
-  tree.
-- Provider startup error text is absent from SQLite, JSONL, and persistent
-  application logs.
+- Provider startup failure preserves the accepted user card and appends one
+  bounded failure card without duplicating or restoring the prompt.
+- Credential values and raw Provider diagnostics are absent from SQLite,
+  JSONL, and persistent application logs.
 - A workspace contains no Latte Code database or Session files.
 - Two workspaces share the global database but use distinct Session buckets.
 - Two different Sessions run concurrently; two writers for one Session are
   fenced.
 - JSONL tail repair removes only a torn final line.
-- A failed follow-up leaves the original Session unchanged.
+- A failed follow-up appends one immutable failed child while preserving every
+  earlier child; a retryable configuration failure permits another follow-up.
 - A `Started` Effect becomes `Unknown` after crash or lease loss.
 - An observed Effect with a missing JSONL tool result is repaired without
   executing the Effect again.
@@ -390,38 +408,88 @@ These scenarios follow the repository's independent UT 95%, final-binary E2E
 
 ## 15. Current implementation status
 
-Latte Code currently uses one product state database at
-`$HOME/.latte/latte-code/state.db`. An absolute `LATTE_CODE_HOME` overrides the
-product home. The former `database.path` JSONC value remains accepted for
-configuration compatibility but no longer redirects product state.
+Latte Code currently honors `database.path`, defaulting to
+`.latte/latte-code.db` below the workspace root. Relative values are resolved
+from that root and absolute paths are supported. There is no
+`LATTE_CODE_HOME` product-state switch, legacy import, or product-wide database
+default yet.
 
 Migration 9 adds a bounded, redacted title and canonical `workspace_root` to
 the v2 Session metadata. Catalog reads do not deserialize transcript rows. The
 TUI filters Sessions by the current canonical workspace, resumes the newest
 matching Session on startup, starts a transient draft for `/new`, and exposes
 explicit selection through `/sessions` and `/resume`.
+When upgrading a v8 database, legacy rows can be adopted only when the database
+is physically below the current canonical workspace; the migration backfills
+their workspace and title in the schema transaction. An external or shared v8
+database with unscoped Session rows fails with an explicit migration error
+instead of silently attributing them to the caller's workspace.
 
-A new conversation remains process-local until Provider binding resolves.
-Missing credentials, invalid binding/configuration, or Provider construction
-failure creates no `threads_v2` row, linked run, transcript entry, or persisted
-error record; the TUI restores the composer draft with a secret-safe error.
-Already durable engine safety state is not erased.
+Migration 10 replaces the singleton runtime lease with scoped lease rows.
+Legacy headless runs retain the `runtime` scope, while Thread v2 uses one
+`thread:<session-id>` scope per Session. Each acquisition has a distinct
+coordinator owner, so a second coordinator for the same Session is rejected
+while different Sessions remain concurrent. The runtime releases its lease
+when an operation returns; durable input and permission waits become
+writer-free clean quiescence rather than orphaned runs. Fencing tokens remain
+globally monotonic so concurrent Sessions do not weaken restart recovery.
+Releasing a Thread lease while its child is still active is an unclean
+coordinator exit: the release transaction immediately interrupts the child, or
+marks every `Started` Effect `Unknown` and requires reconciliation, before it
+removes the lease. The TUI therefore never waits for process restart to escape
+a lease-less `Running` projection.
 
-The JSONL transcript layout, repair, Session-scoped writers, and removal of
-SQLite transcript duplication are not implemented. The global database also
-retains existing v1 run/control records for the headless CLI.
+A new conversation remains process-local only through local prompt and
+non-secret binding validation. Once accepted, one transaction persists the
+`threads_v2` row, linked Run, user transcript entry, exact lease token, and
+durable `Start` events before credential resolution or Provider construction.
+It cannot commit a token-zero Running Session between creation and Start.
+Missing credentials or Provider
+construction failure adds a secret-safe retryable failure card and returns the
+Session to `Ready`; the composer stays empty and usable. A syntactically invalid
+binding or a storage failure before that boundary still restores the draft.
+An HTTP, authentication, transport, timeout, or model-selection failure from an
+attempted Provider request follows the same retryable child-failure path: the
+accepted user card and sanitized failure remain durable, while a later
+follow-up creates a new child. Invalid successful responses and unsafe
+Provider-issued IDs remain terminal protocol failures.
+The TUI reconciles an accepted composer submission only against a redacted user
+card whose source is the new-Session or follow-up commit path; an input-request
+answer with identical text cannot acknowledge it. Input answers use a separate
+submission identity bound to Session, Run, and request ID. Shift+Enter remains
+a newline while that request owns the editor, and a failed command restores the
+value only after an authoritative snapshot proves that its exact input card was
+not committed. Terminal Sessions reject ordinary composer submission without
+consuming the draft; a queued follow-up is restored if the active child ends
+before the follow-up is committed.
 
-Unit tests cover product-home resolution, migration 9, catalog metadata, and
-Provider-configuration non-materialization. Final-binary E2E covers the global
-database, `/resume`, `/new` without another Provider request, and failed
-Provider setup with an empty catalog.
+A model selection is a Session binding transition, not an editor preference.
+Only a `Ready` Session with no active child may change it, under the exact
+`thread:<session-id>` lease and expected revision. The transaction replaces the
+complete non-secret provider binding, appends a bounded System card, and emits
+`BindingChanged`. The TUI blocks a competing follow-up until a refreshed
+snapshot contains the selected provider and model. Provider credentials are
+not resolved by this transition; construction and any resulting sanitized
+failure belong to the next durably accepted child.
+
+The JSONL transcript layout, repair, Session-scoped writers, global product
+home, cross-workspace discovery, legacy import, and removal of SQLite
+transcript duplication are not implemented. The configured database retains
+existing v1 run/control records for the headless CLI.
+
+Unit tests cover configured-path resolution, migrations 9 and 10, catalog
+metadata, scoped authority, and durable retryable Provider-configuration
+failures. Final-binary E2E covers workspace-local and explicitly configured
+databases, `/resume`, `/new` without another Provider request, long transcript
+tail resume/follow-up, and a failed Provider setup followed by a multiline
+retry in the same Session.
 
 ## 16. Delivery phases
 
 1. Add the global product home, Workspace storage keys, global catalog, and
    per-Session leases.
-2. Introduce Draft new-Session and follow-up lifecycles so Provider startup
-   failures remain transient.
+2. Introduce Draft validation plus durable new-Session/follow-up acceptance so
+   Provider startup failures become visible retryable child failures.
 3. Add the bounded JSONL writer, reader, tail repair, checkpoints, and combined
    projection.
 4. Integrate the existing fenced Effect lifecycle with JSONL tool-call and

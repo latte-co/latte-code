@@ -74,10 +74,12 @@ reconciliation behavior.
 
 Mailbox, partial delta, stream handle, timer, and cancellation token are
 process-local. Acceptance may display `InputQueued` progress but writes no
-JSONL, SQLite, or telemetry. Once an entry enters a Provider request and gets a
-first complete valid outcome, session-store materialization appends exact input
-and outcome to JSONL and creates needed Run/control state. Start failure, a full
-mailbox, expired reminder, or process exit creates no Conversation Record.
+JSONL, SQLite, or telemetry. Once the runner consumes an entry at a safe
+injection point, session-store materialization appends the exact input and
+creates its child Run/control state before Provider construction or request.
+The complete outcome is appended afterward. Provider startup failure appends a
+bounded, redacted failure to that accepted Conversation Record; a full mailbox,
+expired reminder, or process exit before consumption creates no record.
 
 Capacity and entry bytes are bounded and configurable. `MailboxFull` is
 secret-safe, preserves composer text, and never drops older input. Only the
@@ -100,4 +102,5 @@ event gap or reconnect and reloads its snapshot.
 - E2E proves the final binary accepts a second prompt during a Provider stream
   and sends it exactly once in the next safe request.
 - E2E proves a reminder during tool execution is injected only after tool result;
-  cancellation and Provider-start failure create no fake transcript entry.
+  cancellation creates no fake transcript entry, while Provider-start failure
+  preserves the accepted user entry and one bounded failure without duplication.

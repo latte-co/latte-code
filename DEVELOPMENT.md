@@ -70,7 +70,7 @@ make run ARGS='--help'
 make run ARGS='--json list'
 ```
 
-没有配置文件时，CLI/TUI 会使用内置默认配置。自定义配置按“内置默认值 → `$HOME/.latte/latte-code.jsonc` → `<workspace>/.latte/latte-code.jsonc`”递归合并；相同 key 由工作区配置覆盖，数组和标量整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，只需导出最终配置所引用的密钥。若要自定义当前工作区：
+CLI/TUI 会先加载内置的应用默认值，再按 `$HOME/.latte/latte-code.jsonc`、`<workspace>/.latte/latte-code.jsonc` 的顺序递归合并；Provider 与 Model 必须显式配置，Latte Code 不内置任何 Provider 或 Model。相同 key 由工作区配置覆盖，数组、标量以及每个 Provider 的完整 `models` 目录整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，还需导出最终配置所引用的密钥。若要配置当前工作区：
 
 ```bash
 mkdir -p .latte
@@ -78,7 +78,7 @@ cp latte-code.config.example.jsonc .latte/latte-code.jsonc
 export OPENAI_API_KEY='...'
 ```
 
-用户配置和工作区配置都可以只写需要覆盖的 key。在 `.latte/latte-code.jsonc` 中可配置 `default_provider`、`providers.<name>` 和 `verification.argv`。示例使用 `type: "openai-chat"`、`base_url`、`model`，以及 `api_key: { source: "env", name: "OPENAI_API_KEY" }`；CLI/TUI 只在实际调用 Provider 时于内存中解析该引用。不要把密钥直接写进 JSONC。产品状态固定在 `$HOME/.latte/latte-code/state.db`，或由绝对路径 `LATTE_CODE_HOME` 覆盖，绝不会写入工作区；遗留的 `database.path` 只为迁移兼容而接受，不能重定向状态位置。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
+用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。示例还使用 `type: "openai-chat"`、`base_url`，以及 `api_key: { source: "env", name: "OPENAI_API_KEY" }`；CLI/TUI 只在实际调用 Provider 时于内存中解析该引用。不要把密钥直接写进 JSONC。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
 
 `resume --deny`、等待态取消、查看运行记录和 Unknown reconciliation 不依赖 Provider 凭证。
 
@@ -126,7 +126,7 @@ Windows 上的进程监督和安全文件变更目前运行时 fail-closed；por
 
 ## 本地状态与清理
 
-运行状态默认存放在 `$HOME/.latte/latte-code/state.db`；仅可通过绝对路径 `LATTE_CODE_HOME` 覆盖产品状态 Home。构建输出位于 `target/`。工作区下不创建运行状态目录。
+运行状态默认存放在 `.latte/latte-code.db`；可通过 `database.path` 配置其他位置。构建输出位于 `target/`。默认状态目录与构建目录已被 Git 忽略。
 
 ```bash
 make clean
