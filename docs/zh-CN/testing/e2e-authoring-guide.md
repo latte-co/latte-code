@@ -10,7 +10,7 @@
 
 1. **UT**：在最低责任模块直接证明规则、边界和失败路径；
 2. **E2E**：从最终 `latte-code` 二进制进入，证明用户可观察行为；
-3. **独立覆盖率卡点**：全仓 UT-only 行覆盖率 `>= 95%`，最终二进制 E2E 行覆盖率 `>= 80%`；
+3. **独立覆盖率卡点**：全仓 UT-only 行覆盖率 `>= 95%`，最终二进制 E2E 行覆盖率 `>= 90%`；
 4. **变更直接覆盖**：新增或修改的功能代码必须由对应 UT 和 E2E 直接命中，不能只依赖既有测试维持全仓数字；
 5. **回归保护**：修复用户可见缺陷时，必须增加能在修复前失败、修复后通过的回归测试。
 
@@ -188,7 +188,7 @@ TUI E2E 使用 `PtySession`：
 
 失败消息应包含脱敏后的 stdout、stderr 或 PTY transcript，帮助本地和 CI 定位问题。
 
-## 7. UT 95% / E2E 80% 覆盖率规则
+## 7. UT 95% / E2E 90% 覆盖率规则
 
 ### 7.1 统计口径
 
@@ -196,7 +196,7 @@ UT 覆盖率只运行 crate-local lib/bin tests，不包含 Contract、E2E 或 d
 
 ```bash
 make coverage-unit # --lib --bins --fail-under-lines 95
-make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
+make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 90
 ```
 
 Unix PTY/process E2E 在 Makefile 和 CI 中固定使用单测试线程，避免不同场景争用终端、signal 和 process-group 资源；单个场景内部仍必须使用可观测事件同步和有界超时，不能改回固定 sleep。
@@ -208,14 +208,14 @@ cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --all-features --lib --bins --html
 ```
 
-E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内部 API 的测试也不能计入 E2E 80% 指标。禁止通过扩大排除列表、删除断言、移动测试层级或只统计容易覆盖的 package 来制造达标。
+E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内部 API 的测试也不能计入 E2E 90% 指标。禁止通过扩大排除列表、删除断言、移动测试层级或只统计容易覆盖的 package 来制造达标。
 
 ### 7.2 Required 卡点
 
 三项覆盖率卡点互相独立，全部通过才算完成：
 
 1. `make coverage-unit`：全仓 UT-only lines `>= 95%`；
-2. `make coverage-e2e`：最终二进制 E2E lines `>= 80%`；
+2. `make coverage-e2e`：最终二进制 E2E lines `>= 90%`；
 3. `make coverage-total`：全 targets lines `>= 90%`。
 
 `make coverage` 串行执行三项卡点，并在每项前清理 profile，避免上一层测试命中污染下一层数字。新增或修改功能除了保持全仓卡点通过，还必须直接覆盖 success、boundary、typed failure 和适用的 safety-negative 路径。
@@ -239,7 +239,7 @@ E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内
 - [ ] 功能验收矩阵已明确 happy path 和负向路径；
 - [ ] 最低责任模块有对应 UT；
 - [ ] 全仓 UT-only 行覆盖率达到 95% 以上；
-- [ ] 全仓最终二进制 E2E 行覆盖率达到 80% 以上；
+- [ ] 全仓最终二进制 E2E 行覆盖率达到 90% 以上；
 - [ ] 新增/修改功能代码由对应 UT 和 E2E 直接覆盖；
 - [ ] 至少一个最终二进制 E2E 覆盖主用户旅程；
 - [ ] 权限、安全、恢复、验证行为有显式负向断言；

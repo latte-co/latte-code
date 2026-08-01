@@ -412,7 +412,7 @@ Final-Binary E2E 至少覆盖：
 - Popup Rendering 与 Keyboard Behavior 在 Linux、macOS 和受支持的 Windows
   Terminal Harness 上通过。
 
-这些测试属于仓库现有的独立 UT 95%、Final-Binary E2E 80% 和 All-Target 90%
+这些测试属于仓库现有的独立 UT 95%、Final-Binary E2E 90% 和 All-Target 90%
 覆盖率卡点。
 
 ## 15. 当前实现状态

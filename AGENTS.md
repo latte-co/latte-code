@@ -26,7 +26,7 @@ cargo test --workspace --all-features --locked
 cargo doc --workspace --no-deps --locked
 ```
 
-When installed, also run `make lint-ci`, `make coverage`, and `cargo deny --locked check`. Coverage is three independent gates: UT-only lines >= 95%, final-binary E2E lines >= 80%, and all-target lines >= 90%. Do not lower or merge these floors.
+When installed, also run `make lint-ci`, `make coverage`, and `cargo deny --locked check`. Coverage is three independent gates: UT-only lines >= 95%, final-binary E2E lines >= 90%, and all-target lines >= 90%. Do not lower or merge these floors.
 
 ## PR delivery policy
 
@@ -41,7 +41,7 @@ Every change that adds or modifies product behavior must include both:
 - UT at the lowest responsible module, covering success, boundary, typed failure, and relevant safety-negative paths.
 - At least one final-binary E2E that enters through `CARGO_BIN_EXE_latte-code` and proves the primary user-observable journey. Permission, security, recovery, verification, process, and TUI changes also require the applicable negative journey.
 
-The workspace must pass at least 95% line coverage from UT-only execution (`make coverage-unit`) and at least 80% line coverage from final-binary E2E execution (`make coverage-e2e`). UT, E2E, Contract, and doc-test hits are measured independently and must not be substituted or merged. New or modified functional code must keep both global gates passing and must directly cover its own success, boundary, typed-failure, and applicable safety-negative paths.
+The workspace must pass at least 95% line coverage from UT-only execution (`make coverage-unit`) and at least 90% line coverage from final-binary E2E execution (`make coverage-e2e`). UT, E2E, Contract, and doc-test hits are measured independently and must not be substituted or merged. New or modified functional code must keep both global gates passing and must directly cover its own success, boundary, typed-failure, and applicable safety-negative paths.
 
 Required E2E must be isolated, deterministic, bounded, independent of the public network and real Provider credentials, and free of `#[ignore]` or conditional skips. Use observable events or durable projections instead of fixed sleeps, continuously drain PTY output, and clean up child process groups on failure.
 

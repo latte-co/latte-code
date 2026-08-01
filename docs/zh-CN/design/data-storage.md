@@ -363,7 +363,7 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
 - 已 Observed Effect 缺少 JSONL Tool Result 时可以修复，且不会再次执行 Effect。
 - Archive、Fork、Workspace Rebinding 和幂等 Legacy Import 保留历史与 Lineage。
 
-这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 80% 和 All-Target 90%
+这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 90% 和 All-Target 90%
 覆盖率卡点。
 
 ## 15. 当前实现状态

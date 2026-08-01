@@ -18,7 +18,7 @@ UT and E2E are the two primary gates. The Contract layer does not broaden produc
 
 Final rules:
 
-- Every PR must pass UT, Contract, P0 E2E, and three independent line-coverage gates: UT-only >= 95%, final-binary E2E >= 80%, and all-target >= 90%. New or modified functional code must also be reached directly by its corresponding UT and E2E.
+- Every PR must pass UT, Contract, P0 E2E, and three independent line-coverage gates: UT-only >= 95%, final-binary E2E >= 90%, and all-target >= 90%. New or modified functional code must also be reached directly by its corresponding UT and E2E.
 - Blocking CI must not contact a real Provider, depend on the public network, or consume real API keys.
 - Linux, macOS, and Windows run check, Clippy, UT, Contract, portable final-binary E2E, and release-build gates on every PR. Linux and macOS additionally run the Unix PTY/process E2E suite. This validates every applicable surface without claiming unsupported Windows process supervision.
 - Safety, permission, recovery, and verification behavior require explicit positive and negative assertions; coverage alone is insufficient.
@@ -41,7 +41,7 @@ The repository and CI already provide:
 
 Measured baseline on 2026-07-15:
 
-| Metric | Current value | Notes |
+| Metric | 2026-07-15 baseline | Notes |
 | --- | ---: | --- |
 | Cargo-discovered tests | 353 | 245 crate-local, 15 contract, 3 portable E2E, 75 Unix E2E, and 15 documentation tests |
 | Crate-local tests | 245 | Independent `--lib --bins` profile; existing inline tests still contain some component behavior to purify |
@@ -116,7 +116,7 @@ A Provider E2E test is defined by running the production Provider adapter, seria
 | G0 Static | Every PR | Yes | fmt, three-platform check/Clippy, Rustdoc, actionlint, ShellCheck, MSRV, architecture/repo checks, dependency audit | 3 min |
 | G1 UT | Every PR | Yes | All pure crate-local UT; workspace UT-only line coverage >= 95% | 2 min |
 | G2 Contract | Every PR | Yes | SQLite, FS, process, scripted/cassette Provider, public API, doc tests | 5 min |
-| G3 E2E | Every PR | Yes | Portable final-binary CLI/Provider/SQLite on all three platforms; complete headless + TUI/PTY on Linux/macOS; independent line coverage >= 80% | 5 min/OS |
+| G3 E2E | Every PR | Yes | Portable final-binary CLI/Provider/SQLite on all three platforms; complete headless + TUI/PTY on Linux/macOS; independent line coverage >= 90% | 5 min/OS |
 | G4 Coverage | Every PR | Yes | workspace/all-features/all-targets, total lines >= 90% | 5 min |
 | G5 Release smoke | Release workflow | Yes | Start each release artifact, help, JSON list | 2 min/OS |
 | Extended | Nightly/manual | No for PRs | Repetition, long cancellation, boundary-size matrix, live canary | 15 min |
@@ -129,7 +129,7 @@ Budgets are upper bounds, not time to consume with `sleep`. Jobs should run in p
 
 - Linux, macOS, and Windows independently run check, Clippy, UT, Contract, portable E2E, and release build. Linux and macOS additionally run the Unix PTY/process E2E target.
 - Repository quality runs fmt, Rustdoc, inventory, actionlint, and ShellCheck; Rust 1.93 MSRV, documentation tests, and dependency audit remain independently visible.
-- `Coverage - UT (95%)`, `Coverage - E2E (80%)`, and `Coverage - total (90%)` are separate jobs and cannot compensate for one another.
+- `Coverage - UT (95%)`, `Coverage - E2E (90%)`, and `Coverage - total (90%)` are separate jobs and cannot compensate for one another.
 - The stable `PR Gate` status uses job-level `always()` to wait for all 14 required jobs, then explicitly requires every `needs.<job>.result` to equal `success`. A failure, cancellation, or skip fails the gate.
 - A new PR commit cancels the older run for that PR. `main` and merge-queue runs are never cancelled, preserving trunk and queue evidence.
 - Three-platform release builds are dependencies of `PR Gate`. They prove artifact compilation and upload, but are not yet G5 release smoke.
@@ -357,7 +357,7 @@ The fixture's finally/Drop path must independently terminate the PGID and wait f
 ### 8.1 Coverage
 
 - Workspace UT-only line coverage must be `>= 95%`, measured independently by `make coverage-unit`.
-- Final-binary E2E line coverage must be `>= 80%`, measured independently by `make coverage-e2e`.
+- Final-binary E2E line coverage must be `>= 90%`, measured independently by `make coverage-e2e`.
 - E2E, Contract, and documentation-test hits do not count toward UT coverage. UT, Contract, or tests that directly call internal APIs do not count toward E2E coverage. Functional code must not be excluded to manufacture compliance.
 - Keep the existing total line-coverage gate at `>= 90%`; never lower it.
 - Produce crate/file reports in CI before recording stable baselines.
@@ -467,8 +467,8 @@ The design builds on working test seams rather than hypothetical infrastructure:
 
 - `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the current UT-only profile reaches 95.05%.
 - The independent contract and E2E targets contain 93 integration tests: 15 Contract, 3 portable final-binary E2E, and 75 Unix final-binary E2E tests.
-- The current macOS profiles pass independently at 95.05% UT-only, 80.78% E2E, and 96.64% all-target coverage.
+- The 2026-07-15 macOS baseline measured 95.05% UT-only, 80.78% E2E, and 96.64% all-target coverage; it predates the 90% E2E floor.
 - Final-binary execution, a loopback Provider, a real PTY, cross-process SQLite resume, and terminal-mode restoration already have reusable implementations.
 - The Provider endpoint already targets a loopback harness, so cassette replay can reuse the same final-binary path without a production backdoor.
 - The runtime already has component tests for process `Started`, Unknown, restart recovery, and reconciliation. The external-barrier E2E lifts existing semantics to the final-binary boundary and does not require a production backdoor.
-- The complete local `make ci` gate passes; each layer remains independently runnable, and every coverage profile is cleaned before collection.
+- At that baseline, the complete local `make ci` gate passed under the then-current floors; each layer remains independently runnable, and every coverage profile is cleaned before collection.

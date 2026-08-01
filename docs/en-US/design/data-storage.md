@@ -404,7 +404,7 @@ Implementation is incomplete until UT and final-binary E2E prove at least:
   history and lineage.
 
 These scenarios follow the repository's independent UT 95%, final-binary E2E
-80%, and all-target 90% coverage gates.
+90%, and all-target 90% coverage gates.
 
 ## 15. Current implementation status
 

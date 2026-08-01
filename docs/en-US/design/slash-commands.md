@@ -444,7 +444,7 @@ Final-binary E2E must cover at least:
 - Popup rendering and keyboard behavior pass on Linux, macOS, and the supported
   Windows terminal harness.
 
-These tests are part of the existing independent UT 95%, final-binary E2E 80%,
+These tests are part of the existing independent UT 95%, final-binary E2E 90%,
 and all-target 90% coverage gates.
 
 ## 15. Current implementation status

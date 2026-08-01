@@ -7,7 +7,7 @@
 - [斜杠命令](design/slash-commands.md)：已实现的 Built-in Catalog、Session 命令与 Composer Popup，以及设计中的 Prompt Command 扩展和其余 Typed Action。
 - Agent Harness 设计方案：[异步 Turn Runner](design/agent-harness/asynchronous-turn-runner.md)、[Session 存储与恢复](design/agent-harness/session-store-and-recovery.md)、[Effect Authority、策略与隔离](design/agent-harness/effect-authority-and-policy.md)、[扩展与委派能力](design/agent-harness/extensions-and-delegation.md)、[事件、投影与回放](design/agent-harness/event-projection-and-replay.md)、[TUI Runtime 契约](design/agent-harness/tui-runtime-contract.md) 与 [验证 Harness 与确定性测试](design/agent-harness/verification-harness.md)。
 - [UT / E2E 测试卡点](design/testing-gates.md)：测试分层、阻断矩阵、E2E 场景与分阶段落地方案。
-- [E2E 编写手册](testing/e2e-authoring-guide.md)：功能开发的 UT/E2E 配套规则、Harness 用法、断言清单与 UT 95% / E2E 80% 独立覆盖率口径。
+- [E2E 编写手册](testing/e2e-authoring-guide.md)：功能开发的 UT/E2E 配套规则、Harness 用法、断言清单与 UT 95% / E2E 90% 独立覆盖率口径。
 - [English documentation](../en-US/README.md)。
 
 本文档树描述当前 Rust 实现，以及明确标注状态、尚未全部落地的设计方案。

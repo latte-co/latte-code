@@ -73,7 +73,7 @@ fn ci_workflow_exposes_a_fail_closed_pr_gate_contract() {
         ("msrv", "MSRV (Rust 1.93)"),
         ("doc-tests", "Documentation tests"),
         ("coverage-unit", "Coverage - UT (95%)"),
-        ("coverage-e2e", "Coverage - E2E (80%)"),
+        ("coverage-e2e", "Coverage - E2E (90%)"),
         ("coverage-total", "Coverage - total (90%)"),
         ("dependency-audit", "Dependency audit"),
     ] {

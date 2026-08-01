@@ -226,7 +226,7 @@ jobs:
       - run: make coverage-unit
 
   coverage-e2e:
-    name: Coverage - E2E (80%)
+    name: Coverage - E2E (90%)
     timeout-minutes: 40
     runs-on: ubuntu-latest
     steps:

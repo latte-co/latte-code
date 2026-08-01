@@ -37,7 +37,7 @@ make test        # test-all 的兼容入口
 make check       # fmt + check + Clippy + Rustdoc
 make lint-ci     # actionlint workflow syntax + ShellCheck shell analysis
 make coverage-unit # UT-only 行覆盖率 >= 95%
-make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 80%
+make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 90%
 make coverage-total # 全 targets 行覆盖率 >= 90%
 make coverage    # 串行执行以上三个独立覆盖率卡点
 make deny        # 检查安全公告、许可证和依赖来源
@@ -90,7 +90,7 @@ export OPENAI_API_KEY='...'
 - Unix 最终二进制 E2E：保留 75 个包含 PTY、process group、signal、symlink 和 Unix verification 的场景，通过 `make test-e2e-unix` 运行。
 - doc tests：验证公开 authority API 的 compile-fail 边界。
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
-- 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、80%、90%。
+- 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、90%、90%。
 
 任何新增或修改产品行为的功能都必须同时增加最低责任层 UT 和至少一个最终二进制 E2E。具体目录、Harness、同步方式、断言清单和反例见 [E2E 编写手册](docs/zh-CN/testing/e2e-authoring-guide.md)。
 
@@ -101,7 +101,7 @@ make coverage-unit
 make coverage-e2e
 ```
 
-全仓 UT-only 行覆盖率必须 `>= 95%`，最终二进制 E2E 行覆盖率必须 `>= 80%`。新增或修改的功能代码还必须由对应责任层测试直接覆盖，不能仅依赖既有测试维持全仓数字。全 targets 的 `>= 90%` 卡点继续保留；`make coverage` 会串行执行三项卡点并在每项前清理 profile，避免跨层数据污染。
+全仓 UT-only 行覆盖率必须 `>= 95%`，最终二进制 E2E 行覆盖率必须 `>= 90%`。新增或修改的功能代码还必须由对应责任层测试直接覆盖，不能仅依赖既有测试维持全仓数字。全 targets 的 `>= 90%` 卡点继续保留；`make coverage` 会串行执行三项卡点并在每项前清理 profile，避免跨层数据污染。
 
 ## 与 CI 的关系
 
@@ -112,7 +112,7 @@ GitHub Actions 在 `main` push、面向 `main` 的 PR、merge queue 和手工触
 - Linux、macOS、Windows 各自的 Cargo check、Clippy `-D warnings`、UT、Contract、portable 最终二进制 E2E 和 `latte-code` release build；
 - Linux、macOS 的 75 个 Unix PTY/process 最终二进制 E2E；
 - Rust 1.93 MSRV、actionlint 1.7.12、ShellCheck、Documentation tests 和 Dependency audit；
-- `Coverage - UT (95%)`、`Coverage - E2E (80%)`、`Coverage - total (90%)` 三个独立状态；
+- `Coverage - UT (95%)`、`Coverage - E2E (90%)`、`Coverage - total (90%)` 三个独立状态；
 
 稳定聚合状态 `PR Gate` 使用 fail-closed 语义检查上述每个 job 的结果；失败、取消或跳过任何一个依赖都不会产生假绿。仓库的 branch protection 或 ruleset 应只把 `PR Gate` 配置为 required check，底层 job 仍可用于定位失败。
 
