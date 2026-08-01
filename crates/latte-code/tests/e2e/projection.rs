@@ -1,7 +1,8 @@
 use super::support::{ProviderReply, PtySession, Scenario, ScriptedProvider, wait_until};
 use latte_core::{
-    Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, SystemIdSource,
-    ThreadCommandId, ThreadId, ThreadProviderBindingV2, TranscriptKind, VerificationStatus,
+    Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, RunFailure,
+    SystemIdSource, ThreadCommandId, ThreadId, ThreadProviderBindingV2, TranscriptKind,
+    VerificationStatus,
 };
 use latte_engine::{
     CommitThreadRunUpdate, EngineHandle, Lease, ThreadCommitRequest, ThreadEffectDescriptor,
@@ -408,6 +409,102 @@ fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
     provider.assert_consumed();
     retry_pty.write(F10);
     assert!(retry_pty.finish(Duration::from_secs(5)).0.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_projection_matrix_renders_public_operation_and_target_variants() {
+    for (name, input, expected_operation, expected_target) in [
+        (
+            Some("read_file"),
+            serde_json::json!({"path":"src/read target.rs"}),
+            "Read file",
+            "src/read target.rs",
+        ),
+        (
+            Some("list_directory"),
+            serde_json::json!({"path":"src/components"}),
+            "List directory",
+            "src/components",
+        ),
+        (
+            Some("search"),
+            serde_json::json!({"query":"projection needle"}),
+            "Search workspace",
+            "projection needle",
+        ),
+        (
+            Some("custom_fixture_tool"),
+            serde_json::json!({}),
+            "custom fixture tool",
+            "Not exposed by runtime",
+        ),
+        (
+            None,
+            serde_json::json!({}),
+            "Repository operation",
+            "Not exposed by runtime",
+        ),
+    ] {
+        let scenario = Scenario::new();
+        let (engine, lease, initial) = fixture_engine(&scenario);
+        let mut snapshot = start(&engine, &lease, &initial);
+        let request_id = format!("projection-permission-{}", name.unwrap_or("generic"));
+        if let Some(name) = name {
+            snapshot = commit(
+                &engine,
+                &lease,
+                &snapshot,
+                CommitThreadRunUpdate::AppendTranscript {
+                    source_key: format!("fixture:permission:{name}:descriptor"),
+                    kind: TranscriptKind::ToolCall,
+                    text: format!("inspect {expected_operation}"),
+                    payload: Some(serde_json::json!({"descriptor": {
+                        "tool_call_id": format!("call-{name}"),
+                        "effect_id": request_id,
+                        "name": name,
+                        "input": input,
+                    }})),
+                },
+                1_010,
+            );
+        }
+        snapshot = commit(
+            &engine,
+            &lease,
+            &snapshot,
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: format!("fixture:permission:{}:request", name.unwrap_or("generic")),
+                request: PendingPermission {
+                    request_id,
+                    operation_digest: "d".repeat(64),
+                    description: "bounded public fixture scope".into(),
+                },
+            },
+            1_011,
+        );
+        assert_eq!(
+            snapshot.lifecycle,
+            latte_core::ThreadLifecycle::WaitingPermission
+        );
+        finish_fixture(engine, &lease);
+
+        let mut pty = render_fixture(&scenario, b"Permission required", 26, 88);
+        assert!(
+            pty.wait_for_visible_text(expected_operation, Duration::from_secs(5)),
+            "permission operation was not visible: {}",
+            String::from_utf8_lossy(&pty.output())
+        );
+        assert!(
+            pty.wait_for_visible_text(expected_target, Duration::from_secs(5)),
+            "permission target was not visible: {}",
+            String::from_utf8_lossy(&pty.output())
+        );
+        pty.write(b"\r ");
+        assert!(pty.is_running(), "inert permission keys exited the TUI");
+        pty.write(F10);
+        assert!(pty.finish(Duration::from_secs(5)).0.success());
+    }
 }
 
 trait LifecycleLabelForTest {

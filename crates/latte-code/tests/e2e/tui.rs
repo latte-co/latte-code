@@ -5,9 +5,12 @@ use super::{
         wait_until,
     },
 };
-use latte_core::{TranscriptEntry, TranscriptEntryId, TranscriptKind};
+use latte_core::{
+    IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2, TranscriptEntry,
+    TranscriptEntryId, TranscriptKind,
+};
 use rusqlite::{Connection, params};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 const TUI_READY: &[u8] = b"\x1b[>3u";
 const F10: &[u8] = b"\x1b[21~";
@@ -44,6 +47,22 @@ fn has_one_durable_terminal_tool_result(
                 .count()
                 == 1
     })
+}
+
+fn session_boundary_binding() -> ThreadProviderBindingV2 {
+    ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "main".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "openai-chat-completions-v1".into(),
+        model: "mock".into(),
+        config_fingerprint: "session-boundary-config".into(),
+        tools_fingerprint: "session-boundary-tools".into(),
+        aliases: BTreeMap::new(),
+        credential_ref_id: "env:TEST_OPENAI_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    }
 }
 
 #[test]
@@ -352,7 +371,15 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
         "alpha completion did not become durable: {}",
         String::from_utf8_lossy(&pty.output())
     );
-    assert!(pty.wait_for_output(b"Ask a follow-up", Duration::from_secs(5)));
+    // The durable Ready transition can precede the next redraw. Synchronize
+    // with the visible state label from that exact projection before opening
+    // the picker. The harness ignores cursor-control bytes because Ratatui may
+    // split visible words across delta-render escape sequences.
+    assert!(
+        pty.wait_for_visible_text("Ready for follow-up", Duration::from_secs(5)),
+        "alpha completion was durable but not rendered: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
 
     pty.write(b"/model\r");
     assert!(
@@ -450,6 +477,20 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     );
     assert_eq!(provider.requests().len(), 1);
 
+    let before_title_resume = resumed.output().len();
+    resumed.write(b"/sessions seed session\r");
+    assert!(
+        resumed.wait_for_growth(before_title_resume, Duration::from_secs(5)),
+        "exact-title session lookup did not redraw"
+    );
+    resumed.write(b"/sessions no such durable session\r");
+    assert!(
+        resumed.wait_for_visible_text("No saved sessions", Duration::from_secs(5)),
+        "missing exact-title lookup was not reported: {}",
+        String::from_utf8_lossy(&resumed.output())
+    );
+    resumed.write(b"\x1b[27u");
+
     resumed.write(b"/new\r");
     assert!(wait_until(Duration::from_secs(2), || provider
         .requests()
@@ -460,6 +501,105 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     resumed.write(F10);
     assert!(resumed.finish(Duration::from_secs(5)).0.success());
     provider.assert_consumed();
+}
+
+#[test]
+fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entries() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+    std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
+    let local_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    for offset in 0..2 {
+        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let now = latte_core::wall_time_ms() + offset;
+        let stale = local_engine
+            .acquire_thread_lease(thread_id, now, 1)
+            .unwrap();
+        local_engine
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                session_boundary_binding(),
+                "duplicate session title",
+                &stale,
+                now,
+            )
+            .unwrap();
+        local_engine
+            .recover_thread_after_lease_loss(thread_id, run_id, &stale, 1, now + 2)
+            .unwrap();
+    }
+    drop(local_engine);
+
+    let foreign_workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(foreign_workspace.path().join(".git")).unwrap();
+    let foreign_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let foreign_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(foreign_workspace.path())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    let foreign_now = latte_core::wall_time_ms();
+    let foreign_lease = foreign_engine
+        .acquire_thread_lease(foreign_thread_id, foreign_now, 1)
+        .unwrap();
+    let foreign_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    foreign_engine
+        .create_started_thread_v2(
+            foreign_thread_id,
+            foreign_run_id,
+            session_boundary_binding(),
+            "foreign session title",
+            &foreign_lease,
+            foreign_now,
+        )
+        .unwrap();
+    foreign_engine
+        .recover_thread_after_lease_loss(
+            foreign_thread_id,
+            foreign_run_id,
+            &foreign_lease,
+            1,
+            foreign_now + 2,
+        )
+        .unwrap();
+    drop(foreign_engine);
+
+    let mut pty = PtySession::spawn(scenario.command(&["tui"]));
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(b"/sessions duplicate session title\r");
+    assert!(
+        pty.wait_for_visible_text("Enter resume", Duration::from_secs(5)),
+        "duplicate exact-title result was not rendered: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    assert!(
+        pty.output()
+            .windows(b"duplicate session title".len())
+            .filter(|window| *window == b"duplicate session title")
+            .count()
+            >= 3,
+        "duplicate title picker did not contain both matching Sessions"
+    );
+    pty.write(b"\x1b[27u");
+    pty.write(format!("/resume {foreign_thread_id}\r").as_bytes());
+    assert!(
+        pty.wait_for_visible_text("belongs to another workspace", Duration::from_secs(5)),
+        "foreign Session was not rejected: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    let (status, output) = pty.finish(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(70));
+    assert!(
+        output
+            .windows(b"\x1b[?1049l".len())
+            .any(|value| value == b"\x1b[?1049l")
+    );
 }
 
 #[test]
