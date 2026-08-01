@@ -2,6 +2,93 @@ use super::support::{ProviderReply, Scenario, ScriptedProvider, json};
 use serde_json::Value;
 use std::time::Duration;
 
+#[test]
+fn public_engine_embedding_config_contract_covers_jsonc_environment_and_fail_closed_validation() {
+    let scenario = Scenario::new();
+    let config_dir = scenario.root().join(".latte");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let path = config_dir.join("latte-engine.jsonc");
+    std::fs::write(
+        &path,
+        r#"{
+            // Public embedding configuration remains JSONC.
+            database: { path: "${PATH}" },
+            runtime: { command_buffer: 4, event_buffer: 8 },
+            providers: { local: {
+                base_url: "http://127.0.0.1:9",
+                api_key: "${PATH}",
+            } },
+        }"#,
+    )
+    .unwrap();
+    let loaded = latte_engine::config::Config::load(scenario.root()).unwrap();
+    assert_eq!(loaded.runtime.command_buffer, 4);
+    assert_eq!(loaded.runtime.event_buffer, 8);
+    assert!(!loaded.database.path.is_empty());
+    let provider = loaded.providers.get("local").unwrap();
+    assert!(provider.base_url.starts_with("http://"));
+    let debug = format!("{provider:?}");
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains(&provider.api_key));
+
+    let defaults: latte_engine::config::Config = json5::from_str("{}").unwrap();
+    assert_eq!(defaults.database.path, ".latte/latte-code.db");
+    assert_eq!(defaults.runtime.command_buffer, 32);
+    assert_eq!(defaults.runtime.event_buffer, 128);
+
+    let missing =
+        latte_engine::config::Config::load_path(&config_dir.join("missing.jsonc")).unwrap_err();
+    assert!(missing.to_string().contains("cannot read configuration"));
+
+    let invalid_cases = [
+        ("{", "invalid JSONC configuration"),
+        (r#"{database:{path:""}}"#, "database.path must not be empty"),
+        (
+            r"{runtime:{command_buffer:0,event_buffer:1}}",
+            "runtime buffer sizes must be greater than zero",
+        ),
+        (
+            r"{runtime:{command_buffer:1,event_buffer:0}}",
+            "runtime buffer sizes must be greater than zero",
+        ),
+        (
+            r#"{providers:{empty:{base_url:"",api_key:"key"}}}"#,
+            "provider empty requires base_url and api_key",
+        ),
+        (
+            r#"{providers:{empty:{base_url:"http://localhost",api_key:""}}}"#,
+            "provider empty requires base_url and api_key",
+        ),
+        (
+            r#"{providers:{missing:{base_url:"http://localhost",api_key:"${LATTE_E2E_INTENTIONALLY_MISSING}"}}}"#,
+            "references missing environment variable",
+        ),
+        (
+            r#"{database:{path:"${}"}}"#,
+            "invalid environment placeholder",
+        ),
+        (
+            r#"{providers:{nested:{base_url:"${A${B}}",api_key:"key"}}}"#,
+            "invalid environment placeholder",
+        ),
+        (r"{unknown:true}", "invalid JSONC configuration"),
+    ];
+    for (index, (text, expected)) in invalid_cases.into_iter().enumerate() {
+        let case_path = config_dir.join(format!("invalid-{index}.jsonc"));
+        std::fs::write(&case_path, text).unwrap();
+        let error = latte_engine::config::Config::load_path(&case_path).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "case {index}: {error}"
+        );
+    }
+
+    write_workspace_config(&scenario, r#"{database:{path:".latte/final.db"}}"#);
+    let final_cli = scenario.output(&["--json", "list"], |_| {});
+    assert!(final_cli.status.success());
+    assert!(scenario.root().join(".latte/final.db").exists());
+}
+
 fn write_workspace_config(scenario: &Scenario, text: &str) {
     std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
     std::fs::write(scenario.root().join(".latte/latte-code.jsonc"), text).unwrap();
@@ -96,6 +183,26 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             "temperature must be between 0 and 2",
         ),
         (
+            r#"{providers:{primary:{models:["mock","mock"]}}}"#,
+            "models must be unique, non-empty, and bounded",
+        ),
+        (
+            r"{providers:{primary:{models:{mock:{options:{context_window:0}}}}}}",
+            "model mock options are invalid",
+        ),
+        (
+            r"{providers:{primary:{models:{mock:{options:{context_window:64,max_tokens:64}}}}}}",
+            "model mock options are invalid",
+        ),
+        (
+            r#"{providers:{primary:{models:{mock:{options:{reasoning_effort:" "}}}}}}"#,
+            "model mock options are invalid",
+        ),
+        (
+            r#"{providers:{primary:{models:{mock:{name:" "}}}}}"#,
+            "model mock options are invalid",
+        ),
+        (
             r"{thread:{max_input_bytes:32,reserved_output_bytes:32}}",
             "invalid thread configuration",
         ),
@@ -174,6 +281,48 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             json(&output)
         );
     }
+}
+
+#[test]
+fn configured_alias_rejects_an_unmapped_provider_tool_name_before_execution() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "unmapped-alias",
+        "read_file",
+        &serde_json::json!({"path": "must-not-run.txt"}),
+    )]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["/bin/pwd"]"#,
+        ".latte/latte-code.db",
+        r#",aliases:{read_file:"wire_read_file"}"#,
+    );
+
+    let output = scenario.output(
+        &["--json", "run", "reject an unmapped response alias"],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "alias-response-secret");
+        },
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+    assert!(
+        json(&output)["data"]["run"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("provider returned an unknown tool alias")
+    );
+    assert!(!scenario.root().join("must-not-run.txt").exists());
+    provider.assert_consumed();
+    assert_eq!(provider.requests().len(), 1);
+    assert!(
+        provider.requests()[0].body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "wire_read_file")
+    );
 }
 
 #[cfg(unix)]
@@ -376,6 +525,7 @@ fn fragmented_sse_tool_call_executes_and_reenters_stream_with_ordered_history() 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
     let mut cases = [
         (
@@ -438,6 +588,22 @@ fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
     ));
     cases.push((b"data: \xff\n\n".to_vec(), "SSE data is not UTF-8"));
     cases.push((vec![b'x'; 4 * 1024 * 1024 + 1], "SSE body exceeds limit"));
+    cases.push((
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n".to_vec(),
+        "stream tool call missing id",
+    ));
+    cases.push((
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"missing-name\",\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n".to_vec(),
+        "stream tool call missing name",
+    ));
+    cases.push((
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"bad-arguments\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]}}]}\n\ndata: [DONE]\n\n".to_vec(),
+        "EOF while parsing an object",
+    ));
+    cases.push((
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"invalid id\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n".to_vec(),
+        "must match [A-Za-z0-9_-]{1,256} and be unique",
+    ));
     cases.push((
         b"data: {\"choices\":[{\"delta\":{\"content\":\"unterminated\"}}]}\n".to_vec(),
         "ended without [DONE]",

@@ -340,6 +340,198 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("readable.txt"), "public read\n").unwrap();
+    std::fs::write(
+        scenario.root().join("Cargo.toml"),
+        "[workspace]\nmembers = []\n# public manifest boundary\n",
+    )
+    .unwrap();
+    std::fs::create_dir(scenario.root().join("nested")).unwrap();
+    std::fs::write(
+        scenario.root().join("nested/searchable.txt"),
+        "first public search hit\nsecond boundary hit\n",
+    )
+    .unwrap();
+    std::fs::create_dir(scenario.root().join("private")).unwrap();
+    std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .enabled_tools([
+            "read_file",
+            "list_directory",
+            "search",
+            "read_project_manifest",
+            "write_file",
+        ])
+        .deny_globs(["private/**"])
+        .build()
+        .unwrap();
+    let now = wall_time_ms();
+    let lease = engine.acquire_lease("tool-matrix", now, 120_000).unwrap();
+    let run_id = run_id();
+    engine.create_run(run_id, now + 1).unwrap();
+    let running = engine
+        .apply_transition(run_id, 0, Transition::Start, now + 2, &lease)
+        .unwrap();
+
+    let read_input = serde_json::json!({"path":"readable.txt"});
+    let read = ToolInvocation {
+        name: "read_file",
+        input: &read_input,
+        run_revision: running.revision,
+        effect_id: "allow-read",
+        attempt: 1,
+        precondition: None,
+        timeout_ms: 2_000,
+        output_cap: 4_096,
+        approval_digest: None,
+        lease_owner: lease.owner(),
+        lease_token: lease.fencing_token(),
+    };
+    assert!(
+        engine
+            .execute_tool(run_id, &lease, now + 3, &read)
+            .unwrap()
+            .value
+            .to_string()
+            .contains("public read")
+    );
+    assert!(matches!(
+        engine.reissue_tool_permission("unused", run_id, &lease, now + 4, &read),
+        Err(ToolError::Input(message)) if message.contains("only ask")
+    ));
+
+    let list_input = serde_json::json!({"path":".","max_entries":100});
+    let list = ToolInvocation {
+        name: "list_directory",
+        input: &list_input,
+        effect_id: "allow-list",
+        ..read
+    };
+    let listed = engine.execute_tool(run_id, &lease, now + 4, &list).unwrap();
+    assert!(listed.value.to_string().contains("readable.txt"));
+
+    let search_input = serde_json::json!({
+        "query":"public .* hit",
+        "regex":true,
+        "max_results":10,
+        "max_output":4096
+    });
+    let search = ToolInvocation {
+        name: "search",
+        input: &search_input,
+        effect_id: "allow-search",
+        ..read
+    };
+    let searched = engine
+        .execute_tool(run_id, &lease, now + 4, &search)
+        .unwrap();
+    assert!(searched.value.to_string().contains("searchable.txt"));
+
+    let manifest_input = serde_json::json!({"max_output":4096});
+    let manifest = ToolInvocation {
+        name: "read_project_manifest",
+        input: &manifest_input,
+        effect_id: "allow-manifest",
+        ..read
+    };
+    let manifest = engine
+        .execute_tool(run_id, &lease, now + 4, &manifest)
+        .unwrap();
+    assert!(manifest.value.to_string().contains("workspace"));
+
+    let denied_input = serde_json::json!({
+        "path":"private/denied.txt", "content":"never", "create_intent":true
+    });
+    let denied = ToolInvocation {
+        name: "write_file",
+        input: &denied_input,
+        effect_id: "denied-write",
+        run_revision: running.revision + 2,
+        ..read
+    };
+    assert!(matches!(
+        engine.execute_tool(run_id, &lease, now + 5, &denied),
+        Err(ToolError::Denied(_))
+    ));
+    assert!(!scenario.root().join("private/denied.txt").exists());
+
+    let write_input = serde_json::json!({
+        "path":"allowed.txt", "content":"allowed public write\n", "create_intent":true
+    });
+    let initial = ToolInvocation {
+        input: &write_input,
+        effect_id: "allowed-write",
+        ..denied
+    };
+    let digest = match engine.execute_tool(run_id, &lease, now + 6, &initial) {
+        Err(ToolError::PermissionRequired { digest, .. }) => digest,
+        other => panic!("expected permission, got {other:?}"),
+    };
+    let waiting = engine
+        .apply_transition(
+            run_id,
+            running.revision,
+            Transition::RequestPermission(PendingPermission {
+                request_id: "allowed-write".into(),
+                operation_digest: digest.clone(),
+                description: "public allowed write".into(),
+            }),
+            now + 7,
+            &lease,
+        )
+        .unwrap();
+    let approved = ToolInvocation {
+        approval_digest: Some(&digest),
+        ..initial
+    };
+    let resumed = engine
+        .apply_transition(
+            run_id,
+            waiting.revision,
+            Transition::ResolvePermission {
+                request_id: "allowed-write".into(),
+                allowed: true,
+            },
+            now + 8,
+            &lease,
+        )
+        .unwrap();
+    engine
+        .execute_tool(run_id, &lease, now + 9, &approved)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("allowed.txt")).unwrap(),
+        "allowed public write\n"
+    );
+    assert!(matches!(
+        engine.execute_tool(run_id, &lease, now + 10, &approved),
+        Err(ToolError::InvalidApproval)
+    ));
+    assert_eq!(engine.show(run_id).unwrap(), resumed);
+
+    let unknown = ToolInvocation {
+        name: "not_a_tool",
+        effect_id: "unknown-tool",
+        approval_digest: None,
+        ..read
+    };
+    assert!(matches!(
+        engine.execute_tool(run_id, &lease, now + 11, &unknown),
+        Err(ToolError::Unknown(_))
+    ));
+    engine.release_lease(&lease).unwrap();
+    drop(engine);
+
+    let shown = final_show(&scenario, run_id);
+    assert_eq!(shown["status"], "interrupted");
+}
+
+#[test]
 fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
     let scenario = Scenario::new();
     let engine = build_engine(&scenario);

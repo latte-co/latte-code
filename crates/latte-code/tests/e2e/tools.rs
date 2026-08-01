@@ -13,6 +13,34 @@ fn git(scenario: &Scenario, args: &[&str]) {
 
 #[cfg(unix)]
 #[test]
+fn public_engine_changed_files_combines_tracked_and_untracked_git_state() {
+    let scenario = Scenario::new();
+    scenario.init_git();
+    std::fs::write(scenario.root().join("tracked.txt"), "before\n").unwrap();
+    git(&scenario, &["add", "tracked.txt"]);
+    git(&scenario, &["commit", "--quiet", "-m", "tracked baseline"]);
+    std::fs::write(scenario.root().join("tracked.txt"), "after\n").unwrap();
+    std::fs::write(scenario.root().join("untracked.txt"), "new\n").unwrap();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(scenario.root().join(".latte/ignored-state"), "ignored\n").unwrap();
+
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    let changed = engine.changed_files().unwrap();
+    assert_eq!(changed, vec!["tracked.txt", "untracked.txt"]);
+    assert!(!changed.iter().any(|path| path.contains(".latte")));
+    drop(engine);
+
+    scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
+    let listed = scenario.output(&["--json", "list"], |_| {});
+    assert!(listed.status.success());
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::too_many_lines)]
 fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
     use super::support::PtySession;
@@ -692,6 +720,54 @@ fn process_shell_deny_never_spawns_or_reenters_provider() {
     pty.write(b"\x1b[21~");
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_cli_process_input_validation_matrix_fails_before_spawn() {
+    let cases = [
+        serde_json::json!({"argv":["/bin/echo", 1],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"shell":"echo duplicate","cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":0,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":0,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":0,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":[],"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":"slow","grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+    ];
+    for (index, input) in cases.into_iter().enumerate() {
+        let scenario = Scenario::new();
+        let provider = ScriptedProvider::start([
+            ProviderReply::tool_call(&format!("invalid-process-{index}"), "process", &input),
+            ProviderReply::completion("invalid process was reported without spawning"),
+        ]);
+        scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+        let first = scenario.output(&["--json", "run", "invalid process input"], |command| {
+            command.env("TEST_OPENAI_KEY", "process-validation-secret");
+        });
+        let output = if first.status.code() == Some(10) {
+            let run_id = json(&first)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .to_owned();
+            scenario.output(&["--json", "resume", &run_id, "--allow"], |command| {
+                command.env("TEST_OPENAI_KEY", "process-validation-secret");
+            })
+        } else {
+            first
+        };
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "case {index}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!scenario.root().join("invalid-process-output").exists());
+        assert!((1..=2).contains(&provider.requests().len()));
+    }
 }
 
 #[cfg(unix)]

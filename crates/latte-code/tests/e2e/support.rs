@@ -730,6 +730,28 @@ impl PtySession {
         }
     }
 
+    pub fn wait_for_visible_text(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut output = self
+            .output
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if terminal_visible_text(&output).contains(needle) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let waited = self.output.changed.wait_timeout(output, remaining).unwrap();
+            output = waited.0;
+            if waited.1.timed_out() {
+                return terminal_visible_text(&output).contains(needle);
+            }
+        }
+    }
+
     pub fn output(&self) -> Vec<u8> {
         self.output
             .bytes
@@ -792,6 +814,46 @@ impl PtySession {
         }
         (status, self.output())
     }
+}
+
+#[cfg(unix)]
+fn terminal_visible_text(output: &[u8]) -> String {
+    let mut visible = Vec::with_capacity(output.len());
+    let mut index = 0;
+    while index < output.len() {
+        if output[index] != 0x1b {
+            visible.push(output[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if output.get(index) == Some(&b'[') {
+            index += 1;
+            while index < output.len() {
+                let byte = output[index];
+                index += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        } else if output.get(index) == Some(&b']') {
+            index += 1;
+            while index < output.len() {
+                if output[index] == 0x07 {
+                    index += 1;
+                    break;
+                }
+                if output[index] == 0x1b && output.get(index + 1) == Some(&b'\\') {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    String::from_utf8_lossy(&visible).into_owned()
 }
 
 #[cfg(unix)]
