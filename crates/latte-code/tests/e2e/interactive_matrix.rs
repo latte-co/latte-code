@@ -54,7 +54,13 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
     let before_expand = pty.output().len();
     pty.resize(36, 108);
     assert!(pty.wait_for_growth(before_expand, INSTRUMENTED_WAIT));
-    pty.write(b"ask for one follow-up value\r");
+    pty.write(b"ask for one follow-up value");
+    assert!(
+        pty.wait_for_output(b"\x1b[34;33H", INSTRUMENTED_WAIT),
+        "follow-up composer did not accept input after resize: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(b"\r");
     assert!(provider.wait_for_calls(2, INSTRUMENTED_WAIT));
     assert!(pty.wait_for_output(b"Input required", INSTRUMENTED_WAIT));
     pty.write(b"\x1b[200~matrix-value\nsecond-line\x1b[201~");
