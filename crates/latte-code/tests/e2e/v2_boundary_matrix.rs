@@ -6,9 +6,10 @@ use latte_core::{
     ThreadTransientProgress, TranscriptEntry, TranscriptEntryId, TranscriptKind,
 };
 use latte_engine::{
-    CommitThreadRunUpdate, EngineHandle, Lease, ProcessOutput, ProcessTermination, StorageError,
-    SubscriptionError, ThreadCommitRequest, ThreadEffectDescriptor, ThreadEffectObservedValue,
-    ThreadEffectPolicy, ThreadEffectRequest, ThreadEffectStartRequest,
+    CancellationToken, CommitThreadRunUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
+    ProcessTermination, StorageError, SubscriptionError, ThreadCommitRequest,
+    ThreadEffectDescriptor, ThreadEffectObservedValue, ThreadEffectPolicy, ThreadEffectRequest,
+    ThreadEffectStartRequest,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -129,6 +130,29 @@ fn start(
         },
         now,
     )
+}
+
+fn create_started_effect_thread(
+    engine: &EngineHandle,
+    prompt: &str,
+    now: u64,
+) -> (latte_core::ThreadSnapshot, Lease, RunId) {
+    let thread_id = thread_id();
+    let lease = engine
+        .acquire_thread_lease(thread_id, now, 120_000)
+        .unwrap();
+    let run_id = run_id();
+    let snapshot = engine
+        .create_thread_v2(thread_id, run_id, binding(), prompt, now + 1)
+        .unwrap();
+    let snapshot = start(
+        engine,
+        &lease,
+        &snapshot,
+        &format!("permission-summary:{run_id}:start"),
+        now + 2,
+    );
+    (snapshot, lease, run_id)
 }
 
 fn prepare_effect(
@@ -3138,4 +3162,356 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 42);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
+    std::fs::write(
+        scenario.root().join("permission-summary.txt"),
+        "before permission summary\n",
+    )
+    .unwrap();
+    let default_database = latte_code::DatabaseConfig::default();
+    assert_eq!(default_database.path, ".latte/latte-code.db");
+    let verification: latte_code::VerificationConfig =
+        serde_json::from_value(serde_json::json!({"argv":["/bin/true"]})).unwrap();
+    assert_eq!(verification.cwd, ".");
+    assert_eq!(verification.timeout_ms, 120_000);
+    let memory_engine = EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .enabled_tools(Vec::<String>::new())
+        .deny_globs(Vec::<String>::new())
+        .build()
+        .unwrap();
+    assert!(format!("{memory_engine:?}").contains("EngineHandle"));
+    assert_eq!(
+        memory_engine
+            .tool_descriptors()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>(),
+        vec!["process"]
+    );
+    drop(memory_engine);
+    let engine = build_engine(&scenario);
+    let now = latte_core::wall_time_ms();
+
+    let (validation, validation_lease, _) =
+        create_started_effect_thread(&engine, "effect descriptor validation", now);
+    let (validation_run_id, validation_run_revision) = active_run(&validation);
+    let valid_descriptor = ThreadEffectDescriptor {
+        effect_id: "validation-effect".into(),
+        tool_call_id: "call-validation-effect".into(),
+        name: "read_file".into(),
+        input: serde_json::json!({"path":"permission-summary.txt"}),
+        attempt: 1,
+    };
+    let invalid_descriptors = [
+        ThreadEffectDescriptor {
+            effect_id: String::new(),
+            ..valid_descriptor.clone()
+        },
+        ThreadEffectDescriptor {
+            name: "read\nfile".into(),
+            ..valid_descriptor.clone()
+        },
+        ThreadEffectDescriptor {
+            tool_call_id: "invalid tool call id".into(),
+            ..valid_descriptor.clone()
+        },
+        ThreadEffectDescriptor {
+            attempt: 0,
+            ..valid_descriptor.clone()
+        },
+        ThreadEffectDescriptor {
+            input: serde_json::json!(["not", "an", "object"]),
+            ..valid_descriptor.clone()
+        },
+    ];
+    for (ordinal, descriptor) in invalid_descriptors.into_iter().enumerate() {
+        let error = engine
+            .prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id: validation.thread_id,
+                    run_id: validation_run_id,
+                    expected_thread_revision: validation.revision,
+                    expected_run_revision: validation_run_revision,
+                    command_id: command_id(),
+                    source_key: format!("validation:{ordinal}"),
+                    descriptor,
+                },
+                &validation_lease,
+                now + 3 + u64::try_from(ordinal).unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StorageError::InvalidData(_)));
+    }
+    for (ordinal, descriptor) in [
+        ThreadEffectDescriptor {
+            effect_id: "validation-denied-process".into(),
+            tool_call_id: "call-validation-denied-process".into(),
+            name: "process".into(),
+            input: serde_json::json!({"shell":"rm -rf /","cwd":"."}),
+            attempt: 1,
+        },
+        ThreadEffectDescriptor {
+            effect_id: "validation-unknown-tool".into(),
+            tool_call_id: "call-validation-unknown-tool".into(),
+            name: "unknown_tool".into(),
+            input: serde_json::json!({}),
+            attempt: 1,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = engine
+            .prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id: validation.thread_id,
+                    run_id: validation_run_id,
+                    expected_thread_revision: validation.revision,
+                    expected_run_revision: validation_run_revision,
+                    command_id: command_id(),
+                    source_key: format!("policy-rejection:{ordinal}"),
+                    descriptor,
+                },
+                &validation_lease,
+                now + 8 + u64::try_from(ordinal).unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StorageError::InvalidData(_)));
+    }
+    assert_eq!(
+        engine
+            .thread_snapshot_v2(validation.thread_id, None, 500)
+            .unwrap(),
+        validation
+    );
+
+    let prepared = prepare_effect(
+        &engine,
+        &validation_lease,
+        &validation,
+        "summary-read",
+        "read_file",
+        serde_json::json!({"path":"permission-summary.txt"}),
+        now + 10,
+    );
+    assert_eq!(prepared.policy, ThreadEffectPolicy::Allow);
+    let started = start_effect(
+        &engine,
+        &validation_lease,
+        &prepared,
+        "summary-read",
+        now + 11,
+    );
+    let foreign_thread_id = thread_id();
+    let foreign_lease = engine
+        .acquire_thread_lease(foreign_thread_id, now + 12, 120_000)
+        .unwrap();
+    let wrong_scope = engine
+        .execute_started_thread_effect(&started, &foreign_lease, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_scope,
+        latte_engine::ThreadEffectExecutionError::Uncertain(_)
+    ));
+    engine.release_lease(&foreign_lease).unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(cancelled.is_cancelled());
+    cancelled.cancelled().await;
+    let cancellation_error = engine
+        .execute_started_thread_effect(&started, &validation_lease, &cancelled)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        cancellation_error,
+        latte_engine::ThreadEffectExecutionError::Uncertain(message)
+            if message.contains("tool cancelled after Started")
+    ));
+
+    let (changed, changed_lease, _) =
+        create_started_effect_thread(&engine, "changed completion rejection", now + 14);
+    std::fs::write(scenario.root().join("changed-after-start.txt"), "changed\n").unwrap();
+    let changed_error = commit_with_command(
+        &engine,
+        &changed_lease,
+        &changed,
+        command_id(),
+        CommitThreadRunUpdate::Complete {
+            source_key: "changed-completion:complete".into(),
+            handoff: Handoff {
+                summary: "must not complete without verification".into(),
+                files_changed: vec!["changed-after-start.txt".into()],
+                evidence: Vec::new(),
+            },
+        },
+        now + 17,
+    )
+    .unwrap_err();
+    assert!(
+        changed_error
+            .to_string()
+            .contains("use verified completion")
+    );
+    engine.release_lease(&changed_lease).unwrap();
+
+    let mut leases = vec![validation_lease];
+    {
+        let mut next_now = now + 20;
+        let mut prepare = |prompt: &str, effect_id: &str, name: &str, input: serde_json::Value| {
+            let (snapshot, lease, _) = create_started_effect_thread(&engine, prompt, next_now);
+            let prepared = prepare_effect(
+                &engine,
+                &lease,
+                &snapshot,
+                effect_id,
+                name,
+                input,
+                next_now + 3,
+            );
+            next_now += 20;
+            leases.push(lease);
+            prepared
+        };
+
+        let listed = prepare(
+            "list permission summary",
+            "summary-list",
+            "list_directory",
+            serde_json::json!({"path":"."}),
+        );
+        assert_eq!(listed.policy, ThreadEffectPolicy::Allow);
+        let searched = prepare(
+            "search permission summary",
+            "summary-search",
+            "search",
+            serde_json::json!({"query":"permission summary"}),
+        );
+        assert_eq!(searched.policy, ThreadEffectPolicy::Allow);
+
+        let created = prepare(
+            "create permission summary",
+            "summary-create",
+            "write_file",
+            serde_json::json!({
+                "path":"permission-created.txt",
+                "content":"new content",
+                "create_intent":true
+            }),
+        );
+        assert_eq!(created.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            created.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description.contains("create or replace") && description.contains("11 bytes")
+        ));
+
+        let replaced = prepare(
+            "replace permission summary",
+            "summary-replace",
+            "write_file",
+            serde_json::json!({
+                "path":"permission-summary.txt",
+                "content":"replacement",
+                "create_intent":false,
+                "precondition":"0".repeat(64)
+            }),
+        );
+        assert_eq!(replaced.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            replaced.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description.contains("replace existing") && description.contains("11 bytes")
+        ));
+
+        let edited = prepare(
+            "edit permission summary",
+            "summary-edit",
+            "edit_file",
+            serde_json::json!({
+                "path":"permission-summary.txt",
+                "before":"before",
+                "after":"after-value",
+                "precondition":"0".repeat(64)
+            }),
+        );
+        assert_eq!(edited.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            edited.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description.contains("6 bytes") && description.contains("11 bytes")
+        ));
+
+        let safe_process = prepare(
+            "safe process permission summary",
+            "summary-safe-process",
+            "process",
+            serde_json::json!({"argv":["/bin/pwd"],"cwd":"."}),
+        );
+        assert_eq!(safe_process.policy, ThreadEffectPolicy::Allow);
+        let secret_process = prepare(
+            "redacted process permission summary",
+            "summary-secret-process",
+            "process",
+            serde_json::json!({
+                "argv":["/bin/echo","TOKEN=must-not-persist","plain=value"],
+                "cwd":"."
+            }),
+        );
+        assert_eq!(secret_process.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            secret_process.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description.contains("TOKEN=[REDACTED]")
+                    && description.contains("plain=value")
+                    && !description.contains("must-not-persist")
+        ));
+
+        let long_process = prepare(
+            "bounded process permission summary",
+            "summary-long-process",
+            "process",
+            serde_json::json!({"argv":["/bin/echo","x".repeat(1000)],"cwd":"."}),
+        );
+        assert_eq!(long_process.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            long_process.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description.ends_with('…') && description.len() <= 363
+        ));
+
+        let shell_process = prepare(
+            "shell process permission summary",
+            "summary-shell-process",
+            "process",
+            serde_json::json!({"shell":"printf boundary","cwd":"."}),
+        );
+        assert_eq!(shell_process.policy, ThreadEffectPolicy::Ask);
+        assert!(matches!(
+            shell_process.snapshot.pending.as_ref(),
+            Some(ThreadPendingRequest::Permission { description, .. })
+                if description == "Run shell command (cwd: .)"
+        ));
+    }
+    for lease in &leases {
+        engine.release_lease(lease).unwrap();
+    }
+    drop(engine);
+
+    let listed = scenario.output(&["--json", "list"], |_| {});
+    assert!(listed.status.success());
+    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 11);
+    let mut tui = PtySession::spawn(scenario.command(&["tui"]));
+    assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(tui.wait_for_output(b"Run shell command (cwd: .)", Duration::from_secs(5)));
+    tui.write(F10);
+    assert!(tui.finish(Duration::from_secs(5)).0.success());
 }
