@@ -133,9 +133,21 @@ fn final_tui_resizes_across_viewport_tiers_and_sanitizes_rich_paste() {
         assert!(pty.is_running(), "viewport {rows}x{columns} exited the TUI");
     }
 
-    let before_expand = pty.output().len();
     pty.resize(20, 80);
-    assert!(pty.wait_for_growth(before_expand, Duration::from_secs(5)));
+    assert!(
+        pty.wait_for_output(b"\x1b[18;7H", Duration::from_secs(5)),
+        "20x80 viewport did not finish its redraw: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(CTRL_P);
+    assert!(
+        pty.wait_for_visible_text("Show keyboard shortcuts", Duration::from_secs(5)),
+        "resized viewport did not open the command palette: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    let before_close = pty.output().len();
+    pty.write(ESCAPE);
+    assert!(pty.wait_for_growth(before_close, Duration::from_secs(5)));
     pty.write(b"\x1b[200~wide \xe7\x95\x8c\ttabbed \x1b[31mred text\x1b[0m\nsecond row\x1b[201~");
     assert!(
         pty.wait_for_visible_text("wide", Duration::from_secs(5)),
