@@ -372,11 +372,10 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
         String::from_utf8_lossy(&pty.output())
     );
     // The durable Ready transition can precede the next redraw. Synchronize
-    // with the visible state label from that exact projection before opening
-    // the picker. The harness ignores cursor-control bytes because Ratatui may
-    // split visible words across delta-render escape sequences.
+    // with the completed card from that exact projection before opening the
+    // picker; this label is emitted contiguously by Ratatui's delta renderer.
     assert!(
-        pty.wait_for_visible_text("Ready for follow-up", Duration::from_secs(5)),
+        pty.wait_for_output(b"Completed", Duration::from_secs(5)),
         "alpha completion was durable but not rendered: {}",
         String::from_utf8_lossy(&pty.output())
     );
