@@ -51,7 +51,9 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
         String::from_utf8_lossy(&pty.output())
     );
 
+    let before_expand = pty.output().len();
     pty.resize(36, 108);
+    assert!(pty.wait_for_growth(before_expand, INSTRUMENTED_WAIT));
     pty.write(b"ask for one follow-up value\r");
     assert!(provider.wait_for_calls(2, INSTRUMENTED_WAIT));
     assert!(pty.wait_for_output(b"Input required", INSTRUMENTED_WAIT));

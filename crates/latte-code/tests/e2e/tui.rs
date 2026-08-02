@@ -1097,10 +1097,15 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
                 })
         })
     }));
+    assert!(
+        resumed.wait_for_output(b"Completed", Duration::from_secs(5)),
+        "TUI did not reconcile the completed follow-up: {}",
+        String::from_utf8_lossy(&resumed.output())
+    );
     resumed.write(b"\x1b[200~composer unlocked after tail resume\x1b[201~");
     assert!(
-        resumed.wait_for_output(
-            b"composer unlocked after tail resume",
+        resumed.wait_for_visible_text(
+            "composer unlocked after tail resume",
             Duration::from_secs(5)
         ),
         "follow-up remained locked after durable acceptance: {}",

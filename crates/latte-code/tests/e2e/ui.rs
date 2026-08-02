@@ -133,10 +133,10 @@ fn final_tui_resizes_across_viewport_tiers_and_sanitizes_rich_paste() {
         assert!(pty.is_running(), "viewport {rows}x{columns} exited the TUI");
     }
 
-    pty.write(b"\x1b[200~wide \xe7\x95\x8c\ttabbed \x1b[31mred text\x1b[0m\nsecond row\x1b[201~");
     let before_expand = pty.output().len();
     pty.resize(20, 80);
     assert!(pty.wait_for_growth(before_expand, Duration::from_secs(5)));
+    pty.write(b"\x1b[200~wide \xe7\x95\x8c\ttabbed \x1b[31mred text\x1b[0m\nsecond row\x1b[201~");
     assert!(
         pty.wait_for_visible_text("wide", Duration::from_secs(5)),
         "sanitized rich paste was not rendered: {}",
