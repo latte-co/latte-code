@@ -35,6 +35,31 @@ use uuid::Uuid;
 
 const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
 
+fn append_denied_tool_results(segment: &mut Vec<Message>) {
+    let calls = segment
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant { tool_calls, .. } => Some(tool_calls.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let observed = segment
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    segment.extend(calls.into_iter().filter_map(|call| {
+        (!observed.contains(&call.id)).then_some(Message::Tool {
+            tool_call_id: call.id,
+            name: Some(call.name),
+            content: "permission denied by user; tool was not executed".into(),
+        })
+    }));
+}
+
 /// Exact request-size policy for child history construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadHistoryPolicy {
@@ -601,6 +626,23 @@ impl ThreadRuntimeService {
                                 .map(str::to_owned),
                             content: content.into(),
                         });
+                    }
+                }
+                TranscriptKind::Failure
+                    if entry.payload.as_ref().is_some_and(|payload| {
+                        payload
+                            .get("provider_tool_round_aborted")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("permission_denied")
+                    }) =>
+                {
+                    // OpenAI-compatible history requires one tool result for
+                    // every call in an assistant tool round. A denial ends
+                    // the immutable child before execution, so synthesize
+                    // bounded non-execution results for every unobserved call
+                    // when constructing the next child's provider history.
+                    if let Some(segment) = segments.last_mut() {
+                        append_denied_tool_results(segment);
                     }
                 }
                 // ToolCall cards describe the engine ledger rather than a
@@ -2517,7 +2559,7 @@ mod tests {
                     read_call("allowed-read", "new.txt"),
                 ],
             ),
-            response(Some("must not be requested"), vec![]),
+            response(Some("continued without denied tools"), vec![]),
         ]));
         let service = recording_service(root.path(), engine, provider.clone());
         let waiting = service
@@ -2536,9 +2578,23 @@ mod tests {
             .resolve_permission(waiting.thread_id, waiting.revision, request_id, false)
             .await
             .unwrap();
-        assert_eq!(denied.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(denied.lifecycle, ThreadLifecycle::Ready);
+        assert!(denied.active_run_id.is_none());
+        assert!(denied.pending.is_none());
         assert!(!root.path().join("new.txt").exists());
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        let continued = service
+            .follow_up(
+                denied.thread_id,
+                denied.revision,
+                "continue without those tools".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(continued.lifecycle, ThreadLifecycle::Ready);
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(tool_result_ids(&requests[1]), ["ask-write", "allowed-read"]);
     }
 
     #[cfg(unix)]
@@ -3335,7 +3391,14 @@ mod tests {
                     .await
                     .unwrap()
             };
-            assert_eq!(terminal.lifecycle, ThreadLifecycle::Failed);
+            assert_eq!(
+                terminal.lifecycle,
+                if cancel {
+                    ThreadLifecycle::Failed
+                } else {
+                    ThreadLifecycle::Ready
+                }
+            );
             assert!(!root.path().join("created.txt").exists());
             assert!(terminal.active_run_id.is_none());
         }

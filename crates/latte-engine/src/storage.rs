@@ -1043,13 +1043,13 @@ impl Storage {
         let parent_state: RunState = serde_json::from_str(&parent_state).map_err(invalid_json)?;
         let parent_accepts_follow_up = parent_state.status == RunStatus::Completed
             || (parent_state.status == RunStatus::Failed
-                && parent_state
-                    .failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.retryability == Retryability::Retryable));
+                && parent_state.failure.as_ref().is_some_and(|failure| {
+                    failure.retryability == Retryability::Retryable
+                        || failure.code == FailureCode::PermissionDenied
+                }));
         if !parent_accepts_follow_up {
             return Err(StorageError::InvalidData(
-                "follow-up parent must be completed or retryably failed".into(),
+                "follow-up parent must be completed, retryably failed, or permission-denied".into(),
             ));
         }
         let ordinal: u64 = from_i64(tx.query_row(
@@ -2054,7 +2054,10 @@ impl Storage {
                 next_lifecycle = if *allow {
                     "running".into()
                 } else {
-                    "failed".into()
+                    // Denial terminalizes this immutable child, but it does
+                    // not terminalize the conversation. The user may explain
+                    // the denial or choose another approach in a new child.
+                    "ready".into()
                 };
                 if *allow {
                     // A waiting Session deliberately releases its coordinator
@@ -2148,7 +2151,11 @@ impl Storage {
                     } else {
                         "permission denied".into()
                     },
-                    None,
+                    (!allow).then(|| {
+                        serde_json::json!({
+                            "provider_tool_round_aborted": "permission_denied"
+                        })
+                    }),
                     format!("{source_key}:card"),
                 ));
                 if !allow {
@@ -6907,11 +6914,26 @@ mod tests {
             },
             24,
         );
-        assert_eq!(denied.snapshot.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(denied.snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert!(denied.snapshot.active_run_id.is_none());
+        assert!(denied.snapshot.pending.is_none());
         assert_eq!(
             store.load_run(denied_run).unwrap().status,
             RunStatus::Failed
         );
+        let retry_run = RunId::from_uuid(ids.next_uuid_v7());
+        let retry = store
+            .create_thread_follow_up_v2(
+                denied_thread,
+                retry_run,
+                denied.snapshot.revision,
+                "continue after denial",
+                &std::collections::BTreeMap::new(),
+                25,
+            )
+            .unwrap();
+        assert_eq!(retry.lifecycle, ThreadLifecycle::Running);
+        assert_eq!(retry.active_run_id, Some(retry_run));
     }
 
     #[test]
