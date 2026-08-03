@@ -10,7 +10,9 @@ use crate::{
         slash_suggestions,
     },
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use latte_core::{
     RunId, ThreadEvent, ThreadEventEnvelope, ThreadId, ThreadLifecycle, ThreadPendingRequest,
     ThreadRunStatus, ThreadSessionSummary, ThreadSnapshot, ThreadTransientProgress,
@@ -36,6 +38,8 @@ use unicode_width::UnicodeWidthStr;
 
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 const CTRL_C_DUPLICATE_WINDOW: Duration = Duration::from_millis(120);
+const PROVIDER_SETUP_GUIDANCE: &str = "Provider setup required: configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code";
+const MODEL_NOT_CONFIGURED: &str = "Not configured";
 
 /// Thread-only projection boundary; snapshots are authoritative after any
 /// event gap and transient progress must be discarded.
@@ -107,8 +111,12 @@ pub enum ThreadProjectionPoll {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ThreadUiInput {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     Resize(u16, u16),
+    /// Confirms that the current model state reached a terminal frame. This
+    /// arms only the exact permission request visible in that frame.
+    FrameRendered,
     Snapshot(Vec<ThreadSnapshot>),
     SessionCatalog(Vec<ThreadSessionSummary>),
     SessionCatalogReady {
@@ -355,14 +363,6 @@ pub enum ActiveConversation {
     Session(ThreadId),
 }
 
-/// One-shot policy for the first catalog load after TUI startup.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum StartupSessionPolicy {
-    ResumeMostRecent,
-    #[default]
-    KeepDraft,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SlashPopupState {
     #[default]
@@ -387,10 +387,6 @@ pub struct ThreadUiModel {
     pub sessions: Vec<ThreadSnapshot>,
     pub session_catalog: Vec<ThreadSessionSummary>,
     pub active_conversation: Option<ActiveConversation>,
-    /// The first product entry resumes the most recently updated Session for
-    /// this workspace. `/new` clears this one-shot convenience so an explicit
-    /// fresh draft can never be replaced by a later catalog refresh.
-    startup_session_policy: StartupSessionPolicy,
     pub selected: usize,
     pub composer: String,
     pub input: String,
@@ -422,6 +418,10 @@ pub struct ThreadUiModel {
     /// transcript entry arrives. While present the composer is intentionally
     /// locked, preventing duplicate Enter dispatches.
     pub pending_submission: Option<PendingSubmission>,
+    /// A next-message draft displaced while an earlier submission is restored
+    /// after a persistence failure. It returns to the composer after the
+    /// restored submission is durably accepted, so eager typing is never lost.
+    deferred_composer_draft: Option<String>,
     /// A request-scoped input value retained until its exact durable input
     /// card is observed. It is independent from the composer submission so a
     /// provider/configuration failure cannot consume or restore the wrong
@@ -430,6 +430,11 @@ pub struct ThreadUiModel {
     /// The composer remains locked until the authoritative snapshot contains
     /// the selected binding, preventing a follow-up from racing the switch.
     pub pending_model_switch: Option<PendingModelSwitch>,
+    /// Permission decisions are accepted only after the exact request has
+    /// reached a rendered frame. Projection updates are processed before
+    /// terminal input, so this barrier prevents an already-buffered `d` or
+    /// Ctrl+A from resolving a request the user has never seen.
+    rendered_permission_request: Option<(ThreadId, String)>,
     input_target: Option<(ThreadId, String)>,
     submission_refresh: SubmissionRefreshState,
     /// Secret-safe presentation copy for a correlated failure before the
@@ -462,7 +467,6 @@ impl Default for ThreadUiModel {
             sessions: Vec::new(),
             session_catalog: Vec::new(),
             active_conversation: None,
-            startup_session_policy: StartupSessionPolicy::KeepDraft,
             selected: 0,
             composer: String::new(),
             input: String::new(),
@@ -485,8 +489,10 @@ impl Default for ThreadUiModel {
             size: (80, 24),
             queued_follow_up: None,
             pending_submission: None,
+            deferred_composer_draft: None,
             pending_input_submission: None,
             pending_model_switch: None,
+            rendered_permission_request: None,
             input_target: None,
             submission_refresh: SubmissionRefreshState::default(),
             submission_error: None,
@@ -503,15 +509,24 @@ impl Default for ThreadUiModel {
 impl ThreadUiModel {
     #[must_use]
     pub fn with_startup(startup: ThreadStartupPresentation) -> Self {
-        let draft_model = Some((
-            startup.default_provider.clone(),
-            startup.default_model.clone(),
-        ));
+        let draft_model = (!startup.default_provider.is_empty()
+            && !startup.default_model.is_empty())
+        .then(|| {
+            (
+                startup.default_provider.clone(),
+                startup.default_model.clone(),
+            )
+        });
+        let status = if draft_model.is_some() {
+            "Ready".into()
+        } else {
+            PROVIDER_SETUP_GUIDANCE.into()
+        };
         Self {
             startup: Some(startup),
             draft_model,
+            status,
             active_conversation: Some(ActiveConversation::NewSessionDraft),
-            startup_session_policy: StartupSessionPolicy::ResumeMostRecent,
             ..Self::default()
         }
     }
@@ -531,12 +546,31 @@ impl ThreadUiModel {
     pub fn authority_enabled(&self) -> bool {
         self.connection == ConnectionState::Connected
     }
+
+    fn mark_selected_permission_rendered(&mut self) {
+        self.rendered_permission_request = self.selected_thread().and_then(|thread| {
+            let ThreadPendingRequest::Permission { request_id, .. } = thread.pending.as_ref()?
+            else {
+                return None;
+            };
+            Some((thread.thread_id, request_id.clone()))
+        });
+    }
+
+    fn permission_was_rendered(&self, thread_id: ThreadId, request_id: &str) -> bool {
+        self.rendered_permission_request.as_ref().is_some_and(
+            |(rendered_thread_id, rendered_request_id)| {
+                *rendered_thread_id == thread_id && rendered_request_id == request_id
+            },
+        )
+    }
 }
 
 #[allow(clippy::too_many_lines)]
 pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAction> {
     match input {
         ThreadUiInput::Resize(width, height) => model.size = (width, height),
+        ThreadUiInput::FrameRendered => model.mark_selected_permission_rendered(),
         ThreadUiInput::Connected => {
             model.connection = ConnectionState::Connected;
             model.progress.clear();
@@ -642,14 +676,6 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             model.session_index = model
                 .session_index
                 .min(model.session_catalog.len().saturating_sub(1));
-            if model.startup_session_policy == StartupSessionPolicy::ResumeMostRecent {
-                model.startup_session_policy = StartupSessionPolicy::KeepDraft;
-                if let Some(session) = model.session_catalog.first() {
-                    return vec![ThreadUiAction::OpenSession {
-                        thread_id: session.thread_id,
-                    }];
-                }
-            }
         }
         ThreadUiInput::SessionCatalogReady { sessions, query } => {
             model.session_catalog = sessions;
@@ -687,7 +713,6 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             model.sessions = vec![snapshot];
             model.selected = 0;
             model.active_conversation = Some(ActiveConversation::Session(thread_id));
-            model.startup_session_policy = StartupSessionPolicy::KeepDraft;
             model.session_picker = false;
             model.command_palette = false;
             model.help = false;
@@ -833,6 +858,7 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             }
         }
         ThreadUiInput::Key(key) => return reduce_key(model, key),
+        ThreadUiInput::Mouse(mouse) => reduce_mouse(model, mouse),
         ThreadUiInput::Paste(value) => reduce_paste(model, &value),
         ThreadUiInput::Tick => {}
     }
@@ -842,6 +868,14 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
 #[allow(clippy::too_many_lines)]
 fn reduce_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
     reduce_key_at(model, key, Instant::now())
+}
+
+fn reduce_mouse(model: &mut ThreadUiModel, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => model.scroll = model.scroll.saturating_add(3),
+        MouseEventKind::ScrollDown => model.scroll = model.scroll.saturating_sub(3),
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -932,6 +966,7 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         }
         if let Some(ThreadPendingRequest::Permission { request_id, .. }) = thread.pending.as_ref() {
             if model.authority_enabled()
+                && model.permission_was_rendered(thread.thread_id, request_id)
                 && key.code == KeyCode::Char('d')
                 && key.modifiers.is_empty()
             {
@@ -942,6 +977,7 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
                 }];
             }
             if model.authority_enabled()
+                && model.permission_was_rendered(thread.thread_id, request_id)
                 && key.code == KeyCode::Char('a')
                 && key.modifiers == KeyModifiers::CONTROL
             {
@@ -1178,7 +1214,7 @@ fn open_model_picker(model: &mut ThreadUiModel) {
         .as_ref()
         .map_or(&[][..], |startup| startup.model_catalog.as_slice());
     if options.is_empty() {
-        model.status = "No configured provider models are available".into();
+        model.status = PROVIDER_SETUP_GUIDANCE.into();
         return;
     }
     let selected = selected_provider_model(model);
@@ -1305,13 +1341,16 @@ fn dispatch_builtin(
             model.sessions.clear();
             model.selected = 0;
             model.active_conversation = Some(ActiveConversation::NewSessionDraft);
-            model.startup_session_policy = StartupSessionPolicy::KeepDraft;
             model.session_picker = false;
             model.model_picker = None;
-            model.draft_model = model.startup.as_ref().map(|startup| {
-                (
-                    startup.default_provider.clone(),
-                    startup.default_model.clone(),
+            model.draft_model = model.startup.as_ref().and_then(|startup| {
+                (!startup.default_provider.is_empty() && !startup.default_model.is_empty()).then(
+                    || {
+                        (
+                            startup.default_provider.clone(),
+                            startup.default_model.clone(),
+                        )
+                    },
                 )
             });
             model.help = false;
@@ -1342,9 +1381,6 @@ fn dispatch_builtin(
 }
 
 fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
-    if model.pending_submission.is_some() {
-        return Vec::new();
-    }
     match key.code {
         KeyCode::Esc => {
             model.focus = ThreadFocus::Navigation;
@@ -1360,7 +1396,11 @@ fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUi
             model.slash_index = 0;
             model.slash_popup_state = SlashPopupState::Eligible;
         }
-        KeyCode::F(5) | KeyCode::Enter if is_submit(key) && model.authority_enabled() => {
+        KeyCode::F(5) | KeyCode::Enter
+            if is_submit(key)
+                && model.authority_enabled()
+                && model.pending_submission.is_none() =>
+        {
             return submit_composer(model);
         }
         KeyCode::Char(value)
@@ -1419,8 +1459,7 @@ fn reduce_navigation_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thread
 fn reduce_paste(model: &mut ThreadUiModel, value: &str) {
     model.ctrl_c_exit_armed_until = None;
     model.ctrl_c_last_observed_at = None;
-    let blocked = model.pending_submission.is_some()
-        || model.pending_input_submission.is_some()
+    let blocked = model.pending_input_submission.is_some()
         || model.reconciliation_confirmation.is_some()
         || model.selected_thread().is_some_and(|thread| {
             thread.lifecycle == ThreadLifecycle::ReconciliationRequired
@@ -1582,6 +1621,13 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     if let Some(actions) = submit_slash_candidate(model) {
         return actions;
     }
+    if model.selected_thread().is_none()
+        && model.startup.is_some()
+        && selected_provider_model(model).is_none()
+    {
+        model.status = PROVIDER_SETUP_GUIDANCE.into();
+        return Vec::new();
+    }
     if let Some(thread) = model.selected_thread()
         && thread.lifecycle != ThreadLifecycle::Ready
         && !(thread.lifecycle == ThreadLifecycle::Running
@@ -1682,6 +1728,11 @@ fn reconcile_pending_submission(model: &mut ThreadUiModel) {
         model.queued_follow_up = None;
         model.submission_error = None;
         model.submission_refresh.composer = false;
+        if model.composer.is_empty()
+            && let Some(draft) = model.deferred_composer_draft.take()
+        {
+            model.composer = draft;
+        }
     }
 }
 
@@ -1696,6 +1747,9 @@ fn restore_pending_submission(model: &mut ThreadUiModel) {
         return;
     };
     model.queued_follow_up = None;
+    if !model.composer.is_empty() {
+        model.deferred_composer_draft = Some(std::mem::take(&mut model.composer));
+    }
     model.composer = pending.prompt;
     model.status = MESSAGE.into();
     model.submission_error = Some(MESSAGE.into());
@@ -2264,7 +2318,7 @@ pub fn render(frame: &mut Frame<'_>, model: &ThreadUiModel) {
         let overlay = centered(area, 78, 65);
         frame.render_widget(Clear, overlay);
         frame.render_widget(
-            Paragraph::new("Single-session transcript\nComposer owns every printable character. Enter sends; Shift+Enter inserts a newline.\nEsc enters Navigation; j/k selects actions, PgUp/PgDn scrolls, and Enter/Space expands. Esc or i returns to Composer; q quits only from Navigation; F10 quits from either mode.\nCtrl+C interrupts active work; press it again within 2 seconds to exit. Permission: d denies, Ctrl+A allows, and Enter does nothing.\nReconciliation: Ctrl+R opens acknowledgement, Ctrl+A confirms, and Enter does nothing.\nEvent gaps clear transient progress and reload an authoritative snapshot.")
+            Paragraph::new("Single-session transcript\nComposer owns every printable character. Enter sends; Shift+Enter inserts a newline.\nThe mouse wheel or PgUp/PgDn scrolls history. Esc enters Navigation; j/k selects actions, and Enter/Space expands. Esc or i returns to Composer; q quits only from Navigation; F10 quits from either mode.\nCtrl+C interrupts active work; press it again within 2 seconds to exit. Permission: d denies, Ctrl+A allows, and Enter does nothing.\nReconciliation: Ctrl+R opens acknowledgement, Ctrl+A confirms, and Enter does nothing.\nEvent gaps clear transient progress and reload an authoritative snapshot.")
                 .style(Style::default().fg(TEXT_SOFT).bg(TERMINAL_DEEP))
                 .wrap(Wrap { trim: true })
                 .block(
@@ -2969,7 +3023,13 @@ fn render_constrained_welcome_header(
     let data_rows = layout.header.height.saturating_sub(2);
     if let Some(startup) = model.startup.as_ref() {
         let model_name = selected_provider_model(model).map_or_else(
-            || presentation_text(&startup.default_model, 96),
+            || {
+                if startup.default_model.is_empty() {
+                    MODEL_NOT_CONFIGURED.into()
+                } else {
+                    presentation_text(&startup.default_model, 96)
+                }
+            },
             |(_, selected_model)| presentation_text(&selected_model, 96),
         );
         let workspace = presentation_text(&startup.workspace_display, 180);
@@ -3018,7 +3078,13 @@ fn render_environment_card(
     area: Rect,
 ) {
     let model = selected_provider_model(ui).map_or_else(
-        || presentation_text(&startup.default_model, 96),
+        || {
+            if startup.default_model.is_empty() {
+                MODEL_NOT_CONFIGURED.into()
+            } else {
+                presentation_text(&startup.default_model, 96)
+            }
+        },
         |(_, selected_model)| presentation_text(&selected_model, 96),
     );
     let workspace = presentation_text(&startup.workspace_display, 180);
@@ -3466,13 +3532,19 @@ fn render_blocking_card(
     if compact {
         lines = compact_lines;
     }
-    let top_offset = if compact { 0 } else { 2 };
     let card_height = u16::try_from(lines.len()).unwrap_or(area.height);
+    // Blocking decisions belong to the active tail of the waterfall. Pin the
+    // card immediately above the composer instead of at the transcript top,
+    // where a user watching the latest tool row can easily miss it.
+    let bottom_inset = u16::from(area.height > card_height);
+    let visible_height = card_height.min(area.height.saturating_sub(bottom_inset));
     let pinned = Rect::new(
         area.x,
-        area.y.saturating_add(top_offset),
+        area.bottom()
+            .saturating_sub(visible_height)
+            .saturating_sub(bottom_inset),
         area.width,
-        card_height.min(area.height.saturating_sub(top_offset)),
+        visible_height,
     );
     frame.render_widget(Clear, pinned);
     frame.render_widget(
@@ -3785,59 +3857,60 @@ fn render_composer(
     visual_state: VisualState,
     layout: ViewportLayout,
 ) {
-    let (text, placeholder, color) = if model.pending_submission.is_some() {
-        ("Submitting…".into(), true, CYAN)
-    } else {
-        match model.selected_thread() {
-            Some(thread) if thread.lifecycle == ThreadLifecycle::ReconciliationRequired => (
-                "Resolve the unknown effect outcome before continuing".into(),
-                true,
-                AMBER,
-            ),
-            Some(thread) => match thread.pending.as_ref() {
-                Some(ThreadPendingRequest::Permission { .. }) => (
-                    "Resolve the permission request to continue".into(),
+    let (text, placeholder, color) =
+        if model.pending_submission.is_some() && model.composer.is_empty() {
+            ("Submitting…".into(), true, CYAN)
+        } else {
+            match model.selected_thread() {
+                Some(thread) if thread.lifecycle == ThreadLifecycle::ReconciliationRequired => (
+                    "Resolve the unknown effect outcome before continuing".into(),
                     true,
                     AMBER,
                 ),
-                Some(ThreadPendingRequest::Input { prompt, .. }) => (
-                    if model.input.is_empty() {
-                        presentation_text(prompt, 160)
-                    } else {
-                        model.input.clone()
-                    },
-                    model.input.is_empty(),
-                    AMBER,
-                ),
+                Some(thread) => match thread.pending.as_ref() {
+                    Some(ThreadPendingRequest::Permission { .. }) => (
+                        "Resolve the permission request to continue".into(),
+                        true,
+                        AMBER,
+                    ),
+                    Some(ThreadPendingRequest::Input { prompt, .. }) => (
+                        if model.input.is_empty() {
+                            presentation_text(prompt, 160)
+                        } else {
+                            model.input.clone()
+                        },
+                        model.input.is_empty(),
+                        AMBER,
+                    ),
+                    None => (
+                        if model.composer.is_empty() {
+                            if visual_state == VisualState::Complete {
+                                "Ask a follow-up…".into()
+                            } else {
+                                "Ask Latte Code to change this repository…".into()
+                            }
+                        } else {
+                            model.composer.clone()
+                        },
+                        model.composer.is_empty(),
+                        if model.focus == ThreadFocus::Composer {
+                            LATTE
+                        } else {
+                            FAINT
+                        },
+                    ),
+                },
                 None => (
                     if model.composer.is_empty() {
-                        if visual_state == VisualState::Complete {
-                            "Ask a follow-up…".into()
-                        } else {
-                            "Ask Latte Code to change this repository…".into()
-                        }
+                        "Ask Latte Code to change this repository…".into()
                     } else {
                         model.composer.clone()
                     },
                     model.composer.is_empty(),
-                    if model.focus == ThreadFocus::Composer {
-                        LATTE
-                    } else {
-                        FAINT
-                    },
+                    LATTE,
                 ),
-            },
-            None => (
-                if model.composer.is_empty() {
-                    "Ask Latte Code to change this repository…".into()
-                } else {
-                    model.composer.clone()
-                },
-                model.composer.is_empty(),
-                LATTE,
-            ),
-        }
-    };
+            }
+        };
     let area = layout.composer;
     if area.width == 0 || area.height == 0 {
         return;
@@ -3948,11 +4021,10 @@ fn render_composer(
             ),
         );
     }
-    let disabled = model.pending_submission.is_some()
-        || matches!(
-            visual_state,
-            VisualState::Permission | VisualState::Reconciliation
-        );
+    let disabled = matches!(
+        visual_state,
+        VisualState::Permission | VisualState::Reconciliation
+    );
     if !disabled && model.focus == ThreadFocus::Composer && inner.width > 0 {
         let visible_start = editor_layout
             .rows
@@ -3977,10 +4049,21 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
     if model.pending_submission.is_some() {
         return (
             "Submitting".into(),
-            "Waiting for durable transcript…".into(),
+            "Compose next prompt · Shift+Enter newline".into(),
         );
     }
     let Some(thread) = model.selected_thread() else {
+        if selected_provider_model(model).is_none()
+            && model
+                .startup
+                .as_ref()
+                .is_some_and(|startup| startup.default_model.is_empty())
+        {
+            return (
+                "Provider setup required".into(),
+                "Configure ~/.latte/latte-code.jsonc · restart Latte Code".into(),
+            );
+        }
         if model.submission_error.is_some() {
             return (
                 "Submission failed · prompt restored".into(),
@@ -3989,7 +4072,13 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
         }
         let left = model.startup.as_ref().map_or_else(String::new, |startup| {
             let selected = selected_provider_model(model).map_or_else(
-                || startup.default_model.clone(),
+                || {
+                    if startup.default_model.is_empty() {
+                        MODEL_NOT_CONFIGURED.into()
+                    } else {
+                        startup.default_model.clone()
+                    }
+                },
                 |(_, selected_model)| selected_model,
             );
             format!(
@@ -4574,6 +4663,7 @@ pub fn run_with_feedback_and_progress(
         }
         if redraw {
             terminal.draw(|frame| render(frame, &model))?;
+            reduce(&mut model, ThreadUiInput::FrameRendered);
             redraw = false;
         }
         if guard.take_interrupted() {
@@ -4630,6 +4720,10 @@ pub fn run_with_feedback_and_progress(
                     if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
                         return Ok(());
                     }
+                    redraw = true;
+                }
+                Event::Mouse(mouse) => {
+                    reduce(&mut model, ThreadUiInput::Mouse(mouse));
                     redraw = true;
                 }
                 Event::Resize(width, height) => {
@@ -5656,6 +5750,11 @@ mod tests {
         }
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
+        assert!(
+            reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)).is_empty(),
+            "a buffered denial must not resolve an unseen permission request"
+        );
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![ThreadUiAction::ResolvePermission {
@@ -5777,7 +5876,7 @@ mod tests {
         assert!(rendered(&model, 120, 40).contains("optimistic-sentinel"));
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert!(reduce_paste_for_test(&mut model, "duplicate").is_empty());
-        assert!(model.composer.is_empty());
+        assert_eq!(model.composer, "duplicate");
         assert_eq!(
             model
                 .pending_submission
@@ -5826,6 +5925,54 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn failed_submission_restoration_defers_and_then_restores_the_next_draft() {
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let mut model = ThreadUiModel {
+            composer: "next draft\nsecond line".into(),
+            pending_submission: Some(PendingSubmission {
+                submission_id: 1,
+                prompt: "retry me".into(),
+                thread_id: Some(thread_id),
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
+
+        restore_pending_submission(&mut model);
+        assert_eq!(model.composer, "retry me");
+        assert_eq!(
+            model.deferred_composer_draft.as_deref(),
+            Some("next draft\nsecond line")
+        );
+
+        model.composer.clear();
+        model.pending_submission = Some(PendingSubmission {
+            submission_id: 2,
+            prompt: "retry me".into(),
+            thread_id: Some(thread_id),
+            after_sequence: 0,
+        });
+        let mut thread = snapshot(ThreadLifecycle::Running);
+        thread.thread_id = thread_id;
+        thread.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 1,
+            run_id: thread.active_run_id,
+            kind: TranscriptKind::User,
+            text: "retry me".into(),
+            payload: None,
+            source_key: "thread:create:user".into(),
+            created_at_ms: 1,
+        });
+
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        assert!(model.pending_submission.is_none());
+        assert!(model.deferred_composer_draft.is_none());
+        assert_eq!(model.composer, "next draft\nsecond line");
     }
 
     #[test]
@@ -6068,6 +6215,7 @@ mod tests {
             ..Default::default()
         };
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![ThreadUiAction::ResolvePermission {
@@ -6095,6 +6243,60 @@ mod tests {
         assert!(!rendered.contains("live-secret-value"));
         assert!(!rendered.contains('\u{1b}'));
     }
+
+    #[test]
+    fn process_permission_card_is_pinned_at_the_active_waterfall_tail() {
+        let ids = SystemIdSource::default();
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let request_id = "process-permission-card";
+        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
+        thread.pending = Some(ThreadPendingRequest::Permission {
+            run_id,
+            request_id: request_id.into(),
+            description: "Run argv: git status (cwd: .)".into(),
+            expected_run_revision: 2,
+        });
+        thread.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(run_id),
+            TranscriptKind::ToolCall,
+            "Run argv: git status (cwd: .)",
+            Some(serde_json::json!({
+                "descriptor": {
+                    "effect_id": request_id,
+                    "name": "process",
+                    "input": {
+                        "argv": ["git", "status"],
+                        "cwd": "."
+                    }
+                }
+            })),
+        ));
+        let buffer = rendered_buffer(
+            &ThreadUiModel {
+                sessions: vec![thread],
+                ..Default::default()
+            },
+            120,
+            40,
+        );
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        let (_, card_y) = find_symbol(&buffer, "┌").expect("process permission card");
+
+        assert!(card_y > 20, "permission card must stay near the composer");
+        assert!(rendered.contains("Permission required"));
+        assert!(rendered.contains("Operation  Run process"));
+        assert!(rendered.contains("Target     ."));
+        assert!(rendered.contains("Run argv: git status (cwd: .)"));
+        assert!(rendered.contains("[d] Deny"));
+        assert!(rendered.contains("[Ctrl+A] Allow once"));
+    }
+
     #[test]
     fn gap_clears_progress_and_safe_queue_waits_for_snapshot() {
         let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -6236,6 +6438,7 @@ mod tests {
             expected_run_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
             vec![ThreadUiAction::ResolvePermission {
@@ -6551,7 +6754,7 @@ mod tests {
 
         let mut empty = ThreadUiModel::default();
         open_model_picker(&mut empty);
-        assert_eq!(empty.status, "No configured provider models are available");
+        assert_eq!(empty.status, PROVIDER_SETUP_GUIDANCE);
         assert!(filtered_model_options(&empty).is_empty());
         assert!(
             reduce_model_picker_key(&mut empty, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
@@ -6719,7 +6922,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_catalog_resumes_latest_but_new_keeps_an_explicit_draft() {
+    fn startup_catalog_keeps_a_fresh_draft_until_resume_is_explicit() {
         let existing = snapshot(ThreadLifecycle::Ready);
         let summary = ThreadSessionSummary {
             thread_id: existing.thread_id,
@@ -6733,15 +6936,18 @@ mod tests {
         };
 
         let mut startup = ThreadUiModel::with_startup(test_startup());
-        assert_eq!(
+        assert!(
             reduce(
                 &mut startup,
                 ThreadUiInput::SessionCatalog(vec![summary.clone()])
-            ),
-            vec![ThreadUiAction::OpenSession {
-                thread_id: existing.thread_id,
-            }]
+            )
+            .is_empty()
         );
+        assert_eq!(
+            startup.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+        assert!(startup.sessions.is_empty());
 
         let mut explicit_new = ThreadUiModel::with_startup(test_startup());
         explicit_new.composer = "/new".into();
@@ -6757,6 +6963,31 @@ mod tests {
             explicit_new.active_conversation,
             Some(ActiveConversation::NewSessionDraft)
         );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_in_every_focus_mode_and_saturates() {
+        let mut model = ThreadUiModel::default();
+        let mouse = |kind| {
+            ThreadUiInput::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(reduce(&mut model, mouse(MouseEventKind::ScrollUp)).is_empty());
+        assert_eq!(model.scroll, 3);
+        model.focus = ThreadFocus::Navigation;
+        reduce(&mut model, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(model.scroll, 6);
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(model.scroll, 0);
+        reduce(&mut model, mouse(MouseEventKind::Moved));
+        assert_eq!(model.scroll, 0);
     }
 
     #[test]
@@ -7407,6 +7638,7 @@ mod tests {
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
         assert_eq!(model.focus, ThreadFocus::Composer);
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
             vec![ThreadUiAction::ResolvePermission {
@@ -8302,7 +8534,16 @@ mod tests {
                     VisualState::Permission | VisualState::Reconciliation => {
                         let transcript_x = tier.transcript_inset();
                         let card_x = transcript_x + 1;
-                        let card_y = header_height + 2;
+                        let card_height = if state == VisualState::Permission {
+                            8
+                        } else {
+                            7
+                        };
+                        let card_y = layout
+                            .transcript
+                            .bottom()
+                            .saturating_sub(card_height)
+                            .saturating_sub(1);
                         let card_width = width
                             .saturating_sub(transcript_x * 2)
                             .saturating_sub(2)
@@ -8335,9 +8576,7 @@ mod tests {
     #[test]
     fn blocking_cards_ignore_transcript_scroll_and_keep_fixed_chrome() {
         for model in [permission_model(), reconciliation_model()] {
-            for (width, height, card_x, card_y, card_right) in
-                [(120, 40, 5, 5, 80), (100, 30, 5, 5, 80), (72, 24, 3, 4, 68)]
-            {
+            for (width, height) in [(120, 40), (100, 30), (72, 24)] {
                 let before = rendered_buffer(&model, width, height);
                 let after = rendered_buffer(
                     &ThreadUiModel {
@@ -8347,11 +8586,22 @@ mod tests {
                     width,
                     height,
                 );
+                let (card_x, card_y) =
+                    find_symbol(&before, "┌").expect("blocking card before scroll");
+                let (after_x, after_y) =
+                    find_symbol(&after, "┌").expect("blocking card after scroll");
+                let card_right = card_x
+                    + width
+                        .saturating_sub(ViewportTier::for_width(width).transcript_inset() * 2)
+                        .saturating_sub(2)
+                        .clamp(20, 76)
+                    - 1;
+                assert_eq!((after_x, after_y), (card_x, card_y));
                 assert_eq!(before[(card_x, card_y)].symbol(), "┌");
                 assert_eq!(after[(card_x, card_y)].symbol(), "┌");
                 assert_eq!(after[(card_right, card_y)].symbol(), "┐");
                 let card_height = if visual_state(&model) == VisualState::Permission {
-                    9
+                    8
                 } else {
                     7
                 };
@@ -8636,13 +8886,21 @@ mod tests {
             )
             .is_empty()
         );
-        assert_eq!(model.composer, "locked");
+        assert_eq!(model.composer, "lockedx");
+        assert!(
+            reduce_composer_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            )
+            .is_empty()
+        );
+        assert_eq!(model.composer, "lockedx\n");
         model.pending_submission = None;
         let _ = reduce_composer_key(
             &mut model,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         );
-        assert_eq!(model.composer, "locke");
+        assert_eq!(model.composer, "lockedx");
         let _ = reduce_composer_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(model.focus, ThreadFocus::Navigation);
 
@@ -9374,6 +9632,36 @@ mod tests {
             workspace_display: "~/projects/latte-code".into(),
             permission_mode: ThreadPermissionMode::Ask,
         }
+    }
+
+    #[test]
+    fn missing_provider_keeps_tui_usable_and_prompt_local_until_configured() {
+        let startup = ThreadStartupPresentation {
+            default_provider: String::new(),
+            default_model: String::new(),
+            model_catalog: Vec::new(),
+            workspace_display: "~/projects/latte-code".into(),
+            permission_mode: ThreadPermissionMode::Ask,
+        };
+        let mut model = ThreadUiModel::with_startup(startup);
+
+        assert!(model.draft_model.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
+        assert!(rendered(&model, 100, 32).contains(MODEL_NOT_CONFIGURED));
+
+        model.composer = "keep this prompt".into();
+        assert!(submit_composer(&mut model).is_empty());
+        assert_eq!(model.composer, "keep this prompt");
+        assert!(model.pending_submission.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
+
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::SHIFT)).is_empty());
+        assert!(reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.composer, "keep this prompt\nx");
+
+        open_model_picker(&mut model);
+        assert!(model.model_picker.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
     }
 
     fn working_model() -> ThreadUiModel {
