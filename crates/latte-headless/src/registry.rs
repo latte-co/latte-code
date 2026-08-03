@@ -53,16 +53,6 @@ pub enum ProviderDefinition {
         streaming: bool,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
-        /// Stable non-secret credential identity required by Thread v2.  It
-        /// identifies a reference, never a credential value.
-        #[serde(default)]
-        credential_ref_id: Option<String>,
-        /// Stable authorization/data-boundary identity required by Thread v2.
-        #[serde(default)]
-        data_scope_id: Option<String>,
-        /// Explicit rotation generation; changing it prevents history egress.
-        #[serde(default)]
-        credential_generation: Option<u64>,
     },
 }
 
@@ -161,14 +151,33 @@ impl OpenAiChatModels {
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SecretRef {
-    Env { name: String },
+    Literal(String),
+    Env { source: SecretSource, name: String },
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretSource {
+    Env,
 }
 
 impl std::fmt::Debug for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretRef::Env([REDACTED])")
+        match self {
+            Self::Literal(_) => f.write_str("SecretRef::Literal([REDACTED])"),
+            Self::Env { .. } => f.write_str("SecretRef::Env([REDACTED])"),
+        }
+    }
+}
+
+impl SecretRef {
+    fn credential_ref_id(&self, provider_name: &str) -> String {
+        match self {
+            Self::Literal(_) => format!("config:{provider_name}/api_key"),
+            Self::Env { name, .. } => format!("env:{name}"),
+        }
     }
 }
 
@@ -354,9 +363,6 @@ impl ProviderRegistry {
         Ok(resolved)
     }
 
-    /// Computes the complete Thread v2 binding before secret environment
-    /// lookup. Legacy provider definitions intentionally cannot start or
-    /// continue a v2 thread until all scope fields are configured.
     /// Computes the complete Thread v2 binding for the single global default.
     pub fn thread_binding_for_default(
         &self,
@@ -380,25 +386,9 @@ impl ProviderRegistry {
             .ok_or_else(|| RegistryError::Invalid(format!("unknown provider {name}")))?;
         definition.require_model(name, model)?;
         let binding = Self::binding_for_model(name, definition, model, tools)?;
-        let ProviderDefinition::OpenaiChat {
-            credential_ref_id,
-            data_scope_id,
-            credential_generation,
-            ..
-        } = definition;
-        let credential_ref_id = credential_ref_id.clone().ok_or_else(|| {
-            RegistryError::Invalid("Thread v2 requires providers.<name>.credential_ref_id".into())
-        })?;
-        let data_scope_id = data_scope_id.clone().ok_or_else(|| {
-            RegistryError::Invalid("Thread v2 requires providers.<name>.data_scope_id".into())
-        })?;
-        let credential_generation = credential_generation.ok_or_else(|| {
-            RegistryError::Invalid(
-                "Thread v2 requires providers.<name>.credential_generation".into(),
-            )
-        })?;
+        let ProviderDefinition::OpenaiChat { api_key, .. } = definition;
         let result =
-            binding.with_thread_scope(credential_ref_id, data_scope_id, credential_generation);
+            binding.with_thread_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
     }
@@ -468,7 +458,14 @@ impl ProviderRegistry {
                     ))
                 })?;
                 let key = match api_key {
-                    SecretRef::Env { name } => env::var(name)
+                    SecretRef::Literal(value) => {
+                        (!value.is_empty()).then(|| value.clone()).ok_or_else(|| {
+                            RegistryError::Invalid(
+                                "provider inline api_key must not be empty".into(),
+                            )
+                        })?
+                    }
+                    SecretRef::Env { name, .. } => env::var(name)
                         .ok()
                         .filter(|v| !v.is_empty())
                         .ok_or_else(|| RegistryError::MissingSecret(name.clone()))?,
@@ -868,6 +865,25 @@ mod tests {
         let r=ProviderRegistry::parse_jsonc(r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}").unwrap();
         assert_eq!(r.default_name(), Some("main"));
         assert!(!format!("{:?}", r.config).contains("secret-value"));
+        let inline_secret = "inline-secret-must-be-redacted";
+        let inline = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:'inline-secret-must-be-redacted'}}}",
+        )
+        .unwrap();
+        assert!(inline.resolve_default(&[]).is_ok());
+        let inline_binding = inline.thread_binding_for_default(&[]).unwrap();
+        assert_eq!(inline_binding.credential_ref_id, "config:main/api_key");
+        assert_eq!(inline_binding.data_scope_id, "workspace");
+        assert_eq!(inline_binding.credential_generation, 1);
+        assert!(!format!("{:?}", inline.config).contains(inline_secret));
+        let empty = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:''}}}",
+        )
+        .unwrap();
+        assert!(matches!(
+            empty.resolve_default(&[]),
+            Err(RegistryError::Invalid(message)) if message == "provider inline api_key must not be empty"
+        ));
         assert!(
             ProviderRegistry::parse_jsonc(r"{version:1,default_model:'x/m',providers:{},wat:1}")
                 .is_err()
@@ -880,10 +896,19 @@ mod tests {
         let registry = ProviderRegistry::parse_jsonc(example).unwrap();
         assert_eq!(registry.default_name(), Some("primary"));
 
-        let mut invalid: serde_json::Value = json5::from_str(example).unwrap();
-        invalid["providers"]["primary"]["unsupported_provider_option"] =
-            serde_json::Value::Bool(true);
-        assert!(ProviderRegistry::parse_jsonc(&serde_json::to_string(&invalid).unwrap()).is_err());
+        for field in [
+            "unsupported_provider_option",
+            "credential_ref_id",
+            "data_scope_id",
+            "credential_generation",
+        ] {
+            let mut invalid: serde_json::Value = json5::from_str(example).unwrap();
+            invalid["providers"]["primary"][field] = serde_json::Value::Bool(true);
+            assert!(
+                ProviderRegistry::parse_jsonc(&serde_json::to_string(&invalid).unwrap()).is_err(),
+                "{field} must not be public provider configuration"
+            );
+        }
     }
     #[test]
     fn aliases_are_deterministic_bijective_and_byte_bounded() {
@@ -926,9 +951,6 @@ mod tests {
                         api_key: {source: 'env', name: 'NEVER_LOOK_UP_THIS_KEY'},
                         streaming: true,
                         aliases: {read_file: 'rf'},
-                        credential_ref_id: 'keychain://latte/main',
-                        data_scope_id: 'workspace:sample',
-                        credential_generation: 7,
                     }
                 }
             }",
@@ -937,9 +959,9 @@ mod tests {
         let binding = registry.thread_binding_for_default(&tools).unwrap();
         assert_eq!(binding.provider_name, "main");
         assert_eq!(binding.aliases["read_file"], "rf");
-        assert_eq!(binding.credential_ref_id, "keychain://latte/main");
-        assert_eq!(binding.data_scope_id, "workspace:sample");
-        assert_eq!(binding.credential_generation, 7);
+        assert_eq!(binding.credential_ref_id, "env:NEVER_LOOK_UP_THIS_KEY");
+        assert_eq!(binding.data_scope_id, "workspace");
+        assert_eq!(binding.credential_generation, 1);
         assert!(matches!(
             registry.resolve_thread_bound(&binding, &tools),
             Err(RegistryError::MissingSecret(name)) if name == "NEVER_LOOK_UP_THIS_KEY"
@@ -958,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_invalid_semantics_and_missing_thread_scope() {
+    fn registry_rejects_invalid_semantics() {
         let invalid = [
             r"{version:2,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
             r"{version:1,default_model:'missing/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
@@ -980,33 +1002,6 @@ mod tests {
         for source in invalid {
             assert!(ProviderRegistry::parse_jsonc(source).is_err(), "{source}");
         }
-        let legacy = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
-        )
-        .unwrap();
-        assert!(matches!(
-            legacy.thread_binding_for_default(&[]),
-            Err(RegistryError::Invalid(message)) if message.contains("credential_ref_id")
-        ));
-        assert!(matches!(
-            legacy.resolve_default(&[]),
-            Err(RegistryError::MissingSecret(name)) if name == "K"
-        ));
-        for (field, expected) in [
-            ("data_scope_id", "data_scope_id"),
-            ("credential_generation", "credential_generation"),
-        ] {
-            let source = if field == "data_scope_id" {
-                r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'},credential_ref_id:'ref',credential_generation:1}}}"
-            } else {
-                r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'},credential_ref_id:'ref',data_scope_id:'scope'}}}"
-            };
-            let registry = ProviderRegistry::parse_jsonc(source).unwrap();
-            assert!(matches!(
-                registry.thread_binding_for_default(&[]),
-                Err(RegistryError::Invalid(message)) if message.contains(expected)
-            ));
-        }
     }
 
     #[test]
@@ -1015,7 +1010,10 @@ mod tests {
             models: OpenAiChatModels::Ids(vec!["m".into()]),
             base_url: Some("https://example.invalid/v1".into()),
             endpoint: None,
-            api_key: SecretRef::Env { name: "K".into() },
+            api_key: SecretRef::Env {
+                source: SecretSource::Env,
+                name: "K".into(),
+            },
             timeout_ms: default_timeout(),
             max_attempts: default_attempts(),
             temperature: None,
@@ -1023,9 +1021,6 @@ mod tests {
             compatibility_input_request: false,
             streaming: false,
             aliases: BTreeMap::default(),
-            credential_ref_id: Some("ref".into()),
-            data_scope_id: Some("scope".into()),
-            credential_generation: Some(1),
         };
         let forward = ProviderRegistry::binding_for_model(
             "main",
@@ -1061,8 +1056,7 @@ mod tests {
         let registry = ProviderRegistry::parse_jsonc(
             r"{version:1,default_model:'main/m',providers:{main:{
                 type:'openai-chat',models:['m'],base_url:'https://example.invalid/v1',
-                api_key:{source:'env',name:'PATH'},
-                credential_ref_id:'ref',data_scope_id:'scope',credential_generation:1
+                api_key:{source:'env',name:'PATH'}
             }}}",
         )
         .unwrap();
@@ -1090,8 +1084,8 @@ mod tests {
                 alpha:{type:'openai-chat',models:{
                     'family/a-default':{name:'Alpha Default',options:{context_window:128000,reasoning_effort:'high',max_tokens:4096}},
                     'a-fast':{},'a-large':{}
-                },endpoint:'https://a',api_key:{source:'env',name:'PATH'},credential_ref_id:'a',data_scope_id:'workspace',credential_generation:1},
-                beta:{type:'openai-chat',models:['b-default','b-reasoning'],endpoint:'https://b',api_key:{source:'env',name:'PATH'},credential_ref_id:'b',data_scope_id:'workspace',credential_generation:1}
+                },endpoint:'https://a',api_key:{source:'env',name:'PATH'}},
+                beta:{type:'openai-chat',models:['b-default','b-reasoning'],endpoint:'https://b',api_key:{source:'env',name:'PATH'}}
             }}",
         )
         .unwrap();

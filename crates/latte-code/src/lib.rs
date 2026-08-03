@@ -40,7 +40,7 @@ const DEFAULT_CONFIG: &str = r#"{
   },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials are environment references in those files.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials may be literal strings or environment references in those files.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -662,15 +662,20 @@ fn execute_tui() -> i32 {
         }
     };
     let startup_binding = match registry.thread_binding_for_default(&engine.tool_descriptors()) {
-        Ok(binding) => binding,
+        Ok(binding) => Some(binding),
+        Err(_) if registry.model_catalog().is_empty() => None,
         Err(error) => {
             eprintln!("configuration: {error}");
             return EXIT_USAGE;
         }
     };
     let startup = latte_tui::thread::ThreadStartupPresentation {
-        default_provider: startup_binding.provider_name.clone(),
-        default_model: startup_binding.model.clone(),
+        default_provider: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.provider_name.clone()),
+        default_model: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.model.clone()),
         model_catalog: registry
             .model_catalog()
             .into_iter()
@@ -724,7 +729,15 @@ fn execute_tui() -> i32 {
                     submission_id,
                     prompt,
                 } => {
-                    let binding = startup_binding.clone();
+                    let Some(binding) = startup_binding.clone() else {
+                        let _ = feedback_tx.send(
+                            latte_tui::thread::ThreadUiFeedback::submission(
+                                submission_id,
+                                Err("configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code".into()),
+                            ),
+                        );
+                        return Ok(());
+                    };
                     let service = service.clone();
                     let feedback = feedback_tx.clone();
                     let thread_id =
@@ -1579,10 +1592,7 @@ mod tests {
                     type: "openai-chat",
                     models: { "user-model": {} },
                     endpoint: "https://provider.example/chat/completions",
-                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" },
-                    credential_ref_id: "env:TEST_PROVIDER_KEY",
-                    data_scope_id: "workspace",
-                    credential_generation: 1
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
                 } }
             }"#,
         )

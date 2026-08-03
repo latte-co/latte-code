@@ -18,14 +18,12 @@
         }
       },
       "base_url": "https://provider.example/v1",
+      // A literal string is also supported: "api_key": "sk-..."
       "api_key": { "source": "env", "name": "OPENAI_API_KEY" },
       "timeout_ms": 60000,
       "max_attempts": 1,
       "streaming": true,
       "compatibility_input_request": false,
-      "credential_ref_id": "openai-primary-env",
-      "data_scope_id": "workspace",
-      "credential_generation": 1,
       "aliases": {}
     }
   }
