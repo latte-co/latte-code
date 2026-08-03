@@ -2429,7 +2429,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn tool_result_ids(messages: &[Message]) -> Vec<String> {
         messages
             .iter()
