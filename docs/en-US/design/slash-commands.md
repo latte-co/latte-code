@@ -470,10 +470,11 @@ produces a local validation error and preserves the draft; unknown or invalid
 candidates remain ordinary prompts. Local commands do not call a Provider or
 write command text to a transcript.
 
-The TUI resumes the newest Session for the current canonical workspace on
-startup. `/new` selects a transient draft. `/sessions` opens a picker without
-an argument and otherwise resolves a UUID or exact title. A Session from a
-different persisted workspace is not opened implicitly. Session switching is
+The TUI starts with a fresh transient draft on every launch. Existing Sessions
+are loaded only through explicit `/sessions` or `/resume` interaction;
+`/sessions` opens a picker without an argument and otherwise resolves a UUID or
+exact title. A Session from a different persisted workspace is not opened.
+Session switching is
 disabled during a submission, an active child, a pending request, or
 reconciliation, and that availability is checked again at dispatch. Terminal
 `Failed` and `Interrupted` Sessions have no active child and may switch to

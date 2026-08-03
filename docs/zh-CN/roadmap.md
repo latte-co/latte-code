@@ -57,10 +57,10 @@ Windows 已支持任意外部进程执行。
 ## 配置、凭据与模型连接
 
 - [x] 内置默认值、用户级和工作区级 JSONC 配置的确定性合并。
-- [x] 环境变量凭据引用；密钥只在内存解析，正常日志和持久化状态不写入密钥。
+- [x] 内联与环境变量凭据；密钥只在内存解析，正常日志和持久化状态不写入密钥。
 - [x] OpenAI Chat Completions 兼容 Provider、`base_url`、有界 HTTP 超时与重试。
 - [x] 有界 SSE 流式输出、tool-call 聚合，以及受限的非流式回退。
-- [x] Provider binding、工具别名、凭据引用/data scope/generation 的 resume 校验。
+- [x] Provider binding、工具别名，以及内部派生凭据/data scope 的 resume 校验。
 - [ ] 可切换的模型/Provider 选择与每个 Session 的显式模型管理。
 - [ ] 版本化的 Harness Profile：按模型/Provider 成组解析 context strategy、
   system/developer prompt、工具 schema/命名、Plan/Stop 语义与能力开关。它不是

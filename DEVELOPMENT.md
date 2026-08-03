@@ -75,10 +75,11 @@ CLI/TUI 会先加载内置的应用默认值，再按 `$HOME/.latte/latte-code.j
 ```bash
 mkdir -p .latte
 cp latte-code.config.example.jsonc .latte/latte-code.jsonc
+# 仅当 api_key 使用环境变量引用时需要：
 export OPENAI_API_KEY='...'
 ```
 
-用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。示例还使用 `type: "openai-chat"`、`base_url`，以及 `api_key: { source: "env", name: "OPENAI_API_KEY" }`；CLI/TUI 只在实际调用 Provider 时于内存中解析该引用。不要把密钥直接写进 JSONC。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
+用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。`api_key` 可以直接写字符串，也可以使用 `{ source: "env", name: "OPENAI_API_KEY" }`；环境变量只在实际调用 Provider 时解析。内联密钥会保留在用户自己的 JSONC 源文件中，但不会进入 Debug 输出、Session binding、fingerprint、transcript、SQLite 或普通 Effect 记录；包含内联密钥的文件应限制为当前用户可读。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
 
 `resume --deny`、等待态取消、查看运行记录和 Unknown reconciliation 不依赖 Provider 凭证。
 

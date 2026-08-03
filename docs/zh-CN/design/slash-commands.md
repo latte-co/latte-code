@@ -437,9 +437,9 @@ Name 和 Alias 使用小写 ASCII 并精确匹配；Argument 保留内部换行�
 未知或非法 Candidate 仍是普通 Prompt。Local Command 不调用 Provider，也不把
 Command Text 写入 Transcript。
 
-TUI 启动时恢复当前 Canonical Workspace 中最新的 Session。`/new` 选择瞬态
-Draft；无参数 `/sessions` 打开 Picker，携带参数时解析 UUID 或精确 Title。不会
-隐式打开持久化 Workspace 不同的 Session。存在 Submission、Active Child、Pending
+TUI 每次启动都进入全新的瞬态 Draft。已有 Session 只会在用户显式执行
+`/sessions` 或 `/resume` 后载入；无参数 `/sessions` 打开 Picker，携带参数时解析
+UUID 或精确 Title。不会打开持久化 Workspace 不同的 Session。存在 Submission、Active Child、Pending
 Request 或 Reconciliation 时禁用 Session 切换，并在 Dispatch 时再次检查
 Availability。`Failed` 与 `Interrupted` 已没有 Active Child，可以执行 `/new` 或
 `/sessions`。
