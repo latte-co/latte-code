@@ -152,11 +152,20 @@ fn ctrl_c_during_provider_wait_interrupts_cleanly_and_restart_never_reenters() {
             .iter()
             .any(|run| run["status"] == "interrupted")
     );
+    let thread_id = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap()
+        .list_threads_v2()
+        .unwrap()[0]
+        .thread_id;
 
     let mut restart_command = scenario.command(&["tui"]);
     restart_command.env("TEST_OPENAI_KEY", "cancel-secret");
     let mut restart = PtySession::spawn(restart_command);
     assert!(restart.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    restart.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(restart.wait_for_output(b"Interrupted", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     restart.write(F10);

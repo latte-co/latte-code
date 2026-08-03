@@ -394,6 +394,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
 
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {failed_thread_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(b"public certified effect failed", Duration::from_secs(5)),
         "public failure was not rendered: {}",
@@ -481,6 +482,7 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     let projection = build_engine(&scenario);
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(pty.wait_for_output(b"Reconciliation", Duration::from_secs(5)));
     pty.write(CTRL_R);
     assert!(pty.wait_for_output(b"Ctrl+A confirm failed", Duration::from_secs(5)));

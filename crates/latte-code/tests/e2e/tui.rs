@@ -19,6 +19,7 @@ const CTRL_C: &[u8] = b"\x1b[99;5u";
 const CTRL_R: &[u8] = b"\x1b[114;5u";
 const SHIFT_ENTER: &[u8] = b"\x1b[13;2u";
 const ENTER: &[u8] = b"\x1b[13u";
+const MOUSE_SCROLL_UP: &[u8] = b"\x1b[<64;10;10M";
 
 fn has_one_durable_terminal_tool_result(
     engine: &latte_engine::EngineHandle,
@@ -71,6 +72,38 @@ fn explicit_tui_fails_cleanly_without_a_terminal() {
     let output = scenario.output(&["tui"], |_| {});
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires a TTY"));
+}
+
+#[test]
+fn tui_without_provider_opens_and_guides_before_first_submission() {
+    let scenario = Scenario::new();
+    let mut pty = PtySession::spawn(scenario.command(&["tui"]));
+
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(pty.wait_for_output(b"Not configured", Duration::from_secs(5)));
+    assert!(pty.wait_for_output(b"Provider setup required", Duration::from_secs(5)));
+
+    pty.write(b"prompt-kept-before-provider");
+    pty.write(ENTER);
+    assert!(pty.wait_for_output(b"~/.latte/latte-code.jsonc", Duration::from_secs(5)));
+    assert!(pty.is_running());
+    assert!(wait_until(Duration::from_secs(5), || {
+        latte_engine::EngineBuilder::new()
+            .workspace_root(scenario.root())
+            .database_path(scenario.database_path())
+            .build()
+            .and_then(|engine| engine.list_threads_v2())
+            .is_ok_and(|threads| threads.is_empty())
+    }));
+
+    pty.write(SHIFT_ENTER);
+    pty.write(b"second-line-still-editable");
+    assert!(pty.is_running());
+    pty.write(F10);
+    let (status, output) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+    let terminal = String::from_utf8_lossy(&output);
+    assert!(terminal.contains("prompt-kept-before-provider"));
 }
 
 #[test]
@@ -128,6 +161,10 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     assert!(terminal.contains("second"));
     assert!(terminal.contains("\u{1b}[>3u"));
     assert!(terminal.contains("\u{1b}[?1049h"));
+    assert!(terminal.contains("\u{1b}[?1000h"));
+    assert!(terminal.contains("\u{1b}[?1006h"));
+    assert!(terminal.contains("\u{1b}[?1006l"));
+    assert!(terminal.contains("\u{1b}[?1000l"));
     assert!(terminal.contains("\u{1b}[?1049l"));
     assert!(terminal.contains("\u{1b}[<1u"));
 }
@@ -318,10 +355,7 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
                         "alpha-fast": { "options": { "context_window": 32000 } }
                     },
                     "endpoint": alpha.endpoint(),
-                    "api_key": {"source": "env", "name": "TEST_OPENAI_KEY"},
-                    "credential_ref_id": "env:alpha",
-                    "data_scope_id": "workspace",
-                    "credential_generation": 1
+                    "api_key": {"source": "env", "name": "TEST_OPENAI_KEY"}
                 },
                 "beta": {
                     "type": "openai-chat",
@@ -337,10 +371,7 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
                         }
                     },
                     "endpoint": beta.endpoint(),
-                    "api_key": {"source": "env", "name": "TEST_OPENAI_KEY"},
-                    "credential_ref_id": "env:beta",
-                    "data_scope_id": "workspace",
-                    "credential_generation": 1
+                    "api_key": {"source": "env", "name": "TEST_OPENAI_KEY"}
                 }
             },
             "database": {"path": ".latte/latte-code.db"},
@@ -430,7 +461,14 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
 #[test]
 fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     let scenario = Scenario::new();
-    let provider = ScriptedProvider::start([ProviderReply::completion("stored session")]);
+    let long_answer = format!(
+        "OLDEST_MOUSE_MARKER\n{}\nNEWEST_MOUSE_MARKER",
+        (0..60)
+            .map(|index| format!("mouse history row {index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let provider = ScriptedProvider::start([ProviderReply::completion(&long_answer)]);
     let mut first_command = scenario.command(&["tui"]);
     scenario.configure_provider(
         &mut first_command,
@@ -468,13 +506,29 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     resumed_command.env("TEST_OPENAI_KEY", "session-e2e-secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(
+        !resumed
+            .output()
+            .windows(b"NEWEST_MOUSE_MARKER".len())
+            .any(|value| value == b"NEWEST_MOUSE_MARKER"),
+        "TUI startup must keep a fresh draft instead of rendering the latest Session"
+    );
     resumed.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
-        resumed.wait_for_output(b"stored session", Duration::from_secs(5)),
+        resumed.wait_for_output(b"NEWEST_MOUSE_MARKER", Duration::from_secs(5)),
         "TUI did not render resumed Session: {}",
         String::from_utf8_lossy(&resumed.output())
     );
     assert_eq!(provider.requests().len(), 1);
+
+    for _ in 0..40 {
+        resumed.write(MOUSE_SCROLL_UP);
+    }
+    assert!(
+        resumed.wait_for_output(b"OLDEST_MOUSE_MARKER", Duration::from_secs(5)),
+        "mouse wheel did not reveal older transcript rows: {}",
+        String::from_utf8_lossy(&resumed.output())
+    );
 
     let before_title_resume = resumed.output().len();
     resumed.write(b"/sessions seed session\r");
@@ -582,7 +636,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             .windows(b"duplicate session title".len())
             .filter(|window| *window == b"duplicate session title")
             .count()
-            >= 3,
+            >= 2,
         "duplicate title picker did not contain both matching Sessions"
     );
     pty.write(b"\x1b[27u");
@@ -646,6 +700,83 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback_without_fixed_sleeps() {
 }
 
 #[test]
+fn running_tui_keeps_shift_enter_and_the_next_multiline_draft_editable() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first answer").delayed(Duration::from_secs(1)),
+        ProviderReply::completion("queued answer"),
+    ]);
+    let mut command = scenario.command(&["tui"]);
+    scenario.configure_provider(
+        &mut command,
+        provider.endpoint(),
+        r#"["/usr/bin/true"]"#,
+        "secret",
+    );
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(b"first prompt\r");
+    assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
+
+    // The first durable user card must unlock a fresh composer while the
+    // provider is still working. This is a draft, not a second dispatch yet.
+    pty.write(b"\x1b[200~next draft first\x1b[201~");
+    pty.write(SHIFT_ENTER);
+    pty.write(b"\x1b[200~next draft second\x1b[201~");
+    assert!(
+        pty.wait_for_output(b"next draft second", Duration::from_secs(5)),
+        "running composer did not retain the multiline draft: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    assert_eq!(provider.requests().len(), 1);
+
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine.list_threads_v2().is_ok_and(|threads| {
+            threads.len() == 1
+                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
+                && threads[0].transcript.entries.iter().any(|entry| {
+                    entry.kind == latte_core::TranscriptKind::Assistant
+                        && entry.text == "first answer"
+                })
+        })
+    }));
+    assert!(
+        pty.wait_for_output(b"Completed", Duration::from_secs(5)),
+        "TUI did not render the completed first run: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(b"\r");
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine.list_threads_v2().is_ok_and(|threads| {
+            threads.len() == 1
+                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
+                && threads[0].transcript.entries.iter().any(|entry| {
+                    entry.kind == latte_core::TranscriptKind::Assistant
+                        && entry.text == "queued answer"
+                })
+        })
+    }));
+    let requests = provider.requests();
+    assert_eq!(
+        requests[1].body["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"],
+        "next draft first\nnext draft second"
+    );
+    provider.assert_consumed();
+    pty.write(F10);
+    assert!(pty.finish(Duration::from_secs(5)).0.success());
+}
+
+#[test]
 fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([
@@ -688,6 +819,7 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
         "input request was not durable: {}",
         String::from_utf8_lossy(&first.output())
     );
+    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
     first.write(F10);
     let (status, _) = first.finish(Duration::from_secs(5));
     assert!(status.success());
@@ -697,6 +829,7 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
     resumed_command.env("TEST_OPENAI_KEY", "input-e2e-secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    resumed.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(resumed.wait_for_output(b"Input required", Duration::from_secs(5)));
     resumed.write(b"durable-first");
     resumed.write(SHIFT_ENTER);
@@ -757,6 +890,13 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
     first.write(F10);
     assert!(first.finish(Duration::from_secs(5)).0.success());
 
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+
     // Changing the immutable binding makes provider resolution fail before
     // ProvideInput can commit its user card.
     scenario.write_config_with_model(
@@ -770,6 +910,7 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
     resumed_command.env("TEST_OPENAI_KEY", "input-restore-secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    resumed.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(resumed.wait_for_output(b"Input required", Duration::from_secs(5)));
     resumed.write(b"restore-first");
     resumed.write(SHIFT_ENTER);
@@ -791,11 +932,6 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
         String::from_utf8_lossy(&resumed.output())
     );
 
-    let engine = latte_engine::EngineBuilder::new()
-        .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
-        .build()
-        .unwrap();
     let threads = engine.list_threads_v2().unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(
@@ -1071,6 +1207,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
     resumed_command.env("TEST_OPENAI_KEY", "secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    resumed.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         resumed.wait_for_output(b"newest bounded-tail marker", Duration::from_secs(5)),
         "TUI resumed an old transcript page: {}",
@@ -1119,7 +1256,10 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
 #[allow(clippy::too_many_lines)]
 fn permission_card_requires_exact_keys_and_resolves_once() {
     let denied_scenario = Scenario::new();
-    let denied_provider = ScriptedProvider::start([write_file_reply("tui-deny-write")]);
+    let denied_provider = ScriptedProvider::start([
+        write_file_reply("tui-deny-write"),
+        ProviderReply::completion("continued after permission denial"),
+    ]);
     let mut denied_command = denied_scenario.command(&["tui"]);
     denied_scenario.configure_provider(
         &mut denied_command,
@@ -1152,6 +1292,14 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
         assert!(threads[0].pending.is_some());
     };
     assert_still_waiting();
+    let denied_thread_id = latte_engine::EngineBuilder::new()
+        .workspace_root(denied_scenario.root())
+        .database_path(denied_scenario.database_path())
+        .build()
+        .unwrap()
+        .list_threads_v2()
+        .unwrap()[0]
+        .thread_id;
     assert!(!denied_scenario.root().join("new.txt").exists());
     assert_eq!(denied_provider.requests().len(), 1);
 
@@ -1159,6 +1307,7 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
     shifted_command.env("TEST_OPENAI_KEY", "secret");
     let mut shifted_pty = PtySession::spawn(shifted_command);
     assert!(shifted_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    shifted_pty.write(format!("/resume {denied_thread_id}\r").as_bytes());
     assert!(shifted_pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     shifted_pty.write(SHIFT_ENTER);
     shifted_pty.write(F10);
@@ -1172,12 +1321,37 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
     deny_command.env("TEST_OPENAI_KEY", "secret");
     let mut deny_pty = PtySession::spawn(deny_command);
     assert!(deny_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    deny_pty.write(format!("/resume {denied_thread_id}\r").as_bytes());
     assert!(deny_pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     deny_pty.write(b"d");
     assert!(deny_pty.wait_for_output(b"permission denied", Duration::from_secs(5)));
     assert!(!denied_scenario.root().join("new.txt").exists());
+    deny_pty.write(b"retry after denial");
+    deny_pty.write(SHIFT_ENTER);
+    deny_pty.write(b"with a multiline prompt\r");
+    assert!(denied_provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(
+        deny_pty.wait_for_output(b"continued", Duration::from_secs(5)),
+        "TUI did not render the post-denial follow-up: {}",
+        String::from_utf8_lossy(&deny_pty.output())
+    );
+    let denied_threads = latte_engine::EngineBuilder::new()
+        .workspace_root(denied_scenario.root())
+        .database_path(denied_scenario.database_path())
+        .build()
+        .unwrap()
+        .list_threads_v2()
+        .unwrap();
+    assert_eq!(
+        denied_threads[0].lifecycle,
+        latte_core::ThreadLifecycle::Ready
+    );
+    assert_eq!(denied_threads[0].runs.len(), 2);
+    assert!(denied_threads[0].transcript.entries.iter().any(|entry| {
+        entry.kind == TranscriptKind::User
+            && entry.text == "retry after denial\nwith a multiline prompt"
+    }));
     denied_provider.assert_consumed();
-    assert_eq!(denied_provider.requests().len(), 1);
     deny_pty.write(F10);
     let (status, _) = deny_pty.finish(Duration::from_secs(5));
     assert!(status.success());
@@ -1324,6 +1498,7 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
     restart_command.env("TEST_OPENAI_KEY", "secret");
     let mut restarted = PtySession::spawn(restart_command);
     assert!(restarted.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    restarted.write(format!("/resume {}\r", threads[0].thread_id).as_bytes());
     assert!(restarted.wait_for_output(b"Reconciliation", Duration::from_secs(5)));
     restarted.write(CTRL_R);
     assert!(

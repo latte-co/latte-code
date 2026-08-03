@@ -710,7 +710,7 @@ fn process_shell_deny_never_spawns_or_reenters_provider() {
     assert!(wait_until(Duration::from_secs(5), || {
         engine.list_threads_v2().is_ok_and(|threads| {
             threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
+                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
                 && threads[0].pending.is_none()
         })
     }));
@@ -834,6 +834,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     );
     assert!(!scenario.root().join("first-created.txt").exists());
     assert!(!scenario.root().join("second-created.txt").exists());
+    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
     first.write(b"\x1b[21~");
     assert!(first.finish(Duration::from_secs(5)).0.success());
 
@@ -841,6 +842,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     second_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut second = PtySession::spawn(second_command);
     assert!(second.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
+    second.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(second.wait_for_output(b"Permission required", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     second.write(b"\x1b[97;5u");
@@ -860,6 +862,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     third_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut third = PtySession::spawn(third_command);
     assert!(third.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
+    third.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(third.wait_for_output(b"Permission required", Duration::from_secs(5)));
     third.write(b"\x1b[97;5u");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));

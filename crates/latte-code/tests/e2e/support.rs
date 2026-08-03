@@ -73,7 +73,7 @@ impl Scenario {
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();
@@ -107,7 +107,7 @@ impl Scenario {
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_model:"main/{model}",providers:{{main:{{type:"openai-chat",models:[{model:?}],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/{model}",providers:{{main:{{type:"openai-chat",models:[{model:?}],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();

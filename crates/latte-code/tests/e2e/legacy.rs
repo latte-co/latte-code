@@ -316,6 +316,7 @@ fn v8_session_catalog_migrates_workspace_and_title_then_reopens_in_final_tui() {
 
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(
             b"restore the legacy session catalog title",

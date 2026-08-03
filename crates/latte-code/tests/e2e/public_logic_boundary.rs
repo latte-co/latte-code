@@ -265,10 +265,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
                         "local-b": { options: { reasoning_effort: "high", max_tokens: 512 } }
                     },
                     base_url: "http://127.0.0.1:9",
-                    api_key: { source: "env", name: "PATH" },
-                    credential_ref_id: "env:PATH",
-                    data_scope_id: "workspace",
-                    credential_generation: 1
+                    api_key: { source: "env", name: "PATH" }
                 }
             }
         }"#,
@@ -299,7 +296,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     missing_model_binding.model = "removed-model".into();
     assert!(registry.resolve_bound(&missing_model_binding, &[]).is_err());
 
-    let provider_without_thread_scope = ProviderRegistry::parse_jsonc(
+    let provider_with_derived_thread_scope = ProviderRegistry::parse_jsonc(
         r#"{
             version: 1,
             default_model: "primary/model-a",
@@ -314,11 +311,12 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         }"#,
     )
     .unwrap();
-    assert!(
-        provider_without_thread_scope
-            .thread_binding_for_default(&[])
-            .is_err()
-    );
+    let derived = provider_with_derived_thread_scope
+        .thread_binding_for_default(&[])
+        .unwrap();
+    assert_eq!(derived.credential_ref_id, "env:PATH");
+    assert_eq!(derived.data_scope_id, "workspace");
+    assert_eq!(derived.credential_generation, 1);
 
     let invalid_provider_configs = [
         r#"{version:2,default_model:"",providers:{}}"#,

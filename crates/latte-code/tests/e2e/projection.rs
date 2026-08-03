@@ -108,10 +108,17 @@ fn finish_fixture(engine: EngineHandle, lease: &Lease) {
     drop(engine);
 }
 
-fn render_fixture(scenario: &Scenario, expected: &[u8], rows: u16, columns: u16) -> PtySession {
+fn render_fixture(
+    scenario: &Scenario,
+    thread_id: ThreadId,
+    expected: &[u8],
+    rows: u16,
+    columns: u16,
+) -> PtySession {
     scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
-    let pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
+    let mut pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(expected, Duration::from_secs(5)),
         "fixture was not rendered: {}",
@@ -221,7 +228,13 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
     );
     finish_fixture(engine, &lease);
 
-    let mut pty = render_fixture(&scenario, b"rich completion summary", 40, 120);
+    let mut pty = render_fixture(
+        &scenario,
+        snapshot.thread_id,
+        b"rich completion summary",
+        40,
+        120,
+    );
     // Palette Navigation avoids terminal Escape ambiguity. Expand/collapse
     // both projected actions so metadata and success/failure details render.
     pty.write(CTRL_P);
@@ -338,7 +351,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
         assert_eq!(snapshot.lifecycle_label_for_test(), state);
         finish_fixture(engine, &lease);
 
-        let mut pty = render_fixture(&scenario, expected, 28, 82);
+        let mut pty = render_fixture(&scenario, snapshot.thread_id, expected, 28, 82);
         if matches!(state, "failed" | "interrupted") {
             let output_start = pty.output().len();
             pty.write(b"/new\r");
@@ -489,7 +502,13 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
         );
         finish_fixture(engine, &lease);
 
-        let mut pty = render_fixture(&scenario, b"Permission required", 26, 88);
+        let mut pty = render_fixture(
+            &scenario,
+            snapshot.thread_id,
+            b"Permission required",
+            26,
+            88,
+        );
         assert!(
             pty.wait_for_visible_text(expected_operation, Duration::from_secs(5)),
             "permission operation was not visible: {}",

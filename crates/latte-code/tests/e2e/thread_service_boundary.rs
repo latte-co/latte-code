@@ -358,6 +358,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     drop(engine);
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {}\r", reconciliation.thread_id).as_bytes());
     assert!(tui.wait_for_output(b"Reconciliation required", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());

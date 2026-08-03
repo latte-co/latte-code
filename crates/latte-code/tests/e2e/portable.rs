@@ -90,6 +90,47 @@ fn final_binary_parses_loopback_provider_input_and_persists_waiting_projection()
 }
 
 #[test]
+fn final_binary_uses_inline_provider_secret_without_environment_inheritance() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::input_request(
+        "inline-portable-input",
+        "inline portable prompt",
+        false,
+    )]);
+    let secret = "latte-inline-portable-e2e-secret";
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{secret:?},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "run", "inline provider journey"], |_| {});
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json(&output)["error"]["code"], "runtime");
+    provider.assert_consumed();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        &format!("Bearer {secret}")
+    );
+    let database = std::fs::read(scenario.database_path()).unwrap();
+    assert_secret_absent(
+        secret,
+        &[
+            ("stdout", &output.stdout),
+            ("stderr", &output.stderr),
+            ("database", &database),
+        ],
+    );
+}
+
+#[test]
 fn final_binary_persists_terminal_provider_failure_without_retrying() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::json(

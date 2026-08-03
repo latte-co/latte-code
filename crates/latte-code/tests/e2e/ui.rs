@@ -207,16 +207,12 @@ fn final_tui_exercises_escape_reverse_navigation_and_empty_picker_boundaries() {
                 primary: {
                     type: "openai-chat", models: ["model-a", "model-b"],
                     endpoint: "http://127.0.0.1:1",
-                    api_key: { source: "env", name: "TEST_OPENAI_KEY" },
-                    credential_ref_id: "env:TEST_OPENAI_KEY", data_scope_id: "workspace",
-                    credential_generation: 1
+                    api_key: { source: "env", name: "TEST_OPENAI_KEY" }
                 },
                 secondary: {
                     type: "openai-chat", models: { "model-c": { name: "Friendly C" } },
                     endpoint: "http://127.0.0.1:1",
-                    api_key: { source: "env", name: "TEST_OPENAI_KEY" },
-                    credential_ref_id: "env:TEST_OPENAI_KEY", data_scope_id: "workspace",
-                    credential_generation: 1
+                    api_key: { source: "env", name: "TEST_OPENAI_KEY" }
                 }
             },
             database: { path: ".latte/latte-code.db" },
@@ -298,8 +294,7 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         r#"{
             version:1, default_model:"main/mock",
             providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",
-                api_key:{source:"env",name:"TEST_OPENAI_KEY"},credential_ref_id:"env:key",
-                data_scope_id:"workspace",credential_generation:1}},
+                api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},
             database:{path:".latte/state.db"},
             thread:{max_request_bytes:1,max_input_bytes:1,reserved_output_bytes:1,context_cap_bytes:0}
         }"#,
@@ -318,8 +313,7 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         r#"{
             version:1, default_model:"main/mock",
             providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",
-                api_key:{source:"env",name:"TEST_OPENAI_KEY"},credential_ref_id:"env:key",
-                data_scope_id:"workspace",credential_generation:1}},
+                api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},
             database:{path:"blocked/state.db"}, verification:{argv:["/bin/pwd"]}
         }"#,
     )
@@ -336,8 +330,7 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         r#"{
             version:1, default_model:"main/mock",
             providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",
-                api_key:{source:"env",name:"TEST_OPENAI_KEY"},credential_ref_id:"env:key",
-                data_scope_id:"workspace",credential_generation:1}},
+                api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},
             database:{path:".latte/database-dir"}, verification:{argv:["/bin/pwd"]}
         }"#,
     )

@@ -295,7 +295,8 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     let mut no_models = ThreadUiModel::default();
     no_models.composer = "/model".into();
     assert!(reduce(&mut no_models, key(KeyCode::Enter)).is_empty());
-    assert!(no_models.status.contains("No configured"));
+    assert!(no_models.status.contains("Provider setup required"));
+    assert!(no_models.status.contains("~/.latte/latte-code.jsonc"));
 
     let mut validation_model = ThreadUiModel::with_startup(model.startup.clone().unwrap());
     validation_model.composer = "/new unexpected".into();
@@ -355,12 +356,16 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         created_at_ms: now + 1,
         updated_at_ms: now + 3,
     };
-    assert_eq!(
+    assert!(
         reduce(
             &mut model,
             ThreadUiInput::SessionCatalog(vec![summary.clone()])
-        ),
-        vec![ThreadUiAction::OpenSession { thread_id }]
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        model.active_conversation,
+        Some(ActiveConversation::NewSessionDraft)
     );
     assert!(
         reduce(
@@ -772,6 +777,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     drop(engine);
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(tui.wait_for_output(b"public reducer session completed", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
@@ -1250,7 +1256,9 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     });
     let before = model.composer.clone();
     reduce(&mut model, ThreadUiInput::Paste("blocked".into()));
-    assert_eq!(model.composer, before);
+    assert_eq!(model.composer, format!("{before}blocked"));
+    assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
+    assert!(model.pending_submission.is_some());
     model.pending_submission = None;
 
     let mut render_models = Vec::new();
@@ -1272,6 +1280,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         ThreadUiInput::Snapshot(vec![permission]),
     );
     assert!(reduce(&mut permission_model, key(KeyCode::Enter)).is_empty());
+    assert!(reduce(&mut permission_model, ThreadUiInput::FrameRendered).is_empty());
     assert!(matches!(
         reduce(&mut permission_model, key(KeyCode::Char('d'))).as_slice(),
         [ThreadUiAction::ResolvePermission { allow: false, .. }]
@@ -1475,6 +1484,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(tui.wait_for_visible_text("render boundary completed", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
@@ -1782,6 +1792,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     assert_eq!(input.lifecycle, ThreadLifecycle::WaitingInput);
     let mut input_tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(input_tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    input_tui.write(format!("/resume {input_thread_id}\r").as_bytes());
     assert!(
         input_tui.wait_for_output(b"Input required", Duration::from_secs(5)),
         "waiting input projection was not rendered: {}",
@@ -1861,6 +1872,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     assert!(!scenario.root().join("must-not-exist.txt").exists());
     let mut permission_tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(permission_tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    permission_tui.write(format!("/resume {permission_thread_id}\r").as_bytes());
     assert!(permission_tui.wait_for_output(b"Permission required", Duration::from_secs(5)));
     assert!(permission_tui.wait_for_output(b"must-not-exist.txt", Duration::from_secs(5)));
     engine.release_lease(&lease).unwrap();
@@ -2118,6 +2130,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {verification_thread_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(
             b"boundary verification failed with exit 9",
@@ -2389,6 +2402,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(b"boundary history 11", Duration::from_secs(5)),
         "final TUI omitted authoritative transcript tail: {}",
@@ -2608,6 +2622,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(b"effect-boundary.txt", Duration::from_secs(5)),
         "final TUI omitted the still-started authorized descriptor: {}",
@@ -3364,6 +3379,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     engine.release_lease(&changed_lease).unwrap();
 
     let mut leases = vec![validation_lease];
+    let shell_process_thread_id;
     {
         let mut next_now = now + 20;
         let mut prepare = |prompt: &str, effect_id: &str, name: &str, input: serde_json::Value| {
@@ -3500,6 +3516,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             Some(ThreadPendingRequest::Permission { description, .. })
                 if description == "Run shell command (cwd: .)"
         ));
+        shell_process_thread_id = shell_process.snapshot.thread_id;
     }
     for lease in &leases {
         engine.release_lease(lease).unwrap();
@@ -3511,6 +3528,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 11);
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    tui.write(format!("/resume {shell_process_thread_id}\r").as_bytes());
     assert!(tui.wait_for_output(b"Run shell command (cwd: .)", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
