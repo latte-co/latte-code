@@ -18,7 +18,7 @@ fn waiting_run_id(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn final_binary_creates_and_reopens_its_workspace_sqlite_database() {
+fn final_binary_creates_and_reopens_its_configured_sqlite_database() {
     let scenario = Scenario::new();
     let first = scenario.output(&["--json", "list"], |_| {});
     assert!(
@@ -78,6 +78,47 @@ fn final_binary_parses_loopback_provider_input_and_persists_waiting_projection()
     assert!(listed.status.success());
     assert_eq!(json(&listed)["data"]["runs"][0]["run_id"], waiting_id);
 
+    let database = std::fs::read(scenario.database_path()).unwrap();
+    assert_secret_absent(
+        secret,
+        &[
+            ("stdout", &output.stdout),
+            ("stderr", &output.stderr),
+            ("database", &database),
+        ],
+    );
+}
+
+#[test]
+fn final_binary_uses_inline_provider_secret_without_environment_inheritance() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::input_request(
+        "inline-portable-input",
+        "inline portable prompt",
+        false,
+    )]);
+    let secret = "latte-inline-portable-e2e-secret";
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{secret:?},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "run", "inline provider journey"], |_| {});
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json(&output)["error"]["code"], "runtime");
+    provider.assert_consumed();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        &format!("Bearer {secret}")
+    );
     let database = std::fs::read(scenario.database_path()).unwrap();
     assert_secret_absent(
         secret,

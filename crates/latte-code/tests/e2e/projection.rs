@@ -1,7 +1,8 @@
 use super::support::{ProviderReply, PtySession, Scenario, ScriptedProvider, wait_until};
 use latte_core::{
-    Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, SystemIdSource,
-    ThreadCommandId, ThreadId, ThreadProviderBindingV2, TranscriptKind, VerificationStatus,
+    Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, RunFailure,
+    SystemIdSource, ThreadCommandId, ThreadId, ThreadProviderBindingV2, TranscriptKind,
+    VerificationStatus,
 };
 use latte_engine::{
     CommitThreadRunUpdate, EngineHandle, Lease, ThreadCommitRequest, ThreadEffectDescriptor,
@@ -36,13 +37,14 @@ fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::Thre
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let lease = engine
-        .acquire_lease("projection-fixture", 1_000, 60_000)
-        .unwrap();
     let ids = SystemIdSource::default();
+    let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+    let lease = engine
+        .acquire_thread_lease(thread_id, 1_000, 60_000)
+        .unwrap();
     let snapshot = engine
         .create_thread_v2(
-            ThreadId::from_uuid(ids.next_uuid_v7()),
+            thread_id,
             latte_core::RunId::from_uuid(ids.next_uuid_v7()),
             binding(),
             "fixture prompt",
@@ -106,9 +108,17 @@ fn finish_fixture(engine: EngineHandle, lease: &Lease) {
     drop(engine);
 }
 
-fn render_fixture(scenario: &Scenario, expected: &[u8], rows: u16, columns: u16) -> PtySession {
-    let pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
+fn render_fixture(
+    scenario: &Scenario,
+    thread_id: ThreadId,
+    expected: &[u8],
+    rows: u16,
+    columns: u16,
+) -> PtySession {
+    scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
+    let mut pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(expected, Duration::from_secs(5)),
         "fixture was not rendered: {}",
@@ -218,7 +228,13 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
     );
     finish_fixture(engine, &lease);
 
-    let mut pty = render_fixture(&scenario, b"rich completion summary", 40, 120);
+    let mut pty = render_fixture(
+        &scenario,
+        snapshot.thread_id,
+        b"rich completion summary",
+        40,
+        120,
+    );
     // Palette Navigation avoids terminal Escape ambiguity. Expand/collapse
     // both projected actions so metadata and success/failure details render.
     pty.write(CTRL_P);
@@ -335,7 +351,22 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
         assert_eq!(snapshot.lifecycle_label_for_test(), state);
         finish_fixture(engine, &lease);
 
-        let mut pty = render_fixture(&scenario, expected, 28, 82);
+        let mut pty = render_fixture(&scenario, snapshot.thread_id, expected, 28, 82);
+        if matches!(state, "failed" | "interrupted") {
+            let output_start = pty.output().len();
+            pty.write(b"/new\r");
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    let output = pty.output();
+                    output.get(output_start..).is_some_and(|tail| {
+                        tail.windows(b"Describe an outcome".len())
+                            .any(|window| window == b"Describe an outcome")
+                    })
+                }),
+                "terminal Session could not switch to /new: {}",
+                String::from_utf8_lossy(&pty.output())
+            );
+        }
         pty.write(F10);
         assert!(pty.finish(Duration::from_secs(5)).0.success());
     }
@@ -345,6 +376,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
 #[test]
 fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
     let narrow = Scenario::new();
+    narrow.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let mut narrow_pty = PtySession::spawn_with_size(narrow.command(&["tui"]), 9, 38);
     assert!(narrow_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
     assert!(narrow_pty.wait_for_output(b"Latte Code", Duration::from_secs(5)));
@@ -390,6 +422,108 @@ fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
     provider.assert_consumed();
     retry_pty.write(F10);
     assert!(retry_pty.finish(Duration::from_secs(5)).0.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_projection_matrix_renders_public_operation_and_target_variants() {
+    for (name, input, expected_operation, expected_target) in [
+        (
+            Some("read_file"),
+            serde_json::json!({"path":"src/read target.rs"}),
+            "Read file",
+            "src/read target.rs",
+        ),
+        (
+            Some("list_directory"),
+            serde_json::json!({"path":"src/components"}),
+            "List directory",
+            "src/components",
+        ),
+        (
+            Some("search"),
+            serde_json::json!({"query":"projection needle"}),
+            "Search workspace",
+            "projection needle",
+        ),
+        (
+            Some("custom_fixture_tool"),
+            serde_json::json!({}),
+            "custom fixture tool",
+            "Not exposed by runtime",
+        ),
+        (
+            None,
+            serde_json::json!({}),
+            "Repository operation",
+            "Not exposed by runtime",
+        ),
+    ] {
+        let scenario = Scenario::new();
+        let (engine, lease, initial) = fixture_engine(&scenario);
+        let mut snapshot = start(&engine, &lease, &initial);
+        let request_id = format!("projection-permission-{}", name.unwrap_or("generic"));
+        if let Some(name) = name {
+            snapshot = commit(
+                &engine,
+                &lease,
+                &snapshot,
+                CommitThreadRunUpdate::AppendTranscript {
+                    source_key: format!("fixture:permission:{name}:descriptor"),
+                    kind: TranscriptKind::ToolCall,
+                    text: format!("inspect {expected_operation}"),
+                    payload: Some(serde_json::json!({"descriptor": {
+                        "tool_call_id": format!("call-{name}"),
+                        "effect_id": request_id,
+                        "name": name,
+                        "input": input,
+                    }})),
+                },
+                1_010,
+            );
+        }
+        snapshot = commit(
+            &engine,
+            &lease,
+            &snapshot,
+            CommitThreadRunUpdate::RequestPermission {
+                source_key: format!("fixture:permission:{}:request", name.unwrap_or("generic")),
+                request: PendingPermission {
+                    request_id,
+                    operation_digest: "d".repeat(64),
+                    description: "bounded public fixture scope".into(),
+                },
+            },
+            1_011,
+        );
+        assert_eq!(
+            snapshot.lifecycle,
+            latte_core::ThreadLifecycle::WaitingPermission
+        );
+        finish_fixture(engine, &lease);
+
+        let mut pty = render_fixture(
+            &scenario,
+            snapshot.thread_id,
+            b"Permission required",
+            26,
+            88,
+        );
+        assert!(
+            pty.wait_for_visible_text(expected_operation, Duration::from_secs(5)),
+            "permission operation was not visible: {}",
+            String::from_utf8_lossy(&pty.output())
+        );
+        assert!(
+            pty.wait_for_visible_text(expected_target, Duration::from_secs(5)),
+            "permission target was not visible: {}",
+            String::from_utf8_lossy(&pty.output())
+        );
+        pty.write(b"\r ");
+        assert!(pty.is_running(), "inert permission keys exited the TUI");
+        pty.write(F10);
+        assert!(pty.finish(Duration::from_secs(5)).0.success());
+    }
 }
 
 trait LifecycleLabelForTest {

@@ -21,7 +21,8 @@ const MAX_ALIAS_BYTES: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct ProviderFile {
     pub version: u32,
-    pub default_provider: String,
+    #[serde(default)]
+    pub default_model: String,
     pub providers: BTreeMap<String, ProviderDefinition>,
 }
 
@@ -29,7 +30,10 @@ pub struct ProviderFile {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ProviderDefinition {
     OpenaiChat {
-        model: String,
+        /// Provider-specific model catalog. Each object key is the model ID
+        /// sent to the Provider. A string array is accepted as a shorthand
+        /// for models without display names or typed `OpenAI` Chat options.
+        models: OpenAiChatModels,
         #[serde(default)]
         base_url: Option<String>,
         #[serde(default)]
@@ -49,28 +53,131 @@ pub enum ProviderDefinition {
         streaming: bool,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
-        /// Stable non-secret credential identity required by Thread v2.  It
-        /// identifies a reference, never a credential value.
-        #[serde(default)]
-        credential_ref_id: Option<String>,
-        /// Stable authorization/data-boundary identity required by Thread v2.
-        #[serde(default)]
-        data_scope_id: Option<String>,
-        /// Explicit rotation generation; changing it prevents history egress.
-        #[serde(default)]
-        credential_generation: Option<u64>,
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OpenAiChatModels {
+    Ids(Vec<String>),
+    Configured(BTreeMap<String, OpenAiChatModelConfig>),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenAiChatModelConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub options: OpenAiChatModelOptions,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenAiChatModelOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+impl ProviderDefinition {
+    fn available_models(&self) -> Vec<&str> {
+        match self {
+            Self::OpenaiChat { models, .. } => models.ids(),
+        }
+    }
+
+    fn model_options(&self, selected: &str) -> Option<OpenAiChatModelOptions> {
+        match self {
+            Self::OpenaiChat { models, .. } => models.options(selected),
+        }
+    }
+
+    fn model_name(&self, selected: &str) -> Option<&str> {
+        match self {
+            Self::OpenaiChat { models, .. } => models.name(selected),
+        }
+    }
+
+    fn require_model(&self, provider: &str, selected: &str) -> Result<(), RegistryError> {
+        if self.available_models().contains(&selected) {
+            Ok(())
+        } else {
+            Err(RegistryError::Invalid(format!(
+                "unknown model {selected} for provider {provider}"
+            )))
+        }
+    }
+}
+
+impl OpenAiChatModels {
+    fn ids(&self) -> Vec<&str> {
+        match self {
+            Self::Ids(models) => models.iter().map(String::as_str).collect(),
+            Self::Configured(models) => models.keys().map(String::as_str).collect(),
+        }
+    }
+
+    fn options(&self, selected: &str) -> Option<OpenAiChatModelOptions> {
+        match self {
+            Self::Ids(models) => models
+                .iter()
+                .any(|model| model == selected)
+                .then(OpenAiChatModelOptions::default),
+            Self::Configured(models) => models.get(selected).map(|model| model.options.clone()),
+        }
+    }
+
+    fn name(&self, selected: &str) -> Option<&str> {
+        match self {
+            Self::Ids(_) => None,
+            Self::Configured(models) => models.get(selected)?.name.as_deref(),
+        }
+    }
+
+    fn configured(&self) -> Vec<(&str, &OpenAiChatModelConfig)> {
+        match self {
+            Self::Ids(_) => Vec::new(),
+            Self::Configured(models) => models
+                .iter()
+                .map(|(model, options)| (model.as_str(), options))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SecretRef {
-    Env { name: String },
+    Literal(String),
+    Env { source: SecretSource, name: String },
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretSource {
+    Env,
 }
 
 impl std::fmt::Debug for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretRef::Env([REDACTED])")
+        match self {
+            Self::Literal(_) => f.write_str("SecretRef::Literal([REDACTED])"),
+            Self::Env { .. } => f.write_str("SecretRef::Env([REDACTED])"),
+        }
+    }
+}
+
+impl SecretRef {
+    fn credential_ref_id(&self, provider_name: &str) -> String {
+        match self {
+            Self::Literal(_) => format!("config:{provider_name}/api_key"),
+            Self::Env { name, .. } => format!("env:{name}"),
+        }
     }
 }
 
@@ -145,6 +252,15 @@ pub struct ResolvedProvider {
     pub binding: ProviderBinding,
 }
 
+/// Secret-free provider/model option exposed to interactive clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderModelEntry {
+    pub provider_name: String,
+    pub model: String,
+    pub name: Option<String>,
+    pub is_default: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRegistry {
     config: ProviderFile,
@@ -171,15 +287,51 @@ impl ProviderRegistry {
     }
 
     #[must_use]
-    pub fn default_name(&self) -> &str {
-        &self.config.default_provider
+    pub fn default_name(&self) -> Option<&str> {
+        self.default_selection().ok().map(|selection| selection.0)
+    }
+
+    #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_selection().ok().map(|selection| selection.1)
     }
 
     pub fn resolve_default(
         &self,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
-        self.resolve(&self.config.default_provider, tools)
+        let (provider, model) = self.default_selection()?;
+        self.resolve_model(provider, model, tools)
+    }
+
+    /// Returns every configured provider/model pair in deterministic order.
+    /// Exactly one pair is the global default.
+    #[must_use]
+    pub fn model_catalog(&self) -> Vec<ProviderModelEntry> {
+        let default = self.default_selection().ok();
+        self.config
+            .providers
+            .iter()
+            .flat_map(|(provider_name, definition)| {
+                let mut models = definition.available_models();
+                if default.is_some_and(|(default_provider, _)| provider_name == default_provider)
+                    && let Some(index) = models.iter().position(|model| {
+                        default.is_some_and(|(_, default_model)| *model == default_model)
+                    })
+                {
+                    let selected = models.remove(index);
+                    models.insert(0, selected);
+                }
+                models.into_iter().map(move |model| ProviderModelEntry {
+                    provider_name: provider_name.clone(),
+                    name: definition.model_name(model).map(str::to_owned),
+                    is_default: default.is_some_and(|(default_provider, default_model)| {
+                        provider_name == default_provider && model == default_model
+                    }),
+                    model: model.to_owned(),
+                })
+            })
+            .collect()
     }
 
     pub fn resolve_bound(
@@ -187,7 +339,22 @@ impl ProviderRegistry {
         binding: &ProviderBinding,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
-        let resolved = self.resolve(&binding.provider_name, tools)?;
+        let definition = self
+            .config
+            .providers
+            .get(&binding.provider_name)
+            .ok_or_else(|| {
+                RegistryError::BindingMismatch("pinned provider is no longer configured".into())
+            })?;
+        if definition
+            .require_model(&binding.provider_name, &binding.model)
+            .is_err()
+        {
+            return Err(RegistryError::BindingMismatch(
+                "pinned model is no longer configured for its provider".into(),
+            ));
+        }
+        let resolved = self.resolve_model(&binding.provider_name, &binding.model, tools)?;
         if &resolved.binding != binding {
             return Err(RegistryError::BindingMismatch(
                 "semantic provider or tool configuration changed".into(),
@@ -196,12 +363,20 @@ impl ProviderRegistry {
         Ok(resolved)
     }
 
-    /// Computes the complete Thread v2 binding before secret environment
-    /// lookup. Legacy provider definitions intentionally cannot start or
-    /// continue a v2 thread until all scope fields are configured.
-    pub fn thread_binding_for(
+    /// Computes the complete Thread v2 binding for the single global default.
+    pub fn thread_binding_for_default(
+        &self,
+        tools: &[ToolDescriptor],
+    ) -> Result<ThreadProviderBindingV2, RegistryError> {
+        let (provider, model) = self.default_selection()?;
+        self.thread_binding_for_model(provider, model, tools)
+    }
+
+    /// Computes a complete v2 binding for one explicit catalog selection.
+    pub fn thread_binding_for_model(
         &self,
         name: &str,
+        model: &str,
         tools: &[ToolDescriptor],
     ) -> Result<ThreadProviderBindingV2, RegistryError> {
         let definition = self
@@ -209,26 +384,11 @@ impl ProviderRegistry {
             .providers
             .get(name)
             .ok_or_else(|| RegistryError::Invalid(format!("unknown provider {name}")))?;
-        let binding = Self::binding_for(name, definition, tools)?;
-        let ProviderDefinition::OpenaiChat {
-            credential_ref_id,
-            data_scope_id,
-            credential_generation,
-            ..
-        } = definition;
-        let credential_ref_id = credential_ref_id.clone().ok_or_else(|| {
-            RegistryError::Invalid("Thread v2 requires providers.<name>.credential_ref_id".into())
-        })?;
-        let data_scope_id = data_scope_id.clone().ok_or_else(|| {
-            RegistryError::Invalid("Thread v2 requires providers.<name>.data_scope_id".into())
-        })?;
-        let credential_generation = credential_generation.ok_or_else(|| {
-            RegistryError::Invalid(
-                "Thread v2 requires providers.<name>.credential_generation".into(),
-            )
-        })?;
+        definition.require_model(name, model)?;
+        let binding = Self::binding_for_model(name, definition, model, tools)?;
+        let ProviderDefinition::OpenaiChat { api_key, .. } = definition;
         let result =
-            binding.with_thread_scope(credential_ref_id, data_scope_id, credential_generation);
+            binding.with_thread_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
     }
@@ -239,19 +399,37 @@ impl ProviderRegistry {
         binding: &ThreadProviderBindingV2,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
-        let proposed = self.thread_binding_for(&binding.provider_name, tools)?;
+        let definition = self
+            .config
+            .providers
+            .get(&binding.provider_name)
+            .ok_or_else(|| {
+                RegistryError::BindingMismatch("pinned provider is no longer configured".into())
+            })?;
+        if definition
+            .require_model(&binding.provider_name, &binding.model)
+            .is_err()
+        {
+            return Err(RegistryError::BindingMismatch(
+                "pinned model is no longer configured for its provider".into(),
+            ));
+        }
+        let proposed =
+            self.thread_binding_for_model(&binding.provider_name, &binding.model, tools)?;
         if &proposed != binding {
             return Err(RegistryError::BindingMismatch(
                 "provider binding, aliases, credential reference/generation, or data scope changed"
                     .into(),
             ));
         }
-        self.resolve(&binding.provider_name, tools)
+        self.resolve_model(&binding.provider_name, &binding.model, tools)
     }
 
-    pub fn resolve(
+    /// Resolves one explicit configured provider/model pair.
+    pub fn resolve_model(
         &self,
         name: &str,
+        selected_model: &str,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
         let definition = self
@@ -259,9 +437,9 @@ impl ProviderRegistry {
             .providers
             .get(name)
             .ok_or_else(|| RegistryError::Invalid(format!("unknown provider {name}")))?;
+        definition.require_model(name, selected_model)?;
         match definition {
             ProviderDefinition::OpenaiChat {
-                model,
                 base_url,
                 endpoint,
                 api_key,
@@ -274,8 +452,20 @@ impl ProviderRegistry {
                 streaming,
                 ..
             } => {
+                let model_options = definition.model_options(selected_model).ok_or_else(|| {
+                    RegistryError::Invalid(format!(
+                        "unknown model {selected_model} for provider {name}"
+                    ))
+                })?;
                 let key = match api_key {
-                    SecretRef::Env { name } => env::var(name)
+                    SecretRef::Literal(value) => {
+                        (!value.is_empty()).then(|| value.clone()).ok_or_else(|| {
+                            RegistryError::Invalid(
+                                "provider inline api_key must not be empty".into(),
+                            )
+                        })?
+                    }
+                    SecretRef::Env { name, .. } => env::var(name)
                         .ok()
                         .filter(|v| !v.is_empty())
                         .ok_or_else(|| RegistryError::MissingSecret(name.clone()))?,
@@ -286,13 +476,21 @@ impl ProviderRegistry {
                         base_url.as_deref().unwrap().trim_end_matches('/')
                     )
                 });
-                let binding = Self::binding_for(name, definition, tools)?;
-                let provider =
-                    OpenAiProvider::new(endpoint, model, key, Duration::from_millis(*timeout_ms))?
-                        .with_max_attempts(*max_attempts)
-                        .with_sampling_options(*temperature, *max_tokens)
-                        .with_compatibility_input_request(*compatibility_input_request)
-                        .with_streaming(*streaming);
+                let binding = Self::binding_for_model(name, definition, selected_model, tools)?;
+                let provider = OpenAiProvider::new(
+                    endpoint,
+                    selected_model,
+                    key,
+                    Duration::from_millis(*timeout_ms),
+                )?
+                .with_max_attempts(*max_attempts)
+                .with_sampling_options(
+                    model_options.temperature.or(*temperature),
+                    model_options.max_tokens.or(*max_tokens),
+                )
+                .with_reasoning_effort(model_options.reasoning_effort)
+                .with_compatibility_input_request(*compatibility_input_request)
+                .with_streaming(*streaming);
                 let reverse = binding
                     .aliases
                     .iter()
@@ -310,21 +508,25 @@ impl ProviderRegistry {
         }
     }
 
-    fn binding_for(
+    fn binding_for_model(
         name: &str,
         definition: &ProviderDefinition,
+        selected_model: &str,
         tools: &[ToolDescriptor],
     ) -> Result<ProviderBinding, RegistryError> {
         match definition {
-            ProviderDefinition::OpenaiChat { model, aliases, .. } => {
+            ProviderDefinition::OpenaiChat { aliases, .. } => {
                 let alias_table = ToolAliases::new(tools, aliases)?.canonical_to_wire;
                 Ok(ProviderBinding {
                     version: BINDING_VERSION,
                     provider_name: name.into(),
                     provider_type: "openai-chat".into(),
                     protocol: "openai-chat-completions-v1".into(),
-                    model: model.clone(),
-                    config_fingerprint: fingerprint(&semantic_definition(definition)?),
+                    model: selected_model.into(),
+                    config_fingerprint: fingerprint(&semantic_definition_for_model(
+                        definition,
+                        selected_model,
+                    )?),
                     tools_fingerprint: fingerprint(&canonical_tools(tools, &alias_table)?),
                     aliases: alias_table,
                 })
@@ -336,53 +538,128 @@ impl ProviderRegistry {
         if self.config.version != 1 {
             return Err(RegistryError::Invalid("version must be 1".into()));
         }
-        if !self
+        if self.config.default_model.is_empty() && self.config.providers.is_empty() {
+            return Ok(());
+        }
+        if self
             .config
             .providers
-            .contains_key(&self.config.default_provider)
+            .keys()
+            .any(|name| name.trim().is_empty())
         {
             return Err(RegistryError::Invalid(
-                "default_provider must name a configured provider".into(),
+                "provider names must not be empty".into(),
+            ));
+        }
+        let Some((default_provider, default_model)) = self.config.default_model.split_once('/')
+        else {
+            return Err(RegistryError::Invalid(
+                "default_model must use provider/model format".into(),
+            ));
+        };
+        if default_provider.trim().is_empty()
+            || default_model.trim().is_empty()
+            || self.config.default_model.len() > 2048
+            || self.config.default_model.chars().any(char::is_control)
+        {
+            return Err(RegistryError::Invalid(
+                "default_model provider/model must be non-empty, bounded, and contain no controls"
+                    .into(),
+            ));
+        }
+        let Some(default_definition) = self.config.providers.get(default_provider) else {
+            return Err(RegistryError::Invalid(
+                "default_model provider must name a configured provider".into(),
+            ));
+        };
+        if !default_definition
+            .available_models()
+            .contains(&default_model)
+        {
+            return Err(RegistryError::Invalid(
+                "default_model model must be configured for its provider".into(),
             ));
         }
         for (name, provider) in &self.config.providers {
-            if name.trim().is_empty() {
-                return Err(RegistryError::Invalid(
-                    "provider names must not be empty".into(),
-                ));
-            }
-            let ProviderDefinition::OpenaiChat {
-                model,
-                base_url,
-                endpoint,
-                timeout_ms,
-                max_attempts,
-                temperature,
-                ..
-            } = provider;
-            if model.trim().is_empty() {
-                return Err(RegistryError::Invalid(format!(
-                    "provider {name} model must not be empty"
-                )));
-            }
-            if base_url.is_some() == endpoint.is_some() {
-                return Err(RegistryError::Invalid(format!(
-                    "provider {name} requires exactly one of base_url or endpoint"
-                )));
-            }
-            if *timeout_ms == 0 || *max_attempts == 0 || *max_attempts > 10 {
-                return Err(RegistryError::Invalid(format!(
-                    "provider {name} timeout/attempts are out of range"
-                )));
-            }
-            if temperature.is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v)) {
-                return Err(RegistryError::Invalid(format!(
-                    "provider {name} temperature must be between 0 and 2"
-                )));
-            }
+            validate_provider(name, provider)?;
         }
         Ok(())
     }
+
+    fn default_selection(&self) -> Result<(&str, &str), RegistryError> {
+        self.config.default_model.split_once('/').ok_or_else(|| {
+            RegistryError::Invalid(
+                "default_model must be configured as provider/model before provider use".into(),
+            )
+        })
+    }
+}
+
+fn validate_provider(name: &str, provider: &ProviderDefinition) -> Result<(), RegistryError> {
+    let ProviderDefinition::OpenaiChat {
+        models,
+        base_url,
+        endpoint,
+        timeout_ms,
+        max_attempts,
+        temperature,
+        ..
+    } = provider;
+    let model_ids = models.ids();
+    if model_ids.is_empty()
+        || model_ids.len() > 256
+        || model_ids.iter().any(|model| {
+            model.trim().is_empty() || model.len() > 1024 || model.chars().any(char::is_control)
+        })
+        || model_ids.iter().collect::<BTreeSet<_>>().len() != model_ids.len()
+    {
+        return Err(RegistryError::Invalid(format!(
+            "provider {name} models must be unique, non-empty, and bounded"
+        )));
+    }
+    if base_url.is_some() == endpoint.is_some() {
+        return Err(RegistryError::Invalid(format!(
+            "provider {name} requires exactly one of base_url or endpoint"
+        )));
+    }
+    if *timeout_ms == 0 || *max_attempts == 0 || *max_attempts > 10 {
+        return Err(RegistryError::Invalid(format!(
+            "provider {name} timeout/attempts are out of range"
+        )));
+    }
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+        return Err(RegistryError::Invalid(format!(
+            "provider {name} temperature must be between 0 and 2"
+        )));
+    }
+    for (model, config) in models.configured() {
+        let options = &config.options;
+        if options.context_window == Some(0)
+            || options.max_tokens == Some(0)
+            || options
+                .context_window
+                .zip(options.max_tokens)
+                .is_some_and(|(context_window, max_tokens)| max_tokens >= context_window)
+            || options
+                .temperature
+                .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+            || options.reasoning_effort.as_ref().is_some_and(|effort| {
+                effort.trim().is_empty()
+                    || effort.len() > 64
+                    || effort.chars().any(char::is_control)
+            })
+            || config.name.as_ref().is_some_and(|display_name| {
+                display_name.trim().is_empty()
+                    || display_name.len() > 128
+                    || display_name.chars().any(char::is_control)
+            })
+        {
+            return Err(RegistryError::Invalid(format!(
+                "provider {name} model {model} options are invalid"
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct AliasedProvider {
@@ -507,10 +784,26 @@ fn fingerprint(value: &serde_json::Value) -> String {
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn semantic_definition(value: &ProviderDefinition) -> Result<serde_json::Value, RegistryError> {
+fn semantic_definition_for_model(
+    value: &ProviderDefinition,
+    selected_model: &str,
+) -> Result<serde_json::Value, RegistryError> {
+    let selected_options = value
+        .model_options(selected_model)
+        .ok_or_else(|| RegistryError::Invalid(format!("unknown model {selected_model}")))?;
     let mut v = serde_json::to_value(value).map_err(|e| RegistryError::Invalid(e.to_string()))?;
     if let Some(obj) = v.as_object_mut() {
         obj.remove("api_key");
+        obj.remove("models");
+        obj.insert(
+            "model".into(),
+            serde_json::Value::String(selected_model.into()),
+        );
+        obj.insert(
+            "model_options".into(),
+            serde_json::to_value(selected_options)
+                .map_err(|error| RegistryError::Invalid(error.to_string()))?,
+        );
     }
     Ok(serde_json::json!({"version":1,"provider":v}))
 }
@@ -569,11 +862,30 @@ mod tests {
     }
     #[test]
     fn config_is_strict_and_secret_is_redacted() {
-        let r=ProviderRegistry::parse_jsonc(r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}").unwrap();
-        assert_eq!(r.default_name(), "main");
+        let r=ProviderRegistry::parse_jsonc(r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}").unwrap();
+        assert_eq!(r.default_name(), Some("main"));
         assert!(!format!("{:?}", r.config).contains("secret-value"));
+        let inline_secret = "inline-secret-must-be-redacted";
+        let inline = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:'inline-secret-must-be-redacted'}}}",
+        )
+        .unwrap();
+        assert!(inline.resolve_default(&[]).is_ok());
+        let inline_binding = inline.thread_binding_for_default(&[]).unwrap();
+        assert_eq!(inline_binding.credential_ref_id, "config:main/api_key");
+        assert_eq!(inline_binding.data_scope_id, "workspace");
+        assert_eq!(inline_binding.credential_generation, 1);
+        assert!(!format!("{:?}", inline.config).contains(inline_secret));
+        let empty = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:''}}}",
+        )
+        .unwrap();
+        assert!(matches!(
+            empty.resolve_default(&[]),
+            Err(RegistryError::Invalid(message)) if message == "provider inline api_key must not be empty"
+        ));
         assert!(
-            ProviderRegistry::parse_jsonc(r"{version:1,default_provider:'x',providers:{},wat:1}")
+            ProviderRegistry::parse_jsonc(r"{version:1,default_model:'x/m',providers:{},wat:1}")
                 .is_err()
         );
     }
@@ -582,12 +894,21 @@ mod tests {
     fn complete_example_config_parses_but_unknown_provider_fields_do_not() {
         let example = include_str!("../../../latte-code.config.example.jsonc");
         let registry = ProviderRegistry::parse_jsonc(example).unwrap();
-        assert_eq!(registry.default_name(), "primary");
+        assert_eq!(registry.default_name(), Some("primary"));
 
-        let mut invalid: serde_json::Value = json5::from_str(example).unwrap();
-        invalid["providers"]["primary"]["unsupported_provider_option"] =
-            serde_json::Value::Bool(true);
-        assert!(ProviderRegistry::parse_jsonc(&serde_json::to_string(&invalid).unwrap()).is_err());
+        for field in [
+            "unsupported_provider_option",
+            "credential_ref_id",
+            "data_scope_id",
+            "credential_generation",
+        ] {
+            let mut invalid: serde_json::Value = json5::from_str(example).unwrap();
+            invalid["providers"]["primary"][field] = serde_json::Value::Bool(true);
+            assert!(
+                ProviderRegistry::parse_jsonc(&serde_json::to_string(&invalid).unwrap()).is_err(),
+                "{field} must not be public provider configuration"
+            );
+        }
     }
     #[test]
     fn aliases_are_deterministic_bijective_and_byte_bounded() {
@@ -622,28 +943,25 @@ mod tests {
         let registry = ProviderRegistry::parse_jsonc(
             r"{
                 version: 1,
-                default_provider: 'main',
+                default_model: 'main/gpt-test',
                 providers: {
                     main: {
-                        type: 'openai-chat', model: 'gpt-test',
+                        type: 'openai-chat', models: ['gpt-test'],
                         endpoint: 'https://example.invalid/v1/chat/completions',
                         api_key: {source: 'env', name: 'NEVER_LOOK_UP_THIS_KEY'},
                         streaming: true,
                         aliases: {read_file: 'rf'},
-                        credential_ref_id: 'keychain://latte/main',
-                        data_scope_id: 'workspace:sample',
-                        credential_generation: 7,
                     }
                 }
             }",
         )
         .unwrap();
-        let binding = registry.thread_binding_for("main", &tools).unwrap();
+        let binding = registry.thread_binding_for_default(&tools).unwrap();
         assert_eq!(binding.provider_name, "main");
         assert_eq!(binding.aliases["read_file"], "rf");
-        assert_eq!(binding.credential_ref_id, "keychain://latte/main");
-        assert_eq!(binding.data_scope_id, "workspace:sample");
-        assert_eq!(binding.credential_generation, 7);
+        assert_eq!(binding.credential_ref_id, "env:NEVER_LOOK_UP_THIS_KEY");
+        assert_eq!(binding.data_scope_id, "workspace");
+        assert_eq!(binding.credential_generation, 1);
         assert!(matches!(
             registry.resolve_thread_bound(&binding, &tools),
             Err(RegistryError::MissingSecret(name)) if name == "NEVER_LOOK_UP_THIS_KEY"
@@ -656,61 +974,46 @@ mod tests {
             Err(RegistryError::BindingMismatch(_))
         ));
         assert!(matches!(
-            registry.thread_binding_for("unknown", &tools),
+            registry.thread_binding_for_model("unknown", "gpt-test", &tools),
             Err(RegistryError::Invalid(message)) if message.contains("unknown provider")
         ));
     }
 
     #[test]
-    fn registry_rejects_invalid_semantics_and_missing_thread_scope() {
+    fn registry_rejects_invalid_semantics() {
         let invalid = [
-            r"{version:2,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
-            r"{version:1,default_provider:'missing',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'',endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',base_url:'https://y',api_key:{source:'env',name:'K'}}}}",
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'},timeout_ms:0}}}",
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'},max_attempts:11}}}",
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'},temperature:3}}}",
+            r"{version:2,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'missing/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',base_url:'https://y',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'},timeout_ms:0}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'},max_attempts:11}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'},temperature:3}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:[''],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/missing',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m','m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/bad\nmodel',providers:{main:{type:'openai-chat',models:['bad\nmodel'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{options:{context_window:0}}},endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{options:{context_window:10,max_tokens:10}}},endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{options:{reasoning_effort:''}}},endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{options:{anthropic_thinking_budget:10}}},endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{name:' '}}},endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
         ];
         for source in invalid {
             assert!(ProviderRegistry::parse_jsonc(source).is_err(), "{source}");
-        }
-        let legacy = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
-        )
-        .unwrap();
-        assert!(matches!(
-            legacy.thread_binding_for("main", &[]),
-            Err(RegistryError::Invalid(message)) if message.contains("credential_ref_id")
-        ));
-        assert!(matches!(
-            legacy.resolve_default(&[]),
-            Err(RegistryError::MissingSecret(name)) if name == "K"
-        ));
-        for (field, expected) in [
-            ("data_scope_id", "data_scope_id"),
-            ("credential_generation", "credential_generation"),
-        ] {
-            let source = if field == "data_scope_id" {
-                r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'},credential_ref_id:'ref',credential_generation:1}}}"
-            } else {
-                r"{version:1,default_provider:'main',providers:{main:{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'},credential_ref_id:'ref',data_scope_id:'scope'}}}"
-            };
-            let registry = ProviderRegistry::parse_jsonc(source).unwrap();
-            assert!(matches!(
-                registry.thread_binding_for("main", &[]),
-                Err(RegistryError::Invalid(message)) if message.contains(expected)
-            ));
         }
     }
 
     #[test]
     fn bindings_and_aliases_are_stable_when_tool_order_changes() {
         let definition = ProviderDefinition::OpenaiChat {
-            model: "m".into(),
+            models: OpenAiChatModels::Ids(vec!["m".into()]),
             base_url: Some("https://example.invalid/v1".into()),
             endpoint: None,
-            api_key: SecretRef::Env { name: "K".into() },
+            api_key: SecretRef::Env {
+                source: SecretSource::Env,
+                name: "K".into(),
+            },
             timeout_ms: default_timeout(),
             max_attempts: default_attempts(),
             temperature: None,
@@ -718,19 +1021,18 @@ mod tests {
             compatibility_input_request: false,
             streaming: false,
             aliases: BTreeMap::default(),
-            credential_ref_id: Some("ref".into()),
-            data_scope_id: Some("scope".into()),
-            credential_generation: Some(1),
         };
-        let forward = ProviderRegistry::binding_for(
+        let forward = ProviderRegistry::binding_for_model(
             "main",
             &definition,
+            "m",
             &[tool("search"), tool("read_file")],
         )
         .unwrap();
-        let reverse = ProviderRegistry::binding_for(
+        let reverse = ProviderRegistry::binding_for_model(
             "main",
             &definition,
+            "m",
             &[tool("read_file"), tool("search")],
         )
         .unwrap();
@@ -740,7 +1042,7 @@ mod tests {
         assert!(valid_wire_name("letters-123_"));
         assert!(!valid_wire_name(""));
         assert!(!valid_wire_name(&"x".repeat(MAX_ALIAS_BYTES + 1)));
-        let semantic = semantic_definition(&definition).unwrap();
+        let semantic = semantic_definition_for_model(&definition, "m").unwrap();
         assert!(semantic["provider"].get("api_key").is_none());
         assert_eq!(fingerprint(&semantic), fingerprint(&semantic));
     }
@@ -752,10 +1054,9 @@ mod tests {
         // connection. It proves binding equality is checked after the normal
         // resolution path.
         let registry = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_provider:'main',providers:{main:{
-                type:'openai-chat',model:'m',base_url:'https://example.invalid/v1',
-                api_key:{source:'env',name:'PATH'},
-                credential_ref_id:'ref',data_scope_id:'scope',credential_generation:1
+            r"{version:1,default_model:'main/m',providers:{main:{
+                type:'openai-chat',models:['m'],base_url:'https://example.invalid/v1',
+                api_key:{source:'env',name:'PATH'}
             }}}",
         )
         .unwrap();
@@ -767,6 +1068,87 @@ mod tests {
         assert!(matches!(
             registry.resolve_bound(&changed, &tools),
             Err(RegistryError::BindingMismatch(_))
+        ));
+        let mut changed = registry.resolve_default(&tools).unwrap().binding;
+        changed.config_fingerprint = "changed".into();
+        assert!(matches!(
+            registry.resolve_bound(&changed, &tools),
+            Err(RegistryError::BindingMismatch(message)) if message.contains("semantic")
+        ));
+    }
+
+    #[test]
+    fn model_catalog_groups_provider_models_and_resolves_explicit_selection() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'alpha/family/a-default',providers:{
+                alpha:{type:'openai-chat',models:{
+                    'family/a-default':{name:'Alpha Default',options:{context_window:128000,reasoning_effort:'high',max_tokens:4096}},
+                    'a-fast':{},'a-large':{}
+                },endpoint:'https://a',api_key:{source:'env',name:'PATH'}},
+                beta:{type:'openai-chat',models:['b-default','b-reasoning'],endpoint:'https://b',api_key:{source:'env',name:'PATH'}}
+            }}",
+        )
+        .unwrap();
+        assert_eq!(registry.default_name(), Some("alpha"));
+        assert_eq!(registry.default_model(), Some("family/a-default"));
+        assert_eq!(
+            registry
+                .model_catalog()
+                .into_iter()
+                .map(|entry| (entry.provider_name, entry.model, entry.is_default))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha".into(), "family/a-default".into(), true),
+                ("alpha".into(), "a-fast".into(), false),
+                ("alpha".into(), "a-large".into(), false),
+                ("beta".into(), "b-default".into(), false),
+                ("beta".into(), "b-reasoning".into(), false),
+            ]
+        );
+        let catalog = registry.model_catalog();
+        assert_eq!(catalog[0].name.as_deref(), Some("Alpha Default"));
+        assert!(catalog[1..].iter().all(|entry| entry.name.is_none()));
+        let semantic = semantic_definition_for_model(
+            registry.config.providers.get("alpha").unwrap(),
+            "family/a-default",
+        )
+        .unwrap();
+        assert!(!semantic.to_string().contains("Alpha Default"));
+        let selected = registry
+            .thread_binding_for_model("beta", "b-reasoning", &[])
+            .unwrap();
+        assert_eq!(selected.provider_name, "beta");
+        assert_eq!(selected.model, "b-reasoning");
+        assert!(registry.resolve_thread_bound(&selected, &[]).is_ok());
+        assert!(matches!(
+            registry.thread_binding_for_model("beta", "missing", &[]),
+            Err(RegistryError::Invalid(message)) if message.contains("unknown model")
+        ));
+        let mut missing_provider = selected.clone();
+        missing_provider.provider_name = "missing".into();
+        assert!(matches!(
+            registry.resolve_thread_bound(&missing_provider, &[]),
+            Err(RegistryError::BindingMismatch(message)) if message.contains("provider")
+        ));
+        let mut missing_model = selected;
+        missing_model.model = "missing".into();
+        assert!(matches!(
+            registry.resolve_thread_bound(&missing_model, &[]),
+            Err(RegistryError::BindingMismatch(message)) if message.contains("model")
+        ));
+
+        let resolved = registry.resolve_model("beta", "b-reasoning", &[]).unwrap();
+        let mut legacy_missing_provider = resolved.binding.clone();
+        legacy_missing_provider.provider_name = "missing".into();
+        assert!(matches!(
+            registry.resolve_bound(&legacy_missing_provider, &[]),
+            Err(RegistryError::BindingMismatch(message)) if message.contains("provider")
+        ));
+        let mut legacy_missing_model = resolved.binding;
+        legacy_missing_model.model = "missing".into();
+        assert!(matches!(
+            registry.resolve_bound(&legacy_missing_model, &[]),
+            Err(RegistryError::BindingMismatch(message)) if message.contains("model")
         ));
     }
 
@@ -856,7 +1238,7 @@ mod tests {
     #[test]
     fn registry_rejects_empty_provider_name() {
         assert!(ProviderRegistry::parse_jsonc(
-            r"{version:1,default_provider:'',providers:{'':{type:'openai-chat',model:'m',endpoint:'https://x',api_key:{source:'env',name:'K'}}}}"
+            r"{version:1,default_model:'/m',providers:{'':{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}"
         )
         .is_err());
     }

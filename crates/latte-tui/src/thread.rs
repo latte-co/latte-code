@@ -3,22 +3,32 @@
 //! This reducer owns only local text, focus, scroll, and a single safe
 //! follow-up queue. It has no provider, repository, or effect authority.
 
-use crate::{ConnectionState, TuiError};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crate::{
+    ConnectionState, TuiError,
+    command::{
+        BUILTINS, BuiltinCommand, CommandDescriptor, SlashResolution, resolve_slash,
+        slash_suggestions,
+    },
+};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use latte_core::{
     RunId, ThreadEvent, ThreadEventEnvelope, ThreadId, ThreadLifecycle, ThreadPendingRequest,
-    ThreadRunStatus, ThreadSnapshot, ThreadTransientProgress, TranscriptEntry, TranscriptKind,
+    ThreadRunStatus, ThreadSessionSummary, ThreadSnapshot, ThreadTransientProgress,
+    TranscriptEntry, TranscriptKind, redact_thread_text,
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
+    buffer::CellWidth,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     io::{self, IsTerminal},
     sync::mpsc::Receiver,
     time::{Duration, Instant},
@@ -28,11 +38,64 @@ use unicode_width::UnicodeWidthStr;
 
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(2);
 const CTRL_C_DUPLICATE_WINDOW: Duration = Duration::from_millis(120);
+const PROVIDER_SETUP_GUIDANCE: &str = "Provider setup required: configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code";
+const MODEL_NOT_CONFIGURED: &str = "Not configured";
 
 /// Thread-only projection boundary; snapshots are authoritative after any
 /// event gap and transient progress must be discarded.
 pub trait ThreadProjectionClient {
     fn snapshots(&mut self) -> Result<Vec<ThreadSnapshot>, String>;
+    fn session_catalog(&mut self) -> Result<Vec<ThreadSessionSummary>, String> {
+        self.snapshots().map(|snapshots| {
+            snapshots
+                .into_iter()
+                .map(|snapshot| ThreadSessionSummary {
+                    thread_id: snapshot.thread_id,
+                    title: snapshot
+                        .transcript
+                        .entries
+                        .iter()
+                        .find(|entry| entry.kind == TranscriptKind::User)
+                        .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
+                    workspace_root: String::new(),
+                    lifecycle: snapshot.lifecycle,
+                    provider_name: snapshot.binding.provider_name,
+                    model: snapshot.binding.model,
+                    created_at_ms: snapshot
+                        .transcript
+                        .entries
+                        .first()
+                        .map_or(0, |entry| entry.created_at_ms),
+                    updated_at_ms: snapshot
+                        .transcript
+                        .entries
+                        .last()
+                        .map_or(0, |entry| entry.created_at_ms),
+                })
+                .collect()
+        })
+    }
+    fn session(&mut self, thread_id: ThreadId) -> Result<ThreadSnapshot, String> {
+        self.snapshots()?
+            .into_iter()
+            .find(|snapshot| snapshot.thread_id == thread_id)
+            .ok_or_else(|| format!("session {thread_id} was not found"))
+    }
+    fn exact_session_catalog(&mut self, query: &str) -> Result<Vec<ThreadSessionSummary>, String> {
+        self.session_catalog().map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| session.thread_id.to_string() == query || session.title == query)
+                .collect()
+        })
+    }
+    fn exact_session(&mut self, query: &str) -> Result<Option<ThreadSnapshot>, String> {
+        let matches = self.exact_session_catalog(query)?;
+        let [session] = matches.as_slice() else {
+            return Ok(None);
+        };
+        self.session(session.thread_id).map(Some)
+    }
     fn poll(&mut self) -> ThreadProjectionPoll;
 }
 
@@ -48,9 +111,19 @@ pub enum ThreadProjectionPoll {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ThreadUiInput {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     Resize(u16, u16),
+    /// Confirms that the current model state reached a terminal frame. This
+    /// arms only the exact permission request visible in that frame.
+    FrameRendered,
     Snapshot(Vec<ThreadSnapshot>),
+    SessionCatalog(Vec<ThreadSessionSummary>),
+    SessionCatalogReady {
+        sessions: Vec<ThreadSessionSummary>,
+        query: Option<String>,
+    },
+    SessionOpened(Box<ThreadSnapshot>),
     Event(ThreadEventEnvelope),
     Progress(ThreadTransientProgress),
     Lagged,
@@ -58,8 +131,29 @@ pub enum ThreadUiInput {
     Disconnected,
     CommandError(String),
     CommandCompleted(String),
-    SubmissionError { submission_id: u64 },
-    SubmissionCompleted { submission_id: u64 },
+    SubmissionAssigned {
+        submission_id: u64,
+        thread_id: ThreadId,
+    },
+    SubmissionError {
+        submission_id: u64,
+    },
+    SubmissionCompleted {
+        submission_id: u64,
+    },
+    InputSubmissionError {
+        submission_id: u64,
+    },
+    InputSubmissionCompleted {
+        submission_id: u64,
+    },
+    ModelSwitchError {
+        switch_id: u64,
+        error: String,
+    },
+    ModelSwitchCompleted {
+        switch_id: u64,
+    },
     Tick,
 }
 
@@ -67,26 +161,59 @@ pub enum ThreadUiInput {
 /// feedback carries the reducer-issued identity so an old async failure can
 /// never restore a newer prompt.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadUiFeedback {
-    pub submission_id: Option<u64>,
-    pub result: Result<String, String>,
+pub enum ThreadUiFeedback {
+    SubmissionAssigned {
+        submission_id: u64,
+        thread_id: ThreadId,
+    },
+    SubmissionResult {
+        submission_id: u64,
+        result: Result<String, String>,
+    },
+    InputSubmissionResult {
+        submission_id: u64,
+        result: Result<String, String>,
+    },
+    ModelSwitchResult {
+        switch_id: u64,
+        result: Result<String, String>,
+    },
+    Command(Result<String, String>),
 }
 
 impl ThreadUiFeedback {
     #[must_use]
+    pub const fn assigned(submission_id: u64, thread_id: ThreadId) -> Self {
+        Self::SubmissionAssigned {
+            submission_id,
+            thread_id,
+        }
+    }
+
+    #[must_use]
     pub fn submission(submission_id: u64, result: Result<String, String>) -> Self {
-        Self {
-            submission_id: Some(submission_id),
+        Self::SubmissionResult {
+            submission_id,
+            result,
+        }
+    }
+
+    #[must_use]
+    pub fn input_submission(submission_id: u64, result: Result<String, String>) -> Self {
+        Self::InputSubmissionResult {
+            submission_id,
             result,
         }
     }
 
     #[must_use]
     pub fn command(result: Result<String, String>) -> Self {
-        Self {
-            submission_id: None,
-            result,
-        }
+        Self::Command(result)
+    }
+
+    #[must_use]
+    pub fn model_switch(switch_id: u64, result: Result<String, String>) -> Self {
+        Self::ModelSwitchResult { switch_id, result }
     }
 }
 
@@ -97,6 +224,12 @@ pub enum ThreadUiAction {
     Start {
         submission_id: u64,
         prompt: String,
+    },
+    StartWithModel {
+        submission_id: u64,
+        prompt: String,
+        provider_name: String,
+        model: String,
     },
     FollowUp {
         submission_id: u64,
@@ -113,6 +246,7 @@ pub enum ThreadUiAction {
         allow: bool,
     },
     ProvideInput {
+        submission_id: u64,
         thread_id: ThreadId,
         request_id: String,
         value: String,
@@ -123,6 +257,19 @@ pub enum ThreadUiAction {
     ReconcileUnknown {
         thread_id: ThreadId,
         effect_id: String,
+    },
+    ShowSessions {
+        query: Option<String>,
+    },
+    OpenSession {
+        thread_id: ThreadId,
+    },
+    SwitchModel {
+        switch_id: u64,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        provider_name: String,
+        model: String,
     },
     RefreshSnapshots,
     Quit,
@@ -136,14 +283,49 @@ pub struct PendingSubmission {
     pub after_sequence: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInputSubmission {
+    pub submission_id: u64,
+    pub thread_id: ThreadId,
+    pub run_id: RunId,
+    pub request_id: String,
+    pub value: String,
+    pub after_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingModelSwitch {
+    pub switch_id: u64,
+    pub thread_id: ThreadId,
+    pub provider_name: String,
+    pub model: String,
+}
+
 /// Secret-free startup information used only to present the environment that
 /// the CLI has already resolved. Provider credentials and configuration
 /// fingerprints deliberately have no representation here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadStartupPresentation {
+    pub default_provider: String,
     pub default_model: String,
+    pub model_catalog: Vec<ThreadModelOption>,
     pub workspace_display: String,
     pub permission_mode: ThreadPermissionMode,
+}
+
+/// Secret-free provider/model row displayed by `/model`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadModelOption {
+    pub provider_name: String,
+    pub model: String,
+    pub name: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelPickerState {
+    query: String,
+    index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +356,26 @@ pub enum ThreadFocus {
     Navigation,
 }
 
+/// Explicit conversation target. A new draft has no durable Session identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveConversation {
+    NewSessionDraft,
+    Session(ThreadId),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SlashPopupState {
+    #[default]
+    Eligible,
+    Dismissed,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SubmissionRefreshState {
+    composer: bool,
+    input: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ThreadUiModel {
     /// Environment metadata resolved by the startup composition root. This is
@@ -183,9 +385,13 @@ pub struct ThreadUiModel {
     /// Projection order is authoritative. The TUI keeps the focused thread by
     /// identity across refreshes but never compares per-thread sequence values.
     pub sessions: Vec<ThreadSnapshot>,
+    pub session_catalog: Vec<ThreadSessionSummary>,
+    pub active_conversation: Option<ActiveConversation>,
     pub selected: usize,
     pub composer: String,
     pub input: String,
+    /// Wrapped display rows above the current transcript tail. Zero follows
+    /// new durable cards; `u16::MAX` represents the oldest available row.
     pub scroll: u16,
     pub connection: ConnectionState,
     pub progress: Vec<ThreadTransientProgress>,
@@ -195,6 +401,12 @@ pub struct ThreadUiModel {
     /// state means no palette command can bypass the typed runtime boundary.
     pub command_palette: bool,
     pub command_index: usize,
+    slash_index: usize,
+    slash_popup_state: SlashPopupState,
+    pub session_picker: bool,
+    pub session_index: usize,
+    model_picker: Option<ModelPickerState>,
+    draft_model: Option<(String, String)>,
     pub focus: ThreadFocus,
     pub navigation_index: usize,
     pub expanded_actions: BTreeSet<String>,
@@ -206,10 +418,31 @@ pub struct ThreadUiModel {
     /// transcript entry arrives. While present the composer is intentionally
     /// locked, preventing duplicate Enter dispatches.
     pub pending_submission: Option<PendingSubmission>,
-    /// Secret-safe presentation copy for a failed correlated submission. The
-    /// underlying provider error is never placed in the UI model.
+    /// A next-message draft displaced while an earlier submission is restored
+    /// after a persistence failure. It returns to the composer after the
+    /// restored submission is durably accepted, so eager typing is never lost.
+    deferred_composer_draft: Option<String>,
+    /// A request-scoped input value retained until its exact durable input
+    /// card is observed. It is independent from the composer submission so a
+    /// provider/configuration failure cannot consume or restore the wrong
+    /// editor.
+    pub pending_input_submission: Option<PendingInputSubmission>,
+    /// The composer remains locked until the authoritative snapshot contains
+    /// the selected binding, preventing a follow-up from racing the switch.
+    pub pending_model_switch: Option<PendingModelSwitch>,
+    /// Permission decisions are accepted only after the exact request has
+    /// reached a rendered frame. Projection updates are processed before
+    /// terminal input, so this barrier prevents an already-buffered `d` or
+    /// Ctrl+A from resolving a request the user has never seen.
+    rendered_permission_request: Option<(ThreadId, String)>,
+    input_target: Option<(ThreadId, String)>,
+    submission_refresh: SubmissionRefreshState,
+    /// Secret-safe presentation copy for a correlated failure before the
+    /// submission became durable. Provider/runtime failures are transcript
+    /// cards and never take this prompt-restoration path.
     pub submission_error: Option<String>,
     pub next_submission_id: u64,
+    pub next_model_switch_id: u64,
     /// A reconciliation acknowledgement is high-impact: it records the
     /// unknown effect as failed and terminalizes the linked child. Opening
     /// this state is not itself an action; only Ctrl+A can dispatch it.
@@ -232,6 +465,8 @@ impl Default for ThreadUiModel {
         Self {
             startup: None,
             sessions: Vec::new(),
+            session_catalog: Vec::new(),
+            active_conversation: None,
             selected: 0,
             composer: String::new(),
             input: String::new(),
@@ -242,14 +477,27 @@ impl Default for ThreadUiModel {
             help: false,
             command_palette: false,
             command_index: 0,
+            slash_index: 0,
+            slash_popup_state: SlashPopupState::Eligible,
+            session_picker: false,
+            session_index: 0,
+            model_picker: None,
+            draft_model: None,
             focus: ThreadFocus::Composer,
             navigation_index: 0,
             expanded_actions: BTreeSet::new(),
             size: (80, 24),
             queued_follow_up: None,
             pending_submission: None,
+            deferred_composer_draft: None,
+            pending_input_submission: None,
+            pending_model_switch: None,
+            rendered_permission_request: None,
+            input_target: None,
+            submission_refresh: SubmissionRefreshState::default(),
             submission_error: None,
             next_submission_id: 1,
+            next_model_switch_id: 1,
             reconciliation_confirmation: None,
             reconciliation_hint: None,
             ctrl_c_exit_armed_until: None,
@@ -261,19 +509,60 @@ impl Default for ThreadUiModel {
 impl ThreadUiModel {
     #[must_use]
     pub fn with_startup(startup: ThreadStartupPresentation) -> Self {
+        let draft_model = (!startup.default_provider.is_empty()
+            && !startup.default_model.is_empty())
+        .then(|| {
+            (
+                startup.default_provider.clone(),
+                startup.default_model.clone(),
+            )
+        });
+        let status = if draft_model.is_some() {
+            "Ready".into()
+        } else {
+            PROVIDER_SETUP_GUIDANCE.into()
+        };
         Self {
             startup: Some(startup),
+            draft_model,
+            status,
+            active_conversation: Some(ActiveConversation::NewSessionDraft),
             ..Self::default()
         }
     }
 
     #[must_use]
     pub fn selected_thread(&self) -> Option<&ThreadSnapshot> {
-        self.sessions.get(self.selected)
+        match self.active_conversation {
+            Some(ActiveConversation::NewSessionDraft) => None,
+            Some(ActiveConversation::Session(thread_id)) => self
+                .sessions
+                .iter()
+                .find(|thread| thread.thread_id == thread_id),
+            None => self.sessions.get(self.selected),
+        }
     }
     #[must_use]
     pub fn authority_enabled(&self) -> bool {
         self.connection == ConnectionState::Connected
+    }
+
+    fn mark_selected_permission_rendered(&mut self) {
+        self.rendered_permission_request = self.selected_thread().and_then(|thread| {
+            let ThreadPendingRequest::Permission { request_id, .. } = thread.pending.as_ref()?
+            else {
+                return None;
+            };
+            Some((thread.thread_id, request_id.clone()))
+        });
+    }
+
+    fn permission_was_rendered(&self, thread_id: ThreadId, request_id: &str) -> bool {
+        self.rendered_permission_request.as_ref().is_some_and(
+            |(rendered_thread_id, rendered_request_id)| {
+                *rendered_thread_id == thread_id && rendered_request_id == request_id
+            },
+        )
     }
 }
 
@@ -281,6 +570,7 @@ impl ThreadUiModel {
 pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAction> {
     match input {
         ThreadUiInput::Resize(width, height) => model.size = (width, height),
+        ThreadUiInput::FrameRendered => model.mark_selected_permission_rendered(),
         ThreadUiInput::Connected => {
             model.connection = ConnectionState::Connected;
             model.progress.clear();
@@ -299,7 +589,21 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
         ThreadUiInput::Snapshot(sessions) => {
             let selected_id = model.selected_thread().map(|thread| thread.thread_id);
             model.sessions = sessions;
+            if model.active_conversation == Some(ActiveConversation::NewSessionDraft)
+                && let Some(pending) = model.pending_submission.as_ref()
+                && let Some(thread_id) = pending.thread_id
+                && model
+                    .sessions
+                    .iter()
+                    .any(|thread| thread.thread_id == thread_id)
+            {
+                model.active_conversation = Some(ActiveConversation::Session(thread_id));
+            }
             model.selected = selected_id
+                .or(match model.active_conversation {
+                    Some(ActiveConversation::Session(thread_id)) => Some(thread_id),
+                    Some(ActiveConversation::NewSessionDraft) | None => None,
+                })
                 .and_then(|id| {
                     model
                         .sessions
@@ -329,6 +633,11 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                     .map(|effect_id| (thread.thread_id, effect_id))
             });
             reconcile_pending_submission(model);
+            reconcile_pending_input_submission(model);
+            reconcile_pending_model_switch(model);
+            finalize_failed_submissions_after_snapshot(model);
+            restore_stranded_follow_up(model);
+            synchronize_input_target(model);
             if model
                 .reconciliation_confirmation
                 .as_ref()
@@ -362,6 +671,65 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 }];
             }
         }
+        ThreadUiInput::SessionCatalog(sessions) => {
+            model.session_catalog = sessions;
+            model.session_index = model
+                .session_index
+                .min(model.session_catalog.len().saturating_sub(1));
+        }
+        ThreadUiInput::SessionCatalogReady { sessions, query } => {
+            model.session_catalog = sessions;
+            model.session_index = 0;
+            let Some(query) = query.filter(|query| !query.is_empty()) else {
+                model.session_picker = true;
+                model.status = if model.session_catalog.is_empty() {
+                    "No saved sessions".into()
+                } else {
+                    "Select a session to resume".into()
+                };
+                return Vec::new();
+            };
+            let matches = model
+                .session_catalog
+                .iter()
+                .filter(|session| session.thread_id.to_string() == query || session.title == query)
+                .map(|session| session.thread_id)
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                return vec![ThreadUiAction::OpenSession {
+                    thread_id: matches[0],
+                }];
+            }
+            model.session_picker = true;
+            model.status = if matches.is_empty() {
+                format!("No exact session match for {query}")
+            } else {
+                format!("Multiple sessions match {query}; choose one")
+            };
+        }
+        ThreadUiInput::SessionOpened(snapshot) => {
+            let snapshot = *snapshot;
+            let thread_id = snapshot.thread_id;
+            model.sessions = vec![snapshot];
+            model.selected = 0;
+            model.active_conversation = Some(ActiveConversation::Session(thread_id));
+            model.session_picker = false;
+            model.command_palette = false;
+            model.help = false;
+            model.progress.clear();
+            model.scroll = 0;
+            model.status = format!("Resumed session {thread_id}");
+            model.reconciliation_hint = model.selected_thread().and_then(|thread| {
+                reconciliation_effect_from_snapshot(thread)
+                    .map(|effect_id| (thread.thread_id, effect_id))
+            });
+            reconcile_pending_submission(model);
+            reconcile_pending_input_submission(model);
+            reconcile_pending_model_switch(model);
+            finalize_failed_submissions_after_snapshot(model);
+            restore_stranded_follow_up(model);
+            synchronize_input_target(model);
+        }
         ThreadUiInput::Event(event) => {
             let Some(thread) = model
                 .sessions
@@ -386,18 +754,79 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                     thread.runs.push(run);
                     thread.lifecycle = ThreadLifecycle::Running;
                 }
+                ThreadEvent::BindingChanged { .. } => {
+                    model.connection = ConnectionState::SnapshotRequired;
+                    return vec![ThreadUiAction::RefreshSnapshots];
+                }
                 ThreadEvent::ReconciliationRequired { effect_id, .. } => {
                     thread.lifecycle = ThreadLifecycle::ReconciliationRequired;
                     model.reconciliation_hint = Some((thread.thread_id, effect_id));
                 }
             }
             reconcile_pending_submission(model);
+            reconcile_pending_input_submission(model);
+            synchronize_input_target(model);
         }
         ThreadUiInput::Progress(progress) => record_progress(model, progress),
         ThreadUiInput::CommandError(error) => model.status = format!("Command rejected: {error}"),
         ThreadUiInput::CommandCompleted(message) => model.status = message,
+        ThreadUiInput::ModelSwitchError { switch_id, error } => {
+            if model
+                .pending_model_switch
+                .as_ref()
+                .is_some_and(|pending| pending.switch_id == switch_id)
+            {
+                model.pending_model_switch = None;
+                model.status = format!("Model switch rejected: {error}");
+            }
+        }
+        ThreadUiInput::ModelSwitchCompleted { switch_id } => {
+            if model
+                .pending_model_switch
+                .as_ref()
+                .is_some_and(|pending| pending.switch_id == switch_id)
+            {
+                model.status = "Model switch accepted; synchronizing session".into();
+                return vec![ThreadUiAction::RefreshSnapshots];
+            }
+        }
+        ThreadUiInput::SubmissionAssigned {
+            submission_id,
+            thread_id,
+        } => {
+            let assigned = if let Some(pending) = model
+                .pending_submission
+                .as_mut()
+                .filter(|pending| pending.submission_id == submission_id)
+            {
+                pending.thread_id = Some(thread_id);
+                true
+            } else {
+                false
+            };
+            if assigned {
+                if model.active_conversation == Some(ActiveConversation::NewSessionDraft)
+                    && let Some(index) = model
+                        .sessions
+                        .iter()
+                        .position(|thread| thread.thread_id == thread_id)
+                {
+                    model.active_conversation = Some(ActiveConversation::Session(thread_id));
+                    model.selected = index;
+                }
+                reconcile_pending_submission(model);
+            }
+        }
         ThreadUiInput::SubmissionError { submission_id } => {
-            fail_pending_submission(model, submission_id);
+            if model
+                .pending_submission
+                .as_ref()
+                .is_some_and(|pending| pending.submission_id == submission_id)
+            {
+                model.submission_refresh.composer = true;
+                model.status = "Submission result uncertain; checking durable transcript".into();
+                return vec![ThreadUiAction::RefreshSnapshots];
+            }
         }
         ThreadUiInput::SubmissionCompleted { submission_id } => {
             if model
@@ -408,7 +837,28 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 model.status = "Submission accepted; synchronizing transcript".into();
             }
         }
+        ThreadUiInput::InputSubmissionError { submission_id } => {
+            if model
+                .pending_input_submission
+                .as_ref()
+                .is_some_and(|pending| pending.submission_id == submission_id)
+            {
+                model.submission_refresh.input = true;
+                model.status = "Input result uncertain; checking durable transcript".into();
+                return vec![ThreadUiAction::RefreshSnapshots];
+            }
+        }
+        ThreadUiInput::InputSubmissionCompleted { submission_id } => {
+            if model
+                .pending_input_submission
+                .as_ref()
+                .is_some_and(|pending| pending.submission_id == submission_id)
+            {
+                model.status = "Input accepted; synchronizing transcript".into();
+            }
+        }
         ThreadUiInput::Key(key) => return reduce_key(model, key),
+        ThreadUiInput::Mouse(mouse) => reduce_mouse(model, mouse),
         ThreadUiInput::Paste(value) => reduce_paste(model, &value),
         ThreadUiInput::Tick => {}
     }
@@ -418,6 +868,14 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
 #[allow(clippy::too_many_lines)]
 fn reduce_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
     reduce_key_at(model, key, Instant::now())
+}
+
+fn reduce_mouse(model: &mut ThreadUiModel, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => model.scroll = model.scroll.saturating_add(3),
+        MouseEventKind::ScrollDown => model.scroll = model.scroll.saturating_sub(3),
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -508,6 +966,7 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         }
         if let Some(ThreadPendingRequest::Permission { request_id, .. }) = thread.pending.as_ref() {
             if model.authority_enabled()
+                && model.permission_was_rendered(thread.thread_id, request_id)
                 && key.code == KeyCode::Char('d')
                 && key.modifiers.is_empty()
             {
@@ -518,6 +977,7 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
                 }];
             }
             if model.authority_enabled()
+                && model.permission_was_rendered(thread.thread_id, request_id)
                 && key.code == KeyCode::Char('a')
                 && key.modifiers == KeyModifiers::CONTROL
             {
@@ -531,12 +991,31 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
             // and navigation keys cannot mutate any pending input/composer.
             return Vec::new();
         }
-        if let Some(ThreadPendingRequest::Input { request_id, .. }) = thread.pending.as_ref() {
+        if let Some(ThreadPendingRequest::Input {
+            run_id, request_id, ..
+        }) = thread.pending.as_ref()
+        {
+            if model.pending_input_submission.is_some() {
+                return Vec::new();
+            }
             if model.authority_enabled() && is_submit(key) && !model.input.trim().is_empty() {
+                let value = std::mem::take(&mut model.input);
+                let submission_id = model.next_submission_id;
+                model.next_submission_id = model.next_submission_id.saturating_add(1);
+                model.pending_input_submission = Some(PendingInputSubmission {
+                    submission_id,
+                    thread_id: thread.thread_id,
+                    run_id: *run_id,
+                    request_id: request_id.clone(),
+                    value: value.clone(),
+                    after_sequence: thread.sequence,
+                });
+                model.submission_refresh.input = false;
                 return vec![ThreadUiAction::ProvideInput {
+                    submission_id,
                     thread_id: thread.thread_id,
                     request_id: request_id.clone(),
-                    value: std::mem::take(&mut model.input),
+                    value,
                 }];
             }
             if key.code == KeyCode::Backspace {
@@ -559,8 +1038,17 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
             return Vec::new();
         }
     }
+    if model.model_picker.is_some() {
+        return reduce_model_picker_key(model, key);
+    }
+    if model.session_picker {
+        return reduce_session_picker_key(model, key);
+    }
     if model.command_palette {
         return reduce_palette_key(model, key);
+    }
+    if let Some(actions) = reduce_slash_popup_key(model, key) {
+        return actions;
     }
     if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
         model.command_palette = true;
@@ -571,6 +1059,66 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
     match model.focus {
         ThreadFocus::Composer => reduce_composer_key(model, key),
         ThreadFocus::Navigation => reduce_navigation_key(model, key),
+    }
+}
+
+fn slash_popup_suggestions(model: &ThreadUiModel) -> Vec<&'static CommandDescriptor> {
+    if model.focus != ThreadFocus::Composer
+        || model.pending_submission.is_some()
+        || model.slash_popup_state == SlashPopupState::Dismissed
+        || model.help
+        || model.command_palette
+        || model.session_picker
+        || model.model_picker.is_some()
+        || model.selected_thread().is_some_and(|thread| {
+            matches!(
+                thread.lifecycle,
+                ThreadLifecycle::WaitingPermission
+                    | ThreadLifecycle::WaitingInput
+                    | ThreadLifecycle::ReconciliationRequired
+            ) || thread.pending.is_some()
+        })
+    {
+        return Vec::new();
+    }
+    slash_suggestions(&model.composer)
+}
+
+fn reduce_slash_popup_key(model: &mut ThreadUiModel, key: KeyEvent) -> Option<Vec<ThreadUiAction>> {
+    let suggestions = slash_popup_suggestions(model);
+    if suggestions.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            model.slash_popup_state = SlashPopupState::Dismissed;
+            Some(Vec::new())
+        }
+        KeyCode::Up if key.modifiers.is_empty() => {
+            model.slash_index = model.slash_index.saturating_sub(1);
+            Some(Vec::new())
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            model.slash_index = (model.slash_index + 1).min(suggestions.len().saturating_sub(1));
+            Some(Vec::new())
+        }
+        KeyCode::Enter
+            if model.authority_enabled()
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) =>
+        {
+            let command = suggestions[model.slash_index.min(suggestions.len().saturating_sub(1))];
+            if !matches!(
+                command.id,
+                BuiltinCommand::New | BuiltinCommand::Sessions | BuiltinCommand::Model
+            ) || session_switch_available(model)
+            {
+                model.composer.clear();
+                model.slash_index = 0;
+                model.slash_popup_state = SlashPopupState::Eligible;
+            }
+            Some(dispatch_builtin(model, command.id, String::new()))
+        }
+        _ => None,
     }
 }
 
@@ -586,21 +1134,33 @@ fn reduce_palette_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiA
             model.command_index = model.command_index.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
-            model.command_index = (model.command_index + 1).min(PaletteCommand::ALL.len() - 1);
+            model.command_index = (model.command_index + 1).min(BUILTINS.len() - 1);
         }
         KeyCode::Enter => {
-            let command = PaletteCommand::ALL[model
-                .command_index
-                .min(PaletteCommand::ALL.len().saturating_sub(1))];
+            let command = &BUILTINS[model.command_index.min(BUILTINS.len().saturating_sub(1))];
             model.command_palette = false;
-            match command {
-                PaletteCommand::Help => model.help = true,
-                PaletteCommand::Navigation => {
-                    model.focus = ThreadFocus::Navigation;
-                    model.help = false;
-                }
-                PaletteCommand::Refresh => return vec![ThreadUiAction::RefreshSnapshots],
-                PaletteCommand::Quit => return vec![ThreadUiAction::Quit],
+            return dispatch_builtin(model, command.id, String::new());
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+fn reduce_session_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+    match key.code {
+        KeyCode::Esc => model.session_picker = false,
+        KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+            model.session_index = model.session_index.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+            model.session_index =
+                (model.session_index + 1).min(model.session_catalog.len().saturating_sub(1));
+        }
+        KeyCode::Enter => {
+            if let Some(session) = model.session_catalog.get(model.session_index) {
+                return vec![ThreadUiAction::OpenSession {
+                    thread_id: session.thread_id,
+                }];
             }
         }
         _ => {}
@@ -608,20 +1168,239 @@ fn reduce_palette_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiA
     Vec::new()
 }
 
-fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
-    if model.pending_submission.is_some() {
+fn filtered_model_options(model: &ThreadUiModel) -> Vec<ThreadModelOption> {
+    let Some(startup) = model.startup.as_ref() else {
+        return Vec::new();
+    };
+    let query = model
+        .model_picker
+        .as_ref()
+        .map_or("", |picker| picker.query.trim());
+    let query = query.to_ascii_lowercase();
+    startup
+        .model_catalog
+        .iter()
+        .filter(|option| {
+            query.is_empty()
+                || option.provider_name.to_ascii_lowercase().contains(&query)
+                || option.model.to_ascii_lowercase().contains(&query)
+                || option
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.to_ascii_lowercase().contains(&query))
+                || format!("{}/{}", option.provider_name, option.model)
+                    .to_ascii_lowercase()
+                    .contains(&query)
+        })
+        .cloned()
+        .collect()
+}
+
+fn selected_provider_model(model: &ThreadUiModel) -> Option<(String, String)> {
+    model.selected_thread().map_or_else(
+        || model.draft_model.clone(),
+        |thread| {
+            Some((
+                thread.binding.provider_name.clone(),
+                thread.binding.model.clone(),
+            ))
+        },
+    )
+}
+
+fn open_model_picker(model: &mut ThreadUiModel) {
+    let options = model
+        .startup
+        .as_ref()
+        .map_or(&[][..], |startup| startup.model_catalog.as_slice());
+    if options.is_empty() {
+        model.status = PROVIDER_SETUP_GUIDANCE.into();
+        return;
+    }
+    let selected = selected_provider_model(model);
+    let index = selected
+        .and_then(|(provider, selected_model)| {
+            options.iter().position(|option| {
+                option.provider_name == provider && option.model == selected_model
+            })
+        })
+        .unwrap_or(0);
+    model.model_picker = Some(ModelPickerState {
+        query: String::new(),
+        index,
+    });
+    model.help = false;
+    model.command_palette = false;
+    model.session_picker = false;
+}
+
+fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+    let options = filtered_model_options(model);
+    let Some(picker) = model.model_picker.as_mut() else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Esc => model.model_picker = None,
+        KeyCode::Up if key.modifiers.is_empty() => {
+            picker.index = picker.index.saturating_sub(1);
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            picker.index = (picker.index + 1).min(options.len().saturating_sub(1));
+        }
+        KeyCode::Backspace if key.modifiers.is_empty() => {
+            pop_grapheme(&mut picker.query);
+            picker.index = 0;
+        }
+        KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if picker.query.len() < 256 && !value.is_control() {
+                picker.query.push(value);
+                picker.index = 0;
+            }
+        }
+        KeyCode::Enter if key.modifiers.is_empty() => {
+            let Some(option) = options.get(picker.index).cloned() else {
+                return Vec::new();
+            };
+            model.model_picker = None;
+            if let Some(thread) = model.selected_thread() {
+                if !thread.lifecycle.accepts_follow_up()
+                    || thread.active_run_id.is_some()
+                    || thread.pending.is_some()
+                {
+                    model.status =
+                        "Model switching is disabled while work or a request is active".into();
+                    return Vec::new();
+                }
+                if thread.binding.provider_name == option.provider_name
+                    && thread.binding.model == option.model
+                {
+                    model.status = format!(
+                        "Model already selected: {}/{}",
+                        option.provider_name, option.model
+                    );
+                    return Vec::new();
+                }
+                let thread_id = thread.thread_id;
+                let expected_thread_revision = thread.revision;
+                let switch_id = model.next_model_switch_id;
+                model.next_model_switch_id = model.next_model_switch_id.saturating_add(1);
+                model.pending_model_switch = Some(PendingModelSwitch {
+                    switch_id,
+                    thread_id,
+                    provider_name: option.provider_name.clone(),
+                    model: option.model.clone(),
+                });
+                model.status = format!(
+                    "Switching model to {}/{}",
+                    option.provider_name, option.model
+                );
+                return vec![ThreadUiAction::SwitchModel {
+                    switch_id,
+                    thread_id,
+                    expected_thread_revision,
+                    provider_name: option.provider_name,
+                    model: option.model,
+                }];
+            }
+            model.draft_model = Some((option.provider_name.clone(), option.model.clone()));
+            model.status = format!(
+                "New sessions will use {}/{}",
+                option.provider_name, option.model
+            );
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+fn session_switch_available(model: &ThreadUiModel) -> bool {
+    model.pending_submission.is_none()
+        && model.pending_model_switch.is_none()
+        && model.selected_thread().is_none_or(|thread| {
+            thread.active_run_id.is_none()
+                && thread.pending.is_none()
+                && thread.lifecycle != ThreadLifecycle::ReconciliationRequired
+        })
+}
+
+fn dispatch_builtin(
+    model: &mut ThreadUiModel,
+    command: BuiltinCommand,
+    argument: String,
+) -> Vec<ThreadUiAction> {
+    if matches!(
+        command,
+        BuiltinCommand::New | BuiltinCommand::Sessions | BuiltinCommand::Model
+    ) && !session_switch_available(model)
+    {
+        model.status = "Session switching is disabled while work or a request is active".into();
         return Vec::new();
     }
+    match command {
+        BuiltinCommand::New => {
+            model.sessions.clear();
+            model.selected = 0;
+            model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+            model.session_picker = false;
+            model.model_picker = None;
+            model.draft_model = model.startup.as_ref().and_then(|startup| {
+                (!startup.default_provider.is_empty() && !startup.default_model.is_empty()).then(
+                    || {
+                        (
+                            startup.default_provider.clone(),
+                            startup.default_model.clone(),
+                        )
+                    },
+                )
+            });
+            model.help = false;
+            model.progress.clear();
+            model.scroll = 0;
+            model.status = "New conversation draft".into();
+            Vec::new()
+        }
+        BuiltinCommand::Sessions => vec![ThreadUiAction::ShowSessions {
+            query: (!argument.is_empty()).then_some(argument),
+        }],
+        BuiltinCommand::Model => {
+            open_model_picker(model);
+            Vec::new()
+        }
+        BuiltinCommand::Help => {
+            model.help = true;
+            Vec::new()
+        }
+        BuiltinCommand::Navigation => {
+            model.focus = ThreadFocus::Navigation;
+            model.help = false;
+            Vec::new()
+        }
+        BuiltinCommand::Refresh => vec![ThreadUiAction::RefreshSnapshots],
+        BuiltinCommand::Quit => vec![ThreadUiAction::Quit],
+    }
+}
+
+fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
     match key.code {
         KeyCode::Esc => {
             model.focus = ThreadFocus::Navigation;
             model.help = false;
         }
-        KeyCode::Backspace => pop_grapheme(&mut model.composer),
+        KeyCode::Backspace => {
+            pop_grapheme(&mut model.composer);
+            model.slash_index = 0;
+            model.slash_popup_state = SlashPopupState::Eligible;
+        }
         KeyCode::Enter if is_newline(key) => {
             model.composer.push('\n');
+            model.slash_index = 0;
+            model.slash_popup_state = SlashPopupState::Eligible;
         }
-        KeyCode::F(5) | KeyCode::Enter if is_submit(key) && model.authority_enabled() => {
+        KeyCode::F(5) | KeyCode::Enter
+            if is_submit(key)
+                && model.authority_enabled()
+                && model.pending_submission.is_none() =>
+        {
             return submit_composer(model);
         }
         KeyCode::Char(value)
@@ -629,6 +1408,8 @@ fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUi
                 && model.composer.len() < 16 * 1024 =>
         {
             model.composer.push(value);
+            model.slash_index = 0;
+            model.slash_popup_state = SlashPopupState::Eligible;
         }
         _ => {}
     }
@@ -650,9 +1431,9 @@ fn reduce_navigation_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thread
         KeyCode::Down | KeyCode::Char('j') => {
             model.navigation_index = (model.navigation_index + 1).min(keys.len().saturating_sub(1));
         }
-        KeyCode::PageUp => model.scroll = model.scroll.saturating_sub(8),
-        KeyCode::PageDown => model.scroll = model.scroll.saturating_add(8),
-        KeyCode::Home => model.scroll = 0,
+        KeyCode::PageUp => model.scroll = model.scroll.saturating_add(8),
+        KeyCode::PageDown => model.scroll = model.scroll.saturating_sub(8),
+        KeyCode::Home => model.scroll = u16::MAX,
         KeyCode::Enter | KeyCode::Char(' ') => {
             if let Some(key) = keys.get(model.navigation_index)
                 && !model.expanded_actions.remove(key)
@@ -678,7 +1459,7 @@ fn reduce_navigation_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thread
 fn reduce_paste(model: &mut ThreadUiModel, value: &str) {
     model.ctrl_c_exit_armed_until = None;
     model.ctrl_c_last_observed_at = None;
-    let blocked = model.pending_submission.is_some()
+    let blocked = model.pending_input_submission.is_some()
         || model.reconciliation_confirmation.is_some()
         || model.selected_thread().is_some_and(|thread| {
             thread.lifecycle == ThreadLifecycle::ReconciliationRequired
@@ -697,6 +1478,8 @@ fn reduce_paste(model: &mut ThreadUiModel, value: &str) {
         append_editor_text(&mut model.input, value, 16 * 1024);
     } else if model.focus == ThreadFocus::Composer {
         append_editor_text(&mut model.composer, value, 16 * 1024);
+        model.slash_index = 0;
+        model.slash_popup_state = SlashPopupState::Eligible;
     }
 }
 
@@ -801,8 +1584,58 @@ fn is_newline(key: KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT
 }
 
+fn submit_slash_candidate(model: &mut ThreadUiModel) -> Option<Vec<ThreadUiAction>> {
+    match resolve_slash(&model.composer) {
+        SlashResolution::ValidationError(error) => {
+            model.status = error;
+            Some(Vec::new())
+        }
+        SlashResolution::Command {
+            descriptor,
+            argument,
+        } => {
+            if matches!(
+                descriptor.id,
+                BuiltinCommand::New | BuiltinCommand::Sessions | BuiltinCommand::Model
+            ) && !session_switch_available(model)
+            {
+                model.status =
+                    "Session switching is disabled while work or a request is active".into();
+                return Some(Vec::new());
+            }
+            model.composer.clear();
+            Some(dispatch_builtin(model, descriptor.id, argument))
+        }
+        SlashResolution::Prompt => None,
+    }
+}
+
 fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     if model.pending_submission.is_some() || model.composer.trim().is_empty() {
+        return Vec::new();
+    }
+    if model.pending_model_switch.is_some() {
+        model.status = "Wait for the model switch to finish before submitting".into();
+        return Vec::new();
+    }
+    if let Some(actions) = submit_slash_candidate(model) {
+        return actions;
+    }
+    if model.selected_thread().is_none()
+        && model.startup.is_some()
+        && selected_provider_model(model).is_none()
+    {
+        model.status = PROVIDER_SETUP_GUIDANCE.into();
+        return Vec::new();
+    }
+    if let Some(thread) = model.selected_thread()
+        && thread.lifecycle != ThreadLifecycle::Ready
+        && !(thread.lifecycle == ThreadLifecycle::Running
+            && thread.active_run_id.is_some()
+            && thread.pending.is_none())
+    {
+        model.status =
+            "This session has no runnable child; use /new or /sessions before submitting".into();
         return Vec::new();
     }
     let prompt = std::mem::take(&mut model.composer);
@@ -828,10 +1661,25 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     });
     model.submission_error = None;
     match model.selected_thread() {
-        None => vec![ThreadUiAction::Start {
-            submission_id,
-            prompt,
-        }],
+        None => match selected_provider_model(model) {
+            Some((provider_name, selected_model))
+                if model.startup.as_ref().is_some_and(|startup| {
+                    startup.default_provider != provider_name
+                        || startup.default_model != selected_model
+                }) =>
+            {
+                vec![ThreadUiAction::StartWithModel {
+                    submission_id,
+                    prompt,
+                    provider_name,
+                    model: selected_model,
+                }]
+            }
+            _ => vec![ThreadUiAction::Start {
+                submission_id,
+                prompt,
+            }],
+        },
         Some(thread) if thread.lifecycle == ThreadLifecycle::Ready => {
             vec![ThreadUiAction::FollowUp {
                 submission_id,
@@ -840,7 +1688,12 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
                 prompt,
             }]
         }
-        Some(_) if model.queued_follow_up.is_none() => {
+        Some(thread)
+            if thread.lifecycle == ThreadLifecycle::Running
+                && thread.active_run_id.is_some()
+                && thread.pending.is_none()
+                && model.queued_follow_up.is_none() =>
+        {
             model.queued_follow_up = Some(prompt);
             model.status = "One follow-up queued for the next completed snapshot".into();
             Vec::new()
@@ -858,35 +1711,135 @@ fn reconcile_pending_submission(model: &mut ThreadUiModel) {
     let Some(pending) = model.pending_submission.as_ref() else {
         return;
     };
+    let Some(thread_id) = pending.thread_id else {
+        return;
+    };
     let durable = model.sessions.iter().any(|thread| {
-        pending
-            .thread_id
-            .is_none_or(|thread_id| thread.thread_id == thread_id)
+        thread.thread_id == thread_id
             && thread.transcript.entries.iter().any(|entry| {
                 entry.kind == TranscriptKind::User
                     && entry.sequence > pending.after_sequence
-                    && entry.text == pending.prompt
+                    && is_submission_user_card(entry)
+                    && entry.text == redact_thread_text(&pending.prompt)
             })
     });
     if durable {
         model.pending_submission = None;
         model.queued_follow_up = None;
         model.submission_error = None;
+        model.submission_refresh.composer = false;
+        if model.composer.is_empty()
+            && let Some(draft) = model.deferred_composer_draft.take()
+        {
+            model.composer = draft;
+        }
     }
 }
 
-fn fail_pending_submission(model: &mut ThreadUiModel, submission_id: u64) {
-    const MESSAGE: &str = "Unable to submit. Check provider configuration and retry.";
-    let Some(pending) = model
-        .pending_submission
-        .take_if(|pending| pending.submission_id == submission_id)
-    else {
+fn is_submission_user_card(entry: &TranscriptEntry) -> bool {
+    entry.source_key == "thread:create:user"
+        || (entry.source_key.starts_with("follow-up:") && entry.source_key.ends_with(":user"))
+}
+
+fn restore_pending_submission(model: &mut ThreadUiModel) {
+    const MESSAGE: &str = "Unable to persist submission. Prompt restored for retry.";
+    let Some(pending) = model.pending_submission.take() else {
         return;
     };
     model.queued_follow_up = None;
+    if !model.composer.is_empty() {
+        model.deferred_composer_draft = Some(std::mem::take(&mut model.composer));
+    }
     model.composer = pending.prompt;
     model.status = MESSAGE.into();
     model.submission_error = Some(MESSAGE.into());
+    model.submission_refresh.composer = false;
+}
+
+fn reconcile_pending_input_submission(model: &mut ThreadUiModel) {
+    let Some(pending) = model.pending_input_submission.as_ref() else {
+        return;
+    };
+    let source_key = format!("{}:input:{}:card", pending.run_id, pending.request_id);
+    let durable = model.sessions.iter().any(|thread| {
+        thread.thread_id == pending.thread_id
+            && thread.transcript.entries.iter().any(|entry| {
+                entry.kind == TranscriptKind::User
+                    && entry.sequence > pending.after_sequence
+                    && entry.source_key == source_key
+                    && entry.text == redact_thread_text(&pending.value)
+            })
+    });
+    if durable {
+        model.pending_input_submission = None;
+        model.submission_refresh.input = false;
+        model.input.clear();
+    }
+}
+
+fn reconcile_pending_model_switch(model: &mut ThreadUiModel) {
+    let Some(pending) = model.pending_model_switch.as_ref() else {
+        return;
+    };
+    let durable = model.sessions.iter().any(|thread| {
+        thread.thread_id == pending.thread_id
+            && thread.binding.provider_name == pending.provider_name
+            && thread.binding.model == pending.model
+    });
+    if durable {
+        let provider_name = pending.provider_name.clone();
+        let selected_model = pending.model.clone();
+        model.pending_model_switch = None;
+        model.status = format!("Model switched to {provider_name}/{selected_model}");
+    }
+}
+
+fn finalize_failed_submissions_after_snapshot(model: &mut ThreadUiModel) {
+    if model.submission_refresh.composer && model.pending_submission.is_some() {
+        restore_pending_submission(model);
+    }
+    if model.submission_refresh.input
+        && let Some(pending) = model.pending_input_submission.take()
+    {
+        model.input = pending.value;
+        model.input_target = Some((pending.thread_id, pending.request_id));
+        model.submission_refresh.input = false;
+        model.status = "Unable to persist input. Input restored for retry.".into();
+    }
+}
+
+fn restore_stranded_follow_up(model: &mut ThreadUiModel) {
+    let stranded = model.queued_follow_up.is_some()
+        && model.pending_submission.is_some()
+        && model.selected_thread().is_some_and(|thread| {
+            thread.active_run_id.is_none()
+                && thread.pending.is_none()
+                && thread.lifecycle != ThreadLifecycle::Ready
+        });
+    if stranded {
+        restore_pending_submission(model);
+        model.status =
+            "Queued follow-up was not submitted because the active child ended; prompt restored"
+                .into();
+    }
+}
+
+fn synchronize_input_target(model: &mut ThreadUiModel) {
+    if model.pending_input_submission.is_some() {
+        return;
+    }
+    let target = model
+        .selected_thread()
+        .and_then(|thread| match thread.pending.as_ref() {
+            Some(ThreadPendingRequest::Input { request_id, .. }) => {
+                Some((thread.thread_id, request_id.clone()))
+            }
+            Some(ThreadPendingRequest::Permission { .. }) | None => None,
+        });
+    if model.input_target != target {
+        model.input.clear();
+        model.input_target = target;
+    }
 }
 
 fn pop_grapheme(value: &mut String) {
@@ -911,27 +1864,6 @@ enum VisualState {
     Permission,
     Reconciliation,
     Complete,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaletteCommand {
-    Help,
-    Navigation,
-    Refresh,
-    Quit,
-}
-
-impl PaletteCommand {
-    const ALL: [Self; 4] = [Self::Help, Self::Navigation, Self::Refresh, Self::Quit];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Help => "Show keyboard shortcuts",
-            Self::Navigation => "Enter transcript navigation",
-            Self::Refresh => "Refresh authoritative transcript",
-            Self::Quit => "Quit Latte Code",
-        }
-    }
 }
 
 pub const TERMINAL: Color = Color::Rgb(32, 44, 49);
@@ -1379,11 +2311,14 @@ pub fn render(frame: &mut Frame<'_>, model: &ThreadUiModel) {
         visual_state,
         VisualState::Permission | VisualState::Reconciliation
     );
+    if !blocking {
+        render_slash_suggestions(frame, model, layout);
+    }
     if model.help && !blocking {
         let overlay = centered(area, 78, 65);
         frame.render_widget(Clear, overlay);
         frame.render_widget(
-            Paragraph::new("Single-session transcript\nComposer owns every printable character. Enter sends; Shift+Enter inserts a newline.\nEsc enters Navigation; j/k selects actions, PgUp/PgDn scrolls, and Enter/Space expands. Esc or i returns to Composer; q quits only from Navigation; F10 quits from either mode.\nCtrl+C interrupts active work; press it again within 2 seconds to exit. Permission: d denies, Ctrl+A allows, and Enter does nothing.\nReconciliation: Ctrl+R opens acknowledgement, Ctrl+A confirms, and Enter does nothing.\nEvent gaps clear transient progress and reload an authoritative snapshot.")
+            Paragraph::new("Single-session transcript\nComposer owns every printable character. Enter sends; Shift+Enter inserts a newline.\nThe mouse wheel or PgUp/PgDn scrolls history. Esc enters Navigation; j/k selects actions, and Enter/Space expands. Esc or i returns to Composer; q quits only from Navigation; F10 quits from either mode.\nCtrl+C interrupts active work; press it again within 2 seconds to exit. Permission: d denies, Ctrl+A allows, and Enter does nothing.\nReconciliation: Ctrl+R opens acknowledgement, Ctrl+A confirms, and Enter does nothing.\nEvent gaps clear transient progress and reload an authoritative snapshot.")
                 .style(Style::default().fg(TEXT_SOFT).bg(TERMINAL_DEEP))
                 .wrap(Wrap { trim: true })
                 .block(
@@ -1398,12 +2333,93 @@ pub fn render(frame: &mut Frame<'_>, model: &ThreadUiModel) {
     if model.command_palette && !blocking {
         render_command_palette(frame, model, area);
     }
+    if model.session_picker && !blocking {
+        render_session_picker(frame, model, area);
+    }
+    if model.model_picker.is_some() && !blocking {
+        render_model_picker(frame, model, area);
+    }
+}
+
+fn render_slash_suggestions(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: ViewportLayout) {
+    let suggestions = slash_popup_suggestions(model);
+    let available_height = layout.composer.y.saturating_sub(layout.app.y);
+    let inset = bounded_inset(layout.composer.width, layout.composer_inset);
+    let width = layout
+        .composer
+        .width
+        .saturating_sub(inset.saturating_mul(2));
+    if suggestions.is_empty() || available_height < 4 || width < 12 {
+        return;
+    }
+    let height = u16::try_from(suggestions.len().saturating_add(3))
+        .unwrap_or(available_height)
+        .min(available_height);
+    let visible = usize::from(height.saturating_sub(3));
+    if visible == 0 {
+        return;
+    }
+    let selected = model.slash_index.min(suggestions.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(suggestions.len().saturating_sub(visible));
+    let mut lines = suggestions
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, command)| {
+            let selected = index == selected;
+            let argument = command
+                .argument_hint
+                .map_or_else(String::new, |hint| format!(" {hint}"));
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(LATTE_BRIGHT),
+                ),
+                Span::styled(
+                    format!("/{}{}  {}", command.name, argument, command.description),
+                    Style::default()
+                        .fg(if selected { TEXT } else { TEXT_SOFT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select · Enter run · Esc close",
+        Style::default().fg(MUTED),
+    )));
+    let overlay = Rect::new(
+        layout.composer.x.saturating_add(inset),
+        layout.composer.y.saturating_sub(height),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(TERMINAL_DEEP))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(LINE))
+                    .title(" Suggestions "),
+            ),
+        overlay,
+    );
 }
 
 fn render_command_palette(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
     let overlay = centered(area, 62, 34);
     frame.render_widget(Clear, overlay);
-    let lines = PaletteCommand::ALL
+    let lines = BUILTINS
         .iter()
         .enumerate()
         .map(|(index, command)| {
@@ -1414,7 +2430,7 @@ fn render_command_palette(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Re
                     Style::default().fg(LATTE_BRIGHT),
                 ),
                 Span::styled(
-                    command.label(),
+                    format!("/{:<12} {}", command.name, command.description),
                     Style::default()
                         .fg(if selected { TEXT } else { TEXT_SOFT })
                         .add_modifier(if selected {
@@ -1439,6 +2455,166 @@ fn render_command_palette(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Re
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(LINE))
                     .title(" Commands "),
+            ),
+        overlay,
+    );
+}
+
+fn render_session_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
+    let overlay = centered(area, 76, 54);
+    frame.render_widget(Clear, overlay);
+    let mut lines = model
+        .session_catalog
+        .iter()
+        .take(50)
+        .enumerate()
+        .flat_map(|(index, session)| {
+            let selected = index == model.session_index;
+            let marker = if selected { "› " } else { "  " };
+            let title = presentation_text(&session.title, 120);
+            let workspace = presentation_text(&session.workspace_root, 180);
+            [
+                Line::from(vec![
+                    Span::styled(marker, Style::default().fg(LATTE_BRIGHT)),
+                    Span::styled(
+                        title,
+                        Style::default()
+                            .fg(if selected { TEXT } else { TEXT_SOFT })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {} · {:?}", session.model, session.lifecycle),
+                        Style::default().fg(MUTED),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!("    {workspace}  ·  {}", session.thread_id),
+                    Style::default().fg(FAINT),
+                )),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No saved sessions",
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ select · Enter resume · Esc close",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(TERMINAL_DEEP))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(LINE))
+                    .title(" Sessions "),
+            ),
+        overlay,
+    );
+}
+
+fn render_model_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
+    let overlay = centered(area, 72, 68);
+    frame.render_widget(Clear, overlay);
+    let options = filtered_model_options(model);
+    let selected_index = model.model_picker.as_ref().map_or(0, |picker| {
+        picker.index.min(options.len().saturating_sub(1))
+    });
+    let current = selected_provider_model(model);
+    let visible_rows = usize::from(overlay.height.saturating_sub(7)).max(1);
+    let start = selected_index
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(options.len().saturating_sub(visible_rows));
+    let mut previous_provider: Option<&str> = None;
+    let mut lines = Vec::new();
+    for (index, option) in options.iter().enumerate().skip(start).take(visible_rows) {
+        if previous_provider != Some(option.provider_name.as_str()) {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", option.provider_name),
+                Style::default()
+                    .fg(LATTE_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            previous_provider = Some(&option.provider_name);
+        }
+        let selected = index == selected_index;
+        let is_current = current.as_ref().is_some_and(|(provider, selected_model)| {
+            provider == &option.provider_name && selected_model == &option.model
+        });
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(LATTE_BRIGHT),
+            ),
+            Span::styled(
+                if is_current { "● " } else { "  " },
+                Style::default().fg(LATTE_BRIGHT),
+            ),
+            Span::styled(
+                option.name.clone().unwrap_or_else(|| option.model.clone()),
+                Style::default()
+                    .fg(if selected { TEXT } else { TEXT_SOFT })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                option
+                    .name
+                    .as_ref()
+                    .map_or_else(String::new, |_| format!("  {}", option.model)),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                if option.is_default { "  default" } else { "" },
+                Style::default().fg(MUTED),
+            ),
+        ]));
+    }
+    if options.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No matching provider models",
+            Style::default().fg(MUTED),
+        )));
+    }
+    let query = model
+        .model_picker
+        .as_ref()
+        .map_or("", |picker| picker.query.as_str());
+    lines.insert(
+        0,
+        Line::from(vec![
+            Span::styled(" Search: ", Style::default().fg(MUTED)),
+            Span::styled(query, Style::default().fg(TEXT)),
+        ]),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Type to filter · ↑/↓ select · Enter switch · Esc close",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(TERMINAL_DEEP))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(LINE))
+                    .title(" Select provider / model "),
             ),
         overlay,
     );
@@ -1809,7 +2985,7 @@ fn render_welcome_header(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: V
                 5,
             ),
         };
-        render_environment_card(frame, startup, card);
+        render_environment_card(frame, model, startup, card);
     }
     render_rule(
         frame,
@@ -1846,7 +3022,16 @@ fn render_constrained_welcome_header(
     );
     let data_rows = layout.header.height.saturating_sub(2);
     if let Some(startup) = model.startup.as_ref() {
-        let model_name = presentation_text(&startup.default_model, 96);
+        let model_name = selected_provider_model(model).map_or_else(
+            || {
+                if startup.default_model.is_empty() {
+                    MODEL_NOT_CONFIGURED.into()
+                } else {
+                    presentation_text(&startup.default_model, 96)
+                }
+            },
+            |(_, selected_model)| presentation_text(&selected_model, 96),
+        );
         let workspace = presentation_text(&startup.workspace_display, 180);
         let permission = startup.permission_mode.card_label();
         let rows = match data_rows {
@@ -1886,8 +3071,22 @@ fn render_constrained_welcome_header(
     }
 }
 
-fn render_environment_card(frame: &mut Frame<'_>, startup: &ThreadStartupPresentation, area: Rect) {
-    let model = presentation_text(&startup.default_model, 96);
+fn render_environment_card(
+    frame: &mut Frame<'_>,
+    ui: &ThreadUiModel,
+    startup: &ThreadStartupPresentation,
+    area: Rect,
+) {
+    let model = selected_provider_model(ui).map_or_else(
+        || {
+            if startup.default_model.is_empty() {
+                MODEL_NOT_CONFIGURED.into()
+            } else {
+                presentation_text(&startup.default_model, 96)
+            }
+        },
+        |(_, selected_model)| presentation_text(&selected_model, 96),
+    );
     let workspace = presentation_text(&startup.workspace_display, 180);
     let pad = area.height >= 7;
     let mut lines = Vec::with_capacity(4);
@@ -2159,14 +3358,110 @@ fn render_transcript(
         }
         render_progress(&mut lines, progress);
     }
+    let rendered_line_count = wrapped_presentation_line_count(&lines, area.width);
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(TEXT).bg(TERMINAL))
+        .wrap(Wrap { trim: false });
+    let maximum_top_offset = rendered_line_count.saturating_sub(usize::from(area.height));
+    let rows_above_tail = usize::from(model.scroll).min(maximum_top_offset);
+    let top_offset = maximum_top_offset.saturating_sub(rows_above_tail);
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((model.scroll, 0))
-            .style(Style::default().fg(TEXT).bg(TERMINAL))
-            .wrap(Wrap { trim: false }),
+        paragraph.scroll((u16::try_from(top_offset).unwrap_or(u16::MAX), 0)),
         area,
     );
     render_blocking_card(frame, model, visual_state, area);
+}
+
+/// Counts the rows produced by ratatui's `Wrap { trim: false }` contract
+/// without enabling its unstable rendered-line inspection feature. Styling is
+/// irrelevant to wrapping, so this mirrors the word/whitespace width state
+/// machine using the same styled grapheme stream and terminal cell widths.
+fn wrapped_presentation_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| wrapped_presentation_line_height(line, width))
+        .sum()
+}
+
+fn wrapped_presentation_line_height(line: &Line<'_>, width: u16) -> usize {
+    let mut wrapped_lines = 0_usize;
+    let mut line_width = 0_u16;
+    let mut line_has_content = false;
+    let mut word_width = 0_u16;
+    let mut word_has_content = false;
+    let mut whitespace_width = 0_u16;
+    let mut whitespace = VecDeque::<u16>::new();
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line
+        .spans
+        .iter()
+        .flat_map(|span| span.styled_graphemes(Style::default()))
+    {
+        let is_whitespace = grapheme.is_whitespace();
+        let symbol_width = grapheme.symbol.cell_width();
+        if symbol_width > width {
+            continue;
+        }
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow = !line_has_content
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(symbol_width)
+                > width;
+        if word_found || untrimmed_overflow {
+            line_width = line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width);
+            line_has_content |= !whitespace.is_empty() || word_has_content;
+            whitespace.clear();
+            whitespace_width = 0;
+            word_width = 0;
+            word_has_content = false;
+        }
+
+        let line_full = line_width >= width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= width;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(line_width);
+            wrapped_lines = wrapped_lines.saturating_add(1);
+            line_width = 0;
+            line_has_content = false;
+            while let Some(next_width) = whitespace.front().copied() {
+                if next_width > remaining_width {
+                    break;
+                }
+                whitespace.pop_front();
+                whitespace_width = whitespace_width.saturating_sub(next_width);
+                remaining_width = remaining_width.saturating_sub(next_width);
+            }
+            if is_whitespace && whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(symbol_width);
+            whitespace.push_back(symbol_width);
+        } else {
+            word_width = word_width.saturating_add(symbol_width);
+            word_has_content = true;
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    line_has_content |= !whitespace.is_empty() || word_has_content;
+    if line_has_content {
+        wrapped_lines = wrapped_lines.saturating_add(1);
+    }
+    wrapped_lines.max(1)
 }
 
 /// Permission and reconciliation are blocking UI, not transcript history.
@@ -2237,13 +3532,19 @@ fn render_blocking_card(
     if compact {
         lines = compact_lines;
     }
-    let top_offset = if compact { 0 } else { 2 };
     let card_height = u16::try_from(lines.len()).unwrap_or(area.height);
+    // Blocking decisions belong to the active tail of the waterfall. Pin the
+    // card immediately above the composer instead of at the transcript top,
+    // where a user watching the latest tool row can easily miss it.
+    let bottom_inset = u16::from(area.height > card_height);
+    let visible_height = card_height.min(area.height.saturating_sub(bottom_inset));
     let pinned = Rect::new(
         area.x,
-        area.y.saturating_add(top_offset),
+        area.bottom()
+            .saturating_sub(visible_height)
+            .saturating_sub(bottom_inset),
         area.width,
-        card_height.min(area.height.saturating_sub(top_offset)),
+        visible_height,
     );
     frame.render_widget(Clear, pinned);
     frame.render_widget(
@@ -2556,59 +3857,60 @@ fn render_composer(
     visual_state: VisualState,
     layout: ViewportLayout,
 ) {
-    let (text, placeholder, color) = if model.pending_submission.is_some() {
-        ("Submitting…".into(), true, CYAN)
-    } else {
-        match model.selected_thread() {
-            Some(thread) if thread.lifecycle == ThreadLifecycle::ReconciliationRequired => (
-                "Resolve the unknown effect outcome before continuing".into(),
-                true,
-                AMBER,
-            ),
-            Some(thread) => match thread.pending.as_ref() {
-                Some(ThreadPendingRequest::Permission { .. }) => (
-                    "Resolve the permission request to continue".into(),
+    let (text, placeholder, color) =
+        if model.pending_submission.is_some() && model.composer.is_empty() {
+            ("Submitting…".into(), true, CYAN)
+        } else {
+            match model.selected_thread() {
+                Some(thread) if thread.lifecycle == ThreadLifecycle::ReconciliationRequired => (
+                    "Resolve the unknown effect outcome before continuing".into(),
                     true,
                     AMBER,
                 ),
-                Some(ThreadPendingRequest::Input { prompt, .. }) => (
-                    if model.input.is_empty() {
-                        presentation_text(prompt, 160)
-                    } else {
-                        model.input.clone()
-                    },
-                    model.input.is_empty(),
-                    AMBER,
-                ),
+                Some(thread) => match thread.pending.as_ref() {
+                    Some(ThreadPendingRequest::Permission { .. }) => (
+                        "Resolve the permission request to continue".into(),
+                        true,
+                        AMBER,
+                    ),
+                    Some(ThreadPendingRequest::Input { prompt, .. }) => (
+                        if model.input.is_empty() {
+                            presentation_text(prompt, 160)
+                        } else {
+                            model.input.clone()
+                        },
+                        model.input.is_empty(),
+                        AMBER,
+                    ),
+                    None => (
+                        if model.composer.is_empty() {
+                            if visual_state == VisualState::Complete {
+                                "Ask a follow-up…".into()
+                            } else {
+                                "Ask Latte Code to change this repository…".into()
+                            }
+                        } else {
+                            model.composer.clone()
+                        },
+                        model.composer.is_empty(),
+                        if model.focus == ThreadFocus::Composer {
+                            LATTE
+                        } else {
+                            FAINT
+                        },
+                    ),
+                },
                 None => (
                     if model.composer.is_empty() {
-                        if visual_state == VisualState::Complete {
-                            "Ask a follow-up…".into()
-                        } else {
-                            "Ask Latte Code to change this repository…".into()
-                        }
+                        "Ask Latte Code to change this repository…".into()
                     } else {
                         model.composer.clone()
                     },
                     model.composer.is_empty(),
-                    if model.focus == ThreadFocus::Composer {
-                        LATTE
-                    } else {
-                        FAINT
-                    },
+                    LATTE,
                 ),
-            },
-            None => (
-                if model.composer.is_empty() {
-                    "Ask Latte Code to change this repository…".into()
-                } else {
-                    model.composer.clone()
-                },
-                model.composer.is_empty(),
-                LATTE,
-            ),
-        }
-    };
+            }
+        };
     let area = layout.composer;
     if area.width == 0 || area.height == 0 {
         return;
@@ -2719,11 +4021,10 @@ fn render_composer(
             ),
         );
     }
-    let disabled = model.pending_submission.is_some()
-        || matches!(
-            visual_state,
-            VisualState::Permission | VisualState::Reconciliation
-        );
+    let disabled = matches!(
+        visual_state,
+        VisualState::Permission | VisualState::Reconciliation
+    );
     if !disabled && model.focus == ThreadFocus::Composer && inner.width > 0 {
         let visible_start = editor_layout
             .rows
@@ -2748,10 +4049,21 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
     if model.pending_submission.is_some() {
         return (
             "Submitting".into(),
-            "Waiting for durable transcript…".into(),
+            "Compose next prompt · Shift+Enter newline".into(),
         );
     }
     let Some(thread) = model.selected_thread() else {
+        if selected_provider_model(model).is_none()
+            && model
+                .startup
+                .as_ref()
+                .is_some_and(|startup| startup.default_model.is_empty())
+        {
+            return (
+                "Provider setup required".into(),
+                "Configure ~/.latte/latte-code.jsonc · restart Latte Code".into(),
+            );
+        }
         if model.submission_error.is_some() {
             return (
                 "Submission failed · prompt restored".into(),
@@ -2759,9 +4071,19 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
             );
         }
         let left = model.startup.as_ref().map_or_else(String::new, |startup| {
+            let selected = selected_provider_model(model).map_or_else(
+                || {
+                    if startup.default_model.is_empty() {
+                        MODEL_NOT_CONFIGURED.into()
+                    } else {
+                        startup.default_model.clone()
+                    }
+                },
+                |(_, selected_model)| selected_model,
+            );
             format!(
                 "Build · {} · {}",
-                presentation_text(&startup.default_model, 80),
+                presentation_text(&selected, 80),
                 startup.permission_mode.label()
             )
         });
@@ -3182,13 +4504,63 @@ fn apply_thread_actions(
     for action in actions {
         match action {
             ThreadUiAction::Quit => return Ok(true),
+            ThreadUiAction::ShowSessions { query } => {
+                if let Some(snapshot) = query
+                    .as_deref()
+                    .map(|query| projection.exact_session(query))
+                    .transpose()
+                    .map_err(TuiError::Action)?
+                    .flatten()
+                {
+                    let next = reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)));
+                    if apply_thread_actions(projection, model, sink, next)? {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                let sessions = if let Some(query) = query.as_deref() {
+                    projection
+                        .exact_session_catalog(query)
+                        .map_err(TuiError::Action)?
+                } else {
+                    projection.session_catalog().map_err(TuiError::Action)?
+                };
+                let next = reduce(
+                    model,
+                    ThreadUiInput::SessionCatalogReady { sessions, query },
+                );
+                if apply_thread_actions(projection, model, sink, next)? {
+                    return Ok(true);
+                }
+            }
+            ThreadUiAction::OpenSession { thread_id } => {
+                let snapshot = projection.session(thread_id).map_err(TuiError::Action)?;
+                let next = reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)));
+                if apply_thread_actions(projection, model, sink, next)? {
+                    return Ok(true);
+                }
+            }
             ThreadUiAction::RefreshSnapshots => {
                 // A snapshot refresh is a typed projection operation, not a
                 // runtime effect. Consume it in the terminal adapter so a
                 // production command closure cannot accidentally ignore the
                 // recovery path after a broadcast receiver reports Lagged.
-                let snapshots = projection.snapshots().map_err(TuiError::Action)?;
-                let next = reduce(model, ThreadUiInput::Snapshot(snapshots));
+                let next = match model.active_conversation {
+                    Some(ActiveConversation::Session(thread_id)) => {
+                        let snapshot = projection.session(thread_id).map_err(TuiError::Action)?;
+                        reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)))
+                    }
+                    Some(ActiveConversation::NewSessionDraft)
+                        if model.pending_submission.is_none() =>
+                    {
+                        let sessions = projection.session_catalog().map_err(TuiError::Action)?;
+                        reduce(model, ThreadUiInput::SessionCatalog(sessions))
+                    }
+                    Some(ActiveConversation::NewSessionDraft) | None => {
+                        let snapshots = projection.snapshots().map_err(TuiError::Action)?;
+                        reduce(model, ThreadUiInput::Snapshot(snapshots))
+                    }
+                };
                 if apply_thread_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
@@ -3203,26 +4575,63 @@ fn drain_runtime_updates(
     model: &mut ThreadUiModel,
     feedback: &Receiver<ThreadUiFeedback>,
     progress: &Receiver<ThreadTransientProgress>,
-) -> bool {
+) -> (bool, Vec<ThreadUiAction>) {
     let mut changed = false;
+    let mut actions = Vec::new();
     while let Ok(result) = feedback.try_recv() {
-        match (result.submission_id, result.result) {
-            (Some(submission_id), Ok(_)) => {
-                reduce(model, ThreadUiInput::SubmissionCompleted { submission_id })
+        let next = match result {
+            ThreadUiFeedback::SubmissionAssigned {
+                submission_id,
+                thread_id,
+            } => reduce(
+                model,
+                ThreadUiInput::SubmissionAssigned {
+                    submission_id,
+                    thread_id,
+                },
+            ),
+            ThreadUiFeedback::SubmissionResult {
+                submission_id,
+                result: Ok(_),
+            } => reduce(model, ThreadUiInput::SubmissionCompleted { submission_id }),
+            ThreadUiFeedback::SubmissionResult {
+                submission_id,
+                result: Err(_),
+            } => reduce(model, ThreadUiInput::SubmissionError { submission_id }),
+            ThreadUiFeedback::InputSubmissionResult {
+                submission_id,
+                result: Ok(_),
+            } => reduce(
+                model,
+                ThreadUiInput::InputSubmissionCompleted { submission_id },
+            ),
+            ThreadUiFeedback::InputSubmissionResult {
+                submission_id,
+                result: Err(_),
+            } => reduce(model, ThreadUiInput::InputSubmissionError { submission_id }),
+            ThreadUiFeedback::ModelSwitchResult {
+                switch_id,
+                result: Ok(_),
+            } => reduce(model, ThreadUiInput::ModelSwitchCompleted { switch_id }),
+            ThreadUiFeedback::ModelSwitchResult {
+                switch_id,
+                result: Err(error),
+            } => reduce(model, ThreadUiInput::ModelSwitchError { switch_id, error }),
+            ThreadUiFeedback::Command(Ok(message)) => {
+                reduce(model, ThreadUiInput::CommandCompleted(message))
             }
-            (Some(submission_id), Err(_)) => {
-                reduce(model, ThreadUiInput::SubmissionError { submission_id })
+            ThreadUiFeedback::Command(Err(error)) => {
+                reduce(model, ThreadUiInput::CommandError(error))
             }
-            (None, Ok(message)) => reduce(model, ThreadUiInput::CommandCompleted(message)),
-            (None, Err(error)) => reduce(model, ThreadUiInput::CommandError(error)),
         };
+        actions.extend(next);
         changed = true;
     }
     while let Ok(update) = progress.try_recv() {
         reduce(model, ThreadUiInput::Progress(update));
         changed = true;
     }
-    changed
+    (changed, actions)
 }
 
 pub fn run_with_feedback_and_progress(
@@ -3238,8 +4647,8 @@ pub fn run_with_feedback_and_progress(
     let guard = crate::TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut model = ThreadUiModel::with_startup(startup);
-    let snapshots = projection.snapshots().map_err(TuiError::Action)?;
-    let initial_actions = reduce(&mut model, ThreadUiInput::Snapshot(snapshots));
+    let sessions = projection.session_catalog().map_err(TuiError::Action)?;
+    let initial_actions = reduce(&mut model, ThreadUiInput::SessionCatalog(sessions));
     if apply_thread_actions(projection, &mut model, &mut sink, initial_actions)? {
         return Ok(());
     }
@@ -3254,6 +4663,7 @@ pub fn run_with_feedback_and_progress(
         }
         if redraw {
             terminal.draw(|frame| render(frame, &model))?;
+            reduce(&mut model, ThreadUiInput::FrameRendered);
             redraw = false;
         }
         if guard.take_interrupted() {
@@ -3268,8 +4678,7 @@ pub fn run_with_feedback_and_progress(
         }
         match projection.poll() {
             ThreadProjectionPoll::Event => {
-                let snapshots = projection.snapshots().map_err(TuiError::Action)?;
-                let actions = reduce(&mut model, ThreadUiInput::Snapshot(snapshots));
+                let actions = vec![ThreadUiAction::RefreshSnapshots];
                 if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
                     return Ok(());
                 }
@@ -3297,7 +4706,11 @@ pub fn run_with_feedback_and_progress(
             }
             ThreadProjectionPoll::Empty => {}
         }
-        if drain_runtime_updates(&mut model, feedback, progress) {
+        let (updates_changed, actions) = drain_runtime_updates(&mut model, feedback, progress);
+        if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+            return Ok(());
+        }
+        if updates_changed {
             redraw = true;
         }
         if event::poll(Duration::from_millis(80))? {
@@ -3307,6 +4720,10 @@ pub fn run_with_feedback_and_progress(
                     if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
                         return Ok(());
                     }
+                    redraw = true;
+                }
+                Event::Mouse(mouse) => {
+                    reduce(&mut model, ThreadUiInput::Mouse(mouse));
                     redraw = true;
                 }
                 Event::Resize(width, height) => {
@@ -3378,6 +4795,63 @@ mod tests {
         }
     }
 
+    fn running_snapshot() -> ThreadSnapshot {
+        let ids = SystemIdSource::default();
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let mut thread = snapshot(ThreadLifecycle::Running);
+        thread.latest_run_id = Some(run_id);
+        thread.active_run_id = Some(run_id);
+        thread.runs.push(latte_core::ThreadRunSummary {
+            run_id,
+            parent_run_id: None,
+            ordinal: 0,
+            status: ThreadRunStatus::Running,
+            run_revision: 1,
+            completed_at_ms: None,
+        });
+        thread
+    }
+
+    fn session_summary(
+        snapshot: &ThreadSnapshot,
+        title: &str,
+        workspace_root: &str,
+    ) -> ThreadSessionSummary {
+        ThreadSessionSummary {
+            thread_id: snapshot.thread_id,
+            title: title.into(),
+            workspace_root: workspace_root.into(),
+            lifecycle: snapshot.lifecycle,
+            provider_name: snapshot.binding.provider_name.clone(),
+            model: snapshot.binding.model.clone(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    fn assert_terminal_session_switching_available(lifecycle: ThreadLifecycle) {
+        let mut sessions = ThreadUiModel {
+            sessions: vec![snapshot(lifecycle)],
+            composer: "/sessions".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            reduce(&mut sessions, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::ShowSessions { query: None }]
+        );
+
+        let mut new = ThreadUiModel {
+            sessions: vec![snapshot(lifecycle)],
+            composer: "/new".into(),
+            ..Default::default()
+        };
+        assert!(reduce(&mut new, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            new.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+    }
+
     struct ScriptedProjection {
         snapshots: VecDeque<Vec<ThreadSnapshot>>,
         poll: ThreadProjectionPoll,
@@ -3397,25 +4871,161 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn projection_defaults_and_action_adapter_cover_exact_open_and_refresh_paths() {
+        let ready = snapshot(ThreadLifecycle::Ready);
+        let thread_id = ready.thread_id;
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert_eq!(projection.session_catalog().unwrap()[0].title, "hello");
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert_eq!(projection.session(thread_id).unwrap().thread_id, thread_id);
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert_eq!(
+            projection
+                .exact_session("hello")
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            thread_id
+        );
+
+        let mut sink = |_| Ok(());
+        let mut missing_model = ThreadUiModel::with_startup(test_startup());
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut missing_model,
+                &mut sink,
+                vec![ThreadUiAction::ShowSessions {
+                    query: Some("missing".into())
+                }]
+            )
+            .unwrap()
+        );
+
+        let mut model = ThreadUiModel::with_startup(test_startup());
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::ShowSessions {
+                    query: Some("hello".into())
+                }]
+            )
+            .unwrap()
+        );
+        assert_eq!(model.selected_thread().unwrap().thread_id, thread_id);
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::OpenSession { thread_id }]
+            )
+            .unwrap()
+        );
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::RefreshSnapshots]
+            )
+            .unwrap()
+        );
+
+        model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::RefreshSnapshots]
+            )
+            .unwrap()
+        );
+
+        model.active_conversation = None;
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![ready]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut projection,
+                &mut model,
+                &mut sink,
+                vec![ThreadUiAction::RefreshSnapshots]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn feedback_projection_inputs_and_all_event_variants_preserve_authority() {
         assert_eq!(
             ThreadUiFeedback::submission(7, Ok("accepted".into())),
-            ThreadUiFeedback {
-                submission_id: Some(7),
+            ThreadUiFeedback::SubmissionResult {
+                submission_id: 7,
                 result: Ok("accepted".into())
             }
         );
         assert_eq!(
             ThreadUiFeedback::command(Err("offline".into())),
-            ThreadUiFeedback {
-                submission_id: None,
-                result: Err("offline".into())
+            ThreadUiFeedback::Command(Err("offline".into()))
+        );
+        assert_eq!(
+            ThreadUiFeedback::model_switch(9, Ok("accepted".into())),
+            ThreadUiFeedback::ModelSwitchResult {
+                switch_id: 9,
+                result: Ok("accepted".into())
             }
         );
 
         let ids = SystemIdSource::default();
         let mut thread = snapshot(ThreadLifecycle::Running);
         let thread_id = thread.thread_id;
+        assert_eq!(
+            ThreadUiFeedback::assigned(8, thread_id),
+            ThreadUiFeedback::SubmissionAssigned {
+                submission_id: 8,
+                thread_id
+            }
+        );
         let run_id = RunId::from_uuid(ids.next_uuid_v7());
         let mut model = ThreadUiModel::default();
         reduce(&mut model, ThreadUiInput::Resize(99, 31));
@@ -3597,6 +5207,7 @@ mod tests {
                 submission_id: first_id,
             },
         );
+        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
         assert_eq!(model.composer, "first");
         assert!(model.pending_submission.is_none());
     }
@@ -3753,6 +5364,25 @@ mod tests {
             thread_id: None,
             after_sequence: 0,
         });
+        let ids = SystemIdSource::default();
+        model.pending_input_submission = Some(PendingInputSubmission {
+            submission_id: 8,
+            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+            run_id: RunId::from_uuid(ids.next_uuid_v7()),
+            request_id: "input-1".into(),
+            value: "restore this input".into(),
+            after_sequence: 0,
+        });
+        let switch_thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        model.pending_model_switch = Some(PendingModelSwitch {
+            switch_id: 9,
+            thread_id: switch_thread_id,
+            provider_name: "p".into(),
+            model: "next".into(),
+        });
+        feedback_tx
+            .send(ThreadUiFeedback::assigned(7, switch_thread_id))
+            .unwrap();
         feedback_tx
             .send(ThreadUiFeedback::submission(7, Ok("accepted".into())))
             .unwrap();
@@ -3760,10 +5390,25 @@ mod tests {
             .send(ThreadUiFeedback::submission(7, Err("rejected".into())))
             .unwrap();
         feedback_tx
+            .send(ThreadUiFeedback::input_submission(8, Ok("accepted".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::input_submission(
+                8,
+                Err("rejected".into()),
+            ))
+            .unwrap();
+        feedback_tx
             .send(ThreadUiFeedback::command(Ok("command done".into())))
             .unwrap();
         feedback_tx
             .send(ThreadUiFeedback::command(Err("command failed".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::model_switch(9, Ok("accepted".into())))
+            .unwrap();
+        feedback_tx
+            .send(ThreadUiFeedback::model_switch(99, Err("stale".into())))
             .unwrap();
         progress_tx
             .send(ThreadTransientProgress::ProviderAttempt {
@@ -3771,20 +5416,26 @@ mod tests {
                 number: 1,
             })
             .unwrap();
-        assert!(drain_runtime_updates(
-            &mut model,
-            &feedback_rx,
-            &progress_rx
-        ));
-        assert_eq!(model.status, "Command rejected: command failed");
+        let (changed, actions) = drain_runtime_updates(&mut model, &feedback_rx, &progress_rx);
+        assert!(changed);
+        assert_eq!(
+            actions,
+            vec![
+                ThreadUiAction::RefreshSnapshots,
+                ThreadUiAction::RefreshSnapshots,
+                ThreadUiAction::RefreshSnapshots
+            ]
+        );
+        assert_eq!(model.status, "Model switch accepted; synchronizing session");
+        assert!(model.pending_submission.is_some());
+        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
         assert!(model.pending_submission.is_none());
         assert_eq!(model.composer, "restore this prompt");
-        assert_eq!(model.progress.len(), 1);
-        assert!(!drain_runtime_updates(
-            &mut model,
-            &feedback_rx,
-            &progress_rx
-        ));
+        assert!(model.progress.is_empty());
+        assert_eq!(
+            drain_runtime_updates(&mut model, &feedback_rx, &progress_rx),
+            (false, Vec::new())
+        );
 
         let mut safe = snapshot(ThreadLifecycle::ReconciliationRequired);
         safe.transcript.entries.push(transcript_entry(
@@ -4027,6 +5678,50 @@ mod tests {
         }
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
+
+        let ids = SystemIdSource::default();
+        let failed_run = RunId::from_uuid(ids.next_uuid_v7());
+        let mut retryable_failure = snapshot(ThreadLifecycle::Ready);
+        retryable_failure.latest_run_id = Some(failed_run);
+        retryable_failure.runs.push(latte_core::ThreadRunSummary {
+            run_id: failed_run,
+            parent_run_id: None,
+            ordinal: 0,
+            status: ThreadRunStatus::Failed,
+            run_revision: 2,
+            completed_at_ms: Some(2),
+        });
+        retryable_failure.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 2,
+            run_id: Some(failed_run),
+            kind: TranscriptKind::Failure,
+            text: "provider configuration failed".into(),
+            payload: None,
+            source_key: "provider-failure".into(),
+            created_at_ms: 2,
+        });
+        let mut after_error = ThreadUiModel {
+            sessions: vec![retryable_failure],
+            ..Default::default()
+        };
+        assert!(
+            reduce(
+                &mut after_error,
+                key(KeyCode::Char('a'), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert!(reduce(&mut after_error, key(KeyCode::Enter, KeyModifiers::SHIFT)).is_empty());
+        assert!(
+            reduce(
+                &mut after_error,
+                key(KeyCode::Char('b'), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert_eq!(after_error.composer, "a\nb");
+        assert!(after_error.pending_submission.is_none());
     }
 
     #[test]
@@ -4055,6 +5750,11 @@ mod tests {
         }
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
+        assert!(
+            reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)).is_empty(),
+            "a buffered denial must not resolve an unseen permission request"
+        );
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![ThreadUiAction::ResolvePermission {
@@ -4176,7 +5876,7 @@ mod tests {
         assert!(rendered(&model, 120, 40).contains("optimistic-sentinel"));
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert!(reduce_paste_for_test(&mut model, "duplicate").is_empty());
-        assert!(model.composer.is_empty());
+        assert_eq!(model.composer, "duplicate");
         assert_eq!(
             model
                 .pending_submission
@@ -4195,6 +5895,13 @@ mod tests {
         };
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
         let mut thread = snapshot(ThreadLifecycle::Running);
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionAssigned {
+                submission_id: 1,
+                thread_id: thread.thread_id,
+            },
+        );
         reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
         assert!(model.pending_submission.is_some());
         assert!(rendered(&model, 120, 40).contains("durable-sentinel"));
@@ -4205,7 +5912,7 @@ mod tests {
             kind: TranscriptKind::User,
             text: "durable-sentinel".into(),
             payload: None,
-            source_key: "durable-sentinel".into(),
+            source_key: "thread:create:user".into(),
             created_at_ms: 2,
         });
 
@@ -4218,6 +5925,187 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn failed_submission_restoration_defers_and_then_restores_the_next_draft() {
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let mut model = ThreadUiModel {
+            composer: "next draft\nsecond line".into(),
+            pending_submission: Some(PendingSubmission {
+                submission_id: 1,
+                prompt: "retry me".into(),
+                thread_id: Some(thread_id),
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
+
+        restore_pending_submission(&mut model);
+        assert_eq!(model.composer, "retry me");
+        assert_eq!(
+            model.deferred_composer_draft.as_deref(),
+            Some("next draft\nsecond line")
+        );
+
+        model.composer.clear();
+        model.pending_submission = Some(PendingSubmission {
+            submission_id: 2,
+            prompt: "retry me".into(),
+            thread_id: Some(thread_id),
+            after_sequence: 0,
+        });
+        let mut thread = snapshot(ThreadLifecycle::Running);
+        thread.thread_id = thread_id;
+        thread.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 1,
+            run_id: thread.active_run_id,
+            kind: TranscriptKind::User,
+            text: "retry me".into(),
+            payload: None,
+            source_key: "thread:create:user".into(),
+            created_at_ms: 1,
+        });
+
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        assert!(model.pending_submission.is_none());
+        assert!(model.deferred_composer_draft.is_none());
+        assert_eq!(model.composer, "next draft\nsecond line");
+    }
+
+    #[test]
+    fn submission_reconciliation_uses_redacted_text_and_submission_source_identity() {
+        let ids = SystemIdSource::default();
+        let secret_prompt = "token=provider-secret";
+        let mut model = ThreadUiModel {
+            composer: secret_prompt.into(),
+            ..Default::default()
+        };
+        reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
+        let mut thread = running_snapshot();
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionAssigned {
+                submission_id: 1,
+                thread_id: thread.thread_id,
+            },
+        );
+        thread.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 2,
+            run_id: thread.active_run_id,
+            kind: TranscriptKind::User,
+            text: redact_thread_text(secret_prompt),
+            payload: None,
+            source_key: format!(
+                "{}:input:answer:card",
+                thread.active_run_id.expect("running fixture")
+            ),
+            created_at_ms: 2,
+        });
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        assert!(model.pending_submission.is_some());
+
+        thread.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 3,
+            run_id: thread.active_run_id,
+            kind: TranscriptKind::User,
+            text: redact_thread_text(secret_prompt),
+            payload: None,
+            source_key: "thread:create:user".into(),
+            created_at_ms: 3,
+        });
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        assert!(model.pending_submission.is_none());
+    }
+
+    #[test]
+    fn terminal_session_rejects_new_prompt_and_restores_an_unsubmitted_queue() {
+        let mut terminal = snapshot(ThreadLifecycle::Failed);
+        let mut model = ThreadUiModel {
+            sessions: vec![terminal.clone()],
+            composer: "keep me".into(),
+            ..Default::default()
+        };
+        assert!(submit_composer(&mut model).is_empty());
+        assert_eq!(model.composer, "keep me");
+        assert!(model.pending_submission.is_none());
+
+        let running = running_snapshot();
+        let thread_id = running.thread_id;
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![running]));
+        model.composer = "queued once".into();
+        assert!(submit_composer(&mut model).is_empty());
+        assert!(model.queued_follow_up.is_some());
+        terminal.thread_id = thread_id;
+        terminal.active_run_id = None;
+        terminal.pending = None;
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![terminal]));
+        assert_eq!(model.composer, "queued once");
+        assert!(model.pending_submission.is_none());
+        assert!(session_switch_available(&model));
+    }
+
+    #[test]
+    fn input_submission_restores_only_after_exact_snapshot_reconciliation() {
+        let ids = SystemIdSource::default();
+        let mut thread = running_snapshot();
+        let run_id = thread.active_run_id.expect("running fixture");
+        thread.lifecycle = ThreadLifecycle::WaitingInput;
+        thread.pending = Some(ThreadPendingRequest::Input {
+            run_id,
+            request_id: "request-1".into(),
+            prompt: "value".into(),
+            expected_run_revision: 1,
+        });
+        let thread_id = thread.thread_id;
+        let mut model = ThreadUiModel::default();
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        reduce(&mut model, key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(matches!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
+            [ThreadUiAction::ProvideInput { value, .. }] if value == "a\nb"
+        ));
+        assert!(model.input.is_empty());
+        assert_eq!(
+            reduce(
+                &mut model,
+                ThreadUiInput::InputSubmissionError { submission_id: 1 }
+            ),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+        assert!(model.input.is_empty());
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        assert_eq!(model.input, "a\nb");
+
+        model.input.clear();
+        reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
+            [ThreadUiAction::ProvideInput { .. }]
+        ));
+        thread.sequence = 2;
+        thread.lifecycle = ThreadLifecycle::Running;
+        thread.pending = None;
+        thread.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 2,
+            run_id: Some(run_id),
+            kind: TranscriptKind::User,
+            text: "x".into(),
+            payload: None,
+            source_key: format!("{run_id}:input:request-1:card"),
+            created_at_ms: 2,
+        });
+        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        assert!(model.pending_input_submission.is_none());
+        assert!(model.input.is_empty());
+        assert_eq!(model.sessions[0].thread_id, thread_id);
     }
 
     #[test]
@@ -4240,10 +6128,11 @@ mod tests {
             &mut model,
             ThreadUiInput::SubmissionError { submission_id: 1 },
         );
+        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
         assert_eq!(model.composer, exact);
         assert!(model.pending_submission.is_none());
         let screen = rendered(&model, 120, 40);
-        assert!(screen.contains("Unable to submit"));
+        assert!(screen.contains("Unable to persist submission"));
         assert!(screen.contains("prompt has been restored"));
         assert!(!screen.contains("OPENAI_API_KEY=super-secret"));
 
@@ -4326,6 +6215,7 @@ mod tests {
             ..Default::default()
         };
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![ThreadUiAction::ResolvePermission {
@@ -4353,11 +6243,65 @@ mod tests {
         assert!(!rendered.contains("live-secret-value"));
         assert!(!rendered.contains('\u{1b}'));
     }
+
+    #[test]
+    fn process_permission_card_is_pinned_at_the_active_waterfall_tail() {
+        let ids = SystemIdSource::default();
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let request_id = "process-permission-card";
+        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
+        thread.pending = Some(ThreadPendingRequest::Permission {
+            run_id,
+            request_id: request_id.into(),
+            description: "Run argv: git status (cwd: .)".into(),
+            expected_run_revision: 2,
+        });
+        thread.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(run_id),
+            TranscriptKind::ToolCall,
+            "Run argv: git status (cwd: .)",
+            Some(serde_json::json!({
+                "descriptor": {
+                    "effect_id": request_id,
+                    "name": "process",
+                    "input": {
+                        "argv": ["git", "status"],
+                        "cwd": "."
+                    }
+                }
+            })),
+        ));
+        let buffer = rendered_buffer(
+            &ThreadUiModel {
+                sessions: vec![thread],
+                ..Default::default()
+            },
+            120,
+            40,
+        );
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        let (_, card_y) = find_symbol(&buffer, "┌").expect("process permission card");
+
+        assert!(card_y > 20, "permission card must stay near the composer");
+        assert!(rendered.contains("Permission required"));
+        assert!(rendered.contains("Operation  Run process"));
+        assert!(rendered.contains("Target     ."));
+        assert!(rendered.contains("Run argv: git status (cwd: .)"));
+        assert!(rendered.contains("[d] Deny"));
+        assert!(rendered.contains("[Ctrl+A] Allow once"));
+    }
+
     #[test]
     fn gap_clears_progress_and_safe_queue_waits_for_snapshot() {
         let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let mut model = ThreadUiModel {
-            sessions: vec![snapshot(ThreadLifecycle::Running)],
+            sessions: vec![running_snapshot()],
             composer: "later".into(),
             ..Default::default()
         };
@@ -4428,6 +6372,7 @@ mod tests {
             &mut model,
             ThreadUiInput::SubmissionError { submission_id: 1 },
         );
+        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
         model.composer.clear();
 
         reduce(&mut model, ThreadUiInput::Snapshot(vec![ready.clone()]));
@@ -4445,7 +6390,7 @@ mod tests {
             kind: TranscriptKind::User,
             text: "f".into(),
             payload: None,
-            source_key: "assistant".into(),
+            source_key: format!("follow-up:{run_id}:user"),
             created_at_ms: 2,
         };
         assert!(
@@ -4493,6 +6438,7 @@ mod tests {
             expected_run_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
             vec![ThreadUiAction::ResolvePermission {
@@ -4528,9 +6474,11 @@ mod tests {
         assert!(reduce(&mut model, key(KeyCode::Backspace, KeyModifiers::NONE)).is_empty());
         assert!(model.input.is_empty());
         reduce(&mut model, key(KeyCode::Char('v'), KeyModifiers::NONE));
+        let input_submission_id = model.next_submission_id;
         assert_eq!(
             reduce(&mut model, key(KeyCode::F(5), KeyModifiers::NONE)),
             vec![ThreadUiAction::ProvideInput {
+                submission_id: input_submission_id,
                 thread_id: ready.thread_id,
                 request_id: "input-1".into(),
                 value: "v".into(),
@@ -4539,7 +6487,7 @@ mod tests {
 
         reduce(&mut model, ThreadUiInput::Disconnected);
         assert!(reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
-        assert_eq!(model.input, "x");
+        assert!(model.input.is_empty());
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             vec![ThreadUiAction::RefreshSnapshots]
@@ -4586,23 +6534,43 @@ mod tests {
 
     #[test]
     fn ctrl_p_command_palette_executes_every_advertised_command() {
-        let mut model = ThreadUiModel::default();
+        let mut model = ThreadUiModel::with_startup(test_startup());
         let ctrl_p = || key(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
         assert!(reduce(&mut model, ctrl_p()).is_empty());
         assert!(model.command_palette);
         assert!(rendered(&model, 100, 30).contains("Commands"));
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            model.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+
+        reduce(&mut model, ctrl_p());
+        for _ in 0..2 {
+            reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.model_picker.is_some());
+        reduce(&mut model, key(KeyCode::Esc, KeyModifiers::NONE));
+
+        reduce(&mut model, ctrl_p());
+        for _ in 0..3 {
+            reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        }
+        reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(model.help);
 
         model.help = false;
         reduce(&mut model, ctrl_p());
-        reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        for _ in 0..4 {
+            reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        }
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(model.focus, ThreadFocus::Navigation);
 
         reduce(&mut model, ctrl_p());
-        for _ in 0..2 {
+        for _ in 0..5 {
             reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(
@@ -4611,7 +6579,7 @@ mod tests {
         );
 
         reduce(&mut model, ctrl_p());
-        for _ in 0..3 {
+        for _ in 0..6 {
             reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(
@@ -4623,6 +6591,837 @@ mod tests {
         assert!(reduce(&mut blocked, ctrl_p()).is_empty());
         assert!(!blocked.command_palette);
         assert!(reduce(&mut blocked, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn model_picker_groups_filters_and_switches_draft_or_ready_session() {
+        let mut draft = ThreadUiModel::with_startup(test_startup());
+        draft.composer = "/model".into();
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        let screen = rendered(&draft, 100, 32);
+        assert!(screen.contains("Select provider / model"));
+        assert!(screen.contains("runtime-provider"));
+        assert!(screen.contains("Runtime Stable"));
+        assert!(screen.contains("Runtime Fast"));
+        assert!(screen.contains("runtime-model-fast"));
+        assert!(screen.contains("other-provider"));
+        for value in "stable".chars() {
+            reduce(&mut draft, key(KeyCode::Char(value), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            filtered_model_options(&draft)
+                .iter()
+                .map(|option| option.model.as_str())
+                .collect::<Vec<_>>(),
+            ["runtime-model"]
+        );
+        for _ in 0.."stable".len() {
+            reduce(&mut draft, key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for value in "other".chars() {
+            reduce(&mut draft, key(KeyCode::Char(value), KeyModifiers::NONE));
+        }
+        assert!(rendered(&draft, 100, 32).contains("other-model"));
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        draft.composer = "use selected model".into();
+        assert!(matches!(
+            reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
+            [ThreadUiAction::StartWithModel {
+                provider_name,
+                model,
+                prompt,
+                ..
+            }] if provider_name == "other-provider"
+                && model == "other-model"
+                && prompt == "use selected model"
+        ));
+
+        let mut ready = snapshot(ThreadLifecycle::Ready);
+        ready.binding.provider_name = "runtime-provider".into();
+        ready.binding.model = "runtime-model".into();
+        let thread_id = ready.thread_id;
+        let revision = ready.revision;
+        let mut session = ThreadUiModel::with_startup(test_startup());
+        reduce(&mut session, ThreadUiInput::SessionOpened(Box::new(ready)));
+        session.composer = "/model".into();
+        reduce(&mut session, key(KeyCode::Enter, KeyModifiers::NONE));
+        for value in "fast".chars() {
+            reduce(&mut session, key(KeyCode::Char(value), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            reduce(&mut session, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::SwitchModel {
+                switch_id: 1,
+                thread_id,
+                expected_thread_revision: revision,
+                provider_name: "runtime-provider".into(),
+                model: "runtime-model-fast".into(),
+            }]
+        );
+        session.composer = "must wait".into();
+        assert!(reduce(&mut session, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(session.composer, "must wait");
+        assert_eq!(
+            session.status,
+            "Wait for the model switch to finish before submitting"
+        );
+        assert_eq!(
+            reduce(
+                &mut session,
+                ThreadUiInput::ModelSwitchCompleted { switch_id: 1 }
+            ),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+        assert!(session.pending_model_switch.is_some());
+        session.sessions[0].binding.model = "runtime-model-fast".into();
+        let refreshed = session.sessions.clone();
+        assert!(reduce(&mut session, ThreadUiInput::Snapshot(refreshed)).is_empty());
+        assert!(session.pending_model_switch.is_none());
+        assert_eq!(
+            session.status,
+            "Model switched to runtime-provider/runtime-model-fast"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn model_picker_navigation_empty_current_active_and_failed_states_are_total() {
+        let mut draft = ThreadUiModel::with_startup(test_startup());
+        open_model_picker(&mut draft);
+        assert!(reduce(&mut draft, key(KeyCode::Down, KeyModifiers::NONE)).is_empty());
+        assert!(reduce(&mut draft, key(KeyCode::Up, KeyModifiers::NONE)).is_empty());
+        reduce(&mut draft, key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(filtered_model_options(&draft).is_empty());
+        assert!(rendered(&draft, 100, 32).contains("No matching provider models"));
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert!(draft.model_picker.is_some());
+        reduce(&mut draft, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!filtered_model_options(&draft).is_empty());
+        reduce(&mut draft, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(draft.model_picker.is_none());
+
+        let mut ready = snapshot(ThreadLifecycle::Ready);
+        ready.binding.provider_name = "runtime-provider".into();
+        ready.binding.model = "runtime-model".into();
+        let mut current = ThreadUiModel::with_startup(test_startup());
+        reduce(&mut current, ThreadUiInput::SessionOpened(Box::new(ready)));
+        open_model_picker(&mut current);
+        assert!(reduce(&mut current, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            current.status,
+            "Model already selected: runtime-provider/runtime-model"
+        );
+
+        let mut active = ThreadUiModel::with_startup(test_startup());
+        reduce(
+            &mut active,
+            ThreadUiInput::SessionOpened(Box::new(running_snapshot())),
+        );
+        open_model_picker(&mut active);
+        for value in "fast".chars() {
+            reduce(&mut active, key(KeyCode::Char(value), KeyModifiers::NONE));
+        }
+        assert!(reduce(&mut active, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            active.status,
+            "Model switching is disabled while work or a request is active"
+        );
+
+        let thread_id = current.selected_thread().unwrap().thread_id;
+        current.pending_model_switch = Some(PendingModelSwitch {
+            switch_id: 4,
+            thread_id,
+            provider_name: "other-provider".into(),
+            model: "other-model".into(),
+        });
+        reduce(
+            &mut current,
+            ThreadUiInput::ModelSwitchError {
+                switch_id: 3,
+                error: "stale".into(),
+            },
+        );
+        assert!(current.pending_model_switch.is_some());
+        reduce(
+            &mut current,
+            ThreadUiInput::ModelSwitchError {
+                switch_id: 4,
+                error: "lease lost".into(),
+            },
+        );
+        assert!(current.pending_model_switch.is_none());
+        assert_eq!(current.status, "Model switch rejected: lease lost");
+
+        let mut empty = ThreadUiModel::default();
+        open_model_picker(&mut empty);
+        assert_eq!(empty.status, PROVIDER_SETUP_GUIDANCE);
+        assert!(filtered_model_options(&empty).is_empty());
+        assert!(
+            reduce_model_picker_key(&mut empty, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                .is_empty()
+        );
+
+        let assigned = snapshot(ThreadLifecycle::Ready);
+        let assigned_id = assigned.thread_id;
+        let mut materializing = ThreadUiModel::with_startup(test_startup());
+        materializing.pending_submission = Some(PendingSubmission {
+            submission_id: 12,
+            prompt: "materialize".into(),
+            thread_id: Some(assigned_id),
+            after_sequence: 0,
+        });
+        reduce(
+            &mut materializing,
+            ThreadUiInput::Snapshot(vec![assigned.clone()]),
+        );
+        assert_eq!(
+            materializing.active_conversation,
+            Some(ActiveConversation::Session(assigned_id))
+        );
+        let event = ThreadEventEnvelope {
+            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+            event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            thread_id: assigned_id,
+            revision: assigned.revision + 1,
+            sequence: assigned.sequence + 1,
+            event: ThreadEvent::BindingChanged {
+                provider_name: "other".into(),
+                model: "other-model".into(),
+            },
+        };
+        assert_eq!(
+            reduce(&mut materializing, ThreadUiInput::Event(event)),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+
+        let mut blocked = ThreadUiModel::with_startup(test_startup());
+        blocked.pending_model_switch = Some(PendingModelSwitch {
+            switch_id: 1,
+            thread_id: assigned_id,
+            provider_name: "other".into(),
+            model: "other-model".into(),
+        });
+        blocked.composer = "/new".into();
+        assert!(submit_composer(&mut blocked).is_empty());
+        assert_eq!(blocked.composer, "/new");
+        assert_eq!(
+            blocked.status,
+            "Wait for the model switch to finish before submitting"
+        );
+        restore_pending_submission(&mut blocked);
+        let mut editor = String::new();
+        append_editor_text(&mut editor, "a\u{1b}[31mb\u{7}c", 2);
+        assert_eq!(editor, "ab");
+
+        let mut slash_blocked = ThreadUiModel::with_startup(test_startup());
+        reduce(
+            &mut slash_blocked,
+            ThreadUiInput::SessionOpened(Box::new(running_snapshot())),
+        );
+        slash_blocked.composer = "/model".into();
+        assert!(submit_composer(&mut slash_blocked).is_empty());
+        assert_eq!(slash_blocked.composer, "/model");
+        assert_eq!(
+            slash_blocked.status,
+            "Session switching is disabled while work or a request is active"
+        );
+
+        let mut slash_popup = ThreadUiModel {
+            composer: "/".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            reduce_slash_popup_key(
+                &mut slash_popup,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
+            ),
+            Some(Vec::new())
+        );
+        open_model_picker(&mut draft);
+        assert!(
+            reduce_model_picker_key(&mut draft, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+                .is_empty()
+        );
+        assert!(
+            reduce_composer_key(
+                &mut ThreadUiModel::default(),
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)
+            )
+            .is_empty()
+        );
+        assert_eq!(presentation_text("abcd", 2), "ab…");
+        let mut metadata_snapshot = snapshot(ThreadLifecycle::Ready);
+        let entry = metadata_snapshot.transcript.entries.remove(0);
+        assert!(tool_metadata(&entry).is_empty());
+    }
+
+    #[test]
+    fn slash_popup_filters_navigates_executes_and_preserves_composer_ownership() {
+        let mut model = ThreadUiModel::default();
+        assert!(reduce(&mut model, key(KeyCode::Char('/'), KeyModifiers::NONE)).is_empty());
+        let all = rendered(&model, 100, 32);
+        assert!(all.contains("Suggestions"));
+        assert!(all.contains("Start a new conversation draft"));
+        assert!(all.contains("Find and resume a saved session"));
+        assert!(all.contains("↑/↓ select · Enter run · Esc close"));
+
+        reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::ShowSessions { query: None }]
+        );
+        assert!(model.composer.is_empty());
+
+        model.composer = "/r".into();
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::RefreshSnapshots]
+        );
+        model.composer = "/resu".into();
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::ShowSessions { query: None }]
+        );
+
+        model.composer = "/h".into();
+        assert!(reduce(&mut model, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.focus, ThreadFocus::Composer);
+        assert_eq!(model.composer, "/h");
+        assert!(!rendered(&model, 100, 32).contains("Suggestions"));
+        reduce(&mut model, key(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(model.composer, "/he");
+        assert!(rendered(&model, 100, 32).contains("Show keyboard shortcuts"));
+
+        reduce(&mut model, key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(model.command_palette);
+        let palette = rendered(&model, 100, 32);
+        assert!(palette.contains("Commands"));
+        assert!(!palette.contains("Suggestions"));
+    }
+
+    #[test]
+    fn slash_popup_stays_hidden_for_unknown_prompts_and_blocking_requests() {
+        let mut prompt = ThreadUiModel {
+            composer: "/tmp/file".into(),
+            ..Default::default()
+        };
+        assert!(!rendered(&prompt, 100, 32).contains("Suggestions"));
+        assert_eq!(
+            reduce(&mut prompt, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::Start {
+                submission_id: 1,
+                prompt: "/tmp/file".into(),
+            }]
+        );
+
+        let mut blocked = permission_model();
+        blocked.composer = "/".into();
+        assert!(!rendered(&blocked, 100, 32).contains("Suggestions"));
+        assert!(reduce(&mut blocked, key(KeyCode::Down, KeyModifiers::NONE)).is_empty());
+        assert_eq!(blocked.composer, "/");
+    }
+
+    #[test]
+    fn startup_catalog_keeps_a_fresh_draft_until_resume_is_explicit() {
+        let existing = snapshot(ThreadLifecycle::Ready);
+        let summary = ThreadSessionSummary {
+            thread_id: existing.thread_id,
+            title: "Saved session".into(),
+            workspace_root: "/workspace".into(),
+            lifecycle: ThreadLifecycle::Ready,
+            provider_name: "provider".into(),
+            model: "model".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        let mut startup = ThreadUiModel::with_startup(test_startup());
+        assert!(
+            reduce(
+                &mut startup,
+                ThreadUiInput::SessionCatalog(vec![summary.clone()])
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            startup.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+        assert!(startup.sessions.is_empty());
+
+        let mut explicit_new = ThreadUiModel::with_startup(test_startup());
+        explicit_new.composer = "/new".into();
+        assert!(reduce(&mut explicit_new, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert!(
+            reduce(
+                &mut explicit_new,
+                ThreadUiInput::SessionCatalog(vec![summary])
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            explicit_new.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_in_every_focus_mode_and_saturates() {
+        let mut model = ThreadUiModel::default();
+        let mouse = |kind| {
+            ThreadUiInput::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(reduce(&mut model, mouse(MouseEventKind::ScrollUp)).is_empty());
+        assert_eq!(model.scroll, 3);
+        model.focus = ThreadFocus::Navigation;
+        reduce(&mut model, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(model.scroll, 6);
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        reduce(&mut model, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(model.scroll, 0);
+        reduce(&mut model, mouse(MouseEventKind::Moved));
+        assert_eq!(model.scroll, 0);
+    }
+
+    #[test]
+    fn slash_commands_keep_local_session_typed_and_prompt_paths_distinct() {
+        let mut model = ThreadUiModel::with_startup(test_startup());
+        let existing = snapshot(ThreadLifecycle::Ready);
+        let summary = ThreadSessionSummary {
+            thread_id: existing.thread_id,
+            title: "Resume me".into(),
+            workspace_root: "/workspace".into(),
+            lifecycle: ThreadLifecycle::Ready,
+            provider_name: "p".into(),
+            model: "m".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        model.composer = "/new".into();
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            model.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+        assert!(model.sessions.is_empty());
+
+        model.composer = format!("/resume {}", summary.thread_id);
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::ShowSessions {
+                query: Some(summary.thread_id.to_string()),
+            }]
+        );
+        assert!(model.composer.is_empty());
+        assert_eq!(
+            reduce(
+                &mut model,
+                ThreadUiInput::SessionCatalogReady {
+                    sessions: vec![summary],
+                    query: Some(existing.thread_id.to_string()),
+                }
+            ),
+            vec![ThreadUiAction::OpenSession {
+                thread_id: existing.thread_id,
+            }]
+        );
+        assert!(
+            reduce(
+                &mut model,
+                ThreadUiInput::SessionOpened(Box::new(existing.clone()))
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            model.active_conversation,
+            Some(ActiveConversation::Session(existing.thread_id))
+        );
+
+        model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+        model.sessions.clear();
+        model.composer = "/tmp/file".into();
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::Start {
+                submission_id: 1,
+                prompt: "/tmp/file".into(),
+            }]
+        );
+
+        let mut running = snapshot(ThreadLifecycle::Running);
+        running.active_run_id = Some(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
+        let mut blocked = ThreadUiModel::default();
+        reduce(&mut blocked, ThreadUiInput::Snapshot(vec![running]));
+        blocked.composer = "/new".into();
+        assert!(reduce(&mut blocked, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(blocked.composer, "/new");
+        assert!(blocked.status.contains("Session switching is disabled"));
+
+        for lifecycle in [ThreadLifecycle::Failed, ThreadLifecycle::Interrupted] {
+            assert_terminal_session_switching_available(lifecycle);
+        }
+
+        let mut reconciliation = ThreadUiModel {
+            sessions: vec![snapshot(ThreadLifecycle::ReconciliationRequired)],
+            ..Default::default()
+        };
+        assert!(
+            dispatch_builtin(&mut reconciliation, BuiltinCommand::Sessions, String::new())
+                .is_empty()
+        );
+        assert!(
+            reconciliation
+                .status
+                .contains("Session switching is disabled")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn projection_defaults_and_action_adapter_cover_session_discovery_and_refresh() {
+        let saved = snapshot(ThreadLifecycle::Ready);
+        let mut untitled = snapshot(ThreadLifecycle::Ready);
+        untitled.transcript.entries.clear();
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone(), untitled.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let catalog = projection.session_catalog().unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].title, "hello");
+        assert_eq!(catalog[0].created_at_ms, 1);
+        assert_eq!(catalog[0].updated_at_ms, 1);
+        assert_eq!(catalog[1].title, "Untitled session");
+        assert_eq!(catalog[1].created_at_ms, 0);
+        assert_eq!(catalog[1].updated_at_ms, 0);
+        assert!(
+            catalog
+                .iter()
+                .all(|session| session.workspace_root.is_empty())
+        );
+
+        let missing = snapshot(ThreadLifecycle::Ready).thread_id;
+        let mut missing_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert_eq!(
+            missing_projection.session(missing).unwrap_err(),
+            format!("session {missing} was not found")
+        );
+
+        let mut exact_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()], vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let mut exact_model = ThreadUiModel::default();
+        let mut dispatched = Vec::new();
+        assert!(
+            !apply_thread_actions(
+                &mut exact_projection,
+                &mut exact_model,
+                &mut |action| {
+                    dispatched.push(action);
+                    Ok(())
+                },
+                vec![ThreadUiAction::ShowSessions {
+                    query: Some(saved.thread_id.to_string()),
+                }],
+            )
+            .unwrap()
+        );
+        assert!(dispatched.is_empty());
+        assert_eq!(
+            exact_model.active_conversation,
+            Some(ActiveConversation::Session(saved.thread_id))
+        );
+
+        let mut picker_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let mut picker_model = ThreadUiModel::default();
+        assert!(
+            !apply_thread_actions(
+                &mut picker_projection,
+                &mut picker_model,
+                &mut |_| Ok(()),
+                vec![ThreadUiAction::ShowSessions { query: None }],
+            )
+            .unwrap()
+        );
+        assert!(picker_model.session_picker);
+        assert_eq!(picker_model.status, "Select a session to resume");
+
+        let mut active_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut active_projection,
+                &mut exact_model,
+                &mut |_| Ok(()),
+                vec![ThreadUiAction::RefreshSnapshots],
+            )
+            .unwrap()
+        );
+        assert_eq!(exact_model.sessions[0].thread_id, saved.thread_id);
+
+        let mut draft_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let mut draft_model = ThreadUiModel {
+            active_conversation: Some(ActiveConversation::NewSessionDraft),
+            ..Default::default()
+        };
+        assert!(
+            !apply_thread_actions(
+                &mut draft_projection,
+                &mut draft_model,
+                &mut |_| Ok(()),
+                vec![ThreadUiAction::RefreshSnapshots],
+            )
+            .unwrap()
+        );
+        assert_eq!(draft_model.session_catalog[0].thread_id, saved.thread_id);
+
+        let mut snapshot_projection = ScriptedProjection {
+            snapshots: VecDeque::from([vec![saved.clone()]]),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let mut snapshot_model = ThreadUiModel::default();
+        assert!(
+            !apply_thread_actions(
+                &mut snapshot_projection,
+                &mut snapshot_model,
+                &mut |_| Ok(()),
+                vec![ThreadUiAction::RefreshSnapshots],
+            )
+            .unwrap()
+        );
+        assert_eq!(snapshot_model.sessions[0].thread_id, saved.thread_id);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn session_catalog_resolution_picker_keys_and_draft_materialization_are_total() {
+        let mut first = snapshot(ThreadLifecycle::Ready);
+        let second = snapshot(ThreadLifecycle::Ready);
+        let first_summary = session_summary(&first, "same title", "/workspace/one");
+        let second_summary = session_summary(&second, "same title", "/workspace/two");
+
+        let mut startup_empty = ThreadUiModel::with_startup(test_startup());
+        assert!(
+            reduce(
+                &mut startup_empty,
+                ThreadUiInput::SessionCatalog(Vec::new())
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            startup_empty.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+
+        let mut empty = ThreadUiModel::default();
+        assert!(
+            reduce(
+                &mut empty,
+                ThreadUiInput::SessionCatalogReady {
+                    sessions: Vec::new(),
+                    query: Some(String::new()),
+                },
+            )
+            .is_empty()
+        );
+        assert!(empty.session_picker);
+        assert_eq!(empty.status, "No saved sessions");
+
+        let mut missing = ThreadUiModel::default();
+        assert!(
+            reduce(
+                &mut missing,
+                ThreadUiInput::SessionCatalogReady {
+                    sessions: vec![first_summary.clone()],
+                    query: Some("missing".into()),
+                },
+            )
+            .is_empty()
+        );
+        assert!(missing.status.contains("No exact session match"));
+
+        let mut ambiguous = ThreadUiModel::default();
+        assert!(
+            reduce(
+                &mut ambiguous,
+                ThreadUiInput::SessionCatalogReady {
+                    sessions: vec![first_summary.clone(), second_summary.clone()],
+                    query: Some("same title".into()),
+                },
+            )
+            .is_empty()
+        );
+        assert!(ambiguous.session_picker);
+        assert!(ambiguous.status.contains("Multiple sessions match"));
+
+        ambiguous.session_index = 0;
+        assert!(reduce(&mut ambiguous, key(KeyCode::Down, KeyModifiers::NONE)).is_empty());
+        assert_eq!(ambiguous.session_index, 1);
+        assert!(reduce(&mut ambiguous, key(KeyCode::Char('k'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(ambiguous.session_index, 0);
+        assert!(reduce(&mut ambiguous, key(KeyCode::Char('j'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(ambiguous.session_index, 1);
+        assert!(reduce(&mut ambiguous, key(KeyCode::Up, KeyModifiers::NONE)).is_empty());
+        assert_eq!(ambiguous.session_index, 0);
+        assert!(reduce(&mut ambiguous, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            reduce(&mut ambiguous, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![ThreadUiAction::OpenSession {
+                thread_id: first.thread_id,
+            }]
+        );
+        assert!(reduce(&mut ambiguous, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
+        assert!(!ambiguous.session_picker);
+
+        let mut no_rows = ThreadUiModel {
+            session_picker: true,
+            ..Default::default()
+        };
+        assert!(reduce(&mut no_rows, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+
+        let mut materializing = ThreadUiModel::with_startup(test_startup());
+        first.transcript.entries[0].source_key = "thread:create:user".into();
+        materializing.pending_submission = Some(PendingSubmission {
+            submission_id: 9,
+            prompt: "hello".into(),
+            thread_id: None,
+            after_sequence: 0,
+        });
+        assert!(
+            reduce(
+                &mut materializing,
+                ThreadUiInput::Snapshot(vec![first.clone()]),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            materializing.active_conversation,
+            Some(ActiveConversation::NewSessionDraft)
+        );
+        reduce(
+            &mut materializing,
+            ThreadUiInput::SubmissionAssigned {
+                submission_id: 9,
+                thread_id: first.thread_id,
+            },
+        );
+        assert_eq!(
+            materializing.active_conversation,
+            Some(ActiveConversation::Session(first.thread_id))
+        );
+        assert!(materializing.pending_submission.is_none());
+        assert!(
+            reduce(
+                &mut materializing,
+                ThreadUiInput::Snapshot(vec![first.clone(), second]),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            materializing.selected_thread().unwrap().thread_id,
+            first.thread_id
+        );
+    }
+
+    #[test]
+    fn command_failure_and_non_tty_adapter_boundaries_are_explicit() {
+        let mut disabled = ThreadUiModel {
+            pending_submission: Some(PendingSubmission {
+                submission_id: 1,
+                prompt: "busy".into(),
+                thread_id: None,
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(dispatch_builtin(&mut disabled, BuiltinCommand::New, String::new()).is_empty());
+        assert!(disabled.status.contains("Session switching is disabled"));
+
+        let mut invalid = ThreadUiModel {
+            composer: "/help unexpected".into(),
+            ..Default::default()
+        };
+        assert!(submit_composer(&mut invalid).is_empty());
+        assert_eq!(invalid.composer, "/help unexpected");
+        assert!(invalid.status.contains("does not accept arguments"));
+
+        let mut queued = ThreadUiModel::default();
+        reduce(
+            &mut queued,
+            ThreadUiInput::Snapshot(vec![running_snapshot()]),
+        );
+        queued.queued_follow_up = Some("first".into());
+        queued.composer = "second".into();
+        assert!(submit_composer(&mut queued).is_empty());
+        assert_eq!(queued.composer, "second");
+        assert!(queued.pending_submission.is_none());
+        assert_eq!(queued.status, "A follow-up is already queued");
+
+        let mut projection = ScriptedProjection {
+            snapshots: VecDeque::new(),
+            poll: ThreadProjectionPoll::Empty,
+        };
+        let (_feedback_tx, feedback_rx) = std::sync::mpsc::channel();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
+        assert!(matches!(
+            run_with_feedback_and_progress(
+                &mut projection,
+                test_startup(),
+                |_| Ok(()),
+                &feedback_rx,
+                &progress_rx,
+            ),
+            Err(TuiError::NonTty)
+        ));
+    }
+
+    #[test]
+    fn session_picker_rendering_covers_populated_and_empty_catalogs() {
+        let first = snapshot(ThreadLifecycle::Ready);
+        let second = snapshot(ThreadLifecycle::Failed);
+        let populated = ThreadUiModel {
+            session_picker: true,
+            session_index: 1,
+            session_catalog: vec![
+                session_summary(&first, "First saved session", "/workspace/one"),
+                session_summary(&second, "Second saved session", "/workspace/two"),
+            ],
+            ..Default::default()
+        };
+        let screen = rendered(&populated, 120, 32);
+        assert!(screen.contains("Sessions"));
+        assert!(screen.contains("First saved session"));
+        assert!(screen.contains("Second saved session"));
+        assert!(screen.contains("/workspace/one"));
+        assert!(screen.contains("Enter resume"));
+
+        let empty = ThreadUiModel {
+            session_picker: true,
+            ..Default::default()
+        };
+        let screen = rendered(&empty, 100, 28);
+        assert!(screen.contains("No saved sessions"));
     }
 
     #[test]
@@ -4839,6 +7638,7 @@ mod tests {
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
         assert_eq!(model.focus, ThreadFocus::Composer);
+        reduce(&mut model, ThreadUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
             vec![ThreadUiAction::ResolvePermission {
@@ -4860,9 +7660,11 @@ mod tests {
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(model.input, "j\n");
         assert_eq!(model.composer, "kept");
+        let input_submission_id = model.next_submission_id;
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
             vec![ThreadUiAction::ProvideInput {
+                submission_id: input_submission_id,
                 thread_id: model.sessions[0].thread_id,
                 request_id: "exact-input".into(),
                 value: "j\n".into(),
@@ -5319,9 +8121,21 @@ mod tests {
 
     #[test]
     fn scrolling_only_changes_the_transcript_band() {
-        let model = working_model();
+        let mut model = working_model();
+        let ids = SystemIdSource::default();
+        let run_id = model.sessions[0].active_run_id.unwrap();
+        for sequence in 4..=48 {
+            model.sessions[0].transcript.entries.push(transcript_entry(
+                &ids,
+                sequence,
+                Some(run_id),
+                TranscriptKind::Assistant,
+                &format!("scroll fixture row {sequence}"),
+                None,
+            ));
+        }
         let before = rendered_buffer(&model, 120, 40);
-        let after = rendered_buffer(&ThreadUiModel { scroll: 1, ..model }, 120, 40);
+        let after = rendered_buffer(&ThreadUiModel { scroll: 8, ..model }, 120, 40);
         for y in 0..3 {
             for x in 0..120 {
                 assert_eq!(before[(x, y)], after[(x, y)], "header ({x},{y})");
@@ -5332,7 +8146,7 @@ mod tests {
                 assert_eq!(before[(x, y)], after[(x, y)], "composer ({x},{y})");
             }
         }
-        assert_ne!(before[(4, 7)], after[(4, 7)]);
+        assert!((3..36).any(|y| (0..120).any(|x| before[(x, y)] != after[(x, y)])));
     }
 
     #[test]
@@ -5720,7 +8534,16 @@ mod tests {
                     VisualState::Permission | VisualState::Reconciliation => {
                         let transcript_x = tier.transcript_inset();
                         let card_x = transcript_x + 1;
-                        let card_y = header_height + 2;
+                        let card_height = if state == VisualState::Permission {
+                            8
+                        } else {
+                            7
+                        };
+                        let card_y = layout
+                            .transcript
+                            .bottom()
+                            .saturating_sub(card_height)
+                            .saturating_sub(1);
                         let card_width = width
                             .saturating_sub(transcript_x * 2)
                             .saturating_sub(2)
@@ -5753,9 +8576,7 @@ mod tests {
     #[test]
     fn blocking_cards_ignore_transcript_scroll_and_keep_fixed_chrome() {
         for model in [permission_model(), reconciliation_model()] {
-            for (width, height, card_x, card_y, card_right) in
-                [(120, 40, 5, 5, 80), (100, 30, 5, 5, 80), (72, 24, 3, 4, 68)]
-            {
+            for (width, height) in [(120, 40), (100, 30), (72, 24)] {
                 let before = rendered_buffer(&model, width, height);
                 let after = rendered_buffer(
                     &ThreadUiModel {
@@ -5765,11 +8586,22 @@ mod tests {
                     width,
                     height,
                 );
+                let (card_x, card_y) =
+                    find_symbol(&before, "┌").expect("blocking card before scroll");
+                let (after_x, after_y) =
+                    find_symbol(&after, "┌").expect("blocking card after scroll");
+                let card_right = card_x
+                    + width
+                        .saturating_sub(ViewportTier::for_width(width).transcript_inset() * 2)
+                        .saturating_sub(2)
+                        .clamp(20, 76)
+                    - 1;
+                assert_eq!((after_x, after_y), (card_x, card_y));
                 assert_eq!(before[(card_x, card_y)].symbol(), "┌");
                 assert_eq!(after[(card_x, card_y)].symbol(), "┌");
                 assert_eq!(after[(card_right, card_y)].symbol(), "┐");
                 let card_height = if visual_state(&model) == VisualState::Permission {
-                    9
+                    8
                 } else {
                     7
                 };
@@ -6031,7 +8863,7 @@ mod tests {
             let _ = reduce_palette_key(&mut model, key);
         }
         model.command_palette = true;
-        model.command_index = PaletteCommand::ALL.len() - 1;
+        model.command_index = BUILTINS.len() - 1;
         assert_eq!(
             reduce_palette_key(
                 &mut model,
@@ -6054,13 +8886,21 @@ mod tests {
             )
             .is_empty()
         );
-        assert_eq!(model.composer, "locked");
+        assert_eq!(model.composer, "lockedx");
+        assert!(
+            reduce_composer_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            )
+            .is_empty()
+        );
+        assert_eq!(model.composer, "lockedx\n");
         model.pending_submission = None;
         let _ = reduce_composer_key(
             &mut model,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         );
-        assert_eq!(model.composer, "locke");
+        assert_eq!(model.composer, "lockedx");
         let _ = reduce_composer_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(model.focus, ThreadFocus::Navigation);
 
@@ -6767,10 +9607,61 @@ mod tests {
 
     fn test_startup() -> ThreadStartupPresentation {
         ThreadStartupPresentation {
+            default_provider: "runtime-provider".into(),
             default_model: "runtime-model".into(),
+            model_catalog: vec![
+                ThreadModelOption {
+                    provider_name: "runtime-provider".into(),
+                    model: "runtime-model".into(),
+                    name: Some("Runtime Stable".into()),
+                    is_default: true,
+                },
+                ThreadModelOption {
+                    provider_name: "runtime-provider".into(),
+                    model: "runtime-model-fast".into(),
+                    name: Some("Runtime Fast".into()),
+                    is_default: false,
+                },
+                ThreadModelOption {
+                    provider_name: "other-provider".into(),
+                    model: "other-model".into(),
+                    name: None,
+                    is_default: true,
+                },
+            ],
             workspace_display: "~/projects/latte-code".into(),
             permission_mode: ThreadPermissionMode::Ask,
         }
+    }
+
+    #[test]
+    fn missing_provider_keeps_tui_usable_and_prompt_local_until_configured() {
+        let startup = ThreadStartupPresentation {
+            default_provider: String::new(),
+            default_model: String::new(),
+            model_catalog: Vec::new(),
+            workspace_display: "~/projects/latte-code".into(),
+            permission_mode: ThreadPermissionMode::Ask,
+        };
+        let mut model = ThreadUiModel::with_startup(startup);
+
+        assert!(model.draft_model.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
+        assert!(rendered(&model, 100, 32).contains(MODEL_NOT_CONFIGURED));
+
+        model.composer = "keep this prompt".into();
+        assert!(submit_composer(&mut model).is_empty());
+        assert_eq!(model.composer, "keep this prompt");
+        assert!(model.pending_submission.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
+
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::SHIFT)).is_empty());
+        assert!(reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.composer, "keep this prompt\nx");
+
+        open_model_picker(&mut model);
+        assert!(model.model_picker.is_none());
+        assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
     }
 
     fn working_model() -> ThreadUiModel {

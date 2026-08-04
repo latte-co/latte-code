@@ -8,7 +8,7 @@ English counterpart: [Verification harness and deterministic testing](../../../e
 
 Harness 是可替换的 production-boundary dependency 和 test fixture，不是另一套 agent runtime，也不是绕过 `latte-engine` 的 test backdoor。它驱动最终 `latte-code` binary、scripted Provider、temporary global state home、SQLite、event subscription 和真实 PTY，同时保持无公网、无真实 credential、有界且可清理。
 
-UT 95%、final-binary E2E 80%、all-target 90% 的独立 coverage floor 不变。本文定义达到这些门槛的底座；现有 testing gates 与 E2E authoring guide 继续是交付规则。
+UT 95%、final-binary E2E 90%、all-target 90% 的独立 coverage floor 不变。本文定义达到这些门槛的底座；现有 testing gates 与 E2E authoring guide 继续是交付规则。
 
 ## 2. 可替换依赖
 

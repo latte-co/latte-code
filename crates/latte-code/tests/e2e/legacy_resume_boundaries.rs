@@ -255,3 +255,87 @@ fn final_cli_resumes_public_interrupted_checkpoint_at_verification_without_provi
     );
     assert_eq!(provider.requests().len(), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn interrupted_final_message_reissues_verification_permission_before_completion() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion(
+        "verification permission checkpoint",
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+    let source = invoke(
+        &scenario,
+        &["--json", "run", "create final verification checkpoint"],
+    );
+    assert!(source.status.success());
+    let source_run = RunId::from_uuid(
+        uuid::Uuid::parse_str(json(&source)["data"]["run"]["run_id"].as_str().unwrap()).unwrap(),
+    );
+    provider.assert_consumed();
+
+    let engine = fixture_engine(&scenario);
+    let checkpoint = engine.runtime_checkpoint(source_run).unwrap().unwrap();
+    let now = wall_now_ms();
+    let lease = engine
+        .acquire_lease(&format!("agent-{source_run}"), now, 120_000)
+        .unwrap();
+    let interrupted_run = RunId::from_uuid(uuid::Uuid::now_v7());
+    engine.create_run(interrupted_run, now + 1).unwrap();
+    let running = engine
+        .apply_transition(interrupted_run, 0, Transition::Start, now + 2, &lease)
+        .unwrap();
+    let cancelling = engine
+        .apply_transition(
+            interrupted_run,
+            running.revision,
+            Transition::Cancel,
+            now + 3,
+            &lease,
+        )
+        .unwrap();
+    let interrupted = engine
+        .apply_transition(
+            interrupted_run,
+            cancelling.revision,
+            Transition::Interrupt,
+            now + 4,
+            &lease,
+        )
+        .unwrap();
+    engine
+        .persist_runtime_checkpoint(
+            interrupted_run,
+            interrupted.revision,
+            &lease,
+            &checkpoint,
+            now + 5,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+    drop(engine);
+
+    scenario.write_config(provider.endpoint(), r#"["/bin/sh","-c","exit 0"]"#);
+    let waiting = invoke(
+        &scenario,
+        &["--json", "resume", &interrupted_run.to_string(), "--allow"],
+    );
+    assert_eq!(waiting.status.code(), Some(10));
+    assert_eq!(json(&waiting)["error"]["code"], "permission_required");
+    let shown = invoke(&scenario, &["--json", "show", &interrupted_run.to_string()]);
+    assert_eq!(shown.status.code(), Some(10));
+    assert_eq!(json(&shown)["data"]["run"]["status"], "waiting_permission");
+
+    let completed = invoke(
+        &scenario,
+        &["--json", "resume", &interrupted_run.to_string(), "--allow"],
+    );
+    assert!(
+        completed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert_eq!(json(&completed)["data"]["run"]["status"], "completed");
+    assert_eq!(provider.requests().len(), 1);
+}

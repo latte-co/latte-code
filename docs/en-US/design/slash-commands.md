@@ -1,11 +1,12 @@
 # Slash command design
 
-Status: **Proposed; not yet implemented.**
+Status: **First built-in slice implemented.**
 
-Latte Code currently has a local `Ctrl+P` command palette with four actions,
-but composer text beginning with `/` is submitted as an ordinary prompt. This
-document defines the target slash-command contract for the transcript TUI. It
-does not claim that the commands described here are already available.
+Latte Code now shares one built-in catalog between `Ctrl+P` and exact composer
+slash resolution. The Session command slice described in the current-status
+section and a minimal built-in suggestions popup are implemented. Fuzzy
+matching, prompt-command extensions, `/cancel`, and later catalog sources
+remain target design.
 
 ## 1. Reference findings
 
@@ -38,7 +39,7 @@ shell, read environment variables, or perform file I/O while being resolved.
 Goals:
 
 - Complete the primary Session loop with a transient new-Session draft and a
-  global Session picker/resume path.
+  workspace-filtered Session picker/resume path.
 - Discover commands by typing `/` at the beginning of the composer.
 - Make keyboard shortcuts, `Ctrl+P`, and slash aliases converge on the same
   command identifiers and availability rules.
@@ -46,8 +47,9 @@ Goals:
 - Distinguish local controls from commands that become model-visible prompts.
 - Support deterministic matching, arguments, aliases, disabled reasons, and
   future trusted prompt-command sources.
-- Keep command validation errors, popup state, and Provider startup failures
-  transient.
+- Keep command validation errors and popup state transient; once a prompt is
+  accepted, surface Provider startup failures through normal durable Run
+  failure semantics.
 
 Non-goals for the first delivery:
 
@@ -234,7 +236,7 @@ create a parallel command queue.
 
 ## 9. Persistence, history, and telemetry
 
-The persistence contract follows the global data-storage design:
+The persistence contract follows the data-storage design:
 
 - Popup filters, selection, validation errors, disabled reasons, and local
   command output are in-memory presentation state.
@@ -246,8 +248,9 @@ The persistence contract follows the global data-storage design:
   template SHA-256 so replay does not depend on the current template file.
 - Failed template validation or expansion leaves no Session content and
   restores the original composer invocation.
-- Provider startup failures remain transient as defined by the data-storage
-  design.
+- After a PromptTemplate expansion is accepted, Provider startup failure
+  preserves the expanded user message and appends a bounded, redacted failure
+  as defined by the data-storage design.
 
 Composer recall may retain a submitted invocation in process-local history,
 but it is not Session history. Sensitive command arguments are never included
@@ -298,8 +301,8 @@ commands that happen to be easiest to map from the current palette:
 
 | Command | Aliases | Kind | Availability | Mapping |
 | --- | --- | --- | --- | --- |
-| `/new` | – | `LocalUi` | No active Run or blocking request | Switch to a transient `NewSessionDraft`; create no durable Session yet. |
-| `/sessions [query]` | `/resume` | `TypedAction` plus local picker | No active Run or blocking request | With no argument, load and open the global Session picker. With an ID or title query, resolve and open that Session directly. |
+| `/new` | – | `LocalUi` | No active Run or blocking request | Switch to a transient `NewSessionDraft`; create no durable Session until its first prompt is accepted. |
+| `/sessions [query]` | `/resume` | `TypedAction` plus local picker | No active Run or blocking request | With no argument, load and open the current workspace's Session picker. With an ID or title query, resolve and open that Session directly. |
 
 `/new` does not clear, archive, or delete the current Session. The TUI needs an
 explicit active-conversation target such as:
@@ -313,17 +316,18 @@ pub enum ActiveConversation {
 
 Entering `NewSessionDraft` clears only the new draft composer and local
 selection state. The previous Session remains discoverable. Its first prompt
-uses the normal Start path and follows the data-storage commit point: no
-Session row or content file is created until the first complete valid Provider
-outcome.
+uses the normal Start path and follows the data-storage commit point: after
+local validation, the Session, child Run, and user card are accepted atomically
+before Provider construction.
 
 `/sessions` is the canonical discovery command and `/resume` is an exact alias.
-The no-argument form opens a bounded picker backed by the global SQLite
-Session catalog. Rows contain only Session metadata such as title, Project,
-Workspace, lifecycle, model, and update time; transcript JSONL is loaded only
-after selection. An optional argument first tries an exact Session ID and then
-a deterministic title match. Ambiguous titles stay in the picker instead of
-silently choosing one.
+The no-argument form opens a bounded picker backed by Session metadata in the
+configured SQLite database and filtered to the current canonical Workspace.
+Rows contain only title, Workspace, lifecycle, Provider, model, and timestamps;
+transcript rows are loaded only after selection. An optional argument first
+tries an exact Session ID and then an exact title query across the complete
+Workspace catalog rather than only the recent picker page. Ambiguous titles
+stay in the picker instead of silently choosing one.
 
 Selecting a row emits an explicit typed open/resume action. It reloads the
 chosen Session's JSONL conversation and SQLite control projection without
@@ -346,7 +350,7 @@ they do not define the primary product milestone:
 | `/cancel` | – | `TypedAction` | Emit `Cancel { thread_id }` for an active cancellable Run. |
 | `/quit` | `/exit`, `/q` | `TypedAction` | Emit `Quit`. |
 
-Later built-ins may add `/status`, `/fork`, `/rename`, `/compact`, `/model`,
+Later built-ins may add `/status`, `/fork`, `/rename`, `/compact`,
 `/permissions`, and `/diff`, but only after each has a typed service contract
 and lifecycle policy. `/init` and `/review` should be the first built-in
 `PromptTemplate` commands after prompt expansion exists.
@@ -418,8 +422,9 @@ Final-binary E2E must cover at least:
 
 - Typing `/` shows the command popup and does not call the Provider.
 - `/new` leaves the previous Session unchanged, switches to an empty transient
-  draft, and creates no persistent Session before a valid Provider outcome.
-- `/sessions` lists bounded metadata from the global catalog without loading
+  draft, and creates no persistent Session until its first prompt passes local
+  validation and is accepted.
+- `/sessions` lists bounded metadata from the Workspace catalog without loading
   every transcript or calling the Provider.
 - `/resume <session-id>` opens the exact Session; ambiguous title matches remain
   in the picker and require explicit selection.
@@ -439,15 +444,84 @@ Final-binary E2E must cover at least:
 - Popup rendering and keyboard behavior pass on Linux, macOS, and the supported
   Windows terminal harness.
 
-These tests are part of the existing independent UT 95%, final-binary E2E 80%,
+These tests are part of the existing independent UT 95%, final-binary E2E 90%,
 and all-target 90% coverage gates.
 
-## 15. Delivery phases
+## 15. Current implementation status
+
+`latte-tui::command::BUILTINS` is the sole catalog used by composer slash
+resolution and the `Ctrl+P` palette. It contains identifiers and secret-free
+metadata rather than arbitrary callbacks or engine capabilities.
+
+| Command | Aliases | Kind | Current result |
+| --- | --- | --- | --- |
+| `/new` | – | `LocalUi` | Starts a new transient draft. |
+| `/sessions [id or exact title]` | `/resume` | `TypedAction` | Opens the Session picker or resumes one exact match. |
+| `/model` | – | `TypedAction` | Opens a searchable provider-grouped model picker and changes the binding used by the next child. |
+| `/help` | – | `LocalUi` | Opens keyboard help. |
+| `/navigation` | `/nav` | `LocalUi` | Enters transcript navigation. |
+| `/refresh` | – | `TypedAction` | Reloads the authoritative projection. |
+| `/quit` | `/exit`, `/q` | `LocalUi` | Exits the terminal UI. |
+
+Only a first-byte `/` creates a command candidate. Built-in names and aliases
+are lower-case ASCII and matched exactly. Arguments retain internal newlines
+and trim only outer whitespace. A known command with forbidden arguments
+produces a local validation error and preserves the draft; unknown or invalid
+candidates remain ordinary prompts. Local commands do not call a Provider or
+write command text to a transcript.
+
+The TUI starts with a fresh transient draft on every launch. Existing Sessions
+are loaded only through explicit `/sessions` or `/resume` interaction;
+`/sessions` opens a picker without an argument and otherwise resolves a UUID or
+exact title. A Session from a different persisted workspace is not opened.
+Session switching is
+disabled during a submission, an active child, a pending request, or
+reconciliation, and that availability is checked again at dispatch. Terminal
+`Failed` and `Interrupted` Sessions have no active child and may switch to
+`/new` or `/sessions`.
+`/model` groups each provider's complete `models` catalog. Each map key is the
+actual model ID sent to that provider; optional `name` is display/search text
+only, while nested `options` are typed by that provider implementation, so
+option keys need not be shared between providers. Selected options are pinned
+into the binding; display names are not. The single global `default_model`
+`provider/model` ID marks the initial selection; providers
+do not carry independent defaults. A new draft keeps its selection locally until Start. A
+Ready Session persists the exact provider/model binding and a System card
+before another follow-up is accepted; the composer remains locked until the
+authoritative snapshot confirms the switch. Credentials are still resolved
+only when the next child starts, so a bad provider is reported as that child's
+durable retryable failure rather than making the picker flash and discard the
+submission.
+Ordinary Enter in either terminal Session does not create a local queue or
+consume the composer. If a follow-up was queued while a child was active and
+that child terminalizes before the follow-up is durably accepted, the exact
+draft is restored. Submission reconciliation uses the durable card source and
+redacted content, not display-text equality alone.
+
+The composer now opens an anchored built-in suggestions popup for `/` and
+single-token prefixes. It matches canonical and alias prefixes with stable
+exact/canonical/alias ordering. Up/Down changes the bounded selection, Enter
+dispatches after the normal availability recheck, and Esc dismisses the popup
+without changing the draft; later edits reopen it. Blocking request states and
+their key events; other overlays also hide the popup.
+
+Fuzzy matching, dynamic prompt commands, workspace command files, MCP prompts,
+Skills, executable plugins, explicit cross-workspace rebinding, and slash
+`/cancel` are not implemented.
+
+Reducer tests cover popup filtering, keyboard selection, dismissal, blocking,
+local, typed, and ordinary-prompt paths, aliases, exact arguments, disabled
+switching, and draft preservation. Final-binary PTY E2E covers popup rendering,
+arrow navigation, prefix filtering, Session creation, `/resume <thread-id>`,
+`/new`, provider/model switching, the selected model on the next wire request,
+and the absence of an additional Provider request on purely local paths.
+
+## 16. Delivery phases
 
 1. Add the single built-in command catalog, parser, availability evaluation,
    aliases, and an explicit `ActiveConversation` target that can represent a
    transient new-Session draft.
-2. Add the typed global Session catalog/open boundary and bounded Session
+2. Add the typed Session catalog/open boundary and bounded Session
    picker; implement `/new` and `/sessions` with `/resume` as its alias.
 3. Add final-binary E2E for new, discovery, direct resume, Workspace rebinding,
    active-Run blocking, and cross-platform popup/picker rendering.

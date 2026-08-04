@@ -77,8 +77,8 @@ coverage: coverage-unit coverage-e2e coverage-total ## Run every required covera
 coverage-unit: ## Run UT-only coverage with the 95% line gate
 	cargo llvm-cov --workspace --all-features --lib --bins --locked --fail-under-lines 95
 
-coverage-e2e: ## Run final-binary E2E coverage with the 80% line gate
-	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 80 -- --test-threads=1
+coverage-e2e: ## Run final-binary E2E coverage with the 90% line gate
+	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 90 -- --test-threads=1
 
 coverage-total: ## Run all-target coverage with the 90% line gate
 	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90 -- --test-threads=1

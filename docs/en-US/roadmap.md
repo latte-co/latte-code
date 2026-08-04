@@ -78,14 +78,14 @@ process execution.
 
 - [x] Deterministic merge of built-in defaults, user-level, and workspace-level
   JSONC configuration.
-- [x] Environment-variable credential references; keys resolve only in memory
+- [x] Literal and environment-variable credentials; keys resolve only in memory
   and are excluded from ordinary logs and durable state.
 - [x] OpenAI Chat Completions-compatible Provider, `base_url`, bounded HTTP
   timeouts, and retries.
 - [x] Bounded SSE streaming, tool-call aggregation, and constrained fallback to
   non-streaming requests.
-- [x] Provider binding plus tool aliases and credential-reference/data-scope/
-  generation checks for resume.
+- [x] Provider binding plus tool aliases and internally derived credential/data
+  scope checks for resume.
 - [ ] Explicit model/Provider selection and per-Session model management.
 - [ ] Versioned Harness Profiles that resolve context strategy, system/developer
   prompt, tool schema/names, Plan/Stop semantics, and capability switches as a

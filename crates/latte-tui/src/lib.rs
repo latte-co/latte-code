@@ -11,12 +11,16 @@ use std::{
 };
 
 use crossterm::{
-    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use thiserror::Error;
 
+pub mod command;
 pub mod thread;
 
 /// Connectivity is presentation state, never runtime truth.
@@ -62,6 +66,7 @@ struct TerminalStages {
     raw: bool,
     keyboard: bool,
     alternate: bool,
+    mouse: bool,
     paste: bool,
 }
 
@@ -69,8 +74,10 @@ trait TerminalOps: Send + Sync {
     fn enable_raw(&self) -> io::Result<()>;
     fn push_keyboard(&self) -> io::Result<()>;
     fn enter_alternate(&self) -> io::Result<()>;
+    fn enable_mouse(&self) -> io::Result<()>;
     fn enable_paste(&self) -> io::Result<()>;
     fn disable_paste(&self) -> io::Result<()>;
+    fn disable_mouse(&self) -> io::Result<()>;
     fn leave_alternate(&self) -> io::Result<()>;
     fn pop_keyboard(&self) -> io::Result<()>;
     fn disable_raw(&self) -> io::Result<()>;
@@ -97,12 +104,20 @@ impl TerminalOps for CrosstermTerminalOps {
         execute!(io::stdout(), EnterAlternateScreen)
     }
 
+    fn enable_mouse(&self) -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)
+    }
+
     fn enable_paste(&self) -> io::Result<()> {
         execute!(io::stdout(), crossterm::event::EnableBracketedPaste)
     }
 
     fn disable_paste(&self) -> io::Result<()> {
         execute!(io::stdout(), crossterm::event::DisableBracketedPaste)
+    }
+
+    fn disable_mouse(&self) -> io::Result<()> {
+        execute!(io::stdout(), DisableMouseCapture)
     }
 
     fn leave_alternate(&self) -> io::Result<()> {
@@ -125,6 +140,7 @@ pub enum TerminalStage {
     Raw,
     Keyboard,
     Alternate,
+    Mouse,
     Paste,
 }
 
@@ -132,6 +148,7 @@ pub enum TerminalStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalCleanupStage {
     Paste,
+    Mouse,
     Alternate,
     Keyboard,
     Raw,
@@ -204,6 +221,10 @@ impl TerminalGuard {
         ops.enter_alternate()?;
         stages.lock().unwrap().alternate = true;
         hook(TerminalStage::Alternate);
+        guard.check_interrupted()?;
+        ops.enable_mouse()?;
+        stages.lock().unwrap().mouse = true;
+        hook(TerminalStage::Mouse);
         guard.check_interrupted()?;
         ops.enable_paste()?;
         stages.lock().unwrap().paste = true;
@@ -323,6 +344,11 @@ fn restore_once_with_hook(
             let _ = ops.disable_paste();
             stages.paste = false;
         }
+        if stages.mouse {
+            hook(TerminalCleanupStage::Mouse);
+            let _ = ops.disable_mouse();
+            stages.mouse = false;
+        }
         if stages.alternate {
             hook(TerminalCleanupStage::Alternate);
             let _ = ops.leave_alternate();
@@ -351,8 +377,10 @@ mod tests {
         EnableRaw,
         PushKeyboard,
         EnterAlternate,
+        EnableMouse,
         EnablePaste,
         DisablePaste,
+        DisableMouse,
         LeaveAlternate,
         PopKeyboard,
         DisableRaw,
@@ -361,6 +389,7 @@ mod tests {
     struct MockTerminalOps {
         operations: Arc<Mutex<Vec<MockOperation>>>,
         keyboard_error: Option<io::ErrorKind>,
+        mouse_error: Option<io::ErrorKind>,
     }
 
     impl MockTerminalOps {
@@ -387,6 +416,13 @@ mod tests {
             Ok(())
         }
 
+        fn enable_mouse(&self) -> io::Result<()> {
+            self.record(MockOperation::EnableMouse);
+            self.mouse_error.map_or(Ok(()), |kind| {
+                Err(io::Error::new(kind, "injected mouse stage failure"))
+            })
+        }
+
         fn enable_paste(&self) -> io::Result<()> {
             self.record(MockOperation::EnablePaste);
             Ok(())
@@ -394,6 +430,11 @@ mod tests {
 
         fn disable_paste(&self) -> io::Result<()> {
             self.record(MockOperation::DisablePaste);
+            Ok(())
+        }
+
+        fn disable_mouse(&self) -> io::Result<()> {
+            self.record(MockOperation::DisableMouse);
             Ok(())
         }
 
@@ -436,6 +477,7 @@ mod tests {
         let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
             operations: Arc::clone(&operations),
             keyboard_error: Some(io::ErrorKind::Unsupported),
+            mouse_error: None,
         });
         let mut stages = Vec::new();
 
@@ -449,6 +491,7 @@ mod tests {
                 TerminalStage::SignalRegistered,
                 TerminalStage::Raw,
                 TerminalStage::Alternate,
+                TerminalStage::Mouse,
                 TerminalStage::Paste,
             ]
         );
@@ -458,8 +501,10 @@ mod tests {
                 MockOperation::EnableRaw,
                 MockOperation::PushKeyboard,
                 MockOperation::EnterAlternate,
+                MockOperation::EnableMouse,
                 MockOperation::EnablePaste,
                 MockOperation::DisablePaste,
+                MockOperation::DisableMouse,
                 MockOperation::LeaveAlternate,
                 MockOperation::DisableRaw,
             ]
@@ -472,6 +517,7 @@ mod tests {
         let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
             operations: Arc::clone(&operations),
             keyboard_error: None,
+            mouse_error: None,
         });
 
         let guard = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops).unwrap();
@@ -483,8 +529,10 @@ mod tests {
                 MockOperation::EnableRaw,
                 MockOperation::PushKeyboard,
                 MockOperation::EnterAlternate,
+                MockOperation::EnableMouse,
                 MockOperation::EnablePaste,
                 MockOperation::DisablePaste,
+                MockOperation::DisableMouse,
                 MockOperation::LeaveAlternate,
                 MockOperation::PopKeyboard,
                 MockOperation::DisableRaw,
@@ -498,6 +546,7 @@ mod tests {
         let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
             operations: Arc::clone(&operations),
             keyboard_error: Some(io::ErrorKind::BrokenPipe),
+            mouse_error: None,
         });
         let mut stages = Vec::new();
 
@@ -519,6 +568,52 @@ mod tests {
                 MockOperation::DisableRaw,
             ]
         );
+    }
+
+    #[test]
+    fn mouse_capture_failure_rolls_back_alternate_keyboard_and_raw_modes() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+            mouse_error: Some(io::ErrorKind::BrokenPipe),
+        });
+        let mut stages = Vec::new();
+
+        let result = TerminalGuard::enter_with_hook_and_ops(|stage| stages.push(stage), &ops);
+        let Err(TuiError::Io(error)) = result else {
+            panic!("mouse-stage failure must be returned as I/O");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            stages,
+            vec![
+                TerminalStage::SignalRegistered,
+                TerminalStage::Raw,
+                TerminalStage::Keyboard,
+                TerminalStage::Alternate,
+            ]
+        );
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                MockOperation::EnableRaw,
+                MockOperation::PushKeyboard,
+                MockOperation::EnterAlternate,
+                MockOperation::EnableMouse,
+                MockOperation::LeaveAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
+    }
+
+    #[test]
+    fn crossterm_mouse_capture_commands_are_writable() {
+        let ops = CrosstermTerminalOps;
+        ops.enable_mouse().unwrap();
+        ops.disable_mouse().unwrap();
     }
 
     #[test]
@@ -555,12 +650,14 @@ mod tests {
         let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
             operations: Arc::clone(&operations),
             keyboard_error: None,
+            mouse_error: None,
         });
         let restored = Arc::new(Mutex::new(false));
         let stages = Arc::new(Mutex::new(TerminalStages {
             raw: true,
             keyboard: true,
             alternate: true,
+            mouse: true,
             paste: true,
         }));
         let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -590,6 +687,7 @@ mod tests {
             cleanup,
             vec![
                 TerminalCleanupStage::Paste,
+                TerminalCleanupStage::Mouse,
                 TerminalCleanupStage::Alternate,
                 TerminalCleanupStage::Keyboard,
                 TerminalCleanupStage::Raw,
@@ -599,6 +697,7 @@ mod tests {
             *operations.lock().unwrap(),
             vec![
                 MockOperation::DisablePaste,
+                MockOperation::DisableMouse,
                 MockOperation::LeaveAlternate,
                 MockOperation::PopKeyboard,
                 MockOperation::DisableRaw,
@@ -607,6 +706,6 @@ mod tests {
         guard.restore_with_hook(|_| panic!("cleanup must be idempotent"));
         drop(guard);
         assert!(*restored.lock().unwrap());
-        assert_eq!(operations.lock().unwrap().len(), 4);
+        assert_eq!(operations.lock().unwrap().len(), 5);
     }
 }

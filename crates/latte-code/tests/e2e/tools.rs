@@ -13,6 +13,34 @@ fn git(scenario: &Scenario, args: &[&str]) {
 
 #[cfg(unix)]
 #[test]
+fn public_engine_changed_files_combines_tracked_and_untracked_git_state() {
+    let scenario = Scenario::new();
+    scenario.init_git();
+    std::fs::write(scenario.root().join("tracked.txt"), "before\n").unwrap();
+    git(&scenario, &["add", "tracked.txt"]);
+    git(&scenario, &["commit", "--quiet", "-m", "tracked baseline"]);
+    std::fs::write(scenario.root().join("tracked.txt"), "after\n").unwrap();
+    std::fs::write(scenario.root().join("untracked.txt"), "new\n").unwrap();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(scenario.root().join(".latte/ignored-state"), "ignored\n").unwrap();
+
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    let changed = engine.changed_files().unwrap();
+    assert_eq!(changed, vec!["tracked.txt", "untracked.txt"]);
+    assert!(!changed.iter().any(|path| path.contains(".latte")));
+    drop(engine);
+
+    scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
+    let listed = scenario.output(&["--json", "list"], |_| {});
+    assert!(listed.status.success());
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::too_many_lines)]
 fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
     use super::support::PtySession;
@@ -682,7 +710,7 @@ fn process_shell_deny_never_spawns_or_reenters_provider() {
     assert!(wait_until(Duration::from_secs(5), || {
         engine.list_threads_v2().is_ok_and(|threads| {
             threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
+                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
                 && threads[0].pending.is_none()
         })
     }));
@@ -692,6 +720,54 @@ fn process_shell_deny_never_spawns_or_reenters_provider() {
     pty.write(b"\x1b[21~");
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn final_cli_process_input_validation_matrix_fails_before_spawn() {
+    let cases = [
+        serde_json::json!({"argv":["/bin/echo", 1],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"shell":"echo duplicate","cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":0,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":0,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":1000,"grace_ms":50,"stdout_cap":0,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":[],"timeout_ms":1000,"grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+        serde_json::json!({"argv":["/bin/echo"],"cwd":".","env":{},"timeout_ms":"slow","grace_ms":50,"stdout_cap":1024,"stderr_cap":1024}),
+    ];
+    for (index, input) in cases.into_iter().enumerate() {
+        let scenario = Scenario::new();
+        let provider = ScriptedProvider::start([
+            ProviderReply::tool_call(&format!("invalid-process-{index}"), "process", &input),
+            ProviderReply::completion("invalid process was reported without spawning"),
+        ]);
+        scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+        let first = scenario.output(&["--json", "run", "invalid process input"], |command| {
+            command.env("TEST_OPENAI_KEY", "process-validation-secret");
+        });
+        let output = if first.status.code() == Some(10) {
+            let run_id = json(&first)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .to_owned();
+            scenario.output(&["--json", "resume", &run_id, "--allow"], |command| {
+                command.env("TEST_OPENAI_KEY", "process-validation-secret");
+            })
+        } else {
+            first
+        };
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "case {index}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!scenario.root().join("invalid-process-output").exists());
+        assert!((1..=2).contains(&provider.requests().len()));
+    }
 }
 
 #[cfg(unix)]
@@ -719,6 +795,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
         ProviderReply::completion("both queued writes verified"),
     ]);
     scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+    std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -757,6 +834,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     );
     assert!(!scenario.root().join("first-created.txt").exists());
     assert!(!scenario.root().join("second-created.txt").exists());
+    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
     first.write(b"\x1b[21~");
     assert!(first.finish(Duration::from_secs(5)).0.success());
 
@@ -764,6 +842,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     second_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut second = PtySession::spawn(second_command);
     assert!(second.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
+    second.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(second.wait_for_output(b"Permission required", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     second.write(b"\x1b[97;5u");
@@ -783,6 +862,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     third_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut third = PtySession::spawn(third_command);
     assert!(third.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
+    third.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(third.wait_for_output(b"Permission required", Duration::from_secs(5)));
     third.write(b"\x1b[97;5u");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));

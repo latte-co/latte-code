@@ -24,14 +24,30 @@ const EXIT_DENIED: i32 = 11;
 const EXIT_INTERNAL: i32 = 70;
 const EXIT_INTERRUPTED: i32 = 130;
 const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
-const DEFAULT_CONFIG: &str = include_str!("../../../latte-code.config.example.jsonc");
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nConfiguration is optional. Latte Code merges built-in defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials are environment references in those files.";
+const DEFAULT_CONFIG: &str = r#"{
+  version: 1,
+  thread: {
+    max_request_bytes: 524288,
+    max_input_bytes: 393216,
+    reserved_output_bytes: 131072,
+    context_cap_bytes: 65536,
+  },
+  database: { path: ".latte/latte-code.db" },
+  verification: {
+    argv: ["cargo", "test", "--workspace"],
+    cwd: ".",
+    timeout_ms: 120000,
+  },
+  providers: {},
+}"#;
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials may be literal strings or environment references in those files.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub version: u32,
-    pub default_provider: String,
+    #[serde(default)]
+    pub default_model: String,
     pub providers: serde_json::Value,
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -137,8 +153,8 @@ impl AppConfig {
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
         Ok((config, registry))
     }
-    fn database_path(&self, root: &std::path::Path) -> std::path::PathBuf {
-        let path = std::path::Path::new(&self.database.path);
+    fn database_path(&self, root: &Path) -> PathBuf {
+        let path = Path::new(&self.database.path);
         if path.is_absolute() {
             path.to_owned()
         } else {
@@ -184,11 +200,24 @@ fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
 }
 
 fn merge_value(base: &mut Value, overlay: Value) {
+    merge_value_at(base, overlay, &mut Vec::new());
+}
+
+fn merge_value_at(base: &mut Value, overlay: Value, path: &mut Vec<String>) {
     match (base, overlay) {
         (Value::Object(base), Value::Object(overlay)) => {
             for (key, value) in overlay {
+                // A model object is one Provider's complete picker catalog.
+                // Treat it as an atomic value so a later configuration layer
+                // cannot inherit stale models from an earlier layer.
+                if key == "models" && path.len() == 2 && path[0] == "providers" {
+                    base.insert(key, value);
+                    continue;
+                }
                 if let Some(existing) = base.get_mut(&key) {
-                    merge_value(existing, value);
+                    path.push(key);
+                    merge_value_at(existing, value, path);
+                    path.pop();
                 } else {
                     base.insert(key, value);
                 }
@@ -225,14 +254,78 @@ fn workspace_display_path_with_home(root: &Path, home: Option<&Path>) -> String 
     }
 }
 
+fn workspace_identity(root: &Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    canonical
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "workspace root is not valid UTF-8".into())
+}
+
 struct ThreadEngineProjection {
     engine: latte_engine::EngineHandle,
     subscription: latte_engine::ThreadSubscription,
+    workspace_root: String,
 }
 impl latte_tui::thread::ThreadProjectionClient for ThreadEngineProjection {
     fn snapshots(&mut self) -> Result<Vec<latte_core::ThreadSnapshot>, String> {
         self.engine
-            .list_threads_v2()
+            .list_threads_v2_for_workspace(&self.workspace_root)
+            .map_err(|error| error.to_string())
+    }
+    fn session_catalog(&mut self) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+        self.engine
+            .list_thread_sessions_v2_for_workspace(&self.workspace_root, 200)
+            .map_err(|error| error.to_string())
+    }
+    fn exact_session_catalog(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+        if let Ok(thread_id) =
+            serde_json::from_value::<ThreadId>(serde_json::Value::String(query.into()))
+        {
+            let Some(metadata) = self
+                .engine
+                .thread_session_v2(thread_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(Vec::new());
+            };
+            if metadata.workspace_root != self.workspace_root {
+                return Err(format!(
+                    "session {thread_id} belongs to another workspace; explicit rebinding is required"
+                ));
+            }
+            return Ok(vec![metadata]);
+        }
+        self.engine
+            .find_thread_sessions_v2_by_exact_title_for_workspace(&self.workspace_root, query, 200)
+            .map_err(|error| error.to_string())
+    }
+    fn session(&mut self, thread_id: ThreadId) -> Result<latte_core::ThreadSnapshot, String> {
+        let metadata = self
+            .engine
+            .thread_session_v2(thread_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("session {thread_id} was not found"))?;
+        if metadata.workspace_root != self.workspace_root {
+            return Err(format!(
+                "session {thread_id} belongs to another workspace; explicit rebinding is required"
+            ));
+        }
+        self.engine
+            .thread_snapshot_tail_v2(thread_id, 500)
+            .map_err(|error| error.to_string())
+    }
+    fn exact_session(&mut self, query: &str) -> Result<Option<latte_core::ThreadSnapshot>, String> {
+        let matches = self.exact_session_catalog(query)?;
+        let [metadata] = matches.as_slice() else {
+            return Ok(None);
+        };
+        self.engine
+            .thread_snapshot_tail_v2(metadata.thread_id, 500)
+            .map(Some)
             .map_err(|error| error.to_string())
     }
     fn poll(&mut self) -> latte_tui::thread::ThreadProjectionPoll {
@@ -481,7 +574,7 @@ fn deny_headless(
         );
     }
     let now = wall_time_ms();
-    let lease = match engine.acquire_lease(&format!("agent-{run_id}"), now, 60_000) {
+    let lease = match engine.acquire_run_lease(run_id, &format!("agent-{run_id}"), now, 60_000) {
         Ok(lease) => lease,
         Err(error) => {
             return emit_error(
@@ -568,16 +661,31 @@ fn execute_tui() -> i32 {
             return EXIT_INTERNAL;
         }
     };
-    let startup_binding =
-        match registry.thread_binding_for(registry.default_name(), &engine.tool_descriptors()) {
-            Ok(binding) => binding,
-            Err(error) => {
-                eprintln!("configuration: {error}");
-                return EXIT_USAGE;
-            }
-        };
+    let startup_binding = match registry.thread_binding_for_default(&engine.tool_descriptors()) {
+        Ok(binding) => Some(binding),
+        Err(_) if registry.model_catalog().is_empty() => None,
+        Err(error) => {
+            eprintln!("configuration: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let startup = latte_tui::thread::ThreadStartupPresentation {
-        default_model: startup_binding.model.clone(),
+        default_provider: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.provider_name.clone()),
+        default_model: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.model.clone()),
+        model_catalog: registry
+            .model_catalog()
+            .into_iter()
+            .map(|entry| latte_tui::thread::ThreadModelOption {
+                provider_name: entry.provider_name,
+                model: entry.model,
+                name: entry.name,
+                is_default: entry.is_default,
+            })
+            .collect(),
         workspace_display: workspace_display_path(&root),
         permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
     };
@@ -601,9 +709,17 @@ fn execute_tui() -> i32 {
     let mut projection = ThreadEngineProjection {
         engine: engine.clone(),
         subscription: engine.subscribe_threads(),
+        workspace_root: match workspace_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) => {
+                eprintln!("configuration: {error}");
+                return EXIT_USAGE;
+            }
+        },
     };
     let (feedback_tx, feedback_rx) =
         std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
+    let action_registry = registry.clone();
     match latte_tui::thread::run_with_feedback_and_progress(
         &mut projection,
         startup,
@@ -613,13 +729,65 @@ fn execute_tui() -> i32 {
                     submission_id,
                     prompt,
                 } => {
-                    let binding = startup_binding.clone();
+                    let Some(binding) = startup_binding.clone() else {
+                        let _ = feedback_tx.send(
+                            latte_tui::thread::ThreadUiFeedback::submission(
+                                submission_id,
+                                Err("configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code".into()),
+                            ),
+                        );
+                        return Ok(());
+                    };
                     let service = service.clone();
                     let feedback = feedback_tx.clone();
+                    let thread_id =
+                        ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
+                    let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::assigned(
+                        submission_id,
+                        thread_id,
+                    ));
                     tokio::spawn(async move {
-                        let thread_id = ThreadId::from_uuid(
-                            latte_core::SystemIdSource::default().next_uuid_v7(),
-                        );
+                        let result = service
+                            .start(thread_id, prompt, binding)
+                            .await
+                            .map(|_| "conversation completed".into())
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
+                            submission_id,
+                            result,
+                        ));
+                    });
+                }
+                latte_tui::thread::ThreadUiAction::StartWithModel {
+                    submission_id,
+                    prompt,
+                    provider_name,
+                    model,
+                } => {
+                    let binding = match action_registry.thread_binding_for_model(
+                        &provider_name,
+                        &model,
+                        &engine.tool_descriptors(),
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            let _ =
+                                feedback_tx.send(latte_tui::thread::ThreadUiFeedback::submission(
+                                    submission_id,
+                                    Err(error.to_string()),
+                                ));
+                            return Ok(());
+                        }
+                    };
+                    let service = service.clone();
+                    let feedback = feedback_tx.clone();
+                    let thread_id =
+                        ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
+                    let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::assigned(
+                        submission_id,
+                        thread_id,
+                    ));
+                    tokio::spawn(async move {
                         let result = service
                             .start(thread_id, prompt, binding)
                             .await
@@ -663,6 +831,7 @@ fn execute_tui() -> i32 {
                     });
                 }
                 latte_tui::thread::ThreadUiAction::ProvideInput {
+                    submission_id,
                     thread_id,
                     request_id,
                     value,
@@ -680,13 +849,21 @@ fn execute_tui() -> i32 {
                                     .await
                                     .map(|_| "input accepted".into())
                                     .map_err(|error| error.to_string());
-                                let _ = feedback
-                                    .send(latte_tui::thread::ThreadUiFeedback::command(result));
+                                let _ = feedback.send(
+                                    latte_tui::thread::ThreadUiFeedback::input_submission(
+                                        submission_id,
+                                        result,
+                                    ),
+                                );
                             });
                         }
                         Err(error) => {
-                            let _ = feedback
-                                .send(latte_tui::thread::ThreadUiFeedback::command(Err(error)));
+                            let _ = feedback.send(
+                                latte_tui::thread::ThreadUiFeedback::input_submission(
+                                    submission_id,
+                                    Err(error),
+                                ),
+                            );
                         }
                     }
                 }
@@ -745,7 +922,42 @@ fn execute_tui() -> i32 {
                         let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
                     });
                 }
+                latte_tui::thread::ThreadUiAction::SwitchModel {
+                    switch_id,
+                    thread_id,
+                    expected_thread_revision,
+                    provider_name,
+                    model,
+                } => {
+                    let binding = action_registry
+                        .thread_binding_for_model(
+                            &provider_name,
+                            &model,
+                            &engine.tool_descriptors(),
+                        )
+                        .map_err(|error| error.to_string());
+                    let service = service.clone();
+                    let feedback = feedback_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = binding.and_then(|binding| {
+                            service
+                                .switch_model(thread_id, expected_thread_revision, &binding)
+                                .map(|snapshot| {
+                                    format!(
+                                        "Model switched to {}/{}",
+                                        snapshot.binding.provider_name, snapshot.binding.model
+                                    )
+                                })
+                                .map_err(|error| error.to_string())
+                        });
+                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::model_switch(
+                            switch_id, result,
+                        ));
+                    });
+                }
                 latte_tui::thread::ThreadUiAction::RefreshSnapshots
+                | latte_tui::thread::ThreadUiAction::ShowSessions { .. }
+                | latte_tui::thread::ThreadUiAction::OpenSession { .. }
                 | latte_tui::thread::ThreadUiAction::Quit => {}
             }
             Ok(())
@@ -841,7 +1053,7 @@ mod tests {
         ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root, dot,
         emit_data, emit_error, execute_tui, merge_optional_config, merge_value, outcome,
         reconcile_thread_action, render_run, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home,
+        workspace_display_path_with_home, workspace_identity,
     };
     use latte_core::{
         Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
@@ -905,14 +1117,11 @@ mod tests {
         assert_eq!(threads.context_cap_bytes, policy.context_cap_bytes);
         assert_eq!(DatabaseConfig::default().path, ".latte/latte-code.db");
 
-        let absolute = tempfile::tempdir().unwrap().path().join("absolute.db");
         let config = AppConfig {
             version: 1,
-            default_provider: "primary".into(),
+            default_model: "primary/test".into(),
             providers: json!({}),
-            database: DatabaseConfig {
-                path: absolute.display().to_string(),
-            },
+            database: DatabaseConfig::default(),
             verification: VerificationConfig {
                 argv: vec!["cargo".into(), "test".into()],
                 cwd: "checks".into(),
@@ -920,7 +1129,6 @@ mod tests {
             },
             thread: threads,
         };
-        assert_eq!(config.database_path(Path::new("/ignored")), absolute);
         let plan = config.plan();
         assert_eq!(plan.argv, ["cargo", "test"]);
         assert_eq!(plan.cwd, "checks");
@@ -931,6 +1139,38 @@ mod tests {
         let derived = config.thread_policy();
         assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
         assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
+        assert_eq!(
+            config.database_path(Path::new("/workspace")),
+            Path::new("/workspace/.latte/latte-code.db")
+        );
+    }
+
+    #[test]
+    fn workspace_identity_is_canonical_and_database_path_honors_absolute_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            workspace_identity(root.path()).unwrap(),
+            std::fs::canonicalize(root.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let absolute = root.path().join("state.db");
+        let config = AppConfig {
+            version: 1,
+            default_model: "primary/test".into(),
+            providers: json!({}),
+            database: DatabaseConfig {
+                path: absolute.display().to_string(),
+            },
+            verification: VerificationConfig {
+                argv: vec!["true".into()],
+                cwd: ".".into(),
+                timeout_ms: 1,
+            },
+            thread: ThreadConfig::default(),
+        };
+        assert_eq!(config.database_path(Path::new("/ignored")), absolute);
     }
 
     #[test]
@@ -938,6 +1178,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::create_dir_all(home.path().join(".latte")).unwrap();
+        std::fs::write(
+            home.path().join(".latte/latte-code.jsonc"),
+            r#"{
+                default_model: "primary/model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: ["model"],
+                    endpoint: "https://provider.example/chat/completions",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } }
+            }"#,
+        )
+        .unwrap();
         let config_path = root.path().join(".latte/latte-code.jsonc");
 
         std::fs::write(&config_path, "[]").unwrap();
@@ -1000,7 +1254,7 @@ mod tests {
     fn verification_defaults_and_output_contracts_are_stable_for_humans_and_json() {
         let config: AppConfig = serde_json::from_value(json!({
             "version": 1,
-            "default_provider": "primary",
+            "default_model": "primary/test",
             "providers": {},
             "verification": { "argv": ["true"] }
         }))
@@ -1141,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workspace_and_projection_adapters_cover_empty_event_and_lagged_states() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("no/git/here");
@@ -1156,9 +1411,11 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
+        let canonical_root = workspace_identity(root.path()).unwrap();
         let mut projection = ThreadEngineProjection {
             subscription: engine.subscribe_threads(),
             engine: engine.clone(),
+            workspace_root: canonical_root.clone(),
         };
         assert!(projection.snapshots().unwrap().is_empty());
         assert_eq!(projection.poll(), ThreadProjectionPoll::Empty);
@@ -1178,7 +1435,7 @@ mod tests {
             credential_generation: 1,
         };
         let mut created = Vec::new();
-        for index in 0..70 {
+        for index in 0..510 {
             let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
             let run_id = RunId::from_uuid(ids.next_uuid_v7());
             engine
@@ -1192,10 +1449,76 @@ mod tests {
                 .unwrap();
             created.push((thread_id, run_id));
         }
-        let lease = engine
-            .acquire_lease("projection-test", 100, 10_000)
-            .unwrap();
-        for (index, (thread_id, run_id)) in created.into_iter().enumerate() {
+        let first_thread_id = created[0].0;
+        let catalog = projection.session_catalog().unwrap();
+        assert_eq!(catalog.len(), 200);
+        assert!(
+            catalog
+                .iter()
+                .all(|session| session.workspace_root == canonical_root)
+        );
+        assert_eq!(
+            projection.session(first_thread_id).unwrap().thread_id,
+            first_thread_id
+        );
+        assert_eq!(
+            projection
+                .exact_session(&first_thread_id.to_string())
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            first_thread_id,
+            "exact resume must not inherit the recent catalog cap"
+        );
+        assert_eq!(
+            projection
+                .exact_session("thread-0")
+                .unwrap()
+                .unwrap()
+                .thread_id,
+            first_thread_id,
+            "exact title resume must search beyond the recent catalog cap"
+        );
+
+        let mut foreign_projection = ThreadEngineProjection {
+            subscription: engine.subscribe_threads(),
+            engine: engine.clone(),
+            workspace_root: "/another/workspace".into(),
+        };
+        assert!(foreign_projection.session_catalog().unwrap().is_empty());
+        assert!(
+            foreign_projection
+                .session(first_thread_id)
+                .unwrap_err()
+                .contains("belongs to another workspace")
+        );
+        assert!(
+            foreign_projection
+                .exact_session(&first_thread_id.to_string())
+                .unwrap_err()
+                .contains("belongs to another workspace")
+        );
+        assert!(
+            projection
+                .exact_session("not-a-session-id")
+                .unwrap()
+                .is_none()
+        );
+        let missing_thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            projection
+                .session(missing_thread_id)
+                .unwrap_err()
+                .contains("was not found")
+        );
+        assert!(
+            projection
+                .exact_session(&missing_thread_id.to_string())
+                .unwrap()
+                .is_none()
+        );
+        for (index, (thread_id, run_id)) in created.iter().copied().take(70).enumerate() {
+            let lease = engine.acquire_thread_lease(thread_id, 100, 10_000).unwrap();
             engine
                 .commit_thread_run_update(
                     ThreadCommitRequest {
@@ -1218,7 +1541,7 @@ mod tests {
         assert!(matches!(projection.poll(), ThreadProjectionPoll::Lagged(count) if count > 0));
         assert_eq!(projection.poll(), ThreadProjectionPoll::Event);
         let refreshed = projection.snapshots().unwrap();
-        assert_eq!(refreshed.len(), 70);
+        assert_eq!(refreshed.len(), 510);
     }
 
     #[test]
@@ -1236,19 +1559,21 @@ mod tests {
         let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
         assert_eq!(config.thread.max_request_bytes, 524_288);
         assert_eq!(config.thread.reserved_output_bytes, 131_072);
-        assert_eq!(registry.default_name(), "primary");
+        assert_eq!(registry.default_name(), Some("primary"));
+        assert_eq!(registry.default_model(), Some("model-id"));
     }
 
     #[test]
-    fn missing_configuration_uses_built_in_defaults() {
+    fn missing_provider_configuration_keeps_read_only_state_commands_available() {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
 
         let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
 
+        assert!(config.default_model.is_empty());
         assert_eq!(config.database.path, ".latte/latte-code.db");
-        assert_eq!(config.verification.argv, ["cargo", "test", "--workspace"]);
-        assert_eq!(registry.default_name(), "primary");
+        assert!(registry.model_catalog().is_empty());
+        assert!(registry.thread_binding_for_default(&[]).is_err());
     }
 
     #[test]
@@ -1262,7 +1587,13 @@ mod tests {
             r#"{
                 database: { path: "user.db" },
                 verification: { timeout_ms: 9000 },
-                providers: { primary: { model: "user-model" } }
+                default_model: "primary/user-model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "user-model": {} },
+                    endpoint: "https://provider.example/chat/completions",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } }
             }"#,
         )
         .unwrap();
@@ -1270,17 +1601,19 @@ mod tests {
             root.path().join(".latte/latte-code.jsonc"),
             r#"{
                 database: { path: "workspace.db" },
-                providers: { primary: { model: "workspace-model" } }
+                default_model: "primary/workspace-model",
+                providers: { primary: { models: { "workspace-model": {} } } }
             }"#,
         )
         .unwrap();
 
         let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
-        let binding = registry.thread_binding_for("primary", &[]).unwrap();
+        let binding = registry.thread_binding_for_default(&[]).unwrap();
 
         assert_eq!(config.database.path, "workspace.db");
         assert_eq!(config.verification.timeout_ms, 9000);
         assert_eq!(binding.model, "workspace-model");
+        assert_eq!(registry.model_catalog().len(), 1);
     }
 
     #[test]
@@ -1352,7 +1685,7 @@ mod tests {
         engine
             .create_thread_v2(thread_id, run_id, binding, "recover", 1)
             .unwrap();
-        let lease = engine.acquire_lease("test", 2, 10_000).unwrap();
+        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
         let running = engine
             .commit_thread_run_update(
                 ThreadCommitRequest {

@@ -1,6 +1,10 @@
-use super::support::{Scenario, ScriptedProvider, json};
+use super::support::{PtySession, Scenario, ScriptedProvider, json};
+use latte_core::{IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2};
 use rusqlite::Connection;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path, time::Duration};
+
+const TUI_READY: &[u8] = b"\x1b[>3u";
+const F10: &[u8] = b"\x1b[21~";
 
 fn sqlite_execute(database: &Path, sql: &str) {
     Connection::open(database)
@@ -120,14 +124,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        8
+        10
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        8
+        10
     );
     assert_eq!(
         sqlite_integer(
@@ -164,7 +168,13 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
             r"
             PRAGMA foreign_keys=ON;
             DROP TABLE thread_effect_canonical_v2;
-            DELETE FROM schema_migrations WHERE version=8;
+            DROP TABLE runtime_lease;
+            DROP TABLE runtime_lease_epoch;
+            CREATE TABLE runtime_lease(
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
+              fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
+            );
+            DELETE FROM schema_migrations WHERE version IN (8,9,10);
             PRAGMA user_version=7;
             INSERT INTO runs(
               run_id, state_json, status, revision, last_seq, lease_token,
@@ -220,12 +230,12 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
     provider.assert_consumed();
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        8
+        10
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=8;"
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=10;"
         ),
         1
     );
@@ -243,6 +253,93 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "engine_initialization");
     assert_eq!(
         json(&output)["error"]["message"],
-        "database schema version 99 is newer than supported version 8"
+        "database schema version 99 is newer than supported version 10"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn v8_session_catalog_migrates_workspace_and_title_then_reopens_in_final_tui() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+    std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
+    let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    engine
+        .create_thread_v2(
+            thread_id,
+            run_id,
+            ThreadProviderBindingV2 {
+                version: 1,
+                provider_name: "main".into(),
+                provider_type: "openai-chat".into(),
+                protocol: "openai-chat-completions-v1".into(),
+                model: "mock".into(),
+                config_fingerprint: "legacy-v8-config".into(),
+                tools_fingerprint: "legacy-v8-tools".into(),
+                aliases: BTreeMap::new(),
+                credential_ref_id: "env:TEST_OPENAI_KEY".into(),
+                data_scope_id: "workspace".into(),
+                credential_generation: 1,
+            },
+            "restore the legacy session catalog title",
+            latte_core::wall_time_ms(),
+        )
+        .unwrap();
+    drop(engine);
+
+    // Reconstruct the historical v8 authority schema. This is deliberately a
+    // compatibility fixture: current state was first created through the
+    // public Engine, and acceptance still comes from a fresh final TUI.
+    sqlite_execute(
+        &scenario.database_path(),
+        r"
+        PRAGMA foreign_keys=OFF;
+        ALTER TABLE threads_v2 DROP COLUMN title;
+        ALTER TABLE threads_v2 DROP COLUMN workspace_root;
+        DROP TABLE runtime_lease;
+        DROP TABLE runtime_lease_epoch;
+        CREATE TABLE runtime_lease(
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
+          fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
+        );
+        DELETE FROM schema_migrations WHERE version IN (9,10);
+        PRAGMA user_version=8;
+        PRAGMA foreign_keys=ON;
+        ",
+    );
+
+    let mut pty = PtySession::spawn(scenario.command(&["tui"]));
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
+    assert!(
+        pty.wait_for_output(
+            b"restore the legacy session catalog title",
+            Duration::from_secs(5)
+        ),
+        "migrated v8 session did not render: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(F10);
+    assert!(pty.finish(Duration::from_secs(5)).0.success());
+    assert_eq!(
+        sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
+        10
+    );
+    assert_eq!(
+        Connection::open(scenario.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT title FROM threads_v2 WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "restore the legacy session catalog title"
     );
 }

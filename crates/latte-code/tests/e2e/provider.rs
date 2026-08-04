@@ -237,6 +237,75 @@ fn unsupported_empty_stream_response_falls_back_inline_once() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_attempt() {
+    let inline_scenario = Scenario::new();
+    let inline_provider =
+        ScriptedProvider::start([ProviderReply::completion("inline while streaming")]);
+    let inline = run_with_provider(
+        &inline_scenario,
+        &inline_provider,
+        ",timeout_ms:1000,max_attempts:2,streaming:true",
+    );
+    assert!(inline.status.success());
+    assert_eq!(
+        json(&inline)["data"]["run"]["handoff"]["summary"],
+        "inline while streaming"
+    );
+    inline_provider.assert_consumed();
+    assert_eq!(inline_provider.requests().len(), 1);
+    assert_eq!(inline_provider.requests()[0].body["stream"], true);
+
+    let fallback_http_scenario = Scenario::new();
+    let fallback_http_provider = ScriptedProvider::start([
+        ProviderReply::raw(415, "application/json", Vec::new()),
+        ProviderReply::json(429, &serde_json::json!({"error": "limited"}))
+            .header("X-Request-Id", "fallback-request"),
+    ]);
+    let fallback_http = run_with_provider(
+        &fallback_http_scenario,
+        &fallback_http_provider,
+        ",timeout_ms:1000,max_attempts:3,streaming:true",
+    );
+    assert_eq!(fallback_http.status.code(), Some(1));
+    assert!(
+        json(&fallback_http)["data"]["run"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("http 429 (request fallback-request)")
+    );
+    fallback_http_provider.assert_consumed();
+    assert_eq!(fallback_http_provider.requests().len(), 2);
+    assert!(
+        fallback_http_provider.requests()[1]
+            .body
+            .get("stream")
+            .is_none()
+    );
+
+    let fallback_malformed_scenario = Scenario::new();
+    let fallback_malformed_provider = ScriptedProvider::start([
+        ProviderReply::raw(422, "application/json", Vec::new()),
+        ProviderReply::raw(200, "application/json", b"not-json".to_vec()),
+    ]);
+    let fallback_malformed = run_with_provider(
+        &fallback_malformed_scenario,
+        &fallback_malformed_provider,
+        ",timeout_ms:1000,max_attempts:3,streaming:true",
+    );
+    assert_eq!(fallback_malformed.status.code(), Some(1));
+    assert_eq!(json(&fallback_malformed)["data"]["run"]["status"], "failed");
+    assert!(
+        !json(&fallback_malformed)["data"]["run"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    fallback_malformed_provider.assert_consumed();
+    assert_eq!(fallback_malformed_provider.requests().len(), 2);
+}
+
+#[test]
 fn nonstandard_input_and_provider_state_fail_closed_without_a_second_call() {
     for (body, expected) in [
         (
@@ -359,6 +428,65 @@ fn secret_input_empty_assistant_and_nonobject_tool_input_fail_durably() {
             command.env("TEST_OPENAI_KEY", "secret");
         });
         assert_eq!(output.status.code(), Some(1));
+        assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+        assert!(
+            json(&output)["data"]["run"]["failure"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "{}",
+            json(&output)
+        );
+        provider.assert_consumed();
+        assert_eq!(provider.requests().len(), 1);
+    }
+}
+
+#[test]
+fn malformed_inline_tool_calls_are_terminal_and_never_reenter_the_provider() {
+    let cases = [
+        (
+            serde_json::json!({
+                "choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": "malformed-arguments",
+                    "function": {"name": "read_file", "arguments": "{"}
+                }]}}]
+            }),
+            "EOF while parsing an object",
+        ),
+        (
+            serde_json::json!({
+                "choices": [{"message": {"content": "", "tool_calls": [
+                    {"id": "duplicate", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "duplicate", "function": {"name": "search", "arguments": "{}"}}
+                ]}}]
+            }),
+            "must match [A-Za-z0-9_-]{1,256} and be unique",
+        ),
+        (
+            serde_json::json!({
+                "choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": "contains whitespace",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]}}]
+            }),
+            "must match [A-Za-z0-9_-]{1,256} and be unique",
+        ),
+    ];
+
+    for (body, expected) in cases {
+        let scenario = Scenario::new();
+        let provider = ScriptedProvider::start([ProviderReply::json(200, &body)]);
+        let output = run_with_provider(&scenario, &provider, ",max_attempts:3");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "expected {expected}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(json(&output)["status"], "failed");
         assert_eq!(json(&output)["data"]["run"]["status"], "failed");
         assert!(
             json(&output)["data"]["run"]["failure"]["message"]

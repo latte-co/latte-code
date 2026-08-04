@@ -51,8 +51,16 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
         String::from_utf8_lossy(&pty.output())
     );
 
+    let before_expand = pty.output().len();
     pty.resize(36, 108);
-    pty.write(b"ask for one follow-up value\r");
+    assert!(pty.wait_for_growth(before_expand, INSTRUMENTED_WAIT));
+    pty.write(b"ask for one follow-up value");
+    assert!(
+        pty.wait_for_output(b"\x1b[34;33H", INSTRUMENTED_WAIT),
+        "follow-up composer did not accept input after resize: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(b"\r");
     assert!(provider.wait_for_calls(2, INSTRUMENTED_WAIT));
     assert!(pty.wait_for_output(b"Input required", INSTRUMENTED_WAIT));
     pty.write(b"\x1b[200~matrix-value\nsecond-line\x1b[201~");
@@ -144,11 +152,20 @@ fn ctrl_c_during_provider_wait_interrupts_cleanly_and_restart_never_reenters() {
             .iter()
             .any(|run| run["status"] == "interrupted")
     );
+    let thread_id = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap()
+        .list_threads_v2()
+        .unwrap()[0]
+        .thread_id;
 
     let mut restart_command = scenario.command(&["tui"]);
     restart_command.env("TEST_OPENAI_KEY", "cancel-secret");
     let mut restart = PtySession::spawn(restart_command);
     assert!(restart.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    restart.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(restart.wait_for_output(b"Interrupted", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     restart.write(F10);

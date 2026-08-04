@@ -23,5 +23,7 @@ tempfile.workspace=true
 uuid.workspace=true
 rusqlite.workspace=true
 nix={workspace=true,features=["term"]}
+ratatui.workspace=true
+crossterm.workspace=true
 [lints]
 workspace=true

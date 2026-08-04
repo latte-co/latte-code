@@ -66,9 +66,10 @@ prompt 不会改变 descriptor、approval、revision 或执行顺序，而会保
 
 mailbox、partial delta、stream handle、timer 与 cancellation token 都是进程内状态。
 接受 entry 时 TUI 可显示 `InputQueued` progress，但不写 JSONL、SQLite 或 telemetry。
-entry 实际进入 Provider Request 且获得第一个完整有效 outcome 后，才按会话存储的
-物化点把精确输入与 outcome 追加 JSONL 并创建所需 Run/control state。启动失败、满
-队列、过期 reminder 或进程退出不会创建 Conversation Record。
+Runner 在安全注入点消费 Entry 时，会先按会话存储的物化点追加精确输入并创建
+Child Run/Control State，再构造或调用 Provider，完整 Outcome 随后追加。Provider
+启动失败会向这个已接受的 Conversation Record 追加有界、已脱敏的 Failure；满队列、
+过期 Reminder 或消费前进程退出不会创建 Record。
 
 容量和单 entry 字节数必须有界、可配置，且在资源预算内；满时返回无密钥
 `MailboxFull` 并保留 composer，绝不丢弃旧输入。只有当前 Session lease owner 可
@@ -90,4 +91,5 @@ entry 实际进入 Provider Request 且获得第一个完整有效 outcome 后�
 - E2E：最终二进制在 Provider stream 期间接受第二条 prompt，并在下一个安全 request
   中恰好发送一次。
 - E2E：tool 执行中收到 reminder，只能在 tool result 后注入；取消和 Provider 启动
-  失败不产生虚假 transcript entry。
+  失败都不产生虚假 Transcript Entry，其中 Provider 启动失败会无重复地保留已接受
+  User Entry 与一个有界 Failure。

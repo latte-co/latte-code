@@ -4,6 +4,10 @@ use latte_core::{
     Transition,
 };
 use latte_engine::{CancellationToken, EngineHandle, ProcessInvocation};
+use latte_headless::{
+    provider::FakeProvider,
+    runtime::{AgentRuntime, VerificationPlan},
+};
 use std::{collections::BTreeMap, time::SystemTime};
 
 fn wall_now_ms() -> u64 {
@@ -343,14 +347,22 @@ async fn public_unknown_effect_reconciliation_is_terminal_in_final_binary() {
         engine.unknown_effects_for_run(run_id).unwrap(),
         vec!["cancelled-public-effect"]
     );
-    let failed = engine
-        .resolve_unknown_effect_and_abort(
-            run_id,
-            "cancelled-public-effect",
-            state.revision,
-            &lease,
-            now + 4,
-        )
+    engine.release_lease(&lease).unwrap();
+    let runtime = AgentRuntime::new(
+        engine.clone(),
+        FakeProvider::default(),
+        scenario.root(),
+        VerificationPlan {
+            argv: vec!["/bin/pwd".into()],
+            cwd: ".".into(),
+            timeout_ms: 1_000,
+            grace_ms: 50,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+        },
+    );
+    let failed = runtime
+        .reconcile_unknown_and_abort(run_id, "cancelled-public-effect")
         .unwrap();
     assert_eq!(failed.status, RunStatus::Failed);
 
@@ -362,7 +374,6 @@ async fn public_unknown_effect_reconciliation_is_terminal_in_final_binary() {
             .unwrap()
             .contains("acknowledged failed")
     );
-    engine.release_lease(&lease).unwrap();
 }
 
 #[test]

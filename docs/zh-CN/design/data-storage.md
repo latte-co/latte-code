@@ -1,11 +1,13 @@
 # 全局 Session 与数据存储设计
 
-状态：**设计中，尚未实现。**
+状态：**部分已实现；全局 Storage Home 尚未启用。**
 
-当前实现把运行状态和 Thread transcript 存放在配置的工作区相对 SQLite
-数据库中，默认路径是 `.latte/latte-code.db`。本文定义目标存储契约。迁移
-过程中必须保留现有 Engine 对 Effect、Permission、Lease、Fencing、去重和
-`Unknown` Reconciliation 的安全约束。
+当前实现仍把 Runtime State 与 Conversation Card 保存到配置的数据库中，默认路径为
+工作区下的 `.latte/latte-code.db`。Schema 9 Catalog Metadata、按 Workspace 过滤的
+启动恢复、Session Scoped Lease，以及“提交已接受/Provider 失败”边界已在该数据库内
+实现。全局 Product Home、跨 Workspace Catalog、按 Session 存储的 JSONL
+Transcript、恢复、导入和迁移仍是目标设计；落地时必须保留现有 Engine 对 Effect、
+Permission、Lease、Fencing、去重和 `Unknown` Reconciliation 的安全约束。
 
 ## 1. 已确定的决策
 
@@ -14,7 +16,7 @@
 | Session 对话内容 | 全局、每 Session 一个 JSONL | 只追加 user、assistant、tool 与上下文记录。 |
 | Project、Workspace、Session 元数据 | 全局 SQLite | 发现、搜索、生命周期、Provider Binding、血缘和归档状态。 |
 | Run 与 Effect 控制状态 | 全局 SQLite | 事务化 Run 状态、Effect、Permission、Lease、Checkpoint、Evidence 与去重。 |
-| Draft 与 Provider 运行时 | 进程内存 | Draft Prompt、HTTP Stream、Retry、Cancellation、Delta 和启动错误。 |
+| Draft 与 Provider 运行时 | 进程内存 | 尚未接受的 Prompt、HTTP Stream、Retry、Cancellation、Delta 和原始 Provider Diagnostic。 |
 | Credential | 不持久化 | 只允许持久化非密钥的 Credential Reference 与 Generation。 |
 
 其他已确定决策：
@@ -23,7 +25,8 @@
 - Session 文件按 Workspace 分桶，不按日期分层。
 - JSONL 是对话内容唯一的回放来源；SQLite 不复制 Transcript。
 - 不引入 Transcript Outbox，也不建立持久化的 Provider Attempt 表。
-- Provider 启动失败不是 Session 事实，绝不持久化。
+- Prompt 一旦被接受，Provider 启动失败就是 Session 事实；只持久化有界、已脱敏的
+  Failure Card，绝不持久化 Credential 或原始 Provider Diagnostic。
 - Provider Streaming Delta 是瞬态数据；只有完整 Provider Outcome 才有资格持久化。
 
 ## 2. 术语
@@ -34,7 +37,8 @@
   `ThreadId` 一一对应，不引入第二套身份。
 - **Run** 表示一次用户提交及其 Provider/Tool Continuation Loop。
 - **Effect** 表示可能改变或观察外部状态、由 `latte-engine` 掌握权限的操作。
-- **Draft** 表示尚未到达持久化提交点、只存在于内存的新 Session 或 Follow-up。
+- **Draft** 表示尚未通过本地校验并到达持久提交点、只存在于内存的新 Session 或
+  Follow-up。
 
 ## 3. 全局存储 Home
 
@@ -63,8 +67,8 @@ Windows 通过解析出的用户 Home 使用同一套 Home 相对契约。应用
 Workspace 中创建数据库或 Session 目录。
 
 Workspace 配置仍可控制项目行为，但不能控制全局存储位置。Workspace 层的
-`database.path` 必须明确拒绝，不能静默重定向用户历史。只有进程环境或可信
-用户配置可以选择存储 Home。
+`database.path` 只为迁移兼容而继续接受，但会被忽略，绝不能重定向用户历史。
+只有进程环境或可信用户配置可以选择存储 Home。
 
 ## 4. Workspace Storage Key
 
@@ -153,20 +157,28 @@ SQLite 继续作为以下数据的权威来源：
 
 ## 6. 按 Session 管理 Ownership
 
-所有 Workspace 共用一个全局数据库后，不能继续使用当前数据库级 Singleton
-Lease。目标 Lease 必须按 Session 隔离：
+当前配置的数据库使用带 Scope 的 Runtime Lease：
 
 ```text
-session_leases
-  session_id（主键）
+runtime_lease
+  scope（主键：runtime 或 thread:<session-id>）
   owner
   fencing_token
   expires_at_ms
 ```
 
-不同 Session 可以并发运行。一个 Session 最多只有一个有效 Engine Owner 和
-一个 JSONL Writer。Lease 过期后重新获取必须推进 Fencing Token。旧 Owner
-不能开始或观察 Effect，并且失去 Ownership 后必须关闭 Session Writer。
+Legacy Headless Run 共用 `runtime` Scope；不同 Thread v2 Session 使用不同 Scope，
+因此可以并发运行。一个 Session 最多只有一个有效 Engine Owner 和一个 JSONL
+Writer。Lease 过期后重新获取必须推进全局单调的 Fencing Token。旧 Owner 不能
+开始或观察 Effect，并且失去 Ownership 后必须关闭 Session Writer。
+
+一次持久化 `WaitingPermission` 或 `WaitingInput` 操作正常返回时，会先在同一事务
+中把关联 Run 与 Active Row 的 Lease Token 置为零，再删除 Lease Row。Token 零表示
+安全静止：启动恢复会保留这个等待中的 Child；后续 Coordinator 必须先获取新的全局
+Fencing Epoch 才能写入。没有 Lease 且仍保留非零 Token 则表示 Owner 非正常丢失，
+继续执行保守的 Interrupted/`Unknown` 恢复。用户在新 Epoch 中显式 Allow 已 Prepare
+的 Effect 时，Engine 会重新验证私有 Canonical Descriptor，并在进入 `Started` 前
+原子地把单次 Permission Capability 与 Operation Digest 一起重绑定到新 Epoch。
 
 ## 7. JSONL 契约
 
@@ -215,41 +227,41 @@ JSONL 不包含：
 ```text
 Prompt
 → 校验非密钥 Provider Binding
+→ 持久化 Session、Child Run 与 User Card
+→ 在该 Session Lease 下启动 Child
 → 在内存中解析 Credential Reference
 → 构造 Provider
 → 发起第一次 Provider Request
 ```
 
-配置、Credential、Model、Authentication、Transport、Timeout 或其他启动失败
-不会留下 Session Row、Run Row、JSONL、持久化日志记录或 Telemetry Payload。
-已脱敏的展示错误只保留在当前 UI State 中，Prompt 回到 Composer 供用户重试。
+持久创建之前的 Validation 或 Storage Failure 不留下 Session/Run，并精确保留
+Draft。创建之后的 Configuration、Credential、Model、Authentication、
+Transport、Timeout 或其他 Provider 启动失败，会用一个有界、已脱敏的 Failure
+Card 终结该 Child；User Card 不会被删除或复制回 Composer。Provider 构造失败可
+重试：Session 回到 `Ready`，后续提交创建新的不可变 Child。原始 Provider
+Diagnostic 与 Credential Value 继续只存在于进程内。
 
-持久化提交点是第一个完整且有效的 Provider Outcome：
-
-- 完整 Assistant Message。
-- 完整 Assistant Tool-Call Envelope。
-- 有效 Input Request。
-
-到达提交点后，应用执行：
+持久化提交点是已校验 User Submission 被接受的时刻，早于 Provider 构造和网络
+I/O。应用执行：
 
 1. 插入不可被列表发现的 `materializing` Session Metadata Row。
-2. 写入并 Sync JSONL Header、User Message 与完整 Provider Outcome。
-3. 创建该 Outcome 所需的持久化 Run/Control State。
-4. 根据真实 Lifecycle 把 Session 标记为可发现。
+2. 写入并 Sync JSONL Header 与 User Message。
+3. 创建持久化 Child Run/Control State。
+4. 以 `Running` 状态把 Session 标记为可发现。
+
+完整 Assistant Message、Tool-Call Envelope、Input Request 或已脱敏 Failure 只在
+这个持久提交边界之后追加。
 
 启动时删除没有有效文件的 `materializing` Row，或根据有效的自描述文件修复
-Catalog Metadata。空的失败 Session 绝不能出现在 Session Discovery 中。
+Catalog Metadata。不能因为 Provider 启动失败而删除一个已经接受的 Session。
 
 ### 8.2 Follow-up
 
-Follow-up 在第一个完整 Provider Outcome 之前同样只是内存 Draft。启动失败
-不会创建 Child Run，也不会追加 User Prompt。原 Session 保持字节级不变，
-Prompt 回到 Composer。
-
-完整 Outcome 到达后才物化 Run，并一起追加 User/Outcome Record。如果持久化
-工具工作之后的 Provider Request 失败，只保留 `Interrupted` 或
-`ReconciliationRequired` 等最低限度通用 Run State，仍然不持久化 Provider
-Error Text。
+Follow-up 使用相同边界：先校验，再在构造 Provider 之前原子追加 User Card 并创建
+Child。Provider 构造失败会追加可重试 Failure Card；此前已完成的 Child 保持不可
+变，Session 回到 `Ready` 接收下一个 Follow-up。持久化工具工作之后的 Provider
+Request 失败，则保留已有的 `Failed`、`Interrupted` 或
+`ReconciliationRequired` Control State。只有有界、已脱敏的展示文本可以持久化。
 
 ## 9. Effect 顺序
 
@@ -331,31 +343,98 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
 
 新 Session 使用 `jsonl_v1`。滚动迁移期间既有 SQLite Session 继续可读，或由
 显式流程迁移；绝不静默删除旧表。启用全局存储契约后，Workspace 层的
-`database.path` 变为非法配置。
+`database.path` 仍可为迁移兼容而解析，但会被忽略。
 
 ## 14. 必须验证的场景
 
 实现完成前，UT 与 Final-Binary E2E 至少必须证明：
 
-- Provider 启动失败不会改变 Session 数量或 JSONL Tree。
-- SQLite、JSONL 和持久化应用日志中都不存在 Provider 启动错误文本。
+- Provider 启动失败会保留已接受 User Card 并追加一个有界 Failure Card，不重复
+  Prompt，也不把它恢复到 Composer。
+- SQLite、JSONL 和持久化应用日志中都不存在 Credential Value 或原始 Provider
+  Diagnostic。
 - Workspace 中不存在 Latte Code Database 或 Session 文件。
 - 两个 Workspace 共用全局 Database，但使用不同 Session Bucket。
 - 两个不同 Session 可以并发运行；同一 Session 的两个 Writer 会被 Fencing。
 - JSONL Tail Repair 只删除一条撕裂的末行。
-- Follow-up 失败后原 Session 保持不变。
+- Follow-up 失败只追加一个不可变失败 Child，并保留所有更早 Child；可重试的配置
+  失败允许继续提交 Follow-up。
 - `Started` Effect 在崩溃或失去 Lease 后变为 `Unknown`。
 - 已 Observed Effect 缺少 JSONL Tool Result 时可以修复，且不会再次执行 Effect。
 - Archive、Fork、Workspace Rebinding 和幂等 Legacy Import 保留历史与 Lineage。
 
-这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 80% 和 All-Target 90%
+这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 90% 和 All-Target 90%
 覆盖率卡点。
 
-## 15. 交付阶段
+## 15. 当前实现状态
+
+Latte Code 当前遵守 `database.path`，默认值为工作区根目录下的
+`.latte/latte-code.db`。相对路径以该根目录解析，也支持绝对路径。目前尚未启用
+`LATTE_CODE_HOME` Product State 切换、Legacy Import 或产品级全局数据库默认值。
+
+迁移 9 为 v2 Session Metadata 增加有界、脱敏的 Title 与 Canonical
+`workspace_root`。Catalog 查询不会反序列化 Transcript Row。TUI 按当前
+Canonical Workspace 过滤 Session，启动时恢复最新匹配项，`/new` 创建瞬态
+Draft，`/sessions` 与 `/resume` 提供显式选择。
+升级 v8 数据库时，只有数据库物理位于当前 Canonical Workspace 内，才能认领旧
+Session Row；迁移会在 Schema 事务内补齐 Workspace 与 Title。若外置或共享 v8
+数据库含有无法归属的 Session Row，则返回明确的 Migration Error，不会静默归到
+调用方 Workspace。
+
+迁移 10 把 Singleton Runtime Lease 改为带 Scope 的 Lease Row。Legacy Headless
+Run 继续使用 `runtime` Scope；Thread v2 则为每个 Session 使用独立的
+`thread:<session-id>` Scope。每次获取都会使用独立的 Coordinator Owner，因此同一
+Session 的第二个 Coordinator 会被拒绝，而不同 Session 仍可并发；Runtime 在一次
+操作返回时释放 Lease，持久化的 Input/Permission 等待会进入无 Writer 的安全静止，
+而不是被误判为 Orphan Run。Fencing Token 仍保持全局单调，因此 Session 并发不会
+削弱重启恢复语义。
+Thread Lease 被释放时如果 Child 仍 Active，表示 Coordinator 非正常退出：同一释放
+事务会先中断 Child；如果已有 `Started` Effect，则把它们标记为 `Unknown` 并要求
+Reconciliation，然后才删除 Lease。因此 TUI 不需要等进程重启，就能离开无 Lease
+的虚假 `Running` Projection。
+
+新对话只在本地 Prompt 与非密钥 Binding 校验阶段保持进程内状态。一旦接受，TUI
+会在解析 Credential 或构造 Provider 之前，通过同一事务持久化 `threads_v2` Row、
+关联 Run、User Transcript Entry、精确 Lease Token 与 Durable `Start` Event；创建
+与 Start 之间不会提交 Token 为零的 Running Session。Credential 缺失或 Provider
+构造失败会追加无密钥、可重试
+的 Failure Card，让 Session 回到 `Ready`；Composer 保持为空且可继续输入。语法
+非法的 Binding 或持久边界之前的 Storage Failure 仍会恢复 Draft。
+一次已经发出的 Provider Request 若发生 HTTP、Authentication、Transport、Timeout
+或 Model Selection Failure，也使用相同的可重试 Child Failure Path：已接受的 User
+Card 与已脱敏 Failure 保持持久化，后续 Follow-up 创建新 Child。非法 Successful
+Response 与不安全的 Provider ID 仍属于 Terminal Protocol Failure。
+TUI 只使用已脱敏且来源为 New-Session/Follow-up Commit Path 的 User Card 对账
+Composer Submission；文本相同的 Input-Request Answer 不能误确认它。Input Answer
+使用独立的 Submission Identity，并绑定 Session、Run 与 Request ID。该 Request
+拥有 Editor 时，Shift+Enter 始终插入换行；Command 失败后，只有 Authoritative
+Snapshot 证明精确 Input Card 未提交，才恢复输入值。Terminal Session 的普通提交
+不会消费 Composer Draft；如果 Active Child 在 Queued Follow-up 提交前结束，则
+恢复该 Draft。
+
+Model Selection 是 Session Binding Transition，而不是 Editor Preference。只有
+不存在 Active Child 的 `Ready` Session 可以在精确 `thread:<session-id>` Lease
+与 Expected Revision 下切换。该事务替换完整的非密钥 Provider Binding、追加一条
+有界 System Card，并发出 `BindingChanged`。TUI 在刷新的 Snapshot 包含所选
+Provider 与 Model 前阻止竞争的 Follow-up。这个 Transition 不解析 Provider
+Credential；Provider 构造及其已脱敏 Failure 都属于下一个已经持久接受的 Child。
+
+JSONL Transcript Layout、Repair、Session Scoped Writer、全局 Product Home、
+跨 Workspace Discovery、Legacy Import 与移除 SQLite Transcript Duplication
+尚未实现。当前配置的数据库继续保留供 Headless CLI 读取的既有 v1 Run/Control
+Record。
+
+UT 覆盖配置路径解析、迁移 9/10、Catalog Metadata、Scoped Authority 与持久、
+可重试的 Provider Configuration Failure。最终二进制 E2E 覆盖 Workspace 本地和
+显式配置的数据库、`/resume`、不额外调用 Provider 的 `/new`、长 Transcript 的尾部
+恢复与 Follow-up，以及 Provider Setup 失败后在同一 Session 中进行多行重试。
+
+## 16. 交付阶段
 
 1. 增加全局 Product Home、Workspace Storage Key、全局 Catalog 和 Per-Session
    Lease。
-2. 引入 Draft 新 Session/Follow-up 生命周期，使 Provider 启动失败保持瞬态。
+2. 引入 Draft 校验与持久 New Session/Follow-up 接受边界，使 Provider 启动失败
+   成为可见、可重试的 Child Failure。
 3. 增加有界 JSONL Writer、Reader、Tail Repair、Checkpoint 和组合 Projection。
 4. 把现有带 Fencing 的 Effect 生命周期与 JSONL Tool Call/Tool Result 顺序集成。
 5. 增加 Legacy Import、全局 Session Discovery、Archive、Fork、Delete 与

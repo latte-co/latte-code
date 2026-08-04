@@ -37,7 +37,7 @@ make test        # test-all 的兼容入口
 make check       # fmt + check + Clippy + Rustdoc
 make lint-ci     # actionlint workflow syntax + ShellCheck shell analysis
 make coverage-unit # UT-only 行覆盖率 >= 95%
-make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 80%
+make coverage-e2e  # 最终二进制 E2E 行覆盖率 >= 90%
 make coverage-total # 全 targets 行覆盖率 >= 90%
 make coverage    # 串行执行以上三个独立覆盖率卡点
 make deny        # 检查安全公告、许可证和依赖来源
@@ -70,15 +70,16 @@ make run ARGS='--help'
 make run ARGS='--json list'
 ```
 
-没有配置文件时，CLI/TUI 会使用内置默认配置。自定义配置按“内置默认值 → `$HOME/.latte/latte-code.jsonc` → `<workspace>/.latte/latte-code.jsonc`”递归合并；相同 key 由工作区配置覆盖，数组和标量整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，只需导出最终配置所引用的密钥。若要自定义当前工作区：
+CLI/TUI 会先加载内置的应用默认值，再按 `$HOME/.latte/latte-code.jsonc`、`<workspace>/.latte/latte-code.jsonc` 的顺序递归合并；Provider 与 Model 必须显式配置，Latte Code 不内置任何 Provider 或 Model。相同 key 由工作区配置覆盖，数组、标量以及每个 Provider 的完整 `models` 目录整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，还需导出最终配置所引用的密钥。若要配置当前工作区：
 
 ```bash
 mkdir -p .latte
 cp latte-code.config.example.jsonc .latte/latte-code.jsonc
+# 仅当 api_key 使用环境变量引用时需要：
 export OPENAI_API_KEY='...'
 ```
 
-用户配置和工作区配置都可以只写需要覆盖的 key。在 `.latte/latte-code.jsonc` 中可配置 `default_provider`、`providers.<name>`、`database.path` 和 `verification.argv`。示例使用 `type: "openai-chat"`、`base_url`、`model`，以及 `api_key: { source: "env", name: "OPENAI_API_KEY" }`；CLI/TUI 只在实际调用 Provider 时于内存中解析该引用。不要把密钥直接写进 JSONC。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
+用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。`api_key` 可以直接写字符串，也可以使用 `{ source: "env", name: "OPENAI_API_KEY" }`；环境变量只在实际调用 Provider 时解析。内联密钥会保留在用户自己的 JSONC 源文件中，但不会进入 Debug 输出、Session binding、fingerprint、transcript、SQLite 或普通 Effect 记录；包含内联密钥的文件应限制为当前用户可读。无论相对路径来自哪一层，`database.path` 都以工作区根目录为基准。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
 
 `resume --deny`、等待态取消、查看运行记录和 Unknown reconciliation 不依赖 Provider 凭证。
 
@@ -90,7 +91,7 @@ export OPENAI_API_KEY='...'
 - Unix 最终二进制 E2E：保留 75 个包含 PTY、process group、signal、symlink 和 Unix verification 的场景，通过 `make test-e2e-unix` 运行。
 - doc tests：验证公开 authority API 的 compile-fail 边界。
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
-- 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、80%、90%。
+- 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、90%、90%。
 
 任何新增或修改产品行为的功能都必须同时增加最低责任层 UT 和至少一个最终二进制 E2E。具体目录、Harness、同步方式、断言清单和反例见 [E2E 编写手册](docs/zh-CN/testing/e2e-authoring-guide.md)。
 
@@ -101,7 +102,7 @@ make coverage-unit
 make coverage-e2e
 ```
 
-全仓 UT-only 行覆盖率必须 `>= 95%`，最终二进制 E2E 行覆盖率必须 `>= 80%`。新增或修改的功能代码还必须由对应责任层测试直接覆盖，不能仅依赖既有测试维持全仓数字。全 targets 的 `>= 90%` 卡点继续保留；`make coverage` 会串行执行三项卡点并在每项前清理 profile，避免跨层数据污染。
+全仓 UT-only 行覆盖率必须 `>= 95%`，最终二进制 E2E 行覆盖率必须 `>= 90%`。新增或修改的功能代码还必须由对应责任层测试直接覆盖，不能仅依赖既有测试维持全仓数字。全 targets 的 `>= 90%` 卡点继续保留；`make coverage` 会串行执行三项卡点并在每项前清理 profile，避免跨层数据污染。
 
 ## 与 CI 的关系
 
@@ -112,7 +113,7 @@ GitHub Actions 在 `main` push、面向 `main` 的 PR、merge queue 和手工触
 - Linux、macOS、Windows 各自的 Cargo check、Clippy `-D warnings`、UT、Contract、portable 最终二进制 E2E 和 `latte-code` release build；
 - Linux、macOS 的 75 个 Unix PTY/process 最终二进制 E2E；
 - Rust 1.93 MSRV、actionlint 1.7.12、ShellCheck、Documentation tests 和 Dependency audit；
-- `Coverage - UT (95%)`、`Coverage - E2E (80%)`、`Coverage - total (90%)` 三个独立状态；
+- `Coverage - UT (95%)`、`Coverage - E2E (90%)`、`Coverage - total (90%)` 三个独立状态；
 
 稳定聚合状态 `PR Gate` 使用 fail-closed 语义检查上述每个 job 的结果；失败、取消或跳过任何一个依赖都不会产生假绿。仓库的 branch protection 或 ruleset 应只把 `PR Gate` 配置为 required check，底层 job 仍可用于定位失败。
 

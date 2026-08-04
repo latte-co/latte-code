@@ -73,7 +73,7 @@ impl Scenario {
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();
@@ -86,11 +86,28 @@ impl Scenario {
         database_path: &str,
         provider_fields: &str,
     ) {
+        self.write_config_with_model(
+            endpoint,
+            verification,
+            database_path,
+            "mock",
+            provider_fields,
+        );
+    }
+
+    pub fn write_config_with_model(
+        &self,
+        endpoint: &str,
+        verification: &str,
+        database_path: &str,
+        model: &str,
+        provider_fields: &str,
+    ) {
         std::fs::create_dir_all(self.root.path().join(".latte")).unwrap();
         std::fs::write(
             self.root.path().join(".latte/latte-code.jsonc"),
             format!(
-                r#"{{version:1,default_provider:"main",providers:{{main:{{type:"openai-chat",model:"mock",endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},credential_ref_id:"env:TEST_OPENAI_KEY",data_scope_id:"workspace",credential_generation:1{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
+                r#"{{version:1,default_model:"main/{model}",providers:{{main:{{type:"openai-chat",models:[{model:?}],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
             ),
         )
         .unwrap();
@@ -241,6 +258,10 @@ pub struct ProviderReply {
 }
 
 impl ProviderReply {
+    pub fn error(status: u16, message: &str) -> Self {
+        Self::json(status, &serde_json::json!({"error":{"message":message}}))
+    }
+
     pub fn completion(content: &str) -> Self {
         Self::json(
             200,
@@ -709,6 +730,28 @@ impl PtySession {
         }
     }
 
+    pub fn wait_for_visible_text(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut output = self
+            .output
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if terminal_visible_text(&output).contains(needle) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let waited = self.output.changed.wait_timeout(output, remaining).unwrap();
+            output = waited.0;
+            if waited.1.timed_out() {
+                return terminal_visible_text(&output).contains(needle);
+            }
+        }
+    }
+
     pub fn output(&self) -> Vec<u8> {
         self.output
             .bytes
@@ -771,6 +814,46 @@ impl PtySession {
         }
         (status, self.output())
     }
+}
+
+#[cfg(unix)]
+fn terminal_visible_text(output: &[u8]) -> String {
+    let mut visible = Vec::with_capacity(output.len());
+    let mut index = 0;
+    while index < output.len() {
+        if output[index] != 0x1b {
+            visible.push(output[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if output.get(index) == Some(&b'[') {
+            index += 1;
+            while index < output.len() {
+                let byte = output[index];
+                index += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        } else if output.get(index) == Some(&b']') {
+            index += 1;
+            while index < output.len() {
+                if output[index] == 0x07 {
+                    index += 1;
+                    break;
+                }
+                if output[index] == 0x1b && output.get(index + 1) == Some(&b'\\') {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+        } else {
+            index = index.saturating_add(1);
+        }
+    }
+    String::from_utf8_lossy(&visible).into_owned()
 }
 
 #[cfg(unix)]

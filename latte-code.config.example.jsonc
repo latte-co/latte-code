@@ -1,7 +1,6 @@
 {
   "version": 1,
-  "default_provider": "primary",
-  "database": { "path": ".latte/latte-code.db" },
+  "default_model": "primary/model-id",
   "thread": {
     "max_request_bytes": 524288,
     "max_input_bytes": 393216,
@@ -12,16 +11,19 @@
   "providers": {
     "primary": {
       "type": "openai-chat",
-      "model": "gpt-4o",
-      "base_url": "https://api.openai.com/v1",
+      "models": {
+        "model-id": {
+          "name": "Model display name",
+          "options": { "context_window": 128000, "max_tokens": 16384 }
+        }
+      },
+      "base_url": "https://provider.example/v1",
+      // A literal string is also supported: "api_key": "sk-..."
       "api_key": { "source": "env", "name": "OPENAI_API_KEY" },
       "timeout_ms": 60000,
       "max_attempts": 1,
       "streaming": true,
       "compatibility_input_request": false,
-      "credential_ref_id": "openai-primary-env",
-      "data_scope_id": "workspace",
-      "credential_generation": 1,
       "aliases": {}
     }
   }

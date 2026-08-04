@@ -10,7 +10,7 @@ Every change that adds or modifies product behavior must include all of the foll
 
 1. **UT**: directly prove the rules, boundaries, and failures at the lowest responsible module.
 2. **E2E**: enter through the final `latte-code` binary and prove the user-observable behavior.
-3. **Independent coverage gates**: workspace UT-only line coverage must be `>= 95%`, and final-binary E2E line coverage must be `>= 80%`.
+3. **Independent coverage gates**: workspace UT-only line coverage must be `>= 95%`, and final-binary E2E line coverage must be `>= 90%`.
 4. **Direct change coverage**: new or modified functional code must be reached by its corresponding UT and E2E, not merely inherit a passing workspace number from existing tests.
 5. **Regression protection**: a user-visible bug fix must add a test that fails before the fix and passes afterward.
 
@@ -188,7 +188,7 @@ Choose and combine the applicable assertions below; an exit-code assertion alone
 
 Failure messages should include redacted stdout, stderr, or PTY transcripts so local and CI failures remain diagnosable.
 
-## 7. The UT 95% / E2E 80% coverage policy
+## 7. The UT 95% / E2E 90% coverage policy
 
 ### 7.1 Measurement
 
@@ -196,7 +196,7 @@ UT coverage runs crate-local lib/bin tests only and excludes Contract, E2E, and 
 
 ```bash
 make coverage-unit # --lib --bins --fail-under-lines 95
-make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 80
+make coverage-e2e  # --test e2e_portable --test e2e_unix --fail-under-lines 90
 ```
 
 The Makefile and CI run Unix PTY/process E2E with one test thread so independent scenarios cannot contend for terminal, signal, and process-group resources. Each scenario must still synchronize on observable events with bounded timeouts rather than fixed sleeps.
@@ -208,14 +208,14 @@ cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --all-features --lib --bins --html
 ```
 
-Lines reached only by E2E do not count toward the 95% UT requirement. UT, Contract, or tests that directly call internal APIs do not count toward the 80% E2E requirement. Do not manufacture compliance by expanding exclusions, deleting assertions, moving tests between layers, or measuring only convenient packages.
+Lines reached only by E2E do not count toward the 95% UT requirement. UT, Contract, or tests that directly call internal APIs do not count toward the 90% E2E requirement. Do not manufacture compliance by expanding exclusions, deleting assertions, moving tests between layers, or measuring only convenient packages.
 
 ### 7.2 Required gates
 
 The three coverage gates are independent, and completion requires all three:
 
 1. `make coverage-unit`: workspace UT-only lines `>= 95%`.
-2. `make coverage-e2e`: final-binary E2E lines `>= 80%`.
+2. `make coverage-e2e`: final-binary E2E lines `>= 90%`.
 3. `make coverage-total`: all-target lines `>= 90%`.
 
 `make coverage` runs the three gates serially and cleans the profile before each one so hits from one layer cannot contaminate another. In addition to keeping the workspace gates green, new or modified behavior must directly cover its success, boundary, typed-failure, and applicable safety-negative paths.
@@ -239,7 +239,7 @@ A feature is complete only when every applicable item is satisfied:
 - [ ] The acceptance matrix states the happy path and negative paths.
 - [ ] The lowest responsible module has corresponding UT.
 - [ ] Workspace UT-only line coverage is at least 95%.
-- [ ] Workspace final-binary E2E line coverage is at least 80%.
+- [ ] Workspace final-binary E2E line coverage is at least 90%.
 - [ ] New or modified functional code is reached directly by corresponding UT and E2E.
 - [ ] At least one final-binary E2E covers the primary user journey.
 - [ ] Permission, security, recovery, and verification behavior has explicit negative assertions.

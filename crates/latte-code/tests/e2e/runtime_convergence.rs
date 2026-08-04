@@ -349,3 +349,63 @@ fn headless_multi_round_read_only_history_converges_after_cross_process_verifica
     );
     assert_eq!(provider.requests().len(), 6);
 }
+
+#[test]
+fn headless_provider_round_limit_fails_durably_without_an_unbounded_extra_request() {
+    let scenario = Scenario::new();
+    std::fs::write(
+        scenario.root().join("bounded.txt"),
+        "bounded round fixture\n",
+    )
+    .unwrap();
+    let read = serde_json::json!({"path": "bounded.txt", "max_output": 1024});
+    // Each provider tool-call response and its subsequent tool execution consume
+    // one bounded drive step, so 16 complete read-only rounds exhaust 32 steps.
+    let provider = ScriptedProvider::start((0..16).map(|index| {
+        ProviderReply::tool_call(&format!("bounded-round-{index}"), "read_file", &read)
+    }));
+    scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+
+    let output = invoke(
+        &scenario,
+        &[
+            "--json",
+            "run",
+            "keep reading until the bounded agent loop stops",
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json(&output)["status"], "failed");
+    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+    assert!(
+        json(&output)["data"]["run"]["failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent step limit exceeded")
+    );
+    provider.assert_consumed();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 16);
+    assert_eq!(tool_messages(&requests[0].body).len(), 0);
+    assert_eq!(tool_messages(&requests[15].body).len(), 15);
+    assert_eq!(
+        assistant_tool_calls(&requests[15].body).last(),
+        Some(&("bounded-round-14", "read_file"))
+    );
+
+    let run_id = json(&output)["data"]["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shown = invoke(&scenario, &["--json", "show", &run_id]);
+    assert_eq!(shown.status.code(), Some(1));
+    assert_eq!(json(&shown)["data"]["run"]["status"], "failed");
+    assert_eq!(provider.requests().len(), 16);
+}

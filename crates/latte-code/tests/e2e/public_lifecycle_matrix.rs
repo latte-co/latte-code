@@ -181,11 +181,11 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let lease = engine
-        .acquire_lease("public-thread-matrix", now, 120_000)
+    let success_thread_id = thread_id();
+    let success_lease = engine
+        .acquire_thread_lease(success_thread_id, now, 120_000)
         .unwrap();
 
-    let success_thread_id = thread_id();
     let success_parent_id = run_id();
     let initial = engine
         .create_thread_v2(
@@ -196,18 +196,30 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
             now + 1,
         )
         .unwrap();
-    let started_snapshot = start_thread(&engine, &lease, &initial, "public:success:start", now + 2);
+    let started_snapshot = start_thread(
+        &engine,
+        &success_lease,
+        &initial,
+        "public:success:start",
+        now + 2,
+    );
     let prepared = prepare_read(
         &engine,
-        &lease,
+        &success_lease,
         &started_snapshot,
         "public-success-effect",
         "public-read.txt",
         now + 3,
     );
-    let started_effect = start_effect(&engine, &lease, &prepared, "public-success-effect", now + 4);
+    let started_effect = start_effect(
+        &engine,
+        &success_lease,
+        &prepared,
+        "public-success-effect",
+        now + 4,
+    );
     let value = engine
-        .execute_started_thread_effect(&started_effect, &lease, &CancellationToken::new())
+        .execute_started_thread_effect(&started_effect, &success_lease, &CancellationToken::new())
         .await
         .unwrap();
     assert!(value.success);
@@ -218,7 +230,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
             "public:success:observe".into(),
             command_id(),
             value,
-            &lease,
+            &success_lease,
             now + 5,
         )
         .unwrap();
@@ -236,7 +248,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
                 stderr_truncated: false,
                 termination: ProcessTermination::Exited,
             },
-            &lease,
+            &success_lease,
             now + 6,
         )
         .unwrap();
@@ -245,7 +257,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
             &observed.snapshot,
             "public parent verified".into(),
             "public-thread-verification".into(),
-            &lease,
+            &success_lease,
             now + 7,
         )
         .unwrap();
@@ -266,14 +278,14 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
         .unwrap();
     let follow_up = start_thread(
         &engine,
-        &lease,
+        &success_lease,
         &follow_up,
         "public:follow-up:start",
         now + 9,
     );
     let follow_up = commit_thread(
         &engine,
-        &lease,
+        &success_lease,
         &follow_up,
         CommitThreadRunUpdate::Fail {
             source_key: "public:follow-up:fail".into(),
@@ -289,6 +301,9 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
     assert_eq!(follow_up.runs.len(), 2);
 
     let failed_thread_id = thread_id();
+    let failed_lease = engine
+        .acquire_thread_lease(failed_thread_id, now + 11, 120_000)
+        .unwrap();
     let failed_run_id = run_id();
     let failed_initial = engine
         .create_thread_v2(
@@ -301,14 +316,14 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
         .unwrap();
     let failed_started = start_thread(
         &engine,
-        &lease,
+        &failed_lease,
         &failed_initial,
         "public:failed:start",
         now + 12,
     );
     let failed_prepared = prepare_read(
         &engine,
-        &lease,
+        &failed_lease,
         &failed_started,
         "public-failed-effect",
         "public-read.txt",
@@ -316,7 +331,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
     );
     let failed_effect = start_effect(
         &engine,
-        &lease,
+        &failed_lease,
         &failed_prepared,
         "public-failed-effect",
         now + 14,
@@ -335,13 +350,13 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
                 })),
                 success: false,
             },
-            &lease,
+            &failed_lease,
             now + 15,
         )
         .unwrap();
     let failed_thread = commit_thread(
         &engine,
-        &lease,
+        &failed_lease,
         &observed_failure.snapshot,
         CommitThreadRunUpdate::Fail {
             source_key: "public:failed:terminal".into(),
@@ -355,7 +370,8 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
     );
     assert_eq!(failed_thread.lifecycle, latte_core::ThreadLifecycle::Failed);
 
-    engine.release_lease(&lease).unwrap();
+    engine.release_lease(&success_lease).unwrap();
+    engine.release_lease(&failed_lease).unwrap();
     drop(engine);
     for (id, status, summary) in [
         (
@@ -378,6 +394,7 @@ async fn public_thread_effects_verification_and_follow_up_render_through_final_b
 
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {failed_thread_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(b"public certified effect failed", Duration::from_secs(5)),
         "public failure was not rendered: {}",
@@ -396,8 +413,8 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     std::fs::write(scenario.root().join("lease-read.txt"), "lease fixture\n").unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let stale = engine.acquire_lease("public-stale", now, 100).unwrap();
     let thread_id = thread_id();
+    let stale = engine.acquire_thread_lease(thread_id, now, 100).unwrap();
     let run_id = run_id();
     let initial = engine
         .create_thread_v2(
@@ -421,7 +438,7 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     let (_, started_revision) = active_run(&started.snapshot);
 
     let fresh = engine
-        .acquire_lease("public-fresh", now + 200, 120_000)
+        .acquire_thread_lease(thread_id, now + 200, 120_000)
         .unwrap();
     let stale_commit = engine.commit_thread_run_update(
         ThreadCommitRequest {
@@ -465,6 +482,7 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     let projection = build_engine(&scenario);
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(format!("/resume {thread_id}\r").as_bytes());
     assert!(pty.wait_for_output(b"Reconciliation", Duration::from_secs(5)));
     pty.write(CTRL_R);
     assert!(pty.wait_for_output(b"Ctrl+A confirm failed", Duration::from_secs(5)));

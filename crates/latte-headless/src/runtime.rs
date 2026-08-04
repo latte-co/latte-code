@@ -443,7 +443,12 @@ impl AgentRuntime {
         let state = self.engine.show(run_id).map_err(engine)?;
         let lease = self
             .engine
-            .acquire_lease(&format!("reconcile-{run_id}"), now, self.authority_ttl())
+            .acquire_run_lease(
+                run_id,
+                &format!("reconcile-{run_id}"),
+                now,
+                self.authority_ttl(),
+            )
             .map_err(engine)?;
         self.engine
             .resolve_unknown_effect_and_abort(run_id, effect_id, state.revision, &lease, now)
@@ -472,7 +477,12 @@ impl AgentRuntime {
         let queued = self.engine.create_run(run_id, now).map_err(engine)?;
         let lease = self
             .engine
-            .acquire_lease(&format!("agent-{run_id}"), now, self.authority_ttl())
+            .acquire_run_lease(
+                run_id,
+                &format!("agent-{run_id}"),
+                now,
+                self.authority_ttl(),
+            )
             .map_err(engine)?;
         let running = self.transition(
             &queued,
@@ -546,7 +556,12 @@ impl AgentRuntime {
             }
             let lease = self
                 .engine
-                .acquire_lease(&format!("agent-{run_id}"), now_ms(), self.authority_ttl())
+                .acquire_run_lease(
+                    run_id,
+                    &format!("agent-{run_id}"),
+                    now_ms(),
+                    self.authority_ttl(),
+                )
                 .map_err(engine)?;
             if normalized {
                 self.persist(run_id, &checkpoint, &lease)?;
@@ -623,7 +638,12 @@ impl AgentRuntime {
         let now = now_ms();
         let lease = self
             .engine
-            .acquire_lease(&format!("agent-{run_id}"), now, self.authority_ttl())
+            .acquire_run_lease(
+                run_id,
+                &format!("agent-{run_id}"),
+                now,
+                self.authority_ttl(),
+            )
             .map_err(engine)?;
         if allow
             && !self
@@ -779,7 +799,12 @@ impl AgentRuntime {
         }
         let lease = self
             .engine
-            .acquire_lease(&format!("agent-{run_id}"), now_ms(), self.authority_ttl())
+            .acquire_run_lease(
+                run_id,
+                &format!("agent-{run_id}"),
+                now_ms(),
+                self.authority_ttl(),
+            )
             .map_err(engine)?;
         let running = self.transition(
             &state,
@@ -2400,10 +2425,7 @@ mod tests {
         assert_eq!(
             rusqlite::Connection::open(database)
                 .unwrap()
-                .execute(
-                    "UPDATE runtime_lease SET expires_at_ms=0 WHERE singleton=1",
-                    [],
-                )
+                .execute("UPDATE runtime_lease SET expires_at_ms=0", [],)
                 .unwrap(),
             1
         );

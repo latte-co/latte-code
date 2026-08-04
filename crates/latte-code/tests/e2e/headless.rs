@@ -220,14 +220,16 @@ fn home_and_workspace_configuration_precedence_reaches_the_final_binary() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
-    let missing = isolated_output(&["--json", "run", "do work"], |_, _| {});
+    let missing = isolated_output(&["--json", "run", "do work"], |scenario, _| {
+        scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
+    });
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(json(&missing)["error"]["code"], "configuration");
     assert!(
         json(&missing)["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("OPENAI_API_KEY")
+            .contains("TEST_OPENAI_KEY")
     );
 
     let missing_deny = isolated_output(

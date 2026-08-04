@@ -8,7 +8,7 @@ Chinese counterpart: [验证 Harness 与确定性测试](../../../zh-CN/design/a
 
 Harness is replaceable production-boundary dependency and test fixture, not a second agent runtime or a test backdoor around `latte-engine`. It drives final `latte-code` binary, scripted Provider, temporary global state home, SQLite, event subscription, and real PTY while remaining network-free, credential-free, bounded, and cleanable.
 
-Independent coverage floors remain UT 95%, final-binary E2E 80%, and all-target 90%. This document defines the substrate for those floors; existing testing gates and E2E authoring guide remain delivery rules.
+Independent coverage floors remain UT 95%, final-binary E2E 90%, and all-target 90%. This document defines the substrate for those floors; existing testing gates and E2E authoring guide remain delivery rules.
 
 ## 2. Replaceable dependencies
 
