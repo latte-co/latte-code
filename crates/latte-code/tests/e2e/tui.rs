@@ -458,6 +458,32 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
     assert!(pty.finish(Duration::from_secs(5)).0.success());
 }
 
+fn rename_and_fork_from_tui(
+    tui: &mut PtySession,
+    engine: &latte_engine::EngineHandle,
+    workspace: &std::path::Path,
+    parent_thread_id: ThreadId,
+) {
+    tui.write(b"/rename Renamed TUI source\r");
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine
+            .search_thread_sessions_v2("renamed tui source", 10)
+            .is_ok_and(|sessions| sessions.len() == 1 && sessions[0].thread_id == parent_thread_id)
+    }));
+    tui.write(b"/fork TUI fork session\r");
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine
+            .list_thread_sessions_v2_for_workspace(workspace.to_str().unwrap(), 10)
+            .is_ok_and(|sessions| {
+                sessions.len() == 2
+                    && sessions.iter().any(|session| {
+                        session.parent_thread_id == Some(parent_thread_id)
+                            && session.title == "TUI fork session"
+                    })
+            })
+    }));
+}
+
 #[test]
 fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     let scenario = Scenario::new();
@@ -500,7 +526,14 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
         .build()
         .unwrap();
     let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
-    assert_eq!(engine.list_thread_sessions_v2(10).unwrap().len(), 1);
+    let workspace = std::fs::canonicalize(scenario.root()).unwrap();
+    assert_eq!(
+        engine
+            .list_thread_sessions_v2_for_workspace(workspace.to_str().unwrap(), 10)
+            .unwrap()
+            .len(),
+        1
+    );
 
     let mut resumed_command = scenario.command(&["tui"]);
     resumed_command.env("TEST_OPENAI_KEY", "session-e2e-secret");
@@ -544,12 +577,14 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     );
     resumed.write(b"\x1b[27u");
 
+    rename_and_fork_from_tui(&mut resumed, &engine, &workspace, thread_id);
+
     resumed.write(b"/new\r");
     assert!(wait_until(Duration::from_secs(2), || provider
         .requests()
         .len()
         == 1));
-    assert_eq!(engine.list_threads_v2().unwrap().len(), 1);
+    assert_eq!(engine.list_threads_v2().unwrap().len(), 2);
     assert_eq!(provider.requests().len(), 1);
     resumed.write(F10);
     assert!(resumed.finish(Duration::from_secs(5)).0.success());
@@ -697,10 +732,24 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback_without_fixed_sleeps() {
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
     assert!(scenario.database_path().exists());
+    let session_files = scenario.session_files();
+    assert_eq!(session_files.len(), 1);
+    let conversation = std::fs::read_to_string(&session_files[0]).unwrap();
+    assert!(
+        conversation
+            .lines()
+            .next()
+            .unwrap()
+            .contains(r#""record":"session""#)
+    );
+    assert!(conversation.contains(r#""record":"entry""#));
+    assert!(conversation.contains(r#""content":"check""#));
+    assert!(conversation.contains(r#""content":"done""#));
+    assert!(!conversation.contains("secret"));
 }
 
 #[test]
-fn running_tui_keeps_shift_enter_and_the_next_multiline_draft_editable() {
+fn running_tui_queues_and_automatically_runs_the_next_multiline_turn() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([
         ProviderReply::completion("first answer").delayed(Duration::from_secs(1)),
@@ -718,8 +767,9 @@ fn running_tui_keeps_shift_enter_and_the_next_multiline_draft_editable() {
     pty.write(b"first prompt\r");
     assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
 
-    // The first durable user card must unlock a fresh composer while the
-    // provider is still working. This is a draft, not a second dispatch yet.
+    // The first durable user card unlocks a fresh composer while the provider
+    // is still working. Enter sends that draft to the session runner mailbox;
+    // no second Enter after completion is required.
     pty.write(b"\x1b[200~next draft first\x1b[201~");
     pty.write(SHIFT_ENTER);
     pty.write(b"\x1b[200~next draft second\x1b[201~");
@@ -729,6 +779,8 @@ fn running_tui_keeps_shift_enter_and_the_next_multiline_draft_editable() {
         String::from_utf8_lossy(&pty.output())
     );
     assert_eq!(provider.requests().len(), 1);
+    pty.write(ENTER);
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
 
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -739,29 +791,18 @@ fn running_tui_keeps_shift_enter_and_the_next_multiline_draft_editable() {
         engine.list_threads_v2().is_ok_and(|threads| {
             threads.len() == 1
                 && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].transcript.entries.iter().any(|entry| {
-                    entry.kind == latte_core::TranscriptKind::Assistant
-                        && entry.text == "first answer"
+                && ["first answer", "queued answer"].iter().all(|answer| {
+                    threads[0].transcript.entries.iter().any(|entry| {
+                        entry.kind == latte_core::TranscriptKind::Assistant && entry.text == *answer
+                    })
                 })
         })
     }));
     assert!(
         pty.wait_for_output(b"Completed", Duration::from_secs(5)),
-        "TUI did not render the completed first run: {}",
+        "TUI did not render the completed queued run: {}",
         String::from_utf8_lossy(&pty.output())
     );
-    pty.write(b"\r");
-    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
-    assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].transcript.entries.iter().any(|entry| {
-                    entry.kind == latte_core::TranscriptKind::Assistant
-                        && entry.text == "queued answer"
-                })
-        })
-    }));
     let requests = provider.requests();
     assert_eq!(
         requests[1].body["messages"]
@@ -1156,7 +1197,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         };
         connection
             .execute(
-                "INSERT INTO thread_transcript_v2(\
+                "INSERT INTO conversation_outbox(\
                     thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms\
                  ) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
                 params![

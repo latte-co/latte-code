@@ -86,7 +86,9 @@ process execution.
   non-streaming requests.
 - [x] Provider binding plus tool aliases and internally derived credential/data
   scope checks for resume.
-- [ ] Explicit model/Provider selection and per-Session model management.
+- [x] Explicit model/Provider selection from the configured catalog and
+  per-Session binding changes through the TUI model picker; a switch applies to
+  the next immutable child and is recorded in the public transcript.
 - [ ] Versioned Harness Profiles that resolve context strategy, system/developer
   prompt, tool schema/names, Plan/Stop semantics, and capability switches as a
   unit for a model/Provider. A Harness Profile is not a Provider adapter and
@@ -106,23 +108,27 @@ process execution.
 
 - [x] Workspace discovery, path confinement, workspace-contained tool execution,
   and Git/file manifest reads.
-- [x] v1 Run state, Thread v2 control state, and transcript cards in the current
-  workspace SQLite database.
+- [x] v1 Run state and Thread v2 control state in user-global SQLite; Session
+  transcript content is authoritative only in per-Session JSONL.
 - [x] Compatible v1 `run`, `resume`, `show`, and `list` CLI paths; existing v1
   Runs are never backfilled into Threads.
 - [x] Immutable Thread v2 follow-up children, paged projections, and bounded
   history-budget validation.
-- [ ] User-global `LATTE_CODE_HOME`, Project/Workspace/Session catalog, and
-  cross-workspace discovery.
-- [ ] One append-only JSONL conversation file per Session; SQLite retains only
-  metadata and the control plane.
-- [ ] Recovery of torn JSONL final lines, catalog repair, and global
-  Session-partitioned leases.
-- [ ] `/new`, `/sessions`, and `/resume` flows for create, selection, and
-  recovery.
-- [ ] Session archival, search, titles, forks, and visible history governance.
-- [ ] Session deletion, import/export, sharing, and handoff, each retaining
-  authority and sensitive-content boundaries.
+- [x] User-global `LATTE_CODE_HOME`, stable Git-worktree-aware Project/Workspace
+  identities, global catalog registration, and Session-partitioned leases.
+- [x] Current-Workspace Session discovery and bounded search in the TUI catalog.
+- [x] One append-only JSONL conversation file per Session as the transcript read
+  authority, including bounded records and torn-final-line repair. SQLite keeps
+  only a transactional outbox until the corresponding JSONL records are synced.
+- [x] Idempotent import of the current workspace's legacy database without
+  modifying the source, followed by JSONL materialization.
+- [ ] Catalog reconstruction from orphan JSONL and repair of missing observed
+  tool-result records.
+- [x] Workspace-scoped `/new`, `/sessions`, and `/resume` flows for transient
+  draft creation, selection, and recovery against the current SQLite catalog.
+- [x] Current-Workspace search, Session titles, and safe forks.
+- [ ] External Session import, sharing, and handoff, each retaining authority
+  and sensitive-content boundaries.
 - [ ] Compatible import of external-Agent Session/config/Skill/Plugin material
   with source, version, and lossy-conversion warning; an unsupported permission
   or Hook must never be silently treated as active.
@@ -138,13 +144,13 @@ process execution.
   request-byte budgets.
 - [x] Base protocol for Thread v2 snapshots, event subscription, and transient
   streaming progress.
-- [ ] Verified TUI base loop: the first prompt crosses the selected Provider,
-  tools/permission, persistence, and transcript presentation end to end. This
-  is the highest-priority product loop.
-- [ ] One runner per Session, asynchronous turns, FIFO mailbox, and parallel
-  independent Sessions.
-- [ ] Safely accept a second user prompt or trusted reminder at a safe boundary
+- [x] Verified TUI base loop: the first prompt crosses the selected Provider,
+  tools/permission, persistence, and transcript presentation end to end.
+- [x] One process-local runner per Session, bounded FIFO user-input mailbox, and
+  parallel independent Sessions.
+- [x] Safely accept a second user prompt at the next runnable child boundary
   without mutating an in-flight Effect.
+- [ ] Trusted reminder producers, ordering, and cancellation semantics.
 - [ ] Context compaction, summaries, selective context, and explainable token
   budgeting.
 - [ ] User-controlled Session/Workspace memory, provenance, expiry, and reset;
@@ -230,10 +236,12 @@ process execution.
   Enter never approves implicitly.
 - [x] Snapshot reload after event gaps; local progress is not durable authority.
 - [x] `Ctrl+P` local command palette for help, navigation, refresh, and quit.
-- [ ] Slash-command catalog, composer suggestions, argument validation, and
-  availability recheck at dispatch.
-- [ ] `/new`, Session picker, `/sessions`/`/resume`, and safe switching with the
-  current composer draft.
+- [x] One closed built-in slash-command catalog shared with `Ctrl+P`, including
+  composer suggestions, argument validation, and dispatch-time availability
+  rechecks. Dynamic command sources and fuzzy matching remain future work.
+- [x] `/new`, current-Workspace Session picker/search, `/sessions`/`/resume`,
+  rename/fork commands, and safe switching while preserving or deliberately
+  replacing the current draft.
 - [ ] Browseable details and file jumps for change diffs, verification results,
   and Effect history.
 - [ ] Accessibility, themes, keymaps, localization, and configurable terminal

@@ -25,7 +25,7 @@ $LATTE_CODE_HOME/
 
 SQLite 至少保存 Project、Workspace、Session、Run、Effect、Permission、Lease、
 Checkpoint、Evidence 和 deduplication key。它保存 title、最近活动时间、无密钥 binding
-fingerprint、archive state 与 JSONL 定位信息，但不复制 conversation transcript。
+fingerprint 与 JSONL 定位信息，但不复制 conversation transcript。
 
 JSONL 首行是最小自描述 header；后续只追加有稳定 `entry_id`、单调 `seq`、可选
 `run_id` 与有界内容的 `message`、完整 tool-call/tool-result、checkpoint 或 compaction。

@@ -304,7 +304,7 @@ commands that happen to be easiest to map from the current palette:
 | `/new` | – | `LocalUi` | No active Run or blocking request | Switch to a transient `NewSessionDraft`; create no durable Session until its first prompt is accepted. |
 | `/sessions [query]` | `/resume` | `TypedAction` plus local picker | No active Run or blocking request | With no argument, load and open the current workspace's Session picker. With an ID or title query, resolve and open that Session directly. |
 
-`/new` does not clear, archive, or delete the current Session. The TUI needs an
+`/new` does not modify the current Session. The TUI needs an
 explicit active-conversation target such as:
 
 ```rust
@@ -456,7 +456,9 @@ metadata rather than arbitrary callbacks or engine capabilities.
 | Command | Aliases | Kind | Current result |
 | --- | --- | --- | --- |
 | `/new` | – | `LocalUi` | Starts a new transient draft. |
-| `/sessions [id or exact title]` | `/resume` | `TypedAction` | Opens the Session picker or resumes one exact match. |
+| `/sessions [query]` | `/resume` | `TypedAction` | Opens the current Workspace picker, searches that Workspace, or resumes an exact ID. |
+| `/rename <title>` | – | `TypedAction` | Renames the current saved Session. |
+| `/fork [title]` | `/branch` | `TypedAction` | Copies committed conversation history into a new authority-free Session. |
 | `/model` | – | `TypedAction` | Opens a searchable provider-grouped model picker and changes the binding used by the next child. |
 | `/help` | – | `LocalUi` | Opens keyboard help. |
 | `/navigation` | `/nav` | `LocalUi` | Enters transcript navigation. |
@@ -472,8 +474,10 @@ write command text to a transcript.
 
 The TUI starts with a fresh transient draft on every launch. Existing Sessions
 are loaded only through explicit `/sessions` or `/resume` interaction;
-`/sessions` opens a picker without an argument and otherwise resolves a UUID or
-exact title. A Session from a different persisted workspace is not opened.
+`/sessions` opens the current Workspace picker without an argument. A UUID is
+resolved exactly within that Workspace; other text performs a bounded substring
+search over the same Workspace. Sessions registered to another Workspace are
+not discovered or resumed from the TUI.
 Session switching is
 disabled during a submission, an active child, a pending request, or
 reconciliation, and that availability is checked again at dispatch. Terminal
@@ -506,7 +510,7 @@ without changing the draft; later edits reopen it. Blocking request states and
 their key events; other overlays also hide the popup.
 
 Fuzzy matching, dynamic prompt commands, workspace command files, MCP prompts,
-Skills, executable plugins, explicit cross-workspace rebinding, and slash
+Skills, executable plugins, cross-workspace Session discovery/rebinding, and slash
 `/cancel` are not implemented.
 
 Reducer tests cover popup filtering, keyboard selection, dismissal, blocking,

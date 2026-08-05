@@ -1,6 +1,7 @@
 //! Engine actor and its private durable state authority.
 #![allow(clippy::missing_errors_doc)]
 pub mod config;
+mod conversation;
 mod policy;
 mod process;
 mod storage;
@@ -10,7 +11,7 @@ mod workspace;
 pub(crate) use latte_core::wall_time_ms as wall_now_ms;
 use latte_core::{
     EventEnvelope, RunId, RunState, ThreadEventEnvelope, ThreadId, ThreadProviderBindingV2,
-    ThreadSnapshot, Transition,
+    ThreadSnapshot, TranscriptPage, Transition,
 };
 pub use process::{
     CancellationToken, ProcessDecision, ProcessError, ProcessInvocation, ProcessOutput,
@@ -35,6 +36,72 @@ fn manifest_map_digest(
     let bytes = serde_json::to_vec(manifest)
         .map_err(|error| StorageError::InvalidData(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn workspace_catalog_identity(
+    root: &Path,
+    workspace_root: &str,
+) -> (String, String, String, Option<String>) {
+    use sha2::{Digest, Sha256};
+
+    let git_common_dir =
+        resolve_git_common_dir(root).and_then(|path| path.to_str().map(str::to_owned));
+    let vcs_identity = git_common_dir
+        .as_deref()
+        .unwrap_or(workspace_root)
+        .to_owned();
+    let project_key = format!("project-{:x}", Sha256::digest(vcs_identity.as_bytes()));
+    let digest = format!("{:x}", Sha256::digest(workspace_root.as_bytes()));
+    let mut readable = String::new();
+    let mut separator = false;
+    for value in workspace_root.chars() {
+        if value.is_ascii_alphanumeric() {
+            if separator && !readable.is_empty() {
+                readable.push('-');
+            }
+            separator = false;
+            if readable.len() + value.len_utf8() > 72 {
+                break;
+            }
+            readable.push(value);
+        } else {
+            separator = true;
+        }
+    }
+    if readable.is_empty() {
+        readable.push_str("workspace");
+    }
+    let storage_key = format!("{readable}-{}", &digest[..12]);
+    (project_key, vcs_identity, storage_key, git_common_dir)
+}
+
+fn resolve_git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return std::fs::canonicalize(dot_git).ok();
+    }
+    let text = std::fs::read_to_string(dot_git).ok()?;
+    let git_dir = text.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = Path::new(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir.to_owned()
+    } else {
+        root.join(git_dir)
+    };
+    let git_dir = std::fs::canonicalize(git_dir).ok()?;
+    let common = std::fs::read_to_string(git_dir.join("commondir")).ok();
+    match common {
+        Some(common) => {
+            let common = Path::new(common.trim());
+            let common = if common.is_absolute() {
+                common.to_owned()
+            } else {
+                git_dir.join(common)
+            };
+            std::fs::canonicalize(common).ok()
+        }
+        None => Some(git_dir),
+    }
 }
 
 fn validate_thread_effect_descriptor(
@@ -341,6 +408,7 @@ pub struct EngineBuilder {
     workspace_root: Option<PathBuf>,
     enabled_tools: Option<BTreeSet<String>>,
     deny_globs: Vec<String>,
+    conversation_root: Option<PathBuf>,
 }
 impl EngineBuilder {
     /// Creates a builder.
@@ -351,6 +419,7 @@ impl EngineBuilder {
             workspace_root: None,
             enabled_tools: None,
             deny_globs: Vec::new(),
+            conversation_root: None,
         }
     }
     /// Selects the trusted workspace root for engine-owned tools.
@@ -377,6 +446,12 @@ impl EngineBuilder {
         self.database_path = Some(path.as_ref().to_owned());
         self
     }
+    /// Selects the trusted root for append-only per-Session conversation files.
+    #[must_use]
+    pub fn conversation_root(mut self, path: impl AsRef<Path>) -> Self {
+        self.conversation_root = Some(path.as_ref().to_owned());
+        self
+    }
     /// Starts the actor and initializes durable storage.
     pub fn build(self) -> Result<EngineHandle, StorageError> {
         let root = self.workspace_root.unwrap_or(
@@ -391,6 +466,16 @@ impl EngineBuilder {
             .ok_or_else(|| StorageError::InvalidData("workspace root is not valid UTF-8".into()))?
             .to_owned();
         let database_path = self.database_path;
+        let inferred_conversation_root = database_path.as_ref().and_then(|path| {
+            path.parent().and_then(|parent| {
+                let canonical_parent =
+                    std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_owned());
+                (path.file_name().is_some_and(|name| name == "state.db")
+                    && path.is_absolute()
+                    && !canonical_parent.starts_with(&workspace_identity))
+                .then(|| parent.join("sessions"))
+            })
+        });
         let tools = tools::ToolRegistry::new(
             &root,
             self.enabled_tools.as_ref(),
@@ -421,9 +506,27 @@ impl EngineBuilder {
             }
             None => storage::Storage::memory()?,
         };
+        let (project_key, vcs_identity, storage_key, git_common_dir) =
+            workspace_catalog_identity(&root, &workspace_root);
+        storage.register_workspace(
+            &workspace_root,
+            &project_key,
+            &vcs_identity,
+            &storage_key,
+            git_common_dir.as_deref(),
+            wall_now_ms(),
+        )?;
+        let conversation_store = self
+            .conversation_root
+            .or(inferred_conversation_root)
+            .as_deref()
+            .map(|root| conversation::ConversationStore::open(root, &storage_key))
+            .transpose()
+            .map_err(StorageError::InvalidData)?
+            .map(Arc::new);
         let (events, _) = broadcast::channel(32);
         let (thread_events, _) = broadcast::channel(64);
-        Ok(EngineHandle {
+        let handle = EngineHandle {
             events,
             thread_events,
             storage: Arc::new(storage),
@@ -432,9 +535,19 @@ impl EngineBuilder {
             process_supervision_supported: cfg!(unix),
             process_group_probe_override: None,
             operation_gate: Arc::new(Semaphore::new(1)),
+            conversation_store,
             #[cfg(test)]
             completion_hook: Arc::new(std::sync::Mutex::new(None)),
-        })
+        };
+        if handle.conversation_store.is_some() {
+            for session in handle
+                .storage
+                .list_thread_sessions_v2_for_workspace(&handle.workspace_root, 500)?
+            {
+                handle.sync_thread_conversation(session.thread_id)?;
+            }
+        }
+        Ok(handle)
     }
 }
 /// Restricted capability for dispatch and subscription.
@@ -535,6 +648,7 @@ pub struct EngineHandle {
     process_supervision_supported: bool,
     process_group_probe_override: Option<process::GroupProbe>,
     operation_gate: Arc<Semaphore>,
+    conversation_store: Option<Arc<conversation::ConversationStore>>,
     #[cfg(test)]
     completion_hook: CompletionHook,
 }
@@ -546,6 +660,77 @@ impl std::fmt::Debug for EngineHandle {
     }
 }
 impl EngineHandle {
+    fn sync_thread_conversation(&self, thread_id: ThreadId) -> Result<(), StorageError> {
+        let Some(store) = &self.conversation_store else {
+            return Ok(());
+        };
+        let metadata = self
+            .storage
+            .thread_session_v2(thread_id)?
+            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+        if metadata.workspace_root != self.workspace_root.as_ref() {
+            return Err(StorageError::InvalidData(
+                "cannot write a Session conversation from a foreign workspace".into(),
+            ));
+        }
+        let entries = self.storage.conversation_outbox_entries(thread_id)?;
+        store
+            .sync(thread_id, metadata.created_at_ms, &entries)
+            .map_err(StorageError::InvalidData)?;
+        if let Some(sequence) = entries.last().map(|entry| entry.sequence) {
+            self.storage
+                .acknowledge_conversation_outbox(thread_id, sequence)?;
+        }
+        Ok(())
+    }
+
+    fn conversation_page(
+        &self,
+        thread_id: ThreadId,
+        after: Option<u64>,
+        limit: usize,
+        tail: bool,
+    ) -> Result<Option<TranscriptPage>, StorageError> {
+        let Some(store) = &self.conversation_store else {
+            return Ok(None);
+        };
+        self.sync_thread_conversation(thread_id)?;
+        let mut entries = store.read(thread_id).map_err(StorageError::InvalidData)?;
+        let bounded = limit.clamp(1, 500);
+        if tail {
+            let start = entries.len().saturating_sub(bounded);
+            entries = entries.split_off(start);
+            let next_after = entries.last().map(|entry| entry.sequence);
+            return Ok(Some(TranscriptPage {
+                entries,
+                next_after,
+                has_more: start > 0,
+            }));
+        }
+        let after = after.unwrap_or(0);
+        entries.retain(|entry| entry.sequence > after);
+        let has_more = entries.len() > bounded;
+        entries.truncate(bounded);
+        let next_after = entries.last().map(|entry| entry.sequence);
+        Ok(Some(TranscriptPage {
+            entries,
+            next_after,
+            has_more,
+        }))
+    }
+
+    fn finish_thread_response(
+        &self,
+        mut response: ThreadCommitResponse,
+    ) -> Result<ThreadCommitResponse, StorageError> {
+        self.sync_thread_conversation(response.snapshot.thread_id)?;
+        response.snapshot = self.thread_snapshot_tail_v2(response.snapshot.thread_id, 500)?;
+        let _ = self
+            .thread_events
+            .send(response.thread_event.envelope.clone());
+        Ok(response)
+    }
+
     fn ensure_thread_lease(thread_id: ThreadId, lease: &Lease) -> Result<(), StorageError> {
         if lease.scope == format!("thread:{thread_id}") {
             Ok(())
@@ -805,7 +990,9 @@ impl EngineHandle {
             prompt,
             &baseline,
             now_ms,
-        )
+        )?;
+        self.sync_thread_conversation(thread_id)?;
+        self.thread_snapshot_tail_v2(thread_id, 500)
     }
     /// Atomically accepts a new Session submission and starts its first child
     /// under the exact thread lease. A failure commits neither the user card nor
@@ -833,10 +1020,7 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        let _ = self
-            .thread_events
-            .send(response.thread_event.envelope.clone());
-        Ok(response.snapshot)
+        Ok(self.finish_thread_response(response)?.snapshot)
     }
     /// Creates an immutable child run for a ready completed thread.
     pub fn create_thread_follow_up_v2(
@@ -857,7 +1041,9 @@ impl EngineHandle {
             prompt,
             &baseline,
             now_ms,
-        )
+        )?;
+        self.sync_thread_conversation(thread_id)?;
+        self.thread_snapshot_tail_v2(thread_id, 500)
     }
     /// Atomically accepts and starts a follow-up child under the exact Session
     /// lease, preserving the completed parent if any precondition fails.
@@ -882,10 +1068,7 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        let _ = self
-            .thread_events
-            .send(response.thread_event.envelope.clone());
-        Ok(response.snapshot)
+        Ok(self.finish_thread_response(response)?.snapshot)
     }
     /// Switches the provider/model binding for subsequent children of an idle
     /// Session and publishes the durable binding-change event.
@@ -904,10 +1087,7 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        let _ = self
-            .thread_events
-            .send(response.thread_event.envelope.clone());
-        Ok(response.snapshot)
+        Ok(self.finish_thread_response(response)?.snapshot)
     }
     /// Reads one paged thread projection.
     pub fn thread_snapshot_v2(
@@ -916,7 +1096,11 @@ impl EngineHandle {
         after: Option<u64>,
         limit: usize,
     ) -> Result<ThreadSnapshot, StorageError> {
-        self.storage.thread_snapshot_v2(thread_id, after, limit)
+        let mut snapshot = self.storage.thread_snapshot_v2(thread_id, after, limit)?;
+        if let Some(page) = self.conversation_page(thread_id, after, limit, false)? {
+            snapshot.transcript = page;
+        }
+        Ok(snapshot)
     }
     /// Reads the newest bounded transcript cards for presentation and resume
     /// reconciliation. Durable history reconstruction continues to use the
@@ -926,25 +1110,147 @@ impl EngineHandle {
         thread_id: ThreadId,
         limit: usize,
     ) -> Result<ThreadSnapshot, StorageError> {
-        self.storage.thread_snapshot_tail_v2(thread_id, limit)
+        let mut snapshot = self.storage.thread_snapshot_tail_v2(thread_id, limit)?;
+        if let Some(page) = self.conversation_page(thread_id, None, limit, true)? {
+            snapshot.transcript = page;
+        }
+        Ok(snapshot)
     }
     /// Lists thread sessions with bounded recent transcript cards.
     pub fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
-        self.storage.list_threads_v2()
+        let mut snapshots = self.storage.list_threads_v2()?;
+        if self.conversation_store.is_some() {
+            for snapshot in &mut snapshots {
+                let is_local = self
+                    .storage
+                    .thread_session_v2(snapshot.thread_id)?
+                    .is_some_and(|session| session.workspace_root == self.workspace_root.as_ref());
+                if is_local
+                    && let Some(page) =
+                        self.conversation_page(snapshot.thread_id, None, 500, true)?
+                {
+                    snapshot.transcript = page;
+                }
+            }
+        }
+        Ok(snapshots)
     }
     /// Lists thread projections belonging to one exact workspace identity.
     pub fn list_threads_v2_for_workspace(
         &self,
         workspace_root: &str,
     ) -> Result<Vec<ThreadSnapshot>, StorageError> {
-        self.storage.list_threads_v2_for_workspace(workspace_root)
+        let mut snapshots = self.storage.list_threads_v2_for_workspace(workspace_root)?;
+        if workspace_root == self.workspace_root.as_ref() {
+            for snapshot in &mut snapshots {
+                if let Some(page) = self.conversation_page(snapshot.thread_id, None, 500, true)? {
+                    snapshot.transcript = page;
+                }
+            }
+        }
+        Ok(snapshots)
     }
-    /// Lists bounded Session metadata without loading transcripts.
-    pub fn list_thread_sessions_v2(
+    /// Searches the current workspace's local Session catalog.
+    pub fn search_thread_sessions_v2(
         &self,
+        query: &str,
         limit: usize,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
-        self.storage.list_thread_sessions_v2(limit)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.storage
+            .search_thread_sessions(&self.workspace_root, query, limit)
+    }
+    /// Gives a Session a bounded, redacted user-visible title.
+    pub fn rename_thread_session_v2(
+        &self,
+        thread_id: ThreadId,
+        title: &str,
+    ) -> Result<latte_core::ThreadSessionSummary, StorageError> {
+        self.require_local_session(thread_id)?;
+        self.storage.rename_thread_session(thread_id, title)?;
+        self.storage
+            .thread_session_v2(thread_id)?
+            .ok_or(StorageError::ThreadNotFound(thread_id))
+    }
+    /// Forks committed conversation history into a new Ready Session. Runtime
+    /// authority, Runs, Effects, permissions, and leases are never copied.
+    pub fn fork_thread_session_v2(
+        &self,
+        source_thread_id: ThreadId,
+        fork_thread_id: ThreadId,
+        title: Option<&str>,
+        now_ms: u64,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        self.require_local_session(source_thread_id)?;
+        self.sync_thread_conversation(source_thread_id)?;
+        let store = self.conversation_store.as_ref().ok_or_else(|| {
+            StorageError::InvalidData("Session forking requires JSONL storage".into())
+        })?;
+        let history = store
+            .read(source_thread_id)
+            .map_err(StorageError::InvalidData)?;
+        self.storage.create_thread_session_fork(
+            source_thread_id,
+            fork_thread_id,
+            &history,
+            title,
+            now_ms,
+        )?;
+        self.sync_thread_conversation(fork_thread_id)?;
+        self.thread_snapshot_v2(fork_thread_id, None, 500)
+    }
+    /// Imports one compatible workspace-local database into the global
+    /// authority without modifying the source file. Repeated imports of the
+    /// same content are no-ops.
+    pub fn import_legacy_workspace_database(
+        &self,
+        path: impl AsRef<Path>,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let source_path = canonical
+            .to_str()
+            .ok_or_else(|| StorageError::InvalidData("legacy database path is not UTF-8".into()))?;
+        let mut file = std::fs::File::open(&canonical)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let fingerprint = format!("sha256-{:x}", digest.finalize());
+        let imported = self.storage.import_legacy_database(
+            &canonical,
+            source_path,
+            &fingerprint,
+            &self.workspace_root,
+            now_ms,
+        )?;
+        if imported {
+            for session in self
+                .storage
+                .list_thread_sessions_v2_for_workspace(&self.workspace_root, 500)?
+            {
+                self.sync_thread_conversation(session.thread_id)?;
+            }
+        }
+        Ok(imported)
     }
     /// Lists bounded Session metadata for one exact workspace identity.
     pub fn list_thread_sessions_v2_for_workspace(
@@ -972,6 +1278,22 @@ impl EngineHandle {
         thread_id: ThreadId,
     ) -> Result<Option<latte_core::ThreadSessionSummary>, StorageError> {
         self.storage.thread_session_v2(thread_id)
+    }
+
+    fn require_local_session(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<latte_core::ThreadSessionSummary, StorageError> {
+        let session = self
+            .storage
+            .thread_session_v2(thread_id)?
+            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+        if session.workspace_root != self.workspace_root.as_ref() {
+            return Err(StorageError::InvalidData(
+                "Session management is confined to the current workspace".into(),
+            ));
+        }
+        Ok(session)
     }
     /// The only public mutation path for a linked v2 child run.
     #[allow(clippy::needless_pass_by_value)]
@@ -1001,10 +1323,7 @@ impl EngineHandle {
         let response = self
             .storage
             .commit_thread_run_update(&request, lease, now_ms)?;
-        let _ = self
-            .thread_events
-            .send(response.thread_event.envelope.clone());
-        Ok(response)
+        self.finish_thread_response(response)
     }
     /// Returns the exact files changed since this linked v2 child began.
     /// The comparison is against an engine-owned baseline captured before the
@@ -1556,6 +1875,7 @@ impl EngineHandle {
             now_ms,
         )?;
         if let ThreadLeaseLossRecovery::Recovered(response) = &result {
+            self.sync_thread_conversation(response.snapshot.thread_id)?;
             let _ = self
                 .thread_events
                 .send(response.thread_event.envelope.clone());
@@ -1758,9 +2078,7 @@ impl EngineHandle {
     /// Releases a lease if its fencing token still matches.
     pub fn release_lease(&self, lease: &Lease) -> Result<(), StorageError> {
         if let Some(response) = self.storage.release_lease(lease)? {
-            let _ = self
-                .thread_events
-                .send(response.thread_event.envelope.clone());
+            self.finish_thread_response(response)?;
         }
         Ok(())
     }
@@ -1913,6 +2231,340 @@ mod tool_effect_tests {
     use super::*;
     use latte_core::{IdSource, SystemIdSource};
     use serde_json::json;
+
+    #[test]
+    fn workspace_catalog_identity_groups_linked_worktrees_and_bounds_storage_keys() {
+        let common = tempfile::tempdir().unwrap();
+        let git_dir = common.path().join("worktrees/feature");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(workspace.path()).unwrap();
+        let root = canonical.to_str().unwrap();
+        let (project_key, vcs_identity, storage_key, git_common_dir) =
+            workspace_catalog_identity(&canonical, root);
+        assert!(project_key.starts_with("project-"));
+        assert_eq!(
+            vcs_identity,
+            std::fs::canonicalize(common.path())
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(git_common_dir.as_deref(), Some(vcs_identity.as_str()));
+        assert!(storage_key.len() <= 85);
+        assert!(
+            storage_key
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || value == b'-')
+        );
+
+        let regular = tempfile::tempdir().unwrap();
+        std::fs::create_dir(regular.path().join(".git")).unwrap();
+        let regular_root = regular.path().to_str().unwrap();
+        let (_, regular_vcs, _, regular_common) =
+            workspace_catalog_identity(regular.path(), regular_root);
+        assert_eq!(regular_common.as_deref(), Some(regular_vcs.as_str()));
+
+        let nongit = tempfile::tempdir().unwrap();
+        let nongit_root = nongit.path().to_str().unwrap();
+        let (_, nongit_vcs, _, nongit_common) =
+            workspace_catalog_identity(nongit.path(), nongit_root);
+        assert_eq!(nongit_vcs, nongit_root);
+        assert!(nongit_common.is_none());
+
+        let (_, _, fallback_key, _) = workspace_catalog_identity(Path::new("/"), "///");
+        assert!(fallback_key.starts_with("workspace-"));
+
+        let relative = tempfile::tempdir().unwrap();
+        std::fs::create_dir(relative.path().join("metadata")).unwrap();
+        std::fs::write(relative.path().join(".git"), "gitdir: metadata\n").unwrap();
+        assert!(resolve_git_common_dir(relative.path()).is_some());
+    }
+
+    #[test]
+    fn jsonl_conversation_is_authoritative_and_the_sqlite_outbox_is_drained() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let conversations = root.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(
+                thread_id,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                test_thread_binding(),
+                "authoritative JSONL",
+                1,
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let pending: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_outbox WHERE thread_id=?1",
+                [thread_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+        let workspace_dir = std::fs::read_dir(&conversations)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let path = workspace_dir.join(format!("{thread_id}.jsonl"));
+        let jsonl = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("authoritative JSONL", "JSONL only");
+        std::fs::write(path, jsonl).unwrap();
+        let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+        assert_eq!(snapshot.transcript.entries[0].text, "JSONL only");
+        let tail = engine.thread_snapshot_tail_v2(thread_id, 1).unwrap();
+        assert_eq!(tail.transcript.entries[0].text, "JSONL only");
+        assert!(!tail.transcript.has_more);
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let workspace_sessions = engine
+            .list_threads_v2_for_workspace(canonical_root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(workspace_sessions.len(), 1);
+        assert_eq!(
+            workspace_sessions[0].transcript.entries[0].text,
+            "JSONL only"
+        );
+        assert!(
+            engine
+                .list_threads_v2_for_workspace("/foreign/workspace")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_management_renames_searches_and_forks_with_local_lineage() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let conversations = root.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let source = ThreadId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(
+                source,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                test_thread_binding(),
+                "source prompt",
+                1,
+            )
+            .unwrap();
+        let renamed = engine
+            .rename_thread_session_v2(source, "  durable work  ")
+            .unwrap();
+        assert_eq!(renamed.title, "durable work");
+        let found = engine.search_thread_sessions_v2("durable", 10).unwrap();
+        assert_eq!(
+            found.iter().map(|item| item.thread_id).collect::<Vec<_>>(),
+            vec![source]
+        );
+
+        let fork = ThreadId::from_uuid(ids.next_uuid_v7());
+        let forked = engine
+            .fork_thread_session_v2(source, fork, Some("safe branch"), 2)
+            .unwrap();
+        assert_eq!(forked.thread_id, fork);
+        assert!(forked.runs.is_empty());
+        let fork_metadata = engine.thread_session_v2(fork).unwrap().unwrap();
+        assert_eq!(fork_metadata.parent_thread_id, Some(source));
+        assert_eq!(forked.transcript.entries[0].run_id, None);
+
+        let runnable_fork = ThreadId::from_uuid(ids.next_uuid_v7());
+        let runnable = engine
+            .fork_thread_session_v2(source, runnable_fork, None, 2)
+            .unwrap();
+        let first_child = engine
+            .create_thread_follow_up_v2(
+                runnable_fork,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                runnable.revision,
+                "first fork prompt",
+                3,
+            )
+            .unwrap();
+        assert_eq!(first_child.runs.len(), 1);
+        assert_eq!(first_child.runs[0].parent_run_id, None);
+
+        assert_eq!(
+            engine.search_thread_sessions_v2("safe branch", 10).unwrap()[0].thread_id,
+            fork
+        );
+        assert!(engine.search_thread_sessions_v2("", 0).unwrap().is_empty());
+        assert!(
+            engine
+                .search_thread_sessions_v2("durable", 10)
+                .unwrap()
+                .iter()
+                .any(|session| session.thread_id == source)
+        );
+        assert!(engine.rename_thread_session_v2(source, "   ").is_err());
+        assert!(
+            engine
+                .fork_thread_session_v2(source, source, Some("duplicate"), 4)
+                .is_err()
+        );
+
+        let memory_only = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let memory_thread = ThreadId::from_uuid(ids.next_uuid_v7());
+        memory_only
+            .create_thread_v2(
+                memory_thread,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                test_thread_binding(),
+                "memory only",
+                5,
+            )
+            .unwrap();
+        assert!(
+            memory_only
+                .fork_thread_session_v2(
+                    memory_thread,
+                    ThreadId::from_uuid(ids.next_uuid_v7()),
+                    None,
+                    6,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn startup_flushes_a_crash_surviving_conversation_outbox() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let conversations = root.path().join("sessions");
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        {
+            let engine = EngineBuilder::new()
+                .workspace_root(root.path())
+                .database_path(&database)
+                .build()
+                .unwrap();
+            engine
+                .create_thread_v2(
+                    thread_id,
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    test_thread_binding(),
+                    "survives restart",
+                    1,
+                )
+                .unwrap();
+        }
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        assert_eq!(
+            engine
+                .thread_snapshot_v2(thread_id, None, 10)
+                .unwrap()
+                .transcript
+                .entries[0]
+                .text,
+            "survives restart"
+        );
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let pending: i64 = connection
+            .query_row("SELECT COUNT(*) FROM conversation_outbox", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn engine_imports_workspace_database_exports_jsonl_and_repeats_as_noop() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy_database = root.path().join("legacy.db");
+        let global_database = root.path().join("global.db");
+        let conversations = root.path().join("sessions");
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let legacy = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&legacy_database)
+            .build()
+            .unwrap();
+        legacy
+            .create_thread_v2(
+                thread_id,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                test_thread_binding(),
+                "import me",
+                1,
+            )
+            .unwrap();
+        drop(legacy);
+        let source_before = std::fs::read(&legacy_database).unwrap();
+        let global = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&global_database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+
+        assert!(
+            !global
+                .import_legacy_workspace_database(root.path().join("missing.db"), 2)
+                .unwrap()
+        );
+        assert!(
+            global
+                .import_legacy_workspace_database(&legacy_database, 3)
+                .unwrap()
+        );
+        assert!(
+            !global
+                .import_legacy_workspace_database(&legacy_database, 4)
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&legacy_database).unwrap(), source_before);
+        assert_eq!(
+            global
+                .thread_snapshot_v2(thread_id, None, 10)
+                .unwrap()
+                .transcript
+                .entries[0]
+                .text,
+            "import me"
+        );
+        assert_eq!(
+            std::fs::read_dir(&conversations)
+                .unwrap()
+                .flat_map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap())
+                .count(),
+            1
+        );
+    }
 
     fn descriptor(name: &str, input: Value) -> ThreadEffectDescriptor {
         ThreadEffectDescriptor {

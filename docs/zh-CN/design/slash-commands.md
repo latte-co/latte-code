@@ -283,7 +283,7 @@ Trust Check。它们不会获得新的 Execution Kind。
 | `/new` | – | `LocalUi` | 不存在 Active Run 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，在第一条 Prompt 被接受前不创建 Durable Session。 |
 | `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Run 或 Blocking Request | 无参数时加载并打开当前 Workspace 的 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
 
-`/new` 不会 Clear、Archive 或 Delete 当前 Session。TUI 需要显式的 Active
+`/new` 不会修改当前 Session。TUI 需要显式的 Active
 Conversation Target，例如：
 
 ```rust
@@ -424,7 +424,9 @@ Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata�
 | 命令 | Alias | Kind | 当前结果 |
 | --- | --- | --- | --- |
 | `/new` | – | `LocalUi` | 启动新的瞬态 Draft。 |
-| `/sessions [id 或精确 title]` | `/resume` | `TypedAction` | 打开 Session Picker，或恢复唯一精确匹配。 |
+| `/sessions [query]` | `/resume` | `TypedAction` | 打开当前 Workspace Picker、搜索该 Workspace，或按 ID 精确恢复。 |
+| `/rename <title>` | – | `TypedAction` | 重命名当前已保存 Session。 |
+| `/fork [title]` | `/branch` | `TypedAction` | 把已提交对话历史复制到不携带运行时 Authority 的新 Session。 |
 | `/model` | – | `TypedAction` | 打开可搜索、按 Provider 分组的 Model Picker，并切换下一个 Child 使用的 Binding。 |
 | `/help` | – | `LocalUi` | 打开键盘帮助。 |
 | `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
@@ -438,8 +440,9 @@ Name 和 Alias 使用小写 ASCII 并精确匹配；Argument 保留内部换行�
 Command Text 写入 Transcript。
 
 TUI 每次启动都进入全新的瞬态 Draft。已有 Session 只会在用户显式执行
-`/sessions` 或 `/resume` 后载入；无参数 `/sessions` 打开 Picker，携带参数时解析
-UUID 或精确 Title。不会打开持久化 Workspace 不同的 Session。存在 Submission、Active Child、Pending
+`/sessions` 或 `/resume` 后载入；无参数 `/sessions` 打开当前 Workspace Picker，UUID
+只在该 Workspace 内按 ID 精确解析，其他文本也只在同一 Workspace 执行有界子串搜索。
+TUI 不发现或恢复注册在其他 Workspace 下的 Session。存在 Submission、Active Child、Pending
 Request 或 Reconciliation 时禁用 Session 切换，并在 Dispatch 时再次检查
 Availability。`Failed` 与 `Interrupted` 已没有 Active Child，可以执行 `/new` 或
 `/sessions`。

@@ -86,7 +86,8 @@ fn public_engine_embedding_config_contract_covers_jsonc_environment_and_fail_clo
     write_workspace_config(&scenario, r#"{database:{path:".latte/final.db"}}"#);
     let final_cli = scenario.output(&["--json", "list"], |_| {});
     assert!(final_cli.status.success());
-    assert!(scenario.root().join(".latte/final.db").exists());
+    assert!(scenario.database_path().exists());
+    assert!(!scenario.root().join(".latte/final.db").exists());
 }
 
 fn write_workspace_config(scenario: &Scenario, text: &str) {

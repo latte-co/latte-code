@@ -25,7 +25,7 @@ use latte_engine::{
     ThreadLeaseLossRecovery,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -34,6 +34,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
+const THREAD_MAILBOX_CAPACITY: usize = 8;
 
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
     let calls = segment
@@ -128,6 +129,8 @@ pub enum ThreadRuntimeError {
     History(String),
     #[error("thread is not in the requested active state")]
     InvalidState,
+    #[error("thread input mailbox is full")]
+    MailboxFull,
     #[error("thread effect: {0}")]
     Effect(String),
 }
@@ -141,6 +144,7 @@ pub struct ThreadRuntimeService {
     policy: ThreadHistoryPolicy,
     provider: ThreadProviderFactory,
     active: Arc<Mutex<HashMap<ThreadId, CancellationToken>>>,
+    mailboxes: Arc<Mutex<HashMap<ThreadId, VecDeque<String>>>>,
     progress: Option<Arc<dyn ThreadProgressSink>>,
     verification: Option<VerificationPlan>,
     lease_ttl_ms: u64,
@@ -149,6 +153,29 @@ pub struct ThreadRuntimeService {
 struct ThreadLeaseGuard {
     engine: EngineHandle,
     lease: Lease,
+}
+
+struct ThreadRunnerGuard {
+    thread_id: ThreadId,
+    mailboxes: Arc<Mutex<HashMap<ThreadId, VecDeque<String>>>>,
+    closed: bool,
+}
+
+impl ThreadRunnerGuard {
+    fn mark_closed(&mut self) {
+        self.closed = true;
+    }
+}
+
+impl Drop for ThreadRunnerGuard {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.mailboxes
+                .lock()
+                .expect("mailbox mutex poisoned")
+                .remove(&self.thread_id);
+        }
+    }
 }
 
 impl std::ops::Deref for ThreadLeaseGuard {
@@ -179,6 +206,7 @@ impl ThreadRuntimeService {
             policy,
             provider,
             active: Arc::new(Mutex::new(HashMap::new())),
+            mailboxes: Arc::new(Mutex::new(HashMap::new())),
             progress: None,
             verification: None,
             lease_ttl_ms: 60_000,
@@ -214,6 +242,17 @@ impl ThreadRuntimeService {
     /// validated and the accepted user submission is persisted before
     /// provider construction can resolve an environment key.
     pub async fn start(
+        &self,
+        thread_id: ThreadId,
+        prompt: String,
+        binding: ThreadProviderBindingV2,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = self.begin_runner(thread_id)?;
+        let snapshot = self.start_one(thread_id, prompt, binding).await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    async fn start_one(
         &self,
         thread_id: ThreadId,
         prompt: String,
@@ -255,6 +294,19 @@ impl ThreadRuntimeService {
         expected_thread_revision: u64,
         prompt: String,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = self.begin_runner(thread_id)?;
+        let snapshot = self
+            .follow_up_one(thread_id, expected_thread_revision, prompt)
+            .await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    async fn follow_up_one(
+        &self,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        prompt: String,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let snapshot = self.load_full(thread_id)?;
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
@@ -283,6 +335,72 @@ impl ThreadRuntimeService {
         };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
+    }
+
+    /// Enqueues a user turn behind the active turn for this session. The
+    /// mailbox is intentionally process-local: accepted prompts are persisted
+    /// only when the single session runner reaches the next safe child
+    /// boundary. A restart therefore cannot mistake queued work for durable
+    /// transcript history.
+    pub fn queue_follow_up(
+        &self,
+        thread_id: ThreadId,
+        prompt: String,
+    ) -> Result<usize, ThreadRuntimeError> {
+        let _ = self.initial_messages(&prompt)?;
+        let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+        let mailbox = mailboxes
+            .get_mut(&thread_id)
+            .ok_or(ThreadRuntimeError::InvalidState)?;
+        if mailbox.len() >= THREAD_MAILBOX_CAPACITY {
+            return Err(ThreadRuntimeError::MailboxFull);
+        }
+        mailbox.push_back(prompt);
+        Ok(mailbox.len())
+    }
+
+    fn begin_runner(&self, thread_id: ThreadId) -> Result<ThreadRunnerGuard, ThreadRuntimeError> {
+        let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+        if mailboxes.contains_key(&thread_id) {
+            return Err(ThreadRuntimeError::InvalidState);
+        }
+        mailboxes.insert(thread_id, VecDeque::new());
+        Ok(ThreadRunnerGuard {
+            thread_id,
+            mailboxes: Arc::clone(&self.mailboxes),
+            closed: false,
+        })
+    }
+
+    async fn drain_mailbox(
+        &self,
+        mut snapshot: ThreadSnapshot,
+        mut runner: ThreadRunnerGuard,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        loop {
+            let prompt = {
+                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+                let mailbox = mailboxes
+                    .get_mut(&snapshot.thread_id)
+                    .ok_or(ThreadRuntimeError::InvalidState)?;
+                let prompt = snapshot
+                    .lifecycle
+                    .accepts_follow_up()
+                    .then(|| mailbox.pop_front())
+                    .flatten();
+                if prompt.is_none() {
+                    mailboxes.remove(&snapshot.thread_id);
+                    runner.mark_closed();
+                }
+                prompt
+            };
+            let Some(prompt) = prompt else {
+                return Ok(snapshot);
+            };
+            snapshot = self
+                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt)
+                .await?;
+        }
     }
 
     /// Persists an explicit provider/model selection for subsequent children.
@@ -1739,6 +1857,133 @@ mod tests {
         }
     }
 
+    fn simple_response(message: &str) -> ProviderResponse {
+        ProviderResponse {
+            message: Some(message.into()),
+            tool_calls: Vec::new(),
+            input_request: None,
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_runner_drains_bounded_mailbox_in_fifo_order() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(DelayedProvider::scripted(
+            std::iter::once((Duration::from_millis(100), simple_response("answer-0"))).chain(
+                (1..=THREAD_MAILBOX_CAPACITY)
+                    .map(|index| (Duration::ZERO, simple_response(&format!("answer-{index}")))),
+            ),
+        ));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let task_service = service.clone();
+        let task = tokio::spawn(async move {
+            task_service
+                .start(thread_id, "prompt-0".into(), binding())
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        for index in 1..=THREAD_MAILBOX_CAPACITY {
+            assert_eq!(
+                service
+                    .queue_follow_up(thread_id, format!("prompt-{index}"))
+                    .unwrap(),
+                index
+            );
+        }
+        assert!(matches!(
+            service.queue_follow_up(thread_id, "overflow".into()),
+            Err(ThreadRuntimeError::MailboxFull)
+        ));
+        assert!(matches!(
+            service
+                .follow_up(thread_id, 0, "parallel runner".into())
+                .await,
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+
+        let completed = task.await.unwrap().unwrap();
+        assert_eq!(completed.runs.len(), THREAD_MAILBOX_CAPACITY + 1);
+        let users = completed
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::User)
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            (0..=THREAD_MAILBOX_CAPACITY)
+                .map(|index| format!("prompt-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            service.queue_follow_up(thread_id, "too late".into()),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+    }
+
+    #[tokio::test]
+    async fn runners_for_different_sessions_make_progress_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(DelayedProvider::scripted([
+            (Duration::from_millis(150), simple_response("one")),
+            (Duration::from_millis(150), simple_response("two")),
+            (Duration::ZERO, simple_response("three")),
+            (Duration::ZERO, simple_response("four")),
+        ]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let first = service.clone();
+        let second = service.clone();
+        let left_id = ThreadId::from_uuid(Uuid::now_v7());
+        let right_id = ThreadId::from_uuid(Uuid::now_v7());
+        let left =
+            tokio::spawn(async move { first.start(left_id, "left".into(), binding()).await });
+        let right =
+            tokio::spawn(async move { second.start(right_id, "right".into(), binding()).await });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service
+                .queue_follow_up(left_id, "left queued".into())
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            service
+                .queue_follow_up(right_id, "right queued".into())
+                .unwrap(),
+            1
+        );
+        let (left, right) = tokio::join!(left, right);
+        assert!(left.unwrap().is_ok() && right.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn start_provider_configuration_failure_is_durable_and_retryable() {
         let root = tempfile::tempdir().unwrap();
@@ -2388,7 +2633,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         for table_and_column in [
             ("effects", "descriptor_json"),
-            ("thread_transcript_v2", "entry_json"),
+            ("conversation_outbox", "entry_json"),
             ("runtime_checkpoints", "payload_json"),
             ("thread_command_dedup_v2", "result_json"),
         ] {
@@ -3059,7 +3304,7 @@ mod tests {
             ("effects", "descriptor_json"),
             ("thread_effect_canonical_v2", "descriptor_json"),
             ("pending_permissions", "effect_id"),
-            ("thread_transcript_v2", "entry_json"),
+            ("conversation_outbox", "entry_json"),
             ("thread_events_v2", "event_json"),
             ("runtime_checkpoints", "payload_json"),
             ("thread_command_dedup_v2", "result_json"),
@@ -3151,7 +3396,7 @@ mod tests {
             "unsafe input must not create durable pending state"
         );
         for (table, column) in [
-            ("thread_transcript_v2", "entry_json"),
+            ("conversation_outbox", "entry_json"),
             ("thread_events_v2", "event_json"),
             ("thread_command_dedup_v2", "digest"),
             ("thread_command_dedup_v2", "result_json"),

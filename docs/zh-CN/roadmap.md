@@ -61,7 +61,8 @@ Windows 已支持任意外部进程执行。
 - [x] OpenAI Chat Completions 兼容 Provider、`base_url`、有界 HTTP 超时与重试。
 - [x] 有界 SSE 流式输出、tool-call 聚合，以及受限的非流式回退。
 - [x] Provider binding、工具别名，以及内部派生凭据/data scope 的 resume 校验。
-- [ ] 可切换的模型/Provider 选择与每个 Session 的显式模型管理。
+- [x] 从已配置 Catalog 显式选择模型/Provider，并通过 TUI model picker 修改每个
+  Session 的 binding；切换从下一个不可变 child 生效，并记录在公开 transcript 中。
 - [ ] 版本化的 Harness Profile：按模型/Provider 成组解析 context strategy、
   system/developer prompt、工具 schema/命名、Plan/Stop 语义与能力开关。它不是
   Provider adapter，也不能依赖不透明的模型名猜测来放宽权限。
@@ -75,16 +76,21 @@ Windows 已支持任意外部进程执行。
 ## 工作区、Session 与历史
 
 - [x] 工作区发现、路径约束、工作区内工具执行与 Git/文件 manifest 读取。
-- [x] 当前工作区 SQLite 中的 v1 Run 状态、Thread v2 控制状态和 transcript card。
+- [x] 用户级全局 SQLite 中的 v1 Run 状态与 Thread v2 控制状态；Session Transcript
+  Content 只以每 Session JSONL 为权威。
 - [x] v1 `run`、`resume`、`show`、`list` CLI 兼容路径；既有 v1 Run 不被回填成 Thread。
 - [x] Thread v2 的不可变 follow-up child、分页投影和有界 history 预算校验。
-- [ ] 用户级全局 `LATTE_CODE_HOME`、Project/Workspace/Session Catalog 与跨工作区发现。
-- [ ] 每个 Session 一份追加式 JSONL 对话内容；SQLite 只保存元数据和控制面。
-- [ ] JSONL 撕裂末行恢复、Catalog 修复和全局 Session lease 分区。
-- [ ] `/new`、`/sessions`、`/resume` 驱动的新建、选择、恢复闭环。
-- [ ] Session 归档、搜索、标题、分叉与可见的历史治理。
-- [ ] Session 的删除、导入/导出、分享与 handoff；每种操作都需保留权限和敏感
-  内容边界。
+- [x] 用户级全局 `LATTE_CODE_HOME`、可识别 Git Worktree 的稳定
+  Project/Workspace Identity、全局 Catalog 注册与 Session 分区 Lease。
+- [x] TUI Catalog 中当前 Workspace 的 Session 发现与有界搜索。
+- [x] 每个 Session 一份追加式 JSONL，作为 Transcript 读取权威，并支持有界 Record
+  与撕裂末行恢复；SQLite 只保留同步 JSONL 前的事务 Outbox。
+- [x] 幂等导入当前 Workspace 的旧数据库、不修改源文件，并生成 JSONL。
+- [ ] 从孤立 JSONL 重建 Catalog，以及修复缺失的已观察 Tool Result Record。
+- [x] 基于全局 SQLite Catalog 的 `/new`、`/sessions`、`/resume` 临时 Draft 新建、
+  当前 Workspace 选择与恢复闭环。
+- [x] 当前 Workspace 搜索、Session 标题与安全分叉。
+- [ ] Session 的外部导入、分享与 handoff；每种操作都需保留权限和敏感内容边界。
 - [ ] 外部 Agent 的 Session/config/Skill/Plugin 兼容导入：保留 source、版本和
   lossy conversion warning，绝不把不支持的权限或 hook 静默当成已生效。
 
@@ -95,10 +101,11 @@ Windows 已支持任意外部进程执行。
 - [x] 模型工具调用、非密钥 input request、验证命令、handoff/evidence 的运行路径。
 - [x] Provider 工具调用 ID、history 语法和请求字节预算的 fail-closed 校验。
 - [x] Thread v2 snapshot、事件订阅和瞬态流式进度的基础协议。
-- [ ] 已验证的 TUI 基础 loop：首条 Prompt 经选定 Provider、工具/权限、持久化和
-  transcript 展示完整走通。这是当前最优先的产品闭环。
-- [ ] 每 Session 单 Runner、异步 Turn、FIFO mailbox 与跨 Session 并行。
-- [ ] 在安全边界接收第二条用户 Prompt 或可信 reminder；不篡改进行中的 Effect。
+- [x] 已验证的 TUI 基础 loop：首条 Prompt 经选定 Provider、工具/权限、持久化和
+  transcript 展示完整走通。
+- [x] 每 Session 一个进程内 Runner、有界 FIFO 用户输入 Mailbox 与跨 Session 并行。
+- [x] 在下一个可运行 Child 边界接收第二条用户 Prompt，不篡改进行中的 Effect。
+- [ ] 可信 Reminder Producer、排序与取消语义。
 - [ ] Context compaction、摘要、选择性上下文与可解释 token 预算。
 - [ ] 用户可控的 Session/Workspace memory、provenance、过期与 reset；不能把
   未经确认的模型结论伪装为事实。
@@ -157,8 +164,11 @@ Windows 已支持任意外部进程执行。
 - [x] Permission、input request、Unknown reconciliation 的独立交互路径；Enter 不会隐式批准。
 - [x] 快照重载处理事件缺口；本地 progress 不作为持久化 authority。
 - [x] `Ctrl+P` 的 help、navigation、refresh、quit 本地 command palette。
-- [ ] Slash command Catalog、composer suggestion、参数校验与 dispatch 时 availability 重检。
-- [ ] `/new`、Session picker、`/sessions`/`/resume` 与当前 composer draft 的安全切换。
+- [x] 与 `Ctrl+P` 共享一个封闭的内建 Slash command Catalog，包含 composer
+  suggestion、参数校验与 dispatch 时 availability 重检；动态来源和 fuzzy matching
+  仍属于后续能力。
+- [x] `/new`、分级 Session Picker/Search、`/sessions`/`/resume`、生命周期治理命令，
+  并在切换时安全保留或显式替换当前 Composer Draft。
 - [ ] 变更 diff、验证结果、Effect 历史的可浏览详情与文件跳转。
 - [ ] 辅助功能、主题、键盘映射、国际化和可配置的终端体验。
 

@@ -1,6 +1,6 @@
 # Latte Code UT / E2E 测试卡点设计
 
-> 状态：分层框架、三项独立覆盖率 job 和 fail-closed `PR Gate` workflow 已落地；GitHub 远端 branch protection/ruleset 尚需实际配置后才算 required 已激活。E2E-H-001 至 H-008、H-010/H-011、E2E-T-001 至 T-008 已实现，H-009 已覆盖公开恢复语义但仍缺真实 kill barrier，后续卡点仍按本文推进。
+> 状态：分层框架、三项独立覆盖率 job 和 fail-closed `PR Gate` workflow 已落地；截至 2026-08-05，active 的默认分支 ruleset 已把唯一稳定的 `PR Gate` 设为 required。E2E-H-001 至 H-008、H-010/H-011、E2E-T-001 至 T-008 已实现，H-009 已覆盖公开恢复语义但仍缺真实 kill barrier，后续卡点仍按本文推进。
 >
 > 基线：2026-07-15，当前工作区，以 `make ci` 和三项独立 llvm-cov profile 实测。
 >
@@ -51,6 +51,10 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 | 最终二进制 E2E 行覆盖率 | 80.78% | 当前 macOS 工作区两个 E2E target 合计实测 `10687 / 13230` |
 | 总行覆盖率 | 96.64% | 当前 macOS 工作区 `make coverage-total` 实测 `27286 / 28234` |
 
+2026-08-05 当前验证可发现 301 个 crate-local 测试、15 个 Contract 测试、
+6 个 portable E2E 测试和 113 个 Unix E2E 测试。UT-only 行覆盖率为 95.08%，
+最终二进制 E2E 行覆盖率为 90.03%，完整本地 `make ci` 门禁通过。
+
 ### 2.2 当前剩余问题
 
 1. **UT 仍待纯化**：`test-unit` 已独立可见，但现有 inline tests 中仍包含 SQLite、socket、子进程和真实 signal 的 component 行为。
@@ -58,7 +62,10 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 3. **Provider 协议保真层未落地**：scripted Provider 已能证明产品行为，但 cassette replay 与 live canary 仍待实现。
 4. **release 只构建不启动**：artifact 存在不等于产物可以启动、解析配置和输出稳定 JSON。
 5. **失败证据尚未打包成 artifact**：harness 已持有 stdout、stderr、PTY transcript、Provider request log 和最终投影，但 CI 还没有在失败时统一上传。
-6. **required 激活仍是外部动作**：workflow 已配置完整三平台矩阵和 fail-closed `PR Gate`，但各适用平台仍需连续 10 次零 flake，并在 GitHub branch protection/ruleset 中实际把 `PR Gate` 设为 required；仓库内文件不能证明远端设置已启用。
+6. **required 激活由远端强制执行**：workflow 已配置完整三平台矩阵和
+   fail-closed `PR Gate`；截至 2026-08-05，active 的默认分支 ruleset 已要求这一个
+   稳定检查。仓库内文件仍无法证明未来没有远端配置漂移，因此交付验证必须读取
+   live ruleset；新引入 job 仍须保留连续 10 次零 flake 的激活门槛。
 
 ## 3. 三层测试边界
 
@@ -465,8 +472,8 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 
 本设计不是从空白假设测试能力：
 
-- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 245 个 crate-local 测试，当前 UT-only profile 为 95.05%；
-- 当前独立 Contract 与 E2E targets 共 93 个 integration tests：15 个 Contract、3 个 portable 最终二进制 E2E 和 75 个 Unix 最终二进制 E2E；
+- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 301 个 crate-local 测试，当前 UT-only profile 为 95.08%；
+- 当前独立 Contract 与 E2E targets 共 134 个 integration tests：15 个 Contract、6 个 portable 最终二进制 E2E 和 113 个 Unix 最终二进制 E2E；E2E profile 为 90.03%；
 - 2026-07-15 macOS 基线为 UT-only 95.05%、E2E 80.78%、全 targets 96.64%；该数据早于 E2E 90% 门槛；
 - 最终二进制、loopback Provider、真实 PTY、跨进程 SQLite resume 和 terminal mode restore 都已有可复用实现；
 - Provider endpoint 已可指向 loopback harness，因此 cassette replay 可以复用同一最终二进制路径，不要求生产后门；

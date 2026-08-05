@@ -318,8 +318,9 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         }"#,
     )
     .unwrap();
-    let (status, output) =
-        PtySession::spawn(blocked_parent.command(&["tui"])).finish(Duration::from_secs(5));
+    let mut command = blocked_parent.command(&["tui"]);
+    command.env("LATTE_CODE_HOME", blocked_parent.root().join("blocked"));
+    let (status, output) = PtySession::spawn(command).finish(Duration::from_secs(5));
     assert_eq!(status.code(), Some(70));
     assert!(String::from_utf8_lossy(&output).contains("cannot create"));
 
@@ -335,8 +336,12 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         }"#,
     )
     .unwrap();
-    let (status, output) =
-        PtySession::spawn(directory_database.command(&["tui"])).finish(Duration::from_secs(5));
+    let storage_home = directory_database.root().join("directory-storage-home");
+    std::fs::create_dir(&storage_home).unwrap();
+    std::fs::create_dir(storage_home.join("state.db")).unwrap();
+    let mut command = directory_database.command(&["tui"]);
+    command.env("LATTE_CODE_HOME", storage_home);
+    let (status, output) = PtySession::spawn(command).finish(Duration::from_secs(5));
     assert_eq!(status.code(), Some(70));
     assert!(!output.is_empty());
 }

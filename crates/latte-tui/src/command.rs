@@ -8,6 +8,8 @@
 pub enum BuiltinCommand {
     New,
     Sessions,
+    Rename,
+    Fork,
     Model,
     Help,
     Navigation,
@@ -28,6 +30,7 @@ pub enum CommandKind {
 pub enum ArgumentPolicy {
     None,
     Optional,
+    Required,
 }
 
 /// Secret-free built-in descriptor. No callback or runtime capability can be
@@ -62,7 +65,7 @@ pub const BUILTINS: &[CommandDescriptor] = &[
         name: "sessions",
         aliases: SESSION_ALIASES,
         description: "Find and resume a saved session",
-        argument_hint: Some("[session-id or exact title]"),
+        argument_hint: Some("[query]"),
         kind: CommandKind::TypedAction,
         arguments: ArgumentPolicy::Optional,
     },
@@ -111,6 +114,24 @@ pub const BUILTINS: &[CommandDescriptor] = &[
         kind: CommandKind::LocalUi,
         arguments: ArgumentPolicy::None,
     },
+    CommandDescriptor {
+        id: BuiltinCommand::Rename,
+        name: "rename",
+        aliases: NO_ALIASES,
+        description: "Rename the current session",
+        argument_hint: Some("<title>"),
+        kind: CommandKind::TypedAction,
+        arguments: ArgumentPolicy::Required,
+    },
+    CommandDescriptor {
+        id: BuiltinCommand::Fork,
+        name: "fork",
+        aliases: &["branch"],
+        description: "Fork committed history into a new session",
+        argument_hint: Some("[title]"),
+        kind: CommandKind::TypedAction,
+        arguments: ArgumentPolicy::Optional,
+    },
 ];
 
 /// Result of exact slash recognition. Unknown and syntactically invalid slash
@@ -150,6 +171,12 @@ pub fn resolve_slash(value: &str) -> SlashResolution {
     if descriptor.arguments == ArgumentPolicy::None && !argument.is_empty() {
         return SlashResolution::ValidationError(format!(
             "/{} does not accept arguments",
+            descriptor.name
+        ));
+    }
+    if descriptor.arguments == ArgumentPolicy::Required && argument.is_empty() {
+        return SlashResolution::ValidationError(format!(
+            "/{} requires an argument",
             descriptor.name
         ));
     }
@@ -251,6 +278,10 @@ mod tests {
             resolve_slash("/sessions title"),
             SlashResolution::Command { argument, .. } if argument == "title"
         ));
+        assert_eq!(
+            resolve_slash("/rename"),
+            SlashResolution::ValidationError("/rename requires an argument".into())
+        );
     }
 
     #[test]
@@ -280,10 +311,22 @@ mod tests {
                 .into_iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![BuiltinCommand::Refresh, BuiltinCommand::Sessions]
+            vec![
+                BuiltinCommand::Refresh,
+                BuiltinCommand::Rename,
+                BuiltinCommand::Sessions,
+            ]
         );
         assert_eq!(slash_suggestions("/resu"), vec![&BUILTINS[1]]);
-        assert_eq!(slash_suggestions("/help"), vec![&BUILTINS[3]]);
+        assert_eq!(
+            slash_suggestions("/help"),
+            vec![
+                BUILTINS
+                    .iter()
+                    .find(|item| item.id == BuiltinCommand::Help)
+                    .expect("help command")
+            ]
+        );
     }
 
     #[test]

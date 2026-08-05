@@ -225,6 +225,8 @@ pub struct ThreadSessionSummary {
     pub thread_id: ThreadId,
     pub title: String,
     pub workspace_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<ThreadId>,
     pub lifecycle: ThreadLifecycle,
     pub provider_name: String,
     pub model: String,

@@ -13,7 +13,7 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// thread.  The bound prevents a single long-running conversation from
@@ -475,7 +475,7 @@ impl Storage {
                 run_id TEXT NOT NULL UNIQUE REFERENCES thread_runs_v2(run_id) ON DELETE RESTRICT,
                 lease_token INTEGER NOT NULL DEFAULT 0
               );
-              CREATE TABLE thread_transcript_v2(
+              CREATE TABLE conversation_outbox(
                 thread_id TEXT NOT NULL REFERENCES threads_v2(thread_id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL,
                 entry_id TEXT NOT NULL UNIQUE,
@@ -577,8 +577,8 @@ impl Storage {
                 let titles = {
                     let mut statement = tx.prepare(
                         "SELECT t.thread_id, x.entry_json FROM threads_v2 t \
-                         LEFT JOIN thread_transcript_v2 x ON x.thread_id=t.thread_id \
-                           AND x.seq=(SELECT MIN(y.seq) FROM thread_transcript_v2 y \
+                         LEFT JOIN conversation_outbox x ON x.thread_id=t.thread_id \
+                           AND x.seq=(SELECT MIN(y.seq) FROM conversation_outbox y \
                                       WHERE y.thread_id=t.thread_id AND y.kind='user') \
                          WHERE t.title=''",
                     )?;
@@ -641,6 +641,59 @@ impl Storage {
                 ",
             )?;
             tx.commit()?;
+            version = 10;
+        }
+        if version == 10 {
+            let tx = connection.unchecked_transaction()?;
+            let has_legacy_transcript: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_transcript_v2')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_legacy_transcript {
+                tx.execute_batch(
+                    "ALTER TABLE thread_transcript_v2 RENAME TO conversation_outbox;",
+                )?;
+            }
+            let has_parent: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name='parent_thread_id')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_parent {
+                tx.execute_batch("ALTER TABLE threads_v2 ADD COLUMN parent_thread_id TEXT REFERENCES threads_v2(thread_id) ON DELETE SET NULL;")?;
+            }
+            tx.execute_batch(
+                r"
+                CREATE TABLE IF NOT EXISTS projects(
+                  project_key TEXT PRIMARY KEY,
+                  vcs_identity TEXT NOT NULL UNIQUE,
+                  created_at_ms INTEGER NOT NULL,
+                  updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workspaces(
+                  workspace_root TEXT PRIMARY KEY,
+                  project_key TEXT NOT NULL REFERENCES projects(project_key) ON DELETE RESTRICT,
+                  storage_key TEXT NOT NULL UNIQUE,
+                  git_common_dir TEXT,
+                  first_seen_at_ms INTEGER NOT NULL,
+                  last_seen_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS legacy_imports(
+                  source_path TEXT PRIMARY KEY,
+                  fingerprint TEXT NOT NULL,
+                  imported_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS thread_sessions_workspace_activity
+                  ON threads_v2(workspace_root,updated_at_ms DESC);
+                CREATE INDEX IF NOT EXISTS thread_sessions_parent
+                  ON threads_v2(parent_thread_id,created_at_ms);
+                INSERT INTO schema_migrations(version,applied_at_ms)
+                  VALUES(11,CAST(strftime('%s','now') AS INTEGER)*1000);
+                PRAGMA user_version=11;
+                ",
+            )?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -650,6 +703,182 @@ impl Storage {
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn register_workspace(
+        &self,
+        workspace_root: &str,
+        project_key: &str,
+        vcs_identity: &str,
+        storage_key: &str,
+        git_common_dir: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        validate_catalog_key(project_key, "project key")?;
+        validate_catalog_key(storage_key, "storage key")?;
+        if vcs_identity.is_empty()
+            || vcs_identity.len() > 8 * 1024
+            || vcs_identity.chars().any(char::is_control)
+        {
+            return Err(StorageError::InvalidData(
+                "invalid project VCS identity".into(),
+            ));
+        }
+        if git_common_dir.is_some_and(|value| {
+            value.is_empty() || value.len() > 8 * 1024 || value.chars().any(char::is_control)
+        }) {
+            return Err(StorageError::InvalidData(
+                "invalid workspace Git common directory".into(),
+            ));
+        }
+        let now_ms = to_i64(now_ms)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO projects(project_key,vcs_identity,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,?3,?3) \
+             ON CONFLICT(project_key) DO UPDATE SET \
+               vcs_identity=excluded.vcs_identity,updated_at_ms=excluded.updated_at_ms",
+            params![project_key, vcs_identity, now_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO workspaces(workspace_root,project_key,storage_key,git_common_dir,first_seen_at_ms,last_seen_at_ms) \
+             VALUES(?1,?2,?3,?4,?5,?5) \
+             ON CONFLICT(workspace_root) DO UPDATE SET \
+               project_key=excluded.project_key,storage_key=excluded.storage_key,git_common_dir=excluded.git_common_dir,last_seen_at_ms=excluded.last_seen_at_ms",
+            params![workspace_root, project_key, storage_key, git_common_dir, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn import_legacy_database(
+        &self,
+        path: &Path,
+        source_path: &str,
+        fingerprint: &str,
+        workspace_root: &str,
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        validate_catalog_key(fingerprint, "legacy import fingerprint")?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let current_database = conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        if !current_database.is_empty()
+            && std::fs::canonicalize(&current_database).ok().as_deref()
+                == std::fs::canonicalize(path).ok().as_deref()
+        {
+            return Ok(false);
+        }
+        let previous: Option<String> = conn
+            .query_row(
+                "SELECT fingerprint FROM legacy_imports WHERE source_path=?1",
+                [source_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(fingerprint) {
+            return Ok(false);
+        }
+        conn.execute(
+            "ATTACH DATABASE ?1 AS legacy_import",
+            [path.to_string_lossy().as_ref()],
+        )?;
+        let import_result = (|| {
+            let version: i64 =
+                conn.query_row("PRAGMA legacy_import.user_version", [], |row| row.get(0))?;
+            if !(9..=11).contains(&version) {
+                return Err(StorageError::InvalidData(format!(
+                    "legacy database schema {version} cannot be imported; expected 9 through 11"
+                )));
+            }
+            let foreign_workspace: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_import.threads_v2 WHERE workspace_root<>?1)",
+                [workspace_root],
+                |row| row.get(0),
+            )?;
+            if foreign_workspace {
+                return Err(StorageError::InvalidData(
+                    "legacy database contains Sessions from another workspace".into(),
+                ));
+            }
+            if previous.is_none() {
+                let collision: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_import.runs l JOIN main.runs m USING(run_id)) \
+                     OR EXISTS(SELECT 1 FROM legacy_import.threads_v2 l JOIN main.threads_v2 m USING(thread_id))",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if collision {
+                    return Err(StorageError::InvalidData(
+                        "legacy import collides with existing global identifiers".into(),
+                    ));
+                }
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for table in [
+                "sessions",
+                "runs",
+                "events",
+                "command_dedup",
+                "effects",
+                "effect_attempts",
+                "evidence",
+                "run_read_model",
+                "pending_permissions",
+                "runtime_checkpoints",
+                "run_baselines",
+                "threads_v2",
+                "thread_runs_v2",
+                "thread_active_runs_v2",
+                "thread_events_v2",
+                "thread_command_dedup_v2",
+                "thread_commit_sources_v2",
+                "thread_effect_canonical_v2",
+            ] {
+                tx.execute_batch(&format!(
+                    "INSERT OR IGNORE INTO main.{table} SELECT * FROM legacy_import.{table};"
+                ))?;
+            }
+            let has_outbox: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_import.sqlite_master WHERE type='table' AND name='conversation_outbox')",
+                [],
+                |row| row.get(0),
+            )?;
+            let transcript_source = if has_outbox {
+                "conversation_outbox"
+            } else {
+                "thread_transcript_v2"
+            };
+            tx.execute_batch(&format!(
+                "INSERT OR IGNORE INTO main.conversation_outbox SELECT * FROM legacy_import.{transcript_source};"
+            ))?;
+            tx.execute(
+                "INSERT INTO legacy_imports(source_path,fingerprint,imported_at_ms) VALUES(?1,?2,?3) \
+                 ON CONFLICT(source_path) DO UPDATE SET fingerprint=excluded.fingerprint,imported_at_ms=excluded.imported_at_ms",
+                params![source_path, fingerprint, to_i64(now_ms)?],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        let detach_result = conn.execute_batch("DETACH DATABASE legacy_import;");
+        match (import_result, detach_result) {
+            (Ok(value), Ok(())) => {
+                drop(conn);
+                self.recover_at(now_ms)?;
+                Ok(value)
+            }
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
     }
 
     #[cfg(test)]
@@ -879,7 +1108,7 @@ impl Storage {
             created_at_ms: now_ms,
         };
         tx.execute(
-            "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
+            "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
             params![thread_id.to_string(), entry.entry_id.to_string(), run_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
         )?;
         let thread_event = if initial_lease.is_some() {
@@ -1006,11 +1235,16 @@ impl Storage {
                 return Err(StorageError::LeaseLost);
             }
         }
-        let (revision, lifecycle, latest): (i64, String, Option<String>) = tx
+        let (revision, lifecycle, latest, fork_parent): (
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = tx
             .query_row(
-                "SELECT revision,lifecycle,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+                "SELECT revision,lifecycle,latest_run_id,parent_thread_id FROM threads_v2 WHERE thread_id=?1",
                 [thread_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or(StorageError::ThreadNotFound(thread_id))?;
@@ -1032,22 +1266,31 @@ impl Storage {
                 "follow-up requires a ready thread with no active child".into(),
             ));
         }
-        let parent = latest.ok_or_else(|| {
-            StorageError::InvalidData("ready thread has no completed child".into())
-        })?;
-        let parent_state: String = tx.query_row(
-            "SELECT state_json FROM runs WHERE run_id=?1",
-            [parent.clone()],
-            |row| row.get(0),
-        )?;
-        let parent_state: RunState = serde_json::from_str(&parent_state).map_err(invalid_json)?;
-        let parent_accepts_follow_up = parent_state.status == RunStatus::Completed
-            || (parent_state.status == RunStatus::Failed
-                && parent_state.failure.as_ref().is_some_and(|failure| {
-                    failure.retryability == Retryability::Retryable
-                        || failure.code == FailureCode::PermissionDenied
-                }));
-        if !parent_accepts_follow_up {
+        if latest.is_none() && fork_parent.is_none() {
+            return Err(StorageError::InvalidData(
+                "follow-up thread has no completed child".into(),
+            ));
+        }
+        let parent_state = latest
+            .as_ref()
+            .map(|parent| {
+                tx.query_row(
+                    "SELECT state_json FROM runs WHERE run_id=?1",
+                    [parent],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(StorageError::from)
+                .and_then(|state| serde_json::from_str::<RunState>(&state).map_err(invalid_json))
+            })
+            .transpose()?;
+        if parent_state.as_ref().is_some_and(|parent| {
+            parent.status != RunStatus::Completed
+                && !(parent.status == RunStatus::Failed
+                    && parent.failure.as_ref().is_some_and(|failure| {
+                        failure.retryability == Retryability::Retryable
+                            || failure.code == FailureCode::PermissionDenied
+                    }))
+        }) {
             return Err(StorageError::InvalidData(
                 "follow-up parent must be completed, retryably failed, or permission-denied".into(),
             ));
@@ -1084,7 +1327,7 @@ impl Storage {
                 serde_json::to_string(baseline).map_err(invalid_json)?
             ],
         )?;
-        tx.execute("INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,?3,?4)",params![run_id.to_string(),thread_id.to_string(),parent,to_i64(ordinal)?])?;
+        tx.execute("INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,?3,?4)",params![run_id.to_string(),thread_id.to_string(),latest,to_i64(ordinal)?])?;
         tx.execute(
             "INSERT INTO thread_active_runs_v2(thread_id,run_id,lease_token) VALUES(?1,?2,?3)",
             params![
@@ -1113,10 +1356,10 @@ impl Storage {
             source_key: format!("follow-up:{run_id}:user"),
             created_at_ms: now_ms,
         };
-        tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'user',?5,?6,?7)",params![thread_id.to_string(),to_i64(seq)?,entry.entry_id.to_string(),run_id.to_string(),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'user',?5,?6,?7)",params![thread_id.to_string(),to_i64(seq)?,entry.entry_id.to_string(),run_id.to_string(),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
         let summary = ThreadRunSummary {
             run_id,
-            parent_run_id: Some(parent_state.run_id),
+            parent_run_id: parent_state.map(|parent| parent.run_id),
             ordinal,
             status: ThreadRunStatus::Queued,
             run_revision: 0,
@@ -1264,7 +1507,7 @@ impl Storage {
             created_at_ms: now_ms,
         };
         tx.execute(
-            "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,NULL,'system',?4,?5,?6)",
+            "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,NULL,'system',?4,?5,?6)",
             params![thread_id.to_string(), to_i64(next_sequence)?, entry.entry_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
         )?;
         let envelope = ThreadEventEnvelope {
@@ -1316,6 +1559,33 @@ impl Storage {
         current_thread_snapshot(&conn, thread_id, limit)
     }
 
+    pub(crate) fn conversation_outbox_entries(
+        &self,
+        thread_id: latte_core::ThreadId,
+    ) -> Result<Vec<TranscriptEntry>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT entry_json FROM conversation_outbox WHERE thread_id=?1 ORDER BY seq ASC",
+        )?;
+        statement
+            .query_map([thread_id.to_string()], |row| row.get::<_, String>(0))?
+            .map(|value| serde_json::from_str::<TranscriptEntry>(&value?).map_err(invalid_json))
+            .collect()
+    }
+
+    pub(crate) fn acknowledge_conversation_outbox(
+        &self,
+        thread_id: latte_core::ThreadId,
+        through_sequence: u64,
+    ) -> Result<(), StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "DELETE FROM conversation_outbox WHERE thread_id=?1 AND seq<=?2",
+            params![thread_id.to_string(), to_i64(through_sequence)?],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn
@@ -1362,51 +1632,6 @@ impl Storage {
             .collect()
     }
 
-    pub(crate) fn list_thread_sessions_v2(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ThreadSessionSummary>, StorageError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let limit = limit.min(500);
-        let conn = self.connection.lock().expect("storage mutex poisoned");
-        let mut statement = conn.prepare(
-            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
-             FROM threads_v2 ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?1",
-        )?;
-        let limit = u64::try_from(limit)
-            .map_err(|_| StorageError::InvalidData("session list limit exceeds u64".into()))?;
-        let rows = statement.query_map([to_i64(limit)?], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
-                row?;
-            let binding: ThreadProviderBindingV2 =
-                serde_json::from_str(&binding_json).map_err(invalid_json)?;
-            Ok(ThreadSessionSummary {
-                thread_id: parse_thread_id(&thread_id)?,
-                title,
-                workspace_root,
-                lifecycle: parse_lifecycle(&lifecycle)?,
-                provider_name: binding.provider_name,
-                model: binding.model,
-                created_at_ms: from_i64(created)?,
-                updated_at_ms: from_i64(updated)?,
-            })
-        })
-        .collect()
-    }
-
     pub(crate) fn list_thread_sessions_v2_for_workspace(
         &self,
         workspace_root: &str,
@@ -1419,7 +1644,7 @@ impl Storage {
         let limit = limit.min(500);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
              FROM threads_v2 WHERE workspace_root=?1 \
              ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?2",
         )?;
@@ -1430,21 +1655,31 @@ impl Storage {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         rows.map(|row| {
-            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
-                row?;
+            let (
+                thread_id,
+                title,
+                workspace_root,
+                parent,
+                lifecycle,
+                binding_json,
+                created,
+                updated,
+            ) = row?;
             let binding: ThreadProviderBindingV2 =
                 serde_json::from_str(&binding_json).map_err(invalid_json)?;
             Ok(ThreadSessionSummary {
                 thread_id: parse_thread_id(&thread_id)?,
                 title,
                 workspace_root,
+                parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
                 lifecycle: parse_lifecycle(&lifecycle)?,
                 provider_name: binding.provider_name,
                 model: binding.model,
@@ -1468,7 +1703,7 @@ impl Storage {
         let limit = limit.min(500);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT thread_id,title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
              FROM threads_v2 WHERE workspace_root=?1 AND title=?2 \
              ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
         )?;
@@ -1485,22 +1720,32 @@ impl Storage {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )?;
         rows.map(|row| {
-            let (thread_id, title, workspace_root, lifecycle, binding_json, created, updated) =
-                row?;
+            let (
+                thread_id,
+                title,
+                workspace_root,
+                parent,
+                lifecycle,
+                binding_json,
+                created,
+                updated,
+            ) = row?;
             let binding: ThreadProviderBindingV2 =
                 serde_json::from_str(&binding_json).map_err(invalid_json)?;
             Ok(ThreadSessionSummary {
                 thread_id: parse_thread_id(&thread_id)?,
                 title,
                 workspace_root,
+                parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
                 lifecycle: parse_lifecycle(&lifecycle)?,
                 provider_name: binding.provider_name,
                 model: binding.model,
@@ -1518,29 +1763,31 @@ impl Storage {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT title,workspace_root,lifecycle,binding_json,created_at_ms,updated_at_ms \
+                "SELECT title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
                  FROM threads_v2 WHERE thread_id=?1",
                 [thread_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
-            |(title, workspace_root, lifecycle, binding_json, created, updated)| {
+            |(title, workspace_root, parent, lifecycle, binding_json, created, updated)| {
                 let binding: ThreadProviderBindingV2 =
                     serde_json::from_str(&binding_json).map_err(invalid_json)?;
                 Ok(ThreadSessionSummary {
                     thread_id,
                     title,
                     workspace_root,
+                    parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
                     lifecycle: parse_lifecycle(&lifecycle)?,
                     provider_name: binding.provider_name,
                     model: binding.model,
@@ -1550,6 +1797,146 @@ impl Storage {
             },
         )
         .transpose()
+    }
+
+    pub(crate) fn search_thread_sessions(
+        &self,
+        workspace_root: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ThreadSessionSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let query = query.trim().to_lowercase();
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
+             FROM threads_v2 WHERE workspace_root=?1 AND \
+             (?2='' OR instr(lower(title),?2)>0 OR instr(lower(thread_id),?2)>0) \
+             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                workspace_root,
+                query,
+                to_i64(u64::try_from(limit.min(500)).map_err(|_| {
+                    StorageError::InvalidData("session search limit exceeds u64".into())
+                })?)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (
+                thread_id,
+                title,
+                workspace_root,
+                parent,
+                lifecycle,
+                binding_json,
+                created,
+                updated,
+            ) = row?;
+            let binding: ThreadProviderBindingV2 =
+                serde_json::from_str(&binding_json).map_err(invalid_json)?;
+            Ok(ThreadSessionSummary {
+                thread_id: parse_thread_id(&thread_id)?,
+                title,
+                workspace_root,
+                parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
+                lifecycle: parse_lifecycle(&lifecycle)?,
+                provider_name: binding.provider_name,
+                model: binding.model,
+                created_at_ms: from_i64(created)?,
+                updated_at_ms: from_i64(updated)?,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn rename_thread_session(
+        &self,
+        thread_id: latte_core::ThreadId,
+        title: &str,
+    ) -> Result<(), StorageError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(StorageError::InvalidData(
+                "session title must not be empty".into(),
+            ));
+        }
+        let title = session_title(title);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE threads_v2 SET title=?1 WHERE thread_id=?2",
+            params![title, thread_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::ThreadNotFound(thread_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_thread_session_fork(
+        &self,
+        source_thread_id: latte_core::ThreadId,
+        fork_thread_id: latte_core::ThreadId,
+        history: &[TranscriptEntry],
+        title: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (source_title, workspace_root, binding_json): (String, String, String) = tx
+            .query_row(
+                "SELECT title,workspace_root,binding_json FROM threads_v2 WHERE thread_id=?1",
+                [source_thread_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or(StorageError::ThreadNotFound(source_thread_id))?;
+        let title = title.map_or_else(
+            || session_title(&format!("{source_title} (fork)")),
+            session_title,
+        );
+        let last_sequence = history.last().map_or(0, |entry| entry.sequence);
+        tx.execute(
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id) \
+             VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7)",
+            params![fork_thread_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_thread_id.to_string()],
+        )?;
+        let mut previous = 0;
+        for source in history {
+            if source.sequence <= previous {
+                return Err(StorageError::InvalidData(
+                    "fork history is not a strictly increasing sequence".into(),
+                ));
+            }
+            previous = source.sequence;
+            let mut entry = source.clone();
+            entry.entry_id = TranscriptEntryId::from_uuid(Uuid::now_v7());
+            entry.run_id = None;
+            entry.source_key = format!("fork:{source_thread_id}:{}", source.sequence);
+            tx.execute(
+                "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                 VALUES(?1,?2,?3,NULL,?4,?5,?6,?7)",
+                params![fork_thread_id.to_string(),to_i64(entry.sequence)?,entry.entry_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(entry.created_at_ms)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Computes the exact workspace paths changed since this linked child was
@@ -2473,7 +2860,7 @@ impl Storage {
                 source_key,
                 created_at_ms: now_ms,
             };
-            tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![request.thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),request.run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+            tx.execute("INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![request.thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),request.run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
             Some(entry)
         } else {
             None
@@ -3902,6 +4289,18 @@ fn validate_workspace_root(value: &str) -> Result<&str, StorageError> {
     Ok(value)
 }
 
+fn validate_catalog_key(value: &str, name: &str) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    {
+        return Err(StorageError::InvalidData(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
 fn session_title(prompt: &str) -> String {
     const LIMIT: usize = 120;
     let first_line = prompt.lines().next().unwrap_or_default().trim();
@@ -4039,7 +4438,7 @@ fn thread_snapshot(
     let query_after = after.unwrap_or(0);
     let mut entries = connection
         .prepare(
-            "SELECT entry_json FROM thread_transcript_v2 WHERE thread_id=?1 AND seq>?2 ORDER BY seq ASC LIMIT ?3",
+            "SELECT entry_json FROM conversation_outbox WHERE thread_id=?1 AND seq>?2 ORDER BY seq ASC LIMIT ?3",
         )?
         .query_map(
             params![thread_id.to_string(), to_i64(query_after)?, i64::try_from(bounded_limit + 1).map_err(|_| StorageError::InvalidData("page limit overflow".into()))?],
@@ -4126,7 +4525,7 @@ fn thread_transcript_tail(
     let bounded_limit = limit.clamp(1, THREAD_PROJECTION_TRANSCRIPT_LIMIT);
     let mut newest_first = connection
         .prepare(
-            "SELECT entry_json FROM thread_transcript_v2 WHERE thread_id=?1 ORDER BY seq DESC LIMIT ?2",
+            "SELECT entry_json FROM conversation_outbox WHERE thread_id=?1 ORDER BY seq DESC LIMIT ?2",
         )?
         .query_map(
             params![
@@ -4362,7 +4761,7 @@ fn recover_linked_thread_run(
             source_key,
             created_at_ms: now_ms,
         };
-        tx.execute("INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![thread_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
         let envelope = ThreadEventEnvelope {
             protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
             event_id: ThreadEventId::from_uuid(Uuid::now_v7()),
@@ -4653,6 +5052,220 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         (dir, path)
+    }
+
+    #[test]
+    fn global_catalog_registers_projects_and_refreshes_workspace_observation() {
+        let store = Storage::memory().unwrap();
+        assert!(
+            store
+                .register_workspace(
+                    "/workspace/one",
+                    "invalid/project",
+                    "/repo/.git",
+                    "workspace-one-123",
+                    None,
+                    1,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .register_workspace(
+                    "/workspace/one",
+                    "project-abc",
+                    "",
+                    "workspace-one-123",
+                    None,
+                    1,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .register_workspace(
+                    "/workspace/one",
+                    "project-abc",
+                    "/repo/.git",
+                    "workspace-one-123",
+                    Some("bad\ncommon-dir"),
+                    1,
+                )
+                .is_err()
+        );
+        store
+            .register_workspace(
+                "/workspace/one",
+                "project-abc",
+                "/repo/.git",
+                "workspace-one-123",
+                Some("/repo/.git"),
+                10,
+            )
+            .unwrap();
+        store
+            .register_workspace(
+                "/workspace/one",
+                "project-abc",
+                "/repo/.git",
+                "workspace-one-123",
+                Some("/repo/.git"),
+                20,
+            )
+            .unwrap();
+        let connection = store.connection.lock().unwrap();
+        let project_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .unwrap();
+        let workspace: (String, String, i64, i64) = connection
+            .query_row(
+                "SELECT project_key,storage_key,first_seen_at_ms,last_seen_at_ms FROM workspaces WHERE workspace_root='/workspace/one'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(project_count, 1);
+        assert_eq!(
+            workspace,
+            ("project-abc".into(), "workspace-one-123".into(), 10, 20)
+        );
+    }
+
+    #[test]
+    fn legacy_import_is_idempotent_preserves_source_and_rejects_foreign_sessions() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let (source_dir, source_path) = db();
+        let source = Storage::open(&source_path).unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        source
+            .create_thread_v2(
+                thread_id,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                &thread_binding(),
+                source_dir.path().to_str().unwrap(),
+                "imported conversation",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        drop(source);
+        let before = std::fs::read(&source_path).unwrap();
+
+        let destination = Storage::memory().unwrap();
+        assert!(
+            destination
+                .import_legacy_database(
+                    &source_path,
+                    source_path.to_str().unwrap(),
+                    "sha256-valid",
+                    source_dir.path().to_str().unwrap(),
+                    2,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            destination.list_threads_v2().unwrap()[0].thread_id,
+            thread_id
+        );
+        assert!(
+            !destination
+                .import_legacy_database(
+                    &source_path,
+                    source_path.to_str().unwrap(),
+                    "sha256-valid",
+                    source_dir.path().to_str().unwrap(),
+                    3,
+                )
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), before);
+
+        let foreign = Storage::memory().unwrap();
+        assert!(matches!(
+            foreign.import_legacy_database(
+                &source_path,
+                source_path.to_str().unwrap(),
+                "sha256-foreign",
+                "/another/workspace",
+                2,
+            ),
+            Err(StorageError::InvalidData(message))
+                if message.contains("another workspace")
+        ));
+    }
+
+    #[test]
+    fn legacy_import_rejects_same_unsupported_and_colliding_databases() {
+        use latte_core::ThreadId;
+
+        let (source_dir, source_path) = db();
+        let source = Storage::open(&source_path).unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        source
+            .create_thread_v2(
+                thread_id,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                &thread_binding(),
+                source_dir.path().to_str().unwrap(),
+                "source",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        assert!(
+            !source
+                .import_legacy_database(
+                    &source_path,
+                    source_path.to_str().unwrap(),
+                    "sha256-same",
+                    source_dir.path().to_str().unwrap(),
+                    2,
+                )
+                .unwrap()
+        );
+        drop(source);
+
+        let unsupported_dir = tempfile::tempdir().unwrap();
+        let unsupported_path = unsupported_dir.path().join("v8.db");
+        let unsupported = Connection::open(&unsupported_path).unwrap();
+        unsupported.pragma_update(None, "user_version", 8).unwrap();
+        drop(unsupported);
+        let destination = Storage::memory().unwrap();
+        assert!(matches!(
+            destination.import_legacy_database(
+                &unsupported_path,
+                unsupported_path.to_str().unwrap(),
+                "sha256-v8",
+                source_dir.path().to_str().unwrap(),
+                3,
+            ),
+            Err(StorageError::InvalidData(message)) if message.contains("expected 9 through 11")
+        ));
+
+        destination
+            .create_thread_v2(
+                thread_id,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                &thread_binding(),
+                source_dir.path().to_str().unwrap(),
+                "collision",
+                &std::collections::BTreeMap::new(),
+                4,
+            )
+            .unwrap();
+        assert!(matches!(
+            destination.import_legacy_database(
+                &source_path,
+                source_path.to_str().unwrap(),
+                "sha256-collision",
+                source_dir.path().to_str().unwrap(),
+                5,
+            ),
+            Err(StorageError::InvalidData(message)) if message.contains("collides")
+        ));
     }
 
     #[test]
@@ -5371,7 +5984,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM thread_transcript_v2 WHERE thread_id=?1",
+                "SELECT COUNT(*) FROM conversation_outbox WHERE thread_id=?1",
                 [thread_id.to_string()],
                 |row| row.get(0),
             )
@@ -5544,6 +6157,9 @@ mod tests {
         connection
             .execute_batch(
                 "DROP TABLE thread_effect_canonical_v2; \
+                 DROP TABLE legacy_imports; \
+                 DROP TABLE workspaces; \
+                 DROP TABLE projects; \
                  DROP TABLE runtime_lease; \
                  DROP TABLE runtime_lease_epoch; \
                  CREATE TABLE runtime_lease( \
@@ -5554,7 +6170,7 @@ mod tests {
                  ); \
                  INSERT INTO runtime_lease(singleton,owner,fencing_token,expires_at_ms) \
                    VALUES(1,'legacy-owner',7,9999999999999); \
-                 DELETE FROM schema_migrations WHERE version IN (8,9,10); \
+                 DELETE FROM schema_migrations WHERE version IN (8,9,10,11); \
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -5572,7 +6188,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert!(descriptor_table);
         let migrated_lease: (String, String, i64) = connection
             .query_row(
@@ -5617,6 +6233,9 @@ mod tests {
         connection
             .execute_batch(
                 "UPDATE threads_v2 SET title='',workspace_root=''; \
+                 DROP TABLE legacy_imports; \
+                 DROP TABLE workspaces; \
+                 DROP TABLE projects; \
                  DROP TABLE runtime_lease; \
                  DROP TABLE runtime_lease_epoch; \
                  CREATE TABLE runtime_lease( \
@@ -5625,7 +6244,7 @@ mod tests {
                    fencing_token INTEGER NOT NULL, \
                    expires_at_ms INTEGER NOT NULL \
                  ); \
-                 DELETE FROM schema_migrations WHERE version IN (9,10); \
+                 DELETE FROM schema_migrations WHERE version IN (9,10,11); \
                  PRAGMA user_version=8;",
             )
             .unwrap();
@@ -5895,7 +6514,7 @@ mod tests {
                 created_at_ms: sequence,
             };
             conn.execute(
-                "INSERT INTO thread_transcript_v2(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
+                "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
                 params![
                     thread_id.to_string(),
                     to_i64(sequence).unwrap(),
@@ -5953,13 +6572,15 @@ mod tests {
         {
             let conn = store.connection.lock().unwrap();
             conn.execute(
-                "UPDATE thread_transcript_v2 SET entry_json='{' WHERE thread_id=?1",
+                "UPDATE conversation_outbox SET entry_json='{' WHERE thread_id=?1",
                 [thread_id.to_string()],
             )
             .unwrap();
         }
 
-        let catalog = store.list_thread_sessions_v2(1).unwrap();
+        let catalog = store
+            .list_thread_sessions_v2_for_workspace("/workspace/catalog", 1)
+            .unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].thread_id, thread_id);
         assert_eq!(catalog[0].title, "First session title");
@@ -5977,6 +6598,15 @@ mod tests {
                 .unwrap(),
             catalog
         );
+        assert!(
+            store
+                .search_thread_sessions("/workspace/catalog", "title", 0,)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.rename_thread_session(thread_id, "  ").is_err());
+        let missing = ThreadId::from_uuid(ids.next_uuid_v7());
+        assert!(store.rename_thread_session(missing, "missing").is_err());
     }
 
     #[test]
@@ -7672,7 +8302,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "UPDATE thread_transcript_v2 SET entry_json='{' WHERE thread_id=?1",
+                "UPDATE conversation_outbox SET entry_json='{' WHERE thread_id=?1",
                 [thread_id.to_string()],
             )
             .unwrap();
