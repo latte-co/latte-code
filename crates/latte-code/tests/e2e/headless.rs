@@ -117,6 +117,19 @@ fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_thread_bud
 
 #[test]
 fn filesystem_startup_failures_are_typed_before_command_execution() {
+    for invalid_home in ["", "relative-storage-home"] {
+        let output = isolated_output(&["--json", "list"], |_, command| {
+            command.env("LATTE_CODE_HOME", invalid_home);
+        });
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(json(&output)["error"]["code"], "configuration");
+        assert!(
+            json(&output)["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("LATTE_CODE_HOME"))
+        );
+    }
+
     let unreadable_config = isolated_output(&["--json", "list"], |scenario, _| {
         std::fs::create_dir_all(scenario.root().join(".latte/latte-code.jsonc")).unwrap();
     });
@@ -160,6 +173,20 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         json(&database_is_directory)["error"]["message"]
             .as_str()
             .is_some_and(|message| !message.is_empty())
+    );
+
+    let invalid_legacy_database = isolated_output(&["--json", "list"], |scenario, _| {
+        std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+        std::fs::write(
+            scenario.root().join(".latte/latte-code.db"),
+            "not a SQLite database",
+        )
+        .unwrap();
+    });
+    assert_eq!(invalid_legacy_database.status.code(), Some(70));
+    assert_eq!(
+        json(&invalid_legacy_database)["error"]["code"],
+        "legacy_import"
     );
 }
 

@@ -1503,6 +1503,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .enabled_tools(["read_file", "list_directory"])
         .deny_globs(["private/**"])
         .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
         .build()
         .unwrap();
     assert_eq!(engine.tool_descriptors().len(), 3);
@@ -1752,6 +1753,338 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 2);
+
+    let jsonl_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
+        .build()
+        .unwrap();
+    assert_eq!(
+        jsonl_engine
+            .thread_snapshot_tail_v2(thread_id, 500)
+            .unwrap()
+            .runs
+            .len(),
+        2
+    );
+    let session_files = scenario.session_files();
+    let [session_file] = session_files.as_slice() else {
+        panic!("expected one JSONL Session file");
+    };
+    let original = std::fs::read_to_string(session_file).unwrap();
+    let mut lines = original.lines();
+    let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let corruptions = [
+        {
+            let mut value = header.clone();
+            value["workspace_id"] = serde_json::json!("foreign-workspace");
+            format!("{}\n", serde_json::to_string(&value).unwrap())
+        },
+        {
+            let mut value = entry.clone();
+            value["record"] = serde_json::json!("unknown");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("seq");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("entry_id");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+        {
+            let mut value = entry.clone();
+            value["entry_id"] = serde_json::json!("not-a-uuid");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value["run_id"] = serde_json::json!(7);
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("kind");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("content");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("source_key");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("created_at_ms");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        format!(
+            "{}\n{{invalid json}}\n",
+            serde_json::to_string(&header).unwrap()
+        ),
+        String::new(),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            "x".repeat(2 * 1024 * 1024 + 1)
+        ),
+    ];
+    for corruption in corruptions {
+        std::fs::write(session_file, corruption).unwrap();
+        assert!(matches!(
+            jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+            Err(StorageError::InvalidData(_))
+        ));
+        std::fs::write(session_file, &original).unwrap();
+    }
+
+    let insert_outbox = |entry: &TranscriptEntry| {
+        rusqlite::Connection::open(scenario.database_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                 VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
+                rusqlite::params![
+                    thread_id.to_string(),
+                    i64::try_from(entry.sequence).unwrap(),
+                    entry.entry_id.to_string(),
+                    entry.source_key,
+                    serde_json::to_string(entry).unwrap(),
+                    i64::try_from(entry.created_at_ms).unwrap(),
+                ],
+            )
+            .unwrap();
+    };
+    let clear_outbox = || {
+        rusqlite::Connection::open(scenario.database_path())
+            .unwrap()
+            .execute(
+                "DELETE FROM conversation_outbox WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+    };
+    let conflicting = TranscriptEntry {
+        entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        sequence: entry["seq"].as_u64().unwrap(),
+        run_id: None,
+        kind: TranscriptKind::User,
+        text: "conflicting entry identity".into(),
+        payload: None,
+        source_key: "coverage:conflicting-entry".into(),
+        created_at_ms: now + 20,
+    };
+    insert_outbox(&conflicting);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+
+    let mut later_entry = entry.clone();
+    later_entry["seq"] = serde_json::json!(2);
+    std::fs::write(
+        session_file,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&later_entry).unwrap()
+        ),
+    )
+    .unwrap();
+    let earlier = TranscriptEntry {
+        sequence: 1,
+        source_key: "coverage:earlier-entry".into(),
+        ..conflicting.clone()
+    };
+    insert_outbox(&earlier);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+    std::fs::write(session_file, &original).unwrap();
+
+    let last_sequence = original
+        .lines()
+        .skip(1)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value["seq"].as_u64())
+        .max()
+        .unwrap();
+    let oversized_entry = TranscriptEntry {
+        entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        sequence: last_sequence + 1,
+        run_id: None,
+        kind: TranscriptKind::User,
+        text: "x".repeat(2 * 1024 * 1024 + 1),
+        payload: None,
+        source_key: "coverage:oversized-entry".into(),
+        created_at_ms: now + 21,
+    };
+    insert_outbox(&oversized_entry);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+    std::fs::write(session_file, &original).unwrap();
+
+    let oversized = std::fs::File::create(session_file).unwrap();
+    oversized.set_len(64 * 1024 * 1024 + 1).unwrap();
+    drop(oversized);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::write(session_file, &original).unwrap();
+
+    let symlink_target = scenario.root().join("symlink-target.jsonl");
+    std::fs::write(&symlink_target, &original).unwrap();
+    std::fs::remove_file(session_file).unwrap();
+    std::os::unix::fs::symlink(&symlink_target, session_file).unwrap();
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::remove_file(session_file).unwrap();
+    std::fs::write(session_file, &original).unwrap();
+
+    std::fs::remove_file(session_file).unwrap();
+    std::fs::create_dir(session_file).unwrap();
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::remove_dir(session_file).unwrap();
+    std::fs::write(session_file, &original).unwrap();
+    assert!(jsonl_engine.thread_snapshot_tail_v2(thread_id, 500).is_ok());
+
+    let foreign_workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(foreign_workspace.path().join(".git")).unwrap();
+    let foreign_engine = EngineBuilder::new()
+        .workspace_root(foreign_workspace.path())
+        .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        foreign_engine.rename_thread_session_v2(thread_id, "foreign rename"),
+        Err(StorageError::InvalidData(message)) if message.contains("current workspace")
+    ));
+    assert!(matches!(
+        foreign_engine.thread_snapshot_tail_v2(thread_id, 1),
+        Err(StorageError::InvalidData(message)) if message.contains("foreign workspace")
+    ));
+
+    EngineBuilder::new().workspace_root("/").build().unwrap();
+
+    let linked_root = tempfile::tempdir().unwrap();
+    let common = linked_root.path().join("common");
+    let git_dir = linked_root.path().join("git-dir");
+    let worktree = linked_root.path().join("linked-worktree");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), "gitdir: ../git-dir\n").unwrap();
+    std::fs::write(git_dir.join("commondir"), "../common\n").unwrap();
+    EngineBuilder::new()
+        .workspace_root(&worktree)
+        .build()
+        .unwrap();
+
+    let standalone_git_dir = linked_root.path().join("standalone-git-dir");
+    let standalone = linked_root.path().join("standalone-worktree");
+    std::fs::create_dir_all(&standalone_git_dir).unwrap();
+    std::fs::create_dir_all(&standalone).unwrap();
+    std::fs::write(standalone.join(".git"), "gitdir: ../standalone-git-dir\n").unwrap();
+    EngineBuilder::new()
+        .workspace_root(&standalone)
+        .build()
+        .unwrap();
+
+    let absolute_git_dir = linked_root.path().join("absolute-git-dir");
+    let absolute_common = linked_root.path().join("absolute-common");
+    let absolute_worktree = linked_root.path().join("absolute-worktree");
+    std::fs::create_dir_all(&absolute_git_dir).unwrap();
+    std::fs::create_dir_all(&absolute_common).unwrap();
+    std::fs::create_dir_all(&absolute_worktree).unwrap();
+    std::fs::write(
+        absolute_worktree.join(".git"),
+        format!("gitdir: {}\n", absolute_git_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        absolute_git_dir.join("commondir"),
+        format!("{}\n", absolute_common.display()),
+    )
+    .unwrap();
+    EngineBuilder::new()
+        .workspace_root(&absolute_worktree)
+        .build()
+        .unwrap();
+
+    let conversation_target = tempfile::tempdir().unwrap();
+    let conversation_link = linked_root.path().join("conversation-link");
+    std::os::unix::fs::symlink(conversation_target.path(), &conversation_link).unwrap();
+    assert!(matches!(
+        EngineBuilder::new()
+            .workspace_root(&worktree)
+            .conversation_root(&conversation_link)
+            .build(),
+        Err(StorageError::InvalidData(message)) if message.contains("symlink")
+    ));
 }
 
 #[cfg(unix)]

@@ -10,7 +10,7 @@ use latte_core::{
     TranscriptEntryId, TranscriptKind,
 };
 use rusqlite::{Connection, params};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, io::Write as _, time::Duration};
 
 const TUI_READY: &[u8] = b"\x1b[>3u";
 const F10: &[u8] = b"\x1b[21~";
@@ -485,6 +485,7 @@ fn rename_and_fork_from_tui(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     let scenario = Scenario::new();
     let long_answer = format!(
@@ -520,6 +521,17 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     first.write(F10);
     assert!(first.finish(Duration::from_secs(5)).0.success());
 
+    let session_files = scenario.session_files();
+    let [session_file] = session_files.as_slice() else {
+        panic!("expected exactly one Session transcript");
+    };
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(session_file)
+        .unwrap()
+        .write_all(br#"{"record":"entry"#)
+        .unwrap();
+
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
         .database_path(scenario.database_path())
@@ -546,11 +558,26 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
             .any(|value| value == b"NEWEST_MOUSE_MARKER"),
         "TUI startup must keep a fresh draft instead of rendering the latest Session"
     );
-    resumed.write(format!("/resume {thread_id}\r").as_bytes());
+    let missing_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    resumed.write(format!("/resume {missing_thread_id}\r").as_bytes());
+    assert!(
+        resumed.wait_for_visible_text("No saved sessions", Duration::from_secs(5)),
+        "missing exact Session id was not reported: {}",
+        String::from_utf8_lossy(&resumed.output())
+    );
+    resumed.write(b"\x1b[27u");
+
+    resumed.write(b"/resume seed session\r");
     assert!(
         resumed.wait_for_output(b"NEWEST_MOUSE_MARKER", Duration::from_secs(5)),
         "TUI did not render resumed Session: {}",
         String::from_utf8_lossy(&resumed.output())
+    );
+    assert!(
+        !std::fs::read_to_string(session_file)
+            .unwrap()
+            .ends_with(r#"{"record":"entry"#),
+        "resume must repair only the torn final JSONL line"
     );
     assert_eq!(provider.requests().len(), 1);
 
@@ -660,6 +687,13 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
 
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty.write(b"/resume duplicate session title\r");
+    assert!(
+        pty.wait_for_visible_text("Enter resume", Duration::from_secs(5)),
+        "duplicate exact-title resume did not open the picker: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    pty.write(b"\x1b[27u");
     pty.write(b"/sessions duplicate session title\r");
     assert!(
         pty.wait_for_visible_text("Enter resume", Duration::from_secs(5)),

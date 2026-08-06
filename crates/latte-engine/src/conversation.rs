@@ -444,10 +444,10 @@ mod tests {
         let ids = SystemIdSource::default();
         let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
         store.sync(thread_id, 1, &[entry(1, "first")]).unwrap();
-        let path = session_path(root.path(), "workspace-safe", thread_id);
 
         #[cfg(unix)]
         {
+            let path = session_path(root.path(), "workspace-safe", thread_id);
             let linked_thread = ThreadId::from_uuid(ids.next_uuid_v7());
             std::os::unix::fs::symlink(
                 &path,
