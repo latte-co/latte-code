@@ -1,6 +1,11 @@
 # 异步 Turn Runner 与 Session Mailbox
 
-状态：**设计中，尚未实现。**
+状态：**部分实现：用户 Prompt Runner 与 Mailbox 已启用。**
+
+Runtime 现在保证每 Session 一个进程内 Runner、八条 FIFO 用户 Prompt Mailbox，
+不同 Session 使用独立 Runner。Active Child 期间 TUI 按 Enter 会入队，Runner 只在
+下一个 `accepts_follow_up` 边界物化输入。可信 Reminder、Input Sequence/Progress
+类型、去重/过期与显式 Steer 仍属于提案范围。
 
 English counterpart: [Asynchronous turn runner and session mailbox](../../../en-US/design/agent-harness/asynchronous-turn-runner.md).
 
@@ -71,7 +76,7 @@ Child Run/Control State，再构造或调用 Provider，完整 Outcome 随后追
 启动失败会向这个已接受的 Conversation Record 追加有界、已脱敏的 Failure；满队列、
 过期 Reminder 或消费前进程退出不会创建 Record。
 
-容量和单 entry 字节数必须有界、可配置，且在资源预算内；满时返回无密钥
+容量当前固定为八条，单 Entry 字节数复用现有 Thread Input/History Budget；满时返回无密钥
 `MailboxFull` 并保留 composer，绝不丢弃旧输入。只有当前 Session lease owner 可
 运行 supervisor；失去 lease 后停止消费、取消可取消 Provider work、关闭 writer，已
 `Started` effect 交由 engine 记录 `Unknown` 并 reconciliation。未物化 mailbox 在
@@ -83,13 +88,14 @@ Child Run/Control State，再构造或调用 Provider，完整 Outcome 随后追
 
 ## 5. 验收
 
-- UT：同一 Session 至多一个 Provider Request；不同 Session 可并行。
-- UT：fake clock 与 scripted Provider 验证 FIFO、reminder 去重/过期、容量拒绝、
+- [x] UT：同一 Session 至多一个 Runner；不同 Session 可并行。
+- [x] UT：Scripted Provider 验证用户输入 FIFO 与容量拒绝。
+- [ ] UT：Fake Clock 与 Scripted Provider 验证 Reminder 去重/过期、
   取消优先级和安全注入点。
-- UT：tool/effect 运行时的输入不能修改 prepared descriptor、approval digest 或 Run
+- [ ] UT：tool/effect 运行时的输入不能修改 prepared descriptor、approval digest 或 Run
   revision。
-- E2E：最终二进制在 Provider stream 期间接受第二条 prompt，并在下一个安全 request
+- [x] E2E：最终二进制在 Provider stream 期间接受第二条 prompt，并在下一个安全 request
   中恰好发送一次。
-- E2E：tool 执行中收到 reminder，只能在 tool result 后注入；取消和 Provider 启动
+- [ ] E2E：tool 执行中收到 reminder，只能在 tool result 后注入；取消和 Provider 启动
   失败都不产生虚假 Transcript Entry，其中 Provider 启动失败会无重复地保留已接受
   User Entry 与一个有界 Failure。

@@ -36,6 +36,101 @@ fn final_binary_creates_and_reopens_its_configured_sqlite_database() {
 }
 
 #[test]
+fn global_storage_home_ignores_workspace_database_redirect_and_is_shared_across_workspaces() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::input_request(
+        "global-storage-input",
+        "global storage prompt",
+        false,
+    )]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        "workspace-redirect.db",
+        ",compatibility_input_request:true",
+    );
+
+    let first = scenario.output(&["--json", "run", "persist globally"], |command| {
+        command.env("TEST_OPENAI_KEY", "global-storage-secret");
+    });
+    assert_eq!(first.status.code(), Some(1));
+    let persisted_run_id = waiting_run_id(&first);
+    provider.assert_consumed();
+    assert!(scenario.database_path().is_file());
+    assert!(!scenario.root().join("workspace-redirect.db").exists());
+
+    let second_workspace = scenario.root().join("second-workspace");
+    std::fs::create_dir_all(second_workspace.join(".git")).unwrap();
+    let second = scenario.output(&["--json", "list"], |command| {
+        command.current_dir(&second_workspace);
+    });
+    assert!(second.status.success());
+    assert_eq!(json(&second)["data"]["runs"][0]["run_id"], persisted_run_id);
+    assert!(!second_workspace.join(".latte/latte-code.db").exists());
+}
+
+#[test]
+fn final_binary_imports_legacy_workspace_sessions_once_and_exports_jsonl() {
+    use latte_core::{IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2};
+
+    let scenario = Scenario::new();
+    let legacy_path = scenario.root().join(".latte/latte-code.db");
+    std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    let legacy = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(&legacy_path)
+        .build()
+        .unwrap();
+    let ids = SystemIdSource::default();
+    let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+    legacy
+        .create_thread_v2(
+            thread_id,
+            RunId::from_uuid(ids.next_uuid_v7()),
+            ThreadProviderBindingV2 {
+                version: 1,
+                provider_name: "test".into(),
+                provider_type: "openai-chat".into(),
+                protocol: "chat".into(),
+                model: "test-model".into(),
+                config_fingerprint: "config".into(),
+                tools_fingerprint: "tools".into(),
+                aliases: std::collections::BTreeMap::new(),
+                credential_ref_id: "env:TEST_KEY".into(),
+                data_scope_id: "workspace".into(),
+                credential_generation: 1,
+            },
+            "legacy conversation",
+            1,
+        )
+        .unwrap();
+    drop(legacy);
+    let source_before = std::fs::read(&legacy_path).unwrap();
+
+    let first = scenario.output(&["--json", "list"], |_| {});
+    assert!(first.status.success());
+    let second = scenario.output(&["--json", "list"], |_| {});
+    assert!(second.status.success());
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), source_before);
+    assert!(scenario.database_path().is_file());
+    let imported = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    let workspace = std::fs::canonicalize(scenario.root()).unwrap();
+    let sessions = imported
+        .list_thread_sessions_v2_for_workspace(workspace.to_str().unwrap(), 10)
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].thread_id, thread_id);
+    let session_files = scenario.session_files();
+    assert_eq!(session_files.len(), 1);
+    let conversation = std::fs::read_to_string(&session_files[0]).unwrap();
+    assert!(conversation.contains(r#""content":"legacy conversation""#));
+}
+
+#[test]
 fn final_binary_parses_loopback_provider_input_and_persists_waiting_projection() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::input_request(

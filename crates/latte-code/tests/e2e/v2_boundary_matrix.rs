@@ -350,6 +350,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         thread_id,
         title: "public reducer authoritative session".into(),
         workspace_root: scenario.root().display().to_string(),
+        parent_thread_id: None,
         lifecycle: ThreadLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
         model: ready.binding.model.clone(),
@@ -399,7 +400,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         reduce(
             &mut model,
             ThreadUiInput::SessionCatalogReady {
-                sessions: vec![summary.clone()],
+                sessions: Vec::new(),
                 query: Some("missing-title".into()),
             }
         )
@@ -888,6 +889,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         thread_id,
         title: "render boundary session".into(),
         workspace_root: scenario.root().display().to_string(),
+        parent_thread_id: None,
         lifecycle: ThreadLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
         model: ready.binding.model.clone(),
@@ -1134,16 +1136,16 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
     assert!(model.status.contains("switching is disabled"));
     model.composer = "queue while running".into();
-    assert_eq!(reduce(&mut model, key(KeyCode::Enter)), Vec::new());
-    assert_eq!(
-        model.queued_follow_up.as_deref(),
-        Some("queue while running")
-    );
+    assert!(matches!(
+        reduce(&mut model, key(KeyCode::Enter)).as_slice(),
+        [ThreadUiAction::QueueFollowUp { prompt, .. }] if prompt == "queue while running"
+    ));
     model.pending_submission = None;
     model.composer = "second queued prompt".into();
-    assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
-    assert_eq!(model.composer, "second queued prompt");
-    assert!(model.status.contains("already queued"));
+    assert!(matches!(
+        reduce(&mut model, key(KeyCode::Enter)).as_slice(),
+        [ThreadUiAction::QueueFollowUp { prompt, .. }] if prompt == "second queued prompt"
+    ));
 
     reduce(&mut model, ThreadUiInput::Snapshot(vec![rich.clone()]));
     model.queued_follow_up = None;
@@ -1501,6 +1503,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .enabled_tools(["read_file", "list_directory"])
         .deny_globs(["private/**"])
         .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
         .build()
         .unwrap();
     assert_eq!(engine.tool_descriptors().len(), 3);
@@ -1591,7 +1594,6 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         ),
         Err(StorageError::InvalidData(message)) if message.contains("ready thread")
     ));
-    assert!(engine.list_thread_sessions_v2(0).unwrap().is_empty());
     assert!(
         engine
             .list_thread_sessions_v2_for_workspace(scenario.root().to_str().unwrap(), 0)
@@ -1751,6 +1753,338 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 2);
+
+    let jsonl_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
+        .build()
+        .unwrap();
+    assert_eq!(
+        jsonl_engine
+            .thread_snapshot_tail_v2(thread_id, 500)
+            .unwrap()
+            .runs
+            .len(),
+        2
+    );
+    let session_files = scenario.session_files();
+    let [session_file] = session_files.as_slice() else {
+        panic!("expected one JSONL Session file");
+    };
+    let original = std::fs::read_to_string(session_file).unwrap();
+    let mut lines = original.lines();
+    let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let corruptions = [
+        {
+            let mut value = header.clone();
+            value["workspace_id"] = serde_json::json!("foreign-workspace");
+            format!("{}\n", serde_json::to_string(&value).unwrap())
+        },
+        {
+            let mut value = entry.clone();
+            value["record"] = serde_json::json!("unknown");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("seq");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("entry_id");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+        {
+            let mut value = entry.clone();
+            value["entry_id"] = serde_json::json!("not-a-uuid");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value["run_id"] = serde_json::json!(7);
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("kind");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("content");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("source_key");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        {
+            let mut value = entry.clone();
+            value.as_object_mut().unwrap().remove("created_at_ms");
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&value).unwrap()
+            )
+        },
+        format!(
+            "{}\n{{invalid json}}\n",
+            serde_json::to_string(&header).unwrap()
+        ),
+        String::new(),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            "x".repeat(2 * 1024 * 1024 + 1)
+        ),
+    ];
+    for corruption in corruptions {
+        std::fs::write(session_file, corruption).unwrap();
+        assert!(matches!(
+            jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+            Err(StorageError::InvalidData(_))
+        ));
+        std::fs::write(session_file, &original).unwrap();
+    }
+
+    let insert_outbox = |entry: &TranscriptEntry| {
+        rusqlite::Connection::open(scenario.database_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                 VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
+                rusqlite::params![
+                    thread_id.to_string(),
+                    i64::try_from(entry.sequence).unwrap(),
+                    entry.entry_id.to_string(),
+                    entry.source_key,
+                    serde_json::to_string(entry).unwrap(),
+                    i64::try_from(entry.created_at_ms).unwrap(),
+                ],
+            )
+            .unwrap();
+    };
+    let clear_outbox = || {
+        rusqlite::Connection::open(scenario.database_path())
+            .unwrap()
+            .execute(
+                "DELETE FROM conversation_outbox WHERE thread_id=?1",
+                [thread_id.to_string()],
+            )
+            .unwrap();
+    };
+    let conflicting = TranscriptEntry {
+        entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        sequence: entry["seq"].as_u64().unwrap(),
+        run_id: None,
+        kind: TranscriptKind::User,
+        text: "conflicting entry identity".into(),
+        payload: None,
+        source_key: "coverage:conflicting-entry".into(),
+        created_at_ms: now + 20,
+    };
+    insert_outbox(&conflicting);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+
+    let mut later_entry = entry.clone();
+    later_entry["seq"] = serde_json::json!(2);
+    std::fs::write(
+        session_file,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&later_entry).unwrap()
+        ),
+    )
+    .unwrap();
+    let earlier = TranscriptEntry {
+        sequence: 1,
+        source_key: "coverage:earlier-entry".into(),
+        ..conflicting.clone()
+    };
+    insert_outbox(&earlier);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+    std::fs::write(session_file, &original).unwrap();
+
+    let last_sequence = original
+        .lines()
+        .skip(1)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value["seq"].as_u64())
+        .max()
+        .unwrap();
+    let oversized_entry = TranscriptEntry {
+        entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        sequence: last_sequence + 1,
+        run_id: None,
+        kind: TranscriptKind::User,
+        text: "x".repeat(2 * 1024 * 1024 + 1),
+        payload: None,
+        source_key: "coverage:oversized-entry".into(),
+        created_at_ms: now + 21,
+    };
+    insert_outbox(&oversized_entry);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    clear_outbox();
+    std::fs::write(session_file, &original).unwrap();
+
+    let oversized = std::fs::File::create(session_file).unwrap();
+    oversized.set_len(64 * 1024 * 1024 + 1).unwrap();
+    drop(oversized);
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::write(session_file, &original).unwrap();
+
+    let symlink_target = scenario.root().join("symlink-target.jsonl");
+    std::fs::write(&symlink_target, &original).unwrap();
+    std::fs::remove_file(session_file).unwrap();
+    std::os::unix::fs::symlink(&symlink_target, session_file).unwrap();
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::remove_file(session_file).unwrap();
+    std::fs::write(session_file, &original).unwrap();
+
+    std::fs::remove_file(session_file).unwrap();
+    std::fs::create_dir(session_file).unwrap();
+    assert!(matches!(
+        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        Err(StorageError::InvalidData(_))
+    ));
+    std::fs::remove_dir(session_file).unwrap();
+    std::fs::write(session_file, &original).unwrap();
+    assert!(jsonl_engine.thread_snapshot_tail_v2(thread_id, 500).is_ok());
+
+    let foreign_workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(foreign_workspace.path().join(".git")).unwrap();
+    let foreign_engine = EngineBuilder::new()
+        .workspace_root(foreign_workspace.path())
+        .database_path(scenario.database_path())
+        .conversation_root(scenario.home().join(".latte/latte-code/sessions"))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        foreign_engine.rename_thread_session_v2(thread_id, "foreign rename"),
+        Err(StorageError::InvalidData(message)) if message.contains("current workspace")
+    ));
+    assert!(matches!(
+        foreign_engine.thread_snapshot_tail_v2(thread_id, 1),
+        Err(StorageError::InvalidData(message)) if message.contains("foreign workspace")
+    ));
+
+    EngineBuilder::new().workspace_root("/").build().unwrap();
+
+    let linked_root = tempfile::tempdir().unwrap();
+    let common = linked_root.path().join("common");
+    let git_dir = linked_root.path().join("git-dir");
+    let worktree = linked_root.path().join("linked-worktree");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), "gitdir: ../git-dir\n").unwrap();
+    std::fs::write(git_dir.join("commondir"), "../common\n").unwrap();
+    EngineBuilder::new()
+        .workspace_root(&worktree)
+        .build()
+        .unwrap();
+
+    let standalone_git_dir = linked_root.path().join("standalone-git-dir");
+    let standalone = linked_root.path().join("standalone-worktree");
+    std::fs::create_dir_all(&standalone_git_dir).unwrap();
+    std::fs::create_dir_all(&standalone).unwrap();
+    std::fs::write(standalone.join(".git"), "gitdir: ../standalone-git-dir\n").unwrap();
+    EngineBuilder::new()
+        .workspace_root(&standalone)
+        .build()
+        .unwrap();
+
+    let absolute_git_dir = linked_root.path().join("absolute-git-dir");
+    let absolute_common = linked_root.path().join("absolute-common");
+    let absolute_worktree = linked_root.path().join("absolute-worktree");
+    std::fs::create_dir_all(&absolute_git_dir).unwrap();
+    std::fs::create_dir_all(&absolute_common).unwrap();
+    std::fs::create_dir_all(&absolute_worktree).unwrap();
+    std::fs::write(
+        absolute_worktree.join(".git"),
+        format!("gitdir: {}\n", absolute_git_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        absolute_git_dir.join("commondir"),
+        format!("{}\n", absolute_common.display()),
+    )
+    .unwrap();
+    EngineBuilder::new()
+        .workspace_root(&absolute_worktree)
+        .build()
+        .unwrap();
+
+    let conversation_target = tempfile::tempdir().unwrap();
+    let conversation_link = linked_root.path().join("conversation-link");
+    std::os::unix::fs::symlink(conversation_target.path(), &conversation_link).unwrap();
+    assert!(matches!(
+        EngineBuilder::new()
+            .workspace_root(&worktree)
+            .conversation_root(&conversation_link)
+            .build(),
+        Err(StorageError::InvalidData(message)) if message.contains("symlink")
+    ));
 }
 
 #[cfg(unix)]
@@ -2757,8 +3091,6 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    assert!(engine.list_thread_sessions_v2(0).unwrap().is_empty());
-    assert_eq!(engine.list_thread_sessions_v2(10).unwrap().len(), 1);
     assert_eq!(
         engine
             .list_thread_sessions_v2_for_workspace(&workspace, 10)
@@ -2818,6 +3150,191 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         "Model switched to v2-boundary-next/v2-boundary-next-model"
     );
 
+    assert!(matches!(
+        engine.rename_thread_session_v2(thread_id, "  "),
+        Err(StorageError::InvalidData(message)) if message.contains("title")
+    ));
+    let renamed = engine
+        .rename_thread_session_v2(thread_id, "Renamed atomic boundary")
+        .unwrap();
+    assert_eq!(renamed.title, "Renamed atomic boundary");
+    assert_eq!(
+        engine
+            .search_thread_sessions_v2("renamed atomic", 10)
+            .unwrap()[0]
+            .thread_id,
+        thread_id
+    );
+    assert_eq!(
+        engine
+            .search_thread_sessions_v2(&thread_id.to_string()[..12], 10)
+            .unwrap()[0]
+            .thread_id,
+        thread_id
+    );
+    assert!(engine.search_thread_sessions_v2("", 0).unwrap().is_empty());
+    assert!(
+        engine
+            .search_thread_sessions_v2("definitely absent", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let fork_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let fork = engine
+        .fork_thread_session_v2(
+            thread_id,
+            fork_thread_id,
+            Some("Forked atomic boundary"),
+            now + 20,
+        )
+        .unwrap();
+    assert_eq!(fork.lifecycle, ThreadLifecycle::Ready);
+    assert!(fork.runs.is_empty());
+    let fork_summary = engine.thread_session_v2(fork_thread_id).unwrap().unwrap();
+    assert_eq!(fork_summary.parent_thread_id, Some(thread_id));
+    assert_eq!(
+        fork.transcript.entries.len(),
+        switched.transcript.entries.len()
+    );
+    assert!(
+        fork.transcript
+            .entries
+            .iter()
+            .zip(&switched.transcript.entries)
+            .all(|(forked, source)| {
+                forked.kind == source.kind
+                    && forked.text == source.text
+                    && forked.payload == source.payload
+                    && forked.run_id.is_none()
+            })
+    );
+    assert_eq!(
+        engine
+            .search_thread_sessions_v2("forked atomic", 10)
+            .unwrap()[0]
+            .thread_id,
+        fork_thread_id
+    );
+    assert!(
+        engine
+            .fork_thread_session_v2(thread_id, fork_thread_id, Some("duplicate"), now + 21,)
+            .is_err()
+    );
+    let default_fork_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let default_fork = engine
+        .fork_thread_session_v2(thread_id, default_fork_id, None, now + 22)
+        .unwrap();
+    assert_eq!(
+        engine
+            .thread_session_v2(default_fork_id)
+            .unwrap()
+            .unwrap()
+            .title,
+        "Renamed atomic boundary (fork)"
+    );
+    assert!(default_fork.runs.is_empty());
+    let missing_source = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    assert!(matches!(
+        engine.rename_thread_session_v2(missing_source, "missing"),
+        Err(StorageError::ThreadNotFound(id)) if id == missing_source
+    ));
+    let bounded_title = engine
+        .rename_thread_session_v2(thread_id, &"x".repeat(1_025))
+        .unwrap();
+    assert!(bounded_title.title.ends_with('…'));
+    assert!(bounded_title.title.len() <= 123);
+    assert_eq!(
+        engine.search_thread_sessions_v2("   ", 10).unwrap().len(),
+        3
+    );
+    assert!(matches!(
+        engine.fork_thread_session_v2(
+            missing_source,
+            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            Some("missing"),
+            now + 22,
+        ),
+        Err(StorageError::ThreadNotFound(id)) if id == missing_source
+    ));
+
+    let memory_root = tempfile::tempdir().unwrap();
+    let memory_engine = EngineBuilder::new()
+        .workspace_root(memory_root.path())
+        .build()
+        .unwrap();
+    let memory_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let memory_lease = memory_engine
+        .acquire_thread_lease(memory_thread_id, now + 26, 120_000)
+        .unwrap();
+    let memory_running = memory_engine
+        .create_started_thread_v2(
+            memory_thread_id,
+            run_id(),
+            binding(),
+            "memory-only session",
+            &memory_lease,
+            now + 27,
+        )
+        .unwrap();
+    let memory_ready = commit(
+        &memory_engine,
+        &memory_lease,
+        &memory_running,
+        CommitThreadRunUpdate::Complete {
+            source_key: "boundary:memory:complete".into(),
+            handoff: Handoff {
+                summary: "memory session completed".into(),
+                files_changed: Vec::new(),
+                evidence: Vec::new(),
+            },
+        },
+        now + 28,
+    );
+    assert_eq!(memory_ready.lifecycle, ThreadLifecycle::Ready);
+    assert!(matches!(
+        memory_engine.fork_thread_session_v2(
+            memory_thread_id,
+            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            None,
+            now + 29,
+        ),
+        Err(StorageError::InvalidData(message)) if message.contains("requires JSONL")
+    ));
+    memory_engine.release_lease(&memory_lease).unwrap();
+
+    let fork_lease = engine
+        .acquire_thread_lease(fork_thread_id, now + 23, 120_000)
+        .unwrap();
+    let fork_run_id = run_id();
+    let fork_running = engine
+        .create_started_thread_follow_up_v2(
+            fork_thread_id,
+            fork_run_id,
+            fork.revision,
+            "independent fork child",
+            &fork_lease,
+            now + 24,
+        )
+        .unwrap();
+    let fork_completed = commit(
+        &engine,
+        &fork_lease,
+        &fork_running,
+        CommitThreadRunUpdate::Complete {
+            source_key: "boundary:fork:complete".into(),
+            handoff: Handoff {
+                summary: "fork child completed independently".into(),
+                files_changed: Vec::new(),
+                evidence: Vec::new(),
+            },
+        },
+        now + 25,
+    );
+    assert_eq!(fork_completed.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(fork_completed.runs.len(), 1);
+    engine.release_lease(&fork_lease).unwrap();
+
     let follow_up_id = run_id();
     assert!(matches!(
         engine.create_started_thread_follow_up_v2(
@@ -2872,7 +3389,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert_eq!(json(&child)["data"]["run"]["status"], "interrupted");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 3);
 }
 
 #[test]

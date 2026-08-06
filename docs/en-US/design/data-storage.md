@@ -1,23 +1,23 @@
 # Global session and data storage design
 
-Status: **Partially implemented; the global storage home is not enabled.**
+Status: **Implemented for local Session storage and current-Workspace management.**
 
-The current implementation keeps runtime state and conversation cards in the
-configured database, defaulting to workspace-relative `.latte/latte-code.db`.
-Schema 9 catalog metadata, workspace-filtered startup resume, scoped Session
-leases, and the accepted-submission/Provider-failure boundary are implemented
-inside that database. The global product home, cross-workspace catalog,
-per-Session JSONL transcript, recovery, import, and migration portions remain
-target design. They must preserve the existing engine invariants around
-effects, permissions, leases, fencing, deduplication, and `Unknown`
-reconciliation.
+The current implementation uses `$LATTE_CODE_HOME`, defaulting to
+`$HOME/.latte/latte-code`, for global SQLite control state and per-Session
+JSONL. Schema 11 registers stable Project/Workspace identities, Session leases
+remain partitioned, JSONL is the transcript read authority with torn-tail
+repair, and a workspace-local legacy database can be imported idempotently
+without modifying its bytes. SQLite uses a transactional conversation outbox
+only until accepted entries are synced to JSONL. Current-Workspace discovery,
+search, rename, and fork are implemented; cross-Workspace discovery and catalog
+reconstruction from orphan JSONL remain target work.
 
 ## 1. Decisions
 
 | Data class | Authoritative location | Contract |
 | --- | --- | --- |
 | Session conversation content | Global per-session JSONL | Append-only user, assistant, tool, and context records. |
-| Project, workspace, and session metadata | Global SQLite | Discovery, search, lifecycle, provider binding, lineage, and archive state. |
+| Project, workspace, and session metadata | Global SQLite | Current-Workspace discovery and search, provider binding, and lineage. |
 | Run and effect control state | Global SQLite | Transactional run state, effects, permissions, leases, checkpoints, evidence, and deduplication. |
 | Drafts and Provider runtime | Process memory | Unaccepted prompts, HTTP streams, retries, cancellation, deltas, and raw Provider diagnostics. |
 | Credentials | No persistent store | Only non-secret credential references and generations may be durable. |
@@ -144,7 +144,6 @@ sessions
   last_content_bytes
   created_at_ms
   updated_at_ms
-  archived_at_ms
 ```
 
 `last_content_seq` and `last_content_bytes` are repairable caches. JSONL wins
@@ -326,8 +325,8 @@ missing tool result from the authoritative observation.
 
 ## 10. Reads and projections
 
-- Global Session discovery, search, archive filtering, Project grouping, and
-  Workspace grouping query SQLite only.
+- Current-Workspace Session discovery and search query SQLite only. Project and
+  Workspace registration remains global storage metadata, not a TUI discovery scope.
 - Opening a Session loads the bounded JSONL tail and the current SQLite control
   projection.
 - Provider history is rebuilt only from JSONL conversation records, beginning
@@ -342,14 +341,12 @@ delete or rewrite earlier lines.
 
 ## 11. Session operations
 
-- **Archive** updates `archived_at_ms`; the JSONL file is not moved.
 - **Fork** creates a new independent file in the target Workspace bucket,
   copies content through the selected sequence, and records
   `forked_from_session_id` plus `forked_from_seq` in SQLite.
-- **Hard delete** is explicit and removes the Session catalog row, control
-  state, JSONL, and owned attachments. Archive remains the default UI action.
 - **Workspace loss or movement** never deletes history. Resume requires an
-  explicit valid Workspace binding when the original path is unavailable.
+  explicit future rebinding flow when the original path is unavailable; the
+  current TUI does not discover Sessions from another Workspace.
 
 ## 12. Security and limits
 
@@ -400,19 +397,18 @@ Implementation is incomplete until UT and final-binary E2E prove at least:
 - A `Started` Effect becomes `Unknown` after crash or lease loss.
 - An observed Effect with a missing JSONL tool result is repaired without
   executing the Effect again.
-- Archive, fork, Workspace rebinding, and idempotent legacy import preserve
-  history and lineage.
+- Fork and idempotent legacy import preserve history and lineage.
 
 These scenarios follow the repository's independent UT 95%, final-binary E2E
 90%, and all-target 90% coverage gates.
 
 ## 15. Current implementation status
 
-Latte Code currently honors `database.path`, defaulting to
-`.latte/latte-code.db` below the workspace root. Relative values are resolved
-from that root and absolute paths are supported. There is no
-`LATTE_CODE_HOME` product-state switch, legacy import, or product-wide database
-default yet.
+Latte Code resolves an absolute `LATTE_CODE_HOME`, defaulting to
+`$HOME/.latte/latte-code`, and stores global control state in `state.db` plus
+conversation files under `sessions/<workspace-storage-key>/`. A parsed
+`database.path` identifies only a legacy workspace database for idempotent
+import and cannot redirect new state.
 
 Migration 9 adds a bounded, redacted title and canonical `workspace_root` to
 the v2 Session metadata. Catalog reads do not deserialize transcript rows. The
@@ -472,17 +468,24 @@ snapshot contains the selected provider and model. Provider credentials are
 not resolved by this transition; construction and any resulting sanitized
 failure belong to the next durably accepted child.
 
-The JSONL transcript layout, repair, Session-scoped writers, global product
-home, cross-workspace discovery, legacy import, and removal of SQLite
-transcript duplication are not implemented. The configured database retains
-existing v1 run/control records for the headless CLI.
+Migration 11 registers Project and Workspace rows, including a stable Git
+common-directory Project identity so linked worktrees group together while
+retaining distinct Workspace storage keys. Session JSONL uses a self-describing
+header and bounded append-only entries, validates monotonic identities, rejects
+symlink targets, syncs accepted records, and repairs only a torn final line.
+Public transcript reads use JSONL; SQLite `conversation_outbox` rows are
+deleted after the corresponding JSONL fsync. Legacy import fingerprints the source, rejects
+foreign-workspace rows and ID collisions, leaves the source unchanged, skips
+live leases, recovers control state, and materializes imported conversations as
+JSONL. TUI discovery and search are limited to the current Workspace; catalog
+reconstruction from orphan JSONL is not implemented.
 
-Unit tests cover configured-path resolution, migrations 9 and 10, catalog
-metadata, scoped authority, and durable retryable Provider-configuration
-failures. Final-binary E2E covers workspace-local and explicitly configured
-databases, `/resume`, `/new` without another Provider request, long transcript
-tail resume/follow-up, and a failed Provider setup followed by a multiline
-retry in the same Session.
+Unit tests cover global-home resolution, migrations through schema 11,
+worktree-aware catalog identity, scoped authority, JSONL tail repair and read
+authority, idempotent legacy import, and durable retryable Provider failures.
+Final-binary E2E covers global state and JSONL creation, unchanged legacy
+source import, `/resume`, `/new`, long-tail follow-up, and queued multiline TUI
+turns.
 
 ## 16. Delivery phases
 
@@ -494,5 +497,4 @@ retry in the same Session.
    projection.
 4. Integrate the existing fenced Effect lifecycle with JSONL tool-call and
    tool-result ordering.
-5. Add legacy import, global Session discovery, archive, fork, delete, and
-   Workspace rebinding.
+5. Add legacy import, current-Workspace Session discovery, rename, and fork.

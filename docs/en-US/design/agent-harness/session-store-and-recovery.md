@@ -26,7 +26,7 @@ $LATTE_CODE_HOME/
 
 SQLite holds at least Project, Workspace, Session, Run, Effect, Permission,
 Lease, Checkpoint, Evidence, and deduplication keys. It holds title,
-last-activity, non-secret binding fingerprint, archive state, and JSONL locator,
+last-activity, non-secret binding fingerprint, and JSONL locator,
 but never duplicates conversation transcript.
 
 JSONL starts with a small self-describing header. Later lines append only bounded

@@ -279,6 +279,15 @@ fn final_tui_exercises_escape_reverse_navigation_and_empty_picker_boundaries() {
 #[cfg(unix)]
 #[test]
 fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes() {
+    for invalid_home in ["", "relative-storage-home"] {
+        let scenario = Scenario::new();
+        let mut command = scenario.command(&["tui"]);
+        command.env("LATTE_CODE_HOME", invalid_home);
+        let (status, output) = PtySession::spawn(command).finish(Duration::from_secs(5));
+        assert_eq!(status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output).contains("LATTE_CODE_HOME"));
+    }
+
     let invalid = Scenario::new();
     std::fs::create_dir_all(invalid.root().join(".latte")).unwrap();
     std::fs::write(invalid.root().join(".latte/latte-code.jsonc"), "{").unwrap();
@@ -305,6 +314,20 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
     assert_eq!(status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output).contains("configuration"));
 
+    let invalid_default_model = Scenario::new();
+    std::fs::create_dir_all(invalid_default_model.root().join(".latte")).unwrap();
+    std::fs::write(
+        invalid_default_model
+            .root()
+            .join(".latte/latte-code.jsonc"),
+        r#"{version:1,default_model:"main/missing",providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}}}"#,
+    )
+    .unwrap();
+    let (status, output) =
+        PtySession::spawn(invalid_default_model.command(&["tui"])).finish(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output).contains("configuration"));
+
     let blocked_parent = Scenario::new();
     std::fs::create_dir_all(blocked_parent.root().join(".latte")).unwrap();
     std::fs::write(blocked_parent.root().join("blocked"), "not a directory").unwrap();
@@ -318,8 +341,9 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         }"#,
     )
     .unwrap();
-    let (status, output) =
-        PtySession::spawn(blocked_parent.command(&["tui"])).finish(Duration::from_secs(5));
+    let mut command = blocked_parent.command(&["tui"]);
+    command.env("LATTE_CODE_HOME", blocked_parent.root().join("blocked"));
+    let (status, output) = PtySession::spawn(command).finish(Duration::from_secs(5));
     assert_eq!(status.code(), Some(70));
     assert!(String::from_utf8_lossy(&output).contains("cannot create"));
 
@@ -335,8 +359,24 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
         }"#,
     )
     .unwrap();
-    let (status, output) =
-        PtySession::spawn(directory_database.command(&["tui"])).finish(Duration::from_secs(5));
+    let storage_home = directory_database.root().join("directory-storage-home");
+    std::fs::create_dir(&storage_home).unwrap();
+    std::fs::create_dir(storage_home.join("state.db")).unwrap();
+    let mut command = directory_database.command(&["tui"]);
+    command.env("LATTE_CODE_HOME", storage_home);
+    let (status, output) = PtySession::spawn(command).finish(Duration::from_secs(5));
     assert_eq!(status.code(), Some(70));
     assert!(!output.is_empty());
+
+    let invalid_legacy = Scenario::new();
+    std::fs::create_dir_all(invalid_legacy.root().join(".latte")).unwrap();
+    std::fs::write(
+        invalid_legacy.root().join(".latte/latte-code.db"),
+        "not a SQLite database",
+    )
+    .unwrap();
+    let (status, output) =
+        PtySession::spawn(invalid_legacy.command(&["tui"])).finish(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output).contains("legacy import"));
 }

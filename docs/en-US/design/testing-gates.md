@@ -1,6 +1,6 @@
 # Latte Code UT / E2E Testing Gate Design
 
-> Status: the layered framework, three independent coverage jobs, and a fail-closed `PR Gate` workflow are implemented. Required-check enforcement is not active until the GitHub branch-protection/ruleset setting is actually configured. E2E-H-001 through H-008, H-010/H-011, and E2E-T-001 through T-008 are present. H-009 covers the public recovery semantics but still lacks a real kill barrier; later gates remain planned here.
+> Status: the layered framework, three independent coverage jobs, and a fail-closed `PR Gate` workflow are implemented. The active default-branch ruleset requires the single stable `PR Gate` check as of 2026-08-05. E2E-H-001 through H-008, H-010/H-011, and E2E-T-001 through T-008 are present. H-009 covers the public recovery semantics but still lacks a real kill barrier; later gates remain planned here.
 >
 > Baseline: 2026-07-15, current working tree, measured by `make ci` and three independent llvm-cov profiles.
 >
@@ -51,6 +51,11 @@ Measured baseline on 2026-07-15:
 | Final-binary E2E line coverage | 80.78% | Current macOS working tree measured `10687 / 13230` across both E2E targets |
 | Total line coverage | 96.64% | Current macOS working tree measured `27286 / 28234` from `make coverage-total` |
 
+Current verification on 2026-08-05 finds 301 crate-local tests, 15 contract
+tests, 6 portable E2E tests, and 113 Unix E2E tests. UT-only line coverage is
+95.08%, final-binary E2E line coverage is 90.03%, and the complete local
+`make ci` gate passes.
+
 ### 2.2 Current remaining gaps
 
 1. **UT still needs purification**: `test-unit` is independently visible, but existing inline tests still include component behavior using SQLite, sockets, child processes, and real signals.
@@ -58,7 +63,12 @@ Measured baseline on 2026-07-15:
 3. **The Provider fidelity layer is not implemented**: the scripted Provider proves product behavior, while cassette replay and a live canary remain planned.
 4. **Release jobs build without starting artifacts**: file existence does not prove that the artifact starts, resolves configuration, or emits stable JSON.
 5. **Failure evidence is not packaged as an artifact**: the harness now holds stdout, stderr, PTY transcripts, Provider request logs, and final projections, but CI does not upload them together on failure yet.
-6. **Required activation remains an external action**: the workflow has the full three-platform matrix and a fail-closed `PR Gate`, but each applicable platform still needs ten consecutive flake-free runs and GitHub branch protection/rulesets must actually require `PR Gate`. Repository files cannot prove that remote setting is active.
+6. **Required activation is externally enforced**: the workflow has the full
+   three-platform matrix and a fail-closed `PR Gate`; the active default-branch
+   ruleset requires that single stable check as of 2026-08-05. Repository files
+   still cannot prove future remote-setting drift, so delivery verification must
+   inspect the live ruleset and retain the ten-consecutive-run activation gate
+   for newly introduced jobs.
 
 ## 3. Test-layer boundaries
 
@@ -465,8 +475,8 @@ This first makes the test gates visible, accurate, and complete before adding ea
 
 The design builds on working test seams rather than hypothetical infrastructure:
 
-- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 245 crate-local tests, and the current UT-only profile reaches 95.05%.
-- The independent contract and E2E targets contain 93 integration tests: 15 Contract, 3 portable final-binary E2E, and 75 Unix final-binary E2E tests.
+- `cargo test --workspace --lib --bins --all-features -- --list` currently finds 301 crate-local tests, and the current UT-only profile reaches 95.08%.
+- The independent contract and E2E targets contain 134 integration tests: 15 Contract, 6 portable final-binary E2E, and 113 Unix final-binary E2E tests; the E2E profile reaches 90.03%.
 - The 2026-07-15 macOS baseline measured 95.05% UT-only, 80.78% E2E, and 96.64% all-target coverage; it predates the 90% E2E floor.
 - Final-binary execution, a loopback Provider, a real PTY, cross-process SQLite resume, and terminal-mode restoration already have reusable implementations.
 - The Provider endpoint already targets a loopback harness, so cassette replay can reuse the same final-binary path without a production backdoor.

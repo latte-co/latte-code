@@ -15,13 +15,16 @@ use std::{
 
 pub struct Scenario {
     root: tempfile::TempDir,
+    home: tempfile::TempDir,
 }
 
 impl Scenario {
     pub fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".git")).unwrap();
-        Self { root }
+        std::fs::create_dir_all(home.path().join(".latte/latte-code")).unwrap();
+        Self { root, home }
     }
 
     pub fn root(&self) -> &Path {
@@ -29,7 +32,7 @@ impl Scenario {
     }
 
     pub fn home(&self) -> std::path::PathBuf {
-        self.root.path().join("home")
+        self.home.path().to_owned()
     }
 
     pub fn command(&self, args: &[&str]) -> Command {
@@ -38,6 +41,7 @@ impl Scenario {
             .args(args)
             .current_dir(self.root.path())
             .env("HOME", self.home())
+            .env("LATTE_CODE_HOME", self.home().join(".latte/latte-code"))
             .env_remove("LATTE_OPENAI_ENDPOINT")
             .env_remove("LATTE_OPENAI_MODEL")
             .env_remove("LATTE_OPENAI_API_KEY")
@@ -149,7 +153,23 @@ impl Scenario {
     }
 
     pub fn database_path(&self) -> std::path::PathBuf {
-        self.root.path().join(".latte/latte-code.db")
+        self.home().join(".latte/latte-code/state.db")
+    }
+
+    pub fn session_files(&self) -> Vec<std::path::PathBuf> {
+        let root = self.home().join(".latte/latte-code/sessions");
+        let Ok(workspaces) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut files = workspaces
+            .filter_map(Result::ok)
+            .filter_map(|workspace| std::fs::read_dir(workspace.path()).ok())
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == "jsonl"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
     }
 }
 

@@ -1,6 +1,12 @@
 # Asynchronous Turn Runner and Session Mailbox
 
-Status: **design proposal; not implemented.**
+Status: **partially implemented: user-prompt runner and mailbox are active.**
+
+The runtime now enforces one process-local runner per Session, an eight-entry
+FIFO user-prompt mailbox, and independent runners across Sessions. TUI Enter
+queues behind an active child and the runner materializes it only at the next
+`accepts_follow_up` boundary. Trusted reminders, input sequence/progress types,
+deduplication/expiry, and explicit steer remain proposal scope.
 
 Chinese counterpart: [异步 Turn Runner 与 Session Mailbox](../../../zh-CN/design/agent-harness/asynchronous-turn-runner.md).
 
@@ -81,7 +87,8 @@ The complete outcome is appended afterward. Provider startup failure appends a
 bounded, redacted failure to that accepted Conversation Record; a full mailbox,
 expired reminder, or process exit before consumption creates no record.
 
-Capacity and entry bytes are bounded and configurable. `MailboxFull` is
+Capacity is currently fixed at eight entries and entry bytes use the existing
+thread input/history budget. `MailboxFull` is
 secret-safe, preserves composer text, and never drops older input. Only the
 current Session lease owner runs the supervisor; lease loss stops consumption,
 cancels cancellable Provider work, closes the writer, and leaves started Effects
@@ -94,13 +101,14 @@ event gap or reconnect and reloads its snapshot.
 
 ## 5. Acceptance
 
-- UT proves one Provider request per Session and concurrent independent Sessions.
-- UT uses fake clock and scripted Provider for FIFO, reminder deduplication/
+- [x] UT proves one runner per Session and concurrent independent Sessions.
+- [x] UT uses a scripted Provider for user-input FIFO and capacity rejection.
+- [ ] UT uses fake clock and scripted Provider for reminder deduplication/
   expiry, capacity rejection, cancellation precedence, and safe injection.
-- UT proves input during tool/effect work cannot alter prepared descriptor,
+- [ ] UT proves input during tool/effect work cannot alter prepared descriptor,
   approval digest, or Run revision.
-- E2E proves the final binary accepts a second prompt during a Provider stream
+- [x] E2E proves the final binary accepts a second prompt during a Provider stream
   and sends it exactly once in the next safe request.
-- E2E proves a reminder during tool execution is injected only after tool result;
+- [ ] E2E proves a reminder during tool execution is injected only after tool result;
   cancellation creates no fake transcript entry, while Provider-start failure
   preserves the accepted user entry and one bounded failure without duplication.

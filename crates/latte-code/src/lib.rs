@@ -24,6 +24,7 @@ const EXIT_DENIED: i32 = 11;
 const EXIT_INTERNAL: i32 = 70;
 const EXIT_INTERRUPTED: i32 = 130;
 const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
+const STORAGE_HOME_ENV: &str = "LATTE_CODE_HOME";
 const DEFAULT_CONFIG: &str = r#"{
   version: 1,
   thread: {
@@ -40,7 +41,7 @@ const DEFAULT_CONFIG: &str = r#"{
   },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Relative database.path values are resolved from the workspace root; absolute paths are supported. Provider credentials may be literal strings or environment references in those files.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,9 +138,6 @@ impl AppConfig {
         if config.verification.argv.is_empty() {
             return Err("verification.argv must not be empty".into());
         }
-        if config.database.path.trim().is_empty() {
-            return Err("database.path must not be empty".into());
-        }
         ThreadHistoryPolicy {
             max_request_bytes: config.thread.max_request_bytes,
             max_input_bytes: config.thread.max_input_bytes,
@@ -153,14 +151,6 @@ impl AppConfig {
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
         Ok((config, registry))
     }
-    fn database_path(&self, root: &Path) -> PathBuf {
-        let path = Path::new(&self.database.path);
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            root.join(path)
-        }
-    }
     fn plan(&self) -> VerificationPlan {
         VerificationPlan {
             argv: self.verification.argv.clone(),
@@ -171,6 +161,14 @@ impl AppConfig {
             stderr_cap: 16 * 1024,
         }
     }
+    fn legacy_database_path(&self, root: &Path) -> PathBuf {
+        let path = Path::new(&self.database.path);
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            root.join(path)
+        }
+    }
     fn thread_policy(&self) -> ThreadHistoryPolicy {
         ThreadHistoryPolicy {
             max_request_bytes: self.thread.max_request_bytes,
@@ -179,6 +177,40 @@ impl AppConfig {
             context_cap_bytes: self.thread.context_cap_bytes,
         }
     }
+}
+
+fn storage_home() -> Result<PathBuf, String> {
+    storage_home_with(
+        std::env::var_os(STORAGE_HOME_ENV).as_deref(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn storage_home_with(
+    override_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let path = if let Some(value) = override_home {
+        if value.is_empty() {
+            return Err(format!("{STORAGE_HOME_ENV} must not be empty"));
+        }
+        PathBuf::from(value)
+    } else {
+        home.ok_or_else(|| format!("{STORAGE_HOME_ENV} or HOME must be set"))?
+            .join(".latte/latte-code")
+    };
+    if !path.is_absolute() {
+        return Err(format!("{STORAGE_HOME_ENV} must be an absolute path"));
+    }
+    Ok(path)
+}
+
+fn storage_database_path() -> Result<PathBuf, String> {
+    Ok(storage_home()?.join("state.db"))
+}
+
+fn storage_conversation_root() -> Result<PathBuf, String> {
+    Ok(storage_home()?.join("sessions"))
 }
 
 fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
@@ -303,6 +335,14 @@ impl latte_tui::thread::ThreadProjectionClient for ThreadEngineProjection {
             .find_thread_sessions_v2_by_exact_title_for_workspace(&self.workspace_root, query, 200)
             .map_err(|error| error.to_string())
     }
+    fn search_session_catalog(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+        self.engine
+            .search_thread_sessions_v2(query, 200)
+            .map_err(|error| error.to_string())
+    }
     fn session(&mut self, thread_id: ThreadId) -> Result<latte_core::ThreadSnapshot, String> {
         let metadata = self
             .engine
@@ -401,13 +441,24 @@ async fn execute() -> i32 {
             return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
         }
     };
-    let database_path = config.database_path(&root);
+    let database_path = match storage_database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
+        }
+    };
+    let conversation_root = match storage_conversation_root() {
+        Ok(path) => path,
+        Err(error) => {
+            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
+        }
+    };
     let Some(database_parent) = database_path.parent() else {
         return emit_error(
             json,
             "usage",
             "configuration",
-            "database.path must have a parent directory",
+            "global storage database must have a parent directory",
             EXIT_USAGE,
             false,
         );
@@ -425,6 +476,7 @@ async fn execute() -> i32 {
     let engine = match EngineBuilder::new()
         .workspace_root(&root)
         .database_path(database_path)
+        .conversation_root(conversation_root)
         .build()
     {
         Ok(engine) => engine,
@@ -439,6 +491,18 @@ async fn execute() -> i32 {
             );
         }
     };
+    if let Err(error) =
+        engine.import_legacy_workspace_database(config.legacy_database_path(&root), wall_time_ms())
+    {
+        return emit_error(
+            json,
+            "internal",
+            "legacy_import",
+            &error.to_string(),
+            EXIT_INTERNAL,
+            false,
+        );
+    }
 
     match command {
         HeadlessCommand::Show { run_id } => match engine.show(run_id) {
@@ -617,6 +681,113 @@ fn reconcile_thread_action(
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
+fn dispatch_session_management_action(
+    engine: &latte_engine::EngineHandle,
+    feedback_tx: &std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
+    action: latte_tui::thread::ThreadUiAction,
+) -> Option<latte_tui::thread::ThreadUiAction> {
+    use latte_tui::thread::{SessionManagementOutcome, ThreadUiAction, ThreadUiFeedback};
+
+    match action {
+        ThreadUiAction::RenameSession { thread_id, title } => {
+            let engine = engine.clone();
+            let feedback = feedback_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = engine
+                    .rename_thread_session_v2(thread_id, &title)
+                    .map(|session| {
+                        SessionManagementOutcome::Updated(format!(
+                            "Session renamed to {}",
+                            session.title
+                        ))
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = feedback.send(ThreadUiFeedback::session_management(result));
+            });
+            None
+        }
+        ThreadUiAction::ForkSession { thread_id, title } => {
+            let engine = engine.clone();
+            let feedback = feedback_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let fork_id =
+                    ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
+                let result = engine
+                    .fork_thread_session_v2(thread_id, fork_id, title.as_deref(), wall_time_ms())
+                    .map(|snapshot| SessionManagementOutcome::Forked(snapshot.thread_id))
+                    .map_err(|error| error.to_string());
+                let _ = feedback.send(ThreadUiFeedback::session_management(result));
+            });
+            None
+        }
+        action => Some(action),
+    }
+}
+
+fn open_tui_engine(
+    root: &Path,
+    config: &AppConfig,
+    database_path: &Path,
+    conversation_root: &Path,
+    now_ms: u64,
+) -> Result<latte_engine::EngineHandle, String> {
+    let parent = database_path
+        .parent()
+        .ok_or_else(|| "global storage database must have a parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let engine = EngineBuilder::new()
+        .workspace_root(root)
+        .database_path(database_path)
+        .conversation_root(conversation_root)
+        .build()
+        .map_err(|error| error.to_string())?;
+    engine
+        .import_legacy_workspace_database(config.legacy_database_path(root), now_ms)
+        .map_err(|error| format!("legacy import: {error}"))?;
+    Ok(engine)
+}
+
+fn tui_startup_presentation(
+    root: &Path,
+    registry: &latte_headless::registry::ProviderRegistry,
+    engine: &latte_engine::EngineHandle,
+) -> Result<
+    (
+        Option<ThreadProviderBindingV2>,
+        latte_tui::thread::ThreadStartupPresentation,
+    ),
+    String,
+> {
+    let startup_binding = match registry.thread_binding_for_default(&engine.tool_descriptors()) {
+        Ok(binding) => Some(binding),
+        Err(_) if registry.model_catalog().is_empty() => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let startup = latte_tui::thread::ThreadStartupPresentation {
+        default_provider: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.provider_name.clone()),
+        default_model: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.model.clone()),
+        model_catalog: registry
+            .model_catalog()
+            .into_iter()
+            .map(|entry| latte_tui::thread::ThreadModelOption {
+                provider_name: entry.provider_name,
+                model: entry.model,
+                name: entry.name,
+                is_default: entry.is_default,
+            })
+            .collect(),
+        workspace_display: workspace_display_path(root),
+        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
+    };
+    Ok((startup_binding, startup))
+}
+
 /// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
 /// the TUI reads only v2 snapshots and submits v2 conversation requests.
 #[allow(clippy::too_many_lines)]
@@ -641,53 +812,39 @@ fn execute_tui() -> i32 {
             return EXIT_USAGE;
         }
     };
-    let database_path = config.database_path(&root);
-    let Some(parent) = database_path.parent() else {
-        eprintln!("configuration: database.path must have a parent directory");
-        return EXIT_USAGE;
+    let database_path = match storage_database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("configuration: {error}");
+            return EXIT_USAGE;
+        }
     };
-    if let Err(error) = std::fs::create_dir_all(parent) {
-        eprintln!("cannot create {}: {error}", parent.display());
-        return EXIT_INTERNAL;
-    }
-    let engine = match EngineBuilder::new()
-        .workspace_root(&root)
-        .database_path(database_path)
-        .build()
-    {
+    let conversation_root = match storage_conversation_root() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("configuration: {error}");
+            return EXIT_USAGE;
+        }
+    };
+    let engine = match open_tui_engine(
+        &root,
+        &config,
+        &database_path,
+        &conversation_root,
+        wall_time_ms(),
+    ) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{error}");
             return EXIT_INTERNAL;
         }
     };
-    let startup_binding = match registry.thread_binding_for_default(&engine.tool_descriptors()) {
-        Ok(binding) => Some(binding),
-        Err(_) if registry.model_catalog().is_empty() => None,
+    let (startup_binding, startup) = match tui_startup_presentation(&root, &registry, &engine) {
+        Ok(value) => value,
         Err(error) => {
             eprintln!("configuration: {error}");
             return EXIT_USAGE;
         }
-    };
-    let startup = latte_tui::thread::ThreadStartupPresentation {
-        default_provider: startup_binding
-            .as_ref()
-            .map_or_else(String::new, |binding| binding.provider_name.clone()),
-        default_model: startup_binding
-            .as_ref()
-            .map_or_else(String::new, |binding| binding.model.clone()),
-        model_catalog: registry
-            .model_catalog()
-            .into_iter()
-            .map(|entry| latte_tui::thread::ThreadModelOption {
-                provider_name: entry.provider_name,
-                model: entry.model,
-                name: entry.name,
-                is_default: entry.is_default,
-            })
-            .collect(),
-        workspace_display: workspace_display_path(&root),
-        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
     };
     let resolver_registry = registry.clone();
     let resolver_engine = engine.clone();
@@ -724,6 +881,10 @@ fn execute_tui() -> i32 {
         &mut projection,
         startup,
         move |action| {
+            let Some(action) = dispatch_session_management_action(&engine, &feedback_tx, action)
+            else {
+                return Ok(());
+            };
             match action {
                 latte_tui::thread::ThreadUiAction::Start {
                     submission_id,
@@ -818,6 +979,20 @@ fn execute_tui() -> i32 {
                             result,
                         ));
                     });
+                }
+                latte_tui::thread::ThreadUiAction::QueueFollowUp {
+                    submission_id,
+                    thread_id,
+                    prompt,
+                } => {
+                    let result = service
+                        .queue_follow_up(thread_id, prompt)
+                        .map(|position| format!("follow-up queued at position {position}"))
+                        .map_err(|error| error.to_string());
+                    let _ = feedback_tx.send(latte_tui::thread::ThreadUiFeedback::submission(
+                        submission_id,
+                        result,
+                    ));
                 }
                 latte_tui::thread::ThreadUiAction::Cancel { thread_id } => {
                     let service = service.clone();
@@ -957,8 +1132,13 @@ fn execute_tui() -> i32 {
                 }
                 latte_tui::thread::ThreadUiAction::RefreshSnapshots
                 | latte_tui::thread::ThreadUiAction::ShowSessions { .. }
+                | latte_tui::thread::ThreadUiAction::SearchSessions { .. }
                 | latte_tui::thread::ThreadUiAction::OpenSession { .. }
                 | latte_tui::thread::ThreadUiAction::Quit => {}
+                latte_tui::thread::ThreadUiAction::RenameSession { .. }
+                | latte_tui::thread::ThreadUiAction::ForkSession { .. } => {
+                    unreachable!("session management actions are dispatched before this match")
+                }
             }
             Ok(())
         },
@@ -1050,10 +1230,11 @@ mod tests {
     use super::{
         AppConfig, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED, EXIT_INTERNAL,
         EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
-        ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root, dot,
-        emit_data, emit_error, execute_tui, merge_optional_config, merge_value, outcome,
-        reconcile_thread_action, render_run, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home, workspace_identity,
+        ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root,
+        dispatch_session_management_action, dot, emit_data, emit_error, execute_tui,
+        merge_optional_config, merge_value, open_tui_engine, outcome, reconcile_thread_action,
+        render_run, storage_home_with, tui_startup_presentation, verify_timeout,
+        workspace_display_path, workspace_display_path_with_home, workspace_identity,
     };
     use latte_core::{
         Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
@@ -1069,7 +1250,10 @@ mod tests {
         runtime::{AgentRuntime, RuntimeError},
         thread::{ThreadHistoryPolicy, ThreadRuntimeService},
     };
-    use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
+    use latte_tui::thread::{
+        SessionManagementOutcome, ThreadProjectionClient, ThreadProjectionPoll, ThreadUiAction,
+        ThreadUiFeedback,
+    };
     use serde_json::json;
     use std::{path::Path, sync::Arc};
 
@@ -1139,14 +1323,10 @@ mod tests {
         let derived = config.thread_policy();
         assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
         assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
-        assert_eq!(
-            config.database_path(Path::new("/workspace")),
-            Path::new("/workspace/.latte/latte-code.db")
-        );
     }
 
     #[test]
-    fn workspace_identity_is_canonical_and_database_path_honors_absolute_configuration() {
+    fn workspace_identity_and_global_storage_home_are_canonical_and_explicit() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
             workspace_identity(root.path()).unwrap(),
@@ -1155,13 +1335,36 @@ mod tests {
                 .to_str()
                 .unwrap()
         );
-        let absolute = root.path().join("state.db");
+        assert_eq!(
+            storage_home_with(None, Some(root.path())).unwrap(),
+            root.path().join(".latte/latte-code")
+        );
+        let absolute = root.path().join("global-state");
+        assert_eq!(
+            storage_home_with(Some(absolute.as_os_str()), Some(Path::new("/ignored"))).unwrap(),
+            absolute
+        );
+        assert_eq!(
+            storage_home_with(Some(std::ffi::OsStr::new("")), Some(root.path())).unwrap_err(),
+            "LATTE_CODE_HOME must not be empty"
+        );
+        assert_eq!(
+            storage_home_with(Some(std::ffi::OsStr::new("relative")), Some(root.path()))
+                .unwrap_err(),
+            "LATTE_CODE_HOME must be an absolute path"
+        );
+        assert_eq!(
+            storage_home_with(None, None).unwrap_err(),
+            "LATTE_CODE_HOME or HOME must be set"
+        );
+
+        let configured = root.path().join("ignored.db");
         let config = AppConfig {
             version: 1,
             default_model: "primary/test".into(),
             providers: json!({}),
             database: DatabaseConfig {
-                path: absolute.display().to_string(),
+                path: configured.display().to_string(),
             },
             verification: VerificationConfig {
                 argv: vec!["true".into()],
@@ -1170,7 +1373,7 @@ mod tests {
             },
             thread: ThreadConfig::default(),
         };
-        assert_eq!(config.database_path(Path::new("/ignored")), absolute);
+        assert_eq!(config.database.path, configured.display().to_string());
     }
 
     #[test]
@@ -1206,10 +1409,8 @@ mod tests {
             "verification.argv must not be empty"
         );
         std::fs::write(&config_path, r#"{ database: { path: " " } }"#).unwrap();
-        assert_eq!(
-            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap_err(),
-            "database.path must not be empty"
-        );
+        let (config, _) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
+        assert_eq!(config.database.path, " ");
         std::fs::write(
             &config_path,
             r"{ thread: { max_input_bytes: 8, reserved_output_bytes: 8 } }",
@@ -1458,6 +1659,16 @@ mod tests {
                 .all(|session| session.workspace_root == canonical_root)
         );
         assert_eq!(
+            projection.search_session_catalog("thread-0").unwrap()[0].thread_id,
+            first_thread_id
+        );
+        assert!(
+            projection
+                .search_session_catalog("missing title")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
             projection.session(first_thread_id).unwrap().thread_id,
             first_thread_id
         );
@@ -1544,6 +1755,106 @@ mod tests {
         assert_eq!(refreshed.len(), 510);
     }
 
+    #[tokio::test]
+    async fn tui_session_management_adapter_renames_and_forks() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(root.path().join("state.db"))
+            .conversation_root(root.path().join("sessions"))
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let source = ThreadId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(
+                source,
+                RunId::from_uuid(ids.next_uuid_v7()),
+                ThreadProviderBindingV2 {
+                    version: 1,
+                    provider_name: "test".into(),
+                    provider_type: "openai-chat".into(),
+                    protocol: "chat".into(),
+                    model: "test".into(),
+                    config_fingerprint: "config".into(),
+                    tools_fingerprint: "tools".into(),
+                    aliases: std::collections::BTreeMap::new(),
+                    credential_ref_id: "env:TEST".into(),
+                    data_scope_id: "workspace".into(),
+                    credential_generation: 1,
+                },
+                "source prompt",
+                1,
+            )
+            .unwrap();
+        let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
+
+        assert!(
+            dispatch_session_management_action(
+                &engine,
+                &feedback_tx,
+                ThreadUiAction::ForkSession {
+                    thread_id: source,
+                    title: Some("branch title".into()),
+                },
+            )
+            .is_none()
+        );
+        let fork = match feedback_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+        {
+            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Forked(
+                thread_id,
+            ))) => thread_id,
+            feedback => panic!("unexpected feedback: {feedback:?}"),
+        };
+
+        assert!(
+            dispatch_session_management_action(
+                &engine,
+                &feedback_tx,
+                ThreadUiAction::RenameSession {
+                    thread_id: fork,
+                    title: "renamed branch".into(),
+                },
+            )
+            .is_none()
+        );
+        match feedback_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+        {
+            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Updated(message))) => {
+                assert!(message.contains("renamed branch"));
+            }
+            feedback => panic!("unexpected feedback: {feedback:?}"),
+        }
+
+        let missing = ThreadId::from_uuid(ids.next_uuid_v7());
+        assert!(
+            dispatch_session_management_action(
+                &engine,
+                &feedback_tx,
+                ThreadUiAction::RenameSession {
+                    thread_id: missing,
+                    title: "missing".into(),
+                },
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            feedback_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            ThreadUiFeedback::SessionManagement(Err(_))
+        ));
+        assert!(matches!(
+            dispatch_session_management_action(&engine, &feedback_tx, ThreadUiAction::Quit,),
+            Some(ThreadUiAction::Quit)
+        ));
+    }
+
     #[test]
     fn complete_example_config_loads_application_and_provider_sections() {
         let root = tempfile::tempdir().unwrap();
@@ -1561,6 +1872,20 @@ mod tests {
         assert_eq!(config.thread.reserved_output_bytes, 131_072);
         assert_eq!(registry.default_name(), Some("primary"));
         assert_eq!(registry.default_model(), Some("model-id"));
+        let engine = open_tui_engine(
+            root.path(),
+            &config,
+            &root.path().join("global/state.db"),
+            &root.path().join("global/sessions"),
+            1,
+        )
+        .unwrap();
+        let (binding, startup) = tui_startup_presentation(root.path(), &registry, &engine).unwrap();
+        assert_eq!(binding.unwrap().model, "model-id");
+        assert_eq!(startup.default_provider, "primary");
+        assert_eq!(startup.default_model, "model-id");
+        assert_eq!(startup.model_catalog.len(), 1);
+        assert!(!startup.workspace_display.is_empty());
     }
 
     #[test]
@@ -1574,6 +1899,55 @@ mod tests {
         assert_eq!(config.database.path, ".latte/latte-code.db");
         assert!(registry.model_catalog().is_empty());
         assert!(registry.thread_binding_for_default(&[]).is_err());
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let (binding, startup) = tui_startup_presentation(root.path(), &registry, &engine).unwrap();
+        assert!(binding.is_none());
+        assert!(startup.default_provider.is_empty());
+        assert!(startup.default_model.is_empty());
+        assert!(startup.model_catalog.is_empty());
+        assert!(
+            open_tui_engine(
+                root.path(),
+                &config,
+                Path::new(""),
+                &root.path().join("sessions"),
+                1,
+            )
+            .is_err()
+        );
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::write(config.legacy_database_path(root.path()), b"not sqlite").unwrap();
+        assert!(
+            open_tui_engine(
+                root.path(),
+                &config,
+                &root.path().join("global/state.db"),
+                &root.path().join("global/sessions"),
+                2,
+            )
+            .is_err()
+        );
+        let configured_without_default = latte_headless::registry::ProviderRegistry::parse_jsonc(
+            r#"{
+                version: 1,
+                default_model: "primary/model-id",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "model-id": {} },
+                    base_url: "https://provider.example/v1",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" },
+                    aliases: { unknown_tool: "unknown_alias" }
+                } }
+            }"#,
+        )
+        .unwrap();
+        assert!(!configured_without_default.model_catalog().is_empty());
+        assert!(
+            tui_startup_presentation(root.path(), &configured_without_default, &engine).is_err()
+        );
     }
 
     #[test]

@@ -1,20 +1,20 @@
 # 全局 Session 与数据存储设计
 
-状态：**部分已实现；全局 Storage Home 尚未启用。**
+状态：**本地 Session 存储与当前 Workspace 管理已实现。**
 
-当前实现仍把 Runtime State 与 Conversation Card 保存到配置的数据库中，默认路径为
-工作区下的 `.latte/latte-code.db`。Schema 9 Catalog Metadata、按 Workspace 过滤的
-启动恢复、Session Scoped Lease，以及“提交已接受/Provider 失败”边界已在该数据库内
-实现。全局 Product Home、跨 Workspace Catalog、按 Session 存储的 JSONL
-Transcript、恢复、导入和迁移仍是目标设计；落地时必须保留现有 Engine 对 Effect、
-Permission、Lease、Fencing、去重和 `Unknown` Reconciliation 的安全约束。
+当前实现使用 `$LATTE_CODE_HOME`（默认 `$HOME/.latte/latte-code`）保存全局 SQLite
+控制状态和每 Session JSONL。Schema 11 注册稳定的 Project/Workspace Identity，
+Session Lease 继续分区；JSONL 已是 Transcript 读取权威并支持撕裂尾行修复；旧工作区
+数据库可幂等导入且源文件字节不变。SQLite 的事务 `conversation_outbox` 只保留尚未
+fsync 到 JSONL 的已接受记录，同步成功后立即删除。当前 Workspace 内的发现、搜索、
+重命名和 Fork 已实现；跨 Workspace 发现与从孤立 JSONL 重建 Catalog 仍是目标工作。
 
 ## 1. 已确定的决策
 
 | 数据类型 | 权威存储 | 契约 |
 | --- | --- | --- |
 | Session 对话内容 | 全局、每 Session 一个 JSONL | 只追加 user、assistant、tool 与上下文记录。 |
-| Project、Workspace、Session 元数据 | 全局 SQLite | 发现、搜索、生命周期、Provider Binding、血缘和归档状态。 |
+| Project、Workspace、Session 元数据 | 全局 SQLite | 当前 Workspace 发现与搜索、Provider Binding 和血缘。 |
 | Run 与 Effect 控制状态 | 全局 SQLite | 事务化 Run 状态、Effect、Permission、Lease、Checkpoint、Evidence 与去重。 |
 | Draft 与 Provider 运行时 | 进程内存 | 尚未接受的 Prompt、HTTP Stream、Retry、Cancellation、Delta 和原始 Provider Diagnostic。 |
 | Credential | 不持久化 | 只允许持久化非密钥的 Credential Reference 与 Generation。 |
@@ -130,7 +130,6 @@ sessions
   last_content_bytes
   created_at_ms
   updated_at_ms
-  archived_at_ms
 ```
 
 `last_content_seq` 和 `last_content_bytes` 是可修复缓存。它们与文件不一致时，
@@ -295,8 +294,8 @@ Observation 修复缺失的 Tool Result。
 
 ## 10. 读取与 Projection
 
-- 全局 Session Discovery、Search、Archive Filter、Project Grouping 和 Workspace
-  Grouping 只查询 SQLite。
+- 当前 Workspace 内的 Session Discovery 与 Search 只查询 SQLite。Project 与
+  Workspace 注册仍是全局存储元数据，不是 TUI Discovery Scope。
 - 打开 Session 时加载有界 JSONL Tail 与当前 SQLite Control Projection。
 - Provider History 只从 JSONL Conversation Record 重建，并从最新可用 Context
   Checkpoint 开始。
@@ -310,13 +309,10 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
 
 ## 11. Session 操作
 
-- **Archive** 只更新 `archived_at_ms`，不移动 JSONL。
 - **Fork** 在目标 Workspace 分桶创建独立新文件，复制到所选 Sequence 为止的
   Content，并在 SQLite 记录 `forked_from_session_id` 和 `forked_from_seq`。
-- **Hard Delete** 必须显式执行，并删除 Session Catalog Row、Control State、
-  JSONL 和归属该 Session 的附件。默认 UI 操作仍是 Archive。
-- **Workspace 丢失或移动** 绝不删除历史。原路径不可用时，Resume 必须显式绑定
-  一个有效 Workspace。
+- **Workspace 丢失或移动** 绝不删除历史。原路径不可用时，需要未来显式的
+  Rebinding Flow；当前 TUI 不发现其他 Workspace 下的 Session。
 
 ## 12. 安全与限制
 
@@ -361,16 +357,17 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
   失败允许继续提交 Follow-up。
 - `Started` Effect 在崩溃或失去 Lease 后变为 `Unknown`。
 - 已 Observed Effect 缺少 JSONL Tool Result 时可以修复，且不会再次执行 Effect。
-- Archive、Fork、Workspace Rebinding 和幂等 Legacy Import 保留历史与 Lineage。
+- Fork 与幂等 Legacy Import 保留历史与 Lineage。
 
 这些场景继续遵守仓库独立的 UT 95%、Final-Binary E2E 90% 和 All-Target 90%
 覆盖率卡点。
 
 ## 15. 当前实现状态
 
-Latte Code 当前遵守 `database.path`，默认值为工作区根目录下的
-`.latte/latte-code.db`。相对路径以该根目录解析，也支持绝对路径。目前尚未启用
-`LATTE_CODE_HOME` Product State 切换、Legacy Import 或产品级全局数据库默认值。
+Latte Code 解析绝对路径 `LATTE_CODE_HOME`，默认值为
+`$HOME/.latte/latte-code`；全局控制状态位于 `state.db`，Conversation File 位于
+`sessions/<workspace-storage-key>/`。已解析的 `database.path` 只用于定位和幂等导入
+旧工作区数据库，不能重定向新状态。
 
 迁移 9 为 v2 Session Metadata 增加有界、脱敏的 Title 与 Canonical
 `workspace_root`。Catalog 查询不会反序列化 Transcript Row。TUI 按当前
@@ -419,15 +416,20 @@ Model Selection 是 Session Binding Transition，而不是 Editor Preference。�
 Provider 与 Model 前阻止竞争的 Follow-up。这个 Transition 不解析 Provider
 Credential；Provider 构造及其已脱敏 Failure 都属于下一个已经持久接受的 Child。
 
-JSONL Transcript Layout、Repair、Session Scoped Writer、全局 Product Home、
-跨 Workspace Discovery、Legacy Import 与移除 SQLite Transcript Duplication
-尚未实现。当前配置的数据库继续保留供 Headless CLI 读取的既有 v1 Run/Control
-Record。
+迁移 11 注册 Project 与 Workspace Row：Linked Worktree 通过稳定的 Git Common
+Directory Project Identity 归组，同时保留不同的 Workspace Storage Key。Session
+JSONL 使用自描述 Header 和有界追加式 Entry，校验单调 Identity、拒绝 Symlink
+Target、同步已接受 Record，并且只修复撕裂的最后一行。公开 Transcript 读取使用
+JSONL；SQLite `conversation_outbox` 只保存尚未同步到 JSONL 的事务记录，同步后
+立即删除。Legacy Import 对源文件取
+Fingerprint，拒绝外部 Workspace Row 与 ID 冲突，保持源文件不变，跳过 Live Lease，
+恢复控制状态并把导入对话生成为 JSONL。TUI Discovery 与 Search 仅限当前
+Workspace；从孤立 JSONL 重建 Catalog 尚未实现。
 
-UT 覆盖配置路径解析、迁移 9/10、Catalog Metadata、Scoped Authority 与持久、
-可重试的 Provider Configuration Failure。最终二进制 E2E 覆盖 Workspace 本地和
-显式配置的数据库、`/resume`、不额外调用 Provider 的 `/new`、长 Transcript 的尾部
-恢复与 Follow-up，以及 Provider Setup 失败后在同一 Session 中进行多行重试。
+UT 覆盖全局 Home 解析、迁移至 Schema 11、Worktree-Aware Catalog Identity、
+Scoped Authority、JSONL 尾行修复与读取权威、幂等 Legacy Import，以及持久、可重试
+的 Provider Failure。最终二进制 E2E 覆盖全局 State/JSONL 创建、旧库源文件不变的
+导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Turn。
 
 ## 16. 交付阶段
 
@@ -437,5 +439,4 @@ UT 覆盖配置路径解析、迁移 9/10、Catalog Metadata、Scoped Authority 
    成为可见、可重试的 Child Failure。
 3. 增加有界 JSONL Writer、Reader、Tail Repair、Checkpoint 和组合 Projection。
 4. 把现有带 Fencing 的 Effect 生命周期与 JSONL Tool Call/Tool Result 顺序集成。
-5. 增加 Legacy Import、全局 Session Discovery、Archive、Fork、Delete 与
-   Workspace Rebinding。
+5. 增加 Legacy Import、当前 Workspace Session Discovery、Rename 与 Fork。
