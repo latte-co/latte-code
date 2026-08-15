@@ -1021,3 +1021,99 @@ fn final_binary_server_provides_input_through_http() {
     assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
     assert!(input_body["snapshot"].is_object());
 }
+
+#[test]
+fn final_binary_server_queues_follow_up_during_an_active_turn() {
+    let scenario = Scenario::new();
+    // A slow provider keeps the first turn running long enough to queue a
+    // follow-up while the session's runner is still active (202 + position).
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("slow done").delayed(std::time::Duration::from_millis(1500)),
+        ProviderReply::completion("drained the queue"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "slow turn", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // While the (delayed) turn is running, its runner mailbox is active, so a
+    // queued follow-up is accepted with its position.
+    let mut queued = false;
+    for _ in 0..100 {
+        let (status, body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/queue"),
+            Some(&server.token),
+            Some(&serde_json::json!({ "prompt": "queued mid-turn" })),
+            &[],
+        );
+        if status == 202 {
+            assert!(body["position"].as_u64().is_some());
+            queued = true;
+            break;
+        }
+        // 404 before the session is registered, or 409 if the runner window
+        // closed; retry until the active window is observed.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(queued, "queue was never accepted during the active turn");
+
+    // Once the turn and the drained follow-up complete, the idle session
+    // accepts a durable model switch to the other configured model.
+    let mut switched = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            let revision = body["snapshot"]["revision"].as_u64().unwrap();
+            let (switch_status, switch_body) = server.request(
+                "POST",
+                &format!("/v1/sessions/{session_id}/model"),
+                Some(&server.token),
+                Some(&serde_json::json!({
+                    "binding": server_binding_for_model(&scenario, Some("mock-2")),
+                    "expected_thread_revision": revision
+                })),
+                &[],
+            );
+            assert_eq!(switch_status, 200, "switch returned {switch_body:?}");
+            assert_eq!(switch_body["snapshot"]["binding"]["model"], "mock-2");
+            switched = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(switched, "session never became ready for a model switch");
+}

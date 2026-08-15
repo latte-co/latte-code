@@ -226,13 +226,6 @@ impl WorkspaceManager {
         instances.values().find(|i| i.id == id).cloned()
     }
 
-    /// Emit an event to a workspace's event stream.
-    pub async fn emit_event(&self, workspace_id: &str, event: ServerEvent) {
-        if let Some(workspace) = self.get_by_id(workspace_id).await {
-            let _ = workspace.event_tx.send(event);
-        }
-    }
-
     /// Register a session in the index.
     pub async fn register_session(
         &self,
@@ -250,25 +243,6 @@ impl WorkspaceManager {
     ) -> Option<PathBuf> {
         let index = self.session_index.read().await;
         index.get(session_id).cloned()
-    }
-
-    /// Remove a session from the index.
-    pub async fn unregister_session(&self, session_id: &latte_core::ThreadId) {
-        let mut index = self.session_index.write().await;
-        index.remove(session_id);
-    }
-
-    /// List all active workspace paths.
-    pub async fn list_workspaces(&self) -> Vec<PathBuf> {
-        let instances = self.instances.read().await;
-        instances.keys().cloned().collect()
-    }
-
-    /// Remove a workspace instance.
-    pub async fn remove(&self, path: impl AsRef<Path>) -> bool {
-        let path = path.as_ref();
-        let mut instances = self.instances.write().await;
-        instances.remove(path).is_some()
     }
 }
 
@@ -290,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_create_is_single_flight_and_lists_and_removes() {
+    async fn get_or_create_is_single_flight() {
         let manager = manager();
         let dir = tempfile::tempdir().unwrap();
 
@@ -300,16 +274,9 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.id, second.id);
 
-        let workspaces = manager.list_workspaces().await;
-        assert_eq!(workspaces.len(), 1);
-
         // get_by_id resolves the created instance and misses on an unknown id.
         assert!(manager.get_by_id(&first.id).await.is_some());
         assert!(manager.get_by_id("ws_absent").await.is_none());
-
-        assert!(manager.remove(&workspaces[0]).await);
-        assert!(!manager.remove(&workspaces[0]).await);
-        assert!(manager.list_workspaces().await.is_empty());
     }
 
     #[tokio::test]
@@ -344,11 +311,11 @@ mod tests {
             ids.push(handle.await.unwrap());
         }
         assert!(ids.iter().all(|id| *id == ids[0]));
-        assert_eq!(manager.list_workspaces().await.len(), 1);
+        assert!(manager.get_by_id(&ids[0]).await.is_some());
     }
 
     #[tokio::test]
-    async fn session_index_registers_and_unregisters() {
+    async fn session_index_registers_and_resolves() {
         let manager = manager();
         let dir = tempfile::tempdir().unwrap();
         let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
@@ -361,27 +328,6 @@ mod tests {
             manager.get_session_workspace(&thread_id).await,
             Some(dir.path().to_path_buf())
         );
-        manager.unregister_session(&thread_id).await;
-        assert!(manager.get_session_workspace(&thread_id).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn emit_event_reaches_a_workspace_subscriber() {
-        let manager = manager();
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = manager.get_or_create(dir.path()).await.unwrap();
-        let mut rx = workspace.event_tx.subscribe();
-
-        manager
-            .emit_event(&workspace.id, ServerEvent::ResyncRequired)
-            .await;
-        // Emitting to an unknown workspace id is a no-op, not an error.
-        manager
-            .emit_event("ws_absent", ServerEvent::ResyncRequired)
-            .await;
-
-        let event = rx.try_recv().expect("subscriber must observe the event");
-        assert!(matches!(event, ServerEvent::ResyncRequired));
     }
 
     #[tokio::test]
@@ -400,5 +346,29 @@ mod tests {
         );
         let missing = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
         assert!(workspace.snapshot(missing).is_err());
+
+        // The default manager's provider factory is a configured-error stub;
+        // starting a turn exercises it and yields a retryable child failure
+        // rather than a panic.
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let binding = latte_core::ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let snapshot = workspace
+            .runtime
+            .start(thread_id, "hello".into(), binding)
+            .await
+            .expect("start persists a retryable failure without panicking");
+        assert_eq!(snapshot.thread_id, thread_id);
     }
 }
