@@ -240,20 +240,22 @@ Uses existing model:
 
 ## 10. Implementation Status
 
-### Done (skeleton)
-- [x] Protocol types
-- [x] WorkspaceManager skeleton
-- [x] Basic command routing
+### Done
+- [x] HTTP server (axum) with all REST endpoints
+- [x] Auth middleware (Bearer token)
+- [x] Per-workspace event bridging (SSE)
+- [x] WorkspaceManager with single-flight creation
+- [x] All session endpoints (create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile)
+- [x] List/search sessions (stub)
+- [x] Unit tests (6 passing)
+- [x] E2E test (1 passing)
 
 ### TODO
-- [ ] HTTP server (axum)
-- [ ] SSE implementation
-- [ ] Workspace identity (stable ID + single-flight)
-- [ ] Reader/worker/writer pattern
-- [ ] All endpoints from section 5
-- [ ] Token generation and validation
-- [ ] Client library
-- [ ] Tests
+- [ ] List/search return real data
+- [ ] Event forwarding from ThreadRuntimeService to SSE
+- [ ] More comprehensive E2E tests
+- [ ] Performance testing
+- [ ] Documentation (zh-CN translation)
 
 ## 11. Open Questions
 
