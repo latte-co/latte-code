@@ -27,6 +27,11 @@ pub struct ServerCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerCommandPayload {
+    /// Select the workspace for this connection. Must be the first command.
+    SelectWorkspace {
+        /// Absolute path to the workspace root.
+        path: String,
+    },
     /// Thread commands (Start, FollowUp, etc.)
     Thread(ThreadCommand),
     /// Queue a follow-up message.

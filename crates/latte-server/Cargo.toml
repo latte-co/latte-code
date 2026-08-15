@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 latte-core = { workspace = true }
 latte-headless = { workspace = true }
+latte-engine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }

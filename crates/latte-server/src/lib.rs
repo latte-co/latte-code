@@ -1,36 +1,39 @@
-//! latte-code server: accepts client connections and routes commands to the runtime.
+//! latte-code server: accepts client connections and routes commands to workspaces.
+
 mod transport;
+mod workspace;
 
 use anyhow::{Context, Result};
 use latte_core::{
     ServerCommand, ServerCommandPayload, ServerError, ServerEvent, ServerFrame, ServerResponse,
     ServerResponsePayload, ThreadCommand,
 };
-use latte_headless::thread::ThreadRuntimeService;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
 use crate::transport::Listener;
+use crate::workspace::WorkspaceManager;
 
 /// The latte-code server.
 pub struct Server {
-    runtime: Arc<ThreadRuntimeService>,
+    workspaces: Arc<WorkspaceManager>,
     event_tx: broadcast::Sender<ServerEvent>,
-    /// Per-connection subscriptions: connection_id -> set of thread_ids
-    subscriptions: Arc<Mutex<HashMap<u64, Vec<latte_core::ThreadId>>>>,
+    /// Per-connection state: connection_id -> workspace path
+    connections: Arc<Mutex<HashMap<u64, Option<PathBuf>>>>,
     next_conn_id: Arc<Mutex<u64>>,
 }
 
 impl Server {
-    /// Create a new server with the given runtime.
-    pub fn new(runtime: ThreadRuntimeService) -> Self {
+    /// Create a new server.
+    pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
-            runtime: Arc::new(runtime),
+            workspaces: Arc::new(WorkspaceManager::new()),
             event_tx,
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             next_conn_id: Arc::new(Mutex::new(1)),
         }
     }
@@ -49,12 +52,12 @@ impl Server {
                 id
             };
 
-            let runtime = self.runtime.clone();
+            let workspaces = self.workspaces.clone();
             let event_tx = self.event_tx.clone();
-            let subscriptions = self.subscriptions.clone();
+            let connections = self.connections.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(conn_id, conn, runtime, event_tx, subscriptions).await {
+                if let Err(e) = handle_connection(conn_id, conn, workspaces, event_tx, connections).await {
                     error!("connection {} error: {}", conn_id, e);
                 }
             });
@@ -67,15 +70,24 @@ impl Server {
     }
 }
 
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 async fn handle_connection(
     conn_id: u64,
     mut conn: crate::transport::Connection,
-    runtime: Arc<ThreadRuntimeService>,
+    workspaces: Arc<WorkspaceManager>,
     event_tx: broadcast::Sender<ServerEvent>,
-    subscriptions: Arc<Mutex<HashMap<u64, Vec<latte_core::ThreadId>>>>,
+    connections: Arc<Mutex<HashMap<u64, Option<PathBuf>>>>,
 ) -> Result<()> {
     info!("connection {} established", conn_id);
     let mut event_rx = event_tx.subscribe();
+
+    // Register connection
+    connections.lock().await.insert(conn_id, None);
 
     loop {
         tokio::select! {
@@ -89,7 +101,13 @@ async fn handle_connection(
 
                 match frame {
                     ServerFrame::Command(cmd) => {
-                        let response = handle_command(&runtime, cmd).await;
+                        let response = match handle_command(conn_id, &workspaces, &connections, cmd).await {
+                            Ok(resp) => resp,
+                            Err(e) => ServerResponse {
+                                command_id: String::new(),
+                                payload: ServerResponsePayload::Error { error: e },
+                            },
+                        };
                         let response_frame = ServerFrame::Response(response);
                         let json = serde_json::to_vec(&response_frame)?;
                         conn.send(&json).await?;
@@ -102,32 +120,15 @@ async fn handle_connection(
             event = event_rx.recv() => {
                 match event {
                     Ok(event) => {
-                        // Only send events for threads this connection subscribes to
-                        let should_send = match &event {
-                            ServerEvent::ThreadChanged { thread_id, .. } => {
-                                let subs = subscriptions.lock().await;
-                                subs.get(&conn_id)
-                                    .map(|threads| threads.contains(thread_id))
-                                    .unwrap_or(false)
-                            }
-                            ServerEvent::Progress { thread_id, .. } => {
-                                let subs = subscriptions.lock().await;
-                                subs.get(&conn_id)
-                                    .map(|threads| threads.contains(thread_id))
-                                    .unwrap_or(false)
-                            }
-                        };
-                        if should_send {
-                            let frame = ServerFrame::Event(event);
-                            let json = serde_json::to_vec(&frame)?;
-                            if let Err(e) = conn.send(&json).await {
-                                warn!("failed to send event: {}", e);
-                                break;
-                            }
+                        // TODO: implement per-connection subscription tracking
+                        let frame = ServerFrame::Event(event);
+                        let json = serde_json::to_vec(&frame)?;
+                        if let Err(e) = conn.send(&json).await {
+                            warn!("failed to send event: {}", e);
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Client is lagging; it should resync via snapshot
                         warn!("connection {} lagged", conn_id);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -136,106 +137,158 @@ async fn handle_connection(
         }
     }
 
-    // Clean up subscriptions
-    subscriptions.lock().await.remove(&conn_id);
+    // Clean up
+    connections.lock().await.remove(&conn_id);
     info!("connection {} closed", conn_id);
     Ok(())
 }
 
 async fn handle_command(
-    runtime: &ThreadRuntimeService,
+    conn_id: u64,
+    workspaces: &WorkspaceManager,
+    connections: &Mutex<HashMap<u64, Option<PathBuf>>>,
     cmd: ServerCommand,
-) -> ServerResponse {
+) -> Result<ServerResponse, ServerError> {
     let command_id = cmd.command_id;
     let result = match cmd.payload {
+        ServerCommandPayload::SelectWorkspace { path } => {
+            let workspace_path = PathBuf::from(path);
+            match workspaces.get_or_create(&workspace_path).await {
+                Ok(_) => {
+                    connections.lock().await.insert(conn_id, Some(workspace_path));
+                    Ok(ServerResponsePayload::Received)
+                }
+                Err(e) => Err(ServerError::Rejected {
+                    message: format!("invalid workspace: {}", e),
+                }),
+            }
+        }
         ServerCommandPayload::Thread(thread_cmd) => {
-            handle_thread_command(runtime, thread_cmd).await
+            let runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
+            handle_thread_command(&runtime, thread_cmd).await
         }
         ServerCommandPayload::QueueFollowUp { thread_id, prompt } => {
+            let runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
             runtime.queue_follow_up(thread_id, prompt)
-                .map(|pos| ServerResponsePayload::Received)
+                .map(|_| ServerResponsePayload::Received)
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ServerCommandPayload::ReconcileUnknown { thread_id, effect_id } => {
+            let runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
             runtime.reconcile_unknown_effect(thread_id, &effect_id)
                 .map(|_| ServerResponsePayload::Received)
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ServerCommandPayload::ListSessions => {
+            let _runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
             // TODO: implement session listing
             Err(ServerError::Failed {
                 message: "not implemented".to_string(),
             })
         }
         ServerCommandPayload::SearchSessions { query } => {
+            let _runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
             // TODO: implement session search
             Err(ServerError::Failed {
                 message: "not implemented".to_string(),
             })
         }
         ServerCommandPayload::GetSession { thread_id } => {
+            let _runtime = get_workspace_runtime(conn_id, connections, workspaces).await?;
             // TODO: implement session get
             Err(ServerError::Failed {
                 message: "not implemented".to_string(),
             })
         }
         ServerCommandPayload::Subscribe { thread_id } => {
-            // Subscription is handled at connection level
+            // TODO: implement per-connection subscription tracking
             Ok(ServerResponsePayload::Received)
         }
         ServerCommandPayload::Unsubscribe { thread_id } => {
+            // TODO: implement per-connection subscription tracking
             Ok(ServerResponsePayload::Received)
         }
     };
 
     match result {
-        Ok(payload) => ServerResponse {
+        Ok(payload) => Ok(ServerResponse {
             command_id,
             payload,
-        },
-        Err(error) => ServerResponse {
+        }),
+        Err(error) => Ok(ServerResponse {
             command_id,
             payload: ServerResponsePayload::Error { error },
-        },
+        }),
     }
 }
 
+async fn get_workspace_runtime(
+    conn_id: u64,
+    connections: &Mutex<HashMap<u64, Option<PathBuf>>>,
+    workspaces: &WorkspaceManager,
+) -> Result<std::sync::Arc<latte_headless::thread::ThreadRuntimeService>, ServerError> {
+    let workspace_path = {
+        let conns = connections.lock().await;
+        conns
+            .get(&conn_id)
+            .and_then(|p| p.clone())
+            .ok_or_else(|| ServerError::Rejected {
+                message: "no workspace selected".to_string(),
+            })?
+    };
+
+    let instance = workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|e| ServerError::Failed {
+            message: e.to_string(),
+        })?;
+
+    Ok(instance.runtime.clone())
+}
+
 async fn handle_thread_command(
-    runtime: &ThreadRuntimeService,
+    runtime: &latte_headless::thread::ThreadRuntimeService,
     cmd: ThreadCommand,
 ) -> Result<ServerResponsePayload, ServerError> {
     match cmd {
         ThreadCommand::Start { thread_id, prompt, binding } => {
-            runtime.start(thread_id, prompt, binding)
+            runtime
+                .start(thread_id, prompt, binding)
                 .await
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ThreadCommand::FollowUp { thread_id, expected_thread_revision, prompt } => {
-            runtime.follow_up(thread_id, expected_thread_revision, prompt)
+            runtime
+                .follow_up(thread_id, expected_thread_revision, prompt)
                 .await
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ThreadCommand::SwitchModel { thread_id, expected_thread_revision, binding } => {
-            runtime.switch_model(thread_id, expected_thread_revision, &binding)
+            runtime
+                .switch_model(thread_id, expected_thread_revision, &binding)
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ThreadCommand::ProvideInput { thread_id, request_id, expected_thread_revision, expected_run_revision, value } => {
-            runtime.provide_input(thread_id, expected_thread_revision, request_id, value)
+            runtime
+                .provide_input(thread_id, expected_thread_revision, request_id, value)
                 .await
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ThreadCommand::ResolvePermission { thread_id, request_id, expected_thread_revision, expected_run_revision, allow } => {
-            runtime.resolve_permission(thread_id, expected_thread_revision, request_id, allow)
+            runtime
+                .resolve_permission(thread_id, expected_thread_revision, request_id, allow)
                 .await
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }
         ThreadCommand::Cancel { thread_id, expected_thread_revision, expected_run_revision } => {
-            runtime.cancel_durable(thread_id)
+            runtime
+                .cancel_durable(thread_id)
                 .map(|snapshot| ServerResponsePayload::Completed { snapshot })
                 .map_err(|e| ServerError::Failed { message: e.to_string() })
         }

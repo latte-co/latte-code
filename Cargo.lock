@@ -1092,6 +1092,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "latte-core",
+ "latte-engine",
  "latte-headless",
  "serde",
  "serde_json",
