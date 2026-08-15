@@ -662,6 +662,22 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         &[("Idempotency-Key", "e2e-follow-1")],
     );
     assert_eq!(follow_status, 202, "follow-up returned {follow_body:?}");
+    let follow_revision = follow_body["accepted_revision"].as_u64().unwrap();
+
+    // Retrying the follow-up with the same Idempotency-Key replays the original
+    // accepted result rather than starting a second turn.
+    let (replay_follow_status, replay_follow_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "e2e-follow-1")],
+    );
+    assert_eq!(replay_follow_status, 202);
+    assert_eq!(
+        replay_follow_body["accepted_revision"].as_u64().unwrap(),
+        follow_revision
+    );
 
     // The follow-up's durable transitions surface on the SSE stream.
     let frames = events_handle.join().unwrap();
