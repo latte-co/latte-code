@@ -1169,6 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_workspace() {
         let state = state();
+        let workspace = tempfile::tempdir().unwrap();
         let response = router(state.clone())
             .oneshot(
                 axum::http::Request::builder()
@@ -1177,7 +1178,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer test-token")
                     .body(axum::body::Body::from(
-                        serde_json::json!({"path": "/tmp"}).to_string(),
+                        serde_json::json!({ "path": workspace.path().to_string_lossy() })
+                            .to_string(),
                     ))
                     .unwrap(),
             )

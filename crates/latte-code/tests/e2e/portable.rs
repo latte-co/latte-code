@@ -786,11 +786,12 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn final_binary_server_resolves_a_permission_request_through_http() {
     let scenario = Scenario::new();
     // The scripted provider requests a write_file tool call, parking the
-    // session at WaitingPermission; the second reply is never reached because
-    // the request is denied over HTTP.
+    // session at WaitingPermission; after the permission is allowed over HTTP
+    // the effect runs and the provider completes the turn.
     let provider = ScriptedProvider::start([
         ProviderReply::tool_call(
             "write-1",
@@ -801,7 +802,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
                 "create_intent": true
             }),
         ),
-        ProviderReply::completion("unreached"),
+        ProviderReply::completion("wrote the file"),
     ]);
     let endpoint = provider.endpoint();
     std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
@@ -863,22 +864,160 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
     let (revision, request_id, run_revision) =
         pending.expect("session never reached WaitingPermission over HTTP");
 
-    // Denying the permission over HTTP terminates the effect without writing.
-    let (deny_status, deny_body) = server.request(
+    // Allowing the permission over HTTP executes the effect and continues the
+    // provider turn to completion; the file is written exactly once.
+    let (allow_status, allow_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
         Some(&server.token),
         Some(&serde_json::json!({
-            "allow": false,
+            "allow": true,
             "expected_thread_revision": revision,
             "expected_run_revision": run_revision
         })),
         &[],
     );
-    assert_eq!(deny_status, 200, "deny returned {deny_body:?}");
-    assert!(deny_body["snapshot"].is_object());
-    assert!(
-        !scenario.root().join("note.txt").exists(),
-        "denied effect must not write the file"
+    assert_eq!(allow_status, 200, "allow returned {allow_body:?}");
+    assert!(allow_body["snapshot"].is_object());
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("note.txt")).unwrap(),
+        "hello\n",
+        "allowed effect must write the file exactly once"
     );
+
+    // The completed session is not awaiting reconciliation, so a reconcile
+    // request over HTTP is a 404.
+    let (reconcile_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/effects/write-1/reconcile"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(reconcile_status, 404);
+
+    // Switching binding on the session exercises the model route end to end.
+    // The exact outcome depends on the post-completion lifecycle, but it is
+    // never a server error.
+    let (_, snapshot) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
+    let (noop_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/model"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "binding": server_binding(&scenario),
+            "expected_thread_revision": revision
+        })),
+        &[],
+    );
+    assert!(
+        noop_status == 200 || noop_status == 409,
+        "switch-model status: {noop_status}"
+    );
+}
+
+#[test]
+fn final_binary_server_provides_input_through_http() {
+    let scenario = Scenario::new();
+    // The scripted provider requests non-secret input, parking the session at
+    // WaitingInput; providing the value continues the turn, and the queued
+    // follow-up then drains as a further completion.
+    let provider = ScriptedProvider::start([
+        ProviderReply::input_request("input-1", "what value?", false),
+        ProviderReply::completion("got it"),
+        ProviderReply::completion("drained the queue"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "need input", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingInput.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingInput over HTTP");
+
+    // A suspended session has no active runner mailbox, so a queued follow-up
+    // is rejected as a conflict rather than a server error.
+    let (queue_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "queued while waiting" })),
+        &[],
+    );
+    assert_eq!(queue_status, 409);
+
+    // Providing the requested value over HTTP continues the turn to completion.
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "the answer",
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+    assert!(input_body["snapshot"].is_object());
 }
