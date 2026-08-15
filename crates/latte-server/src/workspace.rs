@@ -20,6 +20,8 @@ pub struct WorkspaceInstance {
     pub runtime: Arc<latte_headless::thread::ThreadRuntimeService>,
     /// Event sender for this workspace.
     pub event_tx: broadcast::Sender<ServerEvent>,
+    /// Engine handle for event subscription.
+    engine: latte_engine::EngineHandle,
 }
 
 impl WorkspaceInstance {
@@ -29,13 +31,48 @@ impl WorkspaceInstance {
         path: PathBuf,
         runtime: latte_headless::thread::ThreadRuntimeService,
         event_tx: broadcast::Sender<ServerEvent>,
+        engine: latte_engine::EngineHandle,
     ) -> Self {
-        Self {
+        let instance = Self {
             id,
             path,
             runtime: Arc::new(runtime),
             event_tx,
-        }
+            engine,
+        };
+
+        // Start event bridge
+        instance.start_event_bridge();
+
+        instance
+    }
+
+    /// Start bridging engine events to the workspace event channel.
+    fn start_event_bridge(&self) {
+        let engine = self.engine.clone();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let mut subscription = engine.subscribe_threads();
+            loop {
+                match subscription.recv().await {
+                    Ok(event) => {
+                        // Forward engine events to workspace event channel
+                        let server_event = match event.event {
+                            latte_core::ThreadEvent::LifecycleChanged { .. } => {
+                                ServerEvent::ThreadChanged {
+                                    session_id: event.thread_id.to_string(),
+                                    revision: event.revision,
+                                }
+                            }
+                            _ => continue,
+                        };
+                        let _ = event_tx.send(server_event);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 }
 
@@ -102,13 +139,19 @@ impl WorkspaceManager {
             .build()
             .context("failed to create engine")?;
         let runtime = latte_headless::thread::ThreadRuntimeService::new(
-            engine,
+            engine.clone(),
             &canonical,
             Default::default(),
             Arc::new(|_| unimplemented!("provider factory")),
         );
 
-        let instance = Arc::new(WorkspaceInstance::new(id, canonical.clone(), runtime, event_tx));
+        let instance = Arc::new(WorkspaceInstance::new(
+            id,
+            canonical.clone(),
+            runtime,
+            event_tx,
+            engine,
+        ));
 
         // Store and return the winning instance
         instances.insert(canonical, instance.clone());
