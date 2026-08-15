@@ -1,4 +1,5 @@
 //! Workspace management for the server.
+use sha2::Digest;
 
 use anyhow::{Context, Result};
 use latte_headless::thread::ThreadRuntimeService;
@@ -10,6 +11,8 @@ use tracing::{info, warn};
 
 /// A workspace instance with its own runtime.
 pub struct WorkspaceInstance {
+    /// Stable workspace ID.
+    pub id: String,
     /// Absolute path to the workspace root.
     pub path: PathBuf,
     /// The thread runtime service for this workspace.
@@ -18,8 +21,9 @@ pub struct WorkspaceInstance {
 
 impl WorkspaceInstance {
     /// Create a new workspace instance.
-    pub fn new(path: PathBuf, runtime: latte_headless::thread::ThreadRuntimeService) -> Self {
+    pub fn new(id: String, path: PathBuf, runtime: latte_headless::thread::ThreadRuntimeService) -> Self {
         Self {
+            id,
             path,
             runtime: Arc::new(runtime),
         }
@@ -57,26 +61,42 @@ impl WorkspaceManager {
         // Validate the path
         let canonical = path.canonicalize().context("invalid workspace path")?;
 
+        // Generate stable workspace ID from canonical path
+        let id = format!(
+            "ws_{}",
+            sha2::Sha256::digest(canonical.to_string_lossy().as_bytes())
+                .iter()
+                .take(8)
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+
         // Create the runtime for this workspace
         // TODO: pass proper config, provider, etc.
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(&canonical)
             .build()
             .context("failed to create engine")?;
-        let runtime = ThreadRuntimeService::new(
+        let runtime = latte_headless::thread::ThreadRuntimeService::new(
             engine,
             &canonical,
             Default::default(),
             Arc::new(|_| unimplemented!("provider factory")),
         );
 
-        let instance = Arc::new(WorkspaceInstance::new(canonical, runtime));
+        let instance = Arc::new(WorkspaceInstance::new(id, canonical, runtime));
 
         // Store it
         let mut instances = self.instances.write().await;
-        instances.insert(path.clone(), instance.clone());
+        instances.entry(path).or_insert(instance.clone());
 
         Ok(instance)
+    }
+
+    /// Get a workspace by its ID.
+    pub async fn get_by_id(&self, id: &str) -> Option<Arc<WorkspaceInstance>> {
+        let instances = self.instances.read().await;
+        instances.values().find(|i| i.id == id).cloned()
     }
 
     /// List all active workspace paths.

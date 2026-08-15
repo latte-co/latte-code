@@ -1,6 +1,7 @@
 //! latte-code server: accepts client connections and routes commands to workspaces.
 
 mod transport;
+mod http;
 mod workspace;
 
 use anyhow::{Context, Result};
