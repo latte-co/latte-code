@@ -1188,3 +1188,91 @@ fn final_binary_serve_rejects_invalid_configuration() {
     assert_eq!(envelope["status"], "usage");
     assert_eq!(envelope["error"]["code"], "configuration");
 }
+
+#[test]
+fn final_binary_server_reports_a_full_mailbox_as_conflict() {
+    let scenario = Scenario::new();
+    // A slow first turn keeps the runner active while we flood the bounded
+    // (capacity 8) mailbox; once full, further queues are a mailbox-full 409.
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("slow done").delayed(std::time::Duration::from_secs(5)),
+        ProviderReply::completion("drain 1"),
+        ProviderReply::completion("drain 2"),
+        ProviderReply::completion("drain 3"),
+        ProviderReply::completion("drain 4"),
+        ProviderReply::completion("drain 5"),
+        ProviderReply::completion("drain 6"),
+        ProviderReply::completion("drain 7"),
+        ProviderReply::completion("drain 8"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "slow turn", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Flood the mailbox during the active window until it reports full. Every
+    // response is either 202 (queued), 404 (not yet registered), 409-full
+    // (mailbox saturated), or 409-inactive (window closed) — never a 5xx.
+    let mut saw_full = false;
+    let mut saw_active = false;
+    for _ in 0..400 {
+        let (status, body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/queue"),
+            Some(&server.token),
+            Some(&serde_json::json!({ "prompt": "flood" })),
+            &[],
+        );
+        if status == 202 {
+            saw_active = true;
+            continue;
+        }
+        if status == 409 {
+            if body["error"]["message"] == "input mailbox is full" {
+                saw_full = true;
+                break;
+            }
+            // A generic conflict before the runner opened (still registering)
+            // is transient; only stop once we have seen the active window.
+            if saw_active {
+                break;
+            }
+        }
+        assert!(
+            status == 404 || status == 409,
+            "unexpected queue status {status}: {body:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        saw_full,
+        "mailbox never reported full during the active turn"
+    );
+}
