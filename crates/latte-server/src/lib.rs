@@ -1,7 +1,7 @@
 //! latte-code server: HTTP API with per-workspace event hubs.
 
-mod http;
-mod workspace;
+pub mod http;
+pub mod workspace;
 
 use anyhow::Result;
 use std::sync::Arc;

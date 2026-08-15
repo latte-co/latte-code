@@ -2,12 +2,11 @@
 use sha2::Digest;
 
 use anyhow::{Context, Result};
-use latte_headless::thread::ThreadRuntimeService;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::http::ServerEvent;
 

@@ -10,16 +10,14 @@ use axum::{
     Json, Router,
 };
 use futures::stream::Stream;
-use latte_core::ThreadId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::workspace::WorkspaceManager;
 
@@ -249,7 +247,7 @@ async fn create_session(
 
     // Create thread
     let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-    let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+    let _run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
 
     workspace
         .runtime
@@ -288,7 +286,7 @@ async fn list_sessions(
     Path(workspace_id): Path<String>,
     Query(_pagination): Query<PaginationQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let workspace = state
+    let _workspace = state
         .workspaces
         .get_by_id(&workspace_id)
         .await
@@ -304,7 +302,7 @@ async fn search_sessions(
     Path(workspace_id): Path<String>,
     Query(_query): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let workspace = state
+    let _workspace = state
         .workspaces
         .get_by_id(&workspace_id)
         .await
@@ -320,7 +318,7 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // Find the workspace that contains this session
-    let thread_id = latte_core::ThreadId::from_uuid(
+    let _thread_id = latte_core::ThreadId::from_uuid(
         uuid::Uuid::parse_str(&id).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
@@ -339,7 +337,7 @@ async fn get_session(
     // TODO: optimize with a session index
     let workspaces = state.workspaces.list_workspaces().await;
     for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+        if let Ok(_workspace) = state.workspaces.get_or_create(&ws_path).await {
             // Check if this thread exists in this workspace
             // For now, return not found
         }
@@ -478,7 +476,7 @@ async fn switch_model(
 async fn cancel_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<CancelRequest>,
+    Json(_req): Json<CancelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
 
