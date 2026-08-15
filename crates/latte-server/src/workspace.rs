@@ -2,6 +2,7 @@
 use sha2::Digest;
 
 use anyhow::{Context, Result};
+use latte_headless::thread::ThreadRuntimeService;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +10,13 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
 use crate::http::ServerEvent;
+
+/// Provider factory type.
+pub type ProviderFactory = Arc<
+    dyn Fn(&latte_core::ThreadProviderBindingV2) -> Result<latte_headless::registry::ResolvedProvider, String>
+        + Send
+        + Sync,
+>;
 
 /// A workspace instance with its own runtime.
 pub struct WorkspaceInstance {
@@ -81,14 +89,17 @@ pub struct WorkspaceManager {
     instances: Arc<RwLock<HashMap<PathBuf, Arc<WorkspaceInstance>>>>,
     /// Session ID -> workspace path index.
     session_index: Arc<RwLock<HashMap<latte_core::ThreadId, PathBuf>>>,
+    /// Provider factory.
+    provider_factory: ProviderFactory,
 }
 
 impl WorkspaceManager {
     /// Create a new workspace manager.
-    pub fn new() -> Self {
+    pub fn new(provider_factory: ProviderFactory) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             session_index: Arc::new(RwLock::new(HashMap::new())),
+            provider_factory,
         }
     }
 
@@ -133,7 +144,6 @@ impl WorkspaceManager {
         let (event_tx, _) = broadcast::channel(256);
 
         // Create the runtime for this workspace
-        // TODO: pass proper config, provider, etc.
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(&canonical)
             .build()
@@ -142,7 +152,7 @@ impl WorkspaceManager {
             engine.clone(),
             &canonical,
             Default::default(),
-            Arc::new(|_| unimplemented!("provider factory")),
+            self.provider_factory.clone(),
         );
 
         let instance = Arc::new(WorkspaceInstance::new(
@@ -206,6 +216,10 @@ impl WorkspaceManager {
 
 impl Default for WorkspaceManager {
     fn default() -> Self {
-        Self::new()
+        // Default provider factory that returns an error
+        let factory: ProviderFactory = Arc::new(|_| {
+            Err("no provider factory configured".to_string())
+        });
+        Self::new(factory)
     }
 }

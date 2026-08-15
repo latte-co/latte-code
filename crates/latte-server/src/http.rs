@@ -660,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         let response = app
@@ -678,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_required() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         // Request without auth should fail
@@ -701,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_with_wrong_token() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         // Request with wrong token should fail
@@ -725,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_workspace() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         // Create workspace
@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_workspace_invalid_path() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         // Create workspace with invalid path
@@ -782,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_session_not_found() {
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let app = router(state);
 
         // Get non-existent session (valid UUID format)

@@ -13,7 +13,7 @@ mod e2e_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let state = new_state("test-token".to_string());
+        let state = new_state("test-token".to_string(), std::sync::Arc::new(|_| Err("test".to_string())));
         let server = tokio::spawn(async move {
             let app = latte_server::http::router(state);
             axum::serve(listener, app).await.unwrap();

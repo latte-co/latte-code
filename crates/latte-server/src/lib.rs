@@ -8,12 +8,12 @@ use std::sync::Arc;
 use tracing::info;
 
 pub use crate::http::{run, ServerState};
-pub use crate::workspace::{WorkspaceInstance, WorkspaceManager};
+pub use crate::workspace::{ProviderFactory, WorkspaceInstance, WorkspaceManager};
 
 /// Create a new server state.
-pub fn new_state(token: String) -> Arc<ServerState> {
+pub fn new_state(token: String, provider_factory: ProviderFactory) -> Arc<ServerState> {
     Arc::new(ServerState {
-        workspaces: Arc::new(WorkspaceManager::new()),
+        workspaces: Arc::new(WorkspaceManager::new(provider_factory)),
         event_tx: tokio::sync::broadcast::channel(256).0,
         token,
     })
