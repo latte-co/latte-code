@@ -6,6 +6,7 @@ members = [
   "crates/latte-headless",
   "crates/latte-tui",
   "crates/latte-code",
+  "crates/latte-server",
 ]
 
 [workspace.package]
@@ -18,9 +19,12 @@ rust-version = "1.93"
 [workspace.dependencies]
 latte-core = { path = "crates/latte-core", version = "0.1.0" }
 latte-engine = { path = "crates/latte-engine", version = "0.1.0" }
+latte-headless = { path = "crates/latte-headless", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time"] }
 uuid = { version = "1.20", features = ["serde", "v7"] }
 json5 = "0.4"
