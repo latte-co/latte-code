@@ -1,7 +1,7 @@
 # Server Design
 
-Status: **design proposal, skeleton implemented**
-Date: 2026-08-15
+Status: **implemented (HTTP REST + SSE), reachable through `latte-code serve`**
+Date: 2026-08-16
 
 ## 1. Overview
 
@@ -243,17 +243,19 @@ Uses existing model:
 ### Done
 - [x] HTTP server (axum) with all REST endpoints
 - [x] Auth middleware (Bearer token)
-- [x] Per-workspace event bridging (SSE)
+- [x] Per-workspace event bridging (SSE), resilient to broadcast lag
 - [x] WorkspaceManager with single-flight creation
 - [x] All session endpoints (create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile)
-- [x] List/search sessions (stub)
-- [x] Unit tests (6 passing)
-- [x] E2E test (1 passing)
+- [x] Asynchronous create/follow-up: persist + register, return 202, run the turn in the background, observe completion via SSE
+- [x] `Idempotency-Key` dedup on durable mutations, keyed by `(token, key)`
+- [x] Revision fences: cancel/permission/input validate thread and run revisions and return 409 with the current revision on mismatch
+- [x] List/search/get return real durable snapshots from the workspace engine
+- [x] Server mode wired into the `latte-code` binary (`latte-code serve [--port N]`) with a 0600 token file and graceful shutdown
+- [x] Unit tests and final-binary E2E (portable) covering the HTTP surface and session lifecycle
 
 ### TODO
-- [ ] List/search return real data
-- [ ] Event forwarding from ThreadRuntimeService to SSE
-- [ ] More comprehensive E2E tests
+- [ ] Binding-discovery endpoint so remote (non-co-located) clients can obtain a valid `ThreadProviderBindingV2`
+- [ ] Pagination cursors for list/search (currently returns a single page)
 - [ ] Performance testing
 - [ ] Documentation (zh-CN translation)
 

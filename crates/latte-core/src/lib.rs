@@ -4,7 +4,6 @@ mod ids;
 mod protocol;
 mod state;
 mod thread;
-mod server;
 
 pub use ids::{
     Clock, CommandId, EventId, IdSource, RunId, SystemClock, SystemIdSource, ThreadCommandId,
@@ -13,7 +12,6 @@ pub use ids::{
 pub use protocol::*;
 pub use state::*;
 pub use thread::*;
-pub use server::*;
 
 /// Version of the protocol encoded by this crate.
 pub const PROTOCOL_VERSION: u16 = 1;

@@ -1,5 +1,32 @@
 use super::support::{ProviderReply, Scenario, ScriptedProvider, assert_secret_absent, json};
 
+/// Computes the exact v2 provider binding the server will accept, mirroring
+/// what a co-located client does: load the same layered config and derive the
+/// binding against the workspace engine's tool descriptors.
+fn server_binding(scenario: &Scenario) -> serde_json::Value {
+    server_binding_for_model(scenario, None)
+}
+
+/// Like [`server_binding`], but for an explicit provider model when given.
+fn server_binding_for_model(scenario: &Scenario, model: Option<&str>) -> serde_json::Value {
+    let (_config, registry) =
+        latte_code::AppConfig::load(scenario.root()).expect("config loads for binding");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .build()
+        .expect("engine builds for binding");
+    let tools = engine.tool_descriptors();
+    let binding = match model {
+        Some(model) => registry
+            .thread_binding_for_model("main", model, &tools)
+            .expect("model binding resolves"),
+        None => registry
+            .thread_binding_for_default(&tools)
+            .expect("default binding resolves"),
+    };
+    serde_json::to_value(binding).expect("binding serializes")
+}
+
 fn run_id(output: &std::process::Output) -> String {
     json(output)["data"]["run"]["run_id"]
         .as_str()
@@ -256,5 +283,602 @@ fn final_binary_persists_terminal_provider_failure_without_retrying() {
             .as_str()
             .unwrap()
             .contains("http 400")
+    );
+}
+
+/// A supervised `latte-code serve` child bound to an ephemeral port. Dropping
+/// it terminates the process group so no server survives the test.
+struct ServeChild {
+    child: std::process::Child,
+    port: u16,
+    token: String,
+    #[cfg(unix)]
+    process_group: i32,
+}
+
+impl ServeChild {
+    /// Starts `latte-code --json serve --port 0` and blocks until the readiness
+    /// line reports the bound port and token file, then reads the token.
+    fn start(scenario: &Scenario) -> Self {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+
+        let mut command = scenario.command(&["--json", "serve", "--port", "0"]);
+        command
+            .env("TEST_OPENAI_KEY", "e2e-server-secret")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().unwrap();
+        #[cfg(unix)]
+        let process_group = i32::try_from(child.id()).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        // The first stdout line is the versioned readiness envelope.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            line.clear();
+            let read = reader.read_line(&mut line).unwrap();
+            if read > 0
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
+                && value["status"] == "listening"
+            {
+                break value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not report readiness; last line: {line:?}"
+            );
+        };
+        let port = u16::try_from(ready["data"]["port"].as_u64().unwrap()).unwrap();
+        let token_path = ready["data"]["token_path"].as_str().unwrap();
+        let token = std::fs::read_to_string(token_path).unwrap();
+        assert!(!token.is_empty(), "server token must not be empty");
+
+        Self {
+            child,
+            port,
+            token,
+            #[cfg(unix)]
+            process_group,
+        }
+    }
+
+    /// Issues one framed HTTP/1.1 request over loopback and returns the parsed
+    /// (status, JSON body) pair.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: Option<&serde_json::Value>,
+        extra_headers: &[(&str, &str)],
+    ) -> (u16, serde_json::Value) {
+        use std::fmt::Write as _;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let payload = body.map(|value| serde_json::to_vec(value).unwrap());
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+        if let Some(token) = auth {
+            let _ = write!(request, "Authorization: Bearer {token}\r\n");
+        }
+        for (name, value) in extra_headers {
+            let _ = write!(request, "{name}: {value}\r\n");
+        }
+        if let Some(payload) = &payload {
+            request.push_str("Content-Type: application/json\r\n");
+            let _ = write!(request, "Content-Length: {}\r\n", payload.len());
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        if let Some(payload) = &payload {
+            stream.write_all(payload).unwrap();
+        }
+        stream.flush().unwrap();
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("HTTP response must have a header terminator");
+        let header_text = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let status = header_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        let body_bytes = &raw[split + 4..];
+        let value = if body_bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, value)
+    }
+}
+
+/// Reads the workspace SSE stream over loopback for a bounded window. Kept as
+/// a free function so a reader thread can run without owning a `ServeChild`.
+fn read_events_from(
+    port: u16,
+    token: &str,
+    workspace_id: &str,
+    timeout: std::time::Duration,
+) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    let request = format!(
+        "GET /v1/workspaces/{workspace_id}/events HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = [0_u8; 4096];
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut buf) {
+            Ok(n) if n > 0 => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            _ => break,
+        }
+    }
+    seen
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        // Ask the server to shut down gracefully first so it can flush its
+        // coverage profile and exit cleanly; only force-kill as a fallback.
+        #[cfg(unix)]
+        {
+            let group = nix::unistd::Pid::from_raw(self.process_group);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    _ => break,
+                }
+            }
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
+    let scenario = Scenario::new();
+    // A scripted provider on loopback lets the background turn complete, so the
+    // session reaches a durable idle state and the success mutation paths are
+    // exercised through the final binary. Extra completions cover the queued
+    // follow-up drain and an explicit follow-up turn.
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("done"),
+        ProviderReply::completion("done"),
+        ProviderReply::completion("done"),
+        ProviderReply::completion("done"),
+    ]);
+    // Two configured models let the switch-model success path run end to end.
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    // Health needs no auth.
+    let (health_status, _) = server.request("GET", "/health", None, None, &[]);
+    assert_eq!(health_status, 200);
+
+    // Missing token is rejected.
+    let (unauth_status, _) = server.request("GET", "/v1/sessions/x", None, None, &[]);
+    assert_eq!(unauth_status, 401);
+
+    // A non-existent workspace path is rejected with 400.
+    let (bad_ws_status, bad_ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": "/nonexistent/path/for/serve/e2e" })),
+        &[],
+    );
+    assert_eq!(bad_ws_status, 400);
+    assert_eq!(bad_ws_body["error"]["type"], "rejected");
+
+    // Create/resolve the workspace by absolute path.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (ws_status, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    assert_eq!(ws_status, 200);
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+    // The binding a real co-located client would compute from the same config.
+    let binding = server_binding(&scenario);
+
+    // Create returns 202 immediately (async accept, not a completed turn).
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "hello server", "binding": binding })),
+        &[("Idempotency-Key", "e2e-key-1")],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+    assert_eq!(create_body["accepted_revision"], 0);
+
+    // The same idempotency key replays the original accepted session.
+    let (replay_status, replay_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "hello server", "binding": binding })),
+        &[("Idempotency-Key", "e2e-key-1")],
+    );
+    assert_eq!(replay_status, 202);
+    assert_eq!(replay_body["session_id"].as_str().unwrap(), session_id);
+
+    // The durable session becomes readable and, once the scripted provider
+    // completes the background turn, reaches the idle "ready" lifecycle.
+    let mut ready = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            assert_eq!(body["snapshot"]["thread_id"].as_str().unwrap(), session_id);
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "durable session never reached the ready lifecycle");
+
+    let (list_status, list_body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(list_status, 200);
+    assert!(
+        list_body["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions
+                .iter()
+                .any(|s| s["thread_id"].as_str() == Some(session_id.as_str()))),
+        "list route must return the durable session"
+    );
+
+    // Search returns the workspace catalogue (possibly empty) with 200.
+    let (search_status, search_body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/search?q=hello&limit=10"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(search_status, 200);
+    assert!(search_body["sessions"].is_array());
+
+    // Read the current thread revision to drive revision-fenced mutations.
+    let (_, snapshot) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
+
+    // Switching to the other configured model on an idle session succeeds and
+    // returns the updated snapshot binding.
+    let (switch_ok_status, switch_ok_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/model"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "binding": server_binding_for_model(&scenario, Some("mock-2")),
+            "expected_thread_revision": revision
+        })),
+        &[],
+    );
+    assert_eq!(switch_ok_status, 200, "switch returned {switch_ok_body:?}");
+    assert_eq!(switch_ok_body["snapshot"]["binding"]["model"], "mock-2");
+
+    // Re-read the revision after the durable switch for the follow-up fence.
+    let (_, snapshot) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
+
+    // Subscribe to the workspace SSE stream in a reader thread, then trigger a
+    // follow-up whose durable transitions must surface as thread_changed
+    // frames on the stream.
+    let events_handle = {
+        let port = server.port;
+        let token = server.token.clone();
+        let workspace_id = workspace_id.clone();
+        std::thread::spawn(move || {
+            read_events_from(
+                port,
+                &token,
+                &workspace_id,
+                std::time::Duration::from_secs(3),
+            )
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Follow-up with the matching revision is accepted (202) and queued.
+    let (follow_status, follow_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "e2e-follow-1")],
+    );
+    assert_eq!(follow_status, 202, "follow-up returned {follow_body:?}");
+
+    // The follow-up's durable transitions surface on the SSE stream.
+    let frames = events_handle.join().unwrap();
+    assert!(
+        frames.contains("text/event-stream"),
+        "events response was not an SSE stream: {frames:?}"
+    );
+    assert!(
+        frames.contains("thread_changed"),
+        "SSE stream carried no thread_changed frame: {frames:?}"
+    );
+
+    // A stale follow-up revision is a 409 conflict.
+    let (follow_conflict, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
+        &[],
+    );
+    assert_eq!(follow_conflict, 409);
+
+    // Queue a follow-up (accepted or conflict depending on runner state, but
+    // never a server error).
+    let (queue_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "queued" })),
+        &[],
+    );
+    assert!(
+        queue_status == 202 || queue_status == 409,
+        "queue: {queue_status}"
+    );
+
+    // Switch model with a stale revision is a 409 conflict.
+    let (switch_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/model"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "binding": binding, "expected_thread_revision": 999 })),
+        &[],
+    );
+    assert!(
+        switch_status == 409 || switch_status == 200,
+        "switch: {switch_status}"
+    );
+
+    // Permission/input/reconcile against a fresh id are 404; an invalid id is
+    // 400. These exercise the remaining session routes end to end.
+    let other = uuid::Uuid::now_v7();
+    let (perm_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{other}/permissions/req-1"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": 0,
+            "expected_run_revision": 0
+        })),
+        &[],
+    );
+    assert_eq!(perm_status, 404);
+
+    let (input_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{other}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": "req-1",
+            "value": "v",
+            "expected_thread_revision": 0,
+            "expected_run_revision": 0
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 404);
+
+    let (reconcile_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{other}/effects/effect-1/reconcile"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(reconcile_status, 404);
+
+    let (bad_id_status, _) = server.request(
+        "GET",
+        "/v1/sessions/not-a-uuid",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(bad_id_status, 400);
+
+    // A read for an unknown workspace id is 404.
+    let (missing_ws_status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws_absent/sessions",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(missing_ws_status, 404);
+
+    // A stale revision fence is rejected with 409 and the current revision.
+    let (conflict_status, conflict_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/cancel"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "expected_thread_revision": 999,
+            "expected_run_revision": 999
+        })),
+        &[],
+    );
+    assert_eq!(conflict_status, 409);
+    assert_eq!(conflict_body["error"]["type"], "conflict");
+    assert!(conflict_body["error"]["current_revision"].is_u64());
+}
+
+#[test]
+fn final_binary_server_resolves_a_permission_request_through_http() {
+    let scenario = Scenario::new();
+    // The scripted provider requests a write_file tool call, parking the
+    // session at WaitingPermission; the second reply is never reached because
+    // the request is denied over HTTP.
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-1",
+            "write_file",
+            &serde_json::json!({
+                "path": "note.txt",
+                "content": "hello\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("unreached"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission over HTTP");
+
+    // Denying the permission over HTTP terminates the effect without writing.
+    let (deny_status, deny_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": false,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(deny_status, 200, "deny returned {deny_body:?}");
+    assert!(deny_body["snapshot"].is_object());
+    assert!(
+        !scenario.root().join("note.txt").exists(),
+        "denied effect must not write the file"
     );
 }

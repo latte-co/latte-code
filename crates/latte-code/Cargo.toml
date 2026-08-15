@@ -12,6 +12,7 @@ path="src/main.rs"
 latte-core.workspace=true
 latte-engine.workspace=true
 latte-headless={path="../latte-headless",version="0.1.0"}
+latte-server={path="../latte-server",version="0.1.0"}
 latte-tui={path="../latte-tui",version="0.1.0"}
 tokio.workspace=true
 serde_json.workspace=true

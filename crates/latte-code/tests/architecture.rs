@@ -15,6 +15,7 @@ fn workspace_dependency_matrix_is_exact() {
         "latte-engine",
         "latte-headless",
         "latte-tui",
+        "latte-server",
         "latte-code",
     ]);
     let mut actual = BTreeMap::new();
@@ -39,8 +40,18 @@ fn workspace_dependency_matrix_is_exact() {
     );
     assert_eq!(actual["latte-tui"], BTreeSet::from(["latte-core"]));
     assert_eq!(
+        actual["latte-server"],
+        BTreeSet::from(["latte-core", "latte-engine", "latte-headless"])
+    );
+    assert_eq!(
         actual["latte-code"],
-        BTreeSet::from(["latte-core", "latte-engine", "latte-headless", "latte-tui"])
+        BTreeSet::from([
+            "latte-core",
+            "latte-engine",
+            "latte-headless",
+            "latte-tui",
+            "latte-server",
+        ])
     );
 }
 
