@@ -469,8 +469,21 @@ async fn cancel_session(
     Path(id): Path<String>,
     Json(req): Json<CancelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    let thread_id = parse_thread_id(&id)?;
+
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace.runtime.cancel_durable(thread_id) {
+                Ok(snapshot) => {
+                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err(not_found("session not found"))
 }
 
 async fn queue_follow_up(
@@ -478,8 +491,25 @@ async fn queue_follow_up(
     Path(id): Path<String>,
     Json(req): Json<QueueFollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "queue follow up not implemented".to_string(), current_revision: None } })))
+    let thread_id = parse_thread_id(&id)?;
+    let prompt = req.prompt.clone();
+
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace.runtime.queue_follow_up(thread_id, prompt.clone()) {
+                Ok(position) => {
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({ "position": position })),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err(not_found("session not found"))
 }
 
 async fn resolve_permission(
@@ -487,8 +517,25 @@ async fn resolve_permission(
     Path((id, request_id)): Path<(String, String)>,
     Json(req): Json<ResolvePermissionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    let thread_id = parse_thread_id(&id)?;
+
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace
+                .runtime
+                .resolve_permission(thread_id, req.expected_thread_revision, request_id.clone(), req.allow)
+                .await
+            {
+                Ok(snapshot) => {
+                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err(not_found("session not found"))
 }
 
 async fn provide_input(
@@ -496,16 +543,81 @@ async fn provide_input(
     Path(id): Path<String>,
     Json(req): Json<ProvideInputRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    let thread_id = parse_thread_id(&id)?;
+    let request_id = req.request_id.clone();
+    let value = req.value.clone();
+
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace
+                .runtime
+                .provide_input(thread_id, req.expected_thread_revision, request_id.clone(), value.clone())
+                .await
+            {
+                Ok(snapshot) => {
+                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err(not_found("session not found"))
 }
 
 async fn reconcile_effect(
     State(state): State<Arc<ServerState>>,
     Path((id, effect_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    let thread_id = parse_thread_id(&id)?;
+
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace.runtime.reconcile_unknown_effect(thread_id, &effect_id) {
+                Ok(snapshot) => {
+                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err(not_found("session not found"))
+}
+
+// Helper functions
+
+fn parse_thread_id(id: &str) -> Result<latte_core::ThreadId, (StatusCode, Json<ErrorResponse>)> {
+    let uuid = uuid::Uuid::parse_str(id).map_err(|_| bad_request("invalid session id"))?;
+    Ok(latte_core::ThreadId::from_uuid(uuid))
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "rejected".to_string(),
+                message: message.to_string(),
+                current_revision: None,
+            },
+        }),
+    )
+}
+
+fn not_found(message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "not_found".to_string(),
+                message: message.to_string(),
+                current_revision: None,
+            },
+        }),
+    )
 }
 
 async fn workspace_events(
