@@ -282,8 +282,15 @@ async fn list_sessions(
     Path(workspace_id): Path<String>,
     Query(_pagination): Query<PaginationQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "list sessions not implemented".to_string(), current_revision: None } })))
+    let workspace = state
+        .workspaces
+        .get_by_id(&workspace_id)
+        .await
+        .ok_or_else(|| not_found("workspace not found"))?;
+
+    // TODO: implement session listing from workspace
+    // For now, return empty list
+    Ok(Json(serde_json::json!({ "sessions": [], "next_cursor": null })))
 }
 
 async fn search_sessions(
@@ -291,17 +298,15 @@ async fn search_sessions(
     Path(workspace_id): Path<String>,
     Query(_query): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "not_implemented".to_string(),
-                message: "search sessions not implemented".to_string(),
-                current_revision: None,
-            },
-        }),
-    ))
+    let workspace = state
+        .workspaces
+        .get_by_id(&workspace_id)
+        .await
+        .ok_or_else(|| not_found("workspace not found"))?;
+
+    // TODO: implement session search from workspace
+    // For now, return empty list
+    Ok(Json(serde_json::json!({ "sessions": [], "next_cursor": null })))
 }
 
 async fn get_session(
@@ -651,4 +656,52 @@ pub async fn run(state: Arc<ServerState>, port: u16) -> Result<()> {
     info!("server listening on 127.0.0.1:{}", port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::new_state;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_required() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        // Request without auth should fail
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workspaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"path": "/tmp"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
