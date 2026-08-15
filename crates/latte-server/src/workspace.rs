@@ -44,22 +44,31 @@ impl WorkspaceManager {
     }
 
     /// Get or create a workspace instance for the given path.
+    /// Uses canonical path as key and single-flight creation.
     pub async fn get_or_create(&self, path: impl AsRef<Path>) -> Result<Arc<WorkspaceInstance>> {
-        let path = path.as_ref().to_path_buf();
+        let raw_path = path.as_ref().to_path_buf();
 
-        // Try to get existing instance
+        // Canonicalize first
+        let canonical = raw_path.canonicalize().context("invalid workspace path")?;
+
+        // Try to get existing instance with read lock
         {
             let instances = self.instances.read().await;
-            if let Some(instance) = instances.get(&path) {
+            if let Some(instance) = instances.get(&canonical) {
                 return Ok(instance.clone());
             }
         }
 
-        // Create new instance
-        info!("creating workspace instance for {}", path.display());
+        // Acquire write lock for creation (single-flight)
+        let mut instances = self.instances.write().await;
 
-        // Validate the path
-        let canonical = path.canonicalize().context("invalid workspace path")?;
+        // Double-check after acquiring write lock
+        if let Some(instance) = instances.get(&canonical) {
+            return Ok(instance.clone());
+        }
+
+        // Create new instance
+        info!("creating workspace instance for {}", canonical.display());
 
         // Generate stable workspace ID from canonical path
         let id = format!(
@@ -84,11 +93,10 @@ impl WorkspaceManager {
             Arc::new(|_| unimplemented!("provider factory")),
         );
 
-        let instance = Arc::new(WorkspaceInstance::new(id, canonical, runtime));
+        let instance = Arc::new(WorkspaceInstance::new(id, canonical.clone(), runtime));
 
-        // Store it
-        let mut instances = self.instances.write().await;
-        instances.entry(path).or_insert(instance.clone());
+        // Store and return the winning instance
+        instances.insert(canonical, instance.clone());
 
         Ok(instance)
     }

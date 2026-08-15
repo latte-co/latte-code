@@ -146,6 +146,13 @@ pub struct PaginationQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
 // Handlers
 
 async fn create_workspace(
@@ -213,16 +220,25 @@ async fn list_sessions(
     Query(_pagination): Query<PaginationQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "sessions": [] })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "list sessions not implemented".to_string(), current_revision: None } })))
 }
 
 async fn search_sessions(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
-    Query(_pagination): Query<PaginationQuery>,
+    Query(_query): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "sessions": [] })))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "not_implemented".to_string(),
+                message: "search sessions not implemented".to_string(),
+                current_revision: None,
+            },
+        }),
+    ))
 }
 
 async fn get_session(
@@ -230,7 +246,7 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn follow_up(
@@ -239,7 +255,7 @@ async fn follow_up(
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "accepted_revision": 0 }))))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "follow up not implemented".to_string(), current_revision: None } })))
 }
 
 async fn switch_model(
@@ -248,7 +264,7 @@ async fn switch_model(
     Json(req): Json<SwitchModelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn cancel_session(
@@ -257,7 +273,7 @@ async fn cancel_session(
     Json(req): Json<CancelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn queue_follow_up(
@@ -266,7 +282,7 @@ async fn queue_follow_up(
     Json(req): Json<QueueFollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "position": 0 }))))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "queue follow up not implemented".to_string(), current_revision: None } })))
 }
 
 async fn resolve_permission(
@@ -275,7 +291,7 @@ async fn resolve_permission(
     Json(req): Json<ResolvePermissionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn provide_input(
@@ -284,7 +300,7 @@ async fn provide_input(
     Json(req): Json<ProvideInputRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn reconcile_effect(
@@ -292,7 +308,7 @@ async fn reconcile_effect(
     Path((id, effect_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // TODO: implement
-    Ok(Json(serde_json::json!({ "snapshot": null })))
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
 }
 
 async fn workspace_events(
