@@ -1282,3 +1282,68 @@ fn final_binary_server_reports_a_full_mailbox_as_conflict() {
         "mailbox never reported full during the active turn"
     );
 }
+
+#[test]
+fn final_binary_server_marks_a_failed_background_turn() {
+    let scenario = Scenario::new();
+    // The provider rejects the turn, so the accepted session's background turn
+    // fails and the durable projection settles at the failed lifecycle.
+    let provider = ScriptedProvider::start([ProviderReply::error(400, "provider rejected")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},max_attempts:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "will fail", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // The failed background turn logs the warning and settles the session at a
+    // durable, non-running lifecycle (a provider error is retryable, so the
+    // session returns to ready rather than terminal failed).
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        settled,
+        "session never settled after the failed background turn"
+    );
+}

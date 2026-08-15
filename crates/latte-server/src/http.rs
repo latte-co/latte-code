@@ -678,38 +678,18 @@ fn parse_thread_id(id: &str) -> Result<ThreadId, HandlerError> {
     Ok(ThreadId::from_uuid(uuid))
 }
 
-fn bad_request(message: &str) -> HandlerError {
+/// Builds a typed error response with an optional current revision.
+fn error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    current_revision: Option<u64>,
+) -> HandlerError {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         Json(ErrorResponse {
             error: ErrorBody {
-                error_type: "rejected".to_string(),
-                message: message.to_string(),
-                current_revision: None,
-            },
-        }),
-    )
-}
-
-fn not_found(message: &str) -> HandlerError {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "not_found".to_string(),
-                message: message.to_string(),
-                current_revision: None,
-            },
-        }),
-    )
-}
-
-fn conflict(message: &str, current_revision: Option<u64>) -> HandlerError {
-    (
-        StatusCode::CONFLICT,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "conflict".to_string(),
+                error_type: error_type.to_string(),
                 message: message.to_string(),
                 current_revision,
             },
@@ -717,17 +697,20 @@ fn conflict(message: &str, current_revision: Option<u64>) -> HandlerError {
     )
 }
 
+fn bad_request(message: &str) -> HandlerError {
+    error_response(StatusCode::BAD_REQUEST, "rejected", message, None)
+}
+
+fn not_found(message: &str) -> HandlerError {
+    error_response(StatusCode::NOT_FOUND, "not_found", message, None)
+}
+
+fn conflict(message: &str, current_revision: Option<u64>) -> HandlerError {
+    error_response(StatusCode::CONFLICT, "conflict", message, current_revision)
+}
+
 fn failed(message: &str) -> HandlerError {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "failed".to_string(),
-                message: message.to_string(),
-                current_revision: None,
-            },
-        }),
-    )
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed", message, None)
 }
 
 async fn workspace_events(
