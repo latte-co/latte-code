@@ -1044,7 +1044,7 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
     // A slow provider keeps the first turn running long enough to queue a
     // follow-up while the session's runner is still active (202 + position).
     let provider = ScriptedProvider::start([
-        ProviderReply::completion("slow done").delayed(std::time::Duration::from_millis(1500)),
+        ProviderReply::completion("slow done").delayed(std::time::Duration::from_secs(5)),
         ProviderReply::completion("drained the queue"),
     ]);
     let endpoint = provider.endpoint();
@@ -1080,9 +1080,10 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
     // While the (delayed) turn is running, its runner mailbox is active, so a
-    // queued follow-up is accepted with its position.
+    // queued follow-up is accepted with its position. The 5s provider delay
+    // keeps the window open comfortably even under coverage instrumentation.
     let mut queued = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let (status, body) = server.request(
             "POST",
             &format!("/v1/sessions/{session_id}/queue"),
@@ -1102,9 +1103,10 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
     assert!(queued, "queue was never accepted during the active turn");
 
     // Once the turn and the drained follow-up complete, the idle session
-    // accepts a durable model switch to the other configured model.
+    // accepts a durable model switch to the other configured model. Budget the
+    // wait beyond the provider delay (5s) plus coverage-instrumentation slack.
     let mut switched = false;
-    for _ in 0..200 {
+    for _ in 0..600 {
         let (status, body) = server.request(
             "GET",
             &format!("/v1/sessions/{session_id}"),
@@ -1159,4 +1161,30 @@ fn final_binary_serve_reports_a_bind_conflict_as_internal_error() {
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["status"], "internal");
     assert_eq!(envelope["error"]["code"], "server_bind");
+}
+
+#[test]
+fn final_binary_serve_rejects_invalid_configuration() {
+    let scenario = Scenario::new();
+    // An empty verification.argv is a documented configuration error; serve
+    // surfaces it as a usage failure before binding a socket.
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        "{ verification: { argv: [] } }",
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "serve", "--port", "0"], |command| {
+        command.env("TEST_OPENAI_KEY", "e2e-server-secret");
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["status"], "usage");
+    assert_eq!(envelope["error"]["code"], "configuration");
 }
