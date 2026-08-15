@@ -720,4 +720,106 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn test_auth_with_wrong_token() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        // Request with wrong token should fail
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workspaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"path": "/tmp"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        // Create workspace
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workspaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"path": "/tmp"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(result.get("workspace_id").is_some());
+        assert!(result.get("path").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_invalid_path() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        // Create workspace with invalid path
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workspaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"path": "/nonexistent/path/that/does/not/exist"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_session_not_found() {
+        let state = new_state("test-token".to_string());
+        let app = router(state);
+
+        // Get non-existent session (valid UUID format)
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/sessions/00000000-0000-0000-0000-000000000000")
+                    .method("GET")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
