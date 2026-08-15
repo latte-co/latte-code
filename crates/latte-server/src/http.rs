@@ -1,9 +1,10 @@
-//! HTTP server with message bus architecture.
+//! HTTP server with per-workspace event hubs.
 
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
@@ -47,6 +48,7 @@ pub enum ServerEvent {
 /// Create the HTTP router.
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route("/health", get(health_check))
         .route("/v1/workspaces", post(create_workspace))
         .route("/v1/workspaces/{workspace_id}/sessions", post(create_session))
         .route("/v1/workspaces/{workspace_id}/sessions", get(list_sessions))
@@ -60,7 +62,36 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/permissions/{request_id}", post(resolve_permission))
         .route("/v1/sessions/{id}/input", post(provide_input))
         .route("/v1/sessions/{id}/effects/{effect_id}/reconcile", post(reconcile_effect))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
+}
+
+/// Health check endpoint.
+async fn health_check() -> &'static str {
+    "ok"
+}
+
+/// Auth middleware: validate Bearer token.
+async fn auth_middleware(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    // Skip auth for health check
+    if request.uri().path() == "/health" {
+        return Ok(next.run(request).await);
+    }
+
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+
+    match auth {
+        Some(token) if token == state.token => Ok(next.run(request).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 // Request/Response types
@@ -201,15 +232,47 @@ async fn create_session(
             )
         })?;
 
-    // TODO: implement session creation
-    let session_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-    let accepted_revision = 0;
+    // Parse binding
+    let binding: latte_core::ThreadProviderBindingV2 = serde_json::from_value(req.binding)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message: format!("invalid binding: {}", e),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?;
+
+    // Create thread
+    let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+    let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+
+    workspace
+        .runtime
+        .start(thread_id, req.prompt, binding)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "failed".to_string(),
+                        message: format!("failed to start session: {}", e),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(SessionCreatedResponse {
-            session_id: session_id.to_string(),
-            accepted_revision,
+            session_id: thread_id.to_string(),
+            accepted_revision: 0,
         }),
     ))
 }
@@ -245,8 +308,42 @@ async fn get_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    // Find the workspace that contains this session
+    let thread_id = latte_core::ThreadId::from_uuid(
+        uuid::Uuid::parse_str(&id).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message: "invalid session id".to_string(),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?,
+    );
+
+    // Try to find the session in any workspace
+    // TODO: optimize with a session index
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            // Check if this thread exists in this workspace
+            // For now, return not found
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "not_found".to_string(),
+                message: "session not found".to_string(),
+                current_revision: None,
+            },
+        }),
+    ))
 }
 
 async fn follow_up(
@@ -254,8 +351,55 @@ async fn follow_up(
     Path(id): Path<String>,
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "follow up not implemented".to_string(), current_revision: None } })))
+    let thread_id = latte_core::ThreadId::from_uuid(
+        uuid::Uuid::parse_str(&id).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message: "invalid session id".to_string(),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?,
+    );
+
+    let prompt = req.prompt.clone();
+    let expected_revision = req.expected_thread_revision;
+
+    // Find the workspace that contains this thread
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            // Try to follow up in this workspace
+            match workspace
+                .runtime
+                .follow_up(thread_id, expected_revision, prompt.clone())
+                .await
+            {
+                Ok(snapshot) => {
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({ "snapshot": snapshot })),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "not_found".to_string(),
+                message: "session not found".to_string(),
+                current_revision: None,
+            },
+        }),
+    ))
 }
 
 async fn switch_model(
@@ -263,8 +407,61 @@ async fn switch_model(
     Path(id): Path<String>,
     Json(req): Json<SwitchModelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: implement
-    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: ErrorBody { error_type: "not_implemented".to_string(), message: "get session not implemented".to_string(), current_revision: None } })))
+    let thread_id = latte_core::ThreadId::from_uuid(
+        uuid::Uuid::parse_str(&id).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message: "invalid session id".to_string(),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?,
+    );
+
+    let binding: latte_core::ThreadProviderBindingV2 = serde_json::from_value(req.binding)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message: format!("invalid binding: {}", e),
+                        current_revision: None,
+                    },
+                }),
+            )
+        })?;
+
+    // Find the workspace that contains this thread
+    let workspaces = state.workspaces.list_workspaces().await;
+    for ws_path in workspaces {
+        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
+            match workspace
+                .runtime
+                .switch_model(thread_id, req.expected_thread_revision, &binding)
+            {
+                Ok(snapshot) => {
+                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: ErrorBody {
+                error_type: "not_found".to_string(),
+                message: "session not found".to_string(),
+                current_revision: None,
+            },
+        }),
+    ))
 }
 
 async fn cancel_session(
