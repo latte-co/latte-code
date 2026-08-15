@@ -266,6 +266,12 @@ async fn create_session(
             )
         })?;
 
+    // Register session in index
+    state
+        .workspaces
+        .register_session(thread_id, workspace.path.clone())
+        .await;
+
     // Emit event
     let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
         session_id: thread_id.to_string(),
@@ -317,42 +323,24 @@ async fn get_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Find the workspace that contains this session
-    let _thread_id = latte_core::ThreadId::from_uuid(
-        uuid::Uuid::parse_str(&id).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: ErrorBody {
-                        error_type: "rejected".to_string(),
-                        message: "invalid session id".to_string(),
-                        current_revision: None,
-                    },
-                }),
-            )
-        })?,
-    );
+    let thread_id = parse_thread_id(&id)?;
 
-    // Try to find the session in any workspace
-    // TODO: optimize with a session index
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(_workspace) = state.workspaces.get_or_create(&ws_path).await {
-            // Check if this thread exists in this workspace
-            // For now, return not found
-        }
-    }
+    // Look up workspace from index
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
 
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "not_found".to_string(),
-                message: "session not found".to_string(),
-                current_revision: None,
-            },
-        }),
-    ))
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
+
+    // Get session from workspace
+    // TODO: implement actual session retrieval
+    Err(not_found("session not found"))
 }
 
 async fn follow_up(
@@ -378,37 +366,29 @@ async fn follow_up(
     let prompt = req.prompt.clone();
     let expected_revision = req.expected_thread_revision;
 
-    // Find the workspace that contains this thread
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            // Try to follow up in this workspace
-            match workspace
-                .runtime
-                .follow_up(thread_id, expected_revision, prompt.clone())
-                .await
-            {
-                Ok(snapshot) => {
-                    return Ok((
-                        StatusCode::ACCEPTED,
-                        Json(serde_json::json!({ "snapshot": snapshot })),
-                    ));
-                }
-                Err(_) => continue,
-            }
-        }
-    }
+    // Look up workspace from index
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
 
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "not_found".to_string(),
-                message: "session not found".to_string(),
-                current_revision: None,
-            },
-        }),
-    ))
+    match workspace
+        .runtime
+        .follow_up(thread_id, expected_revision, prompt)
+        .await
+    {
+        Ok(snapshot) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "snapshot": snapshot })),
+        )),
+        Err(_) => Err(not_found("session not found")),
+    }
 }
 
 async fn switch_model(
@@ -445,32 +425,25 @@ async fn switch_model(
             )
         })?;
 
-    // Find the workspace that contains this thread
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace
-                .runtime
-                .switch_model(thread_id, req.expected_thread_revision, &binding)
-            {
-                Ok(snapshot) => {
-                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
-                }
-                Err(_) => continue,
-            }
-        }
-    }
+    // Look up workspace from index
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
 
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse {
-            error: ErrorBody {
-                error_type: "not_found".to_string(),
-                message: "session not found".to_string(),
-                current_revision: None,
-            },
-        }),
-    ))
+    match workspace
+        .runtime
+        .switch_model(thread_id, req.expected_thread_revision, &binding)
+    {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(_) => Err(not_found("session not found")),
+    }
 }
 
 async fn cancel_session(
@@ -480,19 +453,21 @@ async fn cancel_session(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
 
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace.runtime.cancel_durable(thread_id) {
-                Ok(snapshot) => {
-                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
-                }
-                Err(_) => continue,
-            }
-        }
-    }
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
 
-    Err(not_found("session not found"))
+    match workspace.runtime.cancel_durable(thread_id) {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(_) => Err(not_found("session not found")),
+    }
 }
 
 async fn queue_follow_up(
@@ -501,24 +476,25 @@ async fn queue_follow_up(
     Json(req): Json<QueueFollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
-    let prompt = req.prompt.clone();
 
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace.runtime.queue_follow_up(thread_id, prompt.clone()) {
-                Ok(position) => {
-                    return Ok((
-                        StatusCode::ACCEPTED,
-                        Json(serde_json::json!({ "position": position })),
-                    ));
-                }
-                Err(_) => continue,
-            }
-        }
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
+
+    match workspace.runtime.queue_follow_up(thread_id, req.prompt) {
+        Ok(position) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "position": position })),
+        )),
+        Err(_) => Err(not_found("session not found")),
     }
-
-    Err(not_found("session not found"))
 }
 
 async fn resolve_permission(
@@ -528,23 +504,25 @@ async fn resolve_permission(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
 
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace
-                .runtime
-                .resolve_permission(thread_id, req.expected_thread_revision, request_id.clone(), req.allow)
-                .await
-            {
-                Ok(snapshot) => {
-                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
-                }
-                Err(_) => continue,
-            }
-        }
-    }
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
 
-    Err(not_found("session not found"))
+    match workspace
+        .runtime
+        .resolve_permission(thread_id, req.expected_thread_revision, request_id, req.allow)
+        .await
+    {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(_) => Err(not_found("session not found")),
+    }
 }
 
 async fn provide_input(
@@ -553,26 +531,26 @@ async fn provide_input(
     Json(req): Json<ProvideInputRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
-    let request_id = req.request_id.clone();
-    let value = req.value.clone();
 
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace
-                .runtime
-                .provide_input(thread_id, req.expected_thread_revision, request_id.clone(), value.clone())
-                .await
-            {
-                Ok(snapshot) => {
-                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
-                }
-                Err(_) => continue,
-            }
-        }
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
+
+    match workspace
+        .runtime
+        .provide_input(thread_id, req.expected_thread_revision, req.request_id, req.value)
+        .await
+    {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(_) => Err(not_found("session not found")),
     }
-
-    Err(not_found("session not found"))
 }
 
 async fn reconcile_effect(
@@ -581,19 +559,21 @@ async fn reconcile_effect(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = parse_thread_id(&id)?;
 
-    let workspaces = state.workspaces.list_workspaces().await;
-    for ws_path in workspaces {
-        if let Ok(workspace) = state.workspaces.get_or_create(&ws_path).await {
-            match workspace.runtime.reconcile_unknown_effect(thread_id, &effect_id) {
-                Ok(snapshot) => {
-                    return Ok(Json(serde_json::json!({ "snapshot": snapshot })));
-                }
-                Err(_) => continue,
-            }
-        }
-    }
+    let workspace_path = state
+        .workspaces
+        .get_session_workspace(&thread_id)
+        .await
+        .ok_or_else(|| not_found("session not found"))?;
+    let workspace = state
+        .workspaces
+        .get_or_create(&workspace_path)
+        .await
+        .map_err(|_| not_found("workspace not found"))?;
 
-    Err(not_found("session not found"))
+    match workspace.runtime.reconcile_unknown_effect(thread_id, &effect_id) {
+        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Err(_) => Err(not_found("session not found")),
+    }
 }
 
 // Helper functions

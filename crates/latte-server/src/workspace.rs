@@ -42,6 +42,8 @@ impl WorkspaceInstance {
 /// Manages multiple workspace instances.
 pub struct WorkspaceManager {
     instances: Arc<RwLock<HashMap<PathBuf, Arc<WorkspaceInstance>>>>,
+    /// Session ID -> workspace path index.
+    session_index: Arc<RwLock<HashMap<latte_core::ThreadId, PathBuf>>>,
 }
 
 impl WorkspaceManager {
@@ -49,6 +51,7 @@ impl WorkspaceManager {
     pub fn new() -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
+            session_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -124,6 +127,24 @@ impl WorkspaceManager {
         if let Some(workspace) = self.get_by_id(workspace_id).await {
             let _ = workspace.event_tx.send(event);
         }
+    }
+
+    /// Register a session in the index.
+    pub async fn register_session(&self, session_id: latte_core::ThreadId, workspace_path: PathBuf) {
+        let mut index = self.session_index.write().await;
+        index.insert(session_id, workspace_path);
+    }
+
+    /// Get the workspace path for a session.
+    pub async fn get_session_workspace(&self, session_id: &latte_core::ThreadId) -> Option<PathBuf> {
+        let index = self.session_index.read().await;
+        index.get(session_id).cloned()
+    }
+
+    /// Remove a session from the index.
+    pub async fn unregister_session(&self, session_id: &latte_core::ThreadId) {
+        let mut index = self.session_index.write().await;
+        index.remove(session_id);
     }
 
     /// List all active workspace paths.
