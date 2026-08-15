@@ -1117,3 +1117,30 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
     }
     assert!(switched, "session never became ready for a model switch");
 }
+
+#[test]
+fn final_binary_serve_reports_a_bind_conflict_as_internal_error() {
+    let scenario = Scenario::new();
+    scenario.write_config(r#"["true"]"#, r#"["true"]"#);
+    // Hold the first server on an ephemeral port, then ask a second serve
+    // process to bind the same port; it must exit non-zero with a classified
+    // server_bind error over the JSON envelope.
+    let server = ServeChild::start(&scenario);
+    let port = server.port;
+
+    let output = scenario.output(
+        &["--json", "serve", "--port", &port.to_string()],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "e2e-server-secret");
+        },
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["status"], "internal");
+    assert_eq!(envelope["error"]["code"], "server_bind");
+}

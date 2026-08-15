@@ -1212,30 +1212,14 @@ async fn execute_serve(args: &[String], json: bool) -> i32 {
         }
     };
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "server_bind",
-                &format!("cannot bind 127.0.0.1:{port}: {error}"),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    let local_addr = match listener.local_addr() {
-        Ok(addr) => addr,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "server_bind",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
+    let (listener, local_addr) = match bind_local_listener(port).await {
+        Ok(value) => value,
+        Err(ServerSetupError {
+            code,
+            category,
+            message,
+        }) => {
+            return emit_error(json, code, category, &message, exit_for_setup(code), false);
         }
     };
 
@@ -1273,6 +1257,7 @@ async fn execute_serve(args: &[String], json: bool) -> i32 {
 
 /// A classified failure from `prepare_server`, carrying the same `(code,
 /// category, message)` shape the CLI emits.
+#[derive(Debug)]
 struct ServerSetupError {
     code: &'static str,
     category: &'static str,
@@ -1286,6 +1271,26 @@ fn exit_for_setup(code: &str) -> i32 {
     } else {
         EXIT_INTERNAL
     }
+}
+
+/// Binds the loopback listener and resolves its local address, classifying any
+/// failure as an internal `server_bind` setup error.
+async fn bind_local_listener(
+    port: u16,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), ServerSetupError> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "server_bind",
+            message: format!("cannot bind 127.0.0.1:{port}: {error}"),
+        })?;
+    let local_addr = listener.local_addr().map_err(|error| ServerSetupError {
+        code: "internal",
+        category: "server_bind",
+        message: error.to_string(),
+    })?;
+    Ok((listener, local_addr))
 }
 
 /// Builds the fully-configured server state for a workspace root without
@@ -1448,6 +1453,7 @@ fn emit_error(
 
 #[cfg(test)]
 mod tests {
+    use super::bind_local_listener;
     use super::{
         AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED,
         EXIT_INTERNAL, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
@@ -2493,5 +2499,21 @@ mod tests {
             execute_serve(&["--nonsense".to_string()], true).await,
             EXIT_USAGE
         );
+    }
+
+    #[tokio::test]
+    async fn bind_local_listener_binds_ephemeral_and_reports_in_use() {
+        // An ephemeral port binds and resolves a loopback address.
+        let (listener, addr) = bind_local_listener(0).await.expect("ephemeral bind");
+        assert!(addr.ip().is_loopback());
+        let port = addr.port();
+
+        // Binding the same port again is a classified server_bind failure.
+        let Err(error) = bind_local_listener(port).await else {
+            panic!("expected the in-use port to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "server_bind");
+        drop(listener);
     }
 }
