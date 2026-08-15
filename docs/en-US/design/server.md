@@ -31,9 +31,12 @@ Clients (CLI / TUI / external)
 ┌─────────────────────────────────┐
 │ Server Process                  │
 │                                 │
-│  HTTP Server (axum)             │
-│    │                            │
-│    ▼                            │
+│  Message Bus (Gateway)          │
+│    ├─ Command Routing           │
+│    ├─ Event Collection          │
+│    └─ Event Distribution        │
+│         │                       │
+│         ▼                       │
 │  WorkspaceManager               │
 │    ├─ Workspace A               │
 │    │   └─ ThreadRuntimeService  │
@@ -41,6 +44,11 @@ Clients (CLI / TUI / external)
 │        └─ ThreadRuntimeService  │
 └─────────────────────────────────┘
 ```
+
+The gateway acts as a lightweight message bus:
+- **Commands**: Routed to the appropriate workspace/session
+- **Events**: Collected from workspaces and distributed to subscribers
+- **v1 scope**: Routing and event fan-out only. No scheduling, cross-workspace messaging, or plugin system (v2).
 
 ## 5. HTTP API
 
