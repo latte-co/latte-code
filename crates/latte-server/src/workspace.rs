@@ -6,8 +6,10 @@ use latte_headless::thread::ThreadRuntimeService;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
+
+use crate::http::ServerEvent;
 
 /// A workspace instance with its own runtime.
 pub struct WorkspaceInstance {
@@ -17,15 +19,23 @@ pub struct WorkspaceInstance {
     pub path: PathBuf,
     /// The thread runtime service for this workspace.
     pub runtime: Arc<latte_headless::thread::ThreadRuntimeService>,
+    /// Event sender for this workspace.
+    pub event_tx: broadcast::Sender<ServerEvent>,
 }
 
 impl WorkspaceInstance {
     /// Create a new workspace instance.
-    pub fn new(id: String, path: PathBuf, runtime: latte_headless::thread::ThreadRuntimeService) -> Self {
+    pub fn new(
+        id: String,
+        path: PathBuf,
+        runtime: latte_headless::thread::ThreadRuntimeService,
+        event_tx: broadcast::Sender<ServerEvent>,
+    ) -> Self {
         Self {
             id,
             path,
             runtime: Arc::new(runtime),
+            event_tx,
         }
     }
 }
@@ -80,6 +90,9 @@ impl WorkspaceManager {
                 .collect::<String>()
         );
 
+        // Create event channel for this workspace
+        let (event_tx, _) = broadcast::channel(256);
+
         // Create the runtime for this workspace
         // TODO: pass proper config, provider, etc.
         let engine = latte_engine::EngineBuilder::new()
@@ -93,7 +106,7 @@ impl WorkspaceManager {
             Arc::new(|_| unimplemented!("provider factory")),
         );
 
-        let instance = Arc::new(WorkspaceInstance::new(id, canonical.clone(), runtime));
+        let instance = Arc::new(WorkspaceInstance::new(id, canonical.clone(), runtime, event_tx));
 
         // Store and return the winning instance
         instances.insert(canonical, instance.clone());
@@ -105,6 +118,13 @@ impl WorkspaceManager {
     pub async fn get_by_id(&self, id: &str) -> Option<Arc<WorkspaceInstance>> {
         let instances = self.instances.read().await;
         instances.values().find(|i| i.id == id).cloned()
+    }
+
+    /// Emit an event to a workspace's event stream.
+    pub async fn emit_event(&self, workspace_id: &str, event: ServerEvent) {
+        if let Some(workspace) = self.get_by_id(workspace_id).await {
+            let _ = workspace.event_tx.send(event);
+        }
     }
 
     /// List all active workspace paths.

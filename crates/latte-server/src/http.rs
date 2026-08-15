@@ -268,6 +268,12 @@ async fn create_session(
             )
         })?;
 
+    // Emit event
+    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+        session_id: thread_id.to_string(),
+        revision: 0,
+    });
+
     Ok((
         StatusCode::ACCEPTED,
         Json(SessionCreatedResponse {
@@ -628,8 +634,18 @@ fn not_found(message: &str) -> (StatusCode, Json<ErrorResponse>) {
 async fn workspace_events(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.event_tx.subscribe();
+) -> Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+    // Get the workspace's event receiver
+    let workspace = state.workspaces.get_by_id(&workspace_id).await;
+
+    let rx = match workspace {
+        Some(ws) => ws.event_tx.subscribe(),
+        None => {
+            // Return an empty stream if workspace not found
+            return Sse::new(Box::pin(futures::stream::empty()));
+        }
+    };
+
     let stream = BroadcastStream::new(rx)
         .map(|result| {
             match result {
@@ -646,7 +662,7 @@ async fn workspace_events(
             }
         });
 
-    Sse::new(stream)
+    Sse::new(Box::pin(stream))
 }
 
 /// Run the HTTP server.
