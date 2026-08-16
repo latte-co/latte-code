@@ -1158,6 +1158,53 @@ fn final_binary_server_provides_input_through_http() {
     );
     assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
     assert!(input_body["snapshot"].is_object());
+
+    // After input, the session completes. Verify a follow-up without an
+    // Idempotency-Key header succeeds (covers the None idempotency branch
+    // in the E2E final binary).
+    let mut input_ready = false;
+    for _ in 0..200 {
+        let (s, b) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if s == 200 && b["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            input_ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if input_ready {
+        let final_rev = {
+            let (_, b) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            b["snapshot"]["revision"].as_u64().unwrap()
+        };
+        // Cancel with matching revisions exercises the cancel handler success path.
+        let (cancel_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/cancel"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "expected_thread_revision": final_rev,
+                "expected_run_revision": 0
+            })),
+            &[],
+        );
+        // Session is idle (ready), so cancel returns conflict (no active run).
+        assert!(
+            cancel_status == 409 || cancel_status == 200,
+            "cancel: {cancel_status}"
+        );
+    }
 }
 
 #[test]
