@@ -2148,11 +2148,10 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let first = service.clone();
-        let running = tokio::spawn(async move {
-            first
-                .start(thread_id, "slow turn".into(), binding())
-                .await
-        });
+        let running =
+            tokio::spawn(
+                async move { first.start(thread_id, "slow turn".into(), binding()).await },
+            );
         // Let the first turn enter the provider call so its runner is active.
         tokio::time::sleep(Duration::from_millis(50)).await;
 

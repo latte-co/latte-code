@@ -1359,7 +1359,10 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
         })),
         &[],
     );
-    assert_eq!(stale_status, 409, "stale run_revision must 409: {stale_body:?}");
+    assert_eq!(
+        stale_status, 409,
+        "stale run_revision must 409: {stale_body:?}"
+    );
 
     // The correct run_revision succeeds.
     let (ok_status, _) = server.request(
@@ -1460,7 +1463,10 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
         })),
         &[],
     );
-    assert_eq!(stale_status, 409, "stale run_revision must 409: {stale_body:?}");
+    assert_eq!(
+        stale_status, 409,
+        "stale run_revision must 409: {stale_body:?}"
+    );
 
     // The correct run_revision succeeds.
     let (ok_status, _) = server.request(

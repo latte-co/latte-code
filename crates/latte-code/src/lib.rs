@@ -2661,7 +2661,7 @@ mod tests {
     ) -> R {
         let _lock = SERVE_ENV_LOCK
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         temp_env::with_vars(
             [
                 ("HOME", Some(home.as_os_str())),
@@ -2674,8 +2674,13 @@ mod tests {
     /// A scratch storage layout under a temporary HOME: `serve_bound` resolves
     /// `$LATTE_CODE_HOME` (and the optional `$HOME` config layer) from the
     /// process environment, so tests point both at scratch directories.
+    /// Also creates a `.git` marker and a minimal workspace config so
+    /// `discover_workspace_root` and `AppConfig::load` resolve to the scratch
+    /// directory rather than the developer's real workspace.
     fn scratch_serve_env() -> (tempfile::TempDir, PathBuf) {
         let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        write_valid_workspace_config(home.path());
         let storage_home = home.path().join(".latte/latte-code");
         (home, storage_home)
     }
@@ -2751,9 +2756,18 @@ mod tests {
                     wait_for_listening(port).await;
 
                     // The token is published after bind, before serving starts.
+                    // Retry briefly for slow filesystems (e.g. Windows CI).
                     let token_path = storage_home.join("server.token");
+                    let mut token_published = false;
+                    for _ in 0..100 {
+                        if token_path.is_file() {
+                            token_published = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                     assert!(
-                        token_path.is_file(),
+                        token_published,
                         "token must be published after the listener binds"
                     );
                     let token = std::fs::read_to_string(&token_path).unwrap();
@@ -2762,7 +2776,9 @@ mod tests {
                     // The health endpoint answers on the bound port without a token.
                     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
                     stream
-                        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                        .write_all(
+                            b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                        )
                         .await
                         .unwrap();
                     let mut response = Vec::new();
@@ -2780,6 +2796,42 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[test]
+    fn serve_bound_rejects_relative_storage_home() {
+        let home = tempfile::tempdir().unwrap();
+        with_scratch_serve_env(home.path(), Path::new("relative/state"), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let Err(error) = rt.block_on(serve_bound(0, true)) else {
+                panic!("expected a relative LATTE_CODE_HOME to be rejected");
+            };
+            assert_eq!(error.code, "usage");
+            assert_eq!(error.category, "configuration");
+        });
+    }
+
+    #[test]
+    fn serve_bound_reports_token_write_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join(".latte/latte-code");
+        std::fs::create_dir_all(&storage_home).unwrap();
+        // A directory at the token path makes the atomic publish fail.
+        std::fs::create_dir_all(storage_home.join("server.token")).unwrap();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let Err(error) = rt.block_on(serve_bound(0, true)) else {
+                panic!("expected the token write to fail");
+            };
+            assert_eq!(error.code, "internal");
+            assert_eq!(error.category, "server_token");
+        });
     }
 
     #[test]
