@@ -5,19 +5,19 @@
 工作区 manifest 的路径和符号链接 target 必须是有效 UTF-8。无法表示为 UTF-8 的操作系统路径字节会失败关闭，绝不会通过替换字符折叠成有损的 manifest key。
 Manifest key 使用 JSON 序列化精确的 UTF-8 路径 component 数组，不会归一化分隔符。因此 Unix 文件名中的字面反斜杠与嵌套路径始终不同。
 
-English counterpart: [English architecture](../../en-US/design/architecture-overview.md).
 
 ## 组成
 
 ```text
-latte-code CLI/TUI
+latte-code CLI/TUI/Server
   |-- latte-tui -------- 投影与类型化 UI 动作
+  |-- latte-server ----- HTTP REST + SSE API、多 Workspace 管理
   |-- latte-headless --- Provider、上下文、Agent Loop 与验证
         |-- latte-engine -- 存储、策略、Effect、工具与进程
               |-- latte-core -- ID、命令、事件与状态迁移
 ```
 
-`latte-core` 不依赖存储、Provider 或 UI。`latte-engine` 是所有特权副作用的唯一执行主体，只暴露受限句柄。前端读取持久化投影并提交类型化命令，不直接修改仓库或运行时状态。
+`latte-core` 不依赖存储、Provider 或 UI。`latte-engine` 是所有特权副作用的唯一执行主体，只暴露受限句柄。前端读取持久化投影并提交类型化命令，不直接修改仓库或运行时状态。`latte-server` 通过 `latte-code serve` 启动，提供多 Workspace 的 HTTP REST + SSE API，内部复用 headless 的 `ThreadRuntimeService` 和 engine 的持久化存储。
 
 `latte-code` 按顺序递归合并内置应用默认值、`$HOME/.latte/latte-code.jsonc` 和工作区 `.latte/latte-code.jsonc`。单个配置文件可以缺失，相同 key 由工作区值覆盖。只读状态命令允许 Provider Catalog 为空；TUI 与调用 Provider 的操作则要求合并结果显式提供唯一的全局 `default_model` 及匹配的 Provider Model。Latte Code 不内置 Provider Catalog。每个 Provider 的 `models` 会作为一份完整目录替换前一层。CLI 与 TUI 共用 headless Provider 注册表。Thread binding 会在解析 secret 或发送 history 前，结构化固定所有 v1 语义 binding 字段（包括 alias）、模型 Options，以及内部派生的非 secret 凭据与数据域元数据；这些 binding 字段不属于公开 Provider 配置。`context_window` 会为后续上下文管理与压缩保留在 binding 中。不匹配会关闭失败，避免静默漂移。
 

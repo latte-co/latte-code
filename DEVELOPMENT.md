@@ -93,7 +93,7 @@ export OPENAI_API_KEY='...'
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
 - 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、90%、90%。
 
-任何新增或修改产品行为的功能都必须同时增加最低责任层 UT 和至少一个最终二进制 E2E。具体目录、Harness、同步方式、断言清单和反例见 [E2E 编写手册](docs/zh-CN/testing/e2e-authoring-guide.md)。
+任何新增或修改产品行为的功能都必须同时增加最低责任层 UT 和至少一个最终二进制 E2E。具体目录、Harness、同步方式、断言清单和反例见 [E2E 编写手册](docs/testing/e2e-authoring-guide.md)。
 
 UT 和 E2E 覆盖率使用互相独立的统计口径，不能合并或互相替代：
 

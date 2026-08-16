@@ -7,7 +7,6 @@ Runtime 现在保证每 Session 一个进程内 Runner、八条 FIFO 用户 Prom
 下一个 `accepts_follow_up` 边界物化输入。可信 Reminder、Input Sequence/Progress
 类型、去重/过期与显式 Steer 仍属于提案范围。
 
-English counterpart: [Asynchronous turn runner and session mailbox](../../../en-US/design/agent-harness/asynchronous-turn-runner.md).
 
 ## 1. 决策
 

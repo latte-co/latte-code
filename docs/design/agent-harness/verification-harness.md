@@ -1,8 +1,7 @@
 # 验证 Harness 与确定性测试
 
-状态：**设计中，尚未实现。**
+状态：**核心已实现。** UT 95%、E2E 90%、全 targets 90% 三项独立覆盖率门禁已落地；loopback Provider、临时 state home、SQLite 和真实 PTY 的 E2E harness 已实现。
 
-English counterpart: [Verification harness and deterministic testing](../../../en-US/design/agent-harness/verification-harness.md).
 
 ## 1. 决策
 

@@ -2,7 +2,6 @@
 
 > 本手册规定功能开发时如何配套编写 UT 与最终二进制 E2E。测试卡点的整体设计和场景编号见 [UT / E2E 测试卡点设计](../design/testing-gates.md)。
 >
-> English counterpart: [E2E authoring guide](../../en-US/testing/e2e-authoring-guide.md).
 
 ## 1. 强制规则
 

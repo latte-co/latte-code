@@ -1,8 +1,7 @@
 # Effect Authority、策略与隔离
 
-状态：**设计中，尚未实现。**
+状态：**核心已实现。** `latte-engine` 是唯一特权 Effect 权威，Provider/TUI/Server 只提交类型化请求；细粒度策略编辑与组织级分发仍是目标。
 
-English counterpart: [Effect authority, policy, and isolation](../../../en-US/design/agent-harness/effect-authority-and-policy.md).
 
 ## 1. 决策
 

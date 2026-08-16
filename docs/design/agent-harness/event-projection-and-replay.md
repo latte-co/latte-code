@@ -1,8 +1,7 @@
 # 事件、投影与回放
 
-状态：**设计中，尚未实现。**
+状态：**核心已实现。** Engine 事务事件、Thread event stream、snapshot reload 与有界 transient progress 已落地；离线回放与审计导出仍是目标。
 
-English counterpart: [Events, projections, and replay](../../../en-US/design/agent-harness/event-projection-and-replay.md).
 
 ## 1. 决策
 

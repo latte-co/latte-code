@@ -11,7 +11,7 @@ Latte Code is a Rust 2024 workspace implementing a code agent with a Ratatui fro
 - `crates/latte-headless`: provider, repository context, agent loop, verification, handoff, and command service.
 - `crates/latte-tui`: pure UI projection/reducer and Ratatui terminal lifecycle.
 - `crates/latte-code`: binary composition and CLI contracts.
-- `docs/en-US` and `docs/zh-CN`: maintained architecture and operations docs.
+- `docs/`: architecture and operations docs (Chinese only).
 
 Local `.latte/`, `.oh-my-code/`, `.tmp/`, `target/`, logs, and secrets are not project source.
 
@@ -47,7 +47,7 @@ Required E2E must be isolated, deterministic, bounded, independent of the public
 
 Put cross-platform final-binary CLI, loopback Provider, and SQLite journeys in `e2e_portable`; they must execute on Linux, macOS, and Windows without skipping the target. Put PTY, Unix signals/process groups, symlink semantics, and executable Unix verification journeys in `e2e_unix`. Windows process execution remains fail-closed, so portable Provider journeys must terminate before verification (for example, an input request or typed Provider failure) instead of pretending Unix process supervision exists.
 
-Follow the [E2E authoring guide](docs/en-US/testing/e2e-authoring-guide.md) and keep its [Chinese counterpart](docs/zh-CN/testing/e2e-authoring-guide.md) aligned. A feature without the required UT, E2E, and coverage evidence is incomplete. Pure documentation, formatting, comments, or behavior-neutral build metadata may omit E2E only when the delivery note explains why behavior is unchanged.
+Follow the [E2E authoring guide](docs/testing/e2e-authoring-guide.md). A feature without the required UT, E2E, and coverage evidence is incomplete. Pure documentation, formatting, comments, or behavior-neutral build metadata may omit E2E only when the delivery note explains why behavior is unchanged.
 
 ## Invariants
 

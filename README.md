@@ -2,7 +2,7 @@
 
 Latte Code is a Rust code agent for scoped repository changes. Its Ratatui UI is a durable, transcript-first conversation surface; the scriptable v1 CLI remains available for existing runs.
 
-中文文档见 [docs/zh-CN/README.md](docs/zh-CN/README.md). Architecture details are in [docs/en-US/design/architecture-overview.md](docs/en-US/design/architecture-overview.md).
+中文文档见 [docs/README.md](docs/README.md)。架构细节见 [docs/design/architecture-overview.md](docs/design/architecture-overview.md)。
 
 ## Requirements
 
