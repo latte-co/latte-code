@@ -797,6 +797,11 @@ async fn supervise(
     cancel: &CancellationToken,
     probe_override: Option<GroupProbe>,
 ) -> Result<ProcessOutput, ProcessError> {
+    if cancel.is_cancelled() {
+        return Err(ProcessError::Supervision(
+            "process cancelled before it could be started".into(),
+        ));
+    }
     use std::os::unix::process::CommandExt;
     let mut command = if let Some(shell) = i.shell {
         let mut c = Command::new("/bin/sh");
