@@ -1,8 +1,7 @@
 # TUI Runtime 契约
 
-状态：**设计中，尚未实现。**
+状态：**已实现。** `latte-tui` 是纯 presentation projection 和 reducer，通过类型化 command sink 与 engine 交互。
 
-English counterpart: [TUI runtime contract](../../../en-US/design/agent-harness/tui-runtime-contract.md).
 
 ## 1. 决策
 

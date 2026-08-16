@@ -2,7 +2,6 @@
 
 状态：**设计中，尚未实现。**
 
-English counterpart: [Extension and delegation capabilities](../../../en-US/design/agent-harness/extensions-and-delegation.md).
 
 ## 1. 决策
 

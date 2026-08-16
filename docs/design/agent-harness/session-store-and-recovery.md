@@ -1,8 +1,7 @@
 # Session 存储与恢复
 
-状态：**设计中，尚未实现。**
+状态：**已实现。** 全局 SQLite + 每 Session JSONL 的存储模型已落地，详见 [全局 Session 与数据存储](../data-storage.md)。
 
-English counterpart: [Session storage and recovery](../../../en-US/design/agent-harness/session-store-and-recovery.md).
 
 ## 1. 决策
 

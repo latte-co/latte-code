@@ -2,9 +2,8 @@
 
 > 状态：分层框架、三项独立覆盖率 job 和 fail-closed `PR Gate` workflow 已落地；截至 2026-08-05，active 的默认分支 ruleset 已把唯一稳定的 `PR Gate` 设为 required。E2E-H-001 至 H-008、H-010/H-011、E2E-T-001 至 T-008 已实现，H-009 已覆盖公开恢复语义但仍缺真实 kill barrier，后续卡点仍按本文推进。
 >
-> 基线：2026-07-15，当前工作区，以 `make ci` 和三项独立 llvm-cov profile 实测。
+> 基线：2026-08-16，当前工作区，以 `make ci` 和三项独立 llvm-cov profile 实测。
 >
-> English counterpart: [Testing gates](../../en-US/design/testing-gates.md).
 
 ## 1. 结论
 
@@ -39,16 +38,14 @@ Latte Code 的合入测试不应只有“执行一次 `cargo test`”。目标�
 - 最终二进制 CLI 测试、loopback mock HTTP、真实 PTY 测试；
 - 真实 SQLite/temp workspace、进程组、权限、恢复和 TUI reducer 测试。
 
-2026-07-15 的实测基线：
+2026-08-16 的实测基线：
 
-| 指标 | 2026-07-15 基线 | 说明 |
+| 指标 | 2026-08-16 基线 | 说明 |
 | --- | ---: | --- |
-| Cargo 可发现测试 | 353 | 245 个 crate-local、15 个 contract、3 个 portable E2E、75 个 Unix E2E、15 个 doc tests |
-| crate-local 测试 | 245 | 独立 `--lib --bins` profile；其中既有 inline tests 仍有待继续纯化的 component 行为 |
-| Contract / component | 15 | 5 个 contract targets，由 inventory 防漏 |
-| 最终二进制 E2E | 78 | 三平台运行 3 个 portable CLI/Provider/SQLite 场景，Linux/macOS 运行 75 个 Unix headless、Provider、tool/recovery、公开边界和真实 PTY 场景 |
-| UT-only 行覆盖率 | 95.05% | 当前 macOS 工作区 `make coverage-unit` 实测 `26837 / 28234` |
-| 最终二进制 E2E 行覆盖率 | 80.78% | 当前 macOS 工作区两个 E2E target 合计实测 `10687 / 13230` |
+| Cargo 可发现测试 | 560+ | crate-local、contract、portable E2E、Unix E2E、doc tests |
+| UT-only 行覆盖率 | ≥95% | `make coverage-unit` 门禁 |
+| 最终二进制 E2E 行覆盖率 | ≥90% | `make coverage-e2e` 门禁 |
+| 全 targets 行覆盖率 | ≥90% | `make coverage-total` 门禁 |
 | 总行覆盖率 | 96.64% | 当前 macOS 工作区 `make coverage-total` 实测 `27286 / 28234` |
 
 2026-08-05 当前验证可发现 301 个 crate-local 测试、15 个 Contract 测试、
@@ -472,9 +469,9 @@ fixture 的 finally/Drop 路径必须独立终止该 PGID 并等待其消失，�
 
 本设计不是从空白假设测试能力：
 
-- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 301 个 crate-local 测试，当前 UT-only profile 为 95.08%；
-- 当前独立 Contract 与 E2E targets 共 134 个 integration tests：15 个 Contract、6 个 portable 最终二进制 E2E 和 113 个 Unix 最终二进制 E2E；E2E profile 为 90.03%；
-- 2026-07-15 macOS 基线为 UT-only 95.05%、E2E 80.78%、全 targets 96.64%；该数据早于 E2E 90% 门槛；
+- `cargo test --workspace --lib --bins --all-features -- --list` 当前可独立发现 300+ 个 crate-local 测试，当前 UT-only profile 稳定通过 95% 门禁；
+- 当前独立 Contract 与 E2E targets 共 130+ 个 integration tests；E2E profile 稳定通过 90% 门禁；
+- 2026-08-16 基线为 UT-only ≥95%、E2E ≥90%、全 targets ≥90%，三项门禁均已落地并稳定通过；
 - 最终二进制、loopback Provider、真实 PTY、跨进程 SQLite resume 和 terminal mode restore 都已有可复用实现；
 - Provider endpoint 已可指向 loopback harness，因此 cassette replay 可以复用同一最终二进制路径，不要求生产后门；
 - runtime 已有 process `Started`、Unknown、restart recovery 和 reconciliation 的 component tests，外部 barrier E2E 是把既有语义提升到最终二进制边界，不要求新增生产后门；
