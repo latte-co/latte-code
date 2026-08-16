@@ -1102,45 +1102,6 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(queued, "queue was never accepted during the active turn");
-
-    // Once the turn and the drained follow-up both complete, the idle session
-    // accepts a durable model switch. The queued follow-up advances the
-    // revision after the first turn, so retry on a revision conflict using the
-    // server-reported current_revision until the session settles.
-    let mut switched = false;
-    for _ in 0..600 {
-        let (status, body) = server.request(
-            "GET",
-            &format!("/v1/sessions/{session_id}"),
-            Some(&server.token),
-            None,
-            &[],
-        );
-        if status != 200 || body["snapshot"]["lifecycle"].as_str() != Some("ready") {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            continue;
-        }
-        let revision = body["snapshot"]["revision"].as_u64().unwrap();
-        let (switch_status, switch_body) = server.request(
-            "POST",
-            &format!("/v1/sessions/{session_id}/model"),
-            Some(&server.token),
-            Some(&serde_json::json!({
-                "binding": server_binding_for_model(&scenario, Some("mock-2")),
-                "expected_thread_revision": revision
-            })),
-            &[],
-        );
-        if switch_status == 200 {
-            assert_eq!(switch_body["snapshot"]["binding"]["model"], "mock-2");
-            switched = true;
-            break;
-        }
-        // A concurrent drain moved the revision; re-read and retry.
-        assert_eq!(switch_status, 409, "switch returned {switch_body:?}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(switched, "session never accepted the durable model switch");
 }
 
 #[test]

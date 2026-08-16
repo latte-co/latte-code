@@ -253,9 +253,10 @@ impl ThreadRuntimeService {
         self.drain_mailbox(snapshot, runner).await
     }
 
-    /// Like [`start`], but signals `accept` at the durable-acceptance boundary
-    /// (once the user submission is persisted) before running the provider
-    /// turn. Lets a server return 202 only after the command is durable, while
+    /// Like [`Self::start`], but signals `accept` at the durable-acceptance
+    /// boundary (once the user submission is persisted) before running the
+    /// provider turn. Lets a server return 202 only after the command is
+    /// durable, while
     /// the turn continues under the same supervised execution. The signal
     /// carries the accepted snapshot, or an error message if acceptance failed
     /// before persistence.
@@ -355,8 +356,8 @@ impl ThreadRuntimeService {
         self.drain_mailbox(snapshot, runner).await
     }
 
-    /// Like [`follow_up`], but signals `accept` once the follow-up submission is
-    /// durably persisted, before the provider turn runs.
+    /// Like [`Self::follow_up`], but signals `accept` once the follow-up
+    /// submission is durably persisted, before the provider turn runs.
     pub async fn follow_up_accepted(
         &self,
         thread_id: ThreadId,
@@ -4633,5 +4634,106 @@ mod tests {
         presentation.input = descriptor.input;
         assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, ThreadLifecycle::Failed);
         verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
+    }
+
+    #[tokio::test]
+    async fn start_accepted_signals_durable_acceptance_then_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("done"), Vec::new())],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let (tx, rx) = oneshot::channel();
+        // Drive the future on a task so it makes progress while we await the
+        // acceptance signal (the future is otherwise lazy).
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_accepted(thread_id, "hello".into(), binding(), tx)
+                    .await
+            })
+        };
+
+        let accepted = rx.await.unwrap().expect("accepted snapshot");
+        assert_eq!(accepted.thread_id, thread_id);
+        let finished = handle.await.unwrap().unwrap();
+        assert_eq!(finished.thread_id, thread_id);
+    }
+
+    #[tokio::test]
+    async fn start_accepted_signals_rejection_on_invalid_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("unused"), Vec::new())],
+        );
+        let mut invalid = binding();
+        invalid.provider_name.clear();
+        let (tx, rx) = oneshot::channel();
+        let result = service
+            .start_accepted(ThreadId::from_uuid(Uuid::now_v7()), "x".into(), invalid, tx)
+            .await;
+        // The accept signal carries the rejection, and the call itself errors.
+        assert!(rx.await.unwrap().is_err());
+        assert!(matches!(
+            result,
+            Err(ThreadRuntimeError::ProviderConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_accepted_signals_acceptance_on_ready_session() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), Vec::new()),
+                response(Some("second"), Vec::new()),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding())
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .follow_up_accepted(thread_id, ready.revision, "second".into(), tx)
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().expect("follow-up accepted");
+        assert_eq!(accepted.thread_id, thread_id);
+        assert!(handle.await.unwrap().is_ok());
+
+        // A stale follow-up signals rejection and errors (call errors directly).
+        let (tx, rx) = oneshot::channel();
+        let stale = service
+            .follow_up_accepted(thread_id, 999, "stale".into(), tx)
+            .await;
+        assert!(rx.await.unwrap().is_err());
+        assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
     }
 }

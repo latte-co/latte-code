@@ -2184,6 +2184,40 @@ mod tests {
         assert!(result.unwrap().is_ok());
     }
 
+    #[tokio::test]
+    async fn shutdown_signal_awaits_without_a_signal() {
+        // Poll the real shutdown future briefly: it installs the ctrl-c/SIGTERM
+        // waiters and parks on the select without a signal, so the timeout
+        // elapses. This exercises the signal-wiring construction path.
+        let elapsed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), shutdown_signal()).await;
+        assert!(
+            elapsed.is_err(),
+            "no signal was sent, so it must not resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_wrapper_binds_and_answers_before_abort() {
+        // Exercise the public `serve_on` wrapper (which the binary uses and
+        // which wires the real signal-based shutdown); we abort rather than
+        // signal, since signals are process-wide.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { crate::serve_on(state(), listener).await });
+
+        let mut ok = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ok, "serve wrapper never accepted a connection");
+        server.abort();
+    }
+
     #[test]
     fn idempotency_claim_reserves_replays_and_releases() {
         let state = state();
@@ -2284,6 +2318,25 @@ mod tests {
         )
         .await;
         assert_eq!(ok_status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_completed_session_is_not_found() {
+        // A completed session is not awaiting reconciliation, so the engine
+        // rejects and the handler maps it to 404 (covers the reconcile Err arm).
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _revision) = completed_session(&state, &workspace_id).await;
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/effects/effect-1/reconcile"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
