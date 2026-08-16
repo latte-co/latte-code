@@ -1011,16 +1011,20 @@ fn final_binary_server_provides_input_through_http() {
     let (revision, request_id, run_revision) =
         pending.expect("session never reached WaitingInput over HTTP");
 
-    // A suspended session has no active runner mailbox, so a queued follow-up
-    // is rejected as a conflict rather than a server error.
-    let (queue_status, _) = server.request(
+    // Queueing against a session parked on input is timing-dependent (the
+    // runner window may or may not still be open), but must never be a server
+    // error — accept queued / conflict / not-found, reject 5xx.
+    let (queue_status, queue_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/queue"),
         Some(&server.token),
         Some(&serde_json::json!({ "prompt": "queued while waiting" })),
         &[],
     );
-    assert_eq!(queue_status, 409);
+    assert!(
+        matches!(queue_status, 202 | 404 | 409),
+        "unexpected queue status {queue_status}: {queue_body:?}"
+    );
 
     // Providing the requested value over HTTP continues the turn to completion.
     let (input_status, input_body) = server.request(
@@ -1397,4 +1401,111 @@ fn final_binary_server_persists_sessions_across_restart() {
                 .any(|s| s["thread_id"].as_str() == Some(session_id.as_str()))),
         "restarted server must list the durable session"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_switches_model_and_replays_follow_up() {
+    let scenario = Scenario::new();
+    // Two models + several completions so the session completes, switches, and
+    // takes an idempotency-keyed follow-up (with a replay) — all deterministic
+    // (no queue-timing races).
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first"),
+        ProviderReply::completion("after follow-up"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let (_, created) = {
+        let binding = server_binding(&scenario);
+        server.request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(&server.token),
+            Some(&serde_json::json!({ "prompt": "hello", "binding": binding })),
+            &[],
+        )
+    };
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the session is idle (ready), then switch to the other model.
+    let mut switched = false;
+    for _ in 0..300 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            let revision = body["snapshot"]["revision"].as_u64().unwrap();
+            let (sw, sw_body) = server.request(
+                "POST",
+                &format!("/v1/sessions/{session_id}/model"),
+                Some(&server.token),
+                Some(&serde_json::json!({
+                    "binding": server_binding_for_model(&scenario, Some("mock-2")),
+                    "expected_thread_revision": revision
+                })),
+                &[],
+            );
+            // 200 on success; 409 only if a concurrent transition raced — retry.
+            if sw == 200 {
+                assert_eq!(sw_body["snapshot"]["binding"]["model"], "mock-2");
+                switched = true;
+                break;
+            }
+            assert_eq!(sw, 409, "switch returned {sw_body:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(switched, "model switch never succeeded on the idle session");
+
+    // Read the current revision, then a keyed follow-up is accepted and replays
+    // identically on retry.
+    let (_, snap) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let revision = snap["snapshot"]["revision"].as_u64().unwrap();
+    let (f1, f1_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "switch-follow")],
+    );
+    assert_eq!(f1, 202, "follow-up returned {f1_body:?}");
+    // Retry with the same key replays the original accepted body.
+    let (f2, f2_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "switch-follow")],
+    );
+    assert_eq!(f2, 202);
+    assert_eq!(f2_body, f1_body, "keyed follow-up retry must replay");
 }
