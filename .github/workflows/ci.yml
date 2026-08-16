@@ -213,7 +213,7 @@ jobs:
       - run: cargo test --workspace --doc --all-features --locked
 
   coverage-unit:
-    name: Coverage - UT (93%)
+    name: Coverage - UT (95%)
     timeout-minutes: 35
     runs-on: ubuntu-latest
     steps:
@@ -226,7 +226,7 @@ jobs:
       - run: make coverage-unit
 
   coverage-e2e:
-    name: Coverage - E2E (88%)
+    name: Coverage - E2E (90%)
     timeout-minutes: 40
     runs-on: ubuntu-latest
     steps:
@@ -239,7 +239,7 @@ jobs:
       - run: make coverage-e2e
 
   coverage-total:
-    name: Coverage - total (88%)
+    name: Coverage - total (90%)
     timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
