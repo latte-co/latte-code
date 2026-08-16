@@ -2876,6 +2876,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn serve_bound_completes_gracefully_on_sigterm() {
         // SIGTERM is process-wide, so re-execute this test in a child process

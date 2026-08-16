@@ -3160,6 +3160,7 @@ mod tests {
         waiting_input_session(&state, &workspace_id).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn serve_on_returns_after_sigterm() {
         // The public serve_on wrapper wires the real signal-based shutdown.
