@@ -1,6 +1,7 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 use latte_core::{
-    FailureCode, IdSource, RunState, RunStatus, ThreadId, ThreadProviderBindingV2, wall_time_ms,
+    FailureCode, IdSource, RunState, RunStatus, SystemIdSource, ThreadId, ThreadProviderBindingV2,
+    wall_time_ms,
 };
 use latte_engine::{EngineBuilder, StorageError};
 use latte_headless::{
@@ -41,7 +42,7 @@ const DEFAULT_CONFIG: &str = r#"{
   },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -403,6 +404,9 @@ async fn execute() -> i32 {
         && std::io::stdout().is_terminal();
     if implicit_tui || matches!(args.as_slice(), [command] if command == "tui") {
         return execute_tui();
+    }
+    if matches!(args.first().map(String::as_str), Some("serve")) {
+        return execute_serve(&args[1..], json).await;
     }
     if args.is_empty()
         || matches!(
@@ -997,11 +1001,26 @@ fn execute_tui() -> i32 {
                 latte_tui::thread::ThreadUiAction::Cancel { thread_id } => {
                     let service = service.clone();
                     let feedback = feedback_tx.clone();
+                    let cancel_engine = engine.clone();
                     tokio::task::spawn_blocking(move || {
-                        let result = service
-                            .cancel_durable(thread_id)
-                            .map(|_| "interruption requested".into())
-                            .map_err(|error| error.to_string());
+                        // The TUI cancels the session's current active run, so
+                        // fence against the live snapshot's revisions.
+                        let result = cancel_engine
+                            .thread_snapshot_v2(thread_id, None, 1)
+                            .map_err(|error| error.to_string())
+                            .and_then(|snapshot| {
+                                let run_revision = snapshot
+                                    .active_run_id
+                                    .and_then(|run_id| {
+                                        snapshot.runs.iter().find(|run| run.run_id == run_id)
+                                    })
+                                    .map(|run| run.run_revision)
+                                    .unwrap_or_default();
+                                service
+                                    .cancel_durable(thread_id, snapshot.revision, run_revision)
+                                    .map(|_| "interruption requested".into())
+                                    .map_err(|error| error.to_string())
+                            });
                         let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
                     });
                 }
@@ -1018,9 +1037,25 @@ fn execute_tui() -> i32 {
                     let feedback = feedback_tx.clone();
                     match snapshot {
                         Ok(snapshot) => {
+                            let run_revision = snapshot
+                                .active_run_id
+                                .and_then(|run_id| {
+                                    snapshot
+                                        .runs
+                                        .iter()
+                                        .find(|r| r.run_id == run_id)
+                                        .map(|r| r.run_revision)
+                                })
+                                .unwrap_or(0);
                             tokio::spawn(async move {
                                 let result = service
-                                    .provide_input(thread_id, snapshot.revision, request_id, value)
+                                    .provide_input(
+                                        thread_id,
+                                        snapshot.revision,
+                                        run_revision,
+                                        request_id,
+                                        value,
+                                    )
                                     .await
                                     .map(|_| "input accepted".into())
                                     .map_err(|error| error.to_string());
@@ -1054,11 +1089,22 @@ fn execute_tui() -> i32 {
                     let feedback = feedback_tx.clone();
                     match snapshot {
                         Ok(snapshot) => {
+                            let run_revision = snapshot
+                                .active_run_id
+                                .and_then(|run_id| {
+                                    snapshot
+                                        .runs
+                                        .iter()
+                                        .find(|r| r.run_id == run_id)
+                                        .map(|r| r.run_revision)
+                                })
+                                .unwrap_or(0);
                             tokio::spawn(async move {
                                 let result = service
                                     .resolve_permission(
                                         thread_id,
                                         snapshot.revision,
+                                        run_revision,
                                         request_id,
                                         allow,
                                     )
@@ -1159,6 +1205,281 @@ fn execute_tui() -> i32 {
     }
 }
 
+/// Default local server port when `--port` is not supplied.
+const DEFAULT_SERVER_PORT: u16 = 4096;
+
+/// Starts the local HTTP server through the final binary. This is the single
+/// observable entry point users have to run `latte-server`: it loads the same
+/// layered configuration and provider registry as the CLI/TUI, builds a
+/// per-binding provider factory, mints a Bearer token into
+/// `$LATTE_CODE_HOME/server.token` (owner-only), and serves on 127.0.0.1.
+async fn execute_serve(args: &[String], json: bool) -> i32 {
+    // `--port` parse errors are a usage error with help.
+    let port = match parse_serve_port(args) {
+        Ok(port) => port,
+        Err(error) => return emit_error(json, "usage", "usage", &error, EXIT_USAGE, true),
+    };
+    match serve_bound(port, json).await {
+        Ok(code) => code,
+        Err(ServerSetupError {
+            code,
+            category,
+            message,
+        }) => emit_error(json, code, category, &message, exit_for_setup(code), false),
+    }
+}
+
+/// Sets up and runs the server, returning a process exit code or a classified
+/// setup error. Splitting this out lets `execute_serve` route every setup
+/// failure through one uniform emitter.
+async fn serve_bound(port: u16, json: bool) -> Result<i32, ServerSetupError> {
+    use std::io::Write;
+
+    let root = std::env::current_dir()
+        .map(|cwd| discover_workspace_root(&cwd))
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "current_directory",
+            message: error.to_string(),
+        })?;
+
+    let storage_home = storage_home().map_err(|message| ServerSetupError {
+        code: "usage",
+        category: "configuration",
+        message,
+    })?;
+    let (state, token, token_path) = prepare_server(&root, &storage_home)?;
+
+    // Bind the listener FIRST so a port conflict fails before we publish the
+    // token; only the process that will actually serve writes server.token.
+    let (listener, local_addr) = bind_local_listener(port).await?;
+
+    write_server_token(&token_path, &token).map_err(|message| ServerSetupError {
+        code: "internal",
+        category: "server_token",
+        message,
+    })?;
+
+    // Announce the observable readiness contract before blocking on serve so a
+    // client (or E2E) can discover the port and token file deterministically.
+    if json {
+        emit_data("listening", &readiness_envelope(local_addr, &token_path));
+    } else {
+        println!(
+            "latte-code server listening on http://{local_addr}; token at {}",
+            token_path.display()
+        );
+    }
+    let _ = std::io::stdout().flush();
+
+    latte_server::serve_on(state, listener)
+        .await
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "server_runtime",
+            message: error.to_string(),
+        })?;
+    Ok(EXIT_COMPLETED)
+}
+
+/// The JSON readiness envelope announced when the server begins listening.
+fn readiness_envelope(local_addr: std::net::SocketAddr, token_path: &Path) -> Value {
+    json!({
+        "address": local_addr.to_string(),
+        "port": local_addr.port(),
+        "token_path": token_path.display().to_string(),
+    })
+}
+
+/// A classified failure from `prepare_server`, carrying the same `(code,
+/// category, message)` shape the CLI emits.
+#[derive(Debug)]
+struct ServerSetupError {
+    code: &'static str,
+    category: &'static str,
+    message: String,
+}
+
+/// Maps a setup failure's status code to the process exit code.
+fn exit_for_setup(code: &str) -> i32 {
+    if code == "usage" {
+        EXIT_USAGE
+    } else {
+        EXIT_INTERNAL
+    }
+}
+
+/// Binds the loopback listener and resolves its local address, classifying any
+/// failure as an internal `server_bind` setup error.
+async fn bind_local_listener(
+    port: u16,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), ServerSetupError> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "server_bind",
+            message: format!("cannot bind 127.0.0.1:{port}: {error}"),
+        })?;
+    let local_addr = listener.local_addr().map_err(|error| ServerSetupError {
+        code: "internal",
+        category: "server_bind",
+        message: error.to_string(),
+    })?;
+    Ok((listener, local_addr))
+}
+
+/// Builds the fully-configured server state for a startup workspace root
+/// without binding a socket or writing the token (the caller owns bind → token
+/// → serve). Each workspace resolves its OWN config/registry and uses the
+/// shared global durable store, so sessions survive restarts and per-workspace
+/// provider configuration is honored.
+fn prepare_server(
+    root: &Path,
+    storage_home: &Path,
+) -> Result<(std::sync::Arc<latte_server::ServerState>, String, PathBuf), ServerSetupError> {
+    // Validate the startup workspace configuration up front for a fast, clear
+    // usage error; per-workspace configs are (re)loaded lazily by the builder.
+    AppConfig::load(root).map_err(|message| ServerSetupError {
+        code: "usage",
+        category: "configuration",
+        message,
+    })?;
+    std::fs::create_dir_all(storage_home).map_err(|error| ServerSetupError {
+        code: "internal",
+        category: "storage_directory",
+        message: format!("cannot create {}: {error}", storage_home.display()),
+    })?;
+
+    let database_path = storage_home.join("state.db");
+    let conversation_root = storage_home.join("sessions");
+
+    // Per-workspace runtime builder: each canonical workspace root loads its
+    // own `.latte/latte-code.jsonc` (models/endpoints/credentials) and gets a
+    // durable engine bound to the shared global database + conversation store.
+    let builder_db = database_path.clone();
+    let builder_conv = conversation_root.clone();
+    let builder: latte_server::WorkspaceRuntimeBuilder =
+        std::sync::Arc::new(move |workspace_root: &Path| {
+            let (config, registry) = AppConfig::load(workspace_root)?;
+            let engine = EngineBuilder::new()
+                .workspace_root(workspace_root)
+                .database_path(&builder_db)
+                .conversation_root(&builder_conv)
+                .build()
+                .map_err(|error| error.to_string())?;
+            let factory_engine = engine.clone();
+            let factory: latte_headless::thread::ThreadProviderFactory =
+                std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
+                    registry
+                        .resolve_thread_bound(binding, &factory_engine.tool_descriptors())
+                        .map_err(|error| error.to_string())
+                });
+            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                engine.clone(),
+                workspace_root,
+                config.thread_policy(),
+                factory,
+            );
+            Ok(latte_server::BuiltWorkspace { engine, runtime })
+        });
+
+    // Session locator: resolve a session's owning workspace from the durable
+    // global catalog so reads work after a restart, before any in-memory index
+    // is populated. Uses a catalog engine bound to the startup root (queries by
+    // thread id are workspace-independent lookups against the shared store).
+    let catalog_engine = EngineBuilder::new()
+        .workspace_root(root)
+        .database_path(&database_path)
+        .conversation_root(&conversation_root)
+        .build()
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "engine_initialization",
+            message: error.to_string(),
+        })?;
+    let session_locator: latte_server::SessionLocator =
+        std::sync::Arc::new(move |thread_id: latte_core::ThreadId| {
+            catalog_engine
+                .thread_session_v2(thread_id)
+                .ok()
+                .flatten()
+                .map(|summary| PathBuf::from(summary.workspace_root))
+        });
+
+    let token = generate_server_token();
+    let token_path = storage_home.join("server.token");
+    Ok((
+        latte_server::new_state(token.clone(), builder, session_locator),
+        token,
+        token_path,
+    ))
+}
+
+/// Parses the optional `--port <port>` flag for `serve`.
+fn parse_serve_port(args: &[String]) -> Result<u16, String> {
+    let mut port = DEFAULT_SERVER_PORT;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--port" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--port requires a value".to_string())?;
+                port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port: {value}"))?;
+                index += 2;
+            }
+            other => return Err(format!("unexpected serve argument: {other}")),
+        }
+    }
+    Ok(port)
+}
+
+/// Mints a Bearer token for the local server. A `UUIDv7` pair provides
+/// sufficient unpredictability for the v1 local-only loopback bind.
+fn generate_server_token() -> String {
+    format!(
+        "{}{}",
+        SystemIdSource::default().next_uuid_v7().simple(),
+        SystemIdSource::default().next_uuid_v7().simple()
+    )
+}
+
+/// Writes the Bearer token atomically with owner-only permissions. Creates a
+/// temporary file with restrictive mode, writes the token, then renames into
+/// place so that the final path is never observable with partial content or
+/// permissive mode.
+fn write_server_token(path: &Path, token: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cannot determine parent of {}", path.display()))?;
+    let tmp_path = parent.join(format!(".server.token.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|error| format!("cannot create {}: {error}", tmp_path.display()))?;
+        file.write_all(token.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", tmp_path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, token)
+            .map_err(|error| format!("cannot write {}: {error}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .map_err(|error| format!("cannot publish {}: {error}", path.display()))?;
+    Ok(())
+}
+
 fn render_run(run: &RunState, json_output: bool) -> i32 {
     let (status, code) = outcome(run);
     if json_output {
@@ -1227,14 +1548,17 @@ fn emit_error(
 
 #[cfg(test)]
 mod tests {
+    use super::bind_local_listener;
     use super::{
-        AppConfig, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED, EXIT_INTERNAL,
-        EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
+        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED,
+        EXIT_INTERNAL, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
         ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root,
-        dispatch_session_management_action, dot, emit_data, emit_error, execute_tui,
-        merge_optional_config, merge_value, open_tui_engine, outcome, reconcile_thread_action,
-        render_run, storage_home_with, tui_startup_presentation, verify_timeout,
+        dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
+        exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
+        outcome, parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action,
+        render_run, serve_bound, storage_home_with, tui_startup_presentation, verify_timeout,
         workspace_display_path, workspace_display_path_with_home, workspace_identity,
+        write_server_token,
     };
     use latte_core::{
         Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
@@ -1255,7 +1579,13 @@ mod tests {
         ThreadUiFeedback,
     };
     use serde_json::json;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     fn state(status: RunStatus) -> RunState {
         let mut state =
@@ -2151,5 +2481,507 @@ mod tests {
             latte_engine::EffectStatus::ObservedFailed
         );
         assert_eq!(engine.show(run_id).unwrap().status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn serve_port_parsing_covers_default_explicit_and_error_shapes() {
+        assert_eq!(parse_serve_port(&[]).unwrap(), DEFAULT_SERVER_PORT);
+        assert_eq!(parse_serve_port(&["--port".into(), "0".into()]).unwrap(), 0);
+        assert_eq!(
+            parse_serve_port(&["--port".into(), "8080".into()]).unwrap(),
+            8080
+        );
+        assert_eq!(
+            parse_serve_port(&["--port".into()]).unwrap_err(),
+            "--port requires a value"
+        );
+        assert_eq!(
+            parse_serve_port(&["--port".into(), "70000".into()]).unwrap_err(),
+            "invalid port: 70000"
+        );
+        assert_eq!(
+            parse_serve_port(&["--bogus".into()]).unwrap_err(),
+            "unexpected serve argument: --bogus"
+        );
+    }
+
+    #[test]
+    fn server_token_is_unpredictable_and_written_with_owner_only_permissions() {
+        let first = generate_server_token();
+        let second = generate_server_token();
+        assert_ne!(first, second, "each token must be distinct");
+        assert!(first.len() >= 32, "token must carry sufficient entropy");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.token");
+        write_server_token(&path, &first).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "token file must be owner-only");
+        }
+
+        let missing = dir.path().join("no-such-dir").join("server.token");
+        let err = write_server_token(&missing, &first).unwrap_err();
+        assert!(
+            err.contains("cannot create") || err.contains("cannot write"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_server_builds_durable_per_workspace_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::write(
+            root.path().join(".latte/latte-code.jsonc"),
+            r#"{
+                version: 1,
+                default_model: "primary/model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "model": {} },
+                    base_url: "https://provider.example/v1",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } },
+                verification: { argv: ["true"] }
+            }"#,
+        )
+        .unwrap();
+        let storage_home = home.path().join(".latte/latte-code");
+
+        let (state, token, token_path) = match prepare_server(root.path(), &storage_home) {
+            Ok(value) => value,
+            Err(error) => panic!("prepare_server failed: {}", error.message),
+        };
+        assert!(!token.is_empty(), "prepared state must carry a token");
+        assert_eq!(state.token, token, "state token matches the returned token");
+        assert_eq!(token_path, storage_home.join("server.token"));
+        // prepare_server does not write the token (bind happens first).
+        assert!(!token_path.exists());
+
+        // The runtime builder produces a durable engine for the workspace, so
+        // the global database materializes under the storage home.
+        let workspace = state.workspaces.get_or_create(root.path()).await.unwrap();
+        assert!(workspace.list_sessions().unwrap().is_empty());
+        assert!(storage_home.join("state.db").is_file());
+
+        // The durable session locator resolves nothing for an unknown thread.
+        let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(
+            state
+                .workspaces
+                .get_session_workspace(&missing)
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepare_server_reports_invalid_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        // An empty verification.argv is a documented configuration error.
+        std::fs::write(
+            root.path().join(".latte/latte-code.jsonc"),
+            "{ verification: { argv: [] } }",
+        )
+        .unwrap();
+
+        let Err(error) = prepare_server(root.path(), &home.path().join("state")) else {
+            panic!("expected invalid configuration to be rejected");
+        };
+        assert_eq!(error.code, "usage");
+        assert_eq!(error.category, "configuration");
+        assert!(error.message.contains("verification.argv"));
+    }
+
+    #[test]
+    fn exit_for_setup_maps_usage_and_internal_codes() {
+        assert_eq!(exit_for_setup("usage"), EXIT_USAGE);
+        assert_eq!(exit_for_setup("internal"), EXIT_INTERNAL);
+    }
+
+    #[tokio::test]
+    async fn execute_serve_rejects_unknown_argument_before_binding() {
+        // An unparseable serve argument is a usage error returned before any
+        // socket bind or configuration load.
+        assert_eq!(
+            execute_serve(&["--nonsense".to_string()], true).await,
+            EXIT_USAGE
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_local_listener_binds_ephemeral_and_reports_in_use() {
+        // An ephemeral port binds and resolves a loopback address.
+        let (listener, addr) = bind_local_listener(0).await.expect("ephemeral bind");
+        assert!(addr.ip().is_loopback());
+        let port = addr.port();
+
+        // Binding the same port again is a classified server_bind failure.
+        let Err(error) = bind_local_listener(port).await else {
+            panic!("expected the in-use port to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "server_bind");
+        drop(listener);
+    }
+
+    #[test]
+    fn readiness_envelope_reports_address_port_and_token_path() {
+        let addr: std::net::SocketAddr = "127.0.0.1:4096".parse().unwrap();
+        let token_path = Path::new("/tmp/latte/server.token");
+        let envelope = readiness_envelope(addr, token_path);
+        assert_eq!(envelope["address"], "127.0.0.1:4096");
+        assert_eq!(envelope["port"], 4096);
+        assert_eq!(envelope["token_path"], "/tmp/latte/server.token");
+    }
+
+    /// Redirects the process-global environment `serve_bound` reads
+    /// (`LATTE_CODE_HOME`, and `HOME` for the optional user config layer) into
+    /// scratch directories, so server tests never touch the developer's real
+    /// state or token file. The mutex serializes env-mutating tests against
+    /// each other; other tests in this crate only read `HOME` for display
+    /// paths and tolerate a temporary value, and other test binaries are
+    /// separate processes.
+    static SERVE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `closure` with `HOME` and `LATTE_CODE_HOME` pointed at scratch
+    /// directories, restoring the previous values on completion.
+    fn with_scratch_serve_env<R>(
+        home: &Path,
+        storage_home: &Path,
+        closure: impl FnOnce() -> R,
+    ) -> R {
+        let _lock = SERVE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("LATTE_CODE_HOME", Some(storage_home.as_os_str())),
+            ],
+            closure,
+        )
+    }
+
+    /// A scratch storage layout under a temporary HOME: `serve_bound` resolves
+    /// `$LATTE_CODE_HOME` (and the optional `$HOME` config layer) from the
+    /// process environment, so tests point both at scratch directories.
+    /// Also creates a `.git` marker and a minimal workspace config so
+    /// `discover_workspace_root` and `AppConfig::load` resolve to the scratch
+    /// directory rather than the developer's real workspace.
+    fn scratch_serve_env() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        write_valid_workspace_config(home.path());
+        let storage_home = home.path().join(".latte/latte-code");
+        (home, storage_home)
+    }
+
+    /// Polls the loopback port until the server accepts a connection.
+    async fn wait_for_listening(port: u16) {
+        for _ in 0..200 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("server never accepted a connection on 127.0.0.1:{port}");
+    }
+
+    /// Writes a minimal valid workspace configuration so `prepare_server`
+    /// passes its up-front configuration validation.
+    fn write_valid_workspace_config(root: &Path) {
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{
+                version: 1,
+                default_model: "primary/model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "model": {} },
+                    base_url: "https://provider.example/v1",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } },
+                verification: { argv: ["true"] }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn execute_serve_classifies_setup_errors_through_the_uniform_emitter() {
+        let (home, storage_home) = scratch_serve_env();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // Occupy a port: serve_bound finishes full preparation, then bind fails
+                // and the classified error routes through execute_serve's emitter.
+                let (listener, addr) = bind_local_listener(0).await.unwrap();
+                let occupied = addr.port();
+                let code = execute_serve(&["--port".to_string(), occupied.to_string()], true).await;
+                assert_eq!(code, EXIT_INTERNAL);
+                drop(listener);
+            })
+        })
+    }
+
+    #[test]
+    fn serve_bound_announces_listening_writes_token_and_serves_health() {
+        let (home, storage_home) = scratch_serve_env();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for json in [true, false] {
+                    // Reserve a likely-free port, then hand it to serve_bound.
+                    let (probe, addr) = bind_local_listener(0).await.unwrap();
+                    let port = addr.port();
+                    drop(probe);
+
+                    let server = tokio::spawn(async move { serve_bound(port, json).await });
+                    wait_for_listening(port).await;
+
+                    // The token is published after bind, before serving starts.
+                    // Retry briefly for slow filesystems (e.g. Windows CI).
+                    let token_path = storage_home.join("server.token");
+                    let mut token_published = false;
+                    for _ in 0..100 {
+                        if token_path.is_file() {
+                            token_published = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert!(
+                        token_published,
+                        "token must be published after the listener binds"
+                    );
+                    let token = std::fs::read_to_string(&token_path).unwrap();
+                    assert!(token.len() >= 32, "token must carry sufficient entropy");
+
+                    // The health endpoint answers on the bound port without a token.
+                    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                    stream
+                        .write_all(
+                            b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+                        "unexpected response: {}",
+                        String::from_utf8_lossy(&response)
+                    );
+
+                    // serve_on blocks on process signals; abort the task like the
+                    // latte-server tests do, since signals are process-wide.
+                    server.abort();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn serve_bound_rejects_relative_storage_home() {
+        let home = tempfile::tempdir().unwrap();
+        with_scratch_serve_env(home.path(), Path::new("relative/state"), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let Err(error) = rt.block_on(serve_bound(0, true)) else {
+                panic!("expected a relative LATTE_CODE_HOME to be rejected");
+            };
+            assert_eq!(error.code, "usage");
+            assert_eq!(error.category, "configuration");
+        });
+    }
+
+    #[test]
+    fn serve_bound_reports_token_write_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join(".latte/latte-code");
+        std::fs::create_dir_all(&storage_home).unwrap();
+        // A directory at the token path makes the atomic publish fail.
+        std::fs::create_dir_all(storage_home.join("server.token")).unwrap();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let Err(error) = rt.block_on(serve_bound(0, true)) else {
+                panic!("expected the token write to fail");
+            };
+            assert_eq!(error.code, "internal");
+            assert_eq!(error.category, "server_token");
+        });
+    }
+
+    #[tokio::test]
+    async fn workspace_builder_reports_provider_resolution_failure() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join("state");
+        let (state, _token, _token_path) = match prepare_server(root.path(), &storage_home) {
+            Ok(value) => value,
+            Err(error) => panic!("prepare_server failed: {}", error.message),
+        };
+        let workspace = state.workspaces.get_or_create(root.path()).await.unwrap();
+
+        // A binding whose provider is no longer configured: the per-workspace
+        // factory built inside prepare_server is invoked when the thread
+        // starts, and its resolution failure surfaces as a retryable child
+        // failure rather than a startup error.
+        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "missing".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "model".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:MISSING".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let snapshot = workspace
+            .runtime
+            .start(thread_id, "hello".into(), binding)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            ThreadLifecycle::Ready,
+            "provider construction failure must be a retryable child failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_bound_completes_gracefully_on_sigterm() {
+        // SIGTERM is process-wide, so re-execute this test in a child process
+        // with a scratch environment; the child signals itself, leaving the
+        // parent test process and other test binaries untouched. The child
+        // inherits the coverage profile with a pid suffix (the E2E harness
+        // trick) so its executed lines are recorded.
+        if std::env::var_os("LATTE_CODE_SIGTERM_TEST").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let storage_home = home.path().join(".latte/latte-code");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("serve_bound_completes_gracefully_on_sigterm")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .stdin(std::process::Stdio::null())
+                .env("HOME", home.path())
+                .env("LATTE_CODE_HOME", &storage_home)
+                .env("LATTE_CODE_SIGTERM_TEST", "1");
+            if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+                command.env(
+                    "LLVM_PROFILE_FILE",
+                    profile.replace(".profraw", "-%p.profraw"),
+                );
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Child: reserve a port, run execute_serve, then SIGTERM self once the
+        // health endpoint answers (proving serve_on is polling its shutdown
+        // signal, so the signal triggers graceful shutdown instead of killing
+        // the process).
+        let (probe, addr) = bind_local_listener(0).await.unwrap();
+        let port = addr.port();
+        drop(probe);
+        let args = vec!["--port".to_string(), port.to_string()];
+        let server = tokio::spawn(async move { execute_serve(&args, true).await });
+        wait_for_listening(port).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(std::process::id()).unwrap()),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server did not shut down within the deadline")
+            .expect("serve task panicked");
+        assert_eq!(code, EXIT_COMPLETED);
+    }
+
+    #[test]
+    fn prepare_server_reports_uncreateable_storage_directory() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let blocker = home.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let storage_home = blocker.join("state");
+
+        let Err(error) = prepare_server(root.path(), &storage_home) else {
+            panic!("expected storage directory creation to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "storage_directory");
+        assert!(
+            error.message.contains("cannot create"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn prepare_server_reports_engine_initialization_failure() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join("state");
+        std::fs::create_dir_all(&storage_home).unwrap();
+        // A directory at the database path makes the SQLite open fail.
+        std::fs::create_dir_all(storage_home.join("state.db")).unwrap();
+
+        let Err(error) = prepare_server(root.path(), &storage_home) else {
+            panic!("expected engine initialization to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "engine_initialization");
     }
 }

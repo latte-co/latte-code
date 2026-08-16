@@ -146,6 +146,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             .provide_input(
                 thread_id,
                 followed.revision,
+                0,
                 "not-waiting".into(),
                 "value".into(),
             )
@@ -154,7 +155,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     ));
     assert!(matches!(
         service
-            .resolve_permission(thread_id, followed.revision, "not-waiting".into(), false,)
+            .resolve_permission(thread_id, followed.revision, 0, "not-waiting".into(), false,)
             .await,
         Err(ThreadRuntimeError::InvalidState)
     ));
@@ -164,7 +165,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     ));
     service.cancel(thread_id);
     assert!(matches!(
-        service.cancel_durable(thread_id),
+        service.cancel_durable(thread_id, followed.revision, 0),
         Err(ThreadRuntimeError::InvalidState)
     ));
     let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -174,7 +175,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             .await
             .is_err()
     );
-    assert!(service.cancel_durable(missing).is_err());
+    assert!(service.cancel_durable(missing, 0, 0).is_err());
 
     let constrained = ThreadRuntimeService::new(
         engine.clone(),
@@ -257,8 +258,24 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
         latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
     };
+    let run_revision = waiting
+        .active_run_id
+        .and_then(|run_id| {
+            waiting
+                .runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .map(|r| r.run_revision)
+        })
+        .unwrap_or(0);
     let failed_verification = no_verification
-        .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+        .resolve_permission(
+            waiting.thread_id,
+            waiting.revision,
+            run_revision,
+            request_id,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(failed_verification.lifecycle, ThreadLifecycle::Failed);

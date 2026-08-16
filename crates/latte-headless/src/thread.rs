@@ -31,6 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
@@ -248,7 +249,34 @@ impl ThreadRuntimeService {
         binding: ThreadProviderBindingV2,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self.start_one(thread_id, prompt, binding).await?;
+        let snapshot = self.start_one(thread_id, prompt, binding, None).await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    /// Like [`Self::start`], but signals `accept` at the durable-acceptance
+    /// boundary (once the user submission is persisted) before running the
+    /// provider turn. Lets a server return 202 only after the command is
+    /// durable, while
+    /// the turn continues under the same supervised execution. The signal
+    /// carries the accepted snapshot, or an error message if acceptance failed
+    /// before persistence.
+    pub async fn start_accepted(
+        &self,
+        thread_id: ThreadId,
+        prompt: String,
+        binding: ThreadProviderBindingV2,
+        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = match self.begin_runner(thread_id) {
+            Ok(runner) => runner,
+            Err(error) => {
+                let _ = accept.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let snapshot = self
+            .start_one(thread_id, prompt, binding, Some(accept))
+            .await?;
         self.drain_mailbox(snapshot, runner).await
     }
 
@@ -257,17 +285,44 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        binding
+        if let Err(error) = binding
             .validate()
-            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
-        let messages = self.initial_messages(&prompt)?;
+            .map_err(ThreadRuntimeError::ProviderConfiguration)
+        {
+            signal_accept(accept, Err(error.to_string()));
+            return Err(error);
+        }
+        let messages = match self.initial_messages(&prompt) {
+            Ok(messages) => messages,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         let run_id = new_run_id();
         let now = now_ms();
-        let lease = self.acquire(thread_id)?;
-        let started = self
+        let lease = match self.acquire(thread_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let started = match self
             .engine
-            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)?;
+            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)
+        {
+            Ok(started) => started,
+            Err(error) => {
+                let error = ThreadRuntimeError::from(error);
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        // The user submission is now durable — acknowledge acceptance.
+        signal_accept(accept, Ok(started.clone()));
         // Provider construction is runtime work, not submission validation.
         // Once the user card is durable, a missing credential or invalid model
         // becomes a visible retryable child failure instead of restoring the
@@ -296,7 +351,29 @@ impl ThreadRuntimeService {
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
         let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt)
+            .follow_up_one(thread_id, expected_thread_revision, prompt, None)
+            .await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    /// Like [`Self::follow_up`], but signals `accept` once the follow-up
+    /// submission is durably persisted, before the provider turn runs.
+    pub async fn follow_up_accepted(
+        &self,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        prompt: String,
+        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = match self.begin_runner(thread_id) {
+            Ok(runner) => runner,
+            Err(error) => {
+                let _ = accept.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let snapshot = self
+            .follow_up_one(thread_id, expected_thread_revision, prompt, Some(accept))
             .await?;
         self.drain_mailbox(snapshot, runner).await
     }
@@ -306,23 +383,52 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         expected_thread_revision: u64,
         prompt: String,
+        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+        let snapshot = match self.load_full(thread_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
+            signal_accept(accept, Err(ThreadRuntimeError::InvalidState.to_string()));
             return Err(ThreadRuntimeError::InvalidState);
         }
-        let messages = self.history_with_prompt(&snapshot, &prompt)?;
+        let messages = match self.history_with_prompt(&snapshot, &prompt) {
+            Ok(messages) => messages,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         let run_id = new_run_id();
-        let lease = self.acquire(thread_id)?;
-        let started = self.engine.create_started_thread_follow_up_v2(
+        let lease = match self.acquire(thread_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let started = match self.engine.create_started_thread_follow_up_v2(
             thread_id,
             run_id,
             expected_thread_revision,
             &prompt,
             &lease,
             now_ms(),
-        )?;
+        ) {
+            Ok(started) => started,
+            Err(error) => {
+                let error = ThreadRuntimeError::from(error);
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        // The follow-up submission is now durable — acknowledge acceptance.
+        signal_accept(accept, Ok(started.clone()));
         let Ok(provider) = (self.provider)(&started.binding) else {
             return self.fail_retryable(
                 thread_id,
@@ -398,7 +504,7 @@ impl ThreadRuntimeService {
                 return Ok(snapshot);
             };
             snapshot = self
-                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt)
+                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt, None)
                 .await?;
         }
     }
@@ -441,6 +547,7 @@ impl ThreadRuntimeService {
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
+        expected_run_revision: u64,
         request_id: String,
         value: String,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
@@ -455,6 +562,7 @@ impl ThreadRuntimeService {
             .ok_or(ThreadRuntimeError::InvalidState)?;
         if snapshot.lifecycle != ThreadLifecycle::WaitingInput
             || snapshot.revision != expected_thread_revision
+            || run.run_revision != expected_run_revision
         {
             return Err(ThreadRuntimeError::InvalidState);
         }
@@ -486,6 +594,7 @@ impl ThreadRuntimeService {
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
+        expected_run_revision: u64,
         request_id: String,
         allow: bool,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
@@ -496,6 +605,7 @@ impl ThreadRuntimeService {
         let run_revision = active_run_revision(&snapshot)?;
         if snapshot.lifecycle != ThreadLifecycle::WaitingPermission
             || snapshot.revision != expected_thread_revision
+            || run_revision != expected_run_revision
             || snapshot.pending.as_ref().and_then(|pending| match pending {
                 latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
                     Some(request_id.as_str())
@@ -637,19 +747,16 @@ impl ThreadRuntimeService {
     /// Cancels a durable waiting/idle active child. An in-flight provider call
     /// is signalled first and commits its own interruption without a partial
     /// assistant card; a waiting request is terminally cancelled immediately.
+    ///
+    /// The caller's `expected_thread_revision`/`expected_run_revision` are
+    /// validated against the authoritative snapshot before any interruption, so
+    /// a stale client cannot cancel a newer run.
     pub fn cancel_durable(
         &self,
         thread_id: ThreadId,
+        expected_thread_revision: u64,
+        expected_run_revision: u64,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        if self
-            .active
-            .lock()
-            .expect("active mutex poisoned")
-            .contains_key(&thread_id)
-        {
-            self.cancel(thread_id);
-            return self.load_full(thread_id);
-        }
         let snapshot = self.load_full(thread_id)?;
         let run_id = snapshot
             .active_run_id
@@ -660,6 +767,22 @@ impl ThreadRuntimeService {
             .find(|run| run.run_id == run_id)
             .ok_or(ThreadRuntimeError::InvalidState)?
             .run_revision;
+        // Fence the caller's expectation against the authoritative snapshot
+        // before signalling or committing any cancellation.
+        if snapshot.revision != expected_thread_revision || run_revision != expected_run_revision {
+            return Err(ThreadRuntimeError::InvalidState);
+        }
+        // Hold the active-map lock across the fence recheck and signal so no
+        // concurrent state advance can slip between validation and
+        // cancellation.
+        {
+            let active = self.active.lock().expect("active mutex poisoned");
+            if let Some(token) = active.get(&thread_id) {
+                token.cancel();
+                drop(active);
+                return self.load_full(thread_id);
+            }
+        }
         let lease = self.acquire(thread_id)?;
         self.commit(
             thread_id,
@@ -1667,6 +1790,17 @@ fn new_run_id() -> RunId {
     RunId::from_uuid(Uuid::now_v7())
 }
 
+/// Sends a durable-acceptance signal if a receiver is present, ignoring a
+/// dropped receiver (the caller may have stopped awaiting acceptance).
+fn signal_accept(
+    accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
+    result: Result<ThreadSnapshot, String>,
+) {
+    if let Some(sender) = accept {
+        let _ = sender.send(result);
+    }
+}
+
 fn active_run_revision(snapshot: &ThreadSnapshot) -> Result<u64, ThreadRuntimeError> {
     let run_id = snapshot
         .active_run_id
@@ -1841,6 +1975,19 @@ mod tests {
         }
     }
 
+    fn test_run_revision(snapshot: &ThreadSnapshot) -> u64 {
+        snapshot
+            .active_run_id
+            .and_then(|run_id| {
+                snapshot
+                    .runs
+                    .iter()
+                    .find(|r| r.run_id == run_id)
+                    .map(|r| r.run_revision)
+            })
+            .unwrap_or(0)
+    }
+
     fn binding() -> ThreadProviderBindingV2 {
         ThreadProviderBindingV2 {
             version: 1,
@@ -1982,6 +2129,60 @@ mod tests {
         );
         let (left, right) = tokio::join!(left, right);
         assert!(left.unwrap().is_ok() && right.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn accepted_start_and_follow_up_reject_while_runner_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        // A delayed provider keeps the runner active while the turn is
+        // running, so a concurrent start/follow_up must fail with
+        // InvalidState (the mailbox is held by the active runner).
+        let service = delayed_service(
+            root.path(),
+            engine,
+            [(Duration::from_millis(300), simple_response("done"))],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let first = service.clone();
+        let running =
+            tokio::spawn(
+                async move { first.start(thread_id, "slow turn".into(), binding()).await },
+            );
+        // Let the first turn enter the provider call so its runner is active.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // While the runner is active, start_accepted must reject with
+        // InvalidState and signal the accept channel.
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let err = service
+            .start_accepted(thread_id, "second start".into(), binding(), accept_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        accept_rx
+            .await
+            .expect("accept channel must be signalled")
+            .expect_err("accept must carry the error");
+
+        // follow_up_accepted must also reject while the runner is active.
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let err = service
+            .follow_up_accepted(thread_id, 0, "second follow-up".into(), accept_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        accept_rx
+            .await
+            .expect("accept channel must be signalled")
+            .expect_err("accept must carry the error");
+
+        // The original turn completes successfully.
+        let completed = running.await.unwrap().unwrap();
+        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
     }
 
     #[tokio::test]
@@ -2429,7 +2630,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let terminal = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(terminal.lifecycle, ThreadLifecycle::ReconciliationRequired);
@@ -2513,7 +2720,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let done = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(done.lifecycle, ThreadLifecycle::Ready);
@@ -2594,6 +2807,7 @@ mod tests {
             .resolve_permission(
                 waiting.thread_id,
                 waiting.revision,
+                test_run_revision(&waiting),
                 request_id.clone(),
                 true,
             )
@@ -2721,7 +2935,13 @@ mod tests {
         assert!(request_id.contains("call_ask-write"));
         assert!(!request_id.contains("[REDACTED]"));
         let completed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
@@ -2775,7 +2995,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let completed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
@@ -2819,7 +3045,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let denied = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, false)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(denied.lifecycle, ThreadLifecycle::Ready);
@@ -2880,7 +3112,13 @@ mod tests {
         drop(first);
         let resumed = recording_service(root.path(), engine, provider.clone())
             .with_verification(passing_verification())
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(resumed.lifecycle, ThreadLifecycle::Ready);
@@ -2958,7 +3196,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = mutated
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
@@ -3004,7 +3248,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
@@ -3061,6 +3311,7 @@ mod tests {
             .resolve_permission(
                 waiting_tool.thread_id,
                 waiting_tool.revision,
+                test_run_revision(&waiting_tool),
                 tool_request,
                 true,
             )
@@ -3080,6 +3331,7 @@ mod tests {
             .resolve_permission(
                 waiting_verification.thread_id,
                 waiting_verification.revision,
+                test_run_revision(&waiting_verification),
                 verification_request,
                 true,
             )
@@ -3137,6 +3389,7 @@ mod tests {
             .provide_input(
                 waiting.thread_id,
                 waiting.revision,
+                test_run_revision(&waiting),
                 "language".into(),
                 "Rust".into(),
             )
@@ -3155,6 +3408,7 @@ mod tests {
                 .provide_input(
                     waiting.thread_id,
                     waiting.revision,
+                    test_run_revision(&waiting),
                     "language".into(),
                     "again".into()
                 )
@@ -3226,7 +3480,7 @@ mod tests {
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
         let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing).is_err());
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -3622,7 +3876,10 @@ mod tests {
                 .await
                 .unwrap();
             let terminal = if cancel {
-                service.cancel_durable(waiting.thread_id).unwrap()
+                let run_revision = active_run_revision(&waiting).unwrap();
+                service
+                    .cancel_durable(waiting.thread_id, waiting.revision, run_revision)
+                    .unwrap()
             } else {
                 let request_id = match waiting.pending.as_ref().unwrap() {
                     latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
@@ -3631,7 +3888,13 @@ mod tests {
                     latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
                 };
                 service
-                    .resolve_permission(waiting.thread_id, waiting.revision, request_id, false)
+                    .resolve_permission(
+                        waiting.thread_id,
+                        waiting.revision,
+                        test_run_revision(&waiting),
+                        request_id,
+                        false,
+                    )
                     .await
                     .unwrap()
             };
@@ -3882,7 +4145,13 @@ mod tests {
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .resolve_permission(thread_id, waiting.revision, request_id, true)
+                .resolve_permission(
+                    thread_id,
+                    waiting.revision,
+                    test_run_revision(&waiting),
+                    request_id,
+                    true,
+                )
                 .await
         });
         let effect_id = loop {
@@ -3976,7 +4245,13 @@ mod tests {
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .resolve_permission(thread_id, waiting.revision, request_id, true)
+                .resolve_permission(
+                    thread_id,
+                    waiting.revision,
+                    test_run_revision(&waiting),
+                    request_id,
+                    true,
+                )
                 .await
         });
         let effect_id = loop {
@@ -4276,6 +4551,7 @@ mod tests {
                 .provide_input(
                     thread_id,
                     running.revision,
+                    test_run_revision(&running),
                     "missing".into(),
                     "value".into()
                 )
@@ -4284,7 +4560,13 @@ mod tests {
         ));
         assert!(matches!(
             service
-                .resolve_permission(thread_id, running.revision, "missing".into(), true)
+                .resolve_permission(
+                    thread_id,
+                    running.revision,
+                    test_run_revision(&running),
+                    "missing".into(),
+                    true
+                )
                 .await,
             Err(ThreadRuntimeError::InvalidState)
         ));
@@ -4307,8 +4589,13 @@ mod tests {
             .insert(thread_id, token.clone());
         service.cancel(thread_id);
         assert!(token.is_cancelled());
+        let live = service.load_full(thread_id).unwrap();
+        let live_run_revision = active_run_revision(&live).unwrap();
         assert_eq!(
-            service.cancel_durable(thread_id).unwrap().thread_id,
+            service
+                .cancel_durable(thread_id, live.revision, live_run_revision)
+                .unwrap()
+                .thread_id,
             thread_id,
             "registered in-flight work is cancelled transiently without forging a durable terminal"
         );
@@ -4498,5 +4785,106 @@ mod tests {
         presentation.input = descriptor.input;
         assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, ThreadLifecycle::Failed);
         verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
+    }
+
+    #[tokio::test]
+    async fn start_accepted_signals_durable_acceptance_then_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("done"), Vec::new())],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let (tx, rx) = oneshot::channel();
+        // Drive the future on a task so it makes progress while we await the
+        // acceptance signal (the future is otherwise lazy).
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_accepted(thread_id, "hello".into(), binding(), tx)
+                    .await
+            })
+        };
+
+        let accepted = rx.await.unwrap().expect("accepted snapshot");
+        assert_eq!(accepted.thread_id, thread_id);
+        let finished = handle.await.unwrap().unwrap();
+        assert_eq!(finished.thread_id, thread_id);
+    }
+
+    #[tokio::test]
+    async fn start_accepted_signals_rejection_on_invalid_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("unused"), Vec::new())],
+        );
+        let mut invalid = binding();
+        invalid.provider_name.clear();
+        let (tx, rx) = oneshot::channel();
+        let result = service
+            .start_accepted(ThreadId::from_uuid(Uuid::now_v7()), "x".into(), invalid, tx)
+            .await;
+        // The accept signal carries the rejection, and the call itself errors.
+        assert!(rx.await.unwrap().is_err());
+        assert!(matches!(
+            result,
+            Err(ThreadRuntimeError::ProviderConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_accepted_signals_acceptance_on_ready_session() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), Vec::new()),
+                response(Some("second"), Vec::new()),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding())
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .follow_up_accepted(thread_id, ready.revision, "second".into(), tx)
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().expect("follow-up accepted");
+        assert_eq!(accepted.thread_id, thread_id);
+        assert!(handle.await.unwrap().is_ok());
+
+        // A stale follow-up signals rejection and errors (call errors directly).
+        let (tx, rx) = oneshot::channel();
+        let stale = service
+            .follow_up_accepted(thread_id, 999, "stale".into(), tx)
+            .await;
+        assert!(rx.await.unwrap().is_err());
+        assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
     }
 }
