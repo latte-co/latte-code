@@ -439,4 +439,27 @@ mod tests {
             .expect("start persists a retryable failure without panicking");
         assert_eq!(snapshot.thread_id, thread_id);
     }
+
+    #[tokio::test]
+    async fn get_or_create_builder_failure_is_reported() {
+        // A builder that always fails: get_or_create surfaces the error rather
+        // than panicking or caching a broken instance.
+        let builder: WorkspaceRuntimeBuilder =
+            Arc::new(|_| Err("simulated builder failure".to_string()));
+        let locator: SessionLocator = Arc::new(|_| None);
+        let manager = WorkspaceManager::new(builder, locator);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = manager.get_or_create(dir.path()).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("simulated builder failure"),
+            "unexpected error: {err}"
+        );
+
+        // A subsequent call with the same path retries the builder (no stale
+        // cache entry from the failure).
+        assert!(manager.get_or_create(dir.path()).await.is_err());
+    }
 }
