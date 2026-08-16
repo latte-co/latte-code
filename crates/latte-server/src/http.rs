@@ -904,16 +904,6 @@ async fn workspace_events(
     Sse::new(Box::pin(stream))
 }
 
-/// Serve the HTTP API on an already-bound listener.
-///
-/// Accepting a bound listener lets the caller discover the actual local
-/// address (for example when binding to port 0) before serving begins.
-/// Serving stops gracefully on Ctrl-C or (on Unix) SIGTERM, letting the
-/// process flush and exit cleanly instead of being force-killed.
-pub async fn serve(state: Arc<ServerState>, listener: tokio::net::TcpListener) -> Result<()> {
-    serve_with_shutdown(state, listener, shutdown_signal()).await
-}
-
 /// Serve until `shutdown` resolves. Separating the shutdown future lets tests
 /// drive graceful shutdown deterministically without process signals.
 pub async fn serve_with_shutdown(
@@ -930,7 +920,7 @@ pub async fn serve_with_shutdown(
 }
 
 /// Resolves when the process receives Ctrl-C or, on Unix, SIGTERM.
-async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -2637,6 +2627,97 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_binding_that_fails_validation() {
+        // A binding that deserializes but fails validate() returns 400 and
+        // covers the binding.validate() error branch.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        // provider_name is empty → validate() returns Err.
+        let mut binding = valid_binding();
+        binding["provider_name"] = serde_json::json!("");
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "x", "binding": binding })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid binding")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_without_key_succeeds() {
+        // A create without Idempotency-Key still succeeds, covering the
+        // idempotency=None path through the handler.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "no key", "binding": valid_binding() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body["session_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn follow_up_without_key_on_completed_session_succeeds() {
+        // Follow-up without Idempotency-Key on a completed session covers the
+        // None idempotency branch.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision) = completed_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(serde_json::json!({ "prompt": "no key", "expected_thread_revision": revision })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "follow-up: {body:?}");
+        assert!(body["accepted_revision"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn switch_model_binding_validates_before_engine() {
+        // switch_model with a binding missing required fields fails
+        // deserialization and returns 400.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision) = completed_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/model"),
+            Some(serde_json::json!({ "binding": {"not": "a valid binding"}, "expected_thread_revision": revision })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid binding")
+        );
     }
 
     #[tokio::test]

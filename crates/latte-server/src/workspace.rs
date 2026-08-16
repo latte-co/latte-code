@@ -117,11 +117,10 @@ impl WorkspaceInstance {
 
     /// Start bridging engine events to the workspace event channel.
     fn start_event_bridge(&self) {
-        let engine = self.engine.clone();
+        let mut subscription = self.engine.subscribe_threads();
         let event_tx = self.event_tx.clone();
 
         tokio::spawn(async move {
-            let mut subscription = engine.subscribe_threads();
             loop {
                 match subscription.recv().await {
                     Ok(event) => {
@@ -461,5 +460,80 @@ mod tests {
         // A subsequent call with the same path retries the builder (no stale
         // cache entry from the failure).
         assert!(manager.get_or_create(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn event_bridge_closes_when_engine_drops() {
+        // Dropping the engine handle closes its broadcast sender, which causes
+        // the event bridge loop to receive Closed and break (line 144).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".latte/state.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db)
+            .conversation_root(dir.path().join(".latte/sessions"))
+            .build()
+            .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            Arc::new(|_| Err("unused".to_string()));
+        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            engine.clone(),
+            dir.path(),
+            Default::default(),
+            factory,
+        );
+        // Creating the instance starts the event bridge task.
+        let instance = WorkspaceInstance::new(
+            "ws_test".into(),
+            dir.path().to_path_buf(),
+            runtime,
+            event_tx.clone(),
+            engine.clone(),
+        );
+
+        // Drop all EngineHandle clones (our local + the one inside instance)
+        // so the broadcast sender closes and the bridge task gets Closed.
+        drop(engine);
+        drop(instance);
+        // Give the bridge task time to observe Closed and break.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_instance_with_non_canonical_path_uses_fallback() {
+        // When the path cannot be canonicalized (doesn't exist on disk),
+        // WorkspaceInstance::new uses the raw path as workspace_root (line 65).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".latte/state.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db)
+            .conversation_root(dir.path().join(".latte/sessions"))
+            .build()
+            .unwrap();
+        let (event_tx, _) = broadcast::channel(16);
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            Arc::new(|_| Err("unused".to_string()));
+        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            engine.clone(),
+            dir.path(),
+            Default::default(),
+            factory,
+        );
+
+        // A path that doesn't exist triggers the unwrap_or_else fallback.
+        let fake_path = PathBuf::from("/nonexistent/workspace/for/coverage");
+        let instance = WorkspaceInstance::new(
+            "ws_fake".into(),
+            fake_path.clone(),
+            runtime,
+            event_tx,
+            engine,
+        );
+        assert_eq!(instance.id, "ws_fake");
+        assert_eq!(instance.path, fake_path);
     }
 }

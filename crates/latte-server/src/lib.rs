@@ -6,7 +6,7 @@ pub mod workspace;
 use anyhow::Result;
 use std::sync::Arc;
 
-pub use crate::http::{ServerState, serve};
+pub use crate::http::{ServerState, serve_with_shutdown, shutdown_signal};
 pub use crate::workspace::{
     BuiltWorkspace, SessionLocator, WorkspaceInstance, WorkspaceManager, WorkspaceRuntimeBuilder,
 };
@@ -26,7 +26,8 @@ pub fn new_state(
 }
 
 /// Run the HTTP server on an already-bound listener, allowing the caller to
-/// discover the actual local address before serving begins.
+/// discover the actual local address before serving begins. Stops gracefully
+/// on Ctrl-C or (on Unix) SIGTERM.
 pub async fn serve_on(state: Arc<ServerState>, listener: tokio::net::TcpListener) -> Result<()> {
-    http::serve(state, listener).await
+    http::serve_with_shutdown(state, listener, http::shutdown_signal()).await
 }
