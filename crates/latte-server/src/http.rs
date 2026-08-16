@@ -667,16 +667,14 @@ async fn resolve_permission(
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
-    // Validate the caller's run revision fence before the authority-changing
-    // operation so a stale client cannot resolve a permission belonging to a
-    // newer run.
-    validate_run_revision(&workspace, thread_id, req.expected_run_revision)?;
-
+    // The run revision fence is now validated atomically inside the runtime
+    // method alongside the thread revision fence.
     match workspace
         .runtime
         .resolve_permission(
             thread_id,
             req.expected_thread_revision,
+            req.expected_run_revision,
             request_id,
             req.allow,
         )
@@ -700,15 +698,14 @@ async fn provide_input(
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
-    // Validate the caller's run revision fence before the authority-changing
-    // operation so a stale client cannot provide input to a newer run.
-    validate_run_revision(&workspace, thread_id, req.expected_run_revision)?;
-
+    // The run revision fence is now validated atomically inside the runtime
+    // method alongside the thread revision fence.
     match workspace
         .runtime
         .provide_input(
             thread_id,
             req.expected_thread_revision,
+            req.expected_run_revision,
             req.request_id,
             req.value,
         )
@@ -755,33 +752,6 @@ async fn lookup_workspace(
         .get_or_create(&workspace_path)
         .await
         .map_err(|_| not_found("workspace not found"))
-}
-
-/// Validates the caller's expected run revision against the authoritative
-/// snapshot. Returns 409 if the run revision is stale, preventing a stale
-/// client from resolving a permission or providing input to a newer run.
-fn validate_run_revision(
-    workspace: &WorkspaceInstance,
-    thread_id: ThreadId,
-    expected_run_revision: u64,
-) -> Result<(), HandlerError> {
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    let actual_run_revision = snapshot
-        .active_run_id
-        .and_then(|run_id| {
-            snapshot
-                .runs
-                .iter()
-                .find(|r| r.run_id == run_id)
-                .map(|r| r.run_revision)
-        })
-        .unwrap_or(0);
-    if expected_run_revision != actual_run_revision {
-        return Err(conflict("run revision is stale", Some(snapshot.revision)));
-    }
-    Ok(())
 }
 
 /// Reads the optional `Idempotency-Key` header and scopes it by server token

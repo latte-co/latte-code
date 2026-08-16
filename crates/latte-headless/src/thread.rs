@@ -547,6 +547,7 @@ impl ThreadRuntimeService {
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
+        expected_run_revision: u64,
         request_id: String,
         value: String,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
@@ -561,6 +562,7 @@ impl ThreadRuntimeService {
             .ok_or(ThreadRuntimeError::InvalidState)?;
         if snapshot.lifecycle != ThreadLifecycle::WaitingInput
             || snapshot.revision != expected_thread_revision
+            || run.run_revision != expected_run_revision
         {
             return Err(ThreadRuntimeError::InvalidState);
         }
@@ -592,6 +594,7 @@ impl ThreadRuntimeService {
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
+        expected_run_revision: u64,
         request_id: String,
         allow: bool,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
@@ -602,6 +605,7 @@ impl ThreadRuntimeService {
         let run_revision = active_run_revision(&snapshot)?;
         if snapshot.lifecycle != ThreadLifecycle::WaitingPermission
             || snapshot.revision != expected_thread_revision
+            || run_revision != expected_run_revision
             || snapshot.pending.as_ref().and_then(|pending| match pending {
                 latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
                     Some(request_id.as_str())
@@ -1971,6 +1975,19 @@ mod tests {
         }
     }
 
+    fn test_run_revision(snapshot: &ThreadSnapshot) -> u64 {
+        snapshot
+            .active_run_id
+            .and_then(|run_id| {
+                snapshot
+                    .runs
+                    .iter()
+                    .find(|r| r.run_id == run_id)
+                    .map(|r| r.run_revision)
+            })
+            .unwrap_or(0)
+    }
+
     fn binding() -> ThreadProviderBindingV2 {
         ThreadProviderBindingV2 {
             version: 1,
@@ -2559,7 +2576,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let terminal = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(terminal.lifecycle, ThreadLifecycle::ReconciliationRequired);
@@ -2643,7 +2666,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let done = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(done.lifecycle, ThreadLifecycle::Ready);
@@ -2724,6 +2753,7 @@ mod tests {
             .resolve_permission(
                 waiting.thread_id,
                 waiting.revision,
+                test_run_revision(&waiting),
                 request_id.clone(),
                 true,
             )
@@ -2851,7 +2881,13 @@ mod tests {
         assert!(request_id.contains("call_ask-write"));
         assert!(!request_id.contains("[REDACTED]"));
         let completed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
@@ -2905,7 +2941,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let completed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
@@ -2949,7 +2991,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let denied = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, false)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(denied.lifecycle, ThreadLifecycle::Ready);
@@ -3010,7 +3058,13 @@ mod tests {
         drop(first);
         let resumed = recording_service(root.path(), engine, provider.clone())
             .with_verification(passing_verification())
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(resumed.lifecycle, ThreadLifecycle::Ready);
@@ -3088,7 +3142,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = mutated
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
@@ -3134,7 +3194,13 @@ mod tests {
             latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = service
-            .resolve_permission(waiting.thread_id, waiting.revision, request_id, true)
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
@@ -3191,6 +3257,7 @@ mod tests {
             .resolve_permission(
                 waiting_tool.thread_id,
                 waiting_tool.revision,
+                test_run_revision(&waiting_tool),
                 tool_request,
                 true,
             )
@@ -3210,6 +3277,7 @@ mod tests {
             .resolve_permission(
                 waiting_verification.thread_id,
                 waiting_verification.revision,
+                test_run_revision(&waiting_verification),
                 verification_request,
                 true,
             )
@@ -3267,6 +3335,7 @@ mod tests {
             .provide_input(
                 waiting.thread_id,
                 waiting.revision,
+                test_run_revision(&waiting),
                 "language".into(),
                 "Rust".into(),
             )
@@ -3285,6 +3354,7 @@ mod tests {
                 .provide_input(
                     waiting.thread_id,
                     waiting.revision,
+                    test_run_revision(&waiting),
                     "language".into(),
                     "again".into()
                 )
@@ -3356,7 +3426,7 @@ mod tests {
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
         let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -3764,7 +3834,13 @@ mod tests {
                     latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
                 };
                 service
-                    .resolve_permission(waiting.thread_id, waiting.revision, request_id, false)
+                    .resolve_permission(
+                        waiting.thread_id,
+                        waiting.revision,
+                        test_run_revision(&waiting),
+                        request_id,
+                        false,
+                    )
                     .await
                     .unwrap()
             };
@@ -4015,7 +4091,13 @@ mod tests {
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .resolve_permission(thread_id, waiting.revision, request_id, true)
+                .resolve_permission(
+                    thread_id,
+                    waiting.revision,
+                    test_run_revision(&waiting),
+                    request_id,
+                    true,
+                )
                 .await
         });
         let effect_id = loop {
@@ -4109,7 +4191,13 @@ mod tests {
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .resolve_permission(thread_id, waiting.revision, request_id, true)
+                .resolve_permission(
+                    thread_id,
+                    waiting.revision,
+                    test_run_revision(&waiting),
+                    request_id,
+                    true,
+                )
                 .await
         });
         let effect_id = loop {
@@ -4409,6 +4497,7 @@ mod tests {
                 .provide_input(
                     thread_id,
                     running.revision,
+                    test_run_revision(&running),
                     "missing".into(),
                     "value".into()
                 )
@@ -4417,7 +4506,13 @@ mod tests {
         ));
         assert!(matches!(
             service
-                .resolve_permission(thread_id, running.revision, "missing".into(), true)
+                .resolve_permission(
+                    thread_id,
+                    running.revision,
+                    test_run_revision(&running),
+                    "missing".into(),
+                    true
+                )
                 .await,
             Err(ThreadRuntimeError::InvalidState)
         ));

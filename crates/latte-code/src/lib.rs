@@ -1037,9 +1037,25 @@ fn execute_tui() -> i32 {
                     let feedback = feedback_tx.clone();
                     match snapshot {
                         Ok(snapshot) => {
+                            let run_revision = snapshot
+                                .active_run_id
+                                .and_then(|run_id| {
+                                    snapshot
+                                        .runs
+                                        .iter()
+                                        .find(|r| r.run_id == run_id)
+                                        .map(|r| r.run_revision)
+                                })
+                                .unwrap_or(0);
                             tokio::spawn(async move {
                                 let result = service
-                                    .provide_input(thread_id, snapshot.revision, request_id, value)
+                                    .provide_input(
+                                        thread_id,
+                                        snapshot.revision,
+                                        run_revision,
+                                        request_id,
+                                        value,
+                                    )
                                     .await
                                     .map(|_| "input accepted".into())
                                     .map_err(|error| error.to_string());
@@ -1073,11 +1089,22 @@ fn execute_tui() -> i32 {
                     let feedback = feedback_tx.clone();
                     match snapshot {
                         Ok(snapshot) => {
+                            let run_revision = snapshot
+                                .active_run_id
+                                .and_then(|run_id| {
+                                    snapshot
+                                        .runs
+                                        .iter()
+                                        .find(|r| r.run_id == run_id)
+                                        .map(|r| r.run_revision)
+                                })
+                                .unwrap_or(0);
                             tokio::spawn(async move {
                                 let result = service
                                     .resolve_permission(
                                         thread_id,
                                         snapshot.revision,
+                                        run_revision,
                                         request_id,
                                         allow,
                                     )
