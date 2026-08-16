@@ -2309,6 +2309,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_permission_stale_run_revision_conflicts() {
+        // A stale expected_run_revision is rejected with 409 even when the
+        // thread revision is correct.
+        let state = permission_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision, request_id, _run_revision) =
+            waiting_permission_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            Some(serde_json::json!({
+                "allow": true,
+                "expected_thread_revision": revision,
+                "expected_run_revision": 999
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn provide_input_stale_run_revision_conflicts() {
+        // A stale expected_run_revision on provide_input is rejected with 409.
+        let state = input_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision, request_id, _run_revision) =
+            waiting_input_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/input"),
+            Some(serde_json::json!({
+                "request_id": request_id,
+                "value": "the answer",
+                "expected_thread_revision": revision,
+                "expected_run_revision": 999
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn follow_up_payload_mismatch_returns_422() {
+        // A keyed follow-up that completed with one payload must reject a retry
+        // of the same key with a different payload.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision) = completed_session(&state, &workspace_id).await;
+
+        // First request completes.
+        let (first, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(serde_json::json!({ "prompt": "original", "expected_thread_revision": revision })),
+            &[("idempotency-key", "follow-mismatch")],
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+
+        // Same key, different prompt → 422.
+        let (mismatch, body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(
+                serde_json::json!({ "prompt": "DIFFERENT", "expected_thread_revision": revision }),
+            ),
+            &[("idempotency-key", "follow-mismatch")],
+        )
+        .await;
+        assert_eq!(mismatch, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["type"], "idempotency_mismatch");
+    }
+
+    #[tokio::test]
     async fn serve_answers_health_and_shuts_down_gracefully() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
