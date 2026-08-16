@@ -2906,6 +2906,84 @@ mod tests {
         assert_eq!(body["error"]["type"], "conflict");
     }
 
+    /// Server state whose provider requests non-secret input on the first call
+    /// and completes the turn on the second. A single shared FakeProvider is
+    /// used across factory calls so the script state (input request then stop)
+    /// is consumed in order even though the runtime rebuilds the provider for
+    /// the follow-up turn after provide_input.
+    fn shared_input_state() -> Arc<ServerState> {
+        use latte_headless::provider::{
+            FakeProvider, InputRequest, ProviderResponse, ProviderUsage,
+        };
+        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+
+        let provider = std::sync::Arc::new(FakeProvider::scripted([
+            ProviderResponse {
+                message: None,
+                tool_calls: Vec::new(),
+                input_request: Some(InputRequest {
+                    id: "req-1".into(),
+                    prompt: "what value?".into(),
+                    secret: false,
+                }),
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+            ProviderResponse {
+                message: Some("done".into()),
+                tool_calls: Vec::new(),
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: Some(latte_headless::provider::FinishReason::Stop),
+                provider_state: None,
+            },
+        ]));
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            std::sync::Arc::new(move |binding: &latte_core::ThreadProviderBindingV2| {
+                Ok(ResolvedProvider {
+                    provider: provider.clone(),
+                    binding: ProviderBinding {
+                        version: binding.version,
+                        provider_name: binding.provider_name.clone(),
+                        provider_type: binding.provider_type.clone(),
+                        protocol: binding.protocol.clone(),
+                        model: binding.model.clone(),
+                        config_fingerprint: binding.config_fingerprint.clone(),
+                        tools_fingerprint: binding.tools_fingerprint.clone(),
+                        aliases: binding.aliases.clone(),
+                    },
+                })
+            });
+        state_with_factory(factory)
+    }
+
+    #[tokio::test]
+    async fn provide_input_with_correct_revisions_succeeds() {
+        // Providing input with matching fences on a WaitingInput session
+        // returns 200 (covers the Ok arm of provide_input).
+        let state = shared_input_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision, request_id, run_revision) =
+            waiting_input_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/input"),
+            Some(serde_json::json!({
+                "request_id": request_id,
+                "value": "the answer",
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "provide_input returned {body:?}");
+        assert!(body["snapshot"].is_object());
+    }
+
     #[tokio::test]
     async fn cancel_session_with_correct_revisions_succeeds() {
         // Cancelling a running session with matching fences returns 200
@@ -3015,6 +3093,7 @@ mod tests {
         state_with_factory(factory)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn reconcile_effect_on_reconciliation_required_session_succeeds() {
         // A process launch that fails after permission is granted leaves the
