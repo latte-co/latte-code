@@ -2554,6 +2554,48 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn payload_mismatch_returns_422_for_create() {
+        // A keyed create that completed with one payload must reject a retry
+        // of the same key with a different payload as 422 rather than replaying.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        // First request succeeds (202).
+        let (first, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "original", "binding": valid_binding() })),
+            &[("idempotency-key", "mismatch-key")],
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+
+        // Same key, different prompt → 422 payload mismatch.
+        let (mismatch, body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "CHANGED", "binding": valid_binding() })),
+            &[("idempotency-key", "mismatch-key")],
+        )
+        .await;
+        assert_eq!(mismatch, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["type"], "idempotency_mismatch");
+    }
+
+    #[test]
+    fn canonical_digest_is_stable_and_content_sensitive() {
+        let a = canonical_digest(&serde_json::json!({"prompt": "hello", "binding": {}}));
+        let b = canonical_digest(&serde_json::json!({"prompt": "hello", "binding": {}}));
+        let c = canonical_digest(&serde_json::json!({"prompt": "world", "binding": {}}));
+        assert_eq!(a, b, "same input must produce same digest");
+        assert_ne!(a, c, "different input must produce different digest");
+        assert_eq!(a.len(), 64, "SHA-256 hex is always 64 chars");
+    }
+
     /// A provider whose turn blocks until released, keeping the session's runner
     /// (and its mailbox) active so queue-accepted / mailbox-full are reachable.
     fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {

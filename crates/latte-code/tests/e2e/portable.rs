@@ -822,6 +822,34 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     assert_eq!(conflict_status, 409);
     assert_eq!(conflict_body["error"]["type"], "conflict");
     assert!(conflict_body["error"]["current_revision"].is_u64());
+
+    // Reusing an idempotency key with a different payload is rejected with 422.
+    let (mismatch_status, mismatch_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "DIFFERENT prompt", "binding": binding })),
+        &[("Idempotency-Key", "e2e-key-1")],
+    );
+    assert_eq!(mismatch_status, 422);
+    assert_eq!(
+        mismatch_body["error"]["type"], "idempotency_mismatch",
+        "payload mismatch must be reported: {mismatch_body:?}"
+    );
+
+    // Reusing a follow-up idempotency key with a different prompt is 422.
+    let (follow_mismatch_status, follow_mismatch_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "DIFFERENT", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "e2e-follow-1")],
+    );
+    assert_eq!(follow_mismatch_status, 422);
+    assert_eq!(
+        follow_mismatch_body["error"]["type"], "idempotency_mismatch",
+        "follow-up payload mismatch must be reported: {follow_mismatch_body:?}"
+    );
 }
 
 #[test]
