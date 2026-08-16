@@ -24,12 +24,6 @@ use tracing::{info, warn};
 
 use crate::workspace::{WorkspaceInstance, WorkspaceManager};
 
-/// A pending idempotency reservation older than this is treated as abandoned.
-/// This only applies after the process has been running continuously; the
-/// ledger does not survive process restart, so stale keys are cleared
-/// implicitly on restart.
-const IDEMPOTENCY_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// A recorded outcome of a durable mutation, replayed verbatim when a client
 /// retries the same `Idempotency-Key`. Only the accepted acknowledgement is
 /// stored; the durable turn continues under supervised background execution.
@@ -37,6 +31,7 @@ const IDEMPOTENCY_PENDING_TTL: std::time::Duration = std::time::Duration::from_s
 struct IdempotentRecord {
     status: StatusCode,
     body: serde_json::Value,
+    payload_digest: String,
 }
 
 /// The state of one idempotency key: either an in-flight reservation (a
@@ -44,7 +39,7 @@ struct IdempotentRecord {
 /// available for replay.
 #[derive(Clone)]
 enum IdempotentSlot {
-    Pending { claimed_at: std::time::Instant },
+    Pending { payload_digest: String },
     Done(IdempotentRecord),
 }
 
@@ -56,6 +51,8 @@ enum IdempotencyClaim {
     Replay(IdempotentRecord),
     /// A concurrent request holds the reservation and has not completed yet.
     InFlight,
+    /// The key was used with a different payload digest — caller must not proceed.
+    PayloadMismatch,
 }
 
 /// Server state shared across handlers.
@@ -87,40 +84,36 @@ impl ServerState {
 
     /// Atomically claims an idempotency key: the first caller becomes `Owner`
     /// and reserves the slot; a concurrent caller sees `InFlight`; a caller
-    /// after completion gets `Replay`. This single-lock reserve-or-replay
-    /// avoids the check-then-store race where two retries both execute.
+    /// after completion gets `Replay`. The slot never expires based on time —
+    /// it remains in-flight until the owner explicitly completes or releases.
     ///
-    /// A `Pending` reservation that has been held longer than
-    /// `IDEMPOTENCY_PENDING_TTL` is released (owner presumed crashed) rather
-    /// than reclaimed directly — the TTL expiry only cleans the slot so the
-    /// *next* request can become Owner fresh. This prevents a live but slow
-    /// original owner from racing with a second Owner.
-    fn idempotency_claim(&self, key: &str) -> IdempotencyClaim {
+    /// If a completed record exists but the payload digest differs from the
+    /// current request, `PayloadMismatch` is returned so the handler can
+    /// reject the request with 422 rather than replaying stale data.
+    fn idempotency_claim(&self, key: &str, payload_digest: &str) -> IdempotencyClaim {
         let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
         match ledger.get(key) {
-            Some(IdempotentSlot::Done(record)) => IdempotencyClaim::Replay(record.clone()),
-            Some(IdempotentSlot::Pending { claimed_at })
-                if claimed_at.elapsed() < IDEMPOTENCY_PENDING_TTL =>
-            {
-                IdempotencyClaim::InFlight
+            Some(IdempotentSlot::Done(record)) => {
+                if record.payload_digest == payload_digest {
+                    IdempotencyClaim::Replay(record.clone())
+                } else {
+                    IdempotencyClaim::PayloadMismatch
+                }
             }
-            Some(IdempotentSlot::Pending { .. }) => {
-                // Expired pending: remove the abandoned reservation and let
-                // the caller retry cleanly from scratch.
-                ledger.remove(key);
-                ledger.insert(
-                    key.to_string(),
-                    IdempotentSlot::Pending {
-                        claimed_at: std::time::Instant::now(),
-                    },
-                );
-                IdempotencyClaim::Owner
+            Some(IdempotentSlot::Pending {
+                payload_digest: existing,
+            }) => {
+                if existing == payload_digest {
+                    IdempotencyClaim::InFlight
+                } else {
+                    IdempotencyClaim::PayloadMismatch
+                }
             }
             None => {
                 ledger.insert(
                     key.to_string(),
                     IdempotentSlot::Pending {
-                        claimed_at: std::time::Instant::now(),
+                        payload_digest: payload_digest.to_string(),
                     },
                 );
                 IdempotencyClaim::Owner
@@ -357,12 +350,17 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
+    let payload_digest = canonical_digest(&serde_json::json!({
+        "prompt": &req.prompt,
+        "binding": &req.binding,
+    }));
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
     if let Some(key) = &idempotency {
-        match state.idempotency_claim(key) {
+        match state.idempotency_claim(key, &payload_digest) {
             IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
             IdempotencyClaim::InFlight => return Err(in_flight()),
+            IdempotencyClaim::PayloadMismatch => return Err(payload_mismatch()),
             IdempotencyClaim::Owner => {}
         }
     }
@@ -375,6 +373,7 @@ async fn create_session(
                 IdempotentRecord {
                     status,
                     body: body.clone(),
+                    payload_digest,
                 },
             );
             Ok((status, Json(body)))
@@ -511,10 +510,15 @@ async fn follow_up(
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
+    let payload_digest = canonical_digest(&serde_json::json!({
+        "prompt": &req.prompt,
+        "expected_thread_revision": req.expected_thread_revision,
+    }));
     if let Some(key) = &idempotency {
-        match state.idempotency_claim(key) {
+        match state.idempotency_claim(key, &payload_digest) {
             IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
             IdempotencyClaim::InFlight => return Err(in_flight()),
+            IdempotencyClaim::PayloadMismatch => return Err(payload_mismatch()),
             IdempotencyClaim::Owner => {}
         }
     }
@@ -526,6 +530,7 @@ async fn follow_up(
                 IdempotentRecord {
                     status,
                     body: body.clone(),
+                    payload_digest,
                 },
             );
             Ok((status, Json(body)))
@@ -845,6 +850,23 @@ fn in_flight() -> HandlerError {
         "a request with this idempotency key is still in flight",
         None,
     )
+}
+
+/// 422 when an idempotency key is reused with a different request payload.
+fn payload_mismatch() -> HandlerError {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "idempotency_mismatch",
+        "this idempotency key was used with a different request payload",
+        None,
+    )
+}
+
+/// Computes a stable SHA-256 hex digest of the canonical JSON serialization.
+fn canonical_digest(value: &serde_json::Value) -> String {
+    use sha2::Digest;
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 
 async fn workspace_events(
@@ -1711,37 +1733,46 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_pending_ttl_expires_and_reclaims() {
+    fn idempotency_payload_mismatch_rejects() {
         let state = state();
-        let key = "test-token:ns:ttl-test";
+        let key = "test-token:ns:mismatch-test";
 
-        // Claim the key.
+        // Claim with one payload.
         assert!(matches!(
-            state.idempotency_claim(key),
+            state.idempotency_claim(key, "digest-a"),
             IdempotencyClaim::Owner
         ));
 
-        // While within TTL, a second claim sees InFlight.
+        // Same key + same digest = InFlight.
         assert!(matches!(
-            state.idempotency_claim(key),
+            state.idempotency_claim(key, "digest-a"),
             IdempotencyClaim::InFlight
         ));
 
-        // Manually expire the pending entry by backdating it.
-        {
-            let mut ledger = state.idempotency.lock().unwrap();
-            ledger.insert(
-                key.to_string(),
-                IdempotentSlot::Pending {
-                    claimed_at: std::time::Instant::now() - Duration::from_secs(600),
-                },
-            );
-        }
-
-        // After TTL, the slot is reclaimed — caller becomes new Owner.
+        // Same key + different digest = PayloadMismatch.
         assert!(matches!(
-            state.idempotency_claim(key),
-            IdempotencyClaim::Owner
+            state.idempotency_claim(key, "digest-b"),
+            IdempotencyClaim::PayloadMismatch
+        ));
+
+        // Complete the key, then replay with matching digest works.
+        state.idempotency_complete(
+            key,
+            IdempotentRecord {
+                status: StatusCode::ACCEPTED,
+                body: serde_json::json!({"ok": true}),
+                payload_digest: "digest-a".to_string(),
+            },
+        );
+        assert!(matches!(
+            state.idempotency_claim(key, "digest-a"),
+            IdempotencyClaim::Replay(_)
+        ));
+
+        // Replay with different digest = PayloadMismatch.
+        assert!(matches!(
+            state.idempotency_claim(key, "digest-c"),
+            IdempotencyClaim::PayloadMismatch
         ));
     }
 
@@ -2357,12 +2388,12 @@ mod tests {
 
         // First claim owns the key and reserves it.
         assert!(matches!(
-            state.idempotency_claim(key),
+            state.idempotency_claim(key, "d"),
             IdempotencyClaim::Owner
         ));
         // A concurrent claim while pending sees it in flight.
         assert!(matches!(
-            state.idempotency_claim(key),
+            state.idempotency_claim(key, "d"),
             IdempotencyClaim::InFlight
         ));
 
@@ -2372,9 +2403,10 @@ mod tests {
             IdempotentRecord {
                 status: StatusCode::ACCEPTED,
                 body: serde_json::json!({ "ok": true }),
+                payload_digest: "d".to_string(),
             },
         );
-        match state.idempotency_claim(key) {
+        match state.idempotency_claim(key, "d") {
             IdempotencyClaim::Replay(record) => {
                 assert_eq!(record.status, StatusCode::ACCEPTED);
                 assert_eq!(record.body, serde_json::json!({ "ok": true }));
@@ -2386,17 +2418,17 @@ mod tests {
         // completed key is a no-op.
         let key2 = "test-token:def";
         assert!(matches!(
-            state.idempotency_claim(key2),
+            state.idempotency_claim(key2, "d2"),
             IdempotencyClaim::Owner
         ));
         state.idempotency_release(key2);
         assert!(matches!(
-            state.idempotency_claim(key2),
+            state.idempotency_claim(key2, "d2"),
             IdempotencyClaim::Owner
         ));
         state.idempotency_release(key); // completed → no-op
         assert!(matches!(
-            state.idempotency_claim(key),
+            state.idempotency_claim(key, "d"),
             IdempotencyClaim::Replay(_)
         ));
     }
@@ -2408,8 +2440,15 @@ mod tests {
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        // Simulate owner in flight with the scoped key that the handler builds.
-        state.idempotency_claim(&format!("test-token:create:{workspace_id}:key-inflight"));
+        // Pre-claim with the exact payload digest the handler will compute.
+        let payload_digest = canonical_digest(&serde_json::json!({
+            "prompt": "x",
+            "binding": valid_binding(),
+        }));
+        state.idempotency_claim(
+            &format!("test-token:create:{workspace_id}:key-inflight"),
+            &payload_digest,
+        );
 
         let (status, body) = call_with_headers(
             &state,
