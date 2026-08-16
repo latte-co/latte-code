@@ -1673,6 +1673,79 @@ mod tests {
     }
 
     #[test]
+    fn map_runtime_error_classifies_storage_lease_and_revision_as_conflict() {
+        // EngineUnavailable (lease held by another owner) becomes 409.
+        let (status, body) = map_runtime_error(
+            &ThreadRuntimeError::Storage(latte_engine::StorageError::EngineUnavailable),
+            5,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0.error.current_revision, Some(5));
+
+        // LeaseLost becomes 409.
+        let (status, _) = map_runtime_error(
+            &ThreadRuntimeError::Storage(latte_engine::StorageError::LeaseLost),
+            7,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // StaleRevision becomes 409.
+        let (status, _) = map_runtime_error(
+            &ThreadRuntimeError::Storage(latte_engine::StorageError::StaleRevision {
+                expected: 1,
+                actual: 2,
+            }),
+            8,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // StaleThreadRevision becomes 409.
+        let (status, _) = map_runtime_error(
+            &ThreadRuntimeError::Storage(latte_engine::StorageError::StaleThreadRevision {
+                expected: 1,
+                actual: 2,
+            }),
+            9,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn idempotency_pending_ttl_expires_and_reclaims() {
+        let state = state();
+        let key = "test-token:ns:ttl-test";
+
+        // Claim the key.
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::Owner
+        ));
+
+        // While within TTL, a second claim sees InFlight.
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::InFlight
+        ));
+
+        // Manually expire the pending entry by backdating it.
+        {
+            let mut ledger = state.idempotency.lock().unwrap();
+            ledger.insert(
+                key.to_string(),
+                IdempotentSlot::Pending {
+                    claimed_at: std::time::Instant::now() - Duration::from_secs(600),
+                },
+            );
+        }
+
+        // After TTL, the slot is reclaimed — caller becomes new Owner.
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::Owner
+        ));
+    }
+
+    #[test]
     fn idempotency_key_is_namespaced_by_token_and_trimmed() {
         let state = state();
         let mut headers = HeaderMap::new();
