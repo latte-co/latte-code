@@ -1212,6 +1212,7 @@ dependencies = [
  "latte-core",
  "latte-engine",
  "latte-headless",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",

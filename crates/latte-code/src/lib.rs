@@ -2834,6 +2834,118 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn workspace_builder_reports_provider_resolution_failure() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join("state");
+        let (state, _token, _token_path) = match prepare_server(root.path(), &storage_home) {
+            Ok(value) => value,
+            Err(error) => panic!("prepare_server failed: {}", error.message),
+        };
+        let workspace = state.workspaces.get_or_create(root.path()).await.unwrap();
+
+        // A binding whose provider is no longer configured: the per-workspace
+        // factory built inside prepare_server is invoked when the thread
+        // starts, and its resolution failure surfaces as a retryable child
+        // failure rather than a startup error.
+        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let binding = ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "missing".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "model".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:MISSING".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let snapshot = workspace
+            .runtime
+            .start(thread_id, "hello".into(), binding)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            ThreadLifecycle::Ready,
+            "provider construction failure must be a retryable child failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_bound_completes_gracefully_on_sigterm() {
+        // SIGTERM is process-wide, so re-execute this test in a child process
+        // with a scratch environment; the child signals itself, leaving the
+        // parent test process and other test binaries untouched. The child
+        // inherits the coverage profile with a pid suffix (the E2E harness
+        // trick) so its executed lines are recorded.
+        if std::env::var_os("LATTE_CODE_SIGTERM_TEST").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let storage_home = home.path().join(".latte/latte-code");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("serve_bound_completes_gracefully_on_sigterm")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .stdin(std::process::Stdio::null())
+                .env("HOME", home.path())
+                .env("LATTE_CODE_HOME", &storage_home)
+                .env("LATTE_CODE_SIGTERM_TEST", "1");
+            if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+                command.env(
+                    "LLVM_PROFILE_FILE",
+                    profile.replace(".profraw", "-%p.profraw"),
+                );
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Child: reserve a port, run execute_serve, then SIGTERM self once the
+        // health endpoint answers (proving serve_on is polling its shutdown
+        // signal, so the signal triggers graceful shutdown instead of killing
+        // the process).
+        let (probe, addr) = bind_local_listener(0).await.unwrap();
+        let port = addr.port();
+        drop(probe);
+        let args = vec!["--port".to_string(), port.to_string()];
+        let server = tokio::spawn(async move { execute_serve(&args, true).await });
+        wait_for_listening(port).await;
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(std::process::id()).unwrap()),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server did not shut down within the deadline")
+            .expect("serve task panicked");
+        assert_eq!(code, EXIT_COMPLETED);
+    }
+
     #[test]
     fn prepare_server_reports_uncreateable_storage_directory() {
         let root = tempfile::tempdir().unwrap();

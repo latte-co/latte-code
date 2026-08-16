@@ -536,4 +536,125 @@ mod tests {
         assert_eq!(instance.id, "ws_fake");
         assert_eq!(instance.path, fake_path);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_bridge_resyncs_on_lagged_subscription() {
+        // Flooding the engine's thread_events channel (capacity 64) with
+        // synchronous commits before the bridge task is polled causes the
+        // bridge receiver to lag; the bridge forwards a ResyncRequired event
+        // (covers the Lagged arm).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".latte/state.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db)
+            .conversation_root(dir.path().join(".latte/sessions"))
+            .build()
+            .unwrap();
+        let (event_tx, mut event_rx) = broadcast::channel(256);
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            Arc::new(|_| Err("unused".to_string()));
+        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            engine.clone(),
+            dir.path(),
+            Default::default(),
+            factory,
+        );
+        // Creating the instance starts the event bridge task. On a
+        // current-thread runtime the task is not polled until this test yields.
+        let _instance = WorkspaceInstance::new(
+            "ws_lag".into(),
+            dir.path().to_path_buf(),
+            runtime,
+            event_tx,
+            engine.clone(),
+        );
+
+        // Produce more thread events than the channel capacity (64) without
+        // yielding, so the bridge receiver falls behind and lags.
+        let binding = latte_core::ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let now = latte_core::wall_time_ms();
+        for _ in 0..70 {
+            let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+            let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+            let lease = engine.acquire_thread_lease(thread_id, now, 60_000).unwrap();
+            engine
+                .create_started_thread_v2(thread_id, run_id, binding.clone(), "prompt", &lease, now)
+                .unwrap();
+        }
+
+        // Yield so the bridge task is polled and observes the lag.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The bridge must have forwarded a ResyncRequired event.
+        let mut saw_resync = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, crate::http::ServerEvent::ResyncRequired) {
+                saw_resync = true;
+            }
+        }
+        assert!(
+            saw_resync,
+            "event bridge did not forward ResyncRequired on lagged subscription"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_get_or_create_with_slow_builder_hits_double_check() {
+        // A slow builder holds the write lock long enough for other tasks to
+        // queue up; when they acquire the lock they hit the double-check path
+        // (lines 194-195) and return the existing instance.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let builder: WorkspaceRuntimeBuilder = Arc::new(move |root: &Path| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let db = root.join(".latte/state.db");
+            std::fs::create_dir_all(db.parent().unwrap()).map_err(|e| e.to_string())?;
+            let engine = latte_engine::EngineBuilder::new()
+                .workspace_root(root)
+                .database_path(&db)
+                .conversation_root(root.join(".latte/sessions"))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let factory: latte_headless::thread::ThreadProviderFactory =
+                Arc::new(|_| Err("no provider".to_string()));
+            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                engine.clone(),
+                root,
+                Default::default(),
+                factory,
+            );
+            Ok(BuiltWorkspace { engine, runtime })
+        });
+        let locator: SessionLocator = Arc::new(|_| None);
+        let manager = Arc::new(WorkspaceManager::new(builder, locator));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let path = path.clone();
+            handles.push(tokio::spawn(async move {
+                manager.get_or_create(&path).await.unwrap().id.clone()
+            }));
+        }
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.unwrap());
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert!(manager.get_by_id(&ids[0]).await.is_some());
+    }
 }

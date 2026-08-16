@@ -2862,4 +2862,333 @@ mod tests {
         // Release the turn so the runner drains and exits cleanly.
         gate.notify_waiters();
     }
+
+    #[test]
+    fn is_retryable_storage_returns_false_for_non_retryable() {
+        // Non-retryable storage errors must not be classified as conflicts,
+        // covering the `_ => false` arm of the matches! in is_retryable_storage.
+        assert!(!is_retryable_storage(
+            &latte_engine::StorageError::EffectFenced
+        ));
+        assert!(!is_retryable_storage(
+            &latte_engine::StorageError::InvalidData("bad".into())
+        ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_in_flight_retry_conflicts() {
+        // A second keyed follow-up while the first holds the reservation is
+        // rejected as 409 (covers the InFlight arm in the follow-up handler).
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision) = completed_session(&state, &workspace_id).await;
+
+        // Pre-claim with the exact payload digest the handler will compute.
+        let payload_digest = canonical_digest(&serde_json::json!({
+            "prompt": "again",
+            "expected_thread_revision": revision,
+        }));
+        state.idempotency_claim(
+            &format!("test-token:follow-up:{session_id}:inflight-key"),
+            &payload_digest,
+        );
+
+        let (status, body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "inflight-key")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn cancel_session_with_correct_revisions_succeeds() {
+        // Cancelling a running session with matching fences returns 200
+        // (covers the Ok arm of cancel_session).
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = blocking_state(gate.clone());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (_, created) = call(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "slow", "binding": valid_binding() })),
+        )
+        .await;
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+
+        // Wait until the session has an active run, then read the authoritative
+        // thread and run revisions for a correct-fence cancel.
+        let (revision, run_revision) = 'wait: {
+            for _ in 0..200 {
+                let (status, body) =
+                    call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
+                if status == StatusCode::OK {
+                    let snapshot = &body["snapshot"];
+                    if let Some(active_run_id) = snapshot["active_run_id"].as_str() {
+                        let revision = snapshot["revision"].as_u64().unwrap();
+                        let run_revision = snapshot["runs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|run| run["run_id"].as_str() == Some(active_run_id))
+                            .and_then(|run| run["run_revision"].as_u64())
+                            .unwrap();
+                        break 'wait (revision, run_revision);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("session never started an active run");
+        };
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/cancel"),
+            Some(serde_json::json!({
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "cancel returned {body:?}");
+        assert!(body["snapshot"].is_object());
+
+        // Release the blocked turn so the runner drains and exits cleanly.
+        gate.notify_waiters();
+    }
+
+    /// Server state whose provider calls a `process` tool with a missing
+    /// command. After permission is granted the launch fails and the session
+    /// enters ReconciliationRequired, so the reconcile Ok path is reachable.
+    fn process_reconciliation_state() -> Arc<ServerState> {
+        use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
+        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+                let provider = FakeProvider::scripted([
+                    ProviderResponse {
+                        message: Some("attempting failed process".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "failed-process".into(),
+                            name: "process".into(),
+                            input: serde_json::json!({
+                                "argv": ["/definitely-missing-latte-command"]
+                            }),
+                        }],
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    },
+                    ProviderResponse {
+                        message: Some("must not be reached".into()),
+                        tool_calls: Vec::new(),
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: Some(latte_headless::provider::FinishReason::Stop),
+                        provider_state: None,
+                    },
+                ]);
+                Ok(ResolvedProvider {
+                    provider: std::sync::Arc::new(provider),
+                    binding: ProviderBinding {
+                        version: binding.version,
+                        provider_name: binding.provider_name.clone(),
+                        provider_type: binding.provider_type.clone(),
+                        protocol: binding.protocol.clone(),
+                        model: binding.model.clone(),
+                        config_fingerprint: binding.config_fingerprint.clone(),
+                        tools_fingerprint: binding.tools_fingerprint.clone(),
+                        aliases: binding.aliases.clone(),
+                    },
+                })
+            });
+        state_with_factory(factory)
+    }
+
+    #[tokio::test]
+    async fn reconcile_effect_on_reconciliation_required_session_succeeds() {
+        // A process launch that fails after permission is granted leaves the
+        // session in ReconciliationRequired; reconciling the unknown effect
+        // returns 200 (covers the Ok arm of reconcile_effect).
+        let state = process_reconciliation_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision, request_id, run_revision) =
+            waiting_permission_session(&state, &workspace_id).await;
+
+        // Grant permission; the launch fails and the session enters
+        // ReconciliationRequired.
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            Some(serde_json::json!({
+                "allow": true,
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resolve returned {body:?}");
+
+        // Wait for ReconciliationRequired and extract the effect_id.
+        let effect_id = 'wait: {
+            for _ in 0..200 {
+                let (status, body) =
+                    call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
+                if status == StatusCode::OK
+                    && body["snapshot"]["lifecycle"].as_str() == Some("reconciliation_required")
+                {
+                    let effect_id = body["snapshot"]["transcript"]["entries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find_map(|entry| {
+                            entry["payload"]["descriptor"]["effect_id"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .expect("effect_id in transcript");
+                    break 'wait effect_id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("session did not enter ReconciliationRequired");
+        };
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/effects/{effect_id}/reconcile"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "reconcile returned {body:?}");
+        assert!(body["snapshot"].is_object());
+    }
+
+    #[tokio::test]
+    async fn workspace_events_emits_resync_on_lagged_receiver() {
+        // Flooding the workspace event channel (capacity 256) without reading
+        // the SSE body causes the BroadcastStream to lag; the handler maps the
+        // lag to a resync_required frame (covers the Err arm).
+        use tokio_stream::StreamExt as _;
+
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let workspace = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+
+        let response = router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/workspaces/{workspace_id}/events"))
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Send more events than the channel capacity so the receiver lags
+        // before the body is read.
+        for _ in 0..257 {
+            let _ = workspace.event_tx.send(ServerEvent::ResyncRequired);
+        }
+
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(200), body.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                    if seen.contains("resync_required") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            seen.contains("resync_required"),
+            "lagged SSE receiver did not emit resync_required: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "session did not reach a durable idle state")]
+    async fn completed_session_times_out_when_turn_never_completes() {
+        // A blocked turn never reaches "ready", so the polling helper
+        // exhausts its retries and panics (covers the sleep + panic lines).
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = blocking_state(gate);
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        completed_session(&state, &workspace_id).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "session did not reach WaitingPermission")]
+    async fn waiting_permission_session_times_out_when_not_permission_gated() {
+        // A completing session reaches "ready", not "waiting_permission", so
+        // the polling helper exhausts its retries and panics.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        waiting_permission_session(&state, &workspace_id).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "session did not reach WaitingInput")]
+    async fn waiting_input_session_times_out_when_not_input_gated() {
+        // A completing session reaches "ready", not "waiting_input", so the
+        // polling helper exhausts its retries and panics.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        waiting_input_session(&state, &workspace_id).await;
+    }
+
+    #[tokio::test]
+    async fn serve_on_returns_after_sigterm() {
+        // The public serve_on wrapper wires the real signal-based shutdown.
+        // Sending SIGTERM resolves shutdown_signal, serve_with_shutdown stops
+        // gracefully, and serve_on returns Ok (covers lib.rs L33 and the
+        // shutdown_signal terminate arm / closing lines).
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        // Register a SIGTERM handler first so the process does not use the
+        // default (terminating) disposition before serve_on installs its own.
+        let mut early_sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(crate::serve_on(state(), listener));
+
+        // Wait for the server to install its signal handlers and start serving.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send SIGTERM to self; both early_sigterm and shutdown_signal receive it.
+        kill(Pid::from_raw(std::process::id() as i32), Signal::SIGTERM).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve_on did not return after SIGTERM");
+        assert!(result.unwrap().is_ok());
+
+        // Consume the signal so it does not leak to other waiters.
+        let _ = early_sigterm.recv().await;
+    }
 }
