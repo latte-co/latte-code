@@ -1420,16 +1420,39 @@ fn generate_server_token() -> String {
     )
 }
 
-/// Writes the Bearer token with owner-only permissions where supported.
+/// Writes the Bearer token atomically with owner-only permissions. Creates a
+/// temporary file with restrictive mode, writes the token, then renames into
+/// place so that the final path is never observable with partial content or
+/// permissive mode.
 fn write_server_token(path: &Path, token: &str) -> Result<(), String> {
-    std::fs::write(path, token)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cannot determine parent of {}", path.display()))?;
+    let tmp_path = parent.join(format!(
+        ".server.token.{}",
+        std::process::id()
+    ));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("cannot secure {}: {error}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|error| format!("cannot create {}: {error}", tmp_path.display()))?;
+        file.write_all(token.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", tmp_path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, token)
+            .map_err(|error| format!("cannot write {}: {error}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .map_err(|error| format!("cannot publish {}: {error}", path.display()))?;
     Ok(())
 }
 
@@ -2472,10 +2495,10 @@ mod tests {
         }
 
         let missing = dir.path().join("no-such-dir").join("server.token");
+        let err = write_server_token(&missing, &first).unwrap_err();
         assert!(
-            write_server_token(&missing, &first)
-                .unwrap_err()
-                .contains("cannot write")
+            err.contains("cannot create") || err.contains("cannot write"),
+            "unexpected error: {err}"
         );
     }
 

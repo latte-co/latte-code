@@ -768,14 +768,16 @@ impl ThreadRuntimeService {
         if snapshot.revision != expected_thread_revision || run_revision != expected_run_revision {
             return Err(ThreadRuntimeError::InvalidState);
         }
-        if self
-            .active
-            .lock()
-            .expect("active mutex poisoned")
-            .contains_key(&thread_id)
+        // Hold the active-map lock across the fence recheck and signal so no
+        // concurrent state advance can slip between validation and
+        // cancellation.
         {
-            self.cancel(thread_id);
-            return self.load_full(thread_id);
+            let active = self.active.lock().expect("active mutex poisoned");
+            if let Some(token) = active.get(&thread_id) {
+                token.cancel();
+                drop(active);
+                return self.load_full(thread_id);
+            }
         }
         let lease = self.acquire(thread_id)?;
         self.commit(

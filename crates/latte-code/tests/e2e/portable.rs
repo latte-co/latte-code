@@ -551,6 +551,28 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     assert_eq!(replay_status, 202);
     assert_eq!(replay_body["session_id"].as_str().unwrap(), session_id);
 
+    // A keyed create that fails (invalid binding) releases its reservation, so
+    // a corrected retry with the same key proceeds rather than 409-in-flight.
+    let (bad_key_status, _) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "x", "binding": { "version": 1 } })),
+        &[("Idempotency-Key", "e2e-release-key")],
+    );
+    assert_eq!(bad_key_status, 400);
+    let (retry_status, _) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "recovered", "binding": binding })),
+        &[("Idempotency-Key", "e2e-release-key")],
+    );
+    assert_eq!(
+        retry_status, 202,
+        "released key must allow a corrected retry"
+    );
+
     // The durable session becomes readable and, once the scripted provider
     // completes the background turn, reaches the idle "ready" lifecycle.
     let mut ready = false;
@@ -1013,7 +1035,7 @@ fn final_binary_server_provides_input_through_http() {
 
     // Queueing against a session parked on input is timing-dependent (the
     // runner window may or may not still be open), but must never be a server
-    // error — accept queued / conflict / not-found, reject 5xx.
+    // error or a 404 (the session IS known and durable at this point).
     let (queue_status, queue_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/queue"),
@@ -1022,7 +1044,7 @@ fn final_binary_server_provides_input_through_http() {
         &[],
     );
     assert!(
-        matches!(queue_status, 202 | 404 | 409),
+        matches!(queue_status, 202 | 409),
         "unexpected queue status {queue_status}: {queue_body:?}"
     );
 

@@ -24,6 +24,9 @@ use tracing::{info, warn};
 
 use crate::workspace::{WorkspaceInstance, WorkspaceManager};
 
+/// A pending idempotency reservation older than this is treated as abandoned.
+const IDEMPOTENCY_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A recorded outcome of a durable mutation, replayed verbatim when a client
 /// retries the same `Idempotency-Key`. Only the accepted acknowledgement is
 /// stored; the durable turn continues under supervised background execution.
@@ -38,7 +41,7 @@ struct IdempotentRecord {
 /// available for replay.
 #[derive(Clone)]
 enum IdempotentSlot {
-    Pending,
+    Pending { claimed_at: std::time::Instant },
     Done(IdempotentRecord),
 }
 
@@ -83,13 +86,36 @@ impl ServerState {
     /// and reserves the slot; a concurrent caller sees `InFlight`; a caller
     /// after completion gets `Replay`. This single-lock reserve-or-replay
     /// avoids the check-then-store race where two retries both execute.
+    ///
+    /// A `Pending` reservation that has been held longer than
+    /// `IDEMPOTENCY_PENDING_TTL` is treated as abandoned (owner crashed or was
+    /// cancelled) and is reclaimed by the new caller.
     fn idempotency_claim(&self, key: &str) -> IdempotencyClaim {
         let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
         match ledger.get(key) {
             Some(IdempotentSlot::Done(record)) => IdempotencyClaim::Replay(record.clone()),
-            Some(IdempotentSlot::Pending) => IdempotencyClaim::InFlight,
+            Some(IdempotentSlot::Pending { claimed_at })
+                if claimed_at.elapsed() < IDEMPOTENCY_PENDING_TTL =>
+            {
+                IdempotencyClaim::InFlight
+            }
+            Some(IdempotentSlot::Pending { .. }) => {
+                // Expired pending: the original owner abandoned the key.
+                ledger.insert(
+                    key.to_string(),
+                    IdempotentSlot::Pending {
+                        claimed_at: std::time::Instant::now(),
+                    },
+                );
+                IdempotencyClaim::Owner
+            }
             None => {
-                ledger.insert(key.to_string(), IdempotentSlot::Pending);
+                ledger.insert(
+                    key.to_string(),
+                    IdempotentSlot::Pending {
+                        claimed_at: std::time::Instant::now(),
+                    },
+                );
                 IdempotencyClaim::Owner
             }
         }
@@ -108,7 +134,7 @@ impl ServerState {
     /// owner does not permanently block retries of the same key.
     fn idempotency_release(&self, key: &str) {
         let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
-        if matches!(ledger.get(key), Some(IdempotentSlot::Pending)) {
+        if matches!(ledger.get(key), Some(IdempotentSlot::Pending { .. })) {
             ledger.remove(key);
         }
     }
@@ -624,8 +650,8 @@ async fn queue_follow_up(
     }
 }
 
-/// Resolves a permission request. The thread revision fence and pending-request
-/// validation happen atomically inside the engine operation.
+/// Resolves a permission request. Both thread and run revision fences are
+/// validated before the authority-changing operation proceeds.
 async fn resolve_permission(
     State(state): State<Arc<ServerState>>,
     Path((id, request_id)): Path<(String, String)>,
@@ -633,6 +659,11 @@ async fn resolve_permission(
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
+
+    // Validate the caller's run revision fence before the authority-changing
+    // operation so a stale client cannot resolve a permission belonging to a
+    // newer run.
+    validate_run_revision(&workspace, thread_id, req.expected_run_revision)?;
 
     match workspace
         .runtime
@@ -652,8 +683,8 @@ async fn resolve_permission(
     }
 }
 
-/// Provides a requested non-secret input value. The thread revision fence and
-/// waiting-input validation happen atomically inside the engine operation.
+/// Provides a requested non-secret input value. Both thread and run revision
+/// fences are validated before the authority-changing operation proceeds.
 async fn provide_input(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -661,6 +692,10 @@ async fn provide_input(
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
+
+    // Validate the caller's run revision fence before the authority-changing
+    // operation so a stale client cannot provide input to a newer run.
+    validate_run_revision(&workspace, thread_id, req.expected_run_revision)?;
 
     match workspace
         .runtime
@@ -715,6 +750,36 @@ async fn lookup_workspace(
         .map_err(|_| not_found("workspace not found"))
 }
 
+/// Validates the caller's expected run revision against the authoritative
+/// snapshot. Returns 409 if the run revision is stale, preventing a stale
+/// client from resolving a permission or providing input to a newer run.
+fn validate_run_revision(
+    workspace: &WorkspaceInstance,
+    thread_id: ThreadId,
+    expected_run_revision: u64,
+) -> Result<(), HandlerError> {
+    let snapshot = workspace
+        .snapshot(thread_id)
+        .map_err(|_| not_found("session not found"))?;
+    let actual_run_revision = snapshot
+        .active_run_id
+        .and_then(|run_id| {
+            snapshot
+                .runs
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .map(|r| r.run_revision)
+        })
+        .unwrap_or(0);
+    if expected_run_revision != actual_run_revision {
+        return Err(conflict(
+            "run revision is stale",
+            Some(snapshot.revision),
+        ));
+    }
+    Ok(())
+}
+
 /// Reads the optional `Idempotency-Key` header namespaced by the server token,
 /// matching the documented `(token, idempotency_key)` dedup identity.
 fn namespaced_idempotency_key(state: &ServerState, headers: &HeaderMap) -> Option<String> {
@@ -726,15 +791,29 @@ fn namespaced_idempotency_key(state: &ServerState, headers: &HeaderMap) -> Optio
         .map(|value| format!("{}:{value}", state.token))
 }
 
-/// Maps a runtime error to an HTTP response. A state/revision conflict becomes
-/// 409 with the current revision; other failures become 500.
+/// Maps a runtime error to an HTTP response. State/revision conflicts and
+/// lease/storage races become 409 with the current revision so clients can
+/// retry after a refetch; other failures become 500.
 fn map_runtime_error(error: &ThreadRuntimeError, current_revision: u64) -> HandlerError {
     match error {
         ThreadRuntimeError::InvalidState => {
             conflict("session state changed", Some(current_revision))
         }
+        ThreadRuntimeError::Storage(storage_err) if is_retryable_storage(storage_err) => {
+            conflict(&format!("{storage_err}"), Some(current_revision))
+        }
         other => failed(&format!("operation failed: {other}")),
     }
+}
+
+fn is_retryable_storage(err: &latte_engine::StorageError) -> bool {
+    matches!(
+        err,
+        latte_engine::StorageError::EngineUnavailable
+            | latte_engine::StorageError::LeaseLost
+            | latte_engine::StorageError::StaleRevision { .. }
+            | latte_engine::StorageError::StaleThreadRevision { .. }
+    )
 }
 
 fn parse_thread_id(id: &str) -> Result<ThreadId, HandlerError> {
