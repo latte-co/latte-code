@@ -1058,6 +1058,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn final_binary_server_provides_input_through_http() {
     let scenario = Scenario::new();
     // The scripted provider requests non-secret input, parking the session at
