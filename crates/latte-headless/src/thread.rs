@@ -2132,6 +2132,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_start_and_follow_up_reject_while_runner_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        // A delayed provider keeps the runner active while the turn is
+        // running, so a concurrent start/follow_up must fail with
+        // InvalidState (the mailbox is held by the active runner).
+        let service = delayed_service(
+            root.path(),
+            engine,
+            [(Duration::from_millis(300), simple_response("done"))],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let first = service.clone();
+        let running = tokio::spawn(async move {
+            first
+                .start(thread_id, "slow turn".into(), binding())
+                .await
+        });
+        // Let the first turn enter the provider call so its runner is active.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // While the runner is active, start_accepted must reject with
+        // InvalidState and signal the accept channel.
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let err = service
+            .start_accepted(thread_id, "second start".into(), binding(), accept_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        accept_rx
+            .await
+            .expect("accept channel must be signalled")
+            .expect_err("accept must carry the error");
+
+        // follow_up_accepted must also reject while the runner is active.
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let err = service
+            .follow_up_accepted(thread_id, 0, "second follow-up".into(), accept_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        accept_rx
+            .await
+            .expect("accept channel must be signalled")
+            .expect_err("accept must carry the error");
+
+        // The original turn completes successfully.
+        let completed = running.await.unwrap().unwrap();
+        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+    }
+
+    #[tokio::test]
     async fn start_provider_configuration_failure_is_durable_and_retryable() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()

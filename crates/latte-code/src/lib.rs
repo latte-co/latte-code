@@ -1556,7 +1556,7 @@ mod tests {
         dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
         exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
         outcome, parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action,
-        render_run, storage_home_with, tui_startup_presentation, verify_timeout,
+        render_run, serve_bound, storage_home_with, tui_startup_presentation, verify_timeout,
         workspace_display_path, workspace_display_path_with_home, workspace_identity,
         write_server_token,
     };
@@ -1579,7 +1579,13 @@ mod tests {
         ThreadUiFeedback,
     };
     use serde_json::json;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     fn state(status: RunStatus) -> RunState {
         let mut state =
@@ -2635,5 +2641,182 @@ mod tests {
         assert_eq!(envelope["address"], "127.0.0.1:4096");
         assert_eq!(envelope["port"], 4096);
         assert_eq!(envelope["token_path"], "/tmp/latte/server.token");
+    }
+
+    /// Redirects the process-global environment `serve_bound` reads
+    /// (`LATTE_CODE_HOME`, and `HOME` for the optional user config layer) into
+    /// scratch directories, so server tests never touch the developer's real
+    /// state or token file. The mutex serializes env-mutating tests against
+    /// each other; other tests in this crate only read `HOME` for display
+    /// paths and tolerate a temporary value, and other test binaries are
+    /// separate processes.
+    static SERVE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `closure` with `HOME` and `LATTE_CODE_HOME` pointed at scratch
+    /// directories, restoring the previous values on completion.
+    fn with_scratch_serve_env<R>(
+        home: &Path,
+        storage_home: &Path,
+        closure: impl FnOnce() -> R,
+    ) -> R {
+        let _lock = SERVE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("LATTE_CODE_HOME", Some(storage_home.as_os_str())),
+            ],
+            closure,
+        )
+    }
+
+    /// A scratch storage layout under a temporary HOME: `serve_bound` resolves
+    /// `$LATTE_CODE_HOME` (and the optional `$HOME` config layer) from the
+    /// process environment, so tests point both at scratch directories.
+    fn scratch_serve_env() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join(".latte/latte-code");
+        (home, storage_home)
+    }
+
+    /// Polls the loopback port until the server accepts a connection.
+    async fn wait_for_listening(port: u16) {
+        for _ in 0..200 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("server never accepted a connection on 127.0.0.1:{port}");
+    }
+
+    /// Writes a minimal valid workspace configuration so `prepare_server`
+    /// passes its up-front configuration validation.
+    fn write_valid_workspace_config(root: &Path) {
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{
+                version: 1,
+                default_model: "primary/model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "model": {} },
+                    base_url: "https://provider.example/v1",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } },
+                verification: { argv: ["true"] }
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn execute_serve_classifies_setup_errors_through_the_uniform_emitter() {
+        let (home, storage_home) = scratch_serve_env();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                // Occupy a port: serve_bound finishes full preparation, then bind fails
+                // and the classified error routes through execute_serve's emitter.
+                let (listener, addr) = bind_local_listener(0).await.unwrap();
+                let occupied = addr.port();
+                let code = execute_serve(&["--port".to_string(), occupied.to_string()], true).await;
+                assert_eq!(code, EXIT_INTERNAL);
+                drop(listener);
+            })
+        })
+    }
+
+    #[test]
+    fn serve_bound_announces_listening_writes_token_and_serves_health() {
+        let (home, storage_home) = scratch_serve_env();
+        with_scratch_serve_env(home.path(), &storage_home, || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for json in [true, false] {
+                    // Reserve a likely-free port, then hand it to serve_bound.
+                    let (probe, addr) = bind_local_listener(0).await.unwrap();
+                    let port = addr.port();
+                    drop(probe);
+
+                    let server = tokio::spawn(async move { serve_bound(port, json).await });
+                    wait_for_listening(port).await;
+
+                    // The token is published after bind, before serving starts.
+                    let token_path = storage_home.join("server.token");
+                    assert!(
+                        token_path.is_file(),
+                        "token must be published after the listener binds"
+                    );
+                    let token = std::fs::read_to_string(&token_path).unwrap();
+                    assert!(token.len() >= 32, "token must carry sufficient entropy");
+
+                    // The health endpoint answers on the bound port without a token.
+                    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                    stream
+                        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+                        "unexpected response: {}",
+                        String::from_utf8_lossy(&response)
+                    );
+
+                    // serve_on blocks on process signals; abort the task like the
+                    // latte-server tests do, since signals are process-wide.
+                    server.abort();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn prepare_server_reports_uncreateable_storage_directory() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let blocker = home.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let storage_home = blocker.join("state");
+
+        let Err(error) = prepare_server(root.path(), &storage_home) else {
+            panic!("expected storage directory creation to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "storage_directory");
+        assert!(
+            error.message.contains("cannot create"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn prepare_server_reports_engine_initialization_failure() {
+        let root = tempfile::tempdir().unwrap();
+        write_valid_workspace_config(root.path());
+        let home = tempfile::tempdir().unwrap();
+        let storage_home = home.path().join("state");
+        std::fs::create_dir_all(&storage_home).unwrap();
+        // A directory at the database path makes the SQLite open fail.
+        std::fs::create_dir_all(storage_home.join("state.db")).unwrap();
+
+        let Err(error) = prepare_server(root.path(), &storage_home) else {
+            panic!("expected engine initialization to fail");
+        };
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.category, "engine_initialization");
     }
 }

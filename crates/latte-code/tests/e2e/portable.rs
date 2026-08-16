@@ -900,6 +900,28 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     );
     assert_eq!(no_key_follow_status, 202);
 
+    // A create WITHOUT key that FAILS (invalid binding) exercises the
+    // (None, Err) branch in the create handler's idempotency match.
+    let (no_key_bad_status, _) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "bad", "binding": {"version": 1} })),
+        &[],
+    );
+    assert_eq!(no_key_bad_status, 400);
+
+    // A follow-up WITHOUT key with a stale revision exercises the
+    // (None, Err) branch in the follow-up handler's idempotency match.
+    let (no_key_stale_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{no_key_session}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "stale", "expected_thread_revision": 999 })),
+        &[],
+    );
+    assert_eq!(no_key_stale_status, 409);
+
     // A create with a key that is currently Pending (in-flight) but with a
     // DIFFERENT payload triggers 422 payload mismatch (Pending-state mismatch).
     let (pending_mismatch_status, pending_mismatch_body) = server.request(
@@ -1055,6 +1077,405 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         noop_status == 200 || noop_status == 409,
         "switch-model status: {noop_status}"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_denies_a_permission_request_through_http() {
+    let scenario = Scenario::new();
+    // The scripted provider requests a write_file tool call, parking the
+    // session at WaitingPermission; denying the permission over HTTP records
+    // the denial and continues the turn without executing the effect.
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-deny",
+            "write_file",
+            &serde_json::json!({
+                "path": "denied.txt",
+                "content": "should not be written\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("permission denied, moving on"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission over HTTP");
+
+    // Denying the permission over HTTP records the denial without executing
+    // the effect; the provider turn continues to completion.
+    let (deny_status, deny_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": false,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(deny_status, 200, "deny returned {deny_body:?}");
+    assert!(deny_body["snapshot"].is_object());
+
+    // The denied effect must not have written the file.
+    assert!(
+        !scenario.root().join("denied.txt").exists(),
+        "denied effect must not write the file"
+    );
+
+    // The session settles at a durable idle lifecycle after the denied turn.
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled after the denied turn");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_rejects_secret_input_request_from_provider() {
+    let scenario = Scenario::new();
+    // The headless runtime does not support provider-requested secret input:
+    // a secret input_request must fail the session with a clear error rather
+    // than park at WaitingInput with a secret in the durable command shape.
+    let provider = ScriptedProvider::start([ProviderReply::input_request(
+        "secret-1",
+        "Enter API key",
+        true,
+    )]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "need a secret", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // The secret input request is rejected; the session settles at Failed.
+    let mut failed = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed") {
+            failed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        failed,
+        "session must fail when the provider requests secret input"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_rejects_stale_run_revision_on_permission() {
+    let scenario = Scenario::new();
+    // The scripted provider requests a tool call, parking the session at
+    // WaitingPermission. Resolving with a stale run_revision must 409;
+    // resolving with the correct run_revision must succeed.
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "stale-run-perm",
+            "write_file",
+            &serde_json::json!({
+                "path": "stale-perm.txt",
+                "content": "ok\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission over HTTP");
+
+    // A stale run_revision is rejected with 409.
+    let (stale_status, stale_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision + 999
+        })),
+        &[],
+    );
+    assert_eq!(stale_status, 409, "stale run_revision must 409: {stale_body:?}");
+
+    // The correct run_revision succeeds.
+    let (ok_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(ok_status, 200);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_rejects_stale_run_revision_on_input() {
+    let scenario = Scenario::new();
+    // The scripted provider requests non-secret input, parking the session at
+    // WaitingInput. Providing input with a stale run_revision must 409;
+    // providing with the correct run_revision must succeed.
+    let provider = ScriptedProvider::start([
+        ProviderReply::input_request("stale-run-input", "what value?", false),
+        ProviderReply::completion("got it"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "need input", "binding": binding })),
+        &[],
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingInput.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingInput over HTTP");
+
+    // A stale run_revision is rejected with 409.
+    let (stale_status, stale_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "stale",
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision + 999
+        })),
+        &[],
+    );
+    assert_eq!(stale_status, 409, "stale run_revision must 409: {stale_body:?}");
+
+    // The correct run_revision succeeds.
+    let (ok_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "correct",
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(ok_status, 200);
 }
 
 #[test]
