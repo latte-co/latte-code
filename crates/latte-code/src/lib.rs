@@ -1428,10 +1428,7 @@ fn write_server_token(path: &Path, token: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("cannot determine parent of {}", path.display()))?;
-    let tmp_path = parent.join(format!(
-        ".server.token.{}",
-        std::process::id()
-    ));
+    let tmp_path = parent.join(format!(".server.token.{}", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write;

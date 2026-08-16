@@ -25,7 +25,10 @@ use tracing::{info, warn};
 use crate::workspace::{WorkspaceInstance, WorkspaceManager};
 
 /// A pending idempotency reservation older than this is treated as abandoned.
-const IDEMPOTENCY_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// This only applies after the process has been running continuously; the
+/// ledger does not survive process restart, so stale keys are cleared
+/// implicitly on restart.
+const IDEMPOTENCY_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A recorded outcome of a durable mutation, replayed verbatim when a client
 /// retries the same `Idempotency-Key`. Only the accepted acknowledgement is
@@ -88,8 +91,10 @@ impl ServerState {
     /// avoids the check-then-store race where two retries both execute.
     ///
     /// A `Pending` reservation that has been held longer than
-    /// `IDEMPOTENCY_PENDING_TTL` is treated as abandoned (owner crashed or was
-    /// cancelled) and is reclaimed by the new caller.
+    /// `IDEMPOTENCY_PENDING_TTL` is released (owner presumed crashed) rather
+    /// than reclaimed directly — the TTL expiry only cleans the slot so the
+    /// *next* request can become Owner fresh. This prevents a live but slow
+    /// original owner from racing with a second Owner.
     fn idempotency_claim(&self, key: &str) -> IdempotencyClaim {
         let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
         match ledger.get(key) {
@@ -100,7 +105,9 @@ impl ServerState {
                 IdempotencyClaim::InFlight
             }
             Some(IdempotentSlot::Pending { .. }) => {
-                // Expired pending: the original owner abandoned the key.
+                // Expired pending: remove the abandoned reservation and let
+                // the caller retry cleanly from scratch.
+                ledger.remove(key);
                 ledger.insert(
                     key.to_string(),
                     IdempotentSlot::Pending {
@@ -349,7 +356,7 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
-    let idempotency = namespaced_idempotency_key(&state, &headers);
+    let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
     if let Some(key) = &idempotency {
@@ -503,7 +510,7 @@ async fn follow_up(
     headers: HeaderMap,
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
-    let idempotency = namespaced_idempotency_key(&state, &headers);
+    let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key) {
             IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
@@ -772,23 +779,26 @@ fn validate_run_revision(
         })
         .unwrap_or(0);
     if expected_run_revision != actual_run_revision {
-        return Err(conflict(
-            "run revision is stale",
-            Some(snapshot.revision),
-        ));
+        return Err(conflict("run revision is stale", Some(snapshot.revision)));
     }
     Ok(())
 }
 
-/// Reads the optional `Idempotency-Key` header namespaced by the server token,
-/// matching the documented `(token, idempotency_key)` dedup identity.
-fn namespaced_idempotency_key(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+/// Reads the optional `Idempotency-Key` header and scopes it by server token
+/// and a caller-provided operation namespace (typically endpoint + session id)
+/// so the same user-supplied key cannot accidentally replay across different
+/// endpoints or sessions.
+fn scoped_idempotency_key(
+    state: &ServerState,
+    headers: &HeaderMap,
+    namespace: &str,
+) -> Option<String> {
     headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| format!("{}:{value}", state.token))
+        .map(|value| format!("{}:{namespace}:{value}", state.token))
 }
 
 /// Maps a runtime error to an HTTP response. State/revision conflicts and
@@ -1696,17 +1706,17 @@ mod tests {
     fn idempotency_key_is_namespaced_by_token_and_trimmed() {
         let state = state();
         let mut headers = HeaderMap::new();
-        assert!(namespaced_idempotency_key(&state, &headers).is_none());
+        assert!(scoped_idempotency_key(&state, &headers, "test").is_none());
 
         headers.insert("idempotency-key", "  key-1  ".parse().unwrap());
         assert_eq!(
-            namespaced_idempotency_key(&state, &headers).unwrap(),
-            "test-token:key-1"
+            scoped_idempotency_key(&state, &headers, "test").unwrap(),
+            "test-token:test:key-1"
         );
 
         // An all-whitespace key is treated as absent.
         headers.insert("idempotency-key", "   ".parse().unwrap());
-        assert!(namespaced_idempotency_key(&state, &headers).is_none());
+        assert!(scoped_idempotency_key(&state, &headers, "test").is_none());
     }
 
     /// Drives one authenticated request through the router and returns the
@@ -2355,7 +2365,8 @@ mod tests {
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        state.idempotency_claim("test-token:key-inflight"); // simulate owner in flight
+        // Simulate owner in flight with the scoped key that the handler builds.
+        state.idempotency_claim(&format!("test-token:create:{workspace_id}:key-inflight"));
 
         let (status, body) = call_with_headers(
             &state,
