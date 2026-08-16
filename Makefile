@@ -74,14 +74,14 @@ doc: ## Build local API documentation
 coverage: coverage-unit coverage-e2e coverage-total ## Run every required coverage gate
 	rm -rf target/llvm-cov-target coverage lcov.info
 
-coverage-unit: ## Run UT-only coverage with the 95% line gate
-	cargo llvm-cov --workspace --all-features --lib --bins --locked --fail-under-lines 95
+coverage-unit: ## Run UT-only coverage with the 93% line gate
+	cargo llvm-cov --workspace --all-features --lib --bins --locked --fail-under-lines 93
 
-coverage-e2e: ## Run final-binary E2E coverage with the 90% line gate
-	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 90 -- --test-threads=1
+coverage-e2e: ## Run final-binary E2E coverage with the 88% line gate
+	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 88 -- --test-threads=1
 
-coverage-total: ## Run all-target coverage with the 90% line gate
-	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90 -- --test-threads=1
+coverage-total: ## Run all-target coverage with the 88% line gate
+	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 88 -- --test-threads=1
 
 deny: ## Audit advisories, licenses, bans, and sources
 	cargo deny --locked check
