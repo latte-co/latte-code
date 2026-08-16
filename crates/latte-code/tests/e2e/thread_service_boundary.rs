@@ -164,7 +164,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     ));
     service.cancel(thread_id);
     assert!(matches!(
-        service.cancel_durable(thread_id),
+        service.cancel_durable(thread_id, followed.revision, 0),
         Err(ThreadRuntimeError::InvalidState)
     ));
     let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -174,7 +174,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             .await
             .is_err()
     );
-    assert!(service.cancel_durable(missing).is_err());
+    assert!(service.cancel_durable(missing, 0, 0).is_err());
 
     let constrained = ThreadRuntimeService::new(
         engine.clone(),

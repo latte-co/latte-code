@@ -537,7 +537,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     );
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
-    assert_eq!(create_body["accepted_revision"], 0);
+    // accepted_revision is the real durable revision after acceptance.
+    assert!(create_body["accepted_revision"].as_u64().is_some());
 
     // The same idempotency key replays the original accepted session.
     let (replay_status, replay_body) = server.request(
@@ -1345,5 +1346,94 @@ fn final_binary_server_marks_a_failed_background_turn() {
     assert!(
         settled,
         "session never settled after the failed background turn"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_persists_sessions_across_restart() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("done"),
+        ProviderReply::completion("done again"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // First server instance: create a durable session, then shut it down.
+    let session_id = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) = server.request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(&server.token),
+            Some(&serde_json::json!({ "prompt": "persist me", "binding": binding })),
+            &[],
+        );
+        assert_eq!(create_status, 202);
+        create_body["session_id"].as_str().unwrap().to_string()
+        // `server` drops here → SIGTERM → graceful shutdown.
+    };
+
+    // Second instance with the SAME HOME must still resolve the session from
+    // the durable global store, before any in-memory index is populated.
+    let server = ServeChild::start(&scenario);
+    let (get_status, get_body) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(
+        get_status, 200,
+        "durable session must be readable after restart: {get_body:?}"
+    );
+    assert_eq!(
+        get_body["snapshot"]["thread_id"].as_str().unwrap(),
+        session_id
+    );
+
+    // And it must appear in the workspace listing after restart.
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let (list_status, list_body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(list_status, 200);
+    assert!(
+        list_body["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions
+                .iter()
+                .any(|s| s["thread_id"].as_str() == Some(session_id.as_str()))),
+        "restarted server must list the durable session"
     );
 }

@@ -1001,11 +1001,26 @@ fn execute_tui() -> i32 {
                 latte_tui::thread::ThreadUiAction::Cancel { thread_id } => {
                     let service = service.clone();
                     let feedback = feedback_tx.clone();
+                    let cancel_engine = engine.clone();
                     tokio::task::spawn_blocking(move || {
-                        let result = service
-                            .cancel_durable(thread_id)
-                            .map(|_| "interruption requested".into())
-                            .map_err(|error| error.to_string());
+                        // The TUI cancels the session's current active run, so
+                        // fence against the live snapshot's revisions.
+                        let result = cancel_engine
+                            .thread_snapshot_v2(thread_id, None, 1)
+                            .map_err(|error| error.to_string())
+                            .and_then(|snapshot| {
+                                let run_revision = snapshot
+                                    .active_run_id
+                                    .and_then(|run_id| {
+                                        snapshot.runs.iter().find(|run| run.run_id == run_id)
+                                    })
+                                    .map(|run| run.run_revision)
+                                    .unwrap_or_default();
+                                service
+                                    .cancel_durable(thread_id, snapshot.revision, run_revision)
+                                    .map(|_| "interruption requested".into())
+                                    .map_err(|error| error.to_string())
+                            });
                         let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
                     });
                 }
@@ -1171,69 +1186,57 @@ const DEFAULT_SERVER_PORT: u16 = 4096;
 /// layered configuration and provider registry as the CLI/TUI, builds a
 /// per-binding provider factory, mints a Bearer token into
 /// `$LATTE_CODE_HOME/server.token` (owner-only), and serves on 127.0.0.1.
-#[allow(clippy::too_many_lines)]
 async fn execute_serve(args: &[String], json: bool) -> i32 {
-    use std::io::Write;
-
+    // `--port` parse errors are a usage error with help.
     let port = match parse_serve_port(args) {
         Ok(port) => port,
         Err(error) => return emit_error(json, "usage", "usage", &error, EXIT_USAGE, true),
     };
-
-    let root = match std::env::current_dir() {
-        Ok(root) => discover_workspace_root(&root),
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "current_directory",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-
-    let (state, token_path) = match storage_home()
-        .map_err(|message| ServerSetupError {
-            code: "usage",
-            category: "configuration",
-            message,
-        })
-        .and_then(|home| prepare_server(&root, &home))
-    {
-        Ok(value) => value,
+    match serve_bound(port, json).await {
+        Ok(code) => code,
         Err(ServerSetupError {
             code,
             category,
             message,
-        }) => {
-            return emit_error(json, code, category, &message, exit_for_setup(code), false);
-        }
-    };
+        }) => emit_error(json, code, category, &message, exit_for_setup(code), false),
+    }
+}
 
-    let (listener, local_addr) = match bind_local_listener(port).await {
-        Ok(value) => value,
-        Err(ServerSetupError {
-            code,
-            category,
-            message,
-        }) => {
-            return emit_error(json, code, category, &message, exit_for_setup(code), false);
-        }
-    };
+/// Sets up and runs the server, returning a process exit code or a classified
+/// setup error. Splitting this out lets `execute_serve` route every setup
+/// failure through one uniform emitter.
+async fn serve_bound(port: u16, json: bool) -> Result<i32, ServerSetupError> {
+    use std::io::Write;
+
+    let root = std::env::current_dir()
+        .map(|cwd| discover_workspace_root(&cwd))
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "current_directory",
+            message: error.to_string(),
+        })?;
+
+    let storage_home = storage_home().map_err(|message| ServerSetupError {
+        code: "usage",
+        category: "configuration",
+        message,
+    })?;
+    let (state, token, token_path) = prepare_server(&root, &storage_home)?;
+
+    // Bind the listener FIRST so a port conflict fails before we publish the
+    // token; only the process that will actually serve writes server.token.
+    let (listener, local_addr) = bind_local_listener(port).await?;
+
+    write_server_token(&token_path, &token).map_err(|message| ServerSetupError {
+        code: "internal",
+        category: "server_token",
+        message,
+    })?;
 
     // Announce the observable readiness contract before blocking on serve so a
     // client (or E2E) can discover the port and token file deterministically.
     if json {
-        emit_data(
-            "listening",
-            &json!({
-                "address": local_addr.to_string(),
-                "port": local_addr.port(),
-                "token_path": token_path.display().to_string(),
-            }),
-        );
+        emit_data("listening", &readiness_envelope(local_addr, &token_path));
     } else {
         println!(
             "latte-code server listening on http://{local_addr}; token at {}",
@@ -1242,17 +1245,23 @@ async fn execute_serve(args: &[String], json: bool) -> i32 {
     }
     let _ = std::io::stdout().flush();
 
-    match latte_server::serve_on(state, listener).await {
-        Ok(()) => EXIT_COMPLETED,
-        Err(error) => emit_error(
-            json,
-            "internal",
-            "server_runtime",
-            &error.to_string(),
-            EXIT_INTERNAL,
-            false,
-        ),
-    }
+    latte_server::serve_on(state, listener)
+        .await
+        .map_err(|error| ServerSetupError {
+            code: "internal",
+            category: "server_runtime",
+            message: error.to_string(),
+        })?;
+    Ok(EXIT_COMPLETED)
+}
+
+/// The JSON readiness envelope announced when the server begins listening.
+fn readiness_envelope(local_addr: std::net::SocketAddr, token_path: &Path) -> Value {
+    json!({
+        "address": local_addr.to_string(),
+        "port": local_addr.port(),
+        "token_path": token_path.display().to_string(),
+    })
 }
 
 /// A classified failure from `prepare_server`, carrying the same `(code,
@@ -1293,14 +1302,18 @@ async fn bind_local_listener(
     Ok((listener, local_addr))
 }
 
-/// Builds the fully-configured server state for a workspace root without
-/// binding a socket. Keeping this side of the boundary listener-free lets it
-/// be unit tested; the caller owns the bind/serve step (an E2E concern).
+/// Builds the fully-configured server state for a startup workspace root
+/// without binding a socket or writing the token (the caller owns bind → token
+/// → serve). Each workspace resolves its OWN config/registry and uses the
+/// shared global durable store, so sessions survive restarts and per-workspace
+/// provider configuration is honored.
 fn prepare_server(
     root: &Path,
     storage_home: &Path,
-) -> Result<(std::sync::Arc<latte_server::ServerState>, PathBuf), ServerSetupError> {
-    let (_config, registry) = AppConfig::load(root).map_err(|message| ServerSetupError {
+) -> Result<(std::sync::Arc<latte_server::ServerState>, String, PathBuf), ServerSetupError> {
+    // Validate the startup workspace configuration up front for a fast, clear
+    // usage error; per-workspace configs are (re)loaded lazily by the builder.
+    AppConfig::load(root).map_err(|message| ServerSetupError {
         code: "usage",
         category: "configuration",
         message,
@@ -1311,34 +1324,69 @@ fn prepare_server(
         message: format!("cannot create {}: {error}", storage_home.display()),
     })?;
 
-    // The provider factory resolves a durable v2 binding against the current
-    // registry. Tool descriptors are host-uniform, so a probe engine's
-    // descriptors match the descriptors each workspace engine will present.
-    let probe = EngineBuilder::new()
+    let database_path = storage_home.join("state.db");
+    let conversation_root = storage_home.join("sessions");
+
+    // Per-workspace runtime builder: each canonical workspace root loads its
+    // own `.latte/latte-code.jsonc` (models/endpoints/credentials) and gets a
+    // durable engine bound to the shared global database + conversation store.
+    let builder_db = database_path.clone();
+    let builder_conv = conversation_root.clone();
+    let builder: latte_server::WorkspaceRuntimeBuilder =
+        std::sync::Arc::new(move |workspace_root: &Path| {
+            let (config, registry) = AppConfig::load(workspace_root)?;
+            let engine = EngineBuilder::new()
+                .workspace_root(workspace_root)
+                .database_path(&builder_db)
+                .conversation_root(&builder_conv)
+                .build()
+                .map_err(|error| error.to_string())?;
+            let factory_engine = engine.clone();
+            let factory: latte_headless::thread::ThreadProviderFactory =
+                std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
+                    registry
+                        .resolve_thread_bound(binding, &factory_engine.tool_descriptors())
+                        .map_err(|error| error.to_string())
+                });
+            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                engine.clone(),
+                workspace_root,
+                config.thread_policy(),
+                factory,
+            );
+            Ok(latte_server::BuiltWorkspace { engine, runtime })
+        });
+
+    // Session locator: resolve a session's owning workspace from the durable
+    // global catalog so reads work after a restart, before any in-memory index
+    // is populated. Uses a catalog engine bound to the startup root (queries by
+    // thread id are workspace-independent lookups against the shared store).
+    let catalog_engine = EngineBuilder::new()
         .workspace_root(root)
+        .database_path(&database_path)
+        .conversation_root(&conversation_root)
         .build()
         .map_err(|error| ServerSetupError {
             code: "internal",
             category: "engine_initialization",
             message: error.to_string(),
         })?;
-    let factory_registry = registry.clone();
-    let factory: latte_server::ProviderFactory =
-        std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
-            factory_registry
-                .resolve_thread_bound(binding, &probe.tool_descriptors())
-                .map_err(|error| error.to_string())
+    let session_locator: latte_server::SessionLocator =
+        std::sync::Arc::new(move |thread_id: latte_core::ThreadId| {
+            catalog_engine
+                .thread_session_v2(thread_id)
+                .ok()
+                .flatten()
+                .map(|summary| PathBuf::from(summary.workspace_root))
         });
 
     let token = generate_server_token();
     let token_path = storage_home.join("server.token");
-    write_server_token(&token_path, &token).map_err(|message| ServerSetupError {
-        code: "internal",
-        category: "server_token",
-        message,
-    })?;
-
-    Ok((latte_server::new_state(token, factory), token_path))
+    Ok((
+        latte_server::new_state(token.clone(), builder, session_locator),
+        token,
+        token_path,
+    ))
 }
 
 /// Parses the optional `--port <port>` flag for `serve`.
@@ -1460,9 +1508,10 @@ mod tests {
         ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root,
         dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
         exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
-        outcome, parse_serve_port, prepare_server, reconcile_thread_action, render_run,
-        storage_home_with, tui_startup_presentation, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home, workspace_identity, write_server_token,
+        outcome, parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action,
+        render_run, storage_home_with, tui_startup_presentation, verify_timeout,
+        workspace_display_path, workspace_display_path_with_home, workspace_identity,
+        write_server_token,
     };
     use latte_core::{
         Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
@@ -2430,8 +2479,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prepare_server_builds_state_and_token_from_configured_workspace() {
+    #[tokio::test]
+    async fn prepare_server_builds_durable_per_workspace_runtime() {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".latte")).unwrap();
@@ -2452,16 +2501,30 @@ mod tests {
         .unwrap();
         let storage_home = home.path().join(".latte/latte-code");
 
-        let (state, token_path) = match prepare_server(root.path(), &storage_home) {
+        let (state, token, token_path) = match prepare_server(root.path(), &storage_home) {
             Ok(value) => value,
             Err(error) => panic!("prepare_server failed: {}", error.message),
         };
-        assert!(!state.token.is_empty(), "prepared state must carry a token");
+        assert!(!token.is_empty(), "prepared state must carry a token");
+        assert_eq!(state.token, token, "state token matches the returned token");
         assert_eq!(token_path, storage_home.join("server.token"));
-        assert_eq!(
-            std::fs::read_to_string(&token_path).unwrap(),
-            state.token,
-            "token file must match the live server token"
+        // prepare_server does not write the token (bind happens first).
+        assert!(!token_path.exists());
+
+        // The runtime builder produces a durable engine for the workspace, so
+        // the global database materializes under the storage home.
+        let workspace = state.workspaces.get_or_create(root.path()).await.unwrap();
+        assert!(workspace.list_sessions().unwrap().is_empty());
+        assert!(storage_home.join("state.db").is_file());
+
+        // The durable session locator resolves nothing for an unknown thread.
+        let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(
+            state
+                .workspaces
+                .get_session_workspace(&missing)
+                .await
+                .is_none()
         );
     }
 
@@ -2515,5 +2578,15 @@ mod tests {
         assert_eq!(error.code, "internal");
         assert_eq!(error.category, "server_bind");
         drop(listener);
+    }
+
+    #[test]
+    fn readiness_envelope_reports_address_port_and_token_path() {
+        let addr: std::net::SocketAddr = "127.0.0.1:4096".parse().unwrap();
+        let token_path = Path::new("/tmp/latte/server.token");
+        let envelope = readiness_envelope(addr, token_path);
+        assert_eq!(envelope["address"], "127.0.0.1:4096");
+        assert_eq!(envelope["port"], 4096);
+        assert_eq!(envelope["token_path"], "/tmp/latte/server.token");
     }
 }

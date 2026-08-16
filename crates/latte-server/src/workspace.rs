@@ -10,14 +10,27 @@ use tracing::info;
 
 use crate::http::ServerEvent;
 
-/// Provider factory type.
-pub type ProviderFactory = Arc<
-    dyn Fn(
-            &latte_core::ThreadProviderBindingV2,
-        ) -> Result<latte_headless::registry::ResolvedProvider, String>
-        + Send
-        + Sync,
->;
+/// A fully constructed per-workspace runtime: a durable engine handle plus the
+/// thread runtime service bound to that workspace's own provider registry.
+///
+/// The binary owns configuration and storage-path resolution, so it builds
+/// these; the server only decides *when* to build one and caches the result.
+pub struct BuiltWorkspace {
+    pub engine: latte_engine::EngineHandle,
+    pub runtime: latte_headless::thread::ThreadRuntimeService,
+}
+
+/// Builds a durable per-workspace runtime for one canonical workspace root.
+/// Injected by the binary so each workspace resolves its own
+/// `.latte/latte-code.jsonc` (models, endpoints, credentials) against the
+/// shared global durable store.
+pub type WorkspaceRuntimeBuilder =
+    Arc<dyn Fn(&Path) -> Result<BuiltWorkspace, String> + Send + Sync>;
+
+/// Resolves the canonical workspace root that durably owns a session, from the
+/// global session catalog. Lets session reads survive a process restart
+/// instead of relying only on the in-memory index.
+pub type SessionLocator = Arc<dyn Fn(latte_core::ThreadId) -> Option<PathBuf> + Send + Sync>;
 
 /// A workspace instance with its own runtime.
 pub struct WorkspaceInstance {
@@ -138,19 +151,24 @@ impl WorkspaceInstance {
 /// Manages multiple workspace instances.
 pub struct WorkspaceManager {
     instances: Arc<RwLock<HashMap<PathBuf, Arc<WorkspaceInstance>>>>,
-    /// Session ID -> workspace path index.
+    /// Session ID -> workspace path index. A best-effort in-memory cache; the
+    /// durable `session_locator` is the source of truth across restarts.
     session_index: Arc<RwLock<HashMap<latte_core::ThreadId, PathBuf>>>,
-    /// Provider factory.
-    provider_factory: ProviderFactory,
+    /// Builds a durable per-workspace runtime on demand.
+    builder: WorkspaceRuntimeBuilder,
+    /// Resolves a session's owning workspace from the durable catalog.
+    session_locator: SessionLocator,
 }
 
 impl WorkspaceManager {
-    /// Create a new workspace manager.
-    pub fn new(provider_factory: ProviderFactory) -> Self {
+    /// Create a new workspace manager from a durable runtime builder and a
+    /// durable session locator.
+    pub fn new(builder: WorkspaceRuntimeBuilder, session_locator: SessionLocator) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             session_index: Arc::new(RwLock::new(HashMap::new())),
-            provider_factory,
+            builder,
+            session_locator,
         }
     }
 
@@ -194,24 +212,16 @@ impl WorkspaceManager {
         // Create event channel for this workspace
         let (event_tx, _) = broadcast::channel(256);
 
-        // Create the runtime for this workspace
-        let engine = latte_engine::EngineBuilder::new()
-            .workspace_root(&canonical)
-            .build()
-            .context("failed to create engine")?;
-        let runtime = latte_headless::thread::ThreadRuntimeService::new(
-            engine.clone(),
-            &canonical,
-            Default::default(),
-            self.provider_factory.clone(),
-        );
+        // Build the durable per-workspace runtime (own engine + own registry).
+        let built = (self.builder)(&canonical)
+            .map_err(|message| anyhow::anyhow!("failed to build workspace runtime: {message}"))?;
 
         let instance = Arc::new(WorkspaceInstance::new(
             id,
             canonical.clone(),
-            runtime,
+            built.runtime,
             event_tx,
-            engine,
+            built.engine,
         ));
 
         // Store and return the winning instance
@@ -226,7 +236,7 @@ impl WorkspaceManager {
         instances.values().find(|i| i.id == id).cloned()
     }
 
-    /// Register a session in the index.
+    /// Register a session in the index (best-effort in-memory cache).
     pub async fn register_session(
         &self,
         session_id: latte_core::ThreadId,
@@ -236,22 +246,25 @@ impl WorkspaceManager {
         index.insert(session_id, workspace_path);
     }
 
-    /// Get the workspace path for a session.
+    /// Resolve the workspace path that owns a session. Prefers the in-memory
+    /// cache, then falls back to the durable catalog locator so reads survive a
+    /// process restart; a durable hit repopulates the cache.
     pub async fn get_session_workspace(
         &self,
         session_id: &latte_core::ThreadId,
     ) -> Option<PathBuf> {
-        let index = self.session_index.read().await;
-        index.get(session_id).cloned()
-    }
-}
-
-impl Default for WorkspaceManager {
-    fn default() -> Self {
-        // Default provider factory that returns an error
-        let factory: ProviderFactory =
-            Arc::new(|_| Err("no provider factory configured".to_string()));
-        Self::new(factory)
+        {
+            let index = self.session_index.read().await;
+            if let Some(path) = index.get(session_id) {
+                return Some(path.clone());
+            }
+        }
+        let path = (self.session_locator)(*session_id)?;
+        self.session_index
+            .write()
+            .await
+            .insert(*session_id, path.clone());
+        Some(path)
     }
 }
 
@@ -259,8 +272,31 @@ impl Default for WorkspaceManager {
 mod tests {
     use super::*;
 
+    /// A manager whose builder makes a durable per-workspace engine (its own
+    /// SQLite under the workspace) with an error-stub provider factory, and
+    /// whose locator never resolves (tests drive the in-memory index).
     fn manager() -> WorkspaceManager {
-        WorkspaceManager::default()
+        let builder: WorkspaceRuntimeBuilder = Arc::new(|root: &Path| {
+            let db = root.join(".latte/state.db");
+            std::fs::create_dir_all(db.parent().unwrap()).map_err(|error| error.to_string())?;
+            let engine = latte_engine::EngineBuilder::new()
+                .workspace_root(root)
+                .database_path(&db)
+                .conversation_root(root.join(".latte/sessions"))
+                .build()
+                .map_err(|error| error.to_string())?;
+            let factory: latte_headless::thread::ThreadProviderFactory =
+                Arc::new(|_| Err("no provider configured in test".to_string()));
+            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                engine.clone(),
+                root,
+                Default::default(),
+                factory,
+            );
+            Ok(BuiltWorkspace { engine, runtime })
+        });
+        let locator: SessionLocator = Arc::new(|_| None);
+        WorkspaceManager::new(builder, locator)
     }
 
     #[tokio::test]
@@ -328,6 +364,38 @@ mod tests {
             manager.get_session_workspace(&thread_id).await,
             Some(dir.path().to_path_buf())
         );
+    }
+
+    #[tokio::test]
+    async fn session_workspace_falls_back_to_durable_locator() {
+        // A manager whose durable locator always resolves to a fixed path, and
+        // whose in-memory index is empty: resolution must fall through to the
+        // locator (simulating a read after a restart) and then cache the hit.
+        let resolved = std::path::PathBuf::from("/durable/workspace/root");
+        let locator_path = resolved.clone();
+        let builder: WorkspaceRuntimeBuilder =
+            Arc::new(|_| Err("builder unused in this test".to_string()));
+        let locator: SessionLocator = Arc::new(move |_| Some(locator_path.clone()));
+        let manager = WorkspaceManager::new(builder, locator);
+
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        // Not in the in-memory index, but the durable locator resolves it.
+        assert_eq!(
+            manager.get_session_workspace(&thread_id).await,
+            Some(resolved.clone())
+        );
+        // The durable hit is cached back into the index.
+        assert_eq!(
+            manager.get_session_workspace(&thread_id).await,
+            Some(resolved)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_workspace_none_when_locator_misses() {
+        let manager = manager(); // locator always returns None
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        assert!(manager.get_session_workspace(&thread_id).await.is_none());
     }
 
     #[tokio::test]

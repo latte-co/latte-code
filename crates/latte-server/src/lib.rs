@@ -7,12 +7,19 @@ use anyhow::Result;
 use std::sync::Arc;
 
 pub use crate::http::{ServerState, serve};
-pub use crate::workspace::{ProviderFactory, WorkspaceInstance, WorkspaceManager};
+pub use crate::workspace::{
+    BuiltWorkspace, SessionLocator, WorkspaceInstance, WorkspaceManager, WorkspaceRuntimeBuilder,
+};
 
-/// Create a new server state.
-pub fn new_state(token: String, provider_factory: ProviderFactory) -> Arc<ServerState> {
+/// Create a new server state from a durable per-workspace runtime builder and a
+/// durable session locator.
+pub fn new_state(
+    token: String,
+    builder: WorkspaceRuntimeBuilder,
+    session_locator: SessionLocator,
+) -> Arc<ServerState> {
     Arc::new(ServerState::new(
-        Arc::new(WorkspaceManager::new(provider_factory)),
+        Arc::new(WorkspaceManager::new(builder, session_locator)),
         tokio::sync::broadcast::channel(256).0,
         token,
     ))

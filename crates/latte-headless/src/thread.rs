@@ -31,6 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
@@ -248,7 +249,33 @@ impl ThreadRuntimeService {
         binding: ThreadProviderBindingV2,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self.start_one(thread_id, prompt, binding).await?;
+        let snapshot = self.start_one(thread_id, prompt, binding, None).await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    /// Like [`start`], but signals `accept` at the durable-acceptance boundary
+    /// (once the user submission is persisted) before running the provider
+    /// turn. Lets a server return 202 only after the command is durable, while
+    /// the turn continues under the same supervised execution. The signal
+    /// carries the accepted snapshot, or an error message if acceptance failed
+    /// before persistence.
+    pub async fn start_accepted(
+        &self,
+        thread_id: ThreadId,
+        prompt: String,
+        binding: ThreadProviderBindingV2,
+        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = match self.begin_runner(thread_id) {
+            Ok(runner) => runner,
+            Err(error) => {
+                let _ = accept.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let snapshot = self
+            .start_one(thread_id, prompt, binding, Some(accept))
+            .await?;
         self.drain_mailbox(snapshot, runner).await
     }
 
@@ -257,17 +284,44 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        binding
+        if let Err(error) = binding
             .validate()
-            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
-        let messages = self.initial_messages(&prompt)?;
+            .map_err(ThreadRuntimeError::ProviderConfiguration)
+        {
+            signal_accept(accept, Err(error.to_string()));
+            return Err(error);
+        }
+        let messages = match self.initial_messages(&prompt) {
+            Ok(messages) => messages,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         let run_id = new_run_id();
         let now = now_ms();
-        let lease = self.acquire(thread_id)?;
-        let started = self
+        let lease = match self.acquire(thread_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let started = match self
             .engine
-            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)?;
+            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)
+        {
+            Ok(started) => started,
+            Err(error) => {
+                let error = ThreadRuntimeError::from(error);
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        // The user submission is now durable — acknowledge acceptance.
+        signal_accept(accept, Ok(started.clone()));
         // Provider construction is runtime work, not submission validation.
         // Once the user card is durable, a missing credential or invalid model
         // becomes a visible retryable child failure instead of restoring the
@@ -296,7 +350,29 @@ impl ThreadRuntimeService {
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
         let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt)
+            .follow_up_one(thread_id, expected_thread_revision, prompt, None)
+            .await?;
+        self.drain_mailbox(snapshot, runner).await
+    }
+
+    /// Like [`follow_up`], but signals `accept` once the follow-up submission is
+    /// durably persisted, before the provider turn runs.
+    pub async fn follow_up_accepted(
+        &self,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        prompt: String,
+        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        let runner = match self.begin_runner(thread_id) {
+            Ok(runner) => runner,
+            Err(error) => {
+                let _ = accept.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let snapshot = self
+            .follow_up_one(thread_id, expected_thread_revision, prompt, Some(accept))
             .await?;
         self.drain_mailbox(snapshot, runner).await
     }
@@ -306,23 +382,52 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         expected_thread_revision: u64,
         prompt: String,
+        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+        let snapshot = match self.load_full(thread_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
+            signal_accept(accept, Err(ThreadRuntimeError::InvalidState.to_string()));
             return Err(ThreadRuntimeError::InvalidState);
         }
-        let messages = self.history_with_prompt(&snapshot, &prompt)?;
+        let messages = match self.history_with_prompt(&snapshot, &prompt) {
+            Ok(messages) => messages,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
         let run_id = new_run_id();
-        let lease = self.acquire(thread_id)?;
-        let started = self.engine.create_started_thread_follow_up_v2(
+        let lease = match self.acquire(thread_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let started = match self.engine.create_started_thread_follow_up_v2(
             thread_id,
             run_id,
             expected_thread_revision,
             &prompt,
             &lease,
             now_ms(),
-        )?;
+        ) {
+            Ok(started) => started,
+            Err(error) => {
+                let error = ThreadRuntimeError::from(error);
+                signal_accept(accept, Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        // The follow-up submission is now durable — acknowledge acceptance.
+        signal_accept(accept, Ok(started.clone()));
         let Ok(provider) = (self.provider)(&started.binding) else {
             return self.fail_retryable(
                 thread_id,
@@ -398,7 +503,7 @@ impl ThreadRuntimeService {
                 return Ok(snapshot);
             };
             snapshot = self
-                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt)
+                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt, None)
                 .await?;
         }
     }
@@ -637,19 +742,16 @@ impl ThreadRuntimeService {
     /// Cancels a durable waiting/idle active child. An in-flight provider call
     /// is signalled first and commits its own interruption without a partial
     /// assistant card; a waiting request is terminally cancelled immediately.
+    ///
+    /// The caller's `expected_thread_revision`/`expected_run_revision` are
+    /// validated against the authoritative snapshot before any interruption, so
+    /// a stale client cannot cancel a newer run.
     pub fn cancel_durable(
         &self,
         thread_id: ThreadId,
+        expected_thread_revision: u64,
+        expected_run_revision: u64,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        if self
-            .active
-            .lock()
-            .expect("active mutex poisoned")
-            .contains_key(&thread_id)
-        {
-            self.cancel(thread_id);
-            return self.load_full(thread_id);
-        }
         let snapshot = self.load_full(thread_id)?;
         let run_id = snapshot
             .active_run_id
@@ -660,6 +762,20 @@ impl ThreadRuntimeService {
             .find(|run| run.run_id == run_id)
             .ok_or(ThreadRuntimeError::InvalidState)?
             .run_revision;
+        // Fence the caller's expectation against the authoritative snapshot
+        // before signalling or committing any cancellation.
+        if snapshot.revision != expected_thread_revision || run_revision != expected_run_revision {
+            return Err(ThreadRuntimeError::InvalidState);
+        }
+        if self
+            .active
+            .lock()
+            .expect("active mutex poisoned")
+            .contains_key(&thread_id)
+        {
+            self.cancel(thread_id);
+            return self.load_full(thread_id);
+        }
         let lease = self.acquire(thread_id)?;
         self.commit(
             thread_id,
@@ -1665,6 +1781,17 @@ fn wire_bytes(messages: &[Message]) -> Result<usize, ThreadRuntimeError> {
 
 fn new_run_id() -> RunId {
     RunId::from_uuid(Uuid::now_v7())
+}
+
+/// Sends a durable-acceptance signal if a receiver is present, ignoring a
+/// dropped receiver (the caller may have stopped awaiting acceptance).
+fn signal_accept(
+    accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
+    result: Result<ThreadSnapshot, String>,
+) {
+    if let Some(sender) = accept {
+        let _ = sender.send(result);
+    }
 }
 
 fn active_run_revision(snapshot: &ThreadSnapshot) -> Result<u64, ThreadRuntimeError> {
@@ -3226,7 +3353,7 @@ mod tests {
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
         let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing).is_err());
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -3622,7 +3749,10 @@ mod tests {
                 .await
                 .unwrap();
             let terminal = if cancel {
-                service.cancel_durable(waiting.thread_id).unwrap()
+                let run_revision = active_run_revision(&waiting).unwrap();
+                service
+                    .cancel_durable(waiting.thread_id, waiting.revision, run_revision)
+                    .unwrap()
             } else {
                 let request_id = match waiting.pending.as_ref().unwrap() {
                     latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
@@ -4307,8 +4437,13 @@ mod tests {
             .insert(thread_id, token.clone());
         service.cancel(thread_id);
         assert!(token.is_cancelled());
+        let live = service.load_full(thread_id).unwrap();
+        let live_run_revision = active_run_revision(&live).unwrap();
         assert_eq!(
-            service.cancel_durable(thread_id).unwrap().thread_id,
+            service
+                .cancel_durable(thread_id, live.revision, live_run_revision)
+                .unwrap()
+                .thread_id,
             thread_id,
             "registered in-flight work is cancelled transiently without forging a durable terminal"
         );

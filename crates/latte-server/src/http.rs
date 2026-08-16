@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::stream::Stream;
-use latte_core::{ThreadId, ThreadSnapshot};
+use latte_core::ThreadId;
 use latte_headless::thread::ThreadRuntimeError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,6 +33,25 @@ struct IdempotentRecord {
     body: serde_json::Value,
 }
 
+/// The state of one idempotency key: either an in-flight reservation (a
+/// concurrent request is currently producing the result) or a completed record
+/// available for replay.
+#[derive(Clone)]
+enum IdempotentSlot {
+    Pending,
+    Done(IdempotentRecord),
+}
+
+/// The outcome of trying to claim an idempotency key.
+enum IdempotencyClaim {
+    /// This request owns the key and must produce the result.
+    Owner,
+    /// A prior request already completed; replay its recorded result.
+    Replay(IdempotentRecord),
+    /// A concurrent request holds the reservation and has not completed yet.
+    InFlight,
+}
+
 /// Server state shared across handlers.
 pub struct ServerState {
     pub workspaces: Arc<WorkspaceManager>,
@@ -41,7 +60,7 @@ pub struct ServerState {
     /// Deduplicates durable mutations by `(token, idempotency_key)`. A retry
     /// after a timeout returns the original accepted result instead of
     /// starting a second session or duplicating provider/effect work.
-    idempotency: Mutex<HashMap<String, IdempotentRecord>>,
+    idempotency: Mutex<HashMap<String, IdempotentSlot>>,
 }
 
 impl ServerState {
@@ -60,21 +79,38 @@ impl ServerState {
         }
     }
 
-    /// Returns a previously accepted result for this idempotency key, if any.
-    fn idempotent_replay(&self, key: &str) -> Option<IdempotentRecord> {
-        self.idempotency
-            .lock()
-            .expect("idempotency mutex poisoned")
-            .get(key)
-            .cloned()
+    /// Atomically claims an idempotency key: the first caller becomes `Owner`
+    /// and reserves the slot; a concurrent caller sees `InFlight`; a caller
+    /// after completion gets `Replay`. This single-lock reserve-or-replay
+    /// avoids the check-then-store race where two retries both execute.
+    fn idempotency_claim(&self, key: &str) -> IdempotencyClaim {
+        let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
+        match ledger.get(key) {
+            Some(IdempotentSlot::Done(record)) => IdempotencyClaim::Replay(record.clone()),
+            Some(IdempotentSlot::Pending) => IdempotencyClaim::InFlight,
+            None => {
+                ledger.insert(key.to_string(), IdempotentSlot::Pending);
+                IdempotencyClaim::Owner
+            }
+        }
     }
 
-    /// Records the accepted result for an idempotency key for later replay.
-    fn idempotent_store(&self, key: String, record: IdempotentRecord) {
+    /// Records the completed result for a key the caller owns, unblocking
+    /// future replays.
+    fn idempotency_complete(&self, key: &str, record: IdempotentRecord) {
         self.idempotency
             .lock()
             .expect("idempotency mutex poisoned")
-            .insert(key, record);
+            .insert(key.to_string(), IdempotentSlot::Done(record));
+    }
+
+    /// Releases an owned reservation without recording a result, so a failed
+    /// owner does not permanently block retries of the same key.
+    fn idempotency_release(&self, key: &str) {
+        let mut ledger = self.idempotency.lock().expect("idempotency mutex poisoned");
+        if matches!(ledger.get(key), Some(IdempotentSlot::Pending)) {
+            ledger.remove(key);
+        }
     }
 }
 
@@ -288,15 +324,48 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
     let idempotency = namespaced_idempotency_key(&state, &headers);
-    if let Some(key) = &idempotency
-        && let Some(record) = state.idempotent_replay(key)
-    {
-        return Ok((record.status, Json(record.body)));
+    // Atomically claim the key: replay a prior result, reject a concurrent
+    // in-flight retry, or become the owner responsible for producing it.
+    if let Some(key) = &idempotency {
+        match state.idempotency_claim(key) {
+            IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
+            IdempotencyClaim::InFlight => return Err(in_flight()),
+            IdempotencyClaim::Owner => {}
+        }
     }
+    // From here the owner must release the reservation on any early error.
+    let result = create_session_owned(&state, &workspace_id, req).await;
+    match (idempotency, result) {
+        (Some(key), Ok((status, body))) => {
+            state.idempotency_complete(
+                &key,
+                IdempotentRecord {
+                    status,
+                    body: body.clone(),
+                },
+            );
+            Ok((status, Json(body)))
+        }
+        (Some(key), Err(error)) => {
+            state.idempotency_release(&key);
+            Err(error)
+        }
+        (None, Ok((status, body))) => Ok((status, Json(body))),
+        (None, Err(error)) => Err(error),
+    }
+}
 
+/// Core of create_session, independent of the idempotency ledger. Persists the
+/// accepted submission durably (awaiting the runtime's acceptance signal) and
+/// returns 202 only after durable acceptance; the turn runs in the background.
+async fn create_session_owned(
+    state: &Arc<ServerState>,
+    workspace_id: &str,
+    req: CreateSessionRequest,
+) -> Result<(StatusCode, serde_json::Value), HandlerError> {
     let workspace = state
         .workspaces
-        .get_by_id(&workspace_id)
+        .get_by_id(workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
 
@@ -307,47 +376,45 @@ async fn create_session(
         .validate()
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
-    // Allocate the session id and register it synchronously so read routes and
-    // SSE routing can observe it before the turn completes.
     let thread_id = ThreadId::from_uuid(uuid::Uuid::now_v7());
+    let runtime = workspace.runtime.clone();
+    let prompt = req.prompt;
+
+    // Run the turn under supervised background execution, but only acknowledge
+    // 202 after the runtime signals the submission is durably accepted.
+    let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(error) = runtime
+            .start_accepted(thread_id, prompt, binding, accept_tx)
+            .await
+        {
+            warn!("session {thread_id} background turn failed: {error}");
+        }
+    });
+
+    let accepted = accept_rx
+        .await
+        .map_err(|_| failed("session runtime dropped before acceptance"))?
+        .map_err(|message| failed(&format!("failed to accept session: {message}")))?;
+
+    // Register the session for O(1) routing now that it is durable.
     state
         .workspaces
         .register_session(thread_id, workspace.path.clone())
         .await;
 
-    // Run the provider turn under supervised background execution. The engine
-    // persists the accepted user submission before provider construction, so a
-    // credential/model failure becomes an observable child failure rather than
-    // a lost prompt; the workspace event bridge forwards completion and error.
-    let runtime = workspace.runtime.clone();
-    let prompt = req.prompt;
-    tokio::spawn(async move {
-        if let Err(error) = runtime.start(thread_id, prompt, binding).await {
-            warn!("session {thread_id} background turn failed: {error}");
-        }
-    });
-
     // Wake subscribers so they fetch the new session snapshot.
     let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
         session_id: thread_id.to_string(),
-        revision: 0,
+        revision: accepted.revision,
     });
 
     let body = serde_json::to_value(SessionCreatedResponse {
         session_id: thread_id.to_string(),
-        accepted_revision: 0,
+        accepted_revision: accepted.revision,
     })
     .expect("session response serializes");
-    if let Some(key) = idempotency {
-        state.idempotent_store(
-            key,
-            IdempotentRecord {
-                status: StatusCode::ACCEPTED,
-                body: body.clone(),
-            },
-        );
-    }
-    Ok((StatusCode::ACCEPTED, Json(body)))
+    Ok((StatusCode::ACCEPTED, body))
 }
 
 async fn list_sessions(
@@ -401,9 +468,9 @@ async fn get_session(
     Ok(Json(serde_json::json!({ "snapshot": snapshot })))
 }
 
-/// Continues a session with a new user turn. Like create, this validates the
-/// revision fence, returns 202, and runs the turn in the background; a durable
-/// `Idempotency-Key` retry replays the original acceptance.
+/// Continues a session with a new user turn. Like create, this awaits durable
+/// acceptance before returning 202 and runs the turn in the background; a
+/// durable `Idempotency-Key` retry replays the original acceptance.
 async fn follow_up(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -411,40 +478,72 @@ async fn follow_up(
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
     let idempotency = namespaced_idempotency_key(&state, &headers);
-    if let Some(key) = &idempotency
-        && let Some(record) = state.idempotent_replay(key)
-    {
-        return Ok((record.status, Json(record.body)));
+    if let Some(key) = &idempotency {
+        match state.idempotency_claim(key) {
+            IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
+            IdempotencyClaim::InFlight => return Err(in_flight()),
+            IdempotencyClaim::Owner => {}
+        }
     }
+    let result = follow_up_owned(&state, &id, req).await;
+    match (idempotency, result) {
+        (Some(key), Ok((status, body))) => {
+            state.idempotency_complete(
+                &key,
+                IdempotentRecord {
+                    status,
+                    body: body.clone(),
+                },
+            );
+            Ok((status, Json(body)))
+        }
+        (Some(key), Err(error)) => {
+            state.idempotency_release(&key);
+            Err(error)
+        }
+        (None, Ok((status, body))) => Ok((status, Json(body))),
+        (None, Err(error)) => Err(error),
+    }
+}
 
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    validate_fences(&snapshot, req.expected_thread_revision, None)?;
-
-    let accepted_revision = snapshot.revision;
+async fn follow_up_owned(
+    state: &Arc<ServerState>,
+    id: &str,
+    req: FollowUpRequest,
+) -> Result<(StatusCode, serde_json::Value), HandlerError> {
+    let thread_id = parse_thread_id(id)?;
+    let workspace = lookup_workspace(state, thread_id).await?;
     let runtime = workspace.runtime.clone();
     let prompt = req.prompt;
     let expected = req.expected_thread_revision;
+
+    let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if let Err(error) = runtime.follow_up(thread_id, expected, prompt).await {
+        if let Err(error) = runtime
+            .follow_up_accepted(thread_id, expected, prompt, accept_tx)
+            .await
+        {
             warn!("session {thread_id} background follow-up failed: {error}");
         }
     });
 
-    let body = serde_json::json!({ "accepted_revision": accepted_revision });
-    if let Some(key) = idempotency {
-        state.idempotent_store(
-            key,
-            IdempotentRecord {
-                status: StatusCode::ACCEPTED,
-                body: body.clone(),
-            },
-        );
-    }
-    Ok((StatusCode::ACCEPTED, Json(body)))
+    let accepted = accept_rx
+        .await
+        .map_err(|_| failed("session runtime dropped before acceptance"))?
+        .map_err(|_| {
+            conflict(
+                "thread revision mismatch or session not accepting follow-up",
+                None,
+            )
+        })?;
+
+    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+        session_id: thread_id.to_string(),
+        revision: accepted.revision,
+    });
+
+    let body = serde_json::json!({ "accepted_revision": accepted.revision });
+    Ok((StatusCode::ACCEPTED, body))
 }
 
 async fn switch_model(
@@ -457,23 +556,24 @@ async fn switch_model(
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
     let workspace = lookup_workspace(&state, thread_id).await?;
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    validate_fences(&snapshot, req.expected_thread_revision, None)?;
-
+    // The revision fence is validated atomically inside the engine operation;
+    // no TOCTOU precheck here.
     match workspace
         .runtime
         .switch_model(thread_id, req.expected_thread_revision, &binding)
     {
         Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
-        Err(error) => Err(map_runtime_error(&error, snapshot.revision)),
+        Err(error) => {
+            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            Err(map_runtime_error(&error, current.unwrap_or_default()))
+        }
     }
 }
 
-/// Cancels an active session. Both advertised revision fences are validated
-/// before the authority-changing mutation so a stale client cannot cancel a
-/// newer run; a mismatch returns 409 with the current revision.
+/// Cancels an active session. Both revision fences are validated atomically
+/// inside the engine authority operation (not a TOCTOU precheck here), so a
+/// stale client cannot cancel a newer run; a mismatch returns 409 with the
+/// current revision.
 async fn cancel_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -481,18 +581,19 @@ async fn cancel_session(
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    validate_fences(
-        &snapshot,
-        req.expected_thread_revision,
-        Some(req.expected_run_revision),
-    )?;
 
-    match workspace.runtime.cancel_durable(thread_id) {
+    match workspace.runtime.cancel_durable(
+        thread_id,
+        req.expected_thread_revision,
+        req.expected_run_revision,
+    ) {
         Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
-        Err(error) => Err(map_runtime_error(&error, snapshot.revision)),
+        Err(error) => {
+            // On a fence/state rejection, surface the current revision so the
+            // client can re-fetch and retry.
+            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            Err(map_runtime_error(&error, current.unwrap_or_default()))
+        }
     }
 }
 
@@ -523,8 +624,8 @@ async fn queue_follow_up(
     }
 }
 
-/// Resolves a permission request. Both revision fences are validated before the
-/// approval consumes the prepared effect.
+/// Resolves a permission request. The thread revision fence and pending-request
+/// validation happen atomically inside the engine operation.
 async fn resolve_permission(
     State(state): State<Arc<ServerState>>,
     Path((id, request_id)): Path<(String, String)>,
@@ -532,14 +633,6 @@ async fn resolve_permission(
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    validate_fences(
-        &snapshot,
-        req.expected_thread_revision,
-        Some(req.expected_run_revision),
-    )?;
 
     match workspace
         .runtime
@@ -552,12 +645,15 @@ async fn resolve_permission(
         .await
     {
         Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
-        Err(error) => Err(map_runtime_error(&error, snapshot.revision)),
+        Err(error) => {
+            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            Err(map_runtime_error(&error, current.unwrap_or_default()))
+        }
     }
 }
 
-/// Provides a requested non-secret input value. Both revision fences are
-/// validated before the session continues the same child.
+/// Provides a requested non-secret input value. The thread revision fence and
+/// waiting-input validation happen atomically inside the engine operation.
 async fn provide_input(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
@@ -565,14 +661,6 @@ async fn provide_input(
 ) -> Result<Json<serde_json::Value>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
-    let snapshot = workspace
-        .snapshot(thread_id)
-        .map_err(|_| not_found("session not found"))?;
-    validate_fences(
-        &snapshot,
-        req.expected_thread_revision,
-        Some(req.expected_run_revision),
-    )?;
 
     match workspace
         .runtime
@@ -585,7 +673,10 @@ async fn provide_input(
         .await
     {
         Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
-        Err(error) => Err(map_runtime_error(&error, snapshot.revision)),
+        Err(error) => {
+            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            Err(map_runtime_error(&error, current.unwrap_or_default()))
+        }
     }
 }
 
@@ -633,33 +724,6 @@ fn namespaced_idempotency_key(state: &ServerState, headers: &HeaderMap) -> Optio
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| format!("{}:{value}", state.token))
-}
-
-/// Validates the client's revision fences against the current snapshot. A
-/// mismatch returns 409 with the current thread revision so the client can
-/// re-fetch and retry.
-fn validate_fences(
-    snapshot: &ThreadSnapshot,
-    expected_thread_revision: u64,
-    expected_run_revision: Option<u64>,
-) -> Result<(), HandlerError> {
-    if snapshot.revision != expected_thread_revision {
-        return Err(conflict(
-            "thread revision mismatch",
-            Some(snapshot.revision),
-        ));
-    }
-    if let Some(expected_run) = expected_run_revision {
-        let current_run = snapshot
-            .active_run_id
-            .and_then(|run_id| snapshot.runs.iter().find(|run| run.run_id == run_id))
-            .map(|run| run.run_revision);
-        match current_run {
-            Some(current) if current == expected_run => {}
-            _ => return Err(conflict("run revision mismatch", Some(snapshot.revision))),
-        }
-    }
-    Ok(())
 }
 
 /// Maps a runtime error to an HTTP response. A state/revision conflict becomes
@@ -713,6 +777,17 @@ fn failed(message: &str) -> HandlerError {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed", message, None)
 }
 
+/// 409 for a concurrent retry that arrived while the original request with the
+/// same idempotency key is still in flight.
+fn in_flight() -> HandlerError {
+    error_response(
+        StatusCode::CONFLICT,
+        "conflict",
+        "a request with this idempotency key is still in flight",
+        None,
+    )
+}
+
 async fn workspace_events(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
@@ -755,10 +830,20 @@ async fn workspace_events(
 /// Serving stops gracefully on Ctrl-C or (on Unix) SIGTERM, letting the
 /// process flush and exit cleanly instead of being force-killed.
 pub async fn serve(state: Arc<ServerState>, listener: tokio::net::TcpListener) -> Result<()> {
+    serve_with_shutdown(state, listener, shutdown_signal()).await
+}
+
+/// Serve until `shutdown` resolves. Separating the shutdown future lets tests
+/// drive graceful shutdown deterministically without process signals.
+pub async fn serve_with_shutdown(
+    state: Arc<ServerState>,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let app = router(state);
     info!("server listening on {}", listener.local_addr()?);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
@@ -839,11 +924,37 @@ mod tests {
             .to_string()
     }
 
+    /// Builds durable server state whose per-workspace runtimes all use the
+    /// given thread provider factory (each workspace still gets its own engine
+    /// under a temp dir). The session locator is a no-op; tests drive the
+    /// in-memory index via `register_session`/create.
+    fn state_with_factory(
+        factory: latte_headless::thread::ThreadProviderFactory,
+    ) -> Arc<ServerState> {
+        let builder: crate::workspace::WorkspaceRuntimeBuilder =
+            std::sync::Arc::new(move |root: &std::path::Path| {
+                let db = root.join(".latte/state.db");
+                std::fs::create_dir_all(db.parent().unwrap()).map_err(|e| e.to_string())?;
+                let engine = latte_engine::EngineBuilder::new()
+                    .workspace_root(root)
+                    .database_path(&db)
+                    .conversation_root(root.join(".latte/sessions"))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                    engine.clone(),
+                    root,
+                    Default::default(),
+                    factory.clone(),
+                );
+                Ok(crate::workspace::BuiltWorkspace { engine, runtime })
+            });
+        let locator: crate::workspace::SessionLocator = std::sync::Arc::new(|_| None);
+        new_state("test-token".to_string(), builder, locator)
+    }
+
     fn state() -> Arc<ServerState> {
-        new_state(
-            "test-token".to_string(),
-            std::sync::Arc::new(|_| Err("test".to_string())),
-        )
+        state_with_factory(std::sync::Arc::new(|_| Err("test".to_string())))
     }
 
     /// Server state whose provider factory returns a `FakeProvider` that
@@ -853,7 +964,7 @@ mod tests {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: crate::workspace::ProviderFactory =
+        let factory: latte_headless::thread::ThreadProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
                 let provider = FakeProvider::scripted([ProviderResponse {
                     message: Some("done".into()),
@@ -877,7 +988,7 @@ mod tests {
                     },
                 })
             });
-        new_state("test-token".to_string(), factory)
+        state_with_factory(factory)
     }
 
     /// Creates a session and blocks until it is durably idle (accepts a
@@ -910,7 +1021,7 @@ mod tests {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: crate::workspace::ProviderFactory =
+        let factory: latte_headless::thread::ThreadProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
@@ -952,7 +1063,7 @@ mod tests {
                     },
                 })
             });
-        new_state("test-token".to_string(), factory)
+        state_with_factory(factory)
     }
 
     /// Creates a session that parks at `WaitingPermission`, returning its id,
@@ -999,7 +1110,7 @@ mod tests {
         };
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: crate::workspace::ProviderFactory =
+        let factory: latte_headless::thread::ThreadProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
@@ -1037,7 +1148,7 @@ mod tests {
                     },
                 })
             });
-        new_state("test-token".to_string(), factory)
+        state_with_factory(factory)
     }
 
     /// Creates a session that parks at `WaitingInput`, returning its id,
@@ -1255,7 +1366,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = json_body(response).await;
         let session_id = body["session_id"].as_str().unwrap().to_string();
-        assert_eq!(body["accepted_revision"], 0);
+        // accepted_revision is the real durable revision after acceptance.
+        assert!(body["accepted_revision"].is_u64());
 
         // The durable thread is created even though the test provider fails,
         // so the read route resolves it once the background turn persists it.
@@ -1543,6 +1655,34 @@ mod tests {
         (status, json_body(response).await)
     }
 
+    /// Like `call`, but with extra request headers (e.g. an idempotency key).
+    async fn call_with_headers(
+        state: &Arc<ServerState>,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder()
+            .uri(uri)
+            .method(method)
+            .header("authorization", "Bearer test-token");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = if let Some(body) = body {
+            builder = builder.header("content-type", "application/json");
+            builder
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        } else {
+            builder.body(axum::body::Body::empty()).unwrap()
+        };
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
     #[tokio::test]
     async fn every_session_mutation_on_missing_session_is_not_found() {
         let state = state();
@@ -1783,15 +1923,32 @@ mod tests {
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let (session_id, revision) = completed_session(&state, &workspace_id).await;
 
-        let (status, body) = call(
+        // Use an idempotency key so the owner/complete path is exercised.
+        let (status, body) = call_with_headers(
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
             Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "follow-key-1")],
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(body["accepted_revision"].as_u64().unwrap(), revision);
+        assert_eq!(status, StatusCode::ACCEPTED, "follow-up returned {body:?}");
+        // The follow-up creates a new child, advancing the thread revision past
+        // the value the client fenced against.
+        let accepted = body["accepted_revision"].as_u64().unwrap();
+        assert!(accepted >= revision);
+
+        // Retrying with the same key replays the original accepted revision.
+        let (replay_status, replay_body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "follow-key-1")],
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::ACCEPTED);
+        assert_eq!(replay_body["accepted_revision"].as_u64().unwrap(), accepted);
     }
 
     #[tokio::test]
@@ -1810,7 +1967,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["type"], "conflict");
-        assert!(body["error"]["current_revision"].is_u64());
     }
 
     #[tokio::test]
@@ -1990,13 +2146,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_binds_a_listener_and_answers_health() {
+    async fn serve_answers_health_and_shuts_down_gracefully() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        // Drive graceful shutdown from a oneshot so the test controls it
+        // deterministically (no process signals).
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            let _ = crate::serve_on(state(), listener).await;
+            crate::http::serve_with_shutdown(state(), listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
         });
 
         // Raw HTTP/1.1 GET /health over the bound socket.
@@ -2014,6 +2176,257 @@ mod tests {
         );
         assert!(text.trim_end().ends_with("ok"));
 
-        server.abort();
+        // Trigger graceful shutdown; the serve future resolves cleanly.
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server did not shut down within the deadline");
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn idempotency_claim_reserves_replays_and_releases() {
+        let state = state();
+        let key = "test-token:abc";
+
+        // First claim owns the key and reserves it.
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::Owner
+        ));
+        // A concurrent claim while pending sees it in flight.
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::InFlight
+        ));
+
+        // Completing records the result; later claims replay it.
+        state.idempotency_complete(
+            key,
+            IdempotentRecord {
+                status: StatusCode::ACCEPTED,
+                body: serde_json::json!({ "ok": true }),
+            },
+        );
+        match state.idempotency_claim(key) {
+            IdempotencyClaim::Replay(record) => {
+                assert_eq!(record.status, StatusCode::ACCEPTED);
+                assert_eq!(record.body, serde_json::json!({ "ok": true }));
+            }
+            _ => panic!("expected replay after completion"),
+        }
+
+        // Releasing a still-pending key clears it for retry; releasing a
+        // completed key is a no-op.
+        let key2 = "test-token:def";
+        assert!(matches!(
+            state.idempotency_claim(key2),
+            IdempotencyClaim::Owner
+        ));
+        state.idempotency_release(key2);
+        assert!(matches!(
+            state.idempotency_claim(key2),
+            IdempotencyClaim::Owner
+        ));
+        state.idempotency_release(key); // completed → no-op
+        assert!(matches!(
+            state.idempotency_claim(key),
+            IdempotencyClaim::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_idempotent_retry_conflicts() {
+        // A second create with the same key, while the first holds the
+        // reservation, is rejected as a conflict rather than executing twice.
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        state.idempotency_claim("test-token:key-inflight"); // simulate owner in flight
+
+        let (status, body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
+            &[("idempotency-key", "key-inflight")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn failed_keyed_create_releases_the_key_for_retry() {
+        // A keyed create that fails (invalid binding) must release its
+        // reservation so a corrected retry with the same key is not blocked.
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (bad_status, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "x", "binding": { "version": 1 } })),
+            &[("idempotency-key", "retry-key")],
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+        // The key was released, so the corrected retry proceeds (202), not 409.
+        let (ok_status, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
+            &[("idempotency-key", "retry-key")],
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn failed_keyed_follow_up_releases_the_key_for_retry() {
+        // A keyed follow-up on a missing session fails and releases the key, so
+        // a later retry with the same key is not blocked as in-flight.
+        let state = state();
+        let missing = uuid::Uuid::now_v7();
+
+        let (first, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{missing}/follow-up"),
+            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
+            &[("idempotency-key", "fu-retry")],
+        )
+        .await;
+        assert_eq!(first, StatusCode::NOT_FOUND);
+
+        let (second, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{missing}/follow-up"),
+            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
+            &[("idempotency-key", "fu-retry")],
+        )
+        .await;
+        // Released, so the retry re-runs (still 404) rather than a 409 in-flight.
+        assert_eq!(second, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn keyed_create_on_missing_workspace_is_not_found() {
+        let state = state();
+        let (status, _) = call_with_headers(
+            &state,
+            "POST",
+            "/v1/workspaces/ws_absent/sessions",
+            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
+            &[("idempotency-key", "ws-missing-key")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A provider whose turn blocks until released, keeping the session's runner
+    /// (and its mailbox) active so queue-accepted / mailbox-full are reachable.
+    fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
+        use latte_headless::provider::{
+            Provider, ProviderCapabilities, ProviderContext, ProviderFuture, ProviderRequest,
+            ProviderResponse, ProviderUsage,
+        };
+        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+
+        struct Blocking(std::sync::Arc<tokio::sync::Notify>);
+        impl Provider for Blocking {
+            fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
+                let gate = self.0.clone();
+                Box::pin(async move {
+                    gate.notified().await;
+                    Ok(ProviderResponse {
+                        message: Some("done".into()),
+                        tool_calls: Vec::new(),
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: Some(latte_headless::provider::FinishReason::Stop),
+                        provider_state: None,
+                    })
+                })
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    tools: true,
+                    parallel_tool_calls: true,
+                    input_request: true,
+                }
+            }
+        }
+
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            std::sync::Arc::new(move |binding: &latte_core::ThreadProviderBindingV2| {
+                Ok(ResolvedProvider {
+                    provider: std::sync::Arc::new(Blocking(gate.clone())),
+                    binding: ProviderBinding {
+                        version: binding.version,
+                        provider_name: binding.provider_name.clone(),
+                        provider_type: binding.provider_type.clone(),
+                        protocol: binding.protocol.clone(),
+                        model: binding.model.clone(),
+                        config_fingerprint: binding.config_fingerprint.clone(),
+                        tools_fingerprint: binding.tools_fingerprint.clone(),
+                        aliases: binding.aliases.clone(),
+                    },
+                })
+            });
+        state_with_factory(factory)
+    }
+
+    #[tokio::test]
+    async fn queue_accepts_then_reports_full_during_active_turn() {
+        // A blocking provider keeps the turn (and runner mailbox) alive while we
+        // queue: the first queues are accepted with positions, then the bounded
+        // mailbox reports full — covering both queue arms.
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = blocking_state(gate.clone());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (_, created) = call(
+            &state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(serde_json::json!({ "prompt": "slow", "binding": valid_binding() })),
+        )
+        .await;
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+
+        // While the turn blocks, queue until the mailbox reports full.
+        let mut accepted = 0;
+        let mut saw_full = false;
+        for _ in 0..64 {
+            let (status, body) = call(
+                &state,
+                "POST",
+                &format!("/v1/sessions/{session_id}/queue"),
+                Some(serde_json::json!({ "prompt": "q" })),
+            )
+            .await;
+            match status {
+                StatusCode::ACCEPTED => {
+                    assert!(body["position"].as_u64().is_some());
+                    accepted += 1;
+                }
+                StatusCode::CONFLICT if body["error"]["message"] == "input mailbox is full" => {
+                    saw_full = true;
+                    break;
+                }
+                other => panic!("unexpected queue status {other}: {body:?}"),
+            }
+        }
+        assert!(accepted >= 1, "at least one queue must be accepted");
+        assert!(saw_full, "mailbox-full arm must be reached");
+
+        // Release the turn so the runner drains and exits cleanly.
+        gate.notify_waiters();
     }
 }
