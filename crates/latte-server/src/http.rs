@@ -3046,6 +3046,7 @@ mod tests {
     /// Server state whose provider calls a `process` tool with a missing
     /// command. After permission is granted the launch fails and the session
     /// enters ReconciliationRequired, so the reconcile Ok path is reachable.
+    #[cfg(unix)]
     fn process_reconciliation_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
