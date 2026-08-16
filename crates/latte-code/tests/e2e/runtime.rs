@@ -137,3 +137,115 @@ fn legacy_process_timeout_reaps_group_then_reenters_provider_once() {
         .unwrap();
     assert!(result.contains("timed_out"));
 }
+
+#[cfg(unix)]
+#[test]
+fn legacy_process_exit_with_live_group_reaps_survivors_then_reenters_provider_once() {
+    let scenario = Scenario::new();
+    let pgid_file = scenario.root().join("legacy-exit-live-group-pgid");
+    let pgid_path = pgid_file.to_str().unwrap().to_owned();
+    // The supervised shell publishes its own PID (the process-group leader), spawns
+    // a long-lived background child in that same group, and then exits promptly.
+    // The leader's `wait()` resolves as `Exited`, but the group is still alive
+    // because of the detached `sleep`, forcing supervise() down its post-exit
+    // group-shutdown path (SIGTERM the survivors, confirm the group is gone).
+    let shell = r#"echo $$ > "$LATTE_E2E_PGID_FILE"; sleep 30 & exit 0"#;
+    let process = serde_json::json!({
+        "shell": shell,
+        "cwd": ".",
+        "env": {"LATTE_E2E_PGID_FILE": pgid_path},
+        // The process exits on its own well before this deadline; the timeout only
+        // guards against a hung shell on a loaded runner, it is not the trigger.
+        "timeout_ms": 5_000,
+        "grace_ms": 200,
+        "stdout_cap": 1_024,
+        "stderr_cap": 1_024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("legacy-exit-live-group-process", "process", &process),
+        ProviderReply::completion("exit with live group observed"),
+    ]);
+    let (_, completed) = run_then_allow(&scenario, &provider, "run exit-with-live-group process");
+
+    assert!(
+        completed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let pgid = std::fs::read_to_string(&pgid_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert_process_group_gone(pgid, Duration::from_secs(5));
+    provider.assert_consumed();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let result = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    // The leader exited cleanly, so the observed outcome is a normal exit, not a
+    // timeout or cancellation, even though the supervisor still reaped the group.
+    assert!(result.contains("\"exit_code\":0"));
+    assert!(!result.contains("timed_out"));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_process_timeout_escalates_to_sigkill_when_group_ignores_sigterm() {
+    let scenario = Scenario::new();
+    let pgid_file = scenario.root().join("legacy-sigkill-escalation-pgid");
+    let pgid_path = pgid_file.to_str().unwrap().to_owned();
+    // The supervised shell ignores SIGTERM and stays busy in the foreground, so
+    // the supervisor's graceful SIGTERM cannot reap it. After the grace window the
+    // supervisor must escalate to SIGKILL to certify the group is gone, exercising
+    // the terminate-and-reap SIGKILL path rather than the graceful shutdown path.
+    let shell = r#"echo $$ > "$LATTE_E2E_PGID_FILE"; trap '' TERM; while :; do sleep 0.2; done"#;
+    let process = serde_json::json!({
+        "shell": shell,
+        "cwd": ".",
+        "env": {"LATTE_E2E_PGID_FILE": pgid_path},
+        // Bound the busy loop so the timeout lane fires, then keep the grace window
+        // large enough that a loaded runner still reaches the SIGKILL escalation.
+        "timeout_ms": 1_000,
+        "grace_ms": 200,
+        "stdout_cap": 1_024,
+        "stderr_cap": 1_024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("legacy-sigkill-escalation-process", "process", &process),
+        ProviderReply::completion("sigkill escalation observed"),
+    ]);
+    let (_, completed) = run_then_allow(&scenario, &provider, "run sigkill escalation process");
+
+    assert!(
+        completed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let pgid = std::fs::read_to_string(&pgid_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert_process_group_gone(pgid, Duration::from_secs(5));
+    provider.assert_consumed();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let result = requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(result.contains("timed_out"));
+}
