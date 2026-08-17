@@ -82,6 +82,15 @@ impl ThreadLifecycle {
     }
 }
 
+/// Outcome of a session create operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateOutcome<T = ThreadSnapshot> {
+    /// A new session was created.
+    Created(T),
+    /// The session already existed (idempotent replay).
+    Replayed(T),
+}
+
 /// A serializable copy of every semantic provider-binding field.  Credential
 /// *values* are intentionally absent; only the stable non-secret reference
 /// and generation are durable.

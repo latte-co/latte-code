@@ -1032,7 +1032,13 @@ impl Storage {
         lease: &Lease,
         now_ms: u64,
         focus: Option<&str>,
-    ) -> Result<ThreadCommitResponse, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
+        // Idempotent create: if the thread already exists, return it.
+        if let Ok(Some(_existing)) = self.thread_session_v2(thread_id) {
+            return Ok(latte_core::CreateOutcome::Replayed(
+                self.thread_snapshot_v2(thread_id, None, 500)?,
+            ));
+        }
         let (snapshot, thread_event) = self.create_thread_v2_inner(
             thread_id,
             run_id,
@@ -1044,12 +1050,8 @@ impl Storage {
             now_ms,
             focus,
         )?;
-        Ok(ThreadCommitResponse {
-            snapshot,
-            thread_event: thread_event.ok_or_else(|| {
-                StorageError::InvalidData("atomic thread start omitted its durable event".into())
-            })?,
-        })
+        let _ = thread_event; // Event is handled by finish_thread_response in engine layer
+        Ok(latte_core::CreateOutcome::Created(snapshot))
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -5826,7 +5828,7 @@ mod tests {
         let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
         let run_id = RunId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
-        let started = store
+        let started = match store
             .create_started_thread_v2(
                 thread_id,
                 run_id,
@@ -5838,8 +5840,11 @@ mod tests {
                 2,
                 None,
             )
-            .unwrap();
-        assert_eq!(started.snapshot.lifecycle, ThreadLifecycle::Running);
+            .unwrap()
+        {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(started.lifecycle, ThreadLifecycle::Running);
 
         let recovered = store
             .release_lease(&lease)

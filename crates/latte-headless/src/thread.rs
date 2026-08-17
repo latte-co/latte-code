@@ -317,7 +317,14 @@ impl ThreadRuntimeService {
             .engine
             .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now, focus.and_then(|f| f.to_str()))
         {
-            Ok(started) => started,
+            Ok(latte_core::CreateOutcome::Created(snapshot)) => snapshot,
+            Ok(latte_core::CreateOutcome::Replayed(snapshot)) => {
+                // Idempotent replay: the session was already created (e.g.,
+                // crash after durable accept but before 202). Don't restart
+                // the provider; return the existing snapshot.
+                signal_accept(accept, Ok(snapshot.clone()));
+                return Ok(snapshot);
+            }
             Err(error) => {
                 let error = ThreadRuntimeError::from(error);
                 signal_accept(accept, Err(error.to_string()));

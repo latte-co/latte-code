@@ -1007,11 +1007,11 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
         focus: Option<&str>,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let response = self.storage.create_started_thread_v2(
+        let outcome = self.storage.create_started_thread_v2(
             thread_id,
             run_id,
             &binding,
@@ -1022,7 +1022,42 @@ impl EngineHandle {
             now_ms,
             focus,
         )?;
-        Ok(self.finish_thread_response(response)?.snapshot)
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                // Broadcast the thread event for the new snapshot.
+                let _ = self.thread_events.send(latte_core::ThreadEventEnvelope {
+                    protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+                    event_id: latte_core::ThreadEventId::from_uuid(uuid::Uuid::now_v7()),
+                    thread_id,
+                    revision: snapshot.revision,
+                    sequence: snapshot.sequence,
+                    event: latte_core::ThreadEvent::LifecycleChanged {
+                        lifecycle: snapshot.lifecycle,
+                        run_id: snapshot.latest_run_id,
+                    },
+                });
+                Ok(latte_core::CreateOutcome::Created(snapshot))
+            }
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
+    }
+
+    /// Convenience: create and return the snapshot, treating replay as success.
+    pub fn create_started_thread_v2_snapshot(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        binding: ThreadProviderBindingV2,
+        prompt: &str,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        match self.create_started_thread_v2(thread_id, run_id, binding, prompt, lease, now_ms, focus)? {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => Ok(s),
+        }
     }
     /// Creates an immutable child run for a ready completed thread.
     pub fn create_thread_follow_up_v2(

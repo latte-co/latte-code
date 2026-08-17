@@ -636,7 +636,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             .acquire_thread_lease(thread_id, now, 1)
             .unwrap();
         local_engine
-            .create_started_thread_v2(
+            .create_started_thread_v2_snapshot(
                 thread_id,
                 run_id,
                 session_boundary_binding(),
@@ -666,7 +666,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         .unwrap();
     let foreign_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
     foreign_engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             foreign_thread_id,
             foreign_run_id,
             session_boundary_binding(),
