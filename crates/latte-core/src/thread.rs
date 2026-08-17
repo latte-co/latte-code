@@ -147,6 +147,8 @@ pub struct ThreadRunSummary {
     pub status: ThreadRunStatus,
     pub run_revision: u64,
     pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<crate::protocol::FailureCode>,
 }
 
 /// Thread-safe projection of a v1 child status. It deliberately has no
@@ -216,6 +218,8 @@ pub struct ThreadSnapshot {
     pub pending: Option<ThreadPendingRequest>,
     pub runs: Vec<ThreadRunSummary>,
     pub transcript: TranscriptPage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
 }
 
 /// Bounded, transcript-free metadata used by Session catalog discovery.
@@ -281,6 +285,8 @@ pub enum ThreadCommand {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        #[serde(default)]
+        focus: Option<String>,
     },
     FollowUp {
         thread_id: ThreadId,
@@ -563,6 +569,7 @@ mod tests {
                 thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
                 prompt: "hello".into(),
                 binding,
+                focus: None,
             },
         );
         assert_eq!(command.protocol_version, THREAD_PROTOCOL_VERSION);

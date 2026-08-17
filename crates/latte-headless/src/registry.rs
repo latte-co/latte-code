@@ -261,6 +261,16 @@ pub struct ProviderModelEntry {
     pub is_default: bool,
 }
 
+/// A complete binding catalog entry for model discovery.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BindingCatalogEntry {
+    pub provider_name: String,
+    pub model: String,
+    pub name: Option<String>,
+    pub is_default: bool,
+    pub binding: ThreadProviderBindingV2,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRegistry {
     config: ProviderFile,
@@ -391,6 +401,28 @@ impl ProviderRegistry {
             binding.with_thread_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
+    }
+
+    /// Returns the complete binding catalog for model discovery.
+    #[must_use]
+    pub fn thread_binding_catalog(
+        &self,
+        tools: &[ToolDescriptor],
+    ) -> Vec<BindingCatalogEntry> {
+        self.model_catalog()
+            .into_iter()
+            .filter_map(|entry| {
+                self.thread_binding_for_model(&entry.provider_name, &entry.model, tools)
+                    .ok()
+                    .map(|binding| BindingCatalogEntry {
+                        provider_name: entry.provider_name,
+                        model: entry.model,
+                        name: entry.name,
+                        is_default: entry.is_default,
+                        binding,
+                    })
+            })
+            .collect()
     }
 
     /// Validates a persisted v2 binding before resolving the configured secret.

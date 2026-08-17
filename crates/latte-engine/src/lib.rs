@@ -1006,6 +1006,7 @@ impl EngineHandle {
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
+        focus: Option<&str>,
     ) -> Result<ThreadSnapshot, StorageError> {
         let baseline = self
             .workspace_manifest()
@@ -1019,6 +1020,7 @@ impl EngineHandle {
             &baseline,
             lease,
             now_ms,
+            focus,
         )?;
         Ok(self.finish_thread_response(response)?.snapshot)
     }

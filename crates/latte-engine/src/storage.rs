@@ -13,7 +13,7 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// thread.  The bound prevents a single long-running conversation from
@@ -460,7 +460,8 @@ impl Storage {
                 binding_json TEXT NOT NULL,
                 latest_run_id TEXT,
                 created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                updated_at_ms INTEGER NOT NULL,
+                focus TEXT
               );
               CREATE TABLE thread_runs_v2(
                 run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -692,6 +693,21 @@ impl Storage {
                   VALUES(11,CAST(strftime('%s','now') AS INTEGER)*1000);
                 PRAGMA user_version=11;
                 ",
+            )?;
+            tx.commit()?;
+        }
+        if version == 11 {
+            let tx = connection.unchecked_transaction()?;
+            let has_focus: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name=?1)",
+                ["focus"],
+                |row| row.get(0),
+            )?;
+            if !has_focus {
+                tx.execute_batch("ALTER TABLE threads_v2 ADD COLUMN focus TEXT;")?;
+            }
+            tx.execute_batch(
+                "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(12,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=12;",
             )?;
             tx.commit()?;
         }
@@ -972,6 +988,7 @@ impl Storage {
             baseline,
             None,
             now_ms,
+            None,
         )
         .map(|(snapshot, _)| snapshot)
     }
@@ -990,6 +1007,7 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         lease: &Lease,
         now_ms: u64,
+        focus: Option<&str>,
     ) -> Result<ThreadCommitResponse, StorageError> {
         let (snapshot, thread_event) = self.create_thread_v2_inner(
             thread_id,
@@ -1000,6 +1018,7 @@ impl Storage {
             baseline,
             Some(lease),
             now_ms,
+            focus,
         )?;
         Ok(ThreadCommitResponse {
             snapshot,
@@ -1020,6 +1039,7 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         initial_lease: Option<&Lease>,
         now_ms: u64,
+        focus: Option<&str>,
     ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
         binding.validate().map_err(StorageError::InvalidData)?;
         let prompt = redact_thread_text(prompt);
@@ -1080,8 +1100,8 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8)",
-            params![thread_id.to_string(), to_i64(thread_revision)?, to_i64(thread_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8,?9)",
+            params![thread_id.to_string(), to_i64(thread_revision)?, to_i64(thread_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
         )?;
         tx.execute(
             "INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
@@ -1364,6 +1384,7 @@ impl Storage {
             status: ThreadRunStatus::Queued,
             run_revision: 0,
             completed_at_ms: None,
+            failure_code: None,
         };
         let event = ThreadEventEnvelope {
             protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
@@ -4368,11 +4389,11 @@ fn thread_snapshot(
     after: Option<u64>,
     limit: usize,
 ) -> Result<ThreadSnapshot, StorageError> {
-    let (revision, sequence, lifecycle, binding_json, latest): (i64, i64, String, String, Option<String>) = connection
+    let (revision, sequence, lifecycle, binding_json, latest, focus): (i64, i64, String, String, Option<String>, Option<String>) = connection
         .query_row(
-            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id,focus FROM threads_v2 WHERE thread_id=?1",
             [thread_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()?
         .ok_or(StorageError::ThreadNotFound(thread_id))?;
@@ -4431,6 +4452,7 @@ fn thread_snapshot(
                 status: thread_run_status(state.status),
                 run_revision: state.revision,
                 completed_at_ms: completed.map(from_i64).transpose()?,
+                failure_code: None,
             })
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
@@ -4498,6 +4520,7 @@ fn thread_snapshot(
             next_after,
             has_more,
         },
+        focus,
     })
 }
 
@@ -5789,6 +5812,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 &lease,
                 2,
+                None,
             )
             .unwrap();
         assert_eq!(started.snapshot.lifecycle, ThreadLifecycle::Running);
@@ -5968,6 +5992,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 &lease,
                 11,
+                None,
             )
             .unwrap_err();
         assert!(error.to_string().contains("injected atomic start failure"));

@@ -861,7 +861,7 @@ fn execute_tui() -> i32 {
     let (progress_tx, progress_rx) =
         std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
     let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
-        std::sync::Arc::new(move |progress| {
+        std::sync::Arc::new(move |_thread_id, progress| {
             let _ = progress_tx.send(progress);
         });
     let service = ThreadRuntimeService::new(engine.clone(), &root, config.thread_policy(), factory)
@@ -913,7 +913,7 @@ fn execute_tui() -> i32 {
                     ));
                     tokio::spawn(async move {
                         let result = service
-                            .start(thread_id, prompt, binding)
+                            .start(thread_id, prompt, binding, None)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -954,7 +954,7 @@ fn execute_tui() -> i32 {
                     ));
                     tokio::spawn(async move {
                         let result = service
-                            .start(thread_id, prompt, binding)
+                            .start(thread_id, prompt, binding, None)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -1369,9 +1369,10 @@ fn prepare_server(
                 .build()
                 .map_err(|error| error.to_string())?;
             let factory_engine = engine.clone();
+            let factory_registry = registry.clone();
             let factory: latte_headless::thread::ThreadProviderFactory =
                 std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
-                    registry
+                    factory_registry
                         .resolve_thread_bound(binding, &factory_engine.tool_descriptors())
                         .map_err(|error| error.to_string())
                 });
@@ -1380,8 +1381,13 @@ fn prepare_server(
                 workspace_root,
                 config.thread_policy(),
                 factory,
-            );
-            Ok(latte_server::BuiltWorkspace { engine, runtime })
+            )
+            .with_verification(config.plan());
+            Ok(latte_server::BuiltWorkspace {
+                engine,
+                runtime,
+                registry: std::sync::Arc::new(registry),
+            })
         });
 
     // Session locator: resolve a session's owning workspace from the durable
@@ -2866,7 +2872,7 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding)
+            .start(thread_id, "hello".into(), binding, None)
             .await
             .unwrap();
         assert_eq!(

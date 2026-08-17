@@ -110,11 +110,11 @@ pub type ThreadProviderFactory =
 /// Non-durable provider progress bridge. It is intentionally separate from
 /// transcript persistence and is cleared by the TUI on a gap or reconnect.
 pub trait ThreadProgressSink: Send + Sync {
-    fn observe(&self, progress: ThreadTransientProgress);
+    fn observe(&self, thread_id: ThreadId, progress: ThreadTransientProgress);
 }
-impl<F: Fn(ThreadTransientProgress) + Send + Sync> ThreadProgressSink for F {
-    fn observe(&self, progress: ThreadTransientProgress) {
-        self(progress);
+impl<F: Fn(ThreadId, ThreadTransientProgress) + Send + Sync> ThreadProgressSink for F {
+    fn observe(&self, thread_id: ThreadId, progress: ThreadTransientProgress) {
+        self(thread_id, progress);
     }
 }
 
@@ -247,9 +247,10 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        focus: Option<&Path>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self.start_one(thread_id, prompt, binding, None).await?;
+        let snapshot = self.start_one(thread_id, prompt, binding, focus, None).await?;
         self.drain_mailbox(snapshot, runner).await
     }
 
@@ -265,6 +266,7 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        focus: Option<&Path>,
         accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = match self.begin_runner(thread_id) {
@@ -275,7 +277,7 @@ impl ThreadRuntimeService {
             }
         };
         let snapshot = self
-            .start_one(thread_id, prompt, binding, Some(accept))
+            .start_one(thread_id, prompt, binding, focus, Some(accept))
             .await?;
         self.drain_mailbox(snapshot, runner).await
     }
@@ -285,6 +287,7 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        focus: Option<&Path>,
         accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         if let Err(error) = binding
@@ -294,7 +297,7 @@ impl ThreadRuntimeService {
             signal_accept(accept, Err(error.to_string()));
             return Err(error);
         }
-        let messages = match self.initial_messages(&prompt) {
+        let messages = match self.initial_messages(&prompt, focus) {
             Ok(messages) => messages,
             Err(error) => {
                 signal_accept(accept, Err(error.to_string()));
@@ -312,7 +315,7 @@ impl ThreadRuntimeService {
         };
         let started = match self
             .engine
-            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now)
+            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now, focus.and_then(|f| f.to_str()))
         {
             Ok(started) => started,
             Err(error) => {
@@ -453,7 +456,7 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         prompt: String,
     ) -> Result<usize, ThreadRuntimeError> {
-        let _ = self.initial_messages(&prompt)?;
+        let _ = self.initial_messages(&prompt, None)?;
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
         let mailbox = mailboxes
             .get_mut(&thread_id)
@@ -797,8 +800,8 @@ impl ThreadRuntimeService {
         )
     }
 
-    fn initial_messages(&self, prompt: &str) -> Result<Vec<Message>, ThreadRuntimeError> {
-        let context = context::build(&self.root, None, self.policy.context_cap_bytes)
+    fn initial_messages(&self, prompt: &str, focus: Option<&Path>) -> Result<Vec<Message>, ThreadRuntimeError> {
+        let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
             .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
         let system = format!(
             "You are Latte Code. Work only in the supplied repository context.{}",
@@ -819,7 +822,8 @@ impl ThreadRuntimeService {
         snapshot: &ThreadSnapshot,
         prompt: &str,
     ) -> Result<Vec<Message>, ThreadRuntimeError> {
-        let context = context::build(&self.root, None, self.policy.context_cap_bytes)
+        let focus = snapshot.focus.as_deref().map(Path::new);
+        let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
             .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
         let system = Message::System {
             content: redact_thread_text(&format!(
@@ -1397,6 +1401,7 @@ impl ThreadRuntimeService {
                     cancellation: cancellation.clone(),
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
+                            thread_id,
                             run_id,
                             sink: Arc::clone(sink),
                         }) as Arc<dyn ProviderEventSink>
@@ -1758,6 +1763,7 @@ fn provider_configuration_failure_message() -> String {
 }
 
 struct ProviderProgress {
+    thread_id: ThreadId,
     run_id: RunId,
     sink: Arc<dyn ThreadProgressSink>,
 }
@@ -1765,13 +1771,13 @@ impl ProviderEventSink for ProviderProgress {
     fn observe(&self, event: ProviderEvent) {
         match event {
             ProviderEvent::Attempt { number } => {
-                self.sink.observe(ThreadTransientProgress::ProviderAttempt {
+                self.sink.observe(self.thread_id, ThreadTransientProgress::ProviderAttempt {
                     run_id: self.run_id,
                     number,
                 });
             }
             ProviderEvent::AssistantDelta { text } => {
-                self.sink.observe(ThreadTransientProgress::AssistantDelta {
+                self.sink.observe(self.thread_id, ThreadTransientProgress::AssistantDelta {
                     run_id: self.run_id,
                     text: redact_thread_text(&text),
                 });
@@ -2040,7 +2046,7 @@ mod tests {
         let task_service = service.clone();
         let task = tokio::spawn(async move {
             task_service
-                .start(thread_id, "prompt-0".into(), binding())
+                .start(thread_id, "prompt-0".into(), binding(), None)
                 .await
         });
         tokio::task::yield_now().await;
@@ -2111,9 +2117,9 @@ mod tests {
         let left_id = ThreadId::from_uuid(Uuid::now_v7());
         let right_id = ThreadId::from_uuid(Uuid::now_v7());
         let left =
-            tokio::spawn(async move { first.start(left_id, "left".into(), binding()).await });
+            tokio::spawn(async move { first.start(left_id, "left".into(), binding(), None).await });
         let right =
-            tokio::spawn(async move { second.start(right_id, "right".into(), binding()).await });
+            tokio::spawn(async move { second.start(right_id, "right".into(), binding(), None).await });
         tokio::task::yield_now().await;
         assert_eq!(
             service
@@ -2150,7 +2156,7 @@ mod tests {
         let first = service.clone();
         let running =
             tokio::spawn(
-                async move { first.start(thread_id, "slow turn".into(), binding()).await },
+                async move { first.start(thread_id, "slow turn".into(), binding(), None).await },
             );
         // Let the first turn enter the provider call so its runner is active.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2159,7 +2165,7 @@ mod tests {
         // InvalidState and signal the accept channel.
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
-            .start_accepted(thread_id, "second start".into(), binding(), accept_tx)
+            .start_accepted(thread_id, "second start".into(), binding(), None, accept_tx)
             .await
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::InvalidState));
@@ -2203,7 +2209,7 @@ mod tests {
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
 
         let failed = service
-            .start(thread_id, "durable prompt".into(), binding())
+            .start(thread_id, "durable prompt".into(), binding(), None)
             .await
             .unwrap();
 
@@ -2280,7 +2286,7 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let complete = service
-            .start(thread_id, "first".into(), binding())
+            .start(thread_id, "first".into(), binding(), None)
             .await
             .unwrap();
 
@@ -2360,7 +2366,7 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let complete = service
-            .start(thread_id, "one".into(), binding())
+            .start(thread_id, "one".into(), binding(), None)
             .await
             .unwrap();
         let parent = complete.latest_run_id.unwrap();
@@ -2448,7 +2454,7 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "initial".into(), binding())
+            .start(thread_id, "initial".into(), binding(), None)
             .await
             .unwrap();
 
@@ -2563,6 +2569,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "read it".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -2621,6 +2628,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "run a failed process".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -2711,6 +2719,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "create it".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -2792,6 +2801,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "write and inspect source".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -2924,6 +2934,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -2986,6 +2997,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3037,6 +3049,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3100,6 +3113,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3154,6 +3168,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "read".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3188,6 +3203,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3240,6 +3256,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3300,6 +3317,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3381,6 +3399,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "choose a language".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3462,6 +3481,7 @@ mod tests {
                     ThreadId::from_uuid(Uuid::now_v7()),
                     "must fail closed".into(),
                     binding(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3478,9 +3498,9 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
-        let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_| {}));
-        let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding()).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
+        let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_, _| {}));
+        let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding(), None).await.unwrap();
+        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding, None).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -3491,7 +3511,7 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let cancel = async { wait_until(|| service.active.lock().unwrap().contains_key(&thread_id), "provider registration").await; service.cancel(thread_id); };
-        let (cancelled, ()) = tokio::join!(service.start(thread_id, "cancel provider".into(), binding()), cancel);
+        let (cancelled, ()) = tokio::join!(service.start(thread_id, "cancel provider".into(), binding(), None), cancel);
         assert_eq!(cancelled.unwrap().lifecycle, ThreadLifecycle::Interrupted);
     }
 
@@ -3527,6 +3547,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "reject unsafe provider identity".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3605,6 +3626,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "reject unsafe input identity".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3692,10 +3714,10 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink: Arc<dyn ThreadProgressSink> = {
             let received = Arc::clone(&received);
-            Arc::new(move |progress| received.lock().unwrap().push(progress))
+            Arc::new(move |_thread_id, progress| received.lock().unwrap().push(progress))
         };
         let run_id = RunId::from_uuid(Uuid::now_v7());
-        let progress = ProviderProgress { run_id, sink };
+        let progress = ProviderProgress { thread_id: ThreadId::from_uuid(Uuid::now_v7()), run_id, sink };
         progress.observe(ProviderEvent::Attempt { number: 2 });
         progress.observe(ProviderEvent::AssistantDelta {
             text: "ok\u{1b}[31m sk-hidden".into(),
@@ -3749,6 +3771,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "read for history".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3827,6 +3850,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "inspect provider settings".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3872,6 +3896,7 @@ mod tests {
                     ThreadId::from_uuid(Uuid::now_v7()),
                     "create it".into(),
                     binding(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3939,6 +3964,7 @@ mod tests {
                 ThreadId::from_uuid(Uuid::now_v7()),
                 "show cwd".into(),
                 binding(),
+                None,
             )
             .await
             .unwrap();
@@ -3968,7 +3994,7 @@ mod tests {
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
         let run =
-            tokio::spawn(async move { runner.start(thread_id, "wait".into(), binding()).await });
+            tokio::spawn(async move { runner.start(thread_id, "wait".into(), binding(), None).await });
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
             engine.acquire_thread_lease(thread_id, now_ms(), 60),
@@ -4012,8 +4038,8 @@ mod tests {
         let second_thread = ThreadId::from_uuid(Uuid::now_v7());
 
         let (first, second) = tokio::join!(
-            first.start(first_thread, "first".into(), binding()),
-            second.start(second_thread, "second".into(), binding()),
+            first.start(first_thread, "first".into(), binding(), None),
+            second.start(second_thread, "second".into(), binding(), None),
         );
 
         assert_eq!(first.unwrap().lifecycle, ThreadLifecycle::Ready);
@@ -4042,7 +4068,7 @@ mod tests {
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .start(thread_id, "wait for fencing".into(), binding())
+                .start(thread_id, "wait for fencing".into(), binding(), None)
                 .await
         });
 
@@ -4134,7 +4160,7 @@ mod tests {
         .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let waiting = service
-            .start(thread_id, "sleep".into(), binding())
+            .start(thread_id, "sleep".into(), binding(), None)
             .await
             .unwrap();
         assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
@@ -4235,7 +4261,7 @@ mod tests {
         .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let waiting = service
-            .start(thread_id, "sleep until fenced".into(), binding())
+            .start(thread_id, "sleep until fenced".into(), binding(), None)
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
@@ -4578,7 +4604,7 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let sink: Arc<dyn ThreadProgressSink> = {
             let observed = Arc::clone(&observed);
-            Arc::new(move |progress| observed.lock().unwrap().push(progress))
+            Arc::new(move |_thread_id, progress| observed.lock().unwrap().push(progress))
         };
         let service = service.with_progress_sink(sink);
         let token = CancellationToken::new();
@@ -4680,6 +4706,7 @@ mod tests {
             status: ThreadRunStatus::Running,
             run_revision: 1,
             completed_at_ms: None,
+            failure_code: None,
         }];
         assert!(matches!(
             active_run_revision(&snapshot),
@@ -4807,7 +4834,7 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .start_accepted(thread_id, "hello".into(), binding(), tx)
+                    .start_accepted(thread_id, "hello".into(), binding(), None, tx)
                     .await
             })
         };
@@ -4834,7 +4861,7 @@ mod tests {
         invalid.provider_name.clear();
         let (tx, rx) = oneshot::channel();
         let result = service
-            .start_accepted(ThreadId::from_uuid(Uuid::now_v7()), "x".into(), invalid, tx)
+            .start_accepted(ThreadId::from_uuid(Uuid::now_v7()), "x".into(), invalid, None, tx)
             .await;
         // The accept signal carries the rejection, and the call itself errors.
         assert!(rx.await.unwrap().is_err());
@@ -4861,7 +4888,7 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding())
+            .start(thread_id, "first".into(), binding(), None)
             .await
             .unwrap();
         assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);

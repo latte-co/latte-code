@@ -551,6 +551,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         status: ThreadRunStatus::Queued,
         run_revision: 0,
         completed_at_ms: None,
+        failure_code: None,
     };
     let run_linked_event = ThreadEventEnvelope {
         protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
@@ -1534,6 +1535,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
             "wrong scope",
             &foreign_lease,
             now + 1,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
@@ -1547,6 +1549,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
             "expired authority",
             &expired,
             now + 2,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
@@ -1561,6 +1564,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
             "valid atomic thread",
             &lease,
             now + 3,
+            None,
         )
         .unwrap();
     assert_eq!(running.lifecycle, ThreadLifecycle::Running);
@@ -2996,6 +3000,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             "atomic boundary session",
             &wrong_scope,
             now + 1,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
@@ -3010,6 +3015,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             "atomic boundary session",
             &lease,
             now + 2,
+            None,
         )
         .unwrap();
     assert_eq!(started.lifecycle, ThreadLifecycle::Running);
@@ -3275,6 +3281,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             "memory-only session",
             &memory_lease,
             now + 27,
+            None,
         )
         .unwrap();
     let memory_ready = commit(
@@ -3419,6 +3426,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
             "explicit unknown boundary",
             &lease,
             now + 1,
+            None,
         )
         .unwrap();
     let prepared = prepare_effect(
@@ -3563,6 +3571,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
             "change feed snapshot fallback",
             &thread_lease,
             now + 1,
+            None,
         )
         .unwrap();
     let created_event = thread_events.try_recv().unwrap().unwrap();

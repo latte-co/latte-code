@@ -150,6 +150,7 @@ pub enum ServerEvent {
     },
     Progress {
         session_id: String,
+        run_id: String,
         progress: serde_json::Value,
     },
     ResyncRequired,
@@ -171,6 +172,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route(
             "/v1/workspaces/{workspace_id}/events",
             get(workspace_events),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/bindings",
+            get(list_bindings),
         )
         .route("/v1/sessions/{session_id}", get(get_session))
         .route("/v1/sessions/{session_id}/follow-up", post(follow_up))
@@ -238,6 +243,12 @@ pub struct WorkspaceResponse {
 pub struct CreateSessionRequest {
     pub prompt: String,
     pub binding: serde_json::Value,
+    #[serde(default)]
+    pub thread_id: Option<latte_core::ThreadId>,
+    #[serde(default)]
+    pub command_id: Option<latte_core::ThreadCommandId>,
+    #[serde(default)]
+    pub focus: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -408,16 +419,17 @@ async fn create_session_owned(
         .validate()
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
-    let thread_id = ThreadId::from_uuid(uuid::Uuid::now_v7());
+    let thread_id = req.thread_id.unwrap_or_else(|| ThreadId::from_uuid(uuid::Uuid::now_v7()));
     let runtime = workspace.runtime.clone();
     let prompt = req.prompt;
+    let focus = req.focus.map(std::path::PathBuf::from);
 
     // Run the turn under supervised background execution, but only acknowledge
     // 202 after the runtime signals the submission is durably accepted.
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .start_accepted(thread_id, prompt, binding, accept_tx)
+            .start_accepted(thread_id, prompt, binding, focus.as_deref(), accept_tx)
             .await
         {
             warn!("session {thread_id} background turn failed: {error}");
@@ -869,6 +881,20 @@ fn canonical_digest(value: &serde_json::Value) -> String {
     format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 
+/// Lists the provider binding catalog for model discovery.
+async fn list_bindings(
+    State(state): State<Arc<ServerState>>,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<serde_json::Value>, HandlerError> {
+    let workspace = state
+        .workspaces
+        .get_by_id(&workspace_id)
+        .await
+        .ok_or_else(|| not_found("workspace not found"))?;
+    let bindings = workspace.bindings();
+    Ok(Json(serde_json::json!({ "bindings": bindings })))
+}
+
 async fn workspace_events(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
@@ -1018,7 +1044,13 @@ mod tests {
                     Default::default(),
                     factory.clone(),
                 );
-                Ok(crate::workspace::BuiltWorkspace { engine, runtime })
+                let registry = std::sync::Arc::new(
+                    latte_headless::registry::ProviderRegistry::parse_jsonc(
+                        r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#,
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+                Ok(crate::workspace::BuiltWorkspace { engine, runtime, registry })
             });
         let locator: crate::workspace::SessionLocator = std::sync::Arc::new(|_| None);
         new_state("test-token".to_string(), builder, locator)
@@ -1996,6 +2028,7 @@ mod tests {
         });
         let _ = workspace.event_tx.send(ServerEvent::Progress {
             session_id: "abc".into(),
+            run_id: "run-1".into(),
             progress: serde_json::json!({ "step": 1 }),
         });
         let _ = workspace.event_tx.send(ServerEvent::ResyncRequired);

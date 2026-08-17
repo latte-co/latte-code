@@ -643,6 +643,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
                 "duplicate session title",
                 &stale,
                 now,
+                None,
             )
             .unwrap();
         local_engine
@@ -672,6 +673,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             "foreign session title",
             &foreign_lease,
             foreign_now,
+            None,
         )
         .unwrap();
     foreign_engine

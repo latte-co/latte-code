@@ -18,6 +18,7 @@ use crate::http::ServerEvent;
 pub struct BuiltWorkspace {
     pub engine: latte_engine::EngineHandle,
     pub runtime: latte_headless::thread::ThreadRuntimeService,
+    pub registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
 }
 
 /// Builds a durable per-workspace runtime for one canonical workspace root.
@@ -48,6 +49,8 @@ pub struct WorkspaceInstance {
     pub event_tx: broadcast::Sender<ServerEvent>,
     /// Engine handle for event subscription.
     engine: latte_engine::EngineHandle,
+    /// Provider registry for binding discovery.
+    registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
 }
 
 impl WorkspaceInstance {
@@ -58,6 +61,7 @@ impl WorkspaceInstance {
         runtime: latte_headless::thread::ThreadRuntimeService,
         event_tx: broadcast::Sender<ServerEvent>,
         engine: latte_engine::EngineHandle,
+        registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
     ) -> Self {
         // The engine canonicalizes the workspace root for its session catalog.
         // Mirror that identity so `list_threads_v2_for_workspace` matches.
@@ -65,6 +69,28 @@ impl WorkspaceInstance {
             .unwrap_or_else(|_| path.clone())
             .to_string_lossy()
             .into_owned();
+
+        // Wire progress events to the workspace event channel.
+        let progress_event_tx = event_tx.clone();
+        let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
+            std::sync::Arc::new(
+                move |thread_id: latte_core::ThreadId, progress: latte_core::ThreadTransientProgress| {
+                    let run_id = match &progress {
+                        latte_core::ThreadTransientProgress::ProviderAttempt { run_id, .. }
+                        | latte_core::ThreadTransientProgress::AssistantDelta { run_id, .. }
+                        | latte_core::ThreadTransientProgress::ToolProgress { run_id, .. } => {
+                            run_id.to_string()
+                        }
+                    };
+                    let _ = progress_event_tx.send(ServerEvent::Progress {
+                        session_id: thread_id.to_string(),
+                        run_id,
+                        progress: serde_json::to_value(&progress).unwrap_or_default(),
+                    });
+                },
+            );
+        let runtime = runtime.with_progress_sink(progress_sink);
+
         let instance = Self {
             id,
             path,
@@ -72,6 +98,7 @@ impl WorkspaceInstance {
             runtime: Arc::new(runtime),
             event_tx,
             engine,
+            registry,
         };
 
         // Start event bridge
@@ -115,6 +142,13 @@ impl WorkspaceInstance {
         self.engine.search_thread_sessions_v2(query, limit)
     }
 
+    /// Returns the provider binding catalog for model discovery.
+    #[must_use]
+    pub fn bindings(&self) -> Vec<latte_headless::registry::BindingCatalogEntry> {
+        self.registry
+            .thread_binding_catalog(&self.engine.tool_descriptors())
+    }
+
     /// Start bridging engine events to the workspace event channel.
     fn start_event_bridge(&self) {
         let mut subscription = self.engine.subscribe_threads();
@@ -124,15 +158,11 @@ impl WorkspaceInstance {
             loop {
                 match subscription.recv().await {
                     Ok(event) => {
-                        // Forward engine events to workspace event channel
-                        let server_event = match event.event {
-                            latte_core::ThreadEvent::LifecycleChanged { .. } => {
-                                ServerEvent::ThreadChanged {
-                                    session_id: event.thread_id.to_string(),
-                                    revision: event.revision,
-                                }
-                            }
-                            _ => continue,
+                        // Forward all durable thread events as wake-up signals.
+                        // SSE is wake-up only; clients refetch snapshots.
+                        let server_event = ServerEvent::ThreadChanged {
+                            session_id: event.thread_id.to_string(),
+                            revision: event.revision,
                         };
                         let _ = event_tx.send(server_event);
                     }
@@ -221,6 +251,7 @@ impl WorkspaceManager {
             built.runtime,
             event_tx,
             built.engine,
+            built.registry,
         ));
 
         // Store and return the winning instance
@@ -292,7 +323,13 @@ mod tests {
                 Default::default(),
                 factory,
             );
-            Ok(BuiltWorkspace { engine, runtime })
+            let registry = std::sync::Arc::new(
+                latte_headless::registry::ProviderRegistry::parse_jsonc(
+                    r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            Ok(BuiltWorkspace { engine, runtime, registry })
         });
         let locator: SessionLocator = Arc::new(|_| None);
         WorkspaceManager::new(builder, locator)
@@ -433,7 +470,7 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding)
+            .start(thread_id, "hello".into(), binding, None)
             .await
             .expect("start persists a retryable failure without panicking");
         assert_eq!(snapshot.thread_id, thread_id);
@@ -491,6 +528,7 @@ mod tests {
             runtime,
             event_tx.clone(),
             engine.clone(),
+            std::sync::Arc::new(latte_headless::registry::ProviderRegistry::parse_jsonc(r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#).unwrap()),
         );
 
         // Drop all EngineHandle clones (our local + the one inside instance)
@@ -532,6 +570,7 @@ mod tests {
             runtime,
             event_tx,
             engine,
+            std::sync::Arc::new(latte_headless::registry::ProviderRegistry::parse_jsonc(r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#).unwrap()),
         );
         assert_eq!(instance.id, "ws_fake");
         assert_eq!(instance.path, fake_path);
@@ -569,6 +608,7 @@ mod tests {
             runtime,
             event_tx,
             engine.clone(),
+            std::sync::Arc::new(latte_headless::registry::ProviderRegistry::parse_jsonc(r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#).unwrap()),
         );
 
         // Produce more thread events than the channel capacity (64) without
@@ -592,7 +632,7 @@ mod tests {
             let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
             let lease = engine.acquire_thread_lease(thread_id, now, 60_000).unwrap();
             engine
-                .create_started_thread_v2(thread_id, run_id, binding.clone(), "prompt", &lease, now)
+                .create_started_thread_v2(thread_id, run_id, binding.clone(), "prompt", &lease, now, None)
                 .unwrap();
         }
 
@@ -637,7 +677,13 @@ mod tests {
                 Default::default(),
                 factory,
             );
-            Ok(BuiltWorkspace { engine, runtime })
+            let registry = std::sync::Arc::new(
+                latte_headless::registry::ProviderRegistry::parse_jsonc(
+                    r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            Ok(BuiltWorkspace { engine, runtime, registry })
         });
         let locator: SessionLocator = Arc::new(|_| None);
         let manager = Arc::new(WorkspaceManager::new(builder, locator));
