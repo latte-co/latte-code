@@ -123,14 +123,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        11
+        12
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        11
+        12
     );
     assert_eq!(
         sqlite_integer(

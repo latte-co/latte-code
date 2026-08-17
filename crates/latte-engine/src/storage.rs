@@ -1034,11 +1034,20 @@ impl Storage {
         focus: Option<&str>,
     ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
         // Idempotent create: if the thread already exists, return it.
-        if let Ok(Some(_existing)) = self.thread_session_v2(thread_id) {
+        // Do this inside the same lock to avoid race conditions.
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM threads_v2 WHERE thread_id=?1)",
+            [thread_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if exists {
+            drop(conn);
             return Ok(latte_core::CreateOutcome::Replayed(
                 self.thread_snapshot_v2(thread_id, None, 500)?,
             ));
         }
+        drop(conn);
         let (snapshot, thread_event) = self.create_thread_v2_inner(
             thread_id,
             run_id,
