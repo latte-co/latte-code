@@ -852,7 +852,31 @@ impl Storage {
                 "pending_permissions",
                 "runtime_checkpoints",
                 "run_baselines",
-                "threads_v2",
+            ] {
+                tx.execute_batch(&format!(
+                    "INSERT OR IGNORE INTO main.{table} SELECT * FROM legacy_import.{table};"
+                ))?;
+            }
+            // threads_v2 must be imported before thread_runs_v2 and other
+            // tables that reference it via foreign keys. Legacy v9-v11 may
+            // lack parent_thread_id (added in v10) and focus (added in v12).
+            let has_parent: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('legacy_import.threads_v2') WHERE name='parent_thread_id')",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_parent {
+                tx.execute_batch(
+                    "INSERT OR IGNORE INTO main.threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,focus) \
+                     SELECT thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,NULL FROM legacy_import.threads_v2;",
+                )?;
+            } else {
+                tx.execute_batch(
+                    "INSERT OR IGNORE INTO main.threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,focus) \
+                     SELECT thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,NULL,NULL FROM legacy_import.threads_v2;",
+                )?;
+            }
+            for table in [
                 "thread_runs_v2",
                 "thread_active_runs_v2",
                 "thread_events_v2",
@@ -1920,11 +1944,11 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (source_title, workspace_root, binding_json): (String, String, String) = tx
+        let (source_title, workspace_root, binding_json, focus): (String, String, String, Option<String>) = tx
             .query_row(
-                "SELECT title,workspace_root,binding_json FROM threads_v2 WHERE thread_id=?1",
+                "SELECT title,workspace_root,binding_json,focus FROM threads_v2 WHERE thread_id=?1",
                 [source_thread_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or(StorageError::ThreadNotFound(source_thread_id))?;
@@ -1934,9 +1958,9 @@ impl Storage {
         );
         let last_sequence = history.last().map_or(0, |entry| entry.sequence);
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id) \
-             VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7)",
-            params![fork_thread_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_thread_id.to_string()],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,focus) \
+             VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7,?8)",
+            params![fork_thread_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_thread_id.to_string(),focus],
         )?;
         let mut previous = 0;
         for source in history {

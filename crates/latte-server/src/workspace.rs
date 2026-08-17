@@ -48,7 +48,7 @@ pub struct WorkspaceInstance {
     /// Event sender for this workspace.
     pub event_tx: broadcast::Sender<ServerEvent>,
     /// Engine handle for event subscription.
-    engine: latte_engine::EngineHandle,
+    pub engine: latte_engine::EngineHandle,
     /// Provider registry for binding discovery.
     registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
 }

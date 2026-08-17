@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use futures::stream::Stream;
 use latte_core::ThreadId;
@@ -191,6 +191,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
             "/v1/sessions/{session_id}/effects/{effect_id}/reconcile",
             post(reconcile_effect),
         )
+        .route("/v1/sessions/{session_id}", patch(rename_session))
+        .route("/v1/sessions/{session_id}/fork", post(fork_session))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -750,6 +752,60 @@ async fn reconcile_effect(
         Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
         Err(_) => Err(not_found("session not found")),
     }
+}
+
+/// Renames a session.
+async fn rename_session(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, HandlerError> {
+    let thread_id = parse_thread_id(&id)?;
+    let title = req
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad_request("missing title"))?;
+    let workspace = lookup_workspace(&state, thread_id).await?;
+    workspace
+        .engine
+        .rename_thread_session_v2(thread_id, title)
+        .map_err(|error| failed(&format!("rename failed: {error}")))?;
+    let snapshot = workspace
+        .snapshot(thread_id)
+        .map_err(|error| failed(&format!("snapshot failed: {error}")))?;
+    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+        session_id: thread_id.to_string(),
+        revision: snapshot.revision,
+    });
+    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
+}
+
+/// Forks a session.
+async fn fork_session(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, HandlerError> {
+    let thread_id = parse_thread_id(&id)?;
+    let title = req
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let workspace = lookup_workspace(&state, thread_id).await?;
+    let fork_id = ThreadId::from_uuid(uuid::Uuid::now_v7());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
+        .unwrap_or(0);
+    let snapshot = workspace
+        .engine
+        .fork_thread_session_v2(thread_id, fork_id, title.as_deref(), now_ms)
+        .map_err(|error| failed(&format!("fork failed: {error}")))?;
+    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+        session_id: fork_id.to_string(),
+        revision: snapshot.revision,
+    });
+    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
 }
 
 // Helper functions
