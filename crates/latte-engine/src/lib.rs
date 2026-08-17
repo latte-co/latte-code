@@ -1139,6 +1139,13 @@ impl EngineHandle {
         }
         Ok(snapshot)
     }
+
+    /// Recovers all expired leases in this engine's storage.
+    /// Called periodically by the server's recovery sweeper.
+    pub fn recover_expired_leases(&self) -> Result<(), StorageError> {
+        self.storage.recover_at(crate::wall_now_ms())
+    }
+
     /// Reads the newest bounded transcript cards for presentation and resume
     /// reconciliation. Durable history reconstruction continues to use the
     /// forward-paged `thread_snapshot_v2` API.

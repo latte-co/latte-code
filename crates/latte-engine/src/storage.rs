@@ -4181,7 +4181,7 @@ impl Storage {
         Ok((state, Some(StoredEvent { sequence, envelope })))
     }
 
-    fn recover_at(&self, now_ms: u64) -> Result<(), StorageError> {
+    pub(crate) fn recover_at(&self, now_ms: u64) -> Result<(), StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Linked children must recover their v1 run, effect ledger, thread
@@ -8830,5 +8830,78 @@ mod tests {
         assert!(matches!(store.apply_transition(running_only, 0, Transition::Cancel, 43, &next), Err(StorageError::StaleRevision { .. }))); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &forged), Err(StorageError::LeaseLost)));
         store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
         store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { run_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
+    }
+
+    #[test]
+    fn focus_is_persisted_and_returned_in_snapshot() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+        let outcome = store
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                Some("src/main.rs"),
+            )
+            .unwrap();
+        let snapshot = match outcome {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(snapshot.focus.as_deref(), Some("src/main.rs"));
+
+        // Read back
+        let loaded = store.thread_snapshot_v2(thread_id, None, 500).unwrap();
+        assert_eq!(loaded.focus.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn create_started_thread_v2_is_idempotent() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+
+        // First create
+        let first = store
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Second create with same thread_id should replay
+        let second = store
+            .create_started_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                3,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(second, latte_core::CreateOutcome::Replayed(_)));
     }
 }

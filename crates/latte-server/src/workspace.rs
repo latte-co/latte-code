@@ -266,6 +266,26 @@ impl WorkspaceManager {
         instances.values().find(|i| i.id == id).cloned()
     }
 
+    /// Start a background task that periodically recovers expired leases.
+    pub fn start_recovery_sweeper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let instances: Vec<Arc<WorkspaceInstance>> = {
+                    let instances = manager.instances.read().await;
+                    instances.values().cloned().collect()
+                };
+                for instance in instances {
+                    if let Err(error) = instance.engine.recover_expired_leases() {
+                        tracing::warn!("lease recovery failed for workspace {}: {error}", instance.id);
+                    }
+                }
+            }
+        })
+    }
+
     /// Register a session in the index (best-effort in-memory cache).
     pub async fn register_session(
         &self,
