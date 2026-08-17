@@ -131,7 +131,7 @@ Response: 200 { "bindings": [ThreadProviderBindingV2, ...] }
 
 返回该 workspace 配置中所有可用的 provider binding。TUI model picker 和 CLI `run` 用此端点选择模型。
 
-Server 侧：从 `AppConfig::load(workspace_root)` 的 `ProviderRegistry` 导出 binding 列表。
+Server 侧：`ProviderRegistry` 目前没有直接导出 `Vec<ThreadProviderBindingV2>` 的方法。需要新增一个方法（如 `thread_binding_catalog(&self, tools: &[ToolDescriptor]) -> Result<Vec<ThreadProviderBindingV2>>`），或遍历 `model_catalog()` 逐条调用 `thread_binding_for_model`（需要 `ToolDescriptor`，可通过 `engine.tool_descriptors()` 获取）。
 
 ### 4.2 Session 创建增加 focus 字段
 
@@ -146,7 +146,7 @@ pub struct CreateSessionRequest {
 }
 ```
 
-Server 侧将 `focus` 传给 `ThreadRuntimeService::start`，由 server 构建 `ContextBundle`（复用 `latte_headless::context::build`）。
+Server 侧将 `focus` 传给 `ThreadRuntimeService`。**注意**：当前 `ThreadRuntimeService::new()` 和 `start()` 都不接受 focus 参数，内部硬编码 `focus = None`（`thread.rs:801,822`）。需要修改 service API：在 `start()` 签名中增加 `focus: Option<&Path>` 参数，或在 service 上增加 `with_focus` 方法。`latte_headless::context::build(root, focus, cap)` 已支持 focus，只需透传。
 
 ### 4.3 Session 重命名
 
@@ -156,33 +156,49 @@ Body: { "title": "新标题" }
 Response: 200 { "snapshot": {...} }
 ```
 
-映射到 `engine.rename_thread_session_v2`。
+映射到 `engine.rename_thread_session_v2`。注意该方法返回 `ThreadSessionSummary`（非 `ThreadSnapshot`），server 需要额外调用 `thread_snapshot_v2` 获取完整 snapshot 后返回。
 
 ### 4.4 Session 分叉
 
 ```
 POST /v1/sessions/{session_id}/fork
+Body: { "title": "可选标题" }
 Response: 200 { "snapshot": {...} }
 ```
 
-映射到 `engine.fork_thread_session_v2`。
+映射到 `engine.fork_thread_session_v2`。注意该方法需要调用方生成 fork 的 `ThreadId`（`ThreadId::from_uuid(Uuid::now_v7())`）和 `now_ms` 时间戳，engine 不自动分配。
 
 ### 4.5 Progress 事件接线
 
-当前 `ServerEvent::Progress` 变体存在但未接线。需要在 workspace builder 中为 `ThreadRuntimeService` 设置 `ThreadProgressSink`：
+当前 `ServerEvent::Progress` 变体存在但未接线。需要在 `WorkspaceManager` 创建 `WorkspaceInstance` 时为 `ThreadRuntimeService` 设置 `ThreadProgressSink`。
+
+**接线点**：`WorkspaceManager::ensure_workspace`（`workspace.rs:212-220`）。`event_tx` 在 builder 调用前创建（`workspace.rs:212`），但 builder 闭包签名（`Fn(&Path) -> Result<BuiltWorkspace, String>`）不接收 `event_tx`。两种方案：
+
+1. **在 `WorkspaceInstance::new` 中接线**（推荐）：`WorkspaceInstance` 已持有 `event_tx`，在构造时从 `BuiltWorkspace` 取出 `runtime`，调用 `with_progress_sink` 后再存入。
+2. **修改 builder 签名**：让 builder 接收 `event_tx`，在构建 runtime 时设置 sink。
+
+方案 1 不需要改 builder 签名，改动更小：
 
 ```rust
-let progress_tx = workspace_event_tx.clone();
-let sink: Arc<dyn ThreadProgressSink> = Arc::new(move |progress| {
-    let _ = progress_tx.send(ServerEvent::Progress {
-        session_id: progress.run_id().to_string(),
-        progress: serde_json::to_value(&progress).unwrap_or_default(),
-    });
-});
+// WorkspaceInstance::new 中
+let sink: Arc<dyn ThreadProgressSink> = {
+    let event_tx = event_tx.clone();
+    Arc::new(move |progress: ThreadTransientProgress| {
+        let session_id = match &progress {
+            ThreadTransientProgress::ProviderAttempt { run_id, .. }
+            | ThreadTransientProgress::AssistantDelta { run_id, .. }
+            | ThreadTransientProgress::ToolProgress { run_id, .. } => run_id.to_string(),
+        };
+        let _ = event_tx.send(ServerEvent::Progress {
+            session_id,
+            progress: serde_json::to_value(&progress).unwrap_or_default(),
+        });
+    })
+};
 let runtime = runtime.with_progress_sink(sink);
 ```
 
-SSE 客户端收到 `progress` 事件后，反序列化 `serde_json::Value` 回 `ThreadTransientProgress`。
+注意 `ThreadTransientProgress` 是 enum（无 `run_id()` 访问器），需要 match 变体提取 `run_id`。enum 已 derive `Serialize`/`Deserialize`，序列化/反序列化路径可行。
 
 ## 5. TUI HTTP Client
 
@@ -201,6 +217,7 @@ TUI Reducer（不变）
   ├── Action Sink（FnMut(ThreadUiAction) → Result）
   │     └── HttpActionSink（新）
   │           ├── Start          → POST /v1/workspaces/{ws}/sessions
+  │           ├── StartWithModel → POST /v1/workspaces/{ws}/sessions（客户端合成 binding）
   │           ├── FollowUp       → POST /v1/sessions/{id}/follow-up
   │           ├── QueueFollowUp  → POST /v1/sessions/{id}/queue
   │           ├── Cancel         → POST /v1/sessions/{id}/cancel
@@ -210,7 +227,7 @@ TUI Reducer（不变）
   │           ├── ReconcileUnknown → POST /v1/sessions/{id}/effects/{effect_id}/reconcile
   │           ├── RenameSession  → PATCH /v1/sessions/{id}
   │           ├── ForkSession    → POST /v1/sessions/{id}/fork
-  │           └── RefreshSnapshots → 触发 snapshot 刷新（无 HTTP 调用）
+  │           └── RefreshSnapshots / ShowSessions / SearchSessions / OpenSession / Quit → UI 内部，无 HTTP
   │
   └── Feedback/Progress Channel
         └── SSE 后台任务
@@ -220,6 +237,18 @@ TUI Reducer（不变）
 ```
 
 ### 5.2 HttpProjectionClient
+
+`ThreadProjectionClient` trait 有 7 个方法（2 个必须实现，5 个有默认实现）。生产环境的 `ThreadEngineProjection` 覆写了全部 7 个方法。`HttpProjectionClient` 同样需要覆写全部 7 个，否则默认实现会走全量 snapshot + 客户端过滤，语义弱且效率低。
+
+| 方法 | HTTP 映射 |
+|---|---|
+| `snapshots()` | `GET /v1/workspaces/{ws}/sessions` |
+| `session_catalog()` | `GET /v1/workspaces/{ws}/sessions`（server 端映射为 summary） |
+| `session(id)` | `GET /v1/sessions/{id}` |
+| `exact_session_catalog(query)` | `GET /v1/workspaces/{ws}/sessions/search?q={query}`（精确匹配） |
+| `exact_session(query)` | `exact_session_catalog` + `session` |
+| `search_session_catalog(query)` | `GET /v1/workspaces/{ws}/sessions/search?q={query}`（模糊匹配） |
+| `poll()` | SSE 后台任务 mpsc channel `try_recv()` |
 
 ```rust
 pub struct HttpProjectionClient {
@@ -241,7 +270,6 @@ enum ProjectionEvent {
 - 构造时启动 SSE 后台任务（`tokio::spawn`），连接 `GET /v1/workspaces/{ws}/events`。
 - SSE 任务解析事件帧，发送 `ProjectionEvent` 到 `std::sync::mpsc::channel`。
 - `poll()` 做 `try_recv()`，映射到 `ThreadProjectionPoll`。
-- `snapshots()` / `session()` / `search_session_catalog()` 做 HTTP GET。
 - 断线自动重连（1s 间隔退避），`resync_required` 触发全量重拉。
 
 ### 5.3 同步/异步桥接
@@ -365,11 +393,11 @@ latte-code run [--focus <path>] [--json] [--server url] [--token token] <prompt>
 
 - [ ] 内嵌 server 构造逻辑（`build_server_state` 提取为可复用函数）
 - [ ] `--server` / `--token` CLI 参数解析
-- [ ] `GET /v1/workspaces/{ws}/bindings` 端点
-- [ ] `CreateSessionRequest` 增加 `focus` 字段
-- [ ] `PATCH /v1/sessions/{id}` 重命名端点
-- [ ] `POST /v1/sessions/{id}/fork` 分叉端点
-- [ ] Progress 事件接线（`ThreadProgressSink` → `ServerEvent::Progress`）
+- [ ] `GET /v1/workspaces/{ws}/bindings` 端点（需新增 `ProviderRegistry::thread_binding_catalog` 方法）
+- [ ] `CreateSessionRequest` 增加 `focus` 字段（需修改 `ThreadRuntimeService::start` 签名透传 focus）
+- [ ] `PATCH /v1/sessions/{id}` 重命名端点（engine 直调，rename 后补 snapshot 查询）
+- [ ] `POST /v1/sessions/{id}/fork` 分叉端点（engine 直调，server 生成 fork ThreadId + now_ms）
+- [ ] Progress 事件接线（`WorkspaceInstance::new` 中 `with_progress_sink`，match enum 变体提取 run_id）
 - [ ] UT + E2E 覆盖
 
 ### Phase 1：TUI HTTP Client（~3 天）
