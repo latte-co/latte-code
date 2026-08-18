@@ -264,8 +264,9 @@ impl ThreadRuntimeService {
     /// boundary (once the user submission is persisted) before running the
     /// provider turn. Lets a server return 202 only after the command is
     /// durable, while the turn continues under the same supervised execution.
-    /// The signal carries the accepted snapshot wrapped in [`CreateOutcome`]:
-    /// `Created` (202) or `Replayed` (200, crash-safe idempotent replay).
+    /// The signal carries the accepted snapshot wrapped in
+    /// [`latte_core::CreateOutcome`]: `Created` (202) or `Replayed` (200,
+    /// crash-safe idempotent replay).
     pub async fn start_accepted(
         &self,
         thread_id: ThreadId,
@@ -830,7 +831,11 @@ impl ThreadRuntimeService {
             .find(|run| run.run_id == run_id)
             .map(|run| run.run_revision)
             .ok_or(ThreadRuntimeError::InvalidState)?;
-        let lease = self.acquire(thread_id)?;
+        // A reconcile acquires a lease and immediately commits under it with no
+        // heartbeat renewal, so it uses the management TTL (floored well above a
+        // sub-second turn TTL) to avoid a spurious `LeaseLost` if the acquire →
+        // in-transaction recheck window stalls under load.
+        let lease = self.acquire_with_ttl(thread_id, self.management_ttl())?;
         self.engine
             .reconcile_thread_effect_unknown(
                 thread_id,
@@ -1774,8 +1779,16 @@ impl ThreadRuntimeService {
     }
 
     fn acquire(&self, thread_id: ThreadId) -> Result<ThreadLeaseGuard, ThreadRuntimeError> {
+        self.acquire_with_ttl(thread_id, self.authority_ttl())
+    }
+
+    fn acquire_with_ttl(
+        &self,
+        thread_id: ThreadId,
+        ttl_ms: u64,
+    ) -> Result<ThreadLeaseGuard, ThreadRuntimeError> {
         self.engine
-            .acquire_thread_lease(thread_id, now_ms(), self.authority_ttl())
+            .acquire_thread_lease(thread_id, now_ms(), ttl_ms)
             .map(|lease| ThreadLeaseGuard {
                 engine: self.engine.clone(),
                 lease,
@@ -1851,6 +1864,24 @@ impl ThreadRuntimeService {
 
     const fn authority_ttl(&self) -> u64 {
         self.lease_ttl_ms
+    }
+
+    /// TTL for a one-shot synchronous recovery/management acquisition
+    /// (`reconcile_unknown_effect`). Unlike a running turn — which renews on a
+    /// heartbeat and so can safely use a short `authority_ttl` — a reconcile
+    /// acquires a lease and immediately commits under it with no renewal. A
+    /// sub-second turn TTL (used by crash-recovery tests, and clamped as low as
+    /// 10ms) could otherwise expire between the acquire and the in-transaction
+    /// `expires_at_ms > now` recheck under a scheduler/coverage stall, spuriously
+    /// failing the commit with `LeaseLost`. Flooring at 5s removes that race
+    /// without ever shortening the production 60s default.
+    const fn management_ttl(&self) -> u64 {
+        let floor = 5_000;
+        if self.lease_ttl_ms > floor {
+            self.lease_ttl_ms
+        } else {
+            floor
+        }
     }
 
     fn heartbeat_interval(&self) -> Duration {
@@ -2822,6 +2853,38 @@ mod tests {
                 .lifecycle,
             ThreadLifecycle::Failed
         );
+    }
+
+    #[test]
+    fn management_ttl_floors_sub_second_turn_ttls_for_reconcile() {
+        // Deterministic guard for the reconcile `LeaseLost` fix. A running turn
+        // renews on a heartbeat, so it may use a short `authority_ttl`; a
+        // reconcile acquires a lease and immediately commits under it with no
+        // renewal, so it must use a `management_ttl` floored well above a
+        // sub-second turn TTL. Otherwise the just-acquired lease can read as
+        // expired at the in-transaction `expires_at_ms > now` recheck under a
+        // scheduler/coverage stall and spuriously fail with `LeaseLost`.
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+
+        // Production default (60s) is unchanged for both paths.
+        let default = scripted_service(root.path(), engine.clone(), vec![]);
+        assert_eq!(default.authority_ttl(), 60_000);
+        assert_eq!(default.management_ttl(), 60_000);
+
+        // A 300ms turn TTL (the value crash-recovery tests use) keeps the turn
+        // heartbeat tight but floors the no-renewal reconcile to 5s.
+        let short = scripted_service(root.path(), engine.clone(), vec![]).with_lease_ttl_ms(300);
+        assert_eq!(short.authority_ttl(), 300);
+        assert_eq!(short.management_ttl(), 5_000);
+
+        // Even the minimum clamped turn TTL (10ms) floors identically.
+        let minimum = scripted_service(root.path(), engine, vec![]).with_lease_ttl_ms(10);
+        assert_eq!(minimum.authority_ttl(), 10);
+        assert_eq!(minimum.management_ttl(), 5_000);
     }
 
     #[cfg(unix)]

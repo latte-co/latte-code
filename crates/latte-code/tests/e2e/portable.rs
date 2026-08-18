@@ -1029,6 +1029,11 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     assert_eq!(no_key_stale_status, 409);
 }
 
+// Allowing the permission executes the `write_file`+`create_intent` mutation as
+// a supervised process effect, which is only available on Unix; on Windows the
+// engine fails closed with "process supervision is unsupported on this
+// platform". The permission-resolve contract is fully exercised on Unix.
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn final_binary_server_resolves_a_permission_request_through_http() {
@@ -1340,6 +1345,11 @@ fn final_binary_server_rejects_secret_input_request_from_provider() {
     );
 }
 
+// Allowing the permission executes the `write_file`+`create_intent` mutation as
+// a supervised process effect (Unix-only); on Windows the engine fails closed
+// with "process supervision is unsupported on this platform", so the
+// stale-run-revision permission contract is proven on Unix.
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn final_binary_server_rejects_stale_run_revision_on_permission() {
@@ -2292,4 +2302,204 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
     );
     assert_eq!(f2, 202);
     assert_eq!(f2_body, f1_body, "keyed follow-up retry must replay");
+}
+
+/// Exercises the session-management surface end to end against the final
+/// binary: once a session is durably idle it is renamed (verified through the
+/// catalog search projection), forked into a fresh thread id, and the provider
+/// binding catalog is listed. These handler paths are otherwise only covered by
+/// in-process unit tests; driving them over real HTTP keeps the final-binary
+/// server honest about the crash-safe session lifecycle.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_renames_forks_and_lists_bindings() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("first")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+    // The provider binding catalog is available immediately from the workspace
+    // registry (the models configured above), independent of any session.
+    let (bindings_status, bindings_body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/bindings"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(
+        bindings_status, 200,
+        "list bindings returned {bindings_body:?}"
+    );
+    assert!(
+        bindings_body["bindings"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "binding catalog must not be empty: {bindings_body:?}"
+    );
+
+    // An unknown workspace id fails closed with 404 rather than leaking an
+    // empty catalog.
+    let (missing_status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws_does_not_exist/bindings",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(missing_status, 404);
+
+    let (_, created) = {
+        let binding = server_binding(&scenario);
+        server.create_session(&workspace_id, "hello", &binding)
+    };
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the session is durably idle before management operations.
+    let mut ready = false;
+    for _ in 0..300 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "session never reached a durable idle state");
+
+    // Rename the session; the handler returns the same session's snapshot.
+    let (rename_status, rename_body) = server.request(
+        "PATCH",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "title": "renamed via http" })),
+        &[],
+    );
+    assert_eq!(rename_status, 200, "rename returned {rename_body:?}");
+    assert_eq!(
+        rename_body["snapshot"]["thread_id"].as_str(),
+        Some(session_id.as_str())
+    );
+
+    // The new title is durable: it appears in the catalog search projection.
+    let (search_status, search_body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/search?q=renamed&limit=10"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(search_status, 200);
+    let renamed = search_body["sessions"]
+        .as_array()
+        .expect("search must return an array")
+        .iter()
+        .find(|s| s["thread_id"].as_str() == Some(session_id.as_str()))
+        .expect("renamed session must appear in the catalog search");
+    assert_eq!(renamed["title"].as_str(), Some("renamed via http"));
+
+    // Missing title on rename is a 400 before the engine is touched.
+    let (bad_rename, _) = server.request(
+        "PATCH",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "not_title": 7 })),
+        &[],
+    );
+    assert_eq!(bad_rename, 400);
+
+    // Fork the session into a distinct thread id and confirm the fork snapshot.
+    let (fork_status, fork_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/fork"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "title": "forked via http" })),
+        &[],
+    );
+    assert_eq!(fork_status, 200, "fork returned {fork_body:?}");
+    let fork_id = fork_body["snapshot"]["thread_id"]
+        .as_str()
+        .expect("fork snapshot missing thread_id");
+    assert_ne!(fork_id, session_id, "fork must mint a distinct thread id");
+
+    // The fork is itself a readable durable session.
+    let (fork_read, fork_snapshot) = server.request(
+        "GET",
+        &format!("/v1/sessions/{fork_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(fork_read, 200, "fork read returned {fork_snapshot:?}");
+    assert_eq!(
+        fork_snapshot["snapshot"]["thread_id"].as_str(),
+        Some(fork_id)
+    );
+
+    // Error branches over real HTTP: management operations on a well-formed but
+    // unknown session id fail closed with 404, and a request without the bearer
+    // token is rejected with 401 before any handler runs.
+    let unknown = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (rename_missing, _) = server.request(
+        "PATCH",
+        &format!("/v1/sessions/{unknown}"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "title": "no such session" })),
+        &[],
+    );
+    assert_eq!(rename_missing, 404, "rename of unknown session must be 404");
+
+    let (fork_missing, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{unknown}/fork"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "title": "no such session" })),
+        &[],
+    );
+    assert_eq!(fork_missing, 404, "fork of unknown session must be 404");
+
+    // A malformed session id is a 400 (bad request), distinct from 404.
+    let (rename_malformed, _) = server.request(
+        "PATCH",
+        "/v1/sessions/not-a-uuid",
+        Some(&server.token),
+        Some(&serde_json::json!({ "title": "bad id" })),
+        &[],
+    );
+    assert_eq!(rename_malformed, 400, "malformed session id must be 400");
+
+    // Missing bearer token is rejected before the handler.
+    let (unauthorized, _) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/bindings"),
+        None,
+        None,
+        &[],
+    );
+    assert_eq!(unauthorized, 401, "missing bearer token must be 401");
 }
