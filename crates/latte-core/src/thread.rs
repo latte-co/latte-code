@@ -91,6 +91,18 @@ pub enum CreateOutcome<T = ThreadSnapshot> {
     Replayed(T),
 }
 
+/// Error class for a session-create acceptance failure, carried by the
+/// durable-acceptance signal so the HTTP layer can map it to the right status
+/// code without inspecting error strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateAcceptError {
+    /// A durable command-id reuse with a different payload, or a non-replay
+    /// create for an already-existing thread. Maps to 409 Conflict.
+    Conflict(String),
+    /// Any other acceptance failure. Maps to 500.
+    Failed(String),
+}
+
 /// A serializable copy of every semantic provider-binding field.  Credential
 /// *values* are intentionally absent; only the stable non-secret reference
 /// and generation are durable.

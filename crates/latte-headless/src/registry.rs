@@ -403,24 +403,26 @@ impl ProviderRegistry {
         Ok(result)
     }
 
-    /// Returns the complete binding catalog for model discovery.
-    #[must_use]
+    /// Returns the complete binding catalog for model discovery. Fails closed:
+    /// a model whose binding cannot be constructed is an error, not a silently
+    /// dropped entry, so a broken configuration is visible to the client
+    /// instead of producing a partial catalog.
     pub fn thread_binding_catalog(
         &self,
         tools: &[ToolDescriptor],
-    ) -> Vec<BindingCatalogEntry> {
+    ) -> Result<Vec<BindingCatalogEntry>, RegistryError> {
         self.model_catalog()
             .into_iter()
-            .filter_map(|entry| {
-                self.thread_binding_for_model(&entry.provider_name, &entry.model, tools)
-                    .ok()
-                    .map(|binding| BindingCatalogEntry {
-                        provider_name: entry.provider_name,
-                        model: entry.model,
-                        name: entry.name,
-                        is_default: entry.is_default,
-                        binding,
-                    })
+            .map(|entry| {
+                let binding =
+                    self.thread_binding_for_model(&entry.provider_name, &entry.model, tools)?;
+                Ok(BindingCatalogEntry {
+                    provider_name: entry.provider_name,
+                    model: entry.model,
+                    name: entry.name,
+                    is_default: entry.is_default,
+                    binding,
+                })
             })
             .collect()
     }
@@ -1318,5 +1320,61 @@ mod tests {
             "rf"
         );
         assert_eq!(outcome.tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn thread_binding_catalog_returns_every_configured_model() {
+        // The happy path: a well-formed config produces a complete catalog with
+        // one entry per configured model, default flagged.
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'alpha/a-default',providers:{
+                alpha:{type:'openai-chat',models:['a-default','a-fast'],endpoint:'https://a',api_key:{source:'env',name:'PATH'}},
+                beta:{type:'openai-chat',models:['b-default'],endpoint:'https://b',api_key:{source:'env',name:'PATH'}}
+            }}",
+        )
+        .unwrap();
+        let catalog = registry
+            .thread_binding_catalog(&[tool("read_file")])
+            .unwrap();
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|entry| (
+                    entry.provider_name.as_str(),
+                    entry.model.as_str(),
+                    entry.is_default
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", "a-default", true),
+                ("alpha", "a-fast", false),
+                ("beta", "b-default", false),
+            ]
+        );
+        // Every entry carries a fully-constructed, valid binding.
+        assert!(catalog.iter().all(|entry| entry.binding.validate().is_ok()));
+    }
+
+    #[test]
+    fn thread_binding_catalog_fails_closed_on_a_broken_model() {
+        // A model whose binding cannot be constructed (here: an alias that
+        // references a tool absent from the descriptor set) must surface as an
+        // error, not be silently dropped from the catalog. A client that asked
+        // for the model list must see the broken configuration rather than a
+        // catalog that looks complete but is missing an entry.
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'alpha/a-default',providers:{
+                alpha:{type:'openai-chat',models:['a-default'],endpoint:'https://a',api_key:{source:'env',name:'PATH'},aliases:{nonexistent_tool:'x'}}
+            }}",
+        )
+        .unwrap();
+        // The model is listed in the catalog...
+        assert_eq!(registry.model_catalog().len(), 1);
+        // ...but its binding cannot be built with these tools, so the catalog
+        // fails closed instead of returning an empty (silently partial) list.
+        assert!(matches!(
+            registry.thread_binding_catalog(&[tool("read_file")]),
+            Err(RegistryError::Invalid(message)) if message.contains("unknown canonical tool")
+        ));
     }
 }

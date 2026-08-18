@@ -4942,7 +4942,7 @@ mod tests {
             status: ThreadRunStatus::Running,
             run_revision: 1,
             completed_at_ms: None,
-        failure_code: None,
+            failure_code: None,
         });
         thread
     }
@@ -5234,7 +5234,7 @@ mod tests {
             status: ThreadRunStatus::Running,
             run_revision: 1,
             completed_at_ms: None,
-        failure_code: None,
+            failure_code: None,
         };
         let linked = ThreadEventEnvelope {
             protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
@@ -5827,7 +5827,7 @@ mod tests {
             status: ThreadRunStatus::Failed,
             run_revision: 2,
             completed_at_ms: Some(2),
-        failure_code: None,
+            failure_code: None,
         });
         retryable_failure.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
@@ -6497,7 +6497,7 @@ mod tests {
             status: latte_core::ThreadRunStatus::Completed,
             run_revision: 3,
             completed_at_ms: Some(3),
-        failure_code: None,
+            failure_code: None,
         });
         let mut model = ThreadUiModel::default();
         assert_eq!(
@@ -7969,7 +7969,7 @@ mod tests {
             status: ThreadRunStatus::Completed,
             run_revision: 4,
             completed_at_ms: Some(4),
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries = vec![
             transcript_entry(
@@ -8050,7 +8050,7 @@ mod tests {
             status: ThreadRunStatus::Running,
             run_revision: 2,
             completed_at_ms: None,
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries = vec![
             transcript_entry(
@@ -8273,7 +8273,7 @@ mod tests {
             status: ThreadRunStatus::Completed,
             run_revision: 2,
             completed_at_ms: Some(2),
-        failure_code: None,
+            failure_code: None,
         });
         let complete_screen = rendered(
             &ThreadUiModel {
@@ -8660,7 +8660,7 @@ mod tests {
             status: ThreadRunStatus::Completed,
             run_revision: 2,
             completed_at_ms: Some(2),
-        failure_code: None,
+            failure_code: None,
         });
         complete.transcript.entries.push(transcript_entry(
             &ids,
@@ -9775,7 +9775,7 @@ mod tests {
             status: ThreadRunStatus::Completed,
             run_revision: 2,
             completed_at_ms: Some(2),
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries.push(transcript_entry(
             &ids,
@@ -9820,7 +9820,7 @@ mod tests {
             status,
             run_revision: 2,
             completed_at_ms: (status == ThreadRunStatus::Completed).then_some(2),
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries.push(transcript_entry(
             &ids,
@@ -9859,7 +9859,7 @@ mod tests {
             },
             run_revision: 2,
             completed_at_ms: None,
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries.push(transcript_entry(
             &ids,
@@ -9971,7 +9971,7 @@ mod tests {
             status: ThreadRunStatus::Running,
             run_revision: 2,
             completed_at_ms: None,
-        failure_code: None,
+            failure_code: None,
         });
         thread.transcript.entries = vec![
             transcript_entry(

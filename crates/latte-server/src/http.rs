@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::sse::{Event, Sse},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, patch, post},
 };
 use futures::stream::Stream;
@@ -173,10 +173,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
             "/v1/workspaces/{workspace_id}/events",
             get(workspace_events),
         )
-        .route(
-            "/v1/workspaces/{workspace_id}/bindings",
-            get(list_bindings),
-        )
+        .route("/v1/workspaces/{workspace_id}/bindings", get(list_bindings))
         .route("/v1/sessions/{session_id}", get(get_session))
         .route("/v1/sessions/{session_id}/follow-up", post(follow_up))
         .route("/v1/sessions/{session_id}/model", post(switch_model))
@@ -243,12 +240,14 @@ pub struct WorkspaceResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Client-generated stable session ID (UUID v7). Required for crash-safe
+    /// idempotent creation and zero-latency assigned feedback.
+    pub thread_id: latte_core::ThreadId,
+    /// Client-generated stable command ID (UUID v7). Must equal the
+    /// `Idempotency-Key` header; drives durable dedup.
+    pub command_id: latte_core::ThreadCommandId,
     pub prompt: String,
     pub binding: serde_json::Value,
-    #[serde(default)]
-    pub thread_id: Option<latte_core::ThreadId>,
-    #[serde(default)]
-    pub command_id: Option<latte_core::ThreadCommandId>,
     #[serde(default)]
     pub focus: Option<String>,
 }
@@ -354,18 +353,36 @@ async fn create_workspace(
 
 /// Accepts a new conversation. The session is registered and the first turn is
 /// dispatched under supervised background execution; the endpoint returns 202
-/// immediately and completion/error is observed through the workspace SSE
-/// stream. A durable `Idempotency-Key` retry replays the original acceptance.
+/// only after durable acceptance (completion/error is observed through the
+/// workspace SSE stream). A crash-safe retry with the same `command_id` +
+/// payload replays the original acceptance as 200; a same-`command_id`
+/// different-payload retry or a non-replay create for an existing thread is
+/// 409.
 async fn create_session(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
+    // The Idempotency-Key header must equal the body command_id: one identity
+    // source for both the in-memory ledger and the durable dedup record.
+    let raw_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if raw_key != Some(req.command_id.to_string().as_str()) {
+        return Err(bad_request(
+            "Idempotency-Key header must equal body command_id",
+        ));
+    }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
     let payload_digest = canonical_digest(&serde_json::json!({
+        "thread_id": req.thread_id.to_string(),
+        "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "binding": &req.binding,
+        "focus": req.focus,
     }));
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
@@ -402,7 +419,8 @@ async fn create_session(
 
 /// Core of create_session, independent of the idempotency ledger. Persists the
 /// accepted submission durably (awaiting the runtime's acceptance signal) and
-/// returns 202 only after durable acceptance; the turn runs in the background.
+/// returns 202 for a fresh create or 200 for a crash-safe replay; the turn
+/// runs in the background for a fresh create only.
 async fn create_session_owned(
     state: &Arc<ServerState>,
     workspace_id: &str,
@@ -421,7 +439,8 @@ async fn create_session_owned(
         .validate()
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
-    let thread_id = req.thread_id.unwrap_or_else(|| ThreadId::from_uuid(uuid::Uuid::now_v7()));
+    let thread_id = req.thread_id;
+    let command_id = req.command_id;
     let runtime = workspace.runtime.clone();
     let prompt = req.prompt;
     let focus = req.focus.map(std::path::PathBuf::from);
@@ -431,7 +450,14 @@ async fn create_session_owned(
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .start_accepted(thread_id, prompt, binding, focus.as_deref(), accept_tx)
+            .start_accepted(
+                thread_id,
+                command_id,
+                prompt,
+                binding,
+                focus.as_deref(),
+                accept_tx,
+            )
             .await
         {
             warn!("session {thread_id} background turn failed: {error}");
@@ -441,7 +467,12 @@ async fn create_session_owned(
     let accepted = accept_rx
         .await
         .map_err(|_| failed("session runtime dropped before acceptance"))?
-        .map_err(|message| failed(&format!("failed to accept session: {message}")))?;
+        .map_err(|error| map_create_error(&error))?;
+
+    let (outcome, status) = match accepted {
+        latte_core::CreateOutcome::Created(snapshot) => (snapshot, StatusCode::ACCEPTED),
+        latte_core::CreateOutcome::Replayed(snapshot) => (snapshot, StatusCode::OK),
+    };
 
     // Register the session for O(1) routing now that it is durable.
     state
@@ -452,15 +483,15 @@ async fn create_session_owned(
     // Wake subscribers so they fetch the new session snapshot.
     let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
         session_id: thread_id.to_string(),
-        revision: accepted.revision,
+        revision: outcome.revision,
     });
 
     let body = serde_json::to_value(SessionCreatedResponse {
         session_id: thread_id.to_string(),
-        accepted_revision: accepted.revision,
+        accepted_revision: outcome.revision,
     })
     .expect("session response serializes");
-    Ok((StatusCode::ACCEPTED, body))
+    Ok((status, body))
 }
 
 async fn list_sessions(
@@ -909,6 +940,18 @@ fn failed(message: &str) -> HandlerError {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed", message, None)
 }
 
+/// Maps a session-create acceptance error to an HTTP response. A durable
+/// command-id reuse with a different payload, or a non-replay create for an
+/// already-existing thread, is a 409 conflict; other failures are 500.
+fn map_create_error(error: &latte_core::CreateAcceptError) -> HandlerError {
+    match error {
+        latte_core::CreateAcceptError::Conflict(message) => conflict(message, None),
+        latte_core::CreateAcceptError::Failed(message) => {
+            failed(&format!("failed to accept session: {message}"))
+        }
+    }
+}
+
 /// 409 for a concurrent retry that arrived while the original request with the
 /// same idempotency key is still in flight.
 fn in_flight() -> HandlerError {
@@ -947,14 +990,24 @@ async fn list_bindings(
         .get_by_id(&workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
-    let bindings = workspace.bindings();
+    let bindings = workspace
+        .bindings()
+        .map_err(|e| failed(&format!("cannot build binding catalog: {e}")))?;
     Ok(Json(serde_json::json!({ "bindings": bindings })))
 }
 
 async fn workspace_events(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
-) -> Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+) -> Sse<
+    axum::response::sse::KeepAliveStream<
+        std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
+    >,
+> {
+    // The keepalive comment bounds how long a blocking SSE client waits
+    // between reads, so its cancel check stays responsive and embedded-server
+    // shutdown does not hang on an idle stream.
+    let keepalive = KeepAlive::new().interval(std::time::Duration::from_secs(2));
     // Get the workspace's event receiver
     let workspace = state.workspaces.get_by_id(&workspace_id).await;
 
@@ -962,7 +1015,9 @@ async fn workspace_events(
         Some(ws) => ws.event_tx.subscribe(),
         None => {
             // Return an empty stream if workspace not found
-            return Sse::new(Box::pin(futures::stream::empty()));
+            let empty: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+                Box::pin(futures::stream::empty());
+            return Sse::new(empty).keep_alive(keepalive);
         }
     };
 
@@ -983,21 +1038,47 @@ async fn workspace_events(
         }
     });
 
-    Sse::new(Box::pin(stream))
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(stream);
+    Sse::new(stream).keep_alive(keepalive)
+}
+
+/// The interval between recovery-sweep passes. Defaults to 30s; the
+/// `LATTE_RECOVERY_SWEEP_MS` environment variable overrides it (in
+/// milliseconds, clamped to at least 1ms) so end-to-end tests can drive the
+/// crash-recovery journey without waiting the full production cadence.
+fn recovery_sweep_interval() -> std::time::Duration {
+    std::env::var("LATTE_RECOVERY_SWEEP_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|ms| std::time::Duration::from_millis(ms.max(1)))
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
 }
 
 /// Serve until `shutdown` resolves. Separating the shutdown future lets tests
 /// drive graceful shutdown deterministically without process signals.
+///
+/// The recovery sweeper is owned here: it starts with the server and is
+/// cancelled and joined when the server stops, so expired-lease recovery
+/// always runs while the server is up and never outlives it.
 pub async fn serve_with_shutdown(
     state: Arc<ServerState>,
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let (sweeper_shutdown, sweeper_shutdown_rx) = tokio::sync::watch::channel(false);
+    let sweeper = state
+        .workspaces
+        .start_recovery_sweeper(sweeper_shutdown_rx, recovery_sweep_interval());
     let app = router(state);
     info!("server listening on {}", listener.local_addr()?);
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    // Stop the sweeper and wait for it to finish before returning.
+    let _ = sweeper_shutdown.send(true);
+    let _ = sweeper.await;
+    result?;
     Ok(())
 }
 
@@ -1084,8 +1165,8 @@ mod tests {
     fn state_with_factory(
         factory: latte_headless::thread::ThreadProviderFactory,
     ) -> Arc<ServerState> {
-        let builder: crate::workspace::WorkspaceRuntimeBuilder =
-            std::sync::Arc::new(move |root: &std::path::Path| {
+        let builder: crate::workspace::WorkspaceRuntimeBuilder = std::sync::Arc::new(
+            move |root: &std::path::Path| {
                 let db = root.join(".latte/state.db");
                 std::fs::create_dir_all(db.parent().unwrap()).map_err(|e| e.to_string())?;
                 let engine = latte_engine::EngineBuilder::new()
@@ -1106,8 +1187,13 @@ mod tests {
                     )
                     .map_err(|e| e.to_string())?,
                 );
-                Ok(crate::workspace::BuiltWorkspace { engine, runtime, registry })
-            });
+                Ok(crate::workspace::BuiltWorkspace {
+                    engine,
+                    runtime,
+                    registry,
+                })
+            },
+        );
         let locator: crate::workspace::SessionLocator = std::sync::Arc::new(|_| None);
         new_state("test-token".to_string(), builder, locator)
     }
@@ -1153,11 +1239,10 @@ mod tests {
     /// Creates a session and blocks until it is durably idle (accepts a
     /// follow-up), returning the session id and its current thread revision.
     async fn completed_session(state: &Arc<ServerState>, workspace_id: &str) -> (String, u64) {
-        let (_, created) = call(
+        let (_, created) = create_call(
             state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "hello", "binding": valid_binding() })),
+            workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -1231,11 +1316,10 @@ mod tests {
         state: &Arc<ServerState>,
         workspace_id: &str,
     ) -> (String, u64, String, u64) {
-        let (_, created) = call(
+        let (_, created) = create_call(
             state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "write it", "binding": valid_binding() })),
+            workspace_id,
+            serde_json::json!({ "prompt": "write it", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -1316,11 +1400,10 @@ mod tests {
         state: &Arc<ServerState>,
         workspace_id: &str,
     ) -> (String, u64, String, u64) {
-        let (_, created) = call(
+        let (_, created) = create_call(
             state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "need input", "binding": valid_binding() })),
+            workspace_id,
+            serde_json::json!({ "prompt": "need input", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -1506,24 +1589,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let response = router(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer test-token")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({ "prompt": "hello", "binding": valid_binding() })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (status, body) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
+        )
+        .await;
 
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
         let session_id = body["session_id"].as_str().unwrap().to_string();
         // accepted_revision is the real durable revision after acceptance.
         assert!(body["accepted_revision"].is_u64());
@@ -1556,42 +1629,158 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_replays_idempotent_key() {
-        let state = state();
+        // A crash-safe replay is keyed on a stable client command_id + thread_id
+        // and identical payload. The first create is a fresh 202. To reach the
+        // durable dedup 200 (rather than the in-memory ledger's verbatim replay
+        // of the 202), the retry must come from a *fresh* server process — a
+        // second ServerState over the same on-disk workspace DB, with an empty
+        // ledger. This is exactly the crash-after-accept-before-response case.
         let workspace = tempfile::tempdir().unwrap();
-        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let state = completing_state();
+        let workspace_id = create_workspace_id(&state, &workspace_path).await;
 
-        let request = || {
-            axum::http::Request::builder()
-                .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
-                .method("POST")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer test-token")
-                .header("idempotency-key", "abc-123")
-                .body(axum::body::Body::from(
-                    serde_json::json!({ "prompt": "hello", "binding": valid_binding() })
-                        .to_string(),
-                ))
-                .unwrap()
-        };
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let body = serde_json::json!({
+            "thread_id": thread_id,
+            "command_id": command_id,
+            "prompt": "hello",
+            "binding": valid_binding(),
+        });
 
-        let first = router(state.clone()).oneshot(request()).await.unwrap();
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        let first_id = json_body(first).await["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let (first_status, first_body) = create_call(&state, &workspace_id, body.clone()).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED);
+        let first_id = first_body["session_id"].as_str().unwrap().to_string();
+        assert_eq!(first_id, thread_id, "create honors the client thread_id");
 
-        let second = router(state.clone()).oneshot(request()).await.unwrap();
-        assert_eq!(second.status(), StatusCode::ACCEPTED);
-        let second_id = json_body(second).await["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        // The first create's background turn must reach durable persistence
+        // before the replay lookup can hit the dedup record.
+        let mut readable = false;
+        for _ in 0..50 {
+            let (status, _) = call(&state, "GET", &format!("/v1/sessions/{first_id}"), None).await;
+            if status == StatusCode::OK {
+                readable = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(readable, "durable session did not become readable");
 
+        // Fresh process: same DB, empty ledger. The durable dedup replays.
+        let restarted = completing_state();
+        let restarted_id = create_workspace_id(&restarted, &workspace_path).await;
+        assert_eq!(restarted_id, workspace_id, "workspace id is path-stable");
+
+        let (second_status, second_body) = create_call(&restarted, &restarted_id, body).await;
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "same command_id + identical payload must replay as 200"
+        );
+        let second_id = second_body["session_id"].as_str().unwrap().to_string();
         assert_eq!(
             first_id, second_id,
             "retry must replay the original session"
         );
+        assert_eq!(second_id, thread_id, "replay returns the client thread_id");
+    }
+
+    #[tokio::test]
+    async fn create_session_same_command_different_payload_conflicts() {
+        // The durable dedup binds command_id to the complete command identity.
+        // A crash-restart retry that reuses the command_id but changes the
+        // payload is a replay conflict (409), not a silent success. The fresh
+        // ServerState models the restart so the durable path (not the
+        // in-memory ledger's 422) is exercised.
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+        let state = completing_state();
+        let workspace_id = create_workspace_id(&state, &workspace_path).await;
+
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+
+        let (first_status, first_body) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": command_id,
+                "prompt": "original",
+                "binding": valid_binding(),
+            }),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::ACCEPTED);
+        let first_id = first_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait for durable persistence so the retry hits the dedup row.
+        for _ in 0..50 {
+            let (status, _) = call(&state, "GET", &format!("/v1/sessions/{first_id}"), None).await;
+            if status == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Fresh process, same DB: a *new* thread_id but the *same* command_id
+        // with a different payload is a durable command-id reuse → 409.
+        let restarted = completing_state();
+        let restarted_id = create_workspace_id(&restarted, &workspace_path).await;
+        let (status, body) = create_call(
+            &restarted,
+            &restarted_id,
+            serde_json::json!({
+                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": command_id,
+                "prompt": "changed prompt",
+                "binding": valid_binding(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_key_body_command_id_mismatch() {
+        // The Idempotency-Key header must equal the body command_id: a single
+        // identity source for the in-memory ledger and the durable dedup row.
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let status = create_raw(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "prompt": "hello",
+                "binding": valid_binding(),
+            }),
+            &[("idempotency-key", "not-the-command-id")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_session_requires_client_ids() {
+        // The contract requires client-supplied thread_id and command_id; a
+        // body omitting them is rejected by the request extractor (422).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let status = create_raw(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
+            &[("idempotency-key", "some-key")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -1600,23 +1789,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let response = router(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer test-token")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({ "prompt": "hello", "binding": {"version": 1} })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": {"version": 1} }),
+        )
+        .await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1625,22 +1805,13 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let created = router(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer test-token")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({ "prompt": "hello", "binding": valid_binding() })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let (status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
 
         let mut listed = false;
         for _ in 0..50 {
@@ -1672,25 +1843,13 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let created = router(state.clone())
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer test-token")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({ "prompt": "hello", "binding": valid_binding() })
-                            .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let session_id = json_body(created).await["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let (_, created) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
+        )
+        .await;
+        let session_id = created["session_id"].as_str().unwrap().to_string();
 
         // Wait until the durable session is readable, then cancel with a
         // deliberately stale thread revision.
@@ -1924,6 +2083,70 @@ mod tests {
         (status, json_body(response).await)
     }
 
+    /// Creates a session with fresh client-generated `thread_id` and
+    /// `command_id`, and the matching `Idempotency-Key` header. The body may
+    /// override either field (e.g. to test replay with a fixed command id);
+    /// the `Idempotency-Key` is always derived from the effective `command_id`
+    /// so the header/body-consistency check passes.
+    async fn create_call(
+        state: &Arc<ServerState>,
+        workspace_id: &str,
+        mut body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("thread_id").or_insert_with(|| {
+                serde_json::json!(latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string())
+            });
+            obj.entry("command_id")
+                .or_insert_with(|| serde_json::json!(command_id.to_string()));
+        }
+        // The Idempotency-Key must equal the effective body command_id (either
+        // a caller-provided override or the freshly minted one above).
+        let key = body
+            .get("command_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(command_id.to_string().as_str())
+            .to_string();
+        call_with_headers(
+            state,
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(body),
+            &[("idempotency-key", &key)],
+        )
+        .await
+    }
+
+    /// Drives a POST /sessions request with an explicit raw body and header
+    /// set, returning only the status. Unlike `create_call`, it does not inject
+    /// any client IDs and tolerates a non-JSON error body (e.g. the 400 the
+    /// `Json` extractor produces when required fields are absent), so it can
+    /// exercise the contract's rejection paths.
+    async fn create_raw(
+        state: &Arc<ServerState>,
+        workspace_id: &str,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        let mut builder = axum::http::Request::builder()
+            .uri(format!("/v1/workspaces/{workspace_id}/sessions"))
+            .method("POST")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
     #[tokio::test]
     async fn every_session_mutation_on_missing_session_is_not_found() {
         let state = state();
@@ -2004,11 +2227,13 @@ mod tests {
         )
         .await;
         assert_eq!(search_status, StatusCode::NOT_FOUND);
-        let (create_status, _) = call(
+        // Supply the required client IDs + matching key so the request passes
+        // extraction and reaches the workspace lookup (which is the 404 under
+        // test), rather than being rejected as a malformed body.
+        let (create_status, _) = create_call(
             &state,
-            "POST",
-            "/v1/workspaces/ws_missing/sessions",
-            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
+            "ws_missing",
+            serde_json::json!({ "prompt": "x", "binding": valid_binding() }),
         )
         .await;
         assert_eq!(create_status, StatusCode::NOT_FOUND);
@@ -2126,11 +2351,10 @@ mod tests {
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (_, created) = call(
+        let (_, created) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "hello", "binding": valid_binding() })),
+            &workspace_id,
+            serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -2604,22 +2828,31 @@ mod tests {
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        // Pre-claim with the exact payload digest the handler will compute.
+        // The Idempotency-Key is the client command_id; the ledger digest binds
+        // the complete command identity (thread_id + command_id + payload).
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let payload_digest = canonical_digest(&serde_json::json!({
+            "thread_id": thread_id,
+            "command_id": command_id,
             "prompt": "x",
             "binding": valid_binding(),
+            "focus": serde_json::Value::Null,
         }));
         state.idempotency_claim(
-            &format!("test-token:create:{workspace_id}:key-inflight"),
+            &format!("test-token:create:{workspace_id}:{command_id}"),
             &payload_digest,
         );
 
-        let (status, body) = call_with_headers(
+        let (status, body) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
-            &[("idempotency-key", "key-inflight")],
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "command_id": command_id,
+                "prompt": "x",
+                "binding": valid_binding(),
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -2634,23 +2867,34 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let (bad_status, _) = call_with_headers(
+        // A stable client command_id + thread_id so both attempts share the
+        // ledger key; the first fails validation and releases it.
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+
+        let (bad_status, _) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "x", "binding": { "version": 1 } })),
-            &[("idempotency-key", "retry-key")],
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "command_id": command_id,
+                "prompt": "x",
+                "binding": { "version": 1 },
+            }),
         )
         .await;
         assert_eq!(bad_status, StatusCode::BAD_REQUEST);
 
         // The key was released, so the corrected retry proceeds (202), not 409.
-        let (ok_status, _) = call_with_headers(
+        let (ok_status, _) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
-            &[("idempotency-key", "retry-key")],
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "command_id": command_id,
+                "prompt": "x",
+                "binding": valid_binding(),
+            }),
         )
         .await;
         assert_eq!(ok_status, StatusCode::ACCEPTED);
@@ -2707,12 +2951,12 @@ mod tests {
     #[tokio::test]
     async fn keyed_create_on_missing_workspace_is_not_found() {
         let state = state();
-        let (status, _) = call_with_headers(
+        // Valid client IDs + matching key so the request reaches the workspace
+        // lookup (the 404 under test) rather than being rejected at extraction.
+        let (status, _) = create_call(
             &state,
-            "POST",
-            "/v1/workspaces/ws_absent/sessions",
-            Some(serde_json::json!({ "prompt": "x", "binding": valid_binding() })),
-            &[("idempotency-key", "ws-missing-key")],
+            "ws_absent",
+            serde_json::json!({ "prompt": "x", "binding": valid_binding() }),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2729,11 +2973,10 @@ mod tests {
         // provider_name is empty → validate() returns Err.
         let mut binding = valid_binding();
         binding["provider_name"] = serde_json::json!("");
-        let (status, body) = call(
+        let (status, body) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "x", "binding": binding })),
+            &workspace_id,
+            serde_json::json!({ "prompt": "x", "binding": binding }),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2746,22 +2989,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_without_key_succeeds() {
-        // A create without Idempotency-Key still succeeds, covering the
-        // idempotency=None path through the handler.
+    async fn create_session_without_key_is_rejected() {
+        // The crash-safe contract makes the Idempotency-Key mandatory (it must
+        // equal the body command_id). A create with no key header is rejected
+        // at the header/body-consistency check rather than running unkeyed.
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let (status, body) = call(
+        let status = create_raw(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "no key", "binding": valid_binding() })),
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "prompt": "no key",
+                "binding": valid_binding(),
+            }),
+            &[],
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert!(body["session_id"].is_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2812,29 +3060,40 @@ mod tests {
     #[tokio::test]
     async fn payload_mismatch_returns_422_for_create() {
         // A keyed create that completed with one payload must reject a retry
-        // of the same key with a different payload as 422 rather than replaying.
+        // of the same key (command_id) with a different payload as 422 rather
+        // than replaying. This is the in-memory ledger's payload guard, which
+        // sits ahead of the durable dedup's 409 for the same-process case.
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+
         // First request succeeds (202).
-        let (first, _) = call_with_headers(
+        let (first, _) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "original", "binding": valid_binding() })),
-            &[("idempotency-key", "mismatch-key")],
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "command_id": command_id,
+                "prompt": "original",
+                "binding": valid_binding(),
+            }),
         )
         .await;
         assert_eq!(first, StatusCode::ACCEPTED);
 
-        // Same key, different prompt → 422 payload mismatch.
-        let (mismatch, body) = call_with_headers(
+        // Same key (command_id), different prompt → 422 payload mismatch.
+        let (mismatch, body) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "CHANGED", "binding": valid_binding() })),
-            &[("idempotency-key", "mismatch-key")],
+            &workspace_id,
+            serde_json::json!({
+                "thread_id": thread_id,
+                "command_id": command_id,
+                "prompt": "CHANGED",
+                "binding": valid_binding(),
+            }),
         )
         .await;
         assert_eq!(mismatch, StatusCode::UNPROCESSABLE_ENTITY);
@@ -2913,11 +3172,10 @@ mod tests {
         let state = blocking_state(gate.clone());
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (_, created) = call(
+        let (_, created) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "slow", "binding": valid_binding() })),
+            &workspace_id,
+            serde_json::json!({ "prompt": "slow", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -3081,11 +3339,10 @@ mod tests {
         let state = blocking_state(gate.clone());
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (_, created) = call(
+        let (_, created) = create_call(
             &state,
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(serde_json::json!({ "prompt": "slow", "binding": valid_binding() })),
+            &workspace_id,
+            serde_json::json!({ "prompt": "slow", "binding": valid_binding() }),
         )
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
@@ -3360,5 +3617,212 @@ mod tests {
 
         // Consume the signal so it does not leak to other waiters.
         let _ = early_sigterm.recv().await;
+    }
+
+    #[tokio::test]
+    async fn rename_session_updates_title_and_broadcasts_thread_changed() {
+        // PATCH /v1/sessions/{id} renames a durable session, returns the fresh
+        // snapshot, and broadcasts a ThreadChanged event so live SSE clients
+        // observe the new title. Covers the rename_session handler end to end.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _) = completed_session(&state, &workspace_id).await;
+
+        let mut events = {
+            let workspace = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+            workspace.event_tx.subscribe()
+        };
+
+        let (status, body) = call(
+            &state,
+            "PATCH",
+            &format!("/v1/sessions/{session_id}"),
+            Some(serde_json::json!({ "title": "renamed catalog title" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["snapshot"]["thread_id"].as_str(),
+            Some(session_id.as_str()),
+            "rename returns the same session's snapshot"
+        );
+
+        // The persisted session-catalog title reflects the rename. The catalog
+        // summary (with its title) is exposed through search, not the snapshot.
+        let (search_status, results) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/search?q=renamed"),
+            None,
+        )
+        .await;
+        assert_eq!(search_status, StatusCode::OK);
+        let renamed = results["sessions"]
+            .as_array()
+            .expect("sessions must be an array")
+            .iter()
+            .find(|s| s["thread_id"].as_str() == Some(session_id.as_str()))
+            .expect("renamed session must appear in the catalog search");
+        assert_eq!(
+            renamed["title"].as_str(),
+            Some("renamed catalog title"),
+            "catalog title reflects the rename"
+        );
+
+        // A ThreadChanged event for this session is broadcast to SSE clients.
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("no ThreadChanged event after rename")
+            .expect("event channel closed");
+        match event {
+            ServerEvent::ThreadChanged { session_id: id, .. } => {
+                assert_eq!(id, session_id);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_session_without_title_is_bad_request() {
+        // The rename handler rejects a body without a string title as 400 before
+        // touching the engine, covering the missing-title branch.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _) = completed_session(&state, &workspace_id).await;
+
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &format!("/v1/sessions/{session_id}"),
+            Some(serde_json::json!({ "not_title": 7 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fork_session_creates_a_new_session_and_broadcasts() {
+        // POST /v1/sessions/{id}/fork forks a durable session into a new thread
+        // id, returns the fork's snapshot, and broadcasts a ThreadChanged event
+        // keyed by the fork id. Covers the fork_session handler.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _) = completed_session(&state, &workspace_id).await;
+
+        let mut events = {
+            let workspace = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+            workspace.event_tx.subscribe()
+        };
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/fork"),
+            Some(serde_json::json!({ "title": "forked branch" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let fork_id = body["snapshot"]["thread_id"]
+            .as_str()
+            .expect("fork snapshot missing thread_id");
+        assert_ne!(fork_id, session_id, "fork must mint a distinct thread id");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("no ThreadChanged event after fork")
+            .expect("event channel closed");
+        match event {
+            ServerEvent::ThreadChanged { session_id: id, .. } => {
+                assert_eq!(id, fork_id, "fork event must key on the fork id");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_bindings_returns_the_workspace_catalog() {
+        // GET /v1/workspaces/{workspace_id}/bindings returns the provider binding catalog
+        // built from the workspace registry. Covers the list_bindings success
+        // path (the workspace-not-found branch is exercised separately).
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/bindings"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["bindings"].is_array(),
+            "bindings must be an array, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_bindings_for_unknown_workspace_is_not_found() {
+        // An unknown workspace id fails closed with 404 rather than panicking or
+        // leaking an empty catalog, covering the not_found branch.
+        let state = completing_state();
+        let (status, _) = call(
+            &state,
+            "GET",
+            "/v1/workspaces/ws_does_not_exist/bindings",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn recovery_sweep_interval_honors_env_override_and_default() {
+        // The recovery-sweep cadence defaults to 30s and can be shortened via
+        // LATTE_RECOVERY_SWEEP_MS (clamped to >=1ms) so E2E crash-recovery tests
+        // do not wait the full production interval. This exercises the parse /
+        // clamp / default branches directly without racing on process env by
+        // asserting the default in the common (unset) case.
+        //
+        // SAFETY: single-threaded #[test]; we set and immediately clear the var
+        // within this test's own scope. No other test reads this variable.
+        let key = "LATTE_RECOVERY_SWEEP_MS";
+        let previous = std::env::var(key).ok();
+
+        unsafe { std::env::set_var(key, "250") };
+        assert_eq!(
+            recovery_sweep_interval(),
+            std::time::Duration::from_millis(250)
+        );
+
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(
+            recovery_sweep_interval(),
+            std::time::Duration::from_millis(1),
+            "zero must clamp to at least 1ms"
+        );
+
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(
+            recovery_sweep_interval(),
+            std::time::Duration::from_secs(30),
+            "unparseable value falls back to the 30s default"
+        );
+
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(
+            recovery_sweep_interval(),
+            std::time::Duration::from_secs(30),
+            "unset value uses the 30s default"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }

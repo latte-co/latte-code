@@ -27,6 +27,34 @@ fn server_binding_for_model(scenario: &Scenario, model: Option<&str>) -> serde_j
     serde_json::to_value(binding).expect("binding serializes")
 }
 
+/// Verification runs as a supervised process, which is unsupported on Windows.
+/// Returns the JSONC verification fragment on Unix and an empty string on
+/// Windows so the permission/effect flow is still exercised without the
+/// platform-unsupported post-verification step.
+fn verification_fragment() -> &'static str {
+    if cfg!(unix) {
+        r#",verification:{argv:["true"]}"#
+    } else {
+        ""
+    }
+}
+
+/// A create-session request body carrying the client-generated `thread_id`
+/// and `command_id` the crash-safe contract now requires, plus the matching
+/// `Idempotency-Key` header value. `prompt`/`binding` are the only per-test
+/// knobs; the ids are fresh unless a caller pins them for a replay test.
+fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Value, String) {
+    let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let body = serde_json::json!({
+        "thread_id": thread_id,
+        "command_id": command_id,
+        "prompt": prompt,
+        "binding": binding,
+    });
+    (body, command_id)
+}
+
 fn run_id(output: &std::process::Output) -> String {
     json(output)["data"]["run"]["run_id"]
         .as_str()
@@ -300,6 +328,14 @@ impl ServeChild {
     /// Starts `latte-code --json serve --port 0` and blocks until the readiness
     /// line reports the bound port and token file, then reads the token.
     fn start(scenario: &Scenario) -> Self {
+        Self::start_with_env(scenario, &[])
+    }
+
+    /// Like [`start`](Self::start) but threads additional environment variables
+    /// into the child. The crash-recovery journey uses this to shorten the
+    /// lease TTL and recovery-sweep cadence so an orphaned lease expires and is
+    /// reclaimed within the test window.
+    fn start_with_env(scenario: &Scenario, extra_env: &[(&str, &str)]) -> Self {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
@@ -308,6 +344,9 @@ impl ServeChild {
             .env("TEST_OPENAI_KEY", "e2e-server-secret")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -348,6 +387,19 @@ impl ServeChild {
             #[cfg(unix)]
             process_group,
         }
+    }
+
+    /// Abruptly terminates the server as a crash would: SIGKILL the whole
+    /// process group so no destructor runs and no lease is released. The
+    /// orphaned lease must then expire and be reclaimed by a fresh server's
+    /// recovery sweeper. Unix-only (the journey test that uses it is too).
+    #[cfg(unix)]
+    fn crash(mut self) {
+        let group = nix::unistd::Pid::from_raw(self.process_group);
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+        let _ = self.child.wait();
+        // The process is already reaped; skip Drop's graceful-shutdown path.
+        std::mem::forget(self);
     }
 
     /// Issues one framed HTTP/1.1 request over loopback and returns the parsed
@@ -408,6 +460,26 @@ impl ServeChild {
             serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null)
         };
         (status, value)
+    }
+
+    /// Creates a session through the crash-safe contract: a fresh client
+    /// `thread_id` + `command_id` in the body and a matching `Idempotency-Key`.
+    /// Returns the (status, body) pair; the created `session_id` equals the
+    /// client `thread_id`.
+    fn create_session(
+        &self,
+        workspace_id: &str,
+        prompt: &str,
+        binding: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let (body, command_id) = create_request(prompt, binding);
+        self.request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(&self.token),
+            Some(&body),
+            &[("Idempotency-Key", &command_id)],
+        )
     }
 }
 
@@ -528,45 +600,63 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     let binding = server_binding(&scenario);
 
     // Create returns 202 immediately (async accept, not a completed turn).
+    // The client supplies a stable thread_id + command_id; the Idempotency-Key
+    // must equal the command_id.
+    let (create_body_json, create_command_id) = create_request("hello server", &binding);
+    let session_id_expected = create_body_json["thread_id"].as_str().unwrap().to_string();
     let (create_status, create_body) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "hello server", "binding": binding })),
-        &[("Idempotency-Key", "e2e-key-1")],
+        Some(&create_body_json),
+        &[("Idempotency-Key", &create_command_id)],
     );
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        session_id, session_id_expected,
+        "create honors client thread_id"
+    );
     // accepted_revision is the real durable revision after acceptance.
     assert!(create_body["accepted_revision"].as_u64().is_some());
 
-    // The same idempotency key replays the original accepted session.
+    // The same command_id + payload replays the original accepted session
+    // (in-process idempotency ledger).
     let (replay_status, replay_body) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "hello server", "binding": binding })),
-        &[("Idempotency-Key", "e2e-key-1")],
+        Some(&create_body_json),
+        &[("Idempotency-Key", &create_command_id)],
     );
     assert_eq!(replay_status, 202);
     assert_eq!(replay_body["session_id"].as_str().unwrap(), session_id);
 
     // A keyed create that fails (invalid binding) releases its reservation, so
-    // a corrected retry with the same key proceeds rather than 409-in-flight.
+    // a corrected retry with the same command_id proceeds rather than
+    // 409-in-flight.
+    let (bad_body, release_command_id) = create_request("x", &serde_json::json!({ "version": 1 }));
     let (bad_key_status, _) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "x", "binding": { "version": 1 } })),
-        &[("Idempotency-Key", "e2e-release-key")],
+        Some(&bad_body),
+        &[("Idempotency-Key", &release_command_id)],
     );
     assert_eq!(bad_key_status, 400);
+    // Same thread_id + command_id, corrected binding: the released key retries.
+    let retry_body = serde_json::json!({
+        "thread_id": bad_body["thread_id"],
+        "command_id": release_command_id,
+        "prompt": "recovered",
+        "binding": binding,
+    });
     let (retry_status, _) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "recovered", "binding": binding })),
-        &[("Idempotency-Key", "e2e-release-key")],
+        Some(&retry_body),
+        &[("Idempotency-Key", &release_command_id)],
     );
     assert_eq!(
         retry_status, 202,
@@ -823,13 +913,19 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     assert_eq!(conflict_body["error"]["type"], "conflict");
     assert!(conflict_body["error"]["current_revision"].is_u64());
 
-    // Reusing an idempotency key with a different payload is rejected with 422.
+    // Reusing the create command_id with a different payload is rejected with
+    // 422 by the in-process idempotency ledger (same key, different digest).
     let (mismatch_status, mismatch_body) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "DIFFERENT prompt", "binding": binding })),
-        &[("Idempotency-Key", "e2e-key-1")],
+        Some(&serde_json::json!({
+            "thread_id": session_id,
+            "command_id": create_command_id,
+            "prompt": "DIFFERENT prompt",
+            "binding": binding,
+        })),
+        &[("Idempotency-Key", &create_command_id)],
     );
     assert_eq!(mismatch_status, 422);
     assert_eq!(
@@ -851,19 +947,13 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "follow-up payload mismatch must be reported: {follow_mismatch_body:?}"
     );
 
-    // A create WITHOUT an Idempotency-Key header succeeds (exercises the None
-    // branch in scoped_idempotency_key, no ledger interaction).
-    let (no_key_status, no_key_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "no key", "binding": binding })),
-        &[],
-    );
+    // A second session (fresh thread_id + command_id) for follow-up coverage.
+    let (no_key_status, no_key_body) = server.create_session(&workspace_id, "second", &binding);
     assert_eq!(no_key_status, 202);
     assert!(no_key_body["session_id"].is_string());
 
-    // A follow-up WITHOUT an Idempotency-Key header succeeds.
+    // A follow-up WITHOUT an Idempotency-Key header succeeds (follow-up keeps
+    // the header optional; only create requires command_id parity).
     let no_key_session = no_key_body["session_id"].as_str().unwrap();
     let mut no_key_ready = false;
     for _ in 0..200 {
@@ -880,7 +970,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(no_key_ready, "no-key session must reach ready");
+    assert!(no_key_ready, "second session must reach ready");
     let no_key_rev = {
         let (_, b) = server.request(
             "GET",
@@ -900,14 +990,30 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     );
     assert_eq!(no_key_follow_status, 202);
 
-    // A create WITHOUT key that FAILS (invalid binding) exercises the
-    // (None, Err) branch in the create handler's idempotency match.
+    // A create whose Idempotency-Key header does NOT equal the body command_id
+    // is rejected 400: one identity, two names must not disagree.
+    let (mismatched_body, mismatched_command_id) = create_request("bad key", &binding);
+    assert_ne!(mismatched_command_id, "not-the-command-id");
+    let (header_mismatch_status, _) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&mismatched_body),
+        &[("Idempotency-Key", "not-the-command-id")],
+    );
+    assert_eq!(header_mismatch_status, 400);
+
+    // A create with a matching key but an invalid binding is rejected 400 and
+    // releases the reservation (covered above for retry); here we just assert
+    // the failure surfaces.
+    let (bad_binding_body, bad_binding_command_id) =
+        create_request("bad binding", &serde_json::json!({ "version": 1 }));
     let (no_key_bad_status, _) = server.request(
         "POST",
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "bad", "binding": {"version": 1} })),
-        &[],
+        Some(&bad_binding_body),
+        &[("Idempotency-Key", &bad_binding_command_id)],
     );
     assert_eq!(no_key_bad_status, 400);
 
@@ -921,24 +1027,6 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         &[],
     );
     assert_eq!(no_key_stale_status, 409);
-
-    // A create with a key that is currently Pending (in-flight) but with a
-    // DIFFERENT payload triggers 422 payload mismatch (Pending-state mismatch).
-    let (pending_mismatch_status, pending_mismatch_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "TOTALLY DIFFERENT payload for pending", "binding": binding })),
-        &[("Idempotency-Key", "e2e-key-1")],
-    );
-    // e2e-key-1 is Done (not Pending), so this hits the Done-mismatch path.
-    // To truly test the Pending-mismatch path we need a request that's in-flight.
-    // But at minimum this confirms mismatch detection.
-    assert_eq!(pending_mismatch_status, 422);
-    assert_eq!(
-        pending_mismatch_body["error"]["type"],
-        "idempotency_mismatch"
-    );
 }
 
 #[test]
@@ -965,7 +1053,8 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
     std::fs::write(
         scenario.root().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
         ),
     )
     .unwrap();
@@ -982,13 +1071,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "write it", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1120,13 +1203,7 @@ fn final_binary_server_denies_a_permission_request_through_http() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "write it", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1236,13 +1313,8 @@ fn final_binary_server_rejects_secret_input_request_from_provider() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "need a secret", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, "need a secret", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1309,13 +1381,7 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "write it", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "write it", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1395,7 +1461,8 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
     std::fs::write(
         scenario.root().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
         ),
     )
     .unwrap();
@@ -1412,13 +1479,7 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "need input", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "need input", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1518,13 +1579,7 @@ fn final_binary_server_provides_input_through_http() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "need input", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "need input", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1666,13 +1721,7 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "slow turn", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "slow turn", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1791,13 +1840,7 @@ fn final_binary_server_reports_a_full_mailbox_as_conflict() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "slow turn", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "slow turn", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1869,13 +1912,7 @@ fn final_binary_server_marks_a_failed_background_turn() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let binding = server_binding(&scenario);
 
-    let (create_status, create_body) = server.request(
-        "POST",
-        &format!("/v1/workspaces/{workspace_id}/sessions"),
-        Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "will fail", "binding": binding })),
-        &[],
-    );
+    let (create_status, create_body) = server.create_session(&workspace_id, "will fail", &binding);
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
@@ -1937,13 +1974,8 @@ fn final_binary_server_persists_sessions_across_restart() {
             &[],
         );
         let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
-        let (create_status, create_body) = server.request(
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(&server.token),
-            Some(&serde_json::json!({ "prompt": "persist me", "binding": binding })),
-            &[],
-        );
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "persist me", &binding);
         assert_eq!(create_status, 202);
         create_body["session_id"].as_str().unwrap().to_string()
         // `server` drops here → SIGTERM → graceful shutdown.
@@ -1995,6 +2027,172 @@ fn final_binary_server_persists_sessions_across_restart() {
     );
 }
 
+/// The reviewer-mandated crash-recovery journey, exercised end-to-end against
+/// the real binary: an in-flight turn holds a lease; the server crashes
+/// (SIGKILL, no graceful release); a fresh server's recovery sweeper reclaims
+/// the expired lease and broadcasts a wake-up; an already-connected SSE client
+/// receives the frame and refetches a terminal (`interrupted`) snapshot. This
+/// is the only path that proves the sweeper actually runs under the server
+/// lifecycle AND wakes live subscribers — the two halves of MF2.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_recovery_sweeper_wakes_live_sse_after_a_crash() {
+    let scenario = Scenario::new();
+    // The first turn stalls long enough to be unambiguously in-flight (holding
+    // a live lease) at the moment we crash the server, yet short enough that
+    // the scripted provider's worker thread does not stall teardown. Recovery
+    // never consults the provider again, so the second reply is only a safety
+    // net and is intentionally left unconsumed.
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("never delivered").delayed(std::time::Duration::from_secs(5)),
+        ProviderReply::completion("unused"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // A short lease TTL means the orphaned lease expires quickly after the
+    // crash; a fast sweep cadence means the fresh server reclaims it promptly.
+    let fast_recovery: &[(&str, &str)] = &[
+        ("LATTE_LEASE_TTL_MS", "300"),
+        ("LATTE_RECOVERY_SWEEP_MS", "50"),
+    ];
+
+    // --- Server A: create a session and let its turn park in `running`. ---
+    let session_id = {
+        let server = ServeChild::start_with_env(&scenario, fast_recovery);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "stall then crash", &binding);
+        assert_eq!(create_status, 202);
+        let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait until the (stalled) turn is observably running, so the lease is
+        // held when we crash.
+        let mut running = false;
+        for _ in 0..300 {
+            let (status, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("running") {
+                running = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            running,
+            "the turn must be running (holding a lease) before crash"
+        );
+
+        // Crash: SIGKILL the whole group. No destructor runs, so the lease is
+        // orphaned rather than released.
+        server.crash();
+        session_id
+    };
+
+    // --- Server B: fresh process, same durable HOME. ---
+    let server = ServeChild::start_with_env(&scenario, fast_recovery);
+    // Materialize the workspace instance so the sweeper includes it and the SSE
+    // hub exists for our subscriber.
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+    // Confirm the session is still non-terminal immediately after restart: the
+    // sweeper has not yet reclaimed the just-orphaned lease.
+    let (pre_status, pre_body) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(pre_status, 200);
+    assert_eq!(
+        pre_body["snapshot"]["thread_id"].as_str().unwrap(),
+        session_id
+    );
+
+    // Subscribe to the workspace SSE stream BEFORE the lease expires, so the
+    // recovery broadcast must reach an already-connected client.
+    let events_handle = {
+        let port = server.port;
+        let token = server.token.clone();
+        let workspace_id = workspace_id.clone();
+        std::thread::spawn(move || {
+            read_events_from(
+                port,
+                &token,
+                &workspace_id,
+                std::time::Duration::from_secs(5),
+            )
+        })
+    };
+
+    // The already-connected client must receive a wake-up frame naming the
+    // recovered session once the sweeper reclaims the expired lease.
+    let frames = events_handle.join().unwrap();
+    assert!(
+        frames.contains("text/event-stream"),
+        "events response was not an SSE stream: {frames:?}"
+    );
+    assert!(
+        frames.contains("thread_changed"),
+        "recovery must wake live subscribers with a thread_changed frame: {frames:?}"
+    );
+    assert!(
+        frames.contains(&session_id),
+        "the wake-up frame must name the recovered session {session_id}: {frames:?}"
+    );
+
+    // Refetching after the wake-up must show the recovered terminal projection.
+    let mut terminal = false;
+    for _ in 0..300 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("interrupted") {
+            terminal = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        terminal,
+        "the recovered session must project the interrupted terminal lifecycle"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn final_binary_server_switches_model_and_replays_follow_up() {
@@ -2028,13 +2226,7 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
     let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
     let (_, created) = {
         let binding = server_binding(&scenario);
-        server.request(
-            "POST",
-            &format!("/v1/workspaces/{workspace_id}/sessions"),
-            Some(&server.token),
-            Some(&serde_json::json!({ "prompt": "hello", "binding": binding })),
-            &[],
-        )
+        server.create_session(&workspace_id, "hello", &binding)
     };
     let session_id = created["session_id"].as_str().unwrap().to_string();
 

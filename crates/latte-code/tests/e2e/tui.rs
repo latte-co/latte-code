@@ -619,6 +619,7 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entries() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);

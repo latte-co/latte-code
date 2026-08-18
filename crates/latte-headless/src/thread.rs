@@ -250,105 +250,210 @@ impl ThreadRuntimeService {
         focus: Option<&Path>,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self.start_one(thread_id, prompt, binding, focus, None).await?;
+        let snapshot = match self
+            .start_one(None, thread_id, prompt, binding, focus, None)
+            .await?
+        {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        };
         self.drain_mailbox(snapshot, runner).await
     }
 
     /// Like [`Self::start`], but signals `accept` at the durable-acceptance
     /// boundary (once the user submission is persisted) before running the
     /// provider turn. Lets a server return 202 only after the command is
-    /// durable, while
-    /// the turn continues under the same supervised execution. The signal
-    /// carries the accepted snapshot, or an error message if acceptance failed
-    /// before persistence.
+    /// durable, while the turn continues under the same supervised execution.
+    /// The signal carries the accepted snapshot wrapped in [`CreateOutcome`]:
+    /// `Created` (202) or `Replayed` (200, crash-safe idempotent replay).
     pub async fn start_accepted(
         &self,
         thread_id: ThreadId,
+        command_id: ThreadCommandId,
         prompt: String,
         binding: ThreadProviderBindingV2,
         focus: Option<&Path>,
-        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let runner = match self.begin_runner(thread_id) {
             Ok(runner) => runner,
             Err(error) => {
-                let _ = accept.send(Err(error.to_string()));
+                let _ = accept.send(Err(latte_core::CreateAcceptError::Failed(
+                    error.to_string(),
+                )));
                 return Err(error);
             }
         };
-        let snapshot = self
-            .start_one(thread_id, prompt, binding, focus, Some(accept))
+        let outcome = self
+            .start_one(
+                Some(command_id),
+                thread_id,
+                prompt,
+                binding,
+                focus,
+                Some(accept),
+            )
             .await?;
-        self.drain_mailbox(snapshot, runner).await
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                let drained = self.drain_mailbox(snapshot, runner).await?;
+                Ok(latte_core::CreateOutcome::Created(drained))
+            }
+            // A replay owns no runner: the accepted submission is already
+            // durable and the pre-crash provider task is gone, so there is
+            // nothing to drain. Recovery of the expired lease is the
+            // sweeper's job.
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
+    }
+
+    /// Looks up a durable crash-safe replay for a create command before any
+    /// lease is acquired. `Ok(Some)` means the command was already durably
+    /// accepted (replay the snapshot, start no runner); `Ok(None)` means it is
+    /// a fresh create; `Err` is a command-identity conflict or storage error.
+    fn durable_replay(
+        &self,
+        command_id: &ThreadCommandId,
+        thread_id: ThreadId,
+        prompt: &str,
+        binding: &ThreadProviderBindingV2,
+        focus: Option<&Path>,
+    ) -> Result<Option<ThreadSnapshot>, ThreadRuntimeError> {
+        self.engine
+            .lookup_create_replay(
+                command_id,
+                thread_id,
+                prompt,
+                binding,
+                focus.and_then(|focus| focus.to_str()),
+            )
+            .map_err(ThreadRuntimeError::from)
     }
 
     async fn start_one(
         &self,
+        command_id: Option<ThreadCommandId>,
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
         focus: Option<&Path>,
-        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        accept: Option<
+            oneshot::Sender<
+                Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+            >,
+        >,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         if let Err(error) = binding
             .validate()
             .map_err(ThreadRuntimeError::ProviderConfiguration)
         {
-            signal_accept(accept, Err(error.to_string()));
+            signal_accept(
+                accept,
+                Err(latte_core::CreateAcceptError::Failed(error.to_string())),
+            );
             return Err(error);
         }
         let messages = match self.initial_messages(&prompt, focus) {
             Ok(messages) => messages,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(
+                    accept,
+                    Err(latte_core::CreateAcceptError::Failed(error.to_string())),
+                );
                 return Err(error);
             }
         };
+        // Crash-safe idempotency: look up the durable dedup record BEFORE
+        // acquiring the lease. A retry after a crash hits the record and
+        // replays without blocking on the dead owner's still-unexpired lease.
+        if let Some(command_id) = &command_id {
+            match self.durable_replay(command_id, thread_id, &prompt, &binding, focus) {
+                Ok(Some(snapshot)) => {
+                    signal_accept(
+                        accept,
+                        Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                    );
+                    return Ok(latte_core::CreateOutcome::Replayed(snapshot));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    signal_accept(accept, Err(classify_create_error(&error)));
+                    return Err(error);
+                }
+            }
+        }
         let run_id = new_run_id();
         let now = now_ms();
         let lease = match self.acquire(thread_id) {
             Ok(lease) => lease,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(
+                    accept,
+                    Err(latte_core::CreateAcceptError::Failed(error.to_string())),
+                );
                 return Err(error);
             }
         };
-        let started = match self
-            .engine
-            .create_started_thread_v2(thread_id, run_id, binding, &prompt, &lease, now, focus.and_then(|f| f.to_str()))
-        {
+        // The legacy in-process path (`start`) passes no command id; mint a
+        // fresh one so the durable dedup record is still written (it will
+        // never replay, but the create contract is uniform).
+        let create_command_id =
+            command_id.unwrap_or_else(|| ThreadCommandId::from_uuid(Uuid::now_v7()));
+        let started = match self.engine.create_started_thread_v2(
+            &create_command_id,
+            thread_id,
+            run_id,
+            binding,
+            &prompt,
+            &lease,
+            now,
+            focus.and_then(|f| f.to_str()),
+        ) {
             Ok(latte_core::CreateOutcome::Created(snapshot)) => snapshot,
             Ok(latte_core::CreateOutcome::Replayed(snapshot)) => {
-                // Idempotent replay: the session was already created (e.g.,
-                // crash after durable accept but before 202). Don't restart
-                // the provider; return the existing snapshot.
-                signal_accept(accept, Ok(snapshot.clone()));
-                return Ok(snapshot);
+                // The in-transaction recheck caught a concurrent create (or a
+                // retry that raced the pre-acquire lookup). Don't restart the
+                // provider; return the existing snapshot.
+                signal_accept(
+                    accept,
+                    Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                );
+                return Ok(latte_core::CreateOutcome::Replayed(snapshot));
             }
             Err(error) => {
                 let error = ThreadRuntimeError::from(error);
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
         // The user submission is now durable — acknowledge acceptance.
-        signal_accept(accept, Ok(started.clone()));
+        signal_accept(
+            accept,
+            Ok(latte_core::CreateOutcome::Created(started.clone())),
+        );
         // Provider construction is runtime work, not submission validation.
         // Once the user card is durable, a missing credential or invalid model
         // becomes a visible retryable child failure instead of restoring the
         // composer and making the accepted prompt appear to vanish.
         let Ok(provider) = (self.provider)(&started.binding) else {
-            return self.fail_retryable(
-                thread_id,
-                run_id,
-                started.revision,
-                active_run_revision(&started)?,
-                provider_configuration_failure_message(),
-                &lease,
-            );
+            return self
+                .fail_retryable(
+                    thread_id,
+                    run_id,
+                    started.revision,
+                    active_run_revision(&started)?,
+                    provider_configuration_failure_message(),
+                    &lease,
+                )
+                .map(latte_core::CreateOutcome::Created);
         };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
+            .map(latte_core::CreateOutcome::Created)
     }
 
     /// Creates a child only after the complete history fits exactly. The
@@ -807,7 +912,11 @@ impl ThreadRuntimeService {
         )
     }
 
-    fn initial_messages(&self, prompt: &str, focus: Option<&Path>) -> Result<Vec<Message>, ThreadRuntimeError> {
+    fn initial_messages(
+        &self,
+        prompt: &str,
+        focus: Option<&Path>,
+    ) -> Result<Vec<Message>, ThreadRuntimeError> {
         let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
             .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
         let system = format!(
@@ -1778,16 +1887,22 @@ impl ProviderEventSink for ProviderProgress {
     fn observe(&self, event: ProviderEvent) {
         match event {
             ProviderEvent::Attempt { number } => {
-                self.sink.observe(self.thread_id, ThreadTransientProgress::ProviderAttempt {
-                    run_id: self.run_id,
-                    number,
-                });
+                self.sink.observe(
+                    self.thread_id,
+                    ThreadTransientProgress::ProviderAttempt {
+                        run_id: self.run_id,
+                        number,
+                    },
+                );
             }
             ProviderEvent::AssistantDelta { text } => {
-                self.sink.observe(self.thread_id, ThreadTransientProgress::AssistantDelta {
-                    run_id: self.run_id,
-                    text: redact_thread_text(&text),
-                });
+                self.sink.observe(
+                    self.thread_id,
+                    ThreadTransientProgress::AssistantDelta {
+                        run_id: self.run_id,
+                        text: redact_thread_text(&text),
+                    },
+                );
             }
         }
     }
@@ -1805,12 +1920,22 @@ fn new_run_id() -> RunId {
 
 /// Sends a durable-acceptance signal if a receiver is present, ignoring a
 /// dropped receiver (the caller may have stopped awaiting acceptance).
-fn signal_accept(
-    accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
-    result: Result<ThreadSnapshot, String>,
-) {
+fn signal_accept<T, E>(accept: Option<oneshot::Sender<Result<T, E>>>, result: Result<T, E>) {
     if let Some(sender) = accept {
         let _ = sender.send(result);
+    }
+}
+
+/// Classifies a create-acceptance error for the HTTP layer: a durable
+/// command-id reuse with a different payload, or a non-replay create for an
+/// existing thread, is a 409 conflict; everything else is a 500.
+fn classify_create_error(error: &ThreadRuntimeError) -> latte_core::CreateAcceptError {
+    match error {
+        ThreadRuntimeError::Storage(
+            latte_engine::StorageError::ThreadCommandReplayMismatch
+            | latte_engine::StorageError::ThreadAlreadyExists(_),
+        ) => latte_core::CreateAcceptError::Conflict(error.to_string()),
+        _ => latte_core::CreateAcceptError::Failed(error.to_string()),
     }
 }
 
@@ -2125,8 +2250,11 @@ mod tests {
         let right_id = ThreadId::from_uuid(Uuid::now_v7());
         let left =
             tokio::spawn(async move { first.start(left_id, "left".into(), binding(), None).await });
-        let right =
-            tokio::spawn(async move { second.start(right_id, "right".into(), binding(), None).await });
+        let right = tokio::spawn(async move {
+            second
+                .start(right_id, "right".into(), binding(), None)
+                .await
+        });
         tokio::task::yield_now().await;
         assert_eq!(
             service
@@ -2161,10 +2289,11 @@ mod tests {
         );
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let first = service.clone();
-        let running =
-            tokio::spawn(
-                async move { first.start(thread_id, "slow turn".into(), binding(), None).await },
-            );
+        let running = tokio::spawn(async move {
+            first
+                .start(thread_id, "slow turn".into(), binding(), None)
+                .await
+        });
         // Let the first turn enter the provider call so its runner is active.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2172,7 +2301,14 @@ mod tests {
         // InvalidState and signal the accept channel.
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
-            .start_accepted(thread_id, "second start".into(), binding(), None, accept_tx)
+            .start_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "second start".into(),
+                binding(),
+                None,
+                accept_tx,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::InvalidState));
@@ -3724,7 +3860,11 @@ mod tests {
             Arc::new(move |_thread_id, progress| received.lock().unwrap().push(progress))
         };
         let run_id = RunId::from_uuid(Uuid::now_v7());
-        let progress = ProviderProgress { thread_id: ThreadId::from_uuid(Uuid::now_v7()), run_id, sink };
+        let progress = ProviderProgress {
+            thread_id: ThreadId::from_uuid(Uuid::now_v7()),
+            run_id,
+            sink,
+        };
         progress.observe(ProviderEvent::Attempt { number: 2 });
         progress.observe(ProviderEvent::AssistantDelta {
             text: "ok\u{1b}[31m sk-hidden".into(),
@@ -4000,8 +4140,11 @@ mod tests {
         .with_lease_ttl_ms(300);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
-        let run =
-            tokio::spawn(async move { runner.start(thread_id, "wait".into(), binding(), None).await });
+        let run = tokio::spawn(async move {
+            runner
+                .start(thread_id, "wait".into(), binding(), None)
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
             engine.acquire_thread_lease(thread_id, now_ms(), 60),
@@ -4841,15 +4984,28 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .start_accepted(thread_id, "hello".into(), binding(), None, tx)
+                    .start_accepted(
+                        thread_id,
+                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        "hello".into(),
+                        binding(),
+                        None,
+                        tx,
+                    )
                     .await
             })
         };
 
         let accepted = rx.await.unwrap().expect("accepted snapshot");
-        assert_eq!(accepted.thread_id, thread_id);
+        let accepted_snapshot = match accepted {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(accepted_snapshot.thread_id, thread_id);
         let finished = handle.await.unwrap().unwrap();
-        assert_eq!(finished.thread_id, thread_id);
+        let finished_snapshot = match finished {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(finished_snapshot.thread_id, thread_id);
     }
 
     #[tokio::test]
@@ -4868,7 +5024,14 @@ mod tests {
         invalid.provider_name.clear();
         let (tx, rx) = oneshot::channel();
         let result = service
-            .start_accepted(ThreadId::from_uuid(Uuid::now_v7()), "x".into(), invalid, None, tx)
+            .start_accepted(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "x".into(),
+                invalid,
+                None,
+                tx,
+            )
             .await;
         // The accept signal carries the rejection, and the call itself errors.
         assert!(rx.await.unwrap().is_err());

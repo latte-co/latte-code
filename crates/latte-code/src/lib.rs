@@ -1334,6 +1334,17 @@ async fn bind_local_listener(
 /// → serve). Each workspace resolves its OWN config/registry and uses the
 /// shared global durable store, so sessions survive restarts and per-workspace
 /// provider configuration is honored.
+/// Reads an optional lease-TTL override (milliseconds) for server-owned
+/// runtimes. Production leaves this unset and keeps the 60s runtime default;
+/// end-to-end crash-recovery tests set `LATTE_LEASE_TTL_MS` low so an orphaned
+/// lease expires within the test window and the recovery sweeper reclaims it.
+fn server_lease_ttl_ms() -> Option<u64> {
+    std::env::var("LATTE_LEASE_TTL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+}
+
 fn prepare_server(
     root: &Path,
     storage_home: &Path,
@@ -1383,6 +1394,10 @@ fn prepare_server(
                 factory,
             )
             .with_verification(config.plan());
+            let runtime = match server_lease_ttl_ms() {
+                Some(ttl_ms) => runtime.with_lease_ttl_ms(ttl_ms),
+                None => runtime,
+            };
             Ok(latte_server::BuiltWorkspace {
                 engine,
                 runtime,

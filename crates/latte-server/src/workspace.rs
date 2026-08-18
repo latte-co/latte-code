@@ -74,7 +74,8 @@ impl WorkspaceInstance {
         let progress_event_tx = event_tx.clone();
         let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
             std::sync::Arc::new(
-                move |thread_id: latte_core::ThreadId, progress: latte_core::ThreadTransientProgress| {
+                move |thread_id: latte_core::ThreadId,
+                      progress: latte_core::ThreadTransientProgress| {
                     let run_id = match &progress {
                         latte_core::ThreadTransientProgress::ProviderAttempt { run_id, .. }
                         | latte_core::ThreadTransientProgress::AssistantDelta { run_id, .. }
@@ -143,8 +144,17 @@ impl WorkspaceInstance {
     }
 
     /// Returns the provider binding catalog for model discovery.
-    #[must_use]
-    pub fn bindings(&self) -> Vec<latte_headless::registry::BindingCatalogEntry> {
+    ///
+    /// # Errors
+    /// Returns a registry error when a configured model's binding cannot be
+    /// constructed (fail-closed: the client sees the broken configuration
+    /// instead of a silently partial catalog).
+    pub fn bindings(
+        &self,
+    ) -> Result<
+        Vec<latte_headless::registry::BindingCatalogEntry>,
+        latte_headless::registry::RegistryError,
+    > {
         self.registry
             .thread_binding_catalog(&self.engine.tool_descriptors())
     }
@@ -267,19 +277,36 @@ impl WorkspaceManager {
     }
 
     /// Start a background task that periodically recovers expired leases.
-    pub fn start_recovery_sweeper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    /// The task runs until `shutdown` fires (the server lifecycle owner
+    /// signals it and joins the returned handle on exit).
+    pub fn start_recovery_sweeper(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut ticker = tokio::time::interval(interval);
+            // The first tick completes immediately; skip it so recovery runs
+            // after one interval, not at startup.
+            ticker.tick().await;
             loop {
-                interval.tick().await;
-                let instances: Vec<Arc<WorkspaceInstance>> = {
-                    let instances = manager.instances.read().await;
-                    instances.values().cloned().collect()
-                };
-                for instance in instances {
-                    if let Err(error) = instance.engine.recover_expired_leases() {
-                        tracing::warn!("lease recovery failed for workspace {}: {error}", instance.id);
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let instances: Vec<Arc<WorkspaceInstance>> = {
+                            let instances = manager.instances.read().await;
+                            instances.values().cloned().collect()
+                        };
+                        for instance in instances {
+                            if let Err(error) = instance.engine.recover_expired_leases() {
+                                tracing::warn!("lease recovery failed for workspace {}: {error}", instance.id);
+                            }
+                        }
                     }
                 }
             }
@@ -349,7 +376,11 @@ mod tests {
                 )
                 .map_err(|error| error.to_string())?,
             );
-            Ok(BuiltWorkspace { engine, runtime, registry })
+            Ok(BuiltWorkspace {
+                engine,
+                runtime,
+                registry,
+            })
         });
         let locator: SessionLocator = Arc::new(|_| None);
         WorkspaceManager::new(builder, locator)
@@ -652,7 +683,16 @@ mod tests {
             let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
             let lease = engine.acquire_thread_lease(thread_id, now, 60_000).unwrap();
             engine
-                .create_started_thread_v2(thread_id, run_id, binding.clone(), "prompt", &lease, now, None)
+                .create_started_thread_v2(
+                    &latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
+                    thread_id,
+                    run_id,
+                    binding.clone(),
+                    "prompt",
+                    &lease,
+                    now,
+                    None,
+                )
                 .unwrap();
         }
 
@@ -703,7 +743,11 @@ mod tests {
                 )
                 .map_err(|error| error.to_string())?,
             );
-            Ok(BuiltWorkspace { engine, runtime, registry })
+            Ok(BuiltWorkspace {
+                engine,
+                runtime,
+                registry,
+            })
         });
         let locator: SessionLocator = Arc::new(|_| None);
         let manager = Arc::new(WorkspaceManager::new(builder, locator));
@@ -722,5 +766,79 @@ mod tests {
         }
         assert!(ids.iter().all(|id| *id == ids[0]));
         assert!(manager.get_by_id(&ids[0]).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn recovery_sweeper_recovers_expired_leases_then_shuts_down_cleanly() {
+        // The sweeper must actually run under the server lifecycle: on each
+        // tick it recovers every workspace's expired leases, and when the
+        // owner signals shutdown the task exits and joins without being
+        // abandoned. This is the production wiring the review flagged as
+        // missing (start_recovery_sweeper had no caller).
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(manager());
+        let instance = manager.get_or_create(dir.path()).await.unwrap();
+
+        // Simulate a crash: a running thread whose lease is already expired
+        // against the wall clock (absolute expiry at epoch 1001ms).
+        let binding = latte_core::ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+        let lease = instance
+            .engine
+            .acquire_thread_lease(thread_id, 1, 1000)
+            .unwrap();
+        instance
+            .engine
+            .create_started_thread_v2(
+                &latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
+                thread_id,
+                run_id,
+                binding,
+                "crashed mid-run",
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+
+        // Start the sweeper with a short interval so the test does not wait 30s.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle =
+            manager.start_recovery_sweeper(shutdown_rx, std::time::Duration::from_millis(20));
+
+        // Poll until the sweep recovers the expired lease (thread interrupted).
+        let mut recovered = false;
+        for _ in 0..100 {
+            let snapshot = instance
+                .engine
+                .thread_snapshot_v2(thread_id, None, 100)
+                .unwrap();
+            if snapshot.lifecycle == latte_core::ThreadLifecycle::Interrupted {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(recovered, "sweeper did not recover the expired lease");
+
+        // Signal shutdown; the task must observe it and join cleanly.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("sweeper task did not join after shutdown")
+            .expect("sweeper task panicked");
     }
 }
