@@ -80,7 +80,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             completion("follow-up public child completed"),
         ]),
     )
-    .with_progress_sink(Arc::new(|_| {}))
+    .with_progress_sink(Arc::new(|_, _| {}))
     .with_verification(VerificationPlan {
         argv: vec!["/bin/pwd".into()],
         cwd: ".".into(),
@@ -97,6 +97,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             thread_id,
             "exercise public thread service states".into(),
             binding("primary", "model-a"),
+            None,
         )
         .await
         .unwrap();
@@ -194,6 +195,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
                 ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 "too large".into(),
                 binding("primary", "model-a"),
+                None,
             )
             .await,
         Err(ThreadRuntimeError::History(_))
@@ -212,6 +214,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "durable provider configuration failure".into(),
             binding("primary", "model-a"),
+            None,
         )
         .await
         .unwrap();
@@ -250,6 +253,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "workspace change without verification".into(),
             binding("primary", "model-a"),
+            None,
         )
         .await
         .unwrap();
@@ -327,6 +331,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
                 ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 format!("invalid provider outcome {index}"),
                 binding("primary", "model-a"),
+                None,
             )
             .await
             .unwrap();
@@ -356,6 +361,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "uncertain filesystem result requires reconciliation".into(),
             binding("primary", "model-a"),
+            None,
         )
         .await
         .unwrap();

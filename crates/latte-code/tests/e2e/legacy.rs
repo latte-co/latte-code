@@ -123,14 +123,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        11
+        12
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        11
+        12
     );
     assert_eq!(
         sqlite_integer(
@@ -176,7 +176,7 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
               fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
             );
-            DELETE FROM schema_migrations WHERE version IN (8,9,10,11);
+            DELETE FROM schema_migrations WHERE version IN (8,9,10,11,12);
             PRAGMA user_version=7;
             INSERT INTO runs(
               run_id, state_json, status, revision, last_seq, lease_token,
@@ -232,12 +232,12 @@ fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider()
     provider.assert_consumed();
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        11
+        12
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=11;"
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=12;"
         ),
         1
     );
@@ -255,7 +255,7 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "engine_initialization");
     assert_eq!(
         json(&output)["error"]["message"],
-        "database schema version 99 is newer than supported version 11"
+        "database schema version 99 is newer than supported version 12"
     );
 }
 
@@ -312,7 +312,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
           singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
           fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
         );
-        DELETE FROM schema_migrations WHERE version IN (10,11);
+        DELETE FROM schema_migrations WHERE version IN (10,11,12);
         PRAGMA user_version=9;
         PRAGMA foreign_keys=ON;
         ",
@@ -337,7 +337,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
     assert!(pty.finish(Duration::from_secs(5)).0.success());
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        11
+        12
     );
     assert_eq!(sqlite_integer(&legacy_path, "PRAGMA user_version;"), 9);
     assert_eq!(

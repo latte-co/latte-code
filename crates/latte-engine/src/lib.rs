@@ -997,20 +997,27 @@ impl EngineHandle {
     /// Atomically accepts a new Session submission and starts its first child
     /// under the exact thread lease. A failure commits neither the user card nor
     /// a token-zero active child.
-    #[allow(clippy::needless_pass_by_value)]
+    ///
+    /// `command_id` drives crash-safe idempotent creation: the caller must
+    /// first call [`Self::lookup_create_replay`] before acquiring the lease;
+    /// this method rechecks the dedup record inside the write transaction.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub fn create_started_thread_v2(
         &self,
+        command_id: &latte_core::ThreadCommandId,
         thread_id: ThreadId,
         run_id: RunId,
         binding: ThreadProviderBindingV2,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+        focus: Option<&str>,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let response = self.storage.create_started_thread_v2(
+        let outcome = self.storage.create_started_thread_v2(
+            Some(command_id),
             thread_id,
             run_id,
             &binding,
@@ -1019,8 +1026,82 @@ impl EngineHandle {
             &baseline,
             lease,
             now_ms,
+            focus,
         )?;
-        Ok(self.finish_thread_response(response)?.snapshot)
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                // Broadcast the thread event for the new snapshot.
+                let _ = self.thread_events.send(latte_core::ThreadEventEnvelope {
+                    protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
+                    event_id: latte_core::ThreadEventId::from_uuid(uuid::Uuid::now_v7()),
+                    thread_id,
+                    revision: snapshot.revision,
+                    sequence: snapshot.sequence,
+                    event: latte_core::ThreadEvent::LifecycleChanged {
+                        lifecycle: snapshot.lifecycle,
+                        run_id: snapshot.latest_run_id,
+                    },
+                });
+                Ok(latte_core::CreateOutcome::Created(snapshot))
+            }
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
+    }
+
+    /// Pre-acquire durable dedup lookup for a session-create command. A hit
+    /// means the command was already durably accepted (possibly by a process
+    /// that crashed before responding); the caller replays the snapshot and
+    /// must not acquire a lease or start a runner. A miss proceeds to lease
+    /// acquisition and [`Self::create_started_thread_v2`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_create_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: ThreadId,
+        prompt: &str,
+        binding: &ThreadProviderBindingV2,
+        focus: Option<&str>,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        self.storage.lookup_create_replay(
+            command_id,
+            thread_id,
+            &self.workspace_root,
+            prompt,
+            binding,
+            focus,
+        )
+    }
+
+    /// Convenience: create and return the snapshot, treating replay as success.
+    /// Generates a fresh command id, so it is suitable for in-process callers
+    /// that do not need crash-safe replay; HTTP clients must use
+    /// [`Self::lookup_create_replay`] + [`Self::create_started_thread_v2`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_started_thread_v2_snapshot(
+        &self,
+        thread_id: ThreadId,
+        run_id: RunId,
+        binding: ThreadProviderBindingV2,
+        prompt: &str,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<ThreadSnapshot, StorageError> {
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
+        match self.create_started_thread_v2(
+            &command_id,
+            thread_id,
+            run_id,
+            binding,
+            prompt,
+            lease,
+            now_ms,
+            focus,
+        )? {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => Ok(s),
+        }
     }
     /// Creates an immutable child run for a ready completed thread.
     pub fn create_thread_follow_up_v2(
@@ -1102,6 +1183,22 @@ impl EngineHandle {
         }
         Ok(snapshot)
     }
+
+    /// Recovers all expired leases in this engine's storage and, for every
+    /// recovered linked child, refreshes its snapshot and broadcasts the
+    /// committed thread event so connected SSE clients wake and refetch.
+    /// Called periodically by the server's recovery sweeper.
+    pub fn recover_expired_leases(&self) -> Result<(), StorageError> {
+        let recovered = self.storage.recover_at(crate::wall_now_ms())?;
+        for response in recovered {
+            self.sync_thread_conversation(response.snapshot.thread_id)?;
+            let _ = self
+                .thread_events
+                .send(response.thread_event.envelope.clone());
+        }
+        Ok(())
+    }
+
     /// Reads the newest bounded transcript cards for presentation and resume
     /// reconciliation. Durable history reconstruction continues to use the
     /// forward-paged `thread_snapshot_v2` API.
@@ -3468,6 +3565,88 @@ mod tool_effect_tests {
             engine.apply_transition(linked_run, 0, Transition::Start, 22, &linked_lease),
             Err(StorageError::LinkedRunRequiresThreadCommit)
         ));
+    }
+
+    #[tokio::test]
+    async fn recovering_an_expired_lease_broadcasts_a_wakeup_to_live_subscribers() {
+        // The recovery sweeper must not silently recover: a crash leaves an
+        // active run whose lease expires, and an *already-connected* SSE
+        // client must be woken so it refetches the now-terminal snapshot.
+        // recover_expired_leases therefore has to broadcast the committed
+        // thread event, not just mutate the row. This proves the engine-level
+        // half of that contract (the server bridge turns the event into an SSE
+        // ThreadChanged).
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(dir.path().join("state.db"))
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+
+        // Acquire a lease valid at the create timestamp (epoch 2ms) but whose
+        // absolute expiry (epoch 1001ms) is long past against the real wall
+        // clock, so a later sweep treats it as an expired crash lease.
+        let lease = engine.acquire_thread_lease(thread_id, 1, 1000).unwrap();
+        let started = match engine
+            .create_started_thread_v2(
+                &latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                thread_id,
+                run_id,
+                test_thread_binding(),
+                "crashed mid-run",
+                &lease,
+                2,
+                None,
+            )
+            .unwrap()
+        {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(started.lifecycle, latte_core::ThreadLifecycle::Running);
+
+        // Subscribe *before* recovery, mirroring a client that stayed connected
+        // across the runner crash.
+        let mut subscription = engine.subscribe_threads();
+        assert!(
+            subscription.try_recv().unwrap().is_none(),
+            "no event before recovery"
+        );
+
+        engine.recover_expired_leases().unwrap();
+
+        // The live subscriber is woken with the recovered thread's event.
+        let event = subscription
+            .try_recv()
+            .expect("recovery must not close the channel")
+            .expect("recovery must broadcast a wakeup event");
+        assert_eq!(event.thread_id, thread_id);
+
+        // The recovered snapshot is terminal (no active run), so the woken
+        // client refetches an interrupted session rather than hanging.
+        let snapshot = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
+        assert_eq!(snapshot.lifecycle, latte_core::ThreadLifecycle::Interrupted);
+        assert!(snapshot.active_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovering_with_no_expired_leases_broadcasts_nothing() {
+        // A sweep that finds nothing to recover must stay silent: it must not
+        // spam connected clients with spurious resync/wakeup events.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(dir.path().join("state.db"))
+            .build()
+            .unwrap();
+        let mut subscription = engine.subscribe_threads();
+        engine.recover_expired_leases().unwrap();
+        assert!(
+            subscription.try_recv().unwrap().is_none(),
+            "an empty sweep must not broadcast"
+        );
     }
 
     #[tokio::test]

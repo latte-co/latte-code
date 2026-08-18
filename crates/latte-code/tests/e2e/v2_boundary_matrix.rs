@@ -551,6 +551,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         status: ThreadRunStatus::Queued,
         run_revision: 0,
         completed_at_ms: None,
+        failure_code: None,
     };
     let run_linked_event = ThreadEventEnvelope {
         protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
@@ -1527,26 +1528,28 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .acquire_thread_lease(foreign_thread, now, 60_000)
         .unwrap();
     assert!(matches!(
-        engine.create_started_thread_v2(
+        engine.create_started_thread_v2_snapshot(
             thread_id,
             run_id,
             binding(),
             "wrong scope",
             &foreign_lease,
             now + 1,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
     engine.release_lease(&foreign_lease).unwrap();
     let expired = engine.acquire_thread_lease(thread_id, now, 1).unwrap();
     assert!(matches!(
-        engine.create_started_thread_v2(
+        engine.create_started_thread_v2_snapshot(
             thread_id,
             run_id,
             binding(),
             "expired authority",
             &expired,
             now + 2,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
@@ -1554,13 +1557,14 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .acquire_thread_lease(thread_id, now + 2, 60_000)
         .unwrap();
     let running = engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             thread_id,
             run_id,
             binding(),
             "valid atomic thread",
             &lease,
             now + 3,
+            None,
         )
         .unwrap();
     assert_eq!(running.lifecycle, ThreadLifecycle::Running);
@@ -2989,13 +2993,14 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .unwrap();
 
     assert!(matches!(
-        engine.create_started_thread_v2(
+        engine.create_started_thread_v2_snapshot(
             thread_id,
             parent_run_id,
             binding(),
             "atomic boundary session",
             &wrong_scope,
             now + 1,
+            None,
         ),
         Err(StorageError::LeaseLost)
     ));
@@ -3003,13 +3008,14 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(engine.show(parent_run_id).is_err());
 
     let started = engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             thread_id,
             parent_run_id,
             binding(),
             "atomic boundary session",
             &lease,
             now + 2,
+            None,
         )
         .unwrap();
     assert_eq!(started.lifecycle, ThreadLifecycle::Running);
@@ -3268,13 +3274,14 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .acquire_thread_lease(memory_thread_id, now + 26, 120_000)
         .unwrap();
     let memory_running = memory_engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             memory_thread_id,
             run_id(),
             binding(),
             "memory-only session",
             &memory_lease,
             now + 27,
+            None,
         )
         .unwrap();
     let memory_ready = commit(
@@ -3412,13 +3419,14 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         .acquire_lease("v2-unknown-wrong-scope", now, 120_000)
         .unwrap();
     let running = engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             thread_id,
             run_id,
             binding(),
             "explicit unknown boundary",
             &lease,
             now + 1,
+            None,
         )
         .unwrap();
     let prepared = prepare_effect(
@@ -3556,13 +3564,14 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         .unwrap();
     assert_eq!(thread_lease.scope(), format!("thread:{thread_id}"));
     let mut snapshot = engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             thread_id,
             thread_run_id,
             binding(),
             "change feed snapshot fallback",
             &thread_lease,
             now + 1,
+            None,
         )
         .unwrap();
     let created_event = thread_events.try_recv().unwrap().unwrap();

@@ -13,7 +13,7 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// thread.  The bound prevents a single long-running conversation from
@@ -47,6 +47,8 @@ pub enum StorageError {
     LinkedRunRequiresThreadCommit,
     #[error("thread command id was reused with different content")]
     ThreadCommandReplayMismatch,
+    #[error("thread {0} already exists")]
+    ThreadAlreadyExists(latte_core::ThreadId),
     #[error("thread does not have the requested active run")]
     ThreadActiveRunMismatch,
 }
@@ -460,7 +462,8 @@ impl Storage {
                 binding_json TEXT NOT NULL,
                 latest_run_id TEXT,
                 created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                updated_at_ms INTEGER NOT NULL,
+                focus TEXT
               );
               CREATE TABLE thread_runs_v2(
                 run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -694,6 +697,22 @@ impl Storage {
                 ",
             )?;
             tx.commit()?;
+            version = 11;
+        }
+        if version == 11 {
+            let tx = connection.unchecked_transaction()?;
+            let has_focus: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name=?1)",
+                ["focus"],
+                |row| row.get(0),
+            )?;
+            if !has_focus {
+                tx.execute_batch("ALTER TABLE threads_v2 ADD COLUMN focus TEXT;")?;
+            }
+            tx.execute_batch(
+                "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(12,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=12;",
+            )?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -795,9 +814,9 @@ impl Storage {
         let import_result = (|| {
             let version: i64 =
                 conn.query_row("PRAGMA legacy_import.user_version", [], |row| row.get(0))?;
-            if !(9..=11).contains(&version) {
+            if !(9..=SCHEMA_VERSION).contains(&version) {
                 return Err(StorageError::InvalidData(format!(
-                    "legacy database schema {version} cannot be imported; expected 9 through 11"
+                    "legacy database schema {version} cannot be imported; expected 9 through {SCHEMA_VERSION}"
                 )));
             }
             let foreign_workspace: bool = conn.query_row(
@@ -836,7 +855,40 @@ impl Storage {
                 "pending_permissions",
                 "runtime_checkpoints",
                 "run_baselines",
-                "threads_v2",
+            ] {
+                tx.execute_batch(&format!(
+                    "INSERT OR IGNORE INTO main.{table} SELECT * FROM legacy_import.{table};"
+                ))?;
+            }
+            // threads_v2 must be imported before thread_runs_v2 and other
+            // tables that reference it via foreign keys. Legacy v9-v12 may
+            // lack parent_thread_id (added in v10) and focus (added in v12).
+            // `pragma_table_info` must use the two-argument form to inspect the
+            // ATTACHed schema; the schema-qualified string form silently
+            // resolves against `main` and reports every legacy column missing.
+            let has_parent: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2','legacy_import') WHERE name='parent_thread_id')",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_focus: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2','legacy_import') WHERE name='focus')",
+                [],
+                |row| row.get(0),
+            )?;
+            // Preserve real parent linkage and focus when the source carries
+            // them; substitute NULL for the columns a legacy schema predates.
+            let parent_expr = if has_parent {
+                "parent_thread_id"
+            } else {
+                "NULL"
+            };
+            let focus_expr = if has_focus { "focus" } else { "NULL" };
+            tx.execute_batch(&format!(
+                "INSERT OR IGNORE INTO main.threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,focus) \
+                 SELECT thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,{parent_expr},{focus_expr} FROM legacy_import.threads_v2;"
+            ))?;
+            for table in [
                 "thread_runs_v2",
                 "thread_active_runs_v2",
                 "thread_events_v2",
@@ -964,6 +1016,7 @@ impl Storage {
         now_ms: u64,
     ) -> Result<ThreadSnapshot, StorageError> {
         self.create_thread_v2_inner(
+            None,
             thread_id,
             run_id,
             binding,
@@ -972,16 +1025,65 @@ impl Storage {
             baseline,
             None,
             now_ms,
+            None,
         )
-        .map(|(snapshot, _)| snapshot)
+        .map(|(outcome, _)| match outcome {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        })
+    }
+
+    /// Pre-acquire durable dedup lookup for a session-create command. Returns
+    /// the accepted snapshot when the same `command_id` + digest was already
+    /// durably accepted (crash-safe replay), `None` on a miss, and
+    /// `ThreadCommandReplayMismatch` when the id was reused with a different
+    /// command identity. This runs *before* lease acquisition so a retry after
+    /// a crash never blocks on the dead owner's still-unexpired lease.
+    pub(crate) fn lookup_create_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: latte_core::ThreadId,
+        workspace_root: &str,
+        prompt: &str,
+        binding: &ThreadProviderBindingV2,
+        focus: Option<&str>,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        let prompt = redact_thread_text(prompt);
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let digest = create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [command_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, result_json)) = row else {
+            return Ok(None);
+        };
+        if stored_digest != digest {
+            return Err(StorageError::ThreadCommandReplayMismatch);
+        }
+        let snapshot: ThreadSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
+        Ok(Some(snapshot))
     }
 
     /// Atomically creates the Session, durable user card, linked child, and
     /// started run under the exact thread lease. There is no committed token-0
     /// child for a caller to strand between acceptance and `Start`.
+    ///
+    /// When `command_id` is provided, the create is crash-safe idempotent: the
+    /// command is deduplicated against `thread_command_dedup_v2` *inside* the
+    /// write transaction (recheck after the pre-acquire lookup), a same-id
+    /// different-digest retry fails with `ThreadCommandReplayMismatch`, and a
+    /// non-replay create for an already-existing thread fails with
+    /// `ThreadAlreadyExists`. A same-id same-digest retry returns `Replayed`
+    /// without starting a runner.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_started_thread_v2(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         binding: &ThreadProviderBindingV2,
@@ -990,8 +1092,10 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadCommitResponse, StorageError> {
-        let (snapshot, thread_event) = self.create_thread_v2_inner(
+        focus: Option<&str>,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
+        let (outcome, thread_event) = self.create_thread_v2_inner(
+            command_id,
             thread_id,
             run_id,
             binding,
@@ -1000,18 +1104,16 @@ impl Storage {
             baseline,
             Some(lease),
             now_ms,
+            focus,
         )?;
-        Ok(ThreadCommitResponse {
-            snapshot,
-            thread_event: thread_event.ok_or_else(|| {
-                StorageError::InvalidData("atomic thread start omitted its durable event".into())
-            })?,
-        })
+        let _ = thread_event; // Event is handled by finish_thread_response in engine layer
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn create_thread_v2_inner(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         binding: &ThreadProviderBindingV2,
@@ -1020,7 +1122,14 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         initial_lease: Option<&Lease>,
         now_ms: u64,
-    ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
+        focus: Option<&str>,
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<ThreadSnapshot>,
+            Option<StoredThreadEvent>,
+        ),
+        StorageError,
+    > {
         binding.validate().map_err(StorageError::InvalidData)?;
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
@@ -1034,6 +1143,11 @@ impl Storage {
         if let Some(lease) = initial_lease {
             require_lease_scope(lease, &expected_scope)?;
         }
+        // Compute the durable command digest once (before `prompt` is moved
+        // into the transcript card) and reuse it for both the in-transaction
+        // recheck and the dedup insert.
+        let command_digest =
+            create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = initial_lease {
@@ -1044,6 +1158,50 @@ impl Storage {
             )?;
             if !authoritative {
                 return Err(StorageError::LeaseLost);
+            }
+        }
+        // Durable command dedup, rechecked inside the write transaction so a
+        // concurrent pair that both missed the pre-acquire lookup cannot both
+        // create. A same-id same-digest retry replays; a same-id
+        // different-digest retry is a conflict.
+        if let Some(command_id) = command_id {
+            let previous: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                    [command_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_digest, result_json)) = previous {
+                if stored_digest != command_digest {
+                    return Err(StorageError::ThreadCommandReplayMismatch);
+                }
+                let snapshot: ThreadSnapshot =
+                    serde_json::from_str(&result_json).map_err(invalid_json)?;
+                tx.commit()?;
+                return Ok((latte_core::CreateOutcome::Replayed(snapshot), None));
+            }
+            // A non-replay create for an already-existing thread is a conflict.
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads_v2 WHERE thread_id=?1)",
+                [thread_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Err(StorageError::ThreadAlreadyExists(thread_id));
+            }
+        } else {
+            // Legacy in-process path: an existing thread replays its snapshot.
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads_v2 WHERE thread_id=?1)",
+                [thread_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if exists {
+                let snapshot =
+                    current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+                tx.commit()?;
+                return Ok((latte_core::CreateOutcome::Replayed(snapshot), None));
             }
         }
         let queued = RunState::queued(run_id);
@@ -1080,8 +1238,8 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8)",
-            params![thread_id.to_string(), to_i64(thread_revision)?, to_i64(thread_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8,?9)",
+            params![thread_id.to_string(), to_i64(thread_revision)?, to_i64(thread_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
         )?;
         tx.execute(
             "INSERT INTO thread_runs_v2(run_id,thread_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
@@ -1148,8 +1306,18 @@ impl Storage {
             None
         };
         let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+        // Record the durable dedup entry so a retry after a crash (durable
+        // accept before 202) replays this acceptance without re-creating the
+        // session or restarting the provider runner.
+        if let Some(command_id) = command_id {
+            let result_json = serde_json::to_string(&snapshot).map_err(invalid_json)?;
+            tx.execute(
+                "INSERT INTO thread_command_dedup_v2(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+                params![command_id.to_string(), command_digest, result_json, to_i64(now_ms)?],
+            )?;
+        }
         tx.commit()?;
-        Ok((snapshot, thread_event))
+        Ok((latte_core::CreateOutcome::Created(snapshot), thread_event))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1364,6 +1532,7 @@ impl Storage {
             status: ThreadRunStatus::Queued,
             run_revision: 0,
             completed_at_ms: None,
+            failure_code: None,
         };
         let event = ThreadEventEnvelope {
             protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
@@ -1899,11 +2068,16 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (source_title, workspace_root, binding_json): (String, String, String) = tx
+        let (source_title, workspace_root, binding_json, focus): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = tx
             .query_row(
-                "SELECT title,workspace_root,binding_json FROM threads_v2 WHERE thread_id=?1",
+                "SELECT title,workspace_root,binding_json,focus FROM threads_v2 WHERE thread_id=?1",
                 [source_thread_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or(StorageError::ThreadNotFound(source_thread_id))?;
@@ -1913,9 +2087,9 @@ impl Storage {
         );
         let last_sequence = history.last().map_or(0, |entry| entry.sequence);
         tx.execute(
-            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id) \
-             VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7)",
-            params![fork_thread_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_thread_id.to_string()],
+            "INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_thread_id,focus) \
+             VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7,?8)",
+            params![fork_thread_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_thread_id.to_string(),focus],
         )?;
         let mut previous = 0;
         for source in history {
@@ -4134,7 +4308,13 @@ impl Storage {
         Ok((state, Some(StoredEvent { sequence, envelope })))
     }
 
-    fn recover_at(&self, now_ms: u64) -> Result<(), StorageError> {
+    /// Recovers all expired leases and returns the committed thread responses
+    /// for every recovered linked child, so the engine can broadcast their
+    /// durable events and wake connected SSE clients.
+    pub(crate) fn recover_at(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ThreadCommitResponse>, StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Linked children must recover their v1 run, effect ledger, thread
@@ -4142,6 +4322,7 @@ impl Storage {
         // never let the legacy loop interrupt a v2 child by itself: doing so
         // leaves an active-row/lifecycle pair that no v2 command can safely
         // reconcile.
+        let mut recovered = Vec::new();
         let linked_rows = {
             let mut stmt = tx.prepare(
                 "SELECT ar.thread_id,ar.run_id,r.lease_token FROM thread_active_runs_v2 ar \
@@ -4166,8 +4347,11 @@ impl Storage {
                 .map_err(|error| {
                     StorageError::InvalidData(format!("invalid stored run id: {error}"))
                 })?;
-            let _ =
-                recover_linked_thread_run(&tx, thread_id, run_id, from_i64(token)?, None, now_ms)?;
+            if let Some(response) =
+                recover_linked_thread_run(&tx, thread_id, run_id, from_i64(token)?, None, now_ms)?
+            {
+                recovered.push(response);
+            }
         }
         let mut stmt = tx.prepare(
             "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM thread_runs_v2 tr WHERE tr.run_id=r.run_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='runtime' AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
@@ -4224,7 +4408,7 @@ impl Storage {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(recovered)
     }
 }
 
@@ -4368,11 +4552,11 @@ fn thread_snapshot(
     after: Option<u64>,
     limit: usize,
 ) -> Result<ThreadSnapshot, StorageError> {
-    let (revision, sequence, lifecycle, binding_json, latest): (i64, i64, String, String, Option<String>) = connection
+    let (revision, sequence, lifecycle, binding_json, latest, focus): (i64, i64, String, String, Option<String>, Option<String>) = connection
         .query_row(
-            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id FROM threads_v2 WHERE thread_id=?1",
+            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id,focus FROM threads_v2 WHERE thread_id=?1",
             [thread_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()?
         .ok_or(StorageError::ThreadNotFound(thread_id))?;
@@ -4431,6 +4615,7 @@ fn thread_snapshot(
                 status: thread_run_status(state.status),
                 run_revision: state.revision,
                 completed_at_ms: completed.map(from_i64).transpose()?,
+                failure_code: state.failure.map(|failure| failure.code),
             })
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
@@ -4498,6 +4683,7 @@ fn thread_snapshot(
             next_after,
             has_more,
         },
+        focus,
     })
 }
 
@@ -4894,6 +5080,33 @@ fn validate_thread_source(source: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Computes the durable digest that binds a session-create command to its
+/// complete identity: operation kind, protocol version, workspace, thread,
+/// prompt, binding, and normalized focus. Two creates with the same
+/// `command_id` but different digests are a replay conflict (409).
+fn create_command_digest(
+    thread_id: latte_core::ThreadId,
+    workspace_root: &str,
+    prompt: &str,
+    binding: &ThreadProviderBindingV2,
+    focus: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "thread.start",
+        "protocol_version": latte_core::THREAD_PROTOCOL_VERSION,
+        "workspace": workspace_root,
+        "thread_id": thread_id.to_string(),
+        "prompt": prompt,
+        "binding": binding,
+        "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn thread_command_digest(request: &ThreadCommitRequest) -> Result<String, StorageError> {
     use sha2::{Digest, Sha256};
@@ -5242,7 +5455,7 @@ mod tests {
                 source_dir.path().to_str().unwrap(),
                 3,
             ),
-            Err(StorageError::InvalidData(message)) if message.contains("expected 9 through 11")
+            Err(StorageError::InvalidData(message)) if message.contains("expected 9 through 12")
         ));
 
         destination
@@ -5779,8 +5992,9 @@ mod tests {
         let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
         let run_id = RunId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
-        let started = store
+        let started = match store
             .create_started_thread_v2(
+                None,
                 thread_id,
                 run_id,
                 &thread_binding(),
@@ -5789,9 +6003,13 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 &lease,
                 2,
+                None,
             )
-            .unwrap();
-        assert_eq!(started.snapshot.lifecycle, ThreadLifecycle::Running);
+            .unwrap()
+        {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(started.lifecycle, ThreadLifecycle::Running);
 
         let recovered = store
             .release_lease(&lease)
@@ -5874,6 +6092,127 @@ mod tests {
             ),
             Err(StorageError::LeaseLost)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn thread_snapshot_projects_failure_code_from_durable_run_state() {
+        // The CLI exit-code contract needs to distinguish a permission-denied
+        // run from any other terminal failure. failure_code must be projected
+        // from the durable RunState.failure.code, not hardcoded to None.
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+
+        // A terminal permission-denied run projects PermissionDenied.
+        let (denied_thread, denied_run, created) =
+            create_linked_fixture(&store, &ids, "denied run", 10);
+        let lease = store.acquire_thread_lease(denied_thread, 11, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &created,
+            denied_run,
+            CommitThreadRunUpdate::Start {
+                source_key: "denied:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        // A run still executing has no failure code yet.
+        assert_eq!(
+            running
+                .runs
+                .iter()
+                .find(|run| run.run_id == denied_run)
+                .unwrap()
+                .failure_code,
+            None,
+            "an active run has no failure code"
+        );
+        let denied = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            denied_run,
+            CommitThreadRunUpdate::Fail {
+                source_key: "denied:fail".into(),
+                failure: RunFailure {
+                    code: FailureCode::PermissionDenied,
+                    message: "permission was denied".into(),
+                    retryability: Retryability::Terminal,
+                },
+            },
+            13,
+        )
+        .snapshot;
+        assert_eq!(
+            denied
+                .runs
+                .iter()
+                .find(|run| run.run_id == denied_run)
+                .unwrap()
+                .failure_code,
+            Some(FailureCode::PermissionDenied),
+            "a permission-denied run projects PermissionDenied"
+        );
+        // The projection survives a fresh read (not just the in-memory commit).
+        let reread = store.thread_snapshot_v2(denied_thread, None, 100).unwrap();
+        assert_eq!(
+            reread
+                .runs
+                .iter()
+                .find(|run| run.run_id == denied_run)
+                .unwrap()
+                .failure_code,
+            Some(FailureCode::PermissionDenied),
+        );
+
+        // An ordinary terminal failure projects RuntimeFailed, so exit-code
+        // logic can tell it apart from the permission-denied case.
+        let (failed_thread, failed_run, created) =
+            create_linked_fixture(&store, &ids, "failed run", 20);
+        let lease = store.acquire_thread_lease(failed_thread, 21, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &created,
+            failed_run,
+            CommitThreadRunUpdate::Start {
+                source_key: "failed:start".into(),
+            },
+            22,
+        )
+        .snapshot;
+        let failed = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            failed_run,
+            CommitThreadRunUpdate::Fail {
+                source_key: "failed:fail".into(),
+                failure: RunFailure {
+                    code: FailureCode::RuntimeFailed,
+                    message: "runtime blew up".into(),
+                    retryability: Retryability::Terminal,
+                },
+            },
+            23,
+        )
+        .snapshot;
+        assert_eq!(
+            failed
+                .runs
+                .iter()
+                .find(|run| run.run_id == failed_run)
+                .unwrap()
+                .failure_code,
+            Some(FailureCode::RuntimeFailed),
+            "an ordinary terminal failure projects RuntimeFailed, not PermissionDenied"
+        );
     }
 
     #[test]
@@ -5960,6 +6299,7 @@ mod tests {
 
         let error = store
             .create_started_thread_v2(
+                None,
                 thread_id,
                 run_id,
                 &thread_binding(),
@@ -5968,6 +6308,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 &lease,
                 11,
+                None,
             )
             .unwrap_err();
         assert!(error.to_string().contains("injected atomic start failure"));
@@ -6170,7 +6511,7 @@ mod tests {
                  ); \
                  INSERT INTO runtime_lease(singleton,owner,fencing_token,expires_at_ms) \
                    VALUES(1,'legacy-owner',7,9999999999999); \
-                 DELETE FROM schema_migrations WHERE version IN (8,9,10,11); \
+                 DELETE FROM schema_migrations WHERE version IN (8,9,10,11,12); \
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -6188,8 +6529,24 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 11);
+        // A single open must complete the entire chain to the current schema,
+        // not stop partway. The focus column (added in v11->12) proves the
+        // final migration step ran in the same open, guarding against the
+        // "user_version written but local `version` not advanced" regression
+        // that would leave the DB stalled at 11 until a second open.
+        let has_focus: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads_v2') WHERE name='focus')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(descriptor_table);
+        assert!(
+            has_focus,
+            "v11->12 focus migration must run in the same open"
+        );
         let migrated_lease: (String, String, i64) = connection
             .query_row(
                 "SELECT scope,owner,fencing_token FROM runtime_lease",
@@ -6244,7 +6601,7 @@ mod tests {
                    fencing_token INTEGER NOT NULL, \
                    expires_at_ms INTEGER NOT NULL \
                  ); \
-                 DELETE FROM schema_migrations WHERE version IN (9,10,11); \
+                 DELETE FROM schema_migrations WHERE version IN (9,10,11,12); \
                  PRAGMA user_version=8;",
             )
             .unwrap();
@@ -8776,5 +9133,81 @@ mod tests {
         assert!(matches!(store.apply_transition(running_only, 0, Transition::Cancel, 43, &next), Err(StorageError::StaleRevision { .. }))); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &forged), Err(StorageError::LeaseLost)));
         store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
         store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { run_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
+    }
+
+    #[test]
+    fn focus_is_persisted_and_returned_in_snapshot() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+        let outcome = store
+            .create_started_thread_v2(
+                None,
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                Some("src/main.rs"),
+            )
+            .unwrap();
+        let snapshot = match outcome {
+            latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
+        };
+        assert_eq!(snapshot.focus.as_deref(), Some("src/main.rs"));
+
+        // Read back
+        let loaded = store.thread_snapshot_v2(thread_id, None, 500).unwrap();
+        assert_eq!(loaded.focus.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn create_started_thread_v2_is_idempotent() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+
+        // First create
+        let first = store
+            .create_started_thread_v2(
+                None,
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Second create with same thread_id should replay
+        let second = store
+            .create_started_thread_v2(
+                None,
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                3,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(second, latte_core::CreateOutcome::Replayed(_)));
     }
 }

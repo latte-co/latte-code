@@ -82,6 +82,27 @@ impl ThreadLifecycle {
     }
 }
 
+/// Outcome of a session create operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateOutcome<T = ThreadSnapshot> {
+    /// A new session was created.
+    Created(T),
+    /// The session already existed (idempotent replay).
+    Replayed(T),
+}
+
+/// Error class for a session-create acceptance failure, carried by the
+/// durable-acceptance signal so the HTTP layer can map it to the right status
+/// code without inspecting error strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateAcceptError {
+    /// A durable command-id reuse with a different payload, or a non-replay
+    /// create for an already-existing thread. Maps to 409 Conflict.
+    Conflict(String),
+    /// Any other acceptance failure. Maps to 500.
+    Failed(String),
+}
+
 /// A serializable copy of every semantic provider-binding field.  Credential
 /// *values* are intentionally absent; only the stable non-secret reference
 /// and generation are durable.
@@ -147,6 +168,8 @@ pub struct ThreadRunSummary {
     pub status: ThreadRunStatus,
     pub run_revision: u64,
     pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<crate::protocol::FailureCode>,
 }
 
 /// Thread-safe projection of a v1 child status. It deliberately has no
@@ -216,6 +239,8 @@ pub struct ThreadSnapshot {
     pub pending: Option<ThreadPendingRequest>,
     pub runs: Vec<ThreadRunSummary>,
     pub transcript: TranscriptPage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
 }
 
 /// Bounded, transcript-free metadata used by Session catalog discovery.
@@ -281,6 +306,8 @@ pub enum ThreadCommand {
         thread_id: ThreadId,
         prompt: String,
         binding: ThreadProviderBindingV2,
+        #[serde(default)]
+        focus: Option<String>,
     },
     FollowUp {
         thread_id: ThreadId,
@@ -563,6 +590,7 @@ mod tests {
                 thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
                 prompt: "hello".into(),
                 binding,
+                focus: None,
             },
         );
         assert_eq!(command.protocol_version, THREAD_PROTOCOL_VERSION);

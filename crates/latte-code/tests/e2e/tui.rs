@@ -619,6 +619,7 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entries() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
@@ -636,13 +637,14 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             .acquire_thread_lease(thread_id, now, 1)
             .unwrap();
         local_engine
-            .create_started_thread_v2(
+            .create_started_thread_v2_snapshot(
                 thread_id,
                 run_id,
                 session_boundary_binding(),
                 "duplicate session title",
                 &stale,
                 now,
+                None,
             )
             .unwrap();
         local_engine
@@ -665,13 +667,14 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         .unwrap();
     let foreign_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
     foreign_engine
-        .create_started_thread_v2(
+        .create_started_thread_v2_snapshot(
             foreign_thread_id,
             foreign_run_id,
             session_boundary_binding(),
             "foreign session title",
             &foreign_lease,
             foreign_now,
+            None,
         )
         .unwrap();
     foreign_engine

@@ -861,7 +861,7 @@ fn execute_tui() -> i32 {
     let (progress_tx, progress_rx) =
         std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
     let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
-        std::sync::Arc::new(move |progress| {
+        std::sync::Arc::new(move |_thread_id, progress| {
             let _ = progress_tx.send(progress);
         });
     let service = ThreadRuntimeService::new(engine.clone(), &root, config.thread_policy(), factory)
@@ -913,7 +913,7 @@ fn execute_tui() -> i32 {
                     ));
                     tokio::spawn(async move {
                         let result = service
-                            .start(thread_id, prompt, binding)
+                            .start(thread_id, prompt, binding, None)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -954,7 +954,7 @@ fn execute_tui() -> i32 {
                     ));
                     tokio::spawn(async move {
                         let result = service
-                            .start(thread_id, prompt, binding)
+                            .start(thread_id, prompt, binding, None)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -1334,6 +1334,17 @@ async fn bind_local_listener(
 /// → serve). Each workspace resolves its OWN config/registry and uses the
 /// shared global durable store, so sessions survive restarts and per-workspace
 /// provider configuration is honored.
+/// Reads an optional lease-TTL override (milliseconds) for server-owned
+/// runtimes. Production leaves this unset and keeps the 60s runtime default;
+/// end-to-end crash-recovery tests set `LATTE_LEASE_TTL_MS` low so an orphaned
+/// lease expires within the test window and the recovery sweeper reclaims it.
+fn server_lease_ttl_ms() -> Option<u64> {
+    std::env::var("LATTE_LEASE_TTL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+}
+
 fn prepare_server(
     root: &Path,
     storage_home: &Path,
@@ -1369,9 +1380,10 @@ fn prepare_server(
                 .build()
                 .map_err(|error| error.to_string())?;
             let factory_engine = engine.clone();
+            let factory_registry = registry.clone();
             let factory: latte_headless::thread::ThreadProviderFactory =
                 std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
-                    registry
+                    factory_registry
                         .resolve_thread_bound(binding, &factory_engine.tool_descriptors())
                         .map_err(|error| error.to_string())
                 });
@@ -1380,8 +1392,17 @@ fn prepare_server(
                 workspace_root,
                 config.thread_policy(),
                 factory,
-            );
-            Ok(latte_server::BuiltWorkspace { engine, runtime })
+            )
+            .with_verification(config.plan());
+            let runtime = match server_lease_ttl_ms() {
+                Some(ttl_ms) => runtime.with_lease_ttl_ms(ttl_ms),
+                None => runtime,
+            };
+            Ok(latte_server::BuiltWorkspace {
+                engine,
+                runtime,
+                registry: std::sync::Arc::new(registry),
+            })
         });
 
     // Session locator: resolve a session's owning workspace from the durable
@@ -2866,7 +2887,7 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding)
+            .start(thread_id, "hello".into(), binding, None)
             .await
             .unwrap();
         assert_eq!(
