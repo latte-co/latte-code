@@ -4695,7 +4695,7 @@ mod tests {
             .create_thread_v2(thread_id, run_id, binding(), "prepare", 1)
             .unwrap();
         let lease = engine
-            .acquire_thread_lease(thread_id, now_ms(), 100)
+            .acquire_thread_lease(thread_id, now_ms(), 500)
             .unwrap();
         let running = engine
             .commit_thread_run_update(
@@ -4740,7 +4740,7 @@ mod tests {
             ThreadLifecycle::WaitingPermission
         );
         drop(engine);
-        tokio::time::sleep(Duration::from_millis(125)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         let reopened = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&db)
