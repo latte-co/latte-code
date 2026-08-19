@@ -4402,3 +4402,110 @@ fn final_binary_cli_list_with_unhealthy_server_reports_unreachable() {
     assert!(!output.status.success());
     assert_eq!(json(&output)["error"]["code"], "server_unreachable");
 }
+
+#[test]
+fn final_binary_cli_run_with_write_file_tool_prepares_and_waits_for_permission() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "write-1",
+        "write_file",
+        &serde_json::json!({"path": "output.txt", "content": "hello world", "create_intent": true}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "write a file"], |command| {
+        command.env("TEST_OPENAI_KEY", "write-tool-secret");
+    });
+    // write_file is a modify tool → session waits for permission.
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_eq!(body["status"], "waiting");
+    assert_eq!(body["data"]["session"]["lifecycle"], "waiting_permission");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_list_directory_tool_completes() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("a.txt"), "a").unwrap();
+    std::fs::write(scenario.root().join("b.txt"), "b").unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "list-1",
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ),
+        ProviderReply::completion("listed directory"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "list files"], |command| {
+        command.env("TEST_OPENAI_KEY", "list-tool-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_git_diff_tool_completes() {
+    let scenario = Scenario::new();
+    // Initialize a git repo so git_diff works.
+    let status = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(scenario.root())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::write(scenario.root().join("tracked.txt"), "content\n").unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(scenario.root())
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(scenario.root())
+        .status();
+    // Modify the file so git_diff has something to report.
+    std::fs::write(scenario.root().join("tracked.txt"), "modified content\n").unwrap();
+
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("diff-1", "git_diff", &serde_json::json!({})),
+        ProviderReply::completion("diff reviewed"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "check the diff"], |command| {
+        command.env("TEST_OPENAI_KEY", "diff-tool-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_provider_error_fails() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::error(500, "provider internal error")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "trigger provider error"], |command| {
+        command.env("TEST_OPENAI_KEY", "error-secret");
+    });
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_eq!(body["status"], "failed");
+    provider.assert_consumed();
+}
