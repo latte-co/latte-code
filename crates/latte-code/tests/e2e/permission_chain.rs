@@ -368,7 +368,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
             "prompt": "continue",
             "expected_thread_revision": thread_revision
         })),
-        &[],
+        &[("Idempotency-Key", "permission-chain-follow-key")],
     );
     assert!(
         follow_status == 202 || follow_status == 409,

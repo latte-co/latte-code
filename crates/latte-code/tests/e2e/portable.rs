@@ -834,7 +834,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
         Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
-        &[],
+        &[("Idempotency-Key", "stale-revision-key")],
     );
     assert_eq!(follow_conflict, 409);
 
@@ -977,8 +977,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     assert_eq!(no_key_status, 202);
     assert!(no_key_body["session_id"].is_string());
 
-    // A follow-up WITHOUT an Idempotency-Key header succeeds (follow-up keeps
-    // the header optional; only create requires command_id parity).
+    // A follow-up WITH an Idempotency-Key header succeeds on a ready session.
     let no_key_session = no_key_body["session_id"].as_str().unwrap();
     let mut no_key_ready = false;
     for _ in 0..200 {
@@ -1011,9 +1010,19 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
         Some(&serde_json::json!({ "prompt": "continue", "expected_thread_revision": no_key_rev })),
-        &[],
+        &[("Idempotency-Key", "second-session-follow-key")],
     );
     assert_eq!(no_key_follow_status, 202);
+
+    // A follow-up WITHOUT an Idempotency-Key header is rejected 400.
+    let (missing_key_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{no_key_session}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "no key", "expected_thread_revision": no_key_rev })),
+        &[],
+    );
+    assert_eq!(missing_key_status, 400);
 
     // A create whose Idempotency-Key header does NOT equal the body command_id
     // is rejected 400: one identity, two names must not disagree.
@@ -1042,14 +1051,13 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     );
     assert_eq!(no_key_bad_status, 400);
 
-    // A follow-up WITHOUT key with a stale revision exercises the
-    // (None, Err) branch in the follow-up handler's idempotency match.
+    // A follow-up with a stale revision is a 409 conflict.
     let (no_key_stale_status, _) = server.request(
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
         Some(&serde_json::json!({ "prompt": "stale", "expected_thread_revision": 999 })),
-        &[],
+        &[("Idempotency-Key", "stale-revision-key")],
     );
     assert_eq!(no_key_stale_status, 409);
 }
