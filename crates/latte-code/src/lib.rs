@@ -3306,7 +3306,7 @@ mod tests {
                 session_id: sid,
                 prompt,
             } => {
-                assert_eq!(sid.to_string(), session_id);
+                assert_eq!(sid, session_id);
                 assert_eq!(prompt, "run --verbose");
             }
             _ => panic!("expected Resume command"),
