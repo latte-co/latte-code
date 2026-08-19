@@ -1727,6 +1727,55 @@ mod tests {
     }
 
     #[test]
+    fn tui_setup_reports_configuration_error_when_storage_home_empty() {
+        // With LATTE_CODE_HOME set to an empty string, storage_home() fails
+        // and tui_setup returns EXIT_USAGE from the database_path branch.
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str())),
+                ("LATTE_CODE_HOME", Some(std::ffi::OsStr::new(""))),
+            ],
+            tui_setup,
+        );
+        std::env::set_current_dir(&original).unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn server_lease_ttl_ms_parses_and_rejects_values() {
+        // Valid value.
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("5000"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), Some(5000));
+        });
+        // Invalid value → None.
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("invalid"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), None);
+        });
+        // Zero → None (filtered out).
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("0"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), None);
+        });
+    }
+
+    #[test]
+    fn storage_paths_fail_without_home() {
+        temp_env::with_vars(
+            [
+                ("HOME", None::<&std::ffi::OsStr>),
+                ("LATTE_CODE_HOME", None::<&std::ffi::OsStr>),
+            ],
+            || {
+                assert!(super::storage_database_path().is_err());
+                assert!(super::storage_conversation_root().is_err());
+            },
+        );
+    }
+
+    #[test]
     fn storage_home_with_covers_all_branches() {
         use std::ffi::OsStr;
         // Override with valid absolute path.
