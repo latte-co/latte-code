@@ -5147,4 +5147,151 @@ mod tests {
         assert!(rx.await.unwrap().is_err());
         assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
     }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn append_denied_tool_results_adds_missing_tool_messages() {
+        use crate::provider::{Message, ToolCall};
+        let mut segment = vec![
+            Message::Assistant {
+                content: Some("calling tools".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({"path": "b.txt", "content": "x"}),
+                    },
+                ],
+            },
+            Message::Tool {
+                tool_call_id: "call-1".into(),
+                name: Some("read_file".into()),
+                content: "file content".into(),
+            },
+        ];
+        append_denied_tool_results(&mut segment);
+        // call-1 already has a Tool message; call-2 should get a denial message.
+        assert_eq!(segment.len(), 3);
+        match &segment[2] {
+            Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call-2");
+                assert!(content.contains("permission denied"));
+            }
+            other => panic!("expected Tool message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_denied_tool_results_handles_empty_segment() {
+        let mut segment: Vec<Message> = vec![];
+        append_denied_tool_results(&mut segment);
+        assert!(segment.is_empty());
+    }
+
+    #[test]
+    fn provider_configuration_failure_message_is_stable() {
+        let msg = provider_configuration_failure_message();
+        assert!(msg.contains("provider configuration"));
+        assert!(msg.contains("credentials"));
+    }
+
+    #[test]
+    fn wire_bytes_counts_serialized_size() {
+        use crate::provider::Message;
+        let messages = vec![Message::User {
+            content: "hello".into(),
+        }];
+        let size = wire_bytes(&messages).unwrap();
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn new_run_id_returns_unique_ids() {
+        let id1 = new_run_id();
+        let id2 = new_run_id();
+        assert_ne!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn signal_accept_sends_to_receiver() {
+        let (tx, rx) = oneshot::channel();
+        signal_accept(Some(tx), Ok::<_, String>(42));
+        assert_eq!(rx.await.unwrap().unwrap(), 42);
+        // None sender is a no-op.
+        signal_accept(None, Ok::<_, String>(42));
+    }
+
+    #[test]
+    fn classify_create_error_maps_conflict_and_failed() {
+        let conflict = ThreadRuntimeError::Storage(
+            latte_engine::StorageError::ThreadCommandReplayMismatch,
+        );
+        assert!(matches!(
+            classify_create_error(&conflict),
+            latte_core::CreateAcceptError::Conflict(_)
+        ));
+        let failed = ThreadRuntimeError::InvalidState;
+        assert!(matches!(
+            classify_create_error(&failed),
+            latte_core::CreateAcceptError::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn active_run_revision_finds_active_run() {
+        use latte_core::{IdSource, SystemIdSource, ThreadRunStatus, ThreadRunSummary, TranscriptPage};
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let snapshot = ThreadSnapshot {
+            thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            revision: 1,
+            sequence: 1,
+            lifecycle: ThreadLifecycle::Running,
+            binding: ThreadProviderBindingV2 {
+                version: 2,
+                provider_name: String::new(),
+                provider_type: String::new(),
+                protocol: String::new(),
+                model: String::new(),
+                config_fingerprint: String::new(),
+                tools_fingerprint: String::new(),
+                aliases: Default::default(),
+                credential_ref_id: String::new(),
+                data_scope_id: String::new(),
+                credential_generation: 0,
+            },
+            latest_run_id: None,
+            active_run_id: Some(run_id),
+            pending: None,
+            runs: vec![ThreadRunSummary {
+                run_id,
+                parent_run_id: None,
+                ordinal: 0,
+                status: ThreadRunStatus::Running,
+                run_revision: 7,
+                completed_at_ms: None,
+                failure_code: None,
+            }],
+            transcript: TranscriptPage {
+                entries: vec![],
+                next_after: None,
+                has_more: false,
+            },
+            focus: None,
+        };
+        assert_eq!(active_run_revision(&snapshot).unwrap(), 7);
+        // No active run → error.
+        let mut no_active = snapshot.clone();
+        no_active.active_run_id = None;
+        assert!(active_run_revision(&no_active).is_err());
+    }
 }
