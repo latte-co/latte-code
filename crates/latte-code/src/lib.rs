@@ -3254,7 +3254,7 @@ mod tests {
             "src/main.rs".to_string(),
         ];
         let parsed = crate::server_client::parse_session_command(&args).unwrap();
-        assert!(parsed.json == false);
+        assert!(!parsed.json);
         match parsed.command {
             crate::server_client::SessionCommand::Run { prompt, focus } => {
                 assert_eq!(prompt, "hello");
