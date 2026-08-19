@@ -183,6 +183,12 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
                 focus = Some(PathBuf::from(next_value(&mut iter, "--focus")?));
             }
             "--focus" => return Err("--focus is only valid with run".to_string()),
+            // For run/resume, unknown --flag tokens are prompt content
+            // (e.g. `latte-code run cargo test --workspace`). For list/show,
+            // reject them as unknown options since they take no prompt.
+            other if other.starts_with("--") && (name == "run" || name == "resume") => {
+                positional.push(other.to_string());
+            }
             other if other.starts_with("--") => return Err(format!("unknown option: {other}")),
             other => positional.push(other.to_string()),
         }
@@ -1095,8 +1101,15 @@ impl SessionServer for ServerClient {
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
         });
+        // Follow-up is a durable mutation: send an idempotency key so a
+        // timeout/retry cannot append a duplicate turn.
+        let idempotency_key = Uuid::now_v7().to_string();
         let value = self
-            .post(&format!("/v1/sessions/{session_id}/follow-up"), body, None)
+            .post(
+                &format!("/v1/sessions/{session_id}/follow-up"),
+                body,
+                Some(&idempotency_key),
+            )
             .await?;
         let revision = value
             .get("accepted_revision")
@@ -1337,7 +1350,8 @@ mod tests {
                 .is_err()
         );
         assert!(parse_session_command(&args(&["list", "--focus", "x"])).is_err());
-        assert!(parse_session_command(&args(&["run", "--bogus"])).is_err());
+        // run/resume accept unknown --flag tokens as prompt content.
+        assert!(parse_session_command(&args(&["run", "--bogus"])).is_ok());
         assert!(parse_session_command(&args(&["run", "--server"])).is_err());
     }
 
@@ -2137,9 +2151,14 @@ mod tests {
 
         async fn follow_up(
             Path(_id): Path<String>,
+            headers: axum::http::HeaderMap,
             axum::Json(body): axum::Json<Value>,
         ) -> impl IntoResponse {
             assert_eq!(body["expected_thread_revision"], 1);
+            assert!(
+                headers.get("idempotency-key").is_some(),
+                "follow-up must send Idempotency-Key"
+            );
             (
                 axum::http::StatusCode::ACCEPTED,
                 axum::Json(json!({ "accepted_revision": 2, "workspace_id": "mock-workspace" })),

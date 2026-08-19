@@ -3333,4 +3333,57 @@ mod tests {
             });
         assert_eq!(code, 2); // EXIT_USAGE
     }
+
+    #[test]
+    fn parse_session_command_run_accepts_dash_flags_in_prompt_without_separator() {
+        // Common case: `latte-code run cargo test --workspace` — the
+        // --workspace token is prompt content, not an unknown option.
+        let args = vec![
+            "run".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "--workspace".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, .. } => {
+                assert_eq!(prompt, "cargo test --workspace");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_resume_accepts_dash_flags_in_prompt_without_separator() {
+        let session_id = "01900000-0000-7000-8000-000000000001";
+        let args = vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "run".to_string(),
+            "--verbose".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Resume { prompt, .. } => {
+                assert_eq!(prompt, "run --verbose");
+            }
+            _ => panic!("expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_list_rejects_unknown_dash_flags() {
+        let args = vec!["list".to_string(), "--unknown".to_string()];
+        assert!(crate::server_client::parse_session_command(&args).is_err());
+    }
+
+    #[test]
+    fn parse_session_command_show_rejects_unknown_dash_flags() {
+        let args = vec![
+            "show".to_string(),
+            "01900000-0000-7000-8000-000000000001".to_string(),
+            "--unknown".to_string(),
+        ];
+        assert!(crate::server_client::parse_session_command(&args).is_err());
+    }
 }
