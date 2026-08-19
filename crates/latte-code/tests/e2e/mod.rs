@@ -15,7 +15,6 @@ mod public_logic_boundary;
 mod recovery;
 mod runtime;
 mod runtime_convergence;
-mod service_boundary;
 mod support;
 mod thread_service_boundary;
 mod tools;

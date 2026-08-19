@@ -1428,10 +1428,12 @@ fn emit_error(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::EXIT_COMPLETED;
     use super::bind_local_listener;
     use super::{
-        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_INTERNAL, EXIT_USAGE,
-        ThreadConfig, ThreadEngineProjection, VerificationConfig, discover_workspace_root,
+        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
+        ThreadEngineProjection, VerificationConfig, discover_workspace_root,
         dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
         exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
         parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action, serve_bound,

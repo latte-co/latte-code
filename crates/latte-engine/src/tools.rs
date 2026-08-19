@@ -1,7 +1,7 @@
+#[cfg(test)]
+use crate::policy::PendingApproval;
 use crate::{
-    policy::{
-        self, EffectClass, OperationBinding, PendingApproval, PermissionPolicy, PolicyDecision,
-    },
+    policy::{self, EffectClass, OperationBinding, PermissionPolicy, PolicyDecision},
     workspace::{FileIdentity, PathError, WorkspacePath},
 };
 use ignore::WalkBuilder;
@@ -262,6 +262,7 @@ pub(crate) struct ToolRegistry {
     policy: PermissionPolicy,
     tools: BTreeMap<String, Box<dyn Tool>>,
     snapshots: Mutex<BTreeMap<String, FileIdentity>>,
+    #[cfg(test)]
     approvals: Mutex<BTreeMap<String, PendingApproval>>,
 }
 impl std::fmt::Debug for ToolRegistry {
@@ -529,6 +530,7 @@ impl ToolRegistry {
             policy,
             tools,
             snapshots: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
             approvals: Mutex::new(BTreeMap::new()),
         })
     }
@@ -588,7 +590,7 @@ impl ToolRegistry {
     pub(crate) fn execute_prepared(&self, prepared: Prepared) -> Result<ToolOutput, ToolError> {
         self.execute(prepared)
     }
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn invoke(&self, invocation: &ToolInvocation<'_>) -> Result<ToolOutput, ToolError> {
         let tool = self
             .tools

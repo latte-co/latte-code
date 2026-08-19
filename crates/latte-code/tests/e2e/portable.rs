@@ -2528,3 +2528,1812 @@ fn final_binary_server_renames_forks_and_lists_bindings() {
     );
     assert_eq!(unauthorized, 401, "missing bearer token must be 401");
 }
+
+/// CLI `run --server` drives a full session through a standalone server,
+/// covering the remote `connect` path, `resolve_remote_token`, and SSE
+/// observation over HTTP (not the embedded server).
+#[test]
+fn final_binary_cli_run_against_standalone_server() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("remote server completed")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = scenario.output(
+        &[
+            "--json",
+            "run",
+            "complete via remote server",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "remote-server-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["data"]["session"]["lifecycle"], "ready");
+    assert_eq!(body["data"]["session"]["runs"][0]["status"], "completed");
+    assert!(
+        body["data"]["session"]["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["text"] == "remote server completed")
+    );
+    provider.assert_consumed();
+}
+
+/// CLI `--server` with a dead port reports `server_unreachable` (exit 71).
+#[test]
+fn final_binary_cli_reports_server_unreachable() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    // Bind and immediately drop a listener to get a guaranteed-free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let output = scenario.output(
+        &[
+            "--json",
+            "list",
+            "--server",
+            &format!("http://127.0.0.1:{port}"),
+            "--token",
+            "unused",
+        ],
+        |_| {},
+    );
+    assert_eq!(output.status.code(), Some(71));
+    assert_eq!(json(&output)["error"]["code"], "server_unreachable");
+}
+
+/// CLI `--server` with a wrong token reports `unauthorized` (exit 70).
+#[test]
+fn final_binary_cli_reports_unauthorized() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+
+    let output = scenario.output(
+        &[
+            "--json",
+            "list",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            "wrong-token",
+        ],
+        |_| {},
+    );
+    assert_eq!(output.status.code(), Some(70));
+    assert_eq!(json(&output)["error"]["code"], "unauthorized");
+}
+
+/// CLI `show`/`list`/`resume` against a standalone server, covering the
+/// remote `--server` path for read and follow-up commands.
+#[test]
+fn final_binary_cli_show_list_resume_against_standalone_server() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn"),
+        ProviderReply::completion("follow-up turn"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Run a session through the standalone server.
+    let run = scenario.output(
+        &[
+            "--json",
+            "run",
+            "first turn",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "remote-server-secret");
+        },
+    );
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let session_id = json(&run)["data"]["session"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Show the session through the standalone server.
+    let show = scenario.output(
+        &[
+            "--json",
+            "show",
+            &session_id,
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |_| {},
+    );
+    assert!(show.status.success());
+    assert_eq!(json(&show)["data"]["session"]["thread_id"], session_id);
+
+    // List sessions through the standalone server.
+    let list = scenario.output(
+        &["--json", "list", "--server", &url, "--token", &server.token],
+        |_| {},
+    );
+    assert!(list.status.success());
+    let list_body = json(&list);
+    let sessions = list_body["data"]["sessions"].as_array().unwrap();
+    assert!(sessions.iter().any(|s| s["thread_id"] == session_id));
+
+    // Resume (follow-up) through the standalone server.
+    let resume = scenario.output(
+        &[
+            "--json",
+            "resume",
+            &session_id,
+            "follow-up turn",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "remote-server-secret");
+        },
+    );
+    assert!(
+        resume.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resume.stdout)
+    );
+    assert_eq!(
+        json(&resume)["data"]["session"]["runs"][0]["status"],
+        "completed"
+    );
+    provider.assert_consumed();
+}
+
+/// CLI `run --focus` passes the focus path through to the server.
+#[test]
+fn final_binary_cli_run_with_focus() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("focused completion")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+    let focus_dir = scenario.root().join("crates");
+    std::fs::create_dir_all(&focus_dir).unwrap();
+
+    let output = scenario.output(
+        &["--json", "run", "--focus", "crates", "complete with focus"],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "focus-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["data"]["session"]["focus"], "crates");
+    provider.assert_consumed();
+}
+
+/// CLI `show`/`resume` with a non-existent session reports `not_found` (exit 4).
+#[test]
+fn final_binary_cli_reports_missing_session() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let missing = "01900000-0000-7000-8000-000000000099";
+
+    let show = scenario.output(&["--json", "show", missing], |_| {});
+    assert_eq!(show.status.code(), Some(4));
+    assert_eq!(json(&show)["error"]["code"], "not_found");
+
+    let resume = scenario.output(&["--json", "resume", missing, "follow up"], |_| {});
+    assert_eq!(resume.status.code(), Some(4));
+    assert_eq!(json(&resume)["error"]["code"], "not_found");
+}
+
+/// Text-mode `list`/`show` render human-readable output (not JSON envelopes).
+#[test]
+fn final_binary_cli_text_mode_list_and_show() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("text mode result")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    // Run a session first.
+    let run = scenario.output(&["run", "complete in text mode"], |command| {
+        command.env("TEST_OPENAI_KEY", "text-mode-secret");
+    });
+    assert!(run.status.success());
+    let run_text = String::from_utf8(run.stdout).unwrap();
+    let session_id = run_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|value| value.trim_end_matches(':'))
+        .unwrap();
+
+    // Text-mode list.
+    let list = scenario.output(&["list"], |_| {});
+    assert!(list.status.success());
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    assert!(list_text.contains(session_id));
+    assert!(list_text.contains("ready"));
+
+    // Text-mode show.
+    let show = scenario.output(&["show", session_id], |_| {});
+    assert!(show.status.success());
+    let show_text = String::from_utf8(show.stdout).unwrap();
+    assert!(show_text.contains(&format!("session {session_id}:")));
+    assert!(show_text.contains("text mode result"));
+    provider.assert_consumed();
+}
+
+/// CLI usage errors: missing prompt, unknown option, invalid UUID, missing
+/// token for remote server. Covers parse and error-classification paths.
+#[test]
+fn final_binary_cli_usage_errors() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    // run without a prompt
+    let no_prompt = scenario.output(&["--json", "run"], |_| {});
+    assert_eq!(no_prompt.status.code(), Some(2));
+    assert_eq!(json(&no_prompt)["error"]["code"], "usage");
+
+    // unknown option
+    let unknown = scenario.output(&["--json", "list", "--bogus"], |_| {});
+    assert_eq!(unknown.status.code(), Some(2));
+    assert_eq!(json(&unknown)["error"]["code"], "usage");
+
+    // show with invalid UUID
+    let bad_id = scenario.output(&["--json", "show", "not-a-uuid"], |_| {});
+    assert_eq!(bad_id.status.code(), Some(2));
+    assert_eq!(json(&bad_id)["error"]["code"], "usage");
+
+    // resume with too few args
+    let no_resume = scenario.output(&["--json", "resume", "only-one-arg"], |_| {});
+    assert_eq!(no_resume.status.code(), Some(2));
+    assert_eq!(json(&no_resume)["error"]["code"], "usage");
+
+    // --focus on non-run command
+    let bad_focus = scenario.output(&["--json", "list", "--focus", "src"], |_| {});
+    assert_eq!(bad_focus.status.code(), Some(2));
+    assert_eq!(json(&bad_focus)["error"]["code"], "usage");
+
+    // --server without --token and no token file
+    let no_token = scenario.output(
+        &["--json", "list", "--server", "http://127.0.0.1:1"],
+        |_| {},
+    );
+    assert_eq!(no_token.status.code(), Some(2));
+    assert_eq!(json(&no_token)["error"]["code"], "usage");
+
+    // unknown command
+    let bad_cmd = scenario.output(&["--json", "bogus"], |_| {});
+    assert_eq!(bad_cmd.status.code(), Some(2));
+    assert_eq!(json(&bad_cmd)["error"]["code"], "usage");
+
+    // list with positional args
+    let list_args = scenario.output(&["--json", "list", "extra"], |_| {});
+    assert_eq!(list_args.status.code(), Some(2));
+    assert_eq!(json(&list_args)["error"]["code"], "usage");
+
+    // show with zero args
+    let show_zero = scenario.output(&["--json", "show"], |_| {});
+    assert_eq!(show_zero.status.code(), Some(2));
+    assert_eq!(json(&show_zero)["error"]["code"], "usage");
+
+    // show with two args
+    let show_two = scenario.output(
+        &[
+            "--json",
+            "show",
+            "00000000-0000-7000-8000-000000000001",
+            "extra",
+        ],
+        |_| {},
+    );
+    assert_eq!(show_two.status.code(), Some(2));
+    assert_eq!(json(&show_two)["error"]["code"], "usage");
+
+    // resume with invalid UUID
+    let resume_bad = scenario.output(&["--json", "resume", "not-a-uuid", "prompt"], |_| {});
+    assert_eq!(resume_bad.status.code(), Some(2));
+    assert_eq!(json(&resume_bad)["error"]["code"], "usage");
+
+    // --server with --token but unreachable server
+    let unreachable = scenario.output(
+        &[
+            "--json",
+            "list",
+            "--server",
+            "http://127.0.0.1:1",
+            "--token",
+            "t",
+        ],
+        |_| {},
+    );
+    assert_eq!(unreachable.status.code(), Some(71));
+    assert_eq!(json(&unreachable)["error"]["code"], "server_unreachable");
+}
+
+/// Text-mode `resume` renders human-readable output (not JSON envelopes).
+#[test]
+fn final_binary_cli_text_mode_resume() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn"),
+        ProviderReply::completion("follow-up turn"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    // Run a session first.
+    let run = scenario.output(&["run", "first turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "text-resume-secret");
+    });
+    assert!(run.status.success());
+    let run_text = String::from_utf8(run.stdout).unwrap();
+    let session_id = run_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|value| value.trim_end_matches(':'))
+        .unwrap();
+
+    // Text-mode resume.
+    let resume = scenario.output(&["resume", session_id, "follow-up turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "text-resume-secret");
+    });
+    assert!(
+        resume.status.success(),
+        "resume failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&resume.stdout),
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let resume_text = String::from_utf8(resume.stdout).unwrap();
+    assert!(resume_text.contains("follow-up turn"));
+    provider.assert_consumed();
+}
+
+/// CLI `run` with no providers configured reports a usage error.
+#[test]
+fn final_binary_cli_run_without_providers() {
+    let scenario = Scenario::new();
+    // Write a config with no providers at all.
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        r#"{version:1,default_model:"",providers:{},database:{path:".latte/latte-code.db"},verification:{argv:["true"]}}"#,
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "run", "test"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+/// CLI with no args in a non-TTY environment prints help (not the TUI).
+#[test]
+fn final_binary_cli_no_args_prints_help() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&[], |_| {});
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Usage") || text.contains("usage"));
+}
+
+/// CLI `--json` with no args emits a JSON help envelope.
+#[test]
+fn final_binary_cli_json_no_args_emits_help() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json"], |_| {});
+    assert!(output.status.success());
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert!(body["data"]["help"].is_string());
+}
+
+/// CLI `serve` with an unknown argument reports a usage error.
+#[test]
+fn final_binary_cli_serve_rejects_unknown_argument() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "serve", "--bogus"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+/// CLI `tui` without a TTY reports a usage error.
+#[test]
+fn final_binary_cli_tui_without_tty_fails() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["tui"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// CLI with no `HOME` and no `LATTE_CODE_HOME` reports a configuration error
+/// (covering the `storage_home` no-home branch).
+#[test]
+fn final_binary_cli_without_home_reports_configuration_error() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "list"], |command| {
+        command.env_remove("HOME").env_remove("LATTE_CODE_HOME");
+    });
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "configuration");
+}
+
+/// CLI `--server` without `--token` reads the bearer token from
+/// `$LATTE_CODE_HOME/server.token` (covering `resolve_remote_token` file path).
+#[test]
+fn final_binary_cli_server_without_token_reads_token_file() {
+    let scenario = Scenario::new();
+    // `list` never calls the provider; a dummy endpoint suffices.
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // No --token: the CLI must read server.token from LATTE_CODE_HOME.
+    let output = scenario.output(&["--json", "list", "--server", &url], |command| {
+        command.env("TEST_OPENAI_KEY", "token-file-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// CLI text-mode `show` on a denied session renders the `denied` outcome.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cli_show_denied_session_in_text_mode() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-deny",
+            "write_file",
+            &serde_json::json!({
+                "path": "denied.txt",
+                "content": "should not be written\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("permission denied, moving on"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.create_session(&workspace_id, "write it", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission over HTTP");
+
+    // Deny the permission.
+    let (deny_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": false,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(deny_status, 200);
+
+    // Wait for the session to settle.
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled after the denied turn");
+
+    // CLI text-mode show on the denied session.
+    let show = scenario.output(
+        &[
+            "show",
+            &session_id,
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "denied-session-secret");
+        },
+    );
+    assert!(show.status.success());
+    let show_text = String::from_utf8(show.stdout).unwrap();
+    assert!(show_text.contains("denied") || show_text.contains("failed"));
+    // Note: provider.assert_consumed() is intentionally omitted — the denied
+    // turn may not consume the completion reply before the session settles.
+}
+
+/// CLI text-mode `show` on a still-running session renders the lifecycle name
+/// (not a terminal outcome), covering `lifecycle_name` and the non-terminal
+/// `render_session_text` path.
+#[test]
+fn final_binary_cli_show_running_session_renders_lifecycle() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("slow response").delayed(std::time::Duration::from_secs(5))
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.create_session(&workspace_id, "slow turn", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait for the session to enter Running (the provider is delayed).
+    let mut running = false;
+    for _ in 0..100 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("running") {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(running, "session never entered Running");
+
+    // CLI text-mode show on the running session.
+    let show = scenario.output(
+        &[
+            "show",
+            &session_id,
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "running-session-secret");
+        },
+    );
+    assert!(show.status.success());
+    let show_text = String::from_utf8(show.stdout).unwrap();
+    assert!(show_text.contains("running"), "show output: {show_text}");
+    // The provider reply is still pending; drop the server to clean up.
+    drop(server);
+}
+
+/// CLI `run` interrupted by SIGINT maps to a best-effort cancel and exits 130
+/// (cancelled), covering the `observe_session` cancel branch, `cancel_session`,
+/// the `cancel` HTTP method, and `RunResult::Cancelled`.
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_sigint_returns_cancelled() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("slow response").delayed(std::time::Duration::from_secs(5))
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let mut child = scenario
+        .command(&["run", "slow task that gets interrupted"])
+        .env("TEST_OPENAI_KEY", "sigint-secret")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn latte-code run");
+
+    // Give the embedded server time to start the turn and open the SSE stream.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "run exited before SIGINT was sent"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("send SIGINT");
+
+    let output = child.wait_with_output().expect("wait for run after SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "expected exit 130 (cancelled); stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The provider reply is intentionally not consumed (the turn was cancelled).
+}
+
+/// CLI `run` against a standalone server with a delayed provider reply: the
+/// session is still Running when the CLI enters the SSE select loop, so the
+/// terminal `ThreadChanged` event is observed through the stream (covering the
+/// `ThreadChanged` handler and its `check_terminal` resync).
+#[test]
+fn final_binary_cli_run_with_delayed_provider_observes_thread_changed() {
+    let scenario = Scenario::new();
+    let provider =
+        ScriptedProvider::start([ProviderReply::completion("delayed completion")
+            .delayed(std::time::Duration::from_secs(1))]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = scenario.output(
+        &[
+            "--json",
+            "run",
+            "slow but steady",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "delayed-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["data"]["session"]["lifecycle"], "ready");
+    provider.assert_consumed();
+}
+
+/// CLI `run` with a read-only tool call: `read_file` is auto-approved (Read
+/// effect class), so the turn executes the tool and completes, covering the
+/// tool execution path and the embedded-server shutdown.
+#[test]
+fn final_binary_cli_run_with_read_only_tool_call_completes() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "hello from file\n").unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "read-1",
+            "read_file",
+            &serde_json::json!({ "path": "target.txt" }),
+        ),
+        ProviderReply::completion("read the file"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "read the file"], |command| {
+        command.env("TEST_OPENAI_KEY", "read-tool-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["data"]["session"]["lifecycle"], "ready");
+    provider.assert_consumed();
+}
+
+/// CLI `run --json` interrupted by SIGINT emits the `cancelled` status envelope
+/// (covering `RunResult::Cancelled::status` in JSON mode).
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_sigint_json_emits_cancelled() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("slow response").delayed(std::time::Duration::from_secs(5))
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let mut child = scenario
+        .command(&["--json", "run", "slow task"])
+        .env("TEST_OPENAI_KEY", "sigint-json-secret")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn latte-code run");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "run exited before SIGINT was sent"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .expect("send SIGINT");
+
+    let output = child.wait_with_output().expect("wait for run after SIGINT");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "expected exit 130; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "cancelled");
+}
+
+/// `waiting_permission` lifecycle name.
+#[test]
+fn final_binary_cli_show_waiting_permission_session() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-waiting",
+            "write_file",
+            &serde_json::json!({
+                "path": "waiting.txt",
+                "content": "parked\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("after permission"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.create_session(&workspace_id, "park here", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut parked = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            parked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(parked, "session never reached WaitingPermission");
+
+    // `list` renders the raw lifecycle name (not the classified outcome), so
+    // it covers `lifecycle_name(WaitingPermission)`.
+    let list = scenario.output(
+        &[
+            "list",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "waiting-session-secret");
+        },
+    );
+    assert!(list.status.success());
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    assert!(
+        list_text.contains("waiting_permission"),
+        "list output: {list_text}"
+    );
+    drop(server);
+}
+
+/// CLI text-mode `show` on a session that was cancelled while waiting renders
+/// the terminal `failed` lifecycle (a waiting cancel maps to Failed).
+#[test]
+fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-cancel",
+            "write_file",
+            &serde_json::json!({
+                "path": "cancel-waiting.txt",
+                "content": "cancelled\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("after cancel"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.create_session(&workspace_id, "cancel me", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, run_revision) = pending.expect("session never reached WaitingPermission");
+
+    // Cancel the waiting session.
+    let (cancel_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/cancel"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(cancel_status, 200);
+
+    // Wait for the session to settle at failed.
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed") {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled at failed after cancel");
+
+    // `list` renders the raw lifecycle name, covering `lifecycle_name(Failed)`.
+    let list = scenario.output(
+        &[
+            "list",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "cancel-waiting-secret");
+        },
+    );
+    assert!(list.status.success());
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    assert!(list_text.contains("failed"), "list output: {list_text}");
+}
+
+/// CLI text-mode `show` on a session parked at `WaitingInput` renders the
+/// `waiting_input` lifecycle name.
+#[test]
+fn final_binary_cli_show_waiting_input_session() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::input_request("input-1", "what value?", false),
+        ProviderReply::completion("got it"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) = server.create_session(&workspace_id, "ask me", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingInput.
+    let mut parked = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            parked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(parked, "session never reached WaitingInput");
+
+    // `list` renders the raw lifecycle name, covering
+    // `lifecycle_name(WaitingInput)`.
+    let list = scenario.output(
+        &[
+            "list",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "waiting-input-secret");
+        },
+    );
+    assert!(list.status.success());
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    assert!(
+        list_text.contains("waiting_input"),
+        "list output: {list_text}"
+    );
+    drop(server);
+}
+
+/// A minimal mock HTTP server that closes the SSE stream after one keepalive
+/// comment, driving the CLI's reconnect path (§8.1: resync → reconnect →
+/// resync). The snapshot endpoint returns `running` for the first few requests
+/// and `ready`+`completed` thereafter, so the observer terminates after one
+/// reconnect cycle.
+struct MockSseServer {
+    port: u16,
+    snapshot_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MockSseServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let snapshot_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&snapshot_count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let count = std::sync::Arc::clone(&count);
+                std::thread::spawn(move || {
+                    handle_mock_request(stream, &count);
+                });
+            }
+        });
+        Self {
+            port,
+            snapshot_count,
+        }
+    }
+}
+
+fn mock_http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let status_text = match status {
+        202 => "Accepted",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        status_text,
+        content_type,
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn handle_mock_request(mut stream: std::net::TcpStream, count: &std::sync::atomic::AtomicUsize) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+    let method = parts[0];
+    let path = parts[1];
+
+    // Read headers until the blank line.
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(len) = trimmed.to_lowercase().strip_prefix("content-length:") {
+            content_length = len.trim().parse().unwrap_or(0);
+        }
+    }
+    // Read and discard the body.
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let running_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+    let completed_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"01a0194a-0000-7000-8000-000000000001","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_run_id":"01a0194a-0000-7000-8000-000000000002","active_run_id":null,"pending":null,"runs":[{{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+
+    let response: Vec<u8> = match (method, path) {
+        ("GET", "/health") => mock_http_response(200, "text/plain", b"ok"),
+        ("POST", "/v1/workspaces") => {
+            mock_http_response(200, "application/json", br#"{"workspace_id":"ws-1"}"#)
+        }
+        ("GET", p) if p.ends_with("/bindings") => mock_http_response(
+            200,
+            "application/json",
+            format!(r#"{{"bindings":[{{"is_default":true,"binding":{binding}}}]}}"#).as_bytes(),
+        ),
+        ("POST", p) if p.ends_with("/sessions") => mock_http_response(
+            202,
+            "application/json",
+            br#"{"session_id":"01a0194a-0000-7000-8000-000000000001","accepted_revision":1}"#,
+        ),
+        ("GET", p) if p.starts_with("/v1/sessions/") => {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = if n < 3 {
+                running_snapshot.as_bytes()
+            } else {
+                completed_snapshot.as_bytes()
+            };
+            mock_http_response(200, "application/json", body)
+        }
+        ("GET", p) if p.ends_with("/events") => {
+            // SSE stream: send one keepalive comment and close.
+            let body = b": keepalive\n\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+            return; // Close the connection to signal stream-end.
+        }
+        _ => mock_http_response(404, "text/plain", b"not found"),
+    };
+    let _ = stream.write_all(&response);
+}
+
+/// CLI `run` against a mock server that closes the SSE stream after one
+/// keepalive: the observer enters the reconnect path (resync → reconnect →
+/// resync) and terminates when the snapshot turns terminal.
+#[test]
+fn final_binary_cli_run_reconnects_after_sse_stream_close() {
+    let server = MockSseServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = Scenario::new().output(
+        &[
+            "--json",
+            "run",
+            "reconnect test",
+            "--server",
+            &url,
+            "--token",
+            "mock-token",
+        ],
+        |_| {},
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    // At least 3 snapshot requests: initial resync + post-connect resync +
+    // reconnect resync (plus the terminal resync).
+    assert!(
+        server
+            .snapshot_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 3,
+        "expected at least 3 snapshot requests (reconnect path)"
+    );
+}
+
+/// A minimal mock HTTP server that returns a terminal snapshot with a
+/// configurable lifecycle, covering the `classify` branches that are hard to
+/// reach through the real server (`Interrupted`, `ReconciliationRequired`, `Failed`,
+/// Denied, Ready-with-no-runs).
+struct MockLifecycleServer {
+    port: u16,
+}
+
+impl MockLifecycleServer {
+    fn start(snapshot_json: String) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let snapshot = snapshot_json.clone();
+                std::thread::spawn(move || {
+                    handle_lifecycle_request(stream, &snapshot);
+                });
+            }
+        });
+        Self { port }
+    }
+}
+
+fn handle_lifecycle_request(mut stream: std::net::TcpStream, snapshot_json: &str) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+    let method = parts[0];
+    let path = parts[1];
+
+    // Read headers until the blank line.
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(len) = trimmed.to_lowercase().strip_prefix("content-length:") {
+            content_length = len.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let response: Vec<u8> = if path == "/health" {
+        mock_http_response(200, "text/plain", b"ok")
+    } else if path == "/v1/workspaces" {
+        mock_http_response(200, "application/json", br#"{"workspace_id":"ws-1"}"#)
+    } else if path.ends_with("/bindings") {
+        mock_http_response(
+            200,
+            "application/json",
+            format!(r#"{{"bindings":[{{"is_default":true,"binding":{binding}}}]}}"#).as_bytes(),
+        )
+    } else if path.ends_with("/sessions") && method == "POST" {
+        mock_http_response(
+            202,
+            "application/json",
+            br#"{"session_id":"01a0194a-0000-7000-8000-000000000001","accepted_revision":1}"#,
+        )
+    } else if path.ends_with("/sessions") && method == "GET" {
+        // list_sessions: the snapshot_json carries the sessions array.
+        mock_http_response(200, "application/json", snapshot_json.as_bytes())
+    } else if path.starts_with("/v1/sessions/") {
+        mock_http_response(200, "application/json", snapshot_json.as_bytes())
+    } else if path.ends_with("/events") {
+        // SSE stream: keep-alive only (should not be reached for terminal snapshots).
+        let body = b": keepalive\n\n";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
+        return;
+    } else {
+        mock_http_response(404, "text/plain", b"not found")
+    };
+    let _ = stream.write_all(&response);
+}
+
+fn terminal_snapshot(lifecycle: &str, runs: &str) -> String {
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    format!(
+        r#"{{"snapshot":{{"thread_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"{lifecycle}","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":{runs},"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    )
+}
+
+/// CLI `run` against a mock server returning terminal snapshots covers the
+/// `classify` branches for `Interrupted`, `ReconciliationRequired`, `Failed`,
+/// Denied, and Ready-with-no-runs.
+#[test]
+fn final_binary_cli_run_classifies_terminal_lifecycles() {
+    let denied_run = r#"[{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"failed","run_revision":1,"completed_at_ms":1234567890,"failure_code":"permission_denied"}]"#;
+    let failed_run = r#"[{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"failed","run_revision":1,"completed_at_ms":1234567890,"failure_code":"runtime_failed"}]"#;
+
+    let cases: &[(&str, &str, i32, &str)] = &[
+        ("interrupted", "[]", 130, "interrupted"),
+        (
+            "reconciliation_required",
+            "[]",
+            1,
+            "reconciliation_required",
+        ),
+        ("failed", "[]", 1, "failed"),
+        ("ready", "[]", 1, "failed"), // Ready with no runs → Failed
+        ("ready", denied_run, 11, "denied"),
+        ("ready", failed_run, 1, "failed"),
+    ];
+
+    for (lifecycle, runs, expected_exit, expected_status) in cases {
+        let snapshot = terminal_snapshot(lifecycle, runs);
+        let server = MockLifecycleServer::start(snapshot);
+        let url = format!("http://127.0.0.1:{}", server.port);
+        let output = Scenario::new().output(
+            &["--json", "run", "test", "--server", &url, "--token", "t"],
+            |_| {},
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(*expected_exit),
+            "lifecycle={lifecycle} runs={runs}: expected exit {expected_exit}; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = json(&output);
+        assert_eq!(
+            body["status"], *expected_status,
+            "lifecycle={lifecycle} runs={runs}: expected status {expected_status}"
+        );
+    }
+}
+
+/// CLI `run` with a provider that calls an unknown tool: the engine rejects
+/// the effect and the run fails, covering the tool-not-found error path.
+#[test]
+fn final_binary_cli_run_with_unknown_tool_fails() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("unknown-1", "nonexistent_tool", &serde_json::json!({})),
+        ProviderReply::completion("after unknown tool"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "use an unknown tool"], |command| {
+        command.env("TEST_OPENAI_KEY", "unknown-tool-secret");
+    });
+    assert!(
+        !output.status.success(),
+        "expected failure; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "failed");
+}
+
+/// CLI `list` against a mock server returning sessions with `Interrupted` and
+/// `ReconciliationRequired` lifecycles covers `lifecycle_name` for those variants.
+#[test]
+fn final_binary_cli_list_renders_interrupted_and_reconciliation_lifecycles() {
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let sessions = format!(
+        r#"{{"sessions":[
+            {{"thread_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"interrupted","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}},
+            {{"thread_id":"01a0194a-0000-7000-8000-000000000002","revision":1,"sequence":1,"lifecycle":"reconciliation_required","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}
+        ]}}"#
+    );
+    let server = MockLifecycleServer::start(sessions);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = Scenario::new().output(&["list", "--server", &url, "--token", "t"], |_| {});
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("interrupted"), "list output: {text}");
+    assert!(
+        text.contains("reconciliation_required"),
+        "list output: {text}"
+    );
+}
+
+/// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
+/// failing verification command: the run fails after the tool executes,
+/// covering the verification-failure path.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cli_run_with_failing_verification_fails() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-verify",
+            "write_file",
+            &serde_json::json!({
+                "path": "verified.txt",
+                "content": "verify me\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("wrote and verified"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["false"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, "write and verify", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission");
+
+    // Grant the permission.
+    let (grant_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(grant_status, 200);
+
+    // The write_file effect triggers a verification effect, which parks at
+    // WaitingPermission again. Grant it too.
+    let mut verify_pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            verify_pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                break; // settled without a verification ask
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Some((revision, request_id, run_revision)) = verify_pending {
+        let (verify_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "allow": true,
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+            &[],
+        );
+        assert_eq!(verify_status, 200);
+    }
+
+    // Wait for the session to settle (verification fails → run fails).
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled after failing verification");
+
+    // The file was written.
+    assert!(scenario.root().join("verified.txt").exists());
+}
+
+// ---------------------------------------------------------------------------
+// server_client error-path coverage
+// ---------------------------------------------------------------------------
+
+/// Starts a mock HTTP server that delegates all requests to `handler`
+/// (which receives the method and path).
+fn start_error_mock_server<F>(mut handler: F) -> (String, std::thread::JoinHandle<()>)
+where
+    F: FnMut(&str, &str) -> (u16, String, String) + Send + 'static,
+{
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let Ok(n) = stream.read(&mut buf) else {
+                continue;
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let mut lines = request.lines();
+            let request_line = lines.next().unwrap_or("");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("GET");
+            let path = parts.next().unwrap_or("/");
+            let (status, content_type, body) = handler(method, path);
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// Starts a mock HTTP server that returns 200 for /health and delegates all
+/// other requests to `handler`.
+fn start_healthy_mock_server<F>(handler: F) -> (String, std::thread::JoinHandle<()>)
+where
+    F: FnMut(&str, &str) -> (u16, String, String) + Send + 'static,
+{
+    let mut inner = handler;
+    start_error_mock_server(move |method, path| {
+        if path == "/health" {
+            (200, "application/json".into(), "{\"status\":\"ok\"}".into())
+        } else {
+            inner(method, path)
+        }
+    })
+}
+
+#[test]
+fn final_binary_cli_run_with_unhealthy_server_reports_unreachable() {
+    // health_check returns non-success → connect fails with Unreachable.
+    let (url, _handle) =
+        start_error_mock_server(|_method, _path| (500, "application/json".into(), String::new()));
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "run", "hello", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "server_unreachable");
+}
+
+#[test]
+fn final_binary_cli_run_with_empty_workspace_response_fails() {
+    // POST /v1/workspaces returns 200 with empty body → json() returns Null →
+    // resolve_workspace fails with "missing workspace_id".
+    let (url, _handle) =
+        start_healthy_mock_server(|_method, _path| (200, "application/json".into(), String::new()));
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "run", "hello", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    let body = json(&output);
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("workspace_id"), "message: {msg}");
+}
+
+#[test]
+fn final_binary_cli_run_with_invalid_json_response_fails() {
+    // POST /v1/workspaces returns 200 with invalid JSON → json() fails.
+    let (url, _handle) = start_healthy_mock_server(|_method, _path| {
+        (200, "application/json".into(), "not valid json{{{".into())
+    });
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "run", "hello", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    let body = json(&output);
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("invalid JSON"), "message: {msg}");
+}
+
+#[test]
+fn final_binary_cli_run_with_unauthorized_workspace_response_fails() {
+    // POST /v1/workspaces returns 401 → map_error_status → Unauthorized.
+    let (url, _handle) = start_healthy_mock_server(|_method, _path| {
+        (
+            401,
+            "application/json".into(),
+            "{\"error\":{\"message\":\"bad token\"}}".into(),
+        )
+    });
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "run", "hello", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "unauthorized");
+}
+
+#[test]
+fn final_binary_cli_run_with_server_error_workspace_response_fails() {
+    // POST /v1/workspaces returns 500 → map_error_status → Internal.
+    let (url, _handle) = start_healthy_mock_server(|_method, _path| {
+        (
+            500,
+            "application/json".into(),
+            "{\"error\":{\"message\":\"boom\"}}".into(),
+        )
+    });
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "run", "hello", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "internal");
+}

@@ -49,11 +49,12 @@ pub(crate) fn digest(binding: &OperationBinding<'_>) -> String {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct PendingApproval {
     digest: String,
     consumed: bool,
 }
+#[cfg(test)]
 impl PendingApproval {
     pub(crate) fn new(digest: String) -> Self {
         Self {
