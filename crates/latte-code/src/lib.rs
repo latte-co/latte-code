@@ -3220,4 +3220,47 @@ mod tests {
             super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
         assert_eq!(result.unwrap(), EXIT_COMPLETED);
     }
+
+    #[test]
+    fn execute_session_command_merges_json_flag_from_args() {
+        // json=false but args include --json → parsed.json=true → json becomes true.
+        // The connect will fail (unreachable), but the merge line is covered.
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "list".to_string(),
+            "--json".to_string(),
+            "--server".to_string(),
+            "http://127.0.0.1:0".to_string(),
+            "--token".to_string(),
+            "dummy".to_string(),
+        ];
+        let code =
+            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(super::execute_session_command(false, &args))
+            });
+        assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+    }
+
+    #[test]
+    fn parse_session_command_accepts_focus_flag_for_run() {
+        let args = vec![
+            "run".to_string(),
+            "hello".to_string(),
+            "--focus".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        assert!(parsed.json == false);
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, focus } => {
+                assert_eq!(prompt, "hello");
+                assert_eq!(focus, Some(std::path::PathBuf::from("src/main.rs")));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
 }
