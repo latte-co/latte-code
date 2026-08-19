@@ -2505,6 +2505,14 @@ mod tests {
             err.contains("cannot create") || err.contains("cannot write"),
             "unexpected error: {err}"
         );
+
+        // A root path has no parent, so the function must fail early.
+        let root_path = Path::new(std::path::MAIN_SEPARATOR_STR);
+        let err = write_server_token(root_path, &first).unwrap_err();
+        assert!(
+            err.contains("cannot determine parent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

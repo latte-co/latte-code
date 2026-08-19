@@ -4471,7 +4471,7 @@ mod tests {
         // Fault injection removes the durable lease after the process starts;
         // a sub-100 ms TTL only makes pre-permission setup scheduler-sensitive
         // under coverage instrumentation and is not part of this test's claim.
-        .with_lease_ttl_ms(300);
+        .with_lease_ttl_ms(1000);
         let thread_id = ThreadId::from_uuid(Uuid::now_v7());
         let waiting = service
             .start(thread_id, "sleep until fenced".into(), binding(), None)
