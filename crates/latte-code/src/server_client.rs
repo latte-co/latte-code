@@ -183,6 +183,12 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
                 focus = Some(PathBuf::from(next_value(&mut iter, "--focus")?));
             }
             "--focus" => return Err("--focus is only valid with run".to_string()),
+            // Removed v1 flags that must remain hard errors.
+            flag @ ("--allow" | "--deny") => {
+                return Err(format!(
+                    "{flag} is no longer supported; use the permission API"
+                ));
+            }
             // For run/resume, unknown --flag tokens are prompt content
             // (e.g. `latte-code run cargo test --workspace`). For list/show,
             // reject them as unknown options since they take no prompt.
