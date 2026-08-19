@@ -9210,4 +9210,251 @@ mod tests {
             .unwrap();
         assert!(matches!(second, latte_core::CreateOutcome::Replayed(_)));
     }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn to_i64_and_from_i64_round_trip() {
+        assert_eq!(to_i64(0).unwrap(), 0);
+        assert_eq!(to_i64(42).unwrap(), 42);
+        assert!(to_i64(u64::MAX).is_err());
+        assert_eq!(from_i64(0).unwrap(), 0);
+        assert_eq!(from_i64(42).unwrap(), 42);
+        assert!(from_i64(-1).is_err());
+    }
+
+    #[test]
+    fn status_name_covers_all_variants() {
+        assert_eq!(status_name(RunStatus::Queued), "queued");
+        assert_eq!(status_name(RunStatus::Running), "running");
+        assert_eq!(
+            status_name(RunStatus::WaitingPermission),
+            "waiting_permission"
+        );
+        assert_eq!(status_name(RunStatus::WaitingInput), "waiting_input");
+        assert_eq!(status_name(RunStatus::Cancelling), "cancelling");
+        assert_eq!(status_name(RunStatus::Interrupted), "interrupted");
+        assert_eq!(status_name(RunStatus::Failed), "failed");
+        assert_eq!(status_name(RunStatus::Completed), "completed");
+    }
+
+    #[test]
+    fn parse_thread_id_and_run_id_reject_invalid() {
+        let id = SystemIdSource::default().next_uuid_v7();
+        let s = id.to_string();
+        assert_eq!(
+            parse_thread_id(&s).unwrap(),
+            latte_core::ThreadId::from_uuid(id)
+        );
+        assert!(parse_thread_id("not-a-uuid").is_err());
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let rs = run_id.to_string();
+        assert_eq!(parse_run_id(&rs).unwrap(), run_id);
+        assert!(parse_run_id("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn thread_lease_scope_formats_correctly() {
+        let id = latte_core::ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert_eq!(thread_lease_scope(id), format!("thread:{id}"));
+    }
+
+    #[test]
+    fn require_lease_scope_checks_exact_match() {
+        let lease = Lease {
+            scope: "thread:abc".into(),
+            owner: "o".into(),
+            fencing_token: 1,
+            expires_at_ms: 1,
+        };
+        assert!(require_lease_scope(&lease, "thread:abc").is_ok());
+        assert!(matches!(
+            require_lease_scope(&lease, "thread:xyz"),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn validate_workspace_root_rejects_invalid() {
+        assert!(validate_workspace_root("/valid/path").is_ok());
+        assert!(validate_workspace_root("").is_err());
+        assert!(validate_workspace_root(&"a".repeat(4097)).is_err());
+        assert!(validate_workspace_root("bad\npath").is_err());
+    }
+
+    #[test]
+    fn validate_catalog_key_rejects_invalid() {
+        assert!(validate_catalog_key("valid-key_123", "test").is_ok());
+        assert!(validate_catalog_key("", "test").is_err());
+        assert!(validate_catalog_key(&"a".repeat(257), "test").is_err());
+        assert!(validate_catalog_key("bad key", "test").is_err());
+        assert!(validate_catalog_key("bad/key", "test").is_err());
+    }
+
+    #[test]
+    fn session_title_truncates_and_falls_back() {
+        assert_eq!(session_title("hello world"), "hello world");
+        assert_eq!(session_title("  trimmed  "), "trimmed");
+        assert_eq!(session_title("line1\nline2"), "line1");
+        assert_eq!(session_title(""), "Untitled session");
+        assert_eq!(session_title("\n\t"), "Untitled session");
+        let long = "a".repeat(200);
+        let title = session_title(&long);
+        assert!(title.ends_with('…'));
+        assert!(title.len() <= 120 + 3);
+    }
+
+    #[test]
+    fn parse_lifecycle_covers_all_variants() {
+        assert_eq!(parse_lifecycle("ready").unwrap(), ThreadLifecycle::Ready);
+        assert_eq!(
+            parse_lifecycle("running").unwrap(),
+            ThreadLifecycle::Running
+        );
+        assert_eq!(
+            parse_lifecycle("waiting_permission").unwrap(),
+            ThreadLifecycle::WaitingPermission
+        );
+        assert_eq!(
+            parse_lifecycle("waiting_input").unwrap(),
+            ThreadLifecycle::WaitingInput
+        );
+        assert_eq!(
+            parse_lifecycle("interrupted").unwrap(),
+            ThreadLifecycle::Interrupted
+        );
+        assert_eq!(parse_lifecycle("failed").unwrap(), ThreadLifecycle::Failed);
+        assert_eq!(
+            parse_lifecycle("reconciliation_required").unwrap(),
+            ThreadLifecycle::ReconciliationRequired
+        );
+        assert!(parse_lifecycle("unknown").is_err());
+    }
+
+    #[test]
+    fn thread_run_status_maps_all_variants() {
+        assert_eq!(
+            thread_run_status(RunStatus::Queued),
+            ThreadRunStatus::Queued
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::Running),
+            ThreadRunStatus::Running
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::Cancelling),
+            ThreadRunStatus::Cancelling
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::WaitingPermission),
+            ThreadRunStatus::WaitingPermission
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::WaitingInput),
+            ThreadRunStatus::WaitingInput
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::Interrupted),
+            ThreadRunStatus::Interrupted
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::Failed),
+            ThreadRunStatus::Failed
+        );
+        assert_eq!(
+            thread_run_status(RunStatus::Completed),
+            ThreadRunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn transcript_kind_name_covers_all_variants() {
+        assert_eq!(transcript_kind_name(TranscriptKind::User), "user");
+        assert_eq!(transcript_kind_name(TranscriptKind::Assistant), "assistant");
+        assert_eq!(transcript_kind_name(TranscriptKind::ToolCall), "tool_call");
+        assert_eq!(
+            transcript_kind_name(TranscriptKind::ToolResult),
+            "tool_result"
+        );
+        assert_eq!(
+            transcript_kind_name(TranscriptKind::Permission),
+            "permission"
+        );
+        assert_eq!(transcript_kind_name(TranscriptKind::Input), "input");
+        assert_eq!(transcript_kind_name(TranscriptKind::Failure), "failure");
+        assert_eq!(
+            transcript_kind_name(TranscriptKind::Completion),
+            "completion"
+        );
+        assert_eq!(transcript_kind_name(TranscriptKind::System), "system");
+    }
+
+    #[test]
+    fn validate_thread_source_rejects_invalid() {
+        assert!(validate_thread_source("valid-source").is_ok());
+        assert!(validate_thread_source("").is_err());
+        assert!(validate_thread_source(&"a".repeat(257)).is_err());
+        assert!(validate_thread_source("bad\nsource").is_err());
+    }
+
+    #[test]
+    fn validate_thread_effect_id_rejects_invalid() {
+        assert!(validate_thread_effect_id("effect-123").is_ok());
+        assert!(validate_thread_effect_id("").is_err());
+        assert!(validate_thread_effect_id(&"a".repeat(513)).is_err());
+        assert!(validate_thread_effect_id("bad\neffect").is_err());
+    }
+
+    #[test]
+    fn validate_thread_digest_rejects_invalid() {
+        let valid = "a".repeat(64);
+        assert!(validate_thread_digest(&valid).is_ok());
+        assert!(validate_thread_digest("short").is_err());
+        assert!(validate_thread_digest(&"g".repeat(64)).is_err());
+        assert!(validate_thread_digest(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn redact_functions_sanitize_terminal_controls() {
+        let permission = latte_core::PendingPermission {
+            request_id: "req\x1b[31m1".into(),
+            operation_digest: "digest".into(),
+            description: "desc\x1b[0m".into(),
+        };
+        let redacted = redact_permission(&permission);
+        assert!(!redacted.request_id.contains('\x1b'));
+        assert!(!redacted.description.contains('\x1b'));
+
+        let input = latte_core::PendingInput {
+            request_id: "req\x1b[31m2".into(),
+            prompt: "prompt\x1b[0m".into(),
+        };
+        let redacted = redact_input(&input);
+        assert!(!redacted.request_id.contains('\x1b'));
+        assert!(!redacted.prompt.contains('\x1b'));
+
+        let failure = RunFailure {
+            code: FailureCode::RuntimeFailed,
+            message: "fail\x1b[0m".into(),
+            retryability: Retryability::Retryable,
+        };
+        let redacted = redact_failure(&failure);
+        assert!(!redacted.message.contains('\x1b'));
+        assert_eq!(redacted.code, failure.code);
+
+        let handoff = Handoff {
+            summary: "summary\x1b[0m".into(),
+            files_changed: vec!["file\x1b[31m1".into()],
+            evidence: vec![Evidence {
+                name: "evidence\x1b[0m".into(),
+                status: VerificationStatus::Passed,
+                summary: "sum\x1b[0m".into(),
+            }],
+        };
+        let redacted = redact_handoff(&handoff);
+        assert!(!redacted.summary.contains('\x1b'));
+        assert!(!redacted.files_changed[0].contains('\x1b'));
+        assert!(!redacted.evidence[0].name.contains('\x1b'));
+        assert!(!redacted.evidence[0].summary.contains('\x1b'));
+    }
 }

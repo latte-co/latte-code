@@ -1434,11 +1434,12 @@ mod tests {
     use super::{
         AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
         ThreadEngineProjection, VerificationConfig, discover_workspace_root,
-        dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
-        exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
-        parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action, serve_bound,
-        storage_home_with, tui_startup_presentation, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home, workspace_identity, write_server_token,
+        dispatch_session_management_action, dot, emit_client_error, emit_data, emit_error,
+        execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
+        merge_value, open_tui_engine, parse_serve_port, prepare_server, readiness_envelope,
+        reconcile_thread_action, serve_bound, storage_home_with, tui_startup_presentation,
+        verify_timeout, workspace_display_path, workspace_display_path_with_home,
+        workspace_identity, write_server_token,
     };
     use latte_core::{
         IdSource, RunId, RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
@@ -2720,5 +2721,85 @@ mod tests {
         };
         assert_eq!(error.code, "internal");
         assert_eq!(error.category, "engine_initialization");
+    }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn workspace_display_path_with_home_covers_all_branches() {
+        let root = Path::new("/home/user/project");
+        // No HOME → raw path.
+        assert_eq!(
+            workspace_display_path_with_home(root, None),
+            "/home/user/project"
+        );
+        // Not under HOME → raw path.
+        assert_eq!(
+            workspace_display_path_with_home(root, Some(Path::new("/other"))),
+            "/home/user/project"
+        );
+        // Under HOME → ~/relative.
+        assert_eq!(
+            workspace_display_path_with_home(root, Some(Path::new("/home/user"))),
+            "~/project"
+        );
+        // IS home → ~.
+        assert_eq!(
+            workspace_display_path_with_home(
+                Path::new("/home/user"),
+                Some(Path::new("/home/user"))
+            ),
+            "~"
+        );
+    }
+
+    #[test]
+    fn emit_error_covers_json_help_and_plain_branches() {
+        // JSON branch.
+        let code = emit_error(true, "failed", "test_code", "json message", 1, false);
+        assert_eq!(code, 1);
+        // Plain text branch (no help).
+        let code = emit_error(false, "failed", "test_code", "plain message", 2, false);
+        assert_eq!(code, 2);
+        // Help branch.
+        let code = emit_error(false, "failed", "test_code", "help message", 2, true);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn emit_data_outputs_envelope() {
+        emit_data("completed", &json!({"session": "test"}));
+    }
+
+    #[test]
+    fn emit_client_error_maps_all_variants() {
+        use crate::server_client::ClientError;
+        assert_eq!(
+            emit_client_error(true, &ClientError::Unreachable("x".into())),
+            71
+        );
+        assert_eq!(emit_client_error(true, &ClientError::Usage("x".into())), 2);
+        assert_eq!(
+            emit_client_error(true, &ClientError::NotFound("x".into())),
+            4
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Unauthorized("x".into())),
+            70
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Internal("x".into())),
+            70
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Conflict("x".into())),
+            1
+        );
+        assert_eq!(emit_client_error(true, &ClientError::Failed("x".into())), 1);
+        // Non-JSON branch.
+        assert_eq!(
+            emit_client_error(false, &ClientError::Failed("x".into())),
+            1
+        );
     }
 }

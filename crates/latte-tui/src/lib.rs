@@ -708,4 +708,71 @@ mod tests {
         assert!(*restored.lock().unwrap());
         assert_eq!(operations.lock().unwrap().len(), 5);
     }
+
+    #[test]
+    fn restore_once_with_hook_restores_all_enabled_stages() {
+        let restored = Arc::new(Mutex::new(false));
+        let stages = Arc::new(Mutex::new(TerminalStages {
+            raw: true,
+            keyboard: true,
+            alternate: true,
+            mouse: true,
+            paste: true,
+        }));
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+            mouse_error: None,
+        });
+        let hooks = Arc::new(Mutex::new(Vec::new()));
+        let hooks_clone = Arc::clone(&hooks);
+        restore_once_with_hook(&restored, &stages, &ops, move |stage| {
+            hooks_clone.lock().unwrap().push(stage);
+        });
+        assert!(*restored.lock().unwrap());
+        // All stages disabled in reverse order.
+        assert_eq!(
+            operations.lock().unwrap().as_slice(),
+            &[
+                MockOperation::DisablePaste,
+                MockOperation::DisableMouse,
+                MockOperation::LeaveAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
+        // Hook called for each stage.
+        assert_eq!(hooks.lock().unwrap().len(), 5);
+        // All stages cleared.
+        let stages = stages.lock().unwrap();
+        assert!(!stages.raw);
+        assert!(!stages.keyboard);
+        assert!(!stages.alternate);
+        assert!(!stages.mouse);
+        assert!(!stages.paste);
+    }
+
+    #[test]
+    fn restore_once_with_hook_is_idempotent() {
+        let restored = Arc::new(Mutex::new(true)); // Already done.
+        let stages = Arc::new(Mutex::new(TerminalStages {
+            raw: true,
+            keyboard: true,
+            alternate: true,
+            mouse: true,
+            paste: true,
+        }));
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+            mouse_error: None,
+        });
+        restore_once_with_hook(&restored, &stages, &ops, |_| {
+            panic!("hook must not be called when already done");
+        });
+        // No operations performed.
+        assert_eq!(operations.lock().unwrap().len(), 0);
+    }
 }

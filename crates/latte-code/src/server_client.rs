@@ -2387,4 +2387,57 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn map_error_status_covers_all_branches() {
+        let body = json!({"error": {"message": "test message"}});
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::UNAUTHORIZED, &body),
+            ClientError::Unauthorized("test message".into())
+        );
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::NOT_FOUND, &body),
+            ClientError::NotFound("test message".into())
+        );
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::BAD_REQUEST, &body),
+            ClientError::Usage("test message".into())
+        );
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::CONFLICT, &body),
+            ClientError::Conflict("test message".into())
+        );
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body),
+            ClientError::Internal("500 Internal Server Error: test message".into())
+        );
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::FORBIDDEN, &body),
+            ClientError::Failed("403 Forbidden: test message".into())
+        );
+        // Missing error.message falls back to "server error".
+        let empty = json!({});
+        assert_eq!(
+            map_error_status(reqwest::StatusCode::BAD_REQUEST, &empty),
+            ClientError::Usage("server error".into())
+        );
+    }
+
+    #[test]
+    fn resolve_remote_token_uses_explicit_or_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Explicit token wins.
+        assert_eq!(
+            resolve_remote_token(Some("explicit".into()), tmp.path()).unwrap(),
+            "explicit"
+        );
+        // No explicit token, no file → Usage error.
+        assert!(resolve_remote_token(None, tmp.path()).is_err());
+        // File token is trimmed.
+        std::fs::write(tmp.path().join("server.token"), "  file-token  \n").unwrap();
+        assert_eq!(
+            resolve_remote_token(None, tmp.path()).unwrap(),
+            "file-token"
+        );
+    }
 }

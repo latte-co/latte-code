@@ -4049,4 +4049,145 @@ mod tool_effect_tests {
             .unwrap();
         assert_eq!(follow_up.active_run_id, Some(follow_up_run));
     }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn manifest_map_digest_is_stable_and_hex() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a".into(), "1".into());
+        map.insert("b".into(), "2".into());
+        let digest = manifest_map_digest(&map).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        // Same input → same digest.
+        assert_eq!(manifest_map_digest(&map).unwrap(), digest);
+    }
+
+    #[test]
+    fn resolve_git_common_dir_handles_dir_file_and_missing() {
+        // No .git at all.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_git_common_dir(tmp.path()).is_none());
+
+        // .git is a directory (non-worktree checkout).
+        let dot_git = tmp.path().join(".git");
+        std::fs::create_dir_all(&dot_git).unwrap();
+        let resolved = resolve_git_common_dir(tmp.path()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&dot_git).unwrap());
+
+        // .git is a file (worktree checkout) without commondir.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let git_dir = tmp2.path().join("real-git-dir");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            tmp2.path().join(".git"),
+            format!("gitdir: {}", git_dir.display()),
+        )
+        .unwrap();
+        let resolved = resolve_git_common_dir(tmp2.path()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&git_dir).unwrap());
+
+        // .git file with commondir (linked worktree).
+        let tmp3 = tempfile::tempdir().unwrap();
+        let common_dir = tmp3.path().join("common");
+        let wt_git_dir = tmp3.path().join("wt-git");
+        std::fs::create_dir_all(&common_dir).unwrap();
+        std::fs::create_dir_all(&wt_git_dir).unwrap();
+        std::fs::write(
+            wt_git_dir.join("commondir"),
+            std::fs::canonicalize(&common_dir)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp3.path().join(".git"),
+            format!("gitdir: {}", wt_git_dir.display()),
+        )
+        .unwrap();
+        let resolved = resolve_git_common_dir(tmp3.path()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&common_dir).unwrap());
+    }
+
+    #[test]
+    fn summary_text_strips_control_chars_and_truncates() {
+        assert_eq!(summary_text("hello"), "hello");
+        assert_eq!(summary_text("hello\nworld"), "helloworld");
+        assert_eq!(summary_text(""), "[unspecified]");
+        assert_eq!(summary_text("\n\t\r"), "[unspecified]");
+        // Truncation at PERMISSION_SUMMARY_CAP.
+        let long = "a".repeat(PERMISSION_SUMMARY_CAP + 10);
+        let result = summary_text(&long);
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= PERMISSION_SUMMARY_CAP + 3); // cap + ellipsis
+    }
+
+    #[test]
+    fn input_string_uses_fallback_when_key_absent() {
+        let input = serde_json::json!({"present": "value"});
+        assert_eq!(input_string(&input, "present", "fallback"), "value");
+        assert_eq!(input_string(&input, "absent", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn summary_argv_redacts_sensitive_keys() {
+        assert_eq!(summary_argv("normal=value"), "normal=value");
+        assert_eq!(summary_argv("no-equals-sign"), "no-equals-sign");
+        assert_eq!(summary_argv("secret=topsecret"), "secret=[REDACTED]");
+        assert_eq!(summary_argv("API_KEY=abc123"), "API_KEY=[REDACTED]");
+        assert_eq!(summary_argv("password=hunter2"), "password=[REDACTED]");
+        assert_eq!(
+            summary_argv("authorization=Bearer xyz"),
+            "authorization=[REDACTED]"
+        );
+        assert_eq!(summary_argv("credential=creds"), "credential=[REDACTED]");
+        assert_eq!(summary_argv("token=abc"), "token=[REDACTED]");
+    }
+
+    #[test]
+    fn run_revision_returns_none_without_active_run() {
+        // The None branch: no active run → None.
+        let snapshot = ThreadSnapshot {
+            thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            revision: 0,
+            sequence: 0,
+            lifecycle: latte_core::ThreadLifecycle::Ready,
+            binding: ThreadProviderBindingV2 {
+                version: 2,
+                provider_name: String::new(),
+                provider_type: String::new(),
+                protocol: String::new(),
+                model: String::new(),
+                config_fingerprint: String::new(),
+                tools_fingerprint: String::new(),
+                aliases: std::collections::BTreeMap::default(),
+                credential_ref_id: String::new(),
+                data_scope_id: String::new(),
+                credential_generation: 0,
+            },
+            latest_run_id: None,
+            active_run_id: None,
+            pending: None,
+            runs: vec![],
+            transcript: TranscriptPage {
+                entries: vec![],
+                next_after: None,
+                has_more: false,
+            },
+            focus: None,
+        };
+        assert!(run_revision(&snapshot, "effect-1").is_none());
+    }
+
+    #[test]
+    fn tool_storage_maps_error_to_input() {
+        let error = StorageError::InvalidData("test error".into());
+        let mapped = tool_storage(error);
+        match mapped {
+            ToolError::Input(msg) => assert!(msg.contains("test error")),
+            other => panic!("expected ToolError::Input, got {other:?}"),
+        }
+    }
 }
