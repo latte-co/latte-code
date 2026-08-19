@@ -1477,7 +1477,6 @@ fn emit_error(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::EXIT_COMPLETED;
     use super::bind_local_listener;
     use super::{
