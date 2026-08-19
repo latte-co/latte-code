@@ -5233,9 +5233,8 @@ mod tests {
 
     #[test]
     fn classify_create_error_maps_conflict_and_failed() {
-        let conflict = ThreadRuntimeError::Storage(
-            latte_engine::StorageError::ThreadCommandReplayMismatch,
-        );
+        let conflict =
+            ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch);
         assert!(matches!(
             classify_create_error(&conflict),
             latte_core::CreateAcceptError::Conflict(_)
@@ -5249,7 +5248,9 @@ mod tests {
 
     #[test]
     fn active_run_revision_finds_active_run() {
-        use latte_core::{IdSource, SystemIdSource, ThreadRunStatus, ThreadRunSummary, TranscriptPage};
+        use latte_core::{
+            IdSource, SystemIdSource, ThreadRunStatus, ThreadRunSummary, TranscriptPage,
+        };
         let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let snapshot = ThreadSnapshot {
             thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),

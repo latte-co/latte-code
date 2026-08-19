@@ -1777,15 +1777,12 @@ mod tests {
     #[test]
     fn storage_paths_succeed_with_home() {
         let temp = tempfile::tempdir().unwrap();
-        temp_env::with_vars(
-            [("LATTE_CODE_HOME", Some(temp.path().as_os_str()))],
-            || {
-                let db = super::storage_database_path().unwrap();
-                assert_eq!(db, temp.path().join("state.db"));
-                let conv = super::storage_conversation_root().unwrap();
-                assert_eq!(conv, temp.path().join("sessions"));
-            },
-        );
+        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+            let db = super::storage_database_path().unwrap();
+            assert_eq!(db, temp.path().join("state.db"));
+            let conv = super::storage_conversation_root().unwrap();
+            assert_eq!(conv, temp.path().join("sessions"));
+        });
     }
 
     #[test]
@@ -3049,7 +3046,9 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let request_line = request.lines().next().unwrap_or("");
                 let mut parts = request_line.split_whitespace();
@@ -3085,26 +3084,23 @@ mod tests {
     #[test]
     fn execute_session_command_reports_unreachable_server() {
         let temp = tempfile::tempdir().unwrap();
-        temp_env::with_vars(
-            [("LATTE_CODE_HOME", Some(temp.path().as_os_str()))],
-            || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async {
-                    let args = vec![
-                        "list".to_string(),
-                        "--server".to_string(),
-                        "http://127.0.0.1:0".to_string(),
-                        "--token".to_string(),
-                        "dummy".to_string(),
-                    ];
-                    let code = super::execute_session_command(true, &args).await;
-                    assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
-                });
-            },
-        );
+        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let args = vec![
+                    "list".to_string(),
+                    "--server".to_string(),
+                    "http://127.0.0.1:0".to_string(),
+                    "--token".to_string(),
+                    "dummy".to_string(),
+                ];
+                let code = super::execute_session_command(true, &args).await;
+                assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+            });
+        });
     }
 
     #[tokio::test]
@@ -3117,11 +3113,7 @@ mod tests {
                     r#"{"workspace_id":"ws-test"}"#.into(),
                 )
             } else if path == "/v1/workspaces/ws-test/sessions" {
-                (
-                    200,
-                    "application/json".into(),
-                    r#"{"sessions":[]}"#.into(),
-                )
+                (200, "application/json".into(), r#"{"sessions":[]}"#.into())
             } else {
                 (
                     404,

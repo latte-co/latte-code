@@ -4351,9 +4351,7 @@ fn final_binary_cli_list_with_server_error_fails() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
     let output = scenario.output(
-        &[
-            "--json", "list", "--server", &url, "--token", "dummy",
-        ],
+        &["--json", "list", "--server", &url, "--token", "dummy"],
         |_| {},
     );
     assert!(!output.status.success());
@@ -4365,10 +4363,7 @@ fn final_binary_cli_show_with_invalid_session_id_reports_usage() {
     // A non-UUID session id is a usage error from parse_session_id.
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
-    let output = scenario.output(
-        &["--json", "show", "not-a-uuid"],
-        |_| {},
-    );
+    let output = scenario.output(&["--json", "show", "not-a-uuid"], |_| {});
     assert!(!output.status.success());
     assert_eq!(json(&output)["error"]["code"], "usage");
 }
@@ -4378,10 +4373,7 @@ fn final_binary_cli_resume_with_invalid_session_id_reports_usage() {
     // A non-UUID session id is a usage error from parse_session_id.
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
-    let output = scenario.output(
-        &["--json", "resume", "not-a-uuid", "hello"],
-        |_| {},
-    );
+    let output = scenario.output(&["--json", "resume", "not-a-uuid", "hello"], |_| {});
     assert!(!output.status.success());
     assert_eq!(json(&output)["error"]["code"], "usage");
 }
@@ -4391,10 +4383,7 @@ fn final_binary_cli_run_without_prompt_reports_usage() {
     // run requires a prompt; missing it is a usage error.
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
-    let output = scenario.output(
-        &["--json", "run"],
-        |_| {},
-    );
+    let output = scenario.output(&["--json", "run"], |_| {});
     assert!(!output.status.success());
     assert_eq!(json(&output)["error"]["code"], "usage");
 }
@@ -4407,9 +4396,7 @@ fn final_binary_cli_list_with_unhealthy_server_reports_unreachable() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
     let output = scenario.output(
-        &[
-            "--json", "list", "--server", &url, "--token", "dummy",
-        ],
+        &["--json", "list", "--server", &url, "--token", "dummy"],
         |_| {},
     );
     assert!(!output.status.success());
