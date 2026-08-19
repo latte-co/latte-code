@@ -1776,6 +1776,55 @@ mod tests {
     }
 
     #[test]
+    fn storage_paths_succeed_with_home() {
+        let temp = tempfile::tempdir().unwrap();
+        temp_env::with_vars(
+            [("LATTE_CODE_HOME", Some(temp.path().as_os_str()))],
+            || {
+                let db = super::storage_database_path().unwrap();
+                assert_eq!(db, temp.path().join("state.db"));
+                let conv = super::storage_conversation_root().unwrap();
+                assert_eq!(conv, temp.path().join("sessions"));
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_database_path_handles_absolute_and_relative() {
+        let root = Path::new("/workspace");
+        // Relative path → joined with root.
+        let config = AppConfig {
+            version: 1,
+            default_model: String::new(),
+            providers: json!({}),
+            database: DatabaseConfig {
+                path: ".latte/latte-code.db".into(),
+            },
+            verification: VerificationConfig {
+                argv: vec!["true".into()],
+                cwd: ".".into(),
+                timeout_ms: 1000,
+            },
+            thread: ThreadConfig::default(),
+        };
+        assert_eq!(
+            config.legacy_database_path(root),
+            root.join(".latte/latte-code.db")
+        );
+        // Absolute path → used as-is.
+        let config = AppConfig {
+            database: DatabaseConfig {
+                path: "/absolute/path.db".into(),
+            },
+            ..config
+        };
+        assert_eq!(
+            config.legacy_database_path(root),
+            PathBuf::from("/absolute/path.db")
+        );
+    }
+
+    #[test]
     fn storage_home_with_covers_all_branches() {
         use std::ffi::OsStr;
         // Override with valid absolute path.
