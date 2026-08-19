@@ -328,9 +328,7 @@ fn cli_list(scenario: &Scenario, server: &ServerChild) -> std::process::Output {
 }
 
 /// Finds the completion transcript card's handoff evidence, if any.
-fn completion_evidence(
-    snapshot: &serde_json::Value,
-) -> Option<&Vec<serde_json::Value>> {
+fn completion_evidence(snapshot: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     snapshot["transcript"]["entries"]
         .as_array()?
         .iter()

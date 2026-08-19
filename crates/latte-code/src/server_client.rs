@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// SSE idle/read timeout: if no bytes arrive for this long, the stream is
+/// considered dead and the observer reconnects (§8.1). This is NOT a total
+/// request timeout — healthy long-lived streams are never forcibly closed.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -660,7 +665,12 @@ async fn observe_session(
                 return Ok(cancel_session(server, session_id).await);
             }
             event = server.next_event() => {
-                match event? {
+                // Both stream-end (Ok(None)) and read errors (Err) enter the
+                // same reconnect path: resync, reconnect, resync (§8.1).
+                // Errors from `open_events`/`snapshot` in the reconnect path
+                // still propagate via `?`, so a down server exits cleanly.
+                let event = event.unwrap_or_default();
+                match event {
                     None => {
                         // Stream ended: resync, reconnect, resync.
                         if let Some(result) = check_terminal(server, session_id).await? {
@@ -1106,13 +1116,13 @@ impl SessionServer for ServerClient {
     }
 
     async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError> {
-        // SSE has no overall timeout: the stream is long-lived and the 2s
-        // keepalive comments bound read latency.
+        // No total timeout on the SSE request: the stream is long-lived and
+        // the 2s keepalive comments bound read latency. Idle/read timeout is
+        // enforced per-read in `next_event` (§8.1).
         let response = self
             .http
             .get(self.url(&format!("/v1/workspaces/{workspace_id}/events")))
             .bearer_auth(&self.token)
-            .timeout(Duration::from_hours(1))
             .send()
             .await
             .map_err(|error| network(&error))?;
@@ -1138,16 +1148,26 @@ impl SessionServer for ServerClient {
             return Ok(None);
         }
         loop {
-            if let Some(event) = events.drain_lines()? {
-                return Ok(Some(event));
-            }
-            match events.stream.next().await {
-                Some(Ok(bytes)) => events.buf.extend_from_slice(&bytes),
-                Some(Err(error)) => return Err(network(&error)),
-                None => {
+            match events.drain_lines() {
+                Ok(Some(event)) => return Ok(Some(event)),
+                Ok(None) => {}
+                Err(_) => {
+                    // Malformed SSE: treat as stream-end so the observer
+                    // reconnects and resyncs (§8.1) instead of exiting.
                     events.done = true;
-                    return events.drain_lines();
+                    return Ok(None);
                 }
+            }
+            // Per-read idle timeout: 30s without bytes means the stream is
+            // dead. Read errors, idle timeouts, and graceful stream end all
+            // enter the reconnect path (Ok(None)) rather than propagating.
+            if let Ok(Some(Ok(bytes))) =
+                tokio::time::timeout(SSE_IDLE_TIMEOUT, events.stream.next()).await
+            {
+                events.buf.extend_from_slice(&bytes);
+            } else {
+                events.done = true;
+                return events.drain_lines().map_or(Ok(None), Ok);
             }
         }
     }
@@ -1530,6 +1550,7 @@ mod tests {
         listed: Mutex<u32>,
         fail_resolve: bool,
         fail_binding: bool,
+        read_error_once: Mutex<bool>,
     }
 
     impl MockServer {
@@ -1643,6 +1664,10 @@ mod tests {
         }
 
         async fn next_event(&mut self) -> Result<Option<StreamEvent>, ClientError> {
+            // Simulate a transient SSE read error once.
+            if std::mem::replace(&mut *self.read_error_once.lock().unwrap(), false) {
+                return Err(ClientError::Failed("simulated SSE read error".into()));
+            }
             // Rewrite sentinel "self" session ids to the created session so
             // the observer's session filter sees them as its own; other ids
             // pass through unchanged (and must be filtered by the observer).
@@ -1812,6 +1837,36 @@ mod tests {
             session_id: "s".into(),
             revision: 3,
         });
+        server.push_snapshot(snapshot(
+            ThreadLifecycle::Ready,
+            vec![run_summary(ThreadRunStatus::Completed, None)],
+        ));
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 0);
+        assert_eq!(server.opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_session_reconnects_after_sse_read_error() {
+        let mut server = MockServer::new();
+        // Initial check: running.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // Post-connect resync: still running.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // Simulate a transient SSE read error.
+        *server.read_error_once.lock().unwrap() = true;
+        // Reconnect resync: still running.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // Post-reconnect resync: terminal.
         server.push_snapshot(snapshot(
             ThreadLifecycle::Ready,
             vec![run_summary(ThreadRunStatus::Completed, None)],
