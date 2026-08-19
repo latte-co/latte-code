@@ -426,6 +426,9 @@ async fn execute() -> i32 {
 /// HTTP+SSE. By default the server is embedded in this process on a random
 /// loopback port; `--server` connects to a standalone server instead.
 async fn execute_session_command(json: bool, args: &[String]) -> i32 {
+    // Pre-scan for `--json` so parse errors still emit a JSON envelope
+    // (the flag may appear after the subcommand, before the bad token).
+    let json = json || args.iter().any(|arg| arg == "--json");
     let parsed = match server_client::parse_session_command(args) {
         Ok(parsed) => parsed,
         Err(message) => return emit_error(json, "usage", "usage", &message, EXIT_USAGE, true),
@@ -3264,5 +3267,70 @@ mod tests {
             }
             _ => panic!("expected Run command"),
         }
+    }
+
+    #[test]
+    fn parse_session_command_dash_dash_separates_prompt_flags() {
+        // `--` marks the end of options; tokens after it are prompt content
+        // even if they look like `--flag`.
+        let args = vec![
+            "run".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "--".to_string(),
+            "--workspace".to_string(),
+            "--nocapture".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, .. } => {
+                assert_eq!(prompt, "cargo test --workspace --nocapture");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_resume_dash_dash_keeps_prompt_flags() {
+        let session_id = "01900000-0000-7000-8000-000000000001";
+        let args = vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "run".to_string(),
+            "--".to_string(),
+            "--verbose".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Resume {
+                session_id: sid,
+                prompt,
+            } => {
+                assert_eq!(sid.to_string(), session_id);
+                assert_eq!(prompt, "run --verbose");
+            }
+            _ => panic!("expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn execute_session_command_json_flag_after_subcommand_emits_json_on_parse_error() {
+        // `--json` after the subcommand must be respected even when the
+        // parse fails (unknown option), so the error envelope is JSON.
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "run".to_string(),
+            "--json".to_string(),
+            "--unknown-flag".to_string(),
+        ];
+        let code =
+            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(super::execute_session_command(false, &args))
+            });
+        assert_eq!(code, 2); // EXIT_USAGE
     }
 }

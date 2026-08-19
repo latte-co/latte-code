@@ -170,6 +170,12 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--" => {
+                // Everything after `--` is positional (prompt content),
+                // even tokens that look like `--flag`.
+                positional.extend(iter.cloned());
+                break;
+            }
             "--json" => json = true,
             "--server" => server = Some(next_value(&mut iter, "--server")?),
             "--token" => token = Some(next_value(&mut iter, "--token")?),
@@ -562,13 +568,15 @@ pub trait SessionServer {
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError>;
-    /// Appends a follow-up turn. Returns the accepted revision.
+    /// Appends a follow-up turn. Returns the accepted revision and the
+    /// workspace id that owns the session (so the caller can subscribe to
+    /// the correct event stream when the cwd workspace differs).
     async fn follow_up(
         &mut self,
         session_id: &ThreadId,
         expected_revision: u64,
         prompt: &str,
-    ) -> Result<u64, ClientError>;
+    ) -> Result<(u64, String), ClientError>;
     /// Fetches the authoritative session snapshot.
     async fn snapshot(&mut self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError>;
     /// Lists the workspace's durable sessions.
@@ -630,13 +638,13 @@ pub async fn resume_session(
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<RunResult, ClientError> {
-    let workspace_id = server.resolve_workspace(root).await?;
+    let _workspace_id = server.resolve_workspace(root).await?;
     let thread_id = parse_session_id(session_id)?;
     let snapshot = server.snapshot(&thread_id).await?;
-    server
+    let (_, event_workspace_id) = server
         .follow_up(&thread_id, snapshot.revision, prompt)
         .await?;
-    observe_session(server, &workspace_id, &thread_id, on_progress, cancel).await
+    observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
 }
 
 /// Observes a session to a terminal state: unconditional snapshot resync on
@@ -1082,7 +1090,7 @@ impl SessionServer for ServerClient {
         session_id: &ThreadId,
         expected_revision: u64,
         prompt: &str,
-    ) -> Result<u64, ClientError> {
+    ) -> Result<(u64, String), ClientError> {
         let body = json!({
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
@@ -1090,12 +1098,18 @@ impl SessionServer for ServerClient {
         let value = self
             .post(&format!("/v1/sessions/{session_id}/follow-up"), body, None)
             .await?;
-        value
+        let revision = value
             .get("accepted_revision")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
                 ClientError::Failed("follow-up response missing accepted_revision".into())
-            })
+            })?;
+        let workspace_id = value
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| ClientError::Failed("follow-up response missing workspace_id".into()))?;
+        Ok((revision, workspace_id))
     }
 
     async fn snapshot(&mut self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
@@ -1637,13 +1651,13 @@ mod tests {
             session_id: &ThreadId,
             expected_revision: u64,
             prompt: &str,
-        ) -> Result<u64, ClientError> {
+        ) -> Result<(u64, String), ClientError> {
             self.followed_up.lock().unwrap().push((
                 session_id.to_string(),
                 expected_revision,
                 prompt.to_string(),
             ));
-            Ok(2)
+            Ok((2, "mock-workspace".into()))
         }
 
         async fn snapshot(
@@ -1968,6 +1982,43 @@ mod tests {
         assert_eq!(followed[0].2, "continue");
     }
 
+    #[tokio::test]
+    async fn resume_session_subscribes_to_session_workspace_not_cwd_workspace() {
+        // The cwd resolves to "ws-1" but the follow-up response returns
+        // "mock-workspace" (the session's actual workspace). The SSE
+        // subscription must use the session's workspace, not the cwd's.
+        let mut server = MockServer::new();
+        let id = "01900000-0000-7000-8000-000000000001";
+        server.push_snapshot(snapshot(ThreadLifecycle::Ready, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_event(StreamEvent::ResyncRequired);
+        server.push_snapshot(snapshot(
+            ThreadLifecycle::Ready,
+            vec![run_summary(ThreadRunStatus::Completed, None)],
+        ));
+        let result = resume_session(
+            &mut server,
+            Path::new("/different-workspace"),
+            id,
+            "continue",
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 0);
+        let opened = server.opened.lock().unwrap().clone();
+        assert!(
+            opened.iter().any(|ws| ws == "mock-workspace"),
+            "expected open_events to use the session's workspace 'mock-workspace', got {opened:?}"
+        );
+        assert!(
+            !opened.iter().any(|ws| ws == "ws-1"),
+            "open_events must not use the cwd workspace 'ws-1', got {opened:?}"
+        );
+    }
+
     // -- real HTTP client against a mock axum server -------------------------
 
     struct MockHttp {
@@ -2091,7 +2142,7 @@ mod tests {
             assert_eq!(body["expected_thread_revision"], 1);
             (
                 axum::http::StatusCode::ACCEPTED,
-                axum::Json(json!({ "accepted_revision": 2 })),
+                axum::Json(json!({ "accepted_revision": 2, "workspace_id": "mock-workspace" })),
             )
         }
 
@@ -2194,7 +2245,9 @@ mod tests {
             )
             .await
             .unwrap();
+        let (revision, event_ws) = revision;
         assert_eq!(revision, 2);
+        assert_eq!(event_ws, "mock-workspace");
         client.open_events(&ws).await.unwrap();
         let event = client.next_event().await.unwrap().unwrap();
         assert_eq!(

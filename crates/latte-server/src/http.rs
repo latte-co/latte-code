@@ -625,7 +625,10 @@ async fn follow_up_owned(
         revision: accepted.revision,
     });
 
-    let body = serde_json::json!({ "accepted_revision": accepted.revision });
+    let body = serde_json::json!({
+        "accepted_revision": accepted.revision,
+        "workspace_id": workspace.id,
+    });
     Ok((StatusCode::ACCEPTED, body))
 }
 
