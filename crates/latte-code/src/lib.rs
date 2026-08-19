@@ -1727,6 +1727,75 @@ mod tests {
     }
 
     #[test]
+    fn storage_home_with_covers_all_branches() {
+        use std::ffi::OsStr;
+        // Override with valid absolute path.
+        let path = storage_home_with(Some(OsStr::new("/tmp/custom")), None).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/custom"));
+        // Override with empty string → error.
+        assert!(storage_home_with(Some(OsStr::new("")), None).is_err());
+        // Override with relative path → error.
+        assert!(storage_home_with(Some(OsStr::new("relative")), None).is_err());
+        // No override, no HOME → error.
+        assert!(storage_home_with(None, None).is_err());
+        // No override, with HOME → ~/.latte/latte-code.
+        let home = Path::new("/home/user");
+        let path = storage_home_with(None, Some(home)).unwrap();
+        assert_eq!(path, home.join(".latte/latte-code"));
+    }
+
+    #[test]
+    fn merge_value_deep_merges_objects() {
+        let mut base = json!({
+            "a": 1,
+            "nested": { "x": 1, "y": 2 }
+        });
+        let overlay = json!({
+            "a": 10,
+            "b": 20,
+            "nested": { "y": 20, "z": 30 }
+        });
+        merge_value(&mut base, overlay);
+        assert_eq!(base["a"], 10);
+        assert_eq!(base["b"], 20);
+        assert_eq!(base["nested"]["x"], 1);
+        assert_eq!(base["nested"]["y"], 20);
+        assert_eq!(base["nested"]["z"], 30);
+    }
+
+    #[test]
+    fn merge_value_replaces_non_object_values() {
+        let mut base = json!({"a": {"nested": 1}});
+        let overlay = json!({"a": "scalar"});
+        merge_value(&mut base, overlay);
+        assert_eq!(base["a"], "scalar");
+    }
+
+    #[test]
+    fn merge_optional_config_handles_missing_and_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = json!({"existing": true});
+        // Missing file → Ok (no merge).
+        let missing = dir.path().join("missing.jsonc");
+        merge_optional_config(&mut base, &missing).unwrap();
+        assert_eq!(base["existing"], true);
+        // Invalid JSONC → error.
+        let invalid = dir.path().join("invalid.jsonc");
+        std::fs::write(&invalid, "{invalid").unwrap();
+        assert!(merge_optional_config(&mut base, &invalid).is_err());
+        // Non-object top-level → error.
+        let non_object = dir.path().join("array.jsonc");
+        std::fs::write(&non_object, "[1,2,3]").unwrap();
+        assert!(merge_optional_config(&mut base, &non_object).is_err());
+        // Valid JSONC → merges.
+        let valid = dir.path().join("valid.jsonc");
+        std::fs::write(&valid, "{merged: true}").unwrap();
+        merge_optional_config(&mut base, &valid).unwrap();
+        assert_eq!(base["merged"], true);
+        assert_eq!(base["existing"], true);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn workspace_and_projection_adapters_cover_empty_event_and_lagged_states() {
         let root = tempfile::tempdir().unwrap();
