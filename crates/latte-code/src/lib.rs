@@ -1823,9 +1823,10 @@ mod tests {
     #[test]
     fn storage_home_with_covers_all_branches() {
         use std::ffi::OsStr;
-        // Override with valid absolute path.
-        let path = storage_home_with(Some(OsStr::new("/tmp/custom")), None).unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/custom"));
+        // Override with valid absolute path (use tempdir for cross-platform).
+        let temp = tempfile::tempdir().unwrap();
+        let path = storage_home_with(Some(temp.path().as_os_str()), None).unwrap();
+        assert_eq!(path, temp.path().to_path_buf());
         // Override with empty string → error.
         assert!(storage_home_with(Some(OsStr::new("")), None).is_err());
         // Override with relative path → error.
@@ -1873,7 +1874,7 @@ mod tests {
         let missing = dir.path().join("missing.jsonc");
         merge_optional_config(&mut base, &missing).unwrap();
         assert_eq!(base["existing"], true);
-        // Invalid JSONC → error.
+        // Invalid JSON → Err.
         let invalid = dir.path().join("invalid.jsonc");
         std::fs::write(&invalid, "{invalid").unwrap();
         assert!(merge_optional_config(&mut base, &invalid).is_err());
@@ -1887,6 +1888,22 @@ mod tests {
         merge_optional_config(&mut base, &valid).unwrap();
         assert_eq!(base["merged"], true);
         assert_eq!(base["existing"], true);
+    }
+
+    #[test]
+    fn app_config_load_with_home_merges_home_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // Write a home config that overrides the verification argv.
+        std::fs::create_dir_all(home.path().join(".latte")).unwrap();
+        std::fs::write(
+            home.path().join(".latte/latte-code.jsonc"),
+            r#"{version:1,providers:{},verification:{argv:["echo","home"]}}"#,
+        )
+        .unwrap();
+        let (config, _registry) =
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
+        assert_eq!(config.verification.argv, ["echo", "home"]);
     }
 
     #[test]

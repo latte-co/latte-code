@@ -4560,3 +4560,91 @@ fn final_binary_cli_run_with_path_escape_tool_covers_error_path() {
     );
     provider.assert_consumed();
 }
+
+#[test]
+fn final_binary_cli_run_with_search_tool_completes() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "hello search\n").unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "search-1",
+            "search",
+            &serde_json::json!({"query": "hello", "max_results": 10}),
+        ),
+        ProviderReply::completion("search done"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "search for hello"], |command| {
+        command.env("TEST_OPENAI_KEY", "search-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_read_project_manifest_tool_completes() {
+    let scenario = Scenario::new();
+    std::fs::write(
+        scenario.root().join("Cargo.toml"),
+        "[package]\nname = \"test\"\n",
+    )
+    .unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "manifest-1",
+            "read_project_manifest",
+            &serde_json::json!({}),
+        ),
+        ProviderReply::completion("manifest read"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "read the manifest"], |command| {
+        command.env("TEST_OPENAI_KEY", "manifest-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_multiple_tool_calls_completes() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("a.txt"), "file a\n").unwrap();
+    std::fs::write(scenario.root().join("b.txt"), "file b\n").unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_calls([
+            ("read-1", "read_file", &serde_json::json!({"path": "a.txt"})),
+            ("read-2", "read_file", &serde_json::json!({"path": "b.txt"})),
+        ]),
+        ProviderReply::completion("read both files"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "read both files"], |command| {
+        command.env("TEST_OPENAI_KEY", "multi-tool-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
