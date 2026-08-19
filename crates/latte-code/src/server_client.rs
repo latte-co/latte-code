@@ -888,8 +888,13 @@ impl EventStream {
 }
 
 /// The HTTP+SSE implementation of [`SessionServer`].
+///
+/// Two reqwest clients are used: `http` for REST calls (30s total timeout)
+/// and `sse_http` for the long-lived SSE stream (connect timeout only, no
+/// total timeout — healthy streams must not be forcibly closed; §8.3).
 pub struct ServerClient {
     http: reqwest::Client,
+    sse_http: reqwest::Client,
     base_url: String,
     token: String,
     workspace_id: Option<String>,
@@ -899,13 +904,28 @@ pub struct ServerClient {
 impl ServerClient {
     #[must_use]
     pub fn new(base_url: String, token: String) -> Self {
+        Self::with_rest_timeout(base_url, token, Duration::from_secs(30))
+    }
+
+    /// Constructs a client with a custom REST timeout. Production uses
+    /// [`Self::new`] (30s); tests inject a smaller value to verify that the
+    /// SSE stream is not subject to the REST client's total timeout.
+    #[must_use]
+    fn with_rest_timeout(base_url: String, token: String, rest_timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
+            .timeout(rest_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        // SSE client: connect timeout only, NO total request timeout. The
+        // per-read idle timeout is enforced in `next_event` (§8.1).
+        let sse_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             http,
+            sse_http,
             base_url,
             token,
             workspace_id: None,
@@ -1116,11 +1136,11 @@ impl SessionServer for ServerClient {
     }
 
     async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError> {
-        // No total timeout on the SSE request: the stream is long-lived and
-        // the 2s keepalive comments bound read latency. Idle/read timeout is
-        // enforced per-read in `next_event` (§8.1).
+        // Uses the SSE-specific client (no total timeout): the stream is
+        // long-lived and the 2s keepalive comments bound read latency.
+        // Idle/read timeout is enforced per-read in `next_event` (§8.1).
         let response = self
-            .http
+            .sse_http
             .get(self.url(&format!("/v1/workspaces/{workspace_id}/events")))
             .bearer_auth(&self.token)
             .send()
@@ -1960,6 +1980,10 @@ mod tests {
         fn client(&self, token: &str) -> ServerClient {
             ServerClient::new(self.base_url.clone(), token.into())
         }
+
+        fn client_with_rest_timeout(&self, token: &str, timeout: Duration) -> ServerClient {
+            ServerClient::with_rest_timeout(self.base_url.clone(), token.into(), timeout)
+        }
     }
 
     impl Drop for MockHttp {
@@ -2255,6 +2279,65 @@ mod tests {
         let client = ServerClient::new(format!("http://127.0.0.1:{port}"), "token".into());
         let error = client.health_check().await.unwrap_err();
         assert_eq!(error.code(), "server_unreachable");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_survives_rest_client_timeout() {
+        // The SSE stream must NOT inherit the REST client's total timeout.
+        // Use a 1s REST timeout and verify the SSE stream stays alive for
+        // >2s with events arriving every 500ms.
+        use axum::response::sse::{Event, Sse};
+        use futures::stream;
+
+        async fn events() -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>>
+        {
+            let s = stream::unfold(0u32, |i| async move {
+                if i >= 5 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let event = Event::default()
+                    .event("thread_changed")
+                    .data(format!(r#"{{"session_id":"s","revision":{i}}}"#));
+                Some((Ok(event), i + 1))
+            });
+            Sse::new(s)
+        }
+
+        let app =
+            axum::Router::new().route("/v1/workspaces/{ws}/events", axum::routing::get(events));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown = async move {
+            let _ = shutdown_rx.wait_for(|stop| *stop).await;
+        };
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        let mock = MockHttp {
+            base_url: format!("http://127.0.0.1:{port}"),
+            _server: server,
+            shutdown: shutdown_tx,
+        };
+        // REST timeout = 1s; the SSE stream must survive past it.
+        let mut client = mock.client_with_rest_timeout("token", Duration::from_secs(1));
+        client.open_events("ws-1").await.unwrap();
+        // Read 5 events over 2.5s. If the SSE stream inherited the 1s REST
+        // timeout, next_event would return Ok(None) after ~1s and we'd only
+        // get ~2 events.
+        let mut count = 0;
+        for _ in 0..5 {
+            let event = client.next_event().await.unwrap();
+            assert!(event.is_some(), "stream ended prematurely at event {count}");
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        let _ = mock;
     }
 
     #[tokio::test]
