@@ -1834,9 +1834,9 @@ mod tests {
         // No override, no HOME → error.
         assert!(storage_home_with(None, None).is_err());
         // No override, with HOME → ~/.latte/latte-code.
-        let home = Path::new("/home/user");
-        let path = storage_home_with(None, Some(home)).unwrap();
-        assert_eq!(path, home.join(".latte/latte-code"));
+        let home = tempfile::tempdir().unwrap();
+        let path = storage_home_with(None, Some(home.path())).unwrap();
+        assert_eq!(path, home.path().join(".latte/latte-code"));
     }
 
     #[test]
