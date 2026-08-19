@@ -554,6 +554,18 @@ async fn follow_up(
     headers: HeaderMap,
     Json(req): Json<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
+    // Follow-up appends a durable child turn, so the Idempotency-Key header
+    // is required (same fail-closed posture as create).
+    let raw_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if raw_key.is_none() {
+        return Err(bad_request(
+            "Idempotency-Key header is required for follow-up",
+        ));
+    }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
     let payload_digest = canonical_digest(&serde_json::json!({
         "prompt": &req.prompt,
@@ -625,7 +637,10 @@ async fn follow_up_owned(
         revision: accepted.revision,
     });
 
-    let body = serde_json::json!({ "accepted_revision": accepted.revision });
+    let body = serde_json::json!({
+        "accepted_revision": accepted.revision,
+        "workspace_id": workspace.id,
+    });
     Ok((StatusCode::ACCEPTED, body))
 }
 
@@ -992,7 +1007,7 @@ async fn list_bindings(
         .ok_or_else(|| not_found("workspace not found"))?;
     let bindings = workspace
         .bindings()
-        .map_err(|e| failed(&format!("cannot build binding catalog: {e}")))?;
+        .map_err(|e| bad_request(&format!("cannot build binding catalog: {e}")))?;
     Ok(Json(serde_json::json!({ "bindings": bindings })))
 }
 
@@ -2194,7 +2209,18 @@ mod tests {
         ];
         for (method, uri, body) in cases {
             let payload = (!body.is_null()).then_some(body);
-            let (status, _) = call(&state, method, &uri, payload).await;
+            let (status, _) = if uri.contains("/follow-up") {
+                call_with_headers(
+                    &state,
+                    method,
+                    &uri,
+                    payload,
+                    &[("idempotency-key", "test-missing-session-key")],
+                )
+                .await
+            } else {
+                call(&state, method, &uri, payload).await
+            };
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
         }
     }
@@ -2424,11 +2450,12 @@ mod tests {
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let (session_id, _revision) = completed_session(&state, &workspace_id).await;
 
-        let (status, body) = call(
+        let (status, body) = call_with_headers(
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
             Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
+            &[("idempotency-key", "stale-revision-key")],
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3013,9 +3040,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follow_up_without_key_on_completed_session_succeeds() {
-        // Follow-up without Idempotency-Key on a completed session covers the
-        // None idempotency branch.
+    async fn follow_up_without_key_is_rejected() {
+        // Follow-up appends a durable child turn, so the Idempotency-Key
+        // header is required (fail-closed, same posture as create).
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
@@ -3028,8 +3055,14 @@ mod tests {
             Some(serde_json::json!({ "prompt": "no key", "expected_thread_revision": revision })),
         )
         .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "follow-up: {body:?}");
-        assert!(body["accepted_revision"].is_u64());
+        assert_eq!(status, StatusCode::BAD_REQUEST, "follow-up: {body:?}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Idempotency-Key"),
+            "unexpected body: {body:?}"
+        );
     }
 
     #[tokio::test]

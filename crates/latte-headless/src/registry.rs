@@ -193,6 +193,7 @@ pub struct ProviderBinding {
     pub aliases: BTreeMap<String, String>,
 }
 impl ProviderBinding {
+    #[cfg(test)]
     pub(crate) fn direct(tools: &[ToolDescriptor]) -> Self {
         Self {
             version: BINDING_VERSION,

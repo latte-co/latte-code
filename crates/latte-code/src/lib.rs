@@ -1,27 +1,21 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
-use latte_core::{
-    FailureCode, IdSource, RunState, RunStatus, SystemIdSource, ThreadId, ThreadProviderBindingV2,
-    wall_time_ms,
-};
-use latte_engine::{EngineBuilder, StorageError};
+use latte_core::{IdSource, SystemIdSource, ThreadId, ThreadProviderBindingV2, wall_time_ms};
+use latte_engine::EngineBuilder;
 use latte_headless::{
-    HeadlessCommand,
     registry::ProviderRegistry,
-    runtime::{AgentRuntime, RuntimeError, VerificationPlan},
+    runtime::VerificationPlan,
     thread::{ThreadHistoryPolicy, ThreadRuntimeService},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-const JSON_VERSION: u8 = 1;
+mod server_client;
+
+const JSON_VERSION: u8 = 2;
 const EXIT_COMPLETED: i32 = 0;
-const EXIT_FAILED: i32 = 1;
 const EXIT_USAGE: i32 = 2;
-const EXIT_NOT_FOUND: i32 = 4;
-const EXIT_WAITING: i32 = 10;
-const EXIT_DENIED: i32 = 11;
 const EXIT_INTERNAL: i32 = 70;
 const EXIT_INTERRUPTED: i32 = 130;
 const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
@@ -42,7 +36,7 @@ const DEFAULT_CONFIG: &str = r#"{
   },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] [--server url] [--token token] <prompt>\n  latte-code [--json] resume <session-id> <prompt> [--server url] [--token token]\n  latte-code [--json] show <session-id> [--server url] [--token token]\n  latte-code [--json] list [--server url] [--token token]\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. run/list/show/resume are session commands served over HTTP+SSE: by default the server is embedded in this process (random loopback port, token kept in memory); --server connects to a standalone server, reading its token from $LATTE_CODE_HOME/server.token or --token. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -422,12 +416,27 @@ async fn execute() -> i32 {
         return EXIT_COMPLETED;
     }
 
-    let command = match latte_headless::parse(&args) {
-        Ok(command) => command,
-        Err(error) => return emit_error(json, "usage", "usage", &error, EXIT_USAGE, true),
+    // run/list/show/resume are session commands served over HTTP+SSE: the
+    // server is the single engine host (embedded by default, or standalone
+    // via --server).
+    execute_session_command(json, &args).await
+}
+
+/// Executes the v2 session commands (`run`/`list`/`show`/`resume`) over
+/// HTTP+SSE. By default the server is embedded in this process on a random
+/// loopback port; `--server` connects to a standalone server instead.
+async fn execute_session_command(json: bool, args: &[String]) -> i32 {
+    // Pre-scan for `--json` so parse errors still emit a JSON envelope
+    // (the flag may appear after the subcommand, before the bad token).
+    let json = json || args.iter().any(|arg| arg == "--json");
+    let parsed = match server_client::parse_session_command(args) {
+        Ok(parsed) => parsed,
+        Err(message) => return emit_error(json, "usage", "usage", &message, EXIT_USAGE, true),
     };
+    // `--json` is accepted both as a global prefix and after the subcommand.
+    let json = json || parsed.json;
     let root = match std::env::current_dir() {
-        Ok(root) => discover_workspace_root(&root),
+        Ok(cwd) => discover_workspace_root(&cwd),
         Err(error) => {
             return emit_error(
                 json,
@@ -439,235 +448,114 @@ async fn execute() -> i32 {
             );
         }
     };
-    let (config, registry) = match AppConfig::load(&root) {
-        Ok(value) => value,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
-        }
-    };
-    let database_path = match storage_database_path() {
+    let storage_home = match storage_home() {
         Ok(path) => path,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
+        Err(message) => {
+            return emit_error(json, "usage", "configuration", &message, EXIT_USAGE, false);
         }
     };
-    let conversation_root = match storage_conversation_root() {
-        Ok(path) => path,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
-        }
-    };
-    let Some(database_parent) = database_path.parent() else {
-        return emit_error(
-            json,
-            "usage",
-            "configuration",
-            "global storage database must have a parent directory",
-            EXIT_USAGE,
-            false,
-        );
-    };
-    if let Err(error) = std::fs::create_dir_all(database_parent) {
-        return emit_error(
-            json,
-            "internal",
-            "database_directory",
-            &format!("cannot create {}: {error}", database_parent.display()),
-            EXIT_INTERNAL,
-            false,
-        );
+    let (mut client, embedded) =
+        match server_client::connect(parsed.server, parsed.token, &root, &storage_home).await {
+            Ok(connected) => connected,
+            Err(error) => return emit_client_error(json, &error),
+        };
+    let outcome = execute_session_command_inner(&mut client, parsed.command, &root, json, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
+    // Close the client (dropping any open SSE stream) before stopping the
+    // embedded server so graceful shutdown does not wait on it.
+    drop(client);
+    if let Some(embedded) = embedded {
+        embedded.shutdown().await;
     }
-    let engine = match EngineBuilder::new()
-        .workspace_root(&root)
-        .database_path(database_path)
-        .conversation_root(conversation_root)
-        .build()
-    {
-        Ok(engine) => engine,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "engine_initialization",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    if let Err(error) =
-        engine.import_legacy_workspace_database(config.legacy_database_path(&root), wall_time_ms())
-    {
-        return emit_error(
-            json,
-            "internal",
-            "legacy_import",
-            &error.to_string(),
-            EXIT_INTERNAL,
-            false,
-        );
+    match outcome {
+        Ok(code) => code,
+        Err(error) => emit_client_error(json, &error),
     }
+}
 
+async fn execute_session_command_inner(
+    client: &mut server_client::ServerClient,
+    command: server_client::SessionCommand,
+    root: &Path,
+    json: bool,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<i32, server_client::ClientError> {
+    use server_client::SessionServer;
+    let mut progress = |text: &str| {
+        eprint!("{text}");
+        let _ = std::io::stderr().flush();
+    };
     match command {
-        HeadlessCommand::Show { run_id } => match engine.show(run_id) {
-            Ok(run) => render_run(&run, json),
-            Err(StorageError::RunNotFound(_)) => emit_error(
-                json,
-                "not_found",
-                "run_not_found",
-                &format!("run {run_id} was not found"),
-                EXIT_NOT_FOUND,
-                false,
-            ),
-            Err(error) => emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            ),
-        },
-        HeadlessCommand::List => match engine.list() {
-            Ok(runs) => {
-                if json {
-                    emit_data("completed", &json!({ "runs": runs }));
-                } else {
-                    for run in runs {
-                        println!("{}\t{:?}\trev {}", run.run_id, run.status, run.revision)
-                    }
-                }
-                EXIT_COMPLETED
+        server_client::SessionCommand::Run { prompt, focus } => {
+            let result = server_client::run_session(
+                client,
+                root,
+                &prompt,
+                focus.as_deref(),
+                &mut progress,
+                cancel,
+            )
+            .await?;
+            if json {
+                println!("{}", server_client::run_envelope(&result));
+            } else if let Some(snapshot) = result.snapshot() {
+                println!("{}", server_client::render_session_text(snapshot));
             }
-            Err(error) => emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            ),
-        },
-        HeadlessCommand::Resume {
-            run_id,
-            allow: false,
-        } => deny_headless(&engine, run_id, json),
-        command @ (HeadlessCommand::Run { .. } | HeadlessCommand::Resume { .. }) => {
-            let provider = match registry.resolve_default(&engine.tool_descriptors()) {
-                Ok(value) => value,
-                Err(error) => {
-                    return emit_error(
-                        json,
-                        "usage",
-                        "configuration",
-                        &error.to_string(),
-                        EXIT_USAGE,
-                        false,
-                    );
-                }
-            };
-            let runtime = AgentRuntime::from_bound_provider(
-                engine,
-                provider.provider,
-                provider.binding,
-                &root,
-                config.plan(),
-            );
-            let result = match command {
-                HeadlessCommand::Run { prompt, focus } => {
-                    runtime.run_with_focus(&prompt, focus.as_deref()).await
-                }
-                HeadlessCommand::Resume { run_id, allow } => runtime.resume(run_id, allow).await,
-                _ => unreachable!(),
-            };
-            match result {
-                Ok(run) => render_run(&run, json),
-                Err(RuntimeError::PermissionRequired { run_id }) => emit_error(
-                    json,
-                    "waiting",
-                    "permission_required",
-                    &format!("permission required for run {run_id}"),
-                    EXIT_WAITING,
-                    false,
-                ),
-                Err(error) => emit_error(
-                    json,
-                    "failed",
-                    "runtime",
-                    &error.to_string(),
-                    EXIT_FAILED,
-                    false,
-                ),
+            Ok(result.exit_code())
+        }
+        server_client::SessionCommand::Resume { session_id, prompt } => {
+            let result = server_client::resume_session(
+                client,
+                root,
+                &session_id,
+                &prompt,
+                &mut progress,
+                cancel,
+            )
+            .await?;
+            if json {
+                println!("{}", server_client::run_envelope(&result));
+            } else if let Some(snapshot) = result.snapshot() {
+                println!("{}", server_client::render_session_text(snapshot));
             }
+            Ok(result.exit_code())
+        }
+        server_client::SessionCommand::List => {
+            let workspace_id = client.resolve_workspace(root).await?;
+            let sessions = client.list_sessions(&workspace_id).await?;
+            if json {
+                println!("{}", server_client::list_envelope(&sessions));
+            } else {
+                for session in &sessions {
+                    println!("{}", server_client::render_session_row(session));
+                }
+            }
+            Ok(EXIT_COMPLETED)
+        }
+        server_client::SessionCommand::Show { session_id } => {
+            let thread_id = server_client::parse_session_id(&session_id)?;
+            let snapshot = client.snapshot(&thread_id).await?;
+            if json {
+                println!("{}", server_client::session_envelope(&snapshot));
+            } else {
+                println!("{}", server_client::render_session_text(&snapshot));
+            }
+            Ok(EXIT_COMPLETED)
         }
     }
 }
 
-fn deny_headless(
-    engine: &latte_engine::EngineHandle,
-    run_id: latte_core::RunId,
-    json: bool,
-) -> i32 {
-    let state = match engine.show(run_id) {
-        Ok(state) => state,
-        Err(StorageError::RunNotFound(_)) => {
-            return emit_error(
-                json,
-                "not_found",
-                "run_not_found",
-                &format!("run {run_id} was not found"),
-                EXIT_NOT_FOUND,
-                false,
-            );
-        }
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    if state.status != RunStatus::WaitingPermission || state.pending_permission.is_none() {
-        return emit_error(
-            json,
-            "failed",
-            "invalid_state",
-            "run is not waiting for permission",
-            EXIT_FAILED,
-            false,
-        );
+/// Emits a v2 error envelope (JSON) or plain stderr line and returns the
+/// classified exit code.
+fn emit_client_error(json: bool, error: &server_client::ClientError) -> i32 {
+    if json {
+        println!("{}", server_client::error_envelope(error));
+    } else {
+        eprintln!("{}", error.message());
     }
-    let now = wall_time_ms();
-    let lease = match engine.acquire_run_lease(run_id, &format!("agent-{run_id}"), now, 60_000) {
-        Ok(lease) => lease,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    let denied = engine.deny_waiting_permission(run_id, state.revision, &lease, now);
-    let _ = engine.release_lease(&lease);
-    match denied {
-        Ok(run) => render_run(&run, json),
-        Err(error) => emit_error(
-            json,
-            "failed",
-            "storage",
-            &error.to_string(),
-            EXIT_FAILED,
-            false,
-        ),
-    }
+    error.exit_code()
 }
 
 /// Executes the single v2 reconciliation command exposed by the transcript
@@ -792,42 +680,48 @@ fn tui_startup_presentation(
     Ok((startup_binding, startup))
 }
 
-/// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
-/// the TUI reads only v2 snapshots and submits v2 conversation requests.
-#[allow(clippy::too_many_lines)]
-fn execute_tui() -> i32 {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        eprintln!(
-            "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
-        );
-        return EXIT_USAGE;
-    }
+/// Holds the fully-resolved state the TUI main loop needs.
+struct TuiSetup {
+    engine: latte_engine::EngineHandle,
+    startup_binding: Option<ThreadProviderBindingV2>,
+    startup: latte_tui::thread::ThreadStartupPresentation,
+    progress_rx: std::sync::mpsc::Receiver<latte_core::ThreadTransientProgress>,
+    service: ThreadRuntimeService,
+    projection: ThreadEngineProjection,
+    feedback_tx: std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
+    feedback_rx: std::sync::mpsc::Receiver<latte_tui::thread::ThreadUiFeedback>,
+    action_registry: latte_headless::registry::ProviderRegistry,
+}
+
+/// Resolves config, engine, and runtime state for the TUI. Separated from
+/// [`execute_tui`] so the setup paths are testable without a TTY.
+fn tui_setup() -> Result<TuiSetup, i32> {
     let root = match std::env::current_dir() {
         Ok(root) => discover_workspace_root(&root),
         Err(error) => {
             eprintln!("{error}");
-            return EXIT_INTERNAL;
+            return Err(EXIT_INTERNAL);
         }
     };
     let (config, registry) = match AppConfig::load(&root) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let database_path = match storage_database_path() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let conversation_root = match storage_conversation_root() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let engine = match open_tui_engine(
@@ -840,14 +734,14 @@ fn execute_tui() -> i32 {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{error}");
-            return EXIT_INTERNAL;
+            return Err(EXIT_INTERNAL);
         }
     };
     let (startup_binding, startup) = match tui_startup_presentation(&root, &registry, &engine) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let resolver_registry = registry.clone();
@@ -867,20 +761,63 @@ fn execute_tui() -> i32 {
     let service = ThreadRuntimeService::new(engine.clone(), &root, config.thread_policy(), factory)
         .with_progress_sink(progress_sink)
         .with_verification(config.plan());
-    let mut projection = ThreadEngineProjection {
+    let projection = ThreadEngineProjection {
         engine: engine.clone(),
         subscription: engine.subscribe_threads(),
         workspace_root: match workspace_identity(&root) {
             Ok(identity) => identity,
             Err(error) => {
                 eprintln!("configuration: {error}");
-                return EXIT_USAGE;
+                return Err(EXIT_USAGE);
             }
         },
     };
     let (feedback_tx, feedback_rx) =
         std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
     let action_registry = registry.clone();
+    Ok(TuiSetup {
+        engine,
+        startup_binding,
+        startup,
+        progress_rx,
+        service,
+        projection,
+        feedback_tx,
+        feedback_rx,
+        action_registry,
+    })
+}
+
+/// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
+/// the TUI reads only v2 snapshots and submits v2 conversation requests.
+fn execute_tui() -> i32 {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!(
+            "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
+        );
+        return EXIT_USAGE;
+    }
+    let setup = match tui_setup() {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    tui_main_loop(setup)
+}
+
+/// The TUI main loop: runs the terminal UI and dispatches actions.
+#[allow(clippy::too_many_lines)]
+fn tui_main_loop(setup: TuiSetup) -> i32 {
+    let TuiSetup {
+        engine,
+        startup_binding,
+        startup,
+        progress_rx,
+        service,
+        mut projection,
+        feedback_tx,
+        feedback_rx,
+        action_registry,
+    } = setup;
     match latte_tui::thread::run_with_feedback_and_progress(
         &mut projection,
         startup,
@@ -1379,6 +1316,14 @@ fn prepare_server(
                 .conversation_root(&builder_conv)
                 .build()
                 .map_err(|error| error.to_string())?;
+            // Import any v1 legacy workspace database once, the same way the
+            // in-process TUI path does, so server-driven sessions see history.
+            engine
+                .import_legacy_workspace_database(
+                    config.legacy_database_path(workspace_root),
+                    wall_time_ms(),
+                )
+                .map_err(|error| format!("legacy import: {error}"))?;
             let factory_engine = engine.clone();
             let factory_registry = registry.clone();
             let factory: latte_headless::thread::ThreadProviderFactory =
@@ -1501,40 +1446,6 @@ fn write_server_token(path: &Path, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn render_run(run: &RunState, json_output: bool) -> i32 {
-    let (status, code) = outcome(run);
-    if json_output {
-        emit_data(status, &json!({ "run": run }));
-    } else {
-        println!(
-            "run {}: {:?} (revision {})",
-            run.run_id, run.status, run.revision
-        );
-        if let Some(handoff) = &run.handoff {
-            println!("{}", handoff.summary)
-        }
-    }
-    code
-}
-
-fn outcome(run: &RunState) -> (&'static str, i32) {
-    match run.status {
-        RunStatus::Completed => ("completed", EXIT_COMPLETED),
-        RunStatus::WaitingPermission | RunStatus::WaitingInput => ("waiting", EXIT_WAITING),
-        RunStatus::Interrupted | RunStatus::Cancelling => ("interrupted", EXIT_INTERRUPTED),
-        RunStatus::Failed
-            if run
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.code == FailureCode::PermissionDenied) =>
-        {
-            ("denied", EXIT_DENIED)
-        }
-        RunStatus::Failed => ("failed", EXIT_FAILED),
-        RunStatus::Queued | RunStatus::Running => ("internal", EXIT_INTERNAL),
-    }
-}
-
 fn emit_data(status: &str, data: &Value) {
     println!(
         "{}",
@@ -1569,32 +1480,27 @@ fn emit_error(
 
 #[cfg(test)]
 mod tests {
+    use super::EXIT_COMPLETED;
     use super::bind_local_listener;
     use super::{
-        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED,
-        EXIT_INTERNAL, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
-        ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root,
-        dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
-        exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
-        outcome, parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action,
-        render_run, serve_bound, storage_home_with, tui_startup_presentation, verify_timeout,
-        workspace_display_path, workspace_display_path_with_home, workspace_identity,
-        write_server_token,
+        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
+        ThreadEngineProjection, VerificationConfig, discover_workspace_root,
+        dispatch_session_management_action, dot, emit_client_error, emit_data, emit_error,
+        execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
+        merge_value, open_tui_engine, parse_serve_port, prepare_server, readiness_envelope,
+        reconcile_thread_action, serve_bound, storage_home_with, tui_setup,
+        tui_startup_presentation, verify_timeout, workspace_display_path,
+        workspace_display_path_with_home, workspace_identity, write_server_token,
     };
     use latte_core::{
-        Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
-        RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
-        ThreadProviderBindingV2, VerificationStatus,
+        IdSource, RunId, RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
+        ThreadProviderBindingV2,
     };
     use latte_engine::{
         CommitThreadRunUpdate, EngineBuilder, ThreadCommitRequest, ThreadEffectDescriptor,
         ThreadEffectRequest, ThreadEffectStartRequest,
     };
-    use latte_headless::{
-        provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall},
-        runtime::{AgentRuntime, RuntimeError},
-        thread::{ThreadHistoryPolicy, ThreadRuntimeService},
-    };
+    use latte_headless::thread::{ThreadHistoryPolicy, ThreadRuntimeService};
     use latte_tui::thread::{
         SessionManagementOutcome, ThreadProjectionClient, ThreadProjectionPoll, ThreadUiAction,
         ThreadUiFeedback,
@@ -1608,42 +1514,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    fn state(status: RunStatus) -> RunState {
-        let mut state =
-            RunState::queued(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
-        state.status = status;
-        state
-    }
-
-    #[test]
-    fn run_statuses_have_stable_exit_codes() {
-        assert_eq!(outcome(&state(RunStatus::Completed)).1, EXIT_COMPLETED);
-        assert_eq!(
-            outcome(&state(RunStatus::WaitingPermission)).1,
-            EXIT_WAITING
-        );
-        assert_eq!(outcome(&state(RunStatus::Failed)).1, EXIT_FAILED);
-        assert_eq!(outcome(&state(RunStatus::Interrupted)).1, EXIT_INTERRUPTED);
-    }
-
-    #[test]
-    fn permission_denial_has_distinct_exit_code() {
-        let mut run = state(RunStatus::Failed);
-        run.failure = Some(RunFailure {
-            code: FailureCode::PermissionDenied,
-            message: "denied".into(),
-            retryability: Retryability::Terminal,
-        });
-        assert_eq!(outcome(&run).1, EXIT_DENIED);
-    }
-
     #[test]
     fn remaining_run_statuses_and_config_value_objects_are_exact() {
-        assert_eq!(outcome(&state(RunStatus::WaitingInput)).1, EXIT_WAITING);
-        assert_eq!(outcome(&state(RunStatus::Cancelling)).1, EXIT_INTERRUPTED);
-        assert_eq!(outcome(&state(RunStatus::Queued)).1, EXIT_INTERNAL);
-        assert_eq!(outcome(&state(RunStatus::Running)).1, EXIT_INTERNAL);
-
         let threads = ThreadConfig::default();
         let policy = ThreadHistoryPolicy::default();
         assert_eq!(threads.max_request_bytes, policy.max_request_bytes);
@@ -1815,23 +1687,6 @@ mod tests {
         assert_eq!(config.verification.timeout_ms, verify_timeout());
         assert_eq!(config.database.path, ".latte/latte-code.db");
 
-        let mut completed = state(RunStatus::Completed);
-        completed.revision = 4;
-        completed.handoff = Some(Handoff {
-            summary: "verified handoff".into(),
-            files_changed: vec!["src/lib.rs".into()],
-            evidence: vec![Evidence {
-                name: "unit".into(),
-                status: VerificationStatus::Passed,
-                summary: "all green".into(),
-            }],
-        });
-        assert_eq!(render_run(&completed, false), EXIT_COMPLETED);
-        assert_eq!(render_run(&completed, true), EXIT_COMPLETED);
-
-        let waiting = state(RunStatus::WaitingInput);
-        assert_eq!(render_run(&waiting, false), EXIT_WAITING);
-        assert_eq!(render_run(&waiting, true), EXIT_WAITING);
         emit_data("completed", &json!({"kind":"contract-probe"}));
         assert_eq!(
             emit_error(true, "usage", "bad_argument", "bad", EXIT_USAGE, true),
@@ -1854,96 +1709,198 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn deny_headless_distinguishes_missing_invalid_and_prepared_permission_states() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("note.txt"), "original").unwrap();
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .database_path(root.path().join("state.db"))
-            .build()
-            .unwrap();
-        let ids = SystemIdSource::default();
-        let missing = RunId::from_uuid(ids.next_uuid_v7());
-        assert_eq!(deny_headless(&engine, missing, true), EXIT_NOT_FOUND);
-
-        let queued_id = RunId::from_uuid(ids.next_uuid_v7());
-        engine.create_run(queued_id, 1).unwrap();
-        assert_eq!(deny_headless(&engine, queued_id, false), EXIT_FAILED);
-
-        let runtime = AgentRuntime::new(
-            engine.clone(),
-            FakeProvider::scripted([
-                ProviderResponse {
-                    message: Some("I will inspect the current file first".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "call_read_1".into(),
-                        name: "read_file".into(),
-                        input: json!({"path":"note.txt"}),
-                    }],
-                    input_request: None,
-                    usage: ProviderUsage::default(),
-                    finish_reason: None,
-                    provider_state: None,
-                },
-                ProviderResponse {
-                    message: Some("I need permission to update the file".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "call_write_1".into(),
-                        name: "write_file".into(),
-                        input: json!({
-                            "path":"note.txt",
-                            "content":"updated",
-                            "create_intent":false,
-                            "precondition":"0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
-                        }),
-                    }],
-                    input_request: None,
-                    usage: ProviderUsage::default(),
-                    finish_reason: None,
-                    provider_state: None,
-                },
-            ]),
-            root.path(),
-            latte_headless::runtime::VerificationPlan {
-                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
-                cwd: ".".into(),
-                timeout_ms: 1_000,
-                grace_ms: 100,
-                stdout_cap: 1_024,
-                stderr_cap: 1_024,
-            },
-        );
-        let run_id = match runtime.run("update note.txt").await.unwrap_err() {
-            RuntimeError::PermissionRequired { run_id } => run_id,
-            error => panic!("expected permission boundary, got {error}"),
-        };
-        let waiting = engine.show(run_id).unwrap();
-        assert_eq!(waiting.status, RunStatus::WaitingPermission);
-        assert!(waiting.pending_permission.is_some());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
-            "original"
-        );
-
-        assert_eq!(deny_headless(&engine, run_id, true), EXIT_DENIED);
-        let denied = engine.show(run_id).unwrap();
-        assert_eq!(denied.status, RunStatus::Failed);
-        assert_eq!(
-            denied.failure.as_ref().map(|failure| failure.code),
-            Some(FailureCode::PermissionDenied)
-        );
-        assert!(denied.pending_permission.is_none());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
-            "original"
-        );
-        assert_eq!(deny_headless(&engine, run_id, false), EXIT_FAILED);
-    }
-
     #[test]
     fn tui_entrypoint_rejects_non_terminal_processes_before_loading_authority() {
         assert_eq!(execute_tui(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn tui_setup_reports_configuration_error_for_invalid_config() {
+        // Create a temp dir with an invalid config file, then set HOME to it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
+        std::fs::write(dir.path().join(".latte/latte-code.jsonc"), "{invalid json").unwrap();
+        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], tui_setup);
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn tui_setup_reports_configuration_error_when_storage_home_empty() {
+        // With LATTE_CODE_HOME set to an empty string, storage_home() fails
+        // and tui_setup returns EXIT_USAGE from the database_path branch.
+        let dir = tempfile::tempdir().unwrap();
+        let result = temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str())),
+                ("LATTE_CODE_HOME", Some(std::ffi::OsStr::new(""))),
+            ],
+            tui_setup,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn server_lease_ttl_ms_parses_and_rejects_values() {
+        // Valid value.
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("5000"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), Some(5000));
+        });
+        // Invalid value → None.
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("invalid"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), None);
+        });
+        // Zero → None (filtered out).
+        temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("0"))], || {
+            assert_eq!(super::server_lease_ttl_ms(), None);
+        });
+    }
+
+    #[test]
+    fn storage_paths_fail_without_home() {
+        temp_env::with_vars(
+            [
+                ("HOME", None::<&std::ffi::OsStr>),
+                ("LATTE_CODE_HOME", None::<&std::ffi::OsStr>),
+            ],
+            || {
+                assert!(super::storage_database_path().is_err());
+                assert!(super::storage_conversation_root().is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn storage_paths_succeed_with_home() {
+        let temp = tempfile::tempdir().unwrap();
+        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+            let db = super::storage_database_path().unwrap();
+            assert_eq!(db, temp.path().join("state.db"));
+            let conv = super::storage_conversation_root().unwrap();
+            assert_eq!(conv, temp.path().join("sessions"));
+        });
+    }
+
+    #[test]
+    fn legacy_database_path_handles_absolute_and_relative() {
+        let root = Path::new("/workspace");
+        // Relative path → joined with root.
+        let config = AppConfig {
+            version: 1,
+            default_model: String::new(),
+            providers: json!({}),
+            database: DatabaseConfig {
+                path: ".latte/latte-code.db".into(),
+            },
+            verification: VerificationConfig {
+                argv: vec!["true".into()],
+                cwd: ".".into(),
+                timeout_ms: 1000,
+            },
+            thread: ThreadConfig::default(),
+        };
+        assert_eq!(
+            config.legacy_database_path(root),
+            root.join(".latte/latte-code.db")
+        );
+        // Absolute path → used as-is.
+        let config = AppConfig {
+            database: DatabaseConfig {
+                path: "/absolute/path.db".into(),
+            },
+            ..config
+        };
+        assert_eq!(
+            config.legacy_database_path(root),
+            PathBuf::from("/absolute/path.db")
+        );
+    }
+
+    #[test]
+    fn storage_home_with_covers_all_branches() {
+        use std::ffi::OsStr;
+        // Override with valid absolute path (use tempdir for cross-platform).
+        let temp = tempfile::tempdir().unwrap();
+        let path = storage_home_with(Some(temp.path().as_os_str()), None).unwrap();
+        assert_eq!(path, temp.path().to_path_buf());
+        // Override with empty string → error.
+        assert!(storage_home_with(Some(OsStr::new("")), None).is_err());
+        // Override with relative path → error.
+        assert!(storage_home_with(Some(OsStr::new("relative")), None).is_err());
+        // No override, no HOME → error.
+        assert!(storage_home_with(None, None).is_err());
+        // No override, with HOME → ~/.latte/latte-code.
+        let home = tempfile::tempdir().unwrap();
+        let path = storage_home_with(None, Some(home.path())).unwrap();
+        assert_eq!(path, home.path().join(".latte/latte-code"));
+    }
+
+    #[test]
+    fn merge_value_deep_merges_objects() {
+        let mut base = json!({
+            "a": 1,
+            "nested": { "x": 1, "y": 2 }
+        });
+        let overlay = json!({
+            "a": 10,
+            "b": 20,
+            "nested": { "y": 20, "z": 30 }
+        });
+        merge_value(&mut base, overlay);
+        assert_eq!(base["a"], 10);
+        assert_eq!(base["b"], 20);
+        assert_eq!(base["nested"]["x"], 1);
+        assert_eq!(base["nested"]["y"], 20);
+        assert_eq!(base["nested"]["z"], 30);
+    }
+
+    #[test]
+    fn merge_value_replaces_non_object_values() {
+        let mut base = json!({"a": {"nested": 1}});
+        let overlay = json!({"a": "scalar"});
+        merge_value(&mut base, overlay);
+        assert_eq!(base["a"], "scalar");
+    }
+
+    #[test]
+    fn merge_optional_config_handles_missing_and_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = json!({"existing": true});
+        // Missing file → Ok (no merge).
+        let missing = dir.path().join("missing.jsonc");
+        merge_optional_config(&mut base, &missing).unwrap();
+        assert_eq!(base["existing"], true);
+        // Invalid JSON → Err.
+        let invalid = dir.path().join("invalid.jsonc");
+        std::fs::write(&invalid, "{invalid").unwrap();
+        assert!(merge_optional_config(&mut base, &invalid).is_err());
+        // Non-object top-level → error.
+        let non_object = dir.path().join("array.jsonc");
+        std::fs::write(&non_object, "[1,2,3]").unwrap();
+        assert!(merge_optional_config(&mut base, &non_object).is_err());
+        // Valid JSONC → merges.
+        let valid = dir.path().join("valid.jsonc");
+        std::fs::write(&valid, "{merged: true}").unwrap();
+        merge_optional_config(&mut base, &valid).unwrap();
+        assert_eq!(base["merged"], true);
+        assert_eq!(base["existing"], true);
+    }
+
+    #[test]
+    fn app_config_load_with_home_merges_home_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // Write a home config that overrides the verification argv.
+        std::fs::create_dir_all(home.path().join(".latte")).unwrap();
+        std::fs::write(
+            home.path().join(".latte/latte-code.jsonc"),
+            r#"{version:1,providers:{},verification:{argv:["echo","home"]}}"#,
+        )
+        .unwrap();
+        let (config, _registry) =
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
+        assert_eq!(config.verification.argv, ["echo", "home"]);
     }
 
     #[test]
@@ -2551,6 +2508,14 @@ mod tests {
             err.contains("cannot create") || err.contains("cannot write"),
             "unexpected error: {err}"
         );
+
+        // A root path has no parent, so the function must fail early.
+        let root_path = Path::new(std::path::MAIN_SEPARATOR_STR);
+        let err = write_server_token(root_path, &first).unwrap_err();
+        assert!(
+            err.contains("cannot determine parent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -3004,5 +2969,421 @@ mod tests {
         };
         assert_eq!(error.code, "internal");
         assert_eq!(error.category, "engine_initialization");
+    }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn workspace_display_path_with_home_covers_all_branches() {
+        let root = Path::new("/home/user/project");
+        // No HOME → raw path.
+        assert_eq!(
+            workspace_display_path_with_home(root, None),
+            "/home/user/project"
+        );
+        // Not under HOME → raw path.
+        assert_eq!(
+            workspace_display_path_with_home(root, Some(Path::new("/other"))),
+            "/home/user/project"
+        );
+        // Under HOME → ~/relative.
+        assert_eq!(
+            workspace_display_path_with_home(root, Some(Path::new("/home/user"))),
+            "~/project"
+        );
+        // IS home → ~.
+        assert_eq!(
+            workspace_display_path_with_home(
+                Path::new("/home/user"),
+                Some(Path::new("/home/user"))
+            ),
+            "~"
+        );
+    }
+
+    #[test]
+    fn emit_error_covers_json_help_and_plain_branches() {
+        // JSON branch.
+        let code = emit_error(true, "failed", "test_code", "json message", 1, false);
+        assert_eq!(code, 1);
+        // Plain text branch (no help).
+        let code = emit_error(false, "failed", "test_code", "plain message", 2, false);
+        assert_eq!(code, 2);
+        // Help branch.
+        let code = emit_error(false, "failed", "test_code", "help message", 2, true);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn emit_data_outputs_envelope() {
+        emit_data("completed", &json!({"session": "test"}));
+    }
+
+    #[test]
+    fn emit_client_error_maps_all_variants() {
+        use crate::server_client::ClientError;
+        assert_eq!(
+            emit_client_error(true, &ClientError::Unreachable("x".into())),
+            71
+        );
+        assert_eq!(emit_client_error(true, &ClientError::Usage("x".into())), 2);
+        assert_eq!(
+            emit_client_error(true, &ClientError::NotFound("x".into())),
+            4
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Unauthorized("x".into())),
+            70
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Internal("x".into())),
+            70
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Conflict("x".into())),
+            1
+        );
+        assert_eq!(emit_client_error(true, &ClientError::Failed("x".into())), 1);
+        // Non-JSON branch.
+        assert_eq!(
+            emit_client_error(false, &ClientError::Failed("x".into())),
+            1
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Session command coverage (execute_session_command / _inner)
+    // ------------------------------------------------------------------
+
+    /// Starts a minimal HTTP mock server. `handler` receives (method, path)
+    /// and returns (status, `content_type`, body). One request per connection.
+    fn start_session_mock_server<F>(mut handler: F) -> (String, std::thread::JoinHandle<()>)
+    where
+        F: FnMut(&str, &str) -> (u16, String, String) + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let (status, content_type, body) = handler(method, path);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// A terminal-ready snapshot JSON for mock server responses.
+    fn terminal_snapshot_json(thread_id: &str, run_id: &str) -> String {
+        format!(
+            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":null,"runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_rejects_unknown_subcommand() {
+        let args = vec!["bogus".to_string()];
+        let code = super::execute_session_command(true, &args).await;
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn execute_session_command_reports_unreachable_server() {
+        let temp = tempfile::tempdir().unwrap();
+        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let args = vec![
+                    "list".to_string(),
+                    "--server".to_string(),
+                    "http://127.0.0.1:0".to_string(),
+                    "--token".to_string(),
+                    "dummy".to_string(),
+                ];
+                let code = super::execute_session_command(true, &args).await;
+                assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_list_returns_sessions() {
+        let (url, _handle) = start_session_mock_server(|method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" {
+                (200, "application/json".into(), r#"{"sessions":[]}"#.into())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_show_returns_snapshot() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Show {
+            session_id: thread_id,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_run_completes() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/bindings" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"bindings":[{"is_default":true,"binding":{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}}]}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":1}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Run {
+            prompt: "hello".to_string(),
+            focus: None,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[test]
+    fn execute_session_command_merges_json_flag_from_args() {
+        // json=false but args include --json → parsed.json=true → json becomes true.
+        // The connect will fail (unreachable), but the merge line is covered.
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "list".to_string(),
+            "--json".to_string(),
+            "--server".to_string(),
+            "http://127.0.0.1:0".to_string(),
+            "--token".to_string(),
+            "dummy".to_string(),
+        ];
+        let code =
+            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(super::execute_session_command(false, &args))
+            });
+        assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+    }
+
+    #[test]
+    fn parse_session_command_accepts_focus_flag_for_run() {
+        let args = vec![
+            "run".to_string(),
+            "hello".to_string(),
+            "--focus".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        assert!(!parsed.json);
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, focus } => {
+                assert_eq!(prompt, "hello");
+                assert_eq!(focus, Some(std::path::PathBuf::from("src/main.rs")));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_dash_dash_separates_prompt_flags() {
+        // `--` marks the end of options; tokens after it are prompt content
+        // even if they look like `--flag`.
+        let args = vec![
+            "run".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "--".to_string(),
+            "--workspace".to_string(),
+            "--nocapture".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, .. } => {
+                assert_eq!(prompt, "cargo test --workspace --nocapture");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_resume_dash_dash_keeps_prompt_flags() {
+        let session_id = "01900000-0000-7000-8000-000000000001";
+        let args = vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "run".to_string(),
+            "--".to_string(),
+            "--verbose".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Resume {
+                session_id: sid,
+                prompt,
+            } => {
+                assert_eq!(sid, session_id);
+                assert_eq!(prompt, "run --verbose");
+            }
+            _ => panic!("expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn execute_session_command_json_flag_after_subcommand_emits_json_on_parse_error() {
+        // `--json` after the subcommand must be respected even when the
+        // parse fails (unknown option), so the error envelope is JSON.
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "run".to_string(),
+            "--json".to_string(),
+            "--unknown-flag".to_string(),
+        ];
+        let code =
+            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(super::execute_session_command(false, &args))
+            });
+        assert_eq!(code, 2); // EXIT_USAGE
+    }
+
+    #[test]
+    fn parse_session_command_run_accepts_dash_flags_in_prompt_without_separator() {
+        // Common case: `latte-code run cargo test --workspace` — the
+        // --workspace token is prompt content, not an unknown option.
+        let args = vec![
+            "run".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+            "--workspace".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Run { prompt, .. } => {
+                assert_eq!(prompt, "cargo test --workspace");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_resume_accepts_dash_flags_in_prompt_without_separator() {
+        let session_id = "01900000-0000-7000-8000-000000000001";
+        let args = vec![
+            "resume".to_string(),
+            session_id.to_string(),
+            "run".to_string(),
+            "--verbose".to_string(),
+        ];
+        let parsed = crate::server_client::parse_session_command(&args).unwrap();
+        match parsed.command {
+            crate::server_client::SessionCommand::Resume { prompt, .. } => {
+                assert_eq!(prompt, "run --verbose");
+            }
+            _ => panic!("expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn parse_session_command_list_rejects_unknown_dash_flags() {
+        let args = vec!["list".to_string(), "--unknown".to_string()];
+        assert!(crate::server_client::parse_session_command(&args).is_err());
+    }
+
+    #[test]
+    fn parse_session_command_show_rejects_unknown_dash_flags() {
+        let args = vec![
+            "show".to_string(),
+            "01900000-0000-7000-8000-000000000001".to_string(),
+            "--unknown".to_string(),
+        ];
+        assert!(crate::server_client::parse_session_command(&args).is_err());
     }
 }

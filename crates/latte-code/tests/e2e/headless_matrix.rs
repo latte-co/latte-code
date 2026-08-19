@@ -1,6 +1,5 @@
 use super::support::{ProviderReply, Scenario, ScriptedProvider, json};
 use serde_json::Value;
-use std::time::Duration;
 
 #[test]
 fn public_engine_embedding_config_contract_covers_jsonc_environment_and_fail_closed_validation() {
@@ -113,30 +112,6 @@ fn write_home_provider_config(scenario: &Scenario) {
     .unwrap();
 }
 
-fn waiting_run_id(output: &std::process::Output) -> String {
-    assert_eq!(
-        output.status.code(),
-        Some(10),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(json(output)["error"]["code"], "permission_required");
-    json(output)["error"]["message"]
-        .as_str()
-        .unwrap()
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .to_owned()
-}
-
-fn pending_effect(scenario: &Scenario, run_id: &str) -> Value {
-    let shown = scenario.output(&["--json", "show", run_id], |_| {});
-    assert_eq!(shown.status.code(), Some(10));
-    json(&shown)["data"]["run"]["pending_permission"].clone()
-}
-
 fn tool_messages(request: &Value) -> Vec<&Value> {
     request["messages"]
         .as_array()
@@ -144,6 +119,30 @@ fn tool_messages(request: &Value) -> Vec<&Value> {
         .iter()
         .filter(|message| message["role"] == "tool")
         .collect()
+}
+
+/// Extracts the text of the session's last failure transcript entry.
+fn failure_text(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"] == "failure")
+        .map(|entry| entry["text"].as_str().unwrap().to_owned())
+        .unwrap()
+}
+
+/// Extracts the text of the session's last assistant transcript entry.
+fn assistant_text(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"] == "assistant")
+        .map(|entry| entry["text"].as_str().unwrap().to_owned())
+        .unwrap()
 }
 
 #[test]
@@ -221,7 +220,7 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(json(&output)["error"]["code"], "configuration");
+        assert_eq!(json(&output)["error"]["code"], "usage");
         assert!(
             json(&output)["error"]["message"]
                 .as_str()
@@ -272,7 +271,7 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             "aliases {aliases}: {}",
             String::from_utf8_lossy(&output.stdout)
         );
-        assert_eq!(json(&output)["error"]["code"], "configuration");
+        assert_eq!(json(&output)["error"]["code"], "usage");
         assert!(
             json(&output)["error"]["message"]
                 .as_str()
@@ -307,13 +306,11 @@ fn configured_alias_rejects_an_unmapped_provider_tool_name_before_execution() {
     );
 
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
-    assert!(
-        json(&output)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("provider returned an unknown tool alias")
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
+    assert!(failure_text(&output).contains("provider returned an unknown tool alias"));
     assert!(!scenario.root().join("must-not-run.txt").exists());
     provider.assert_consumed();
     assert_eq!(provider.requests().len(), 1);
@@ -324,124 +321,6 @@ fn configured_alias_rejects_an_unmapped_provider_tool_name_before_execution() {
             .iter()
             .any(|tool| tool["function"]["name"] == "wire_read_file")
     );
-}
-
-#[cfg(unix)]
-#[test]
-#[allow(clippy::too_many_lines)]
-fn legacy_multi_tool_queue_survives_four_processes_and_verifies_exact_outputs() {
-    let scenario = Scenario::new();
-    std::fs::create_dir(scenario.root().join("work")).unwrap();
-    std::fs::write(scenario.root().join("work/input.txt"), "fixture-before\n").unwrap();
-
-    let read = serde_json::json!({"path": "work/input.txt", "max_output": 1024});
-    let write = serde_json::json!({
-        "path": "work/generated.txt",
-        "content": "created-by-matrix\n",
-        "create_intent": true
-    });
-    let process = serde_json::json!({
-        "shell": "test \"$(basename \"$PWD\")\" = work; printf \"$MATRIX_FLAG-123\"; printf stderr-456 >&2; exit 7",
-        "cwd": "work",
-        "env": {"MATRIX_FLAG": "env-ok"},
-        "timeout_ms": 2_000,
-        "grace_ms": 50,
-        "stdout_cap": 6,
-        "stderr_cap": 6
-    });
-    let provider = ScriptedProvider::start([
-        ProviderReply::tool_calls([
-            ("matrix-read", "read_file", &read),
-            ("matrix-write", "write_file", &write),
-            ("matrix-process", "process", &process),
-        ]),
-        ProviderReply::completion("matrix queue and verification complete"),
-    ]);
-    scenario.write_config(
-        provider.endpoint(),
-        r#"["/bin/sh","-c","test -f work/generated.txt && grep -q created-by-matrix work/generated.txt"]"#,
-    );
-    let invoke = |args: &[&str]| {
-        scenario.output(args, |command| {
-            command.env("TEST_OPENAI_KEY", "matrix-secret");
-        })
-    };
-
-    let first = invoke(&["--json", "run", "exercise the durable tool queue"]);
-    let run_id = waiting_run_id(&first);
-    let pending = pending_effect(&scenario, &run_id);
-    assert_eq!(pending["request_id"], "matrix-write");
-    assert!(!scenario.root().join("work/generated.txt").exists());
-    assert_eq!(provider.requests().len(), 1);
-
-    let second = invoke(&["--json", "resume", &run_id, "--allow"]);
-    assert_eq!(waiting_run_id(&second), run_id);
-    assert_eq!(
-        std::fs::read_to_string(scenario.root().join("work/generated.txt")).unwrap(),
-        "created-by-matrix\n"
-    );
-    let pending = pending_effect(&scenario, &run_id);
-    assert_eq!(pending["request_id"], "matrix-process");
-    assert_eq!(provider.requests().len(), 1);
-
-    let third = invoke(&["--json", "resume", &run_id, "--allow"]);
-    assert_eq!(waiting_run_id(&third), run_id);
-    assert!(
-        pending_effect(&scenario, &run_id)["request_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("verify-")
-    );
-    assert!(provider.wait_for_calls(2, Duration::from_secs(1)));
-    provider.assert_consumed();
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    let results = tool_messages(&requests[1].body);
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0]["tool_call_id"], "matrix-read");
-    assert!(
-        results[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("fixture-before")
-    );
-    assert_eq!(results[1]["tool_call_id"], "matrix-write");
-    assert_eq!(results[2]["tool_call_id"], "matrix-process");
-    let process_result = results[2]["content"].as_str().unwrap();
-    for expected in [
-        "env-ok",
-        "stderr",
-        "\"exit_code\":7",
-        "\"stdout_truncated\":true",
-        "\"stderr_truncated\":true",
-    ] {
-        assert!(
-            process_result.contains(expected),
-            "missing {expected} in {process_result}"
-        );
-    }
-
-    let fourth = invoke(&["--json", "resume", &run_id, "--allow"]);
-    assert!(
-        fourth.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&fourth.stdout),
-        String::from_utf8_lossy(&fourth.stderr)
-    );
-    assert_eq!(json(&fourth)["status"], "completed");
-    assert_eq!(
-        json(&fourth)["data"]["run"]["handoff"]["summary"],
-        "matrix queue and verification complete"
-    );
-    assert_eq!(
-        json(&fourth)["data"]["run"]["handoff"]["evidence"][0]["status"],
-        "passed"
-    );
-
-    let repeated = invoke(&["--json", "resume", &run_id, "--allow"]);
-    assert_eq!(repeated.status.code(), Some(1));
-    assert_eq!(provider.requests().len(), 2);
 }
 
 #[test]
@@ -504,10 +383,7 @@ fn fragmented_sse_tool_call_executes_and_reenters_stream_with_ordered_history() 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        json(&output)["data"]["run"]["handoff"]["summary"],
-        "stream tool complete"
-    );
+    assert_eq!(assistant_text(&output), "stream tool complete");
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -630,12 +506,12 @@ fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+        assert_eq!(
+            json(&output)["data"]["session"]["runs"][0]["status"],
+            "failed"
+        );
         assert!(
-            json(&output)["data"]["run"]["failure"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected),
+            failure_text(&output).contains(expected),
             "{}",
             json(&output)
         );

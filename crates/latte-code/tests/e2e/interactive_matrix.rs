@@ -69,13 +69,16 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
     assert!(wait_until(INSTRUMENTED_WAIT, || {
         let listed = scenario.output(&["--json", "list"], |_| {});
         listed.status.success()
-            && json(&listed)["data"]["runs"]
+            && json(&listed)["data"]["sessions"]
                 .as_array()
-                .is_some_and(|runs| {
-                    runs.iter()
-                        .filter(|run| run["status"] == "completed")
-                        .count()
-                        == 2
+                .is_some_and(|sessions| {
+                    sessions.len() == 1
+                        && sessions[0]["runs"].as_array().is_some_and(|runs| {
+                            runs.iter()
+                                .filter(|run| run["status"] == "completed")
+                                .count()
+                                == 2
+                        })
                 })
     }));
     provider.assert_consumed();
@@ -146,11 +149,11 @@ fn ctrl_c_during_provider_wait_interrupts_cleanly_and_restart_never_reenters() {
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert!(
-        json(&listed)["data"]["runs"]
+        json(&listed)["data"]["sessions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|run| run["status"] == "interrupted")
+            .any(|session| session["lifecycle"] == "interrupted")
     );
     let thread_id = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -223,10 +226,14 @@ fn edit_observed_failure_reaches_provider_then_verifies_without_mutation() {
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert!(
-        json(&listed)["data"]["runs"]
+        json(&listed)["data"]["sessions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|run| run["status"] == "completed")
+            .any(|session| {
+                session["runs"]
+                    .as_array()
+                    .is_some_and(|runs| runs.iter().any(|run| run["status"] == "completed"))
+            })
     );
 }

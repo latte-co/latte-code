@@ -1756,7 +1756,10 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
 
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 2);
+    let listed_json = json(&listed);
+    let sessions = listed_json["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["runs"].as_array().unwrap().len(), 2);
 
     let jsonl_engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -2141,23 +2144,25 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     drop(engine);
     input_tui.write(CTRL_C);
     assert!(wait_until(Duration::from_secs(5), || {
-        let shown = scenario.output(&["--json", "show", &input_run_id.to_string()], |_| {});
-        shown.status.code() == Some(1)
-            && json(&shown)["data"]["run"]["status"] == "failed"
-            && json(&shown)["data"]["run"]["failure"]["code"] == "cancelled"
+        let shown = scenario.output(&["--json", "show", &input_thread_id.to_string()], |_| {});
+        shown.status.success()
+            && json(&shown)["data"]["session"]["lifecycle"] == "failed"
+            && json(&shown)["data"]["session"]["runs"]
+                .as_array()
+                .is_some_and(|runs| runs.iter().any(|run| run["failure_code"] == "cancelled"))
     }));
     input_tui.write(F10);
     assert!(input_tui.finish(Duration::from_secs(5)).0.success());
-    let input_shown = scenario.output(&["--json", "show", &input_run_id.to_string()], |_| {});
-    assert_eq!(input_shown.status.code(), Some(1));
+    let input_shown = scenario.output(&["--json", "show", &input_thread_id.to_string()], |_| {});
+    assert!(input_shown.status.success());
     assert_eq!(
-        json(&input_shown)["data"]["run"]["failure"]["code"],
+        json(&input_shown)["data"]["session"]["runs"][0]["failure_code"],
         "cancelled"
     );
     let input_listed = scenario.output(&["--json", "list"], |_| {});
     assert!(input_listed.status.success());
     assert_eq!(
-        json(&input_listed)["data"]["runs"]
+        json(&input_listed)["data"]["sessions"]
             .as_array()
             .unwrap()
             .len(),
@@ -2217,25 +2222,44 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     drop(engine);
     permission_tui.write(b"d");
     assert!(wait_until(Duration::from_secs(5), || {
-        let shown = scenario.output(&["--json", "show", &permission_run_id.to_string()], |_| {});
-        shown.status.code() == Some(11)
-            && json(&shown)["data"]["run"]["status"] == "failed"
-            && json(&shown)["data"]["run"]["failure"]["code"] == "permission_denied"
+        let shown = scenario.output(
+            &["--json", "show", &permission_thread_id.to_string()],
+            |_| {},
+        );
+        shown.status.success()
+            && json(&shown)["data"]["session"]["runs"]
+                .as_array()
+                .is_some_and(|runs| {
+                    runs.iter().any(|run| {
+                        run["status"] == "failed" && run["failure_code"] == "permission_denied"
+                    })
+                })
     }));
     assert!(!scenario.root().join("must-not-exist.txt").exists());
     permission_tui.write(F10);
     assert!(permission_tui.finish(Duration::from_secs(5)).0.success());
 
-    let shown = scenario.output(&["--json", "show", &permission_run_id.to_string()], |_| {});
-    assert_eq!(shown.status.code(), Some(11));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "failed");
+    let shown = scenario.output(
+        &["--json", "show", &permission_thread_id.to_string()],
+        |_| {},
+    );
+    assert!(shown.status.success());
+    // Denial terminalizes the child run but returns the conversation to Ready.
+    assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "ready");
     assert_eq!(
-        json(&shown)["data"]["run"]["failure"]["code"],
+        json(&shown)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
+    assert_eq!(
+        json(&shown)["data"]["session"]["runs"][0]["failure_code"],
         "permission_denied"
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json(&listed)["data"]["sessions"].as_array().unwrap().len(),
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -2480,37 +2504,62 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
 
-    for (id, code, status, message) in [
-        (
-            effect_run_id,
-            Some(1),
-            "failed",
-            Some("boundary observed effect failed"),
-        ),
-        (parent_run_id, Some(0), "completed", None),
-        (interrupted_run_id, Some(130), "interrupted", None),
-        (
-            verification_run_id,
-            Some(1),
-            "failed",
-            Some("boundary verification failed with exit 9"),
-        ),
-    ] {
-        let shown = scenario.output(&["--json", "show", &id.to_string()], |_| {});
-        assert_eq!(shown.status.code(), code);
-        assert_eq!(json(&shown)["data"]["run"]["status"], status);
-        if let Some(message) = message {
-            assert_eq!(json(&shown)["data"]["run"]["failure"]["message"], message);
-        }
-    }
-    let parent_shown = scenario.output(&["--json", "show", &parent_run_id.to_string()], |_| {});
-    assert_eq!(
-        json(&parent_shown)["data"]["run"]["handoff"]["summary"],
-        "boundary parent completed"
+    let effect_shown = scenario.output(&["--json", "show", &effect_thread_id.to_string()], |_| {});
+    assert!(effect_shown.status.success());
+    let effect_session = json(&effect_shown)["data"]["session"].clone();
+    assert_eq!(effect_session["lifecycle"], "failed");
+    assert_eq!(effect_session["runs"][0]["status"], "failed");
+    assert!(
+        effect_session["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "failure"
+                && entry["text"] == "boundary observed effect failed")
     );
+
+    let tree_shown = scenario.output(&["--json", "show", &tree_thread_id.to_string()], |_| {});
+    assert!(tree_shown.status.success());
+    let tree_session = json(&tree_shown)["data"]["session"].clone();
+    assert_eq!(tree_session["lifecycle"], "interrupted");
+    let tree_runs = tree_session["runs"].as_array().unwrap();
+    assert_eq!(tree_runs.len(), 2);
+    assert_eq!(tree_runs[0]["run_id"], parent_run_id.to_string());
+    assert_eq!(tree_runs[0]["status"], "completed");
+    assert_eq!(tree_runs[1]["run_id"], interrupted_run_id.to_string());
+    assert_eq!(tree_runs[1]["status"], "interrupted");
+    assert!(
+        tree_session["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "completion"
+                && entry["text"] == "boundary parent completed")
+    );
+
+    let verification_shown = scenario.output(
+        &["--json", "show", &verification_thread_id.to_string()],
+        |_| {},
+    );
+    assert!(verification_shown.status.success());
+    let verification_session = json(&verification_shown)["data"]["session"].clone();
+    assert_eq!(verification_session["lifecycle"], "failed");
+    assert_eq!(verification_session["runs"][0]["status"], "failed");
+    assert!(
+        verification_session["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "failure"
+                && entry["text"] == "boundary verification failed with exit 9")
+    );
+
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        json(&listed)["data"]["sessions"].as_array().unwrap().len(),
+        3
+    );
 }
 
 #[cfg(unix)]
@@ -2724,19 +2773,23 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
             .any(|entry| entry.text == "expired owner must not persist")
     );
 
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
-    assert_eq!(shown.status.code(), Some(70));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "running");
+    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    assert!(shown.status.success());
+    let session = json(&shown)["data"]["session"].clone();
+    assert_eq!(session["lifecycle"], "running");
     assert_eq!(
-        json(&shown)["data"]["run"]["revision"],
+        session["runs"][0]["run_revision"],
         authoritative_run_revision
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    let listed_runs = json(&listed)["data"]["runs"].as_array().unwrap().clone();
-    assert_eq!(listed_runs.len(), 1);
-    assert_eq!(listed_runs[0]["run_id"], run_id.to_string());
-    assert_eq!(listed_runs[0]["status"], "running");
+    let listed_sessions = json(&listed)["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(listed_sessions.len(), 1);
+    assert_eq!(listed_sessions[0]["thread_id"], thread_id.to_string());
+    assert_eq!(listed_sessions[0]["lifecycle"], "running");
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
@@ -2946,17 +2999,16 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
             })
     );
 
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
-    assert_eq!(shown.status.code(), Some(70));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "running");
+    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    assert!(shown.status.success());
+    assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "running");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        json(&listed)["data"]["runs"][0]["run_id"],
-        run_id.to_string()
-    );
-    assert_eq!(json(&listed)["data"]["runs"][0]["status"], "running");
+    let listed_json = json(&listed);
+    let listed_sessions = listed_json["data"]["sessions"].as_array().unwrap();
+    assert_eq!(listed_sessions.len(), 1);
+    assert_eq!(listed_sessions[0]["thread_id"], thread_id.to_string());
+    assert_eq!(listed_sessions[0]["lifecycle"], "running");
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
@@ -3384,19 +3436,31 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     engine.release_lease(&wrong_scope).unwrap();
     drop(engine);
 
-    let parent = scenario.output(&["--json", "show", &parent_run_id.to_string()], |_| {});
-    assert!(parent.status.success());
-    assert_eq!(json(&parent)["data"]["run"]["status"], "completed");
-    assert_eq!(
-        json(&parent)["data"]["run"]["handoff"]["summary"],
-        "atomic parent completed"
+    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    assert!(shown.status.success());
+    let session = json(&shown)["data"]["session"].clone();
+    assert_eq!(session["lifecycle"], "interrupted");
+    let runs = session["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["run_id"], parent_run_id.to_string());
+    assert_eq!(runs[0]["status"], "completed");
+    assert_eq!(runs[1]["run_id"], follow_up_id.to_string());
+    assert_eq!(runs[1]["status"], "interrupted");
+    assert!(
+        session["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["kind"] == "completion" && entry["text"] == "atomic parent completed"
+            )
     );
-    let child = scenario.output(&["--json", "show", &follow_up_id.to_string()], |_| {});
-    assert_eq!(child.status.code(), Some(130));
-    assert_eq!(json(&child)["data"]["run"]["status"], "interrupted");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        json(&listed)["data"]["sessions"].as_array().unwrap().len(),
+        3
+    );
 }
 
 #[test]
@@ -3531,19 +3595,27 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     engine.release_lease(&wrong_scope).unwrap();
     drop(engine);
 
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
-    assert_eq!(shown.status.code(), Some(1));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "failed");
+    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    assert!(shown.status.success());
+    let session = json(&shown)["data"]["session"].clone();
+    assert_eq!(session["lifecycle"], "failed");
     assert!(
-        json(&shown)["data"]["run"]["failure"]["message"]
-            .as_str()
+        session["transcript"]["entries"]
+            .as_array()
             .unwrap()
-            .contains("acknowledged failed")
+            .iter()
+            .any(|entry| entry["kind"] == "failure"
+                && entry["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("acknowledged failed"))
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(json(&listed)["data"]["runs"][0]["status"], "failed");
+    let listed_json = json(&listed);
+    let listed_sessions = listed_json["data"]["sessions"].as_array().unwrap();
+    assert_eq!(listed_sessions.len(), 1);
+    assert_eq!(listed_sessions[0]["lifecycle"], "failed");
 }
 
 #[tokio::test]
@@ -3697,12 +3769,15 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
     assert_eq!(closed_legacy.try_recv(), Err(SubscriptionError::Closed));
     assert_eq!(closed_threads.try_recv(), Err(SubscriptionError::Closed));
 
-    let shown = scenario.output(&["--json", "show", &thread_run_id.to_string()], |_| {});
-    assert_eq!(shown.status.code(), Some(130));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "interrupted");
+    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    assert!(shown.status.success());
+    assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "interrupted");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 42);
+    assert_eq!(
+        json(&listed)["data"]["sessions"].as_array().unwrap().len(),
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -4051,7 +4126,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
 
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 11);
+    assert_eq!(
+        json(&listed)["data"]["sessions"].as_array().unwrap().len(),
+        11
+    );
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
     tui.write(format!("/resume {shell_process_thread_id}\r").as_bytes());

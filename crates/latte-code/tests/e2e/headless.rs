@@ -13,11 +13,11 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
     let json_help = isolated_output(&["--json", "--help"], |_, _| {});
     assert!(json_help.status.success());
     assert_eq!(json(&json_help)["status"], "completed");
-    assert_eq!(json(&json_help)["version"], 1);
+    assert_eq!(json(&json_help)["version"], 2);
 
     let list = isolated_output(&["--json", "list"], |_, _| {});
     assert!(list.status.success());
-    assert_eq!(json(&list)["data"]["runs"], serde_json::json!([]));
+    assert_eq!(json(&list)["data"]["sessions"], serde_json::json!([]));
 
     let missing = isolated_output(
         &["--json", "show", "01900000-0000-7000-8000-000000000001"],
@@ -26,7 +26,7 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
         },
     );
     assert_eq!(missing.status.code(), Some(4));
-    assert_eq!(json(&missing)["error"]["code"], "run_not_found");
+    assert_eq!(json(&missing)["error"]["code"], "not_found");
     let missing_text = isolated_output(
         &["show", "01900000-0000-7000-8000-000000000002"],
         |scenario, _| {
@@ -34,7 +34,7 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
         },
     );
     assert_eq!(missing_text.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&missing_text.stderr).contains("was not found"));
+    assert!(String::from_utf8_lossy(&missing_text.stderr).contains("session not found"));
 
     let invalid = isolated_output(&["--json", "show", "not-a-run"], |_, _| {});
     assert_eq!(invalid.status.code(), Some(2));
@@ -42,7 +42,7 @@ fn help_list_show_and_usage_have_stable_envelopes_and_exits() {
 
     let unknown = isolated_output(&["wat"], |_, _| {});
     assert_eq!(unknown.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&unknown.stderr).contains("expected:"));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown command"));
 }
 
 #[test]
@@ -59,26 +59,26 @@ fn text_mode_run_show_and_list_preserve_the_user_visible_summary() {
     });
     assert!(run.status.success());
     let rendered = String::from_utf8(run.stdout).unwrap();
-    assert!(rendered.contains(": Completed (revision "));
+    assert!(rendered.contains(": completed (revision "));
     assert!(rendered.contains("plain-text handoff"));
-    let run_id = rendered
+    let session_id = rendered
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .map(|value| value.trim_end_matches(':'))
         .unwrap();
 
-    let shown = scenario.output(&["show", run_id], |_| {});
+    let shown = scenario.output(&["show", session_id], |_| {});
     assert!(shown.status.success());
     let shown = String::from_utf8(shown.stdout).unwrap();
-    assert!(shown.contains(&format!("run {run_id}: Completed")));
+    assert!(shown.contains(&format!("session {session_id}: completed")));
     assert!(shown.contains("plain-text handoff"));
 
     let listed = scenario.output(&["list"], |_| {});
     assert!(listed.status.success());
     let listed = String::from_utf8(listed.stdout).unwrap();
-    assert!(listed.contains(run_id));
-    assert!(listed.contains("Completed"));
+    assert!(listed.contains(session_id));
+    assert!(listed.contains("ready"));
     provider.assert_consumed();
 }
 
@@ -97,7 +97,7 @@ fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_thread_bud
             std::fs::write(scenario.root().join(".latte/latte-code.jsonc"), config).unwrap();
         });
         assert_eq!(output.status.code(), Some(2));
-        assert_eq!(json(&output)["error"]["code"], "configuration");
+        assert_eq!(json(&output)["error"]["code"], "usage");
         assert!(
             json(&output)["error"]["message"]
                 .as_str()
@@ -134,7 +134,7 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         std::fs::create_dir_all(scenario.root().join(".latte/latte-code.jsonc")).unwrap();
     });
     assert_eq!(unreadable_config.status.code(), Some(2));
-    assert_eq!(json(&unreadable_config)["error"]["code"], "configuration");
+    assert_eq!(json(&unreadable_config)["error"]["code"], "usage");
     assert!(
         json(&unreadable_config)["error"]["message"]
             .as_str()
@@ -147,10 +147,7 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         command.env("LATTE_CODE_HOME", scenario.root().join("blocked-parent"));
     });
     assert_eq!(blocked_database_parent.status.code(), Some(70));
-    assert_eq!(
-        json(&blocked_database_parent)["error"]["code"],
-        "database_directory"
-    );
+    assert_eq!(json(&blocked_database_parent)["error"]["code"], "internal");
     assert!(
         json(&blocked_database_parent)["error"]["message"]
             .as_str()
@@ -165,10 +162,7 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         command.env("LATTE_CODE_HOME", storage_home);
     });
     assert_eq!(database_is_directory.status.code(), Some(70));
-    assert_eq!(
-        json(&database_is_directory)["error"]["code"],
-        "engine_initialization"
-    );
+    assert_eq!(json(&database_is_directory)["error"]["code"], "internal");
     assert!(
         json(&database_is_directory)["error"]["message"]
             .as_str()
@@ -183,10 +177,13 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         )
         .unwrap();
     });
-    assert_eq!(invalid_legacy_database.status.code(), Some(70));
-    assert_eq!(
-        json(&invalid_legacy_database)["error"]["code"],
-        "legacy_import"
+    assert_eq!(invalid_legacy_database.status.code(), Some(2));
+    assert_eq!(json(&invalid_legacy_database)["error"]["code"], "usage");
+    assert!(
+        json(&invalid_legacy_database)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("legacy import")
     );
 }
 
@@ -238,26 +235,12 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
     let missing = isolated_output(&["--json", "run", "do work"], |scenario, _| {
         scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     });
-    assert_eq!(missing.status.code(), Some(2));
-    assert_eq!(json(&missing)["error"]["code"], "configuration");
-    assert!(
-        json(&missing)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("TEST_OPENAI_KEY")
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(json(&missing)["status"], "failed");
+    assert_eq!(
+        json(&missing)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
-
-    let missing_deny = isolated_output(
-        &[
-            "--json",
-            "resume",
-            "01900000-0000-7000-8000-000000000001",
-            "--deny",
-        ],
-        |_, _| {},
-    );
-    assert_eq!(missing_deny.status.code(), Some(4));
-    assert_eq!(json(&missing_deny)["error"]["code"], "run_not_found");
 
     let empty_database = isolated_output(&["--json", "list"], |scenario, _| {
         scenario.write_config_with_database("http://127.0.0.1:1", r#"["/usr/bin/true"]"#, "  ");
@@ -296,7 +279,10 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
     });
     assert_eq!(transport.status.code(), Some(1));
     assert_eq!(json(&transport)["status"], "failed");
-    assert_eq!(json(&transport)["data"]["run"]["status"], "failed");
+    assert_eq!(
+        json(&transport)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
     let database = std::fs::read(scenario.database_path()).unwrap();
     assert_secret_absent(
         secret,
@@ -307,16 +293,14 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
         ],
     );
 
-    let missing_name = "TEST_OPENAI_KEY";
     let output = isolated_output(&["--json", "run", "do work"], |scenario, _| {
         scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
     });
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        json(&output)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains(missing_name)
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json(&output)["status"], "failed");
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
 }
 
@@ -336,7 +320,7 @@ fn scripted_provider_read_only_completion_checks_the_production_wire_contract() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(json(&output)["status"], "completed");
-    assert!(json(&output)["data"]["run"]["pending_permission"].is_null());
+    assert!(json(&output)["data"]["session"]["pending"].is_null());
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("existing.txt")).unwrap(),
         "unchanged\n"

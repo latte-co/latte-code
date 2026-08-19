@@ -7,9 +7,7 @@ use latte_core::{
     redact_thread_text, redact_thread_value, valid_openai_chat_input_request_id,
     valid_openai_chat_opaque_id, valid_openai_chat_tool_call_id,
 };
-use latte_headless::{
-    HeadlessCommand, context, parse, registry::ProviderRegistry, render_placeholder,
-};
+use latte_headless::{context, registry::ProviderRegistry};
 use latte_tui::command::{SlashResolution, resolve_slash, slash_suggestions};
 use std::path::Path;
 
@@ -341,42 +339,6 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     }
 
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
-    let engine = latte_engine::EngineBuilder::new()
-        .workspace_root(scenario.root())
-        .database_path(scenario.database_path())
-        .build()
-        .unwrap();
-    assert_eq!(
-        parse(&["run".into(), "--focus".into()]),
-        Err("--focus requires a path".into())
-    );
-    assert!(parse(&["run".into(), "fix".into(), "--focus".into()]).is_err());
-    assert!(parse(&["run".into()]).is_err());
-    assert!(render_placeholder(&HeadlessCommand::List, &engine).contains("No runs"));
-    assert!(
-        render_placeholder(
-            &HeadlessCommand::Run {
-                prompt: "x".into(),
-                focus: None,
-            },
-            &engine,
-        )
-        .contains("not implemented")
-    );
-    assert!(
-        render_placeholder(&HeadlessCommand::Show { run_id: run_id() }, &engine).contains("lookup")
-    );
-    assert!(
-        render_placeholder(
-            &HeadlessCommand::Resume {
-                run_id: run_id(),
-                allow: true
-            },
-            &engine
-        )
-        .contains("resume")
-    );
-    drop(engine);
     assert!(
         scenario
             .output(&["--json", "list"], |_| {})

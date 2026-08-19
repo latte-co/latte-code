@@ -1,5 +1,5 @@
-use super::support::{Scenario, json};
-use latte_core::{RunId, RunStatus, Transition};
+use super::support::Scenario;
+use latte_core::{RunId, RunStatus, Transition, VerificationStatus};
 use latte_engine::{
     CancellationToken, EffectStatus, EngineHandle, Lease, ProcessError, ProcessInvocation,
     ProcessTermination,
@@ -23,16 +23,6 @@ fn fixture_engine(scenario: &Scenario) -> EngineHandle {
         .database_path(scenario.database_path())
         .build()
         .unwrap()
-}
-
-fn final_show(scenario: &Scenario, run_id: RunId) -> serde_json::Value {
-    let output = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
-    assert!(
-        !output.stdout.is_empty(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    json(&output)["data"]["run"].clone()
 }
 
 fn invocation<'a>(
@@ -289,12 +279,10 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
             now + 14,
         )
         .unwrap();
-    let completed = final_show(&scenario, run_id);
-    assert_eq!(
-        completed["status"],
-        serde_json::to_value(RunStatus::Completed).unwrap()
-    );
-    assert_eq!(completed["handoff"]["summary"], "process boundary verified");
-    assert_eq!(completed["handoff"]["evidence"][0]["status"], "passed");
+    let completed = engine.show(run_id).unwrap();
+    assert_eq!(completed.status, RunStatus::Completed);
+    let handoff = completed.handoff.expect("completed run must have handoff");
+    assert_eq!(handoff.summary, "process boundary verified");
+    assert_eq!(handoff.evidence[0].status, VerificationStatus::Passed);
     engine.release_lease(&lease).unwrap();
 }

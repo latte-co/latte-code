@@ -1722,4 +1722,175 @@ mod tests {
                 .unwrap()
         );
     }
+
+    // -- Pure helper coverage ------------------------------------------------
+
+    #[test]
+    fn digest_is_stable_and_hex() {
+        let argv = vec!["/bin/echo".into(), "hello".into()];
+        let env = BTreeMap::from([("KEY".into(), "value".into())]);
+        let invocation = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 5000,
+            grace_ms: 100,
+            stdout_cap: 65536,
+            stderr_cap: 1024,
+            run_revision: 1,
+            effect_id: "effect-1",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "owner",
+            lease_token: 42,
+        };
+        let d1 = digest(&invocation);
+        let d2 = digest(&invocation);
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 64);
+        assert!(d1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn group_pid_converts_u32_to_pid() {
+        let pid = group_pid(12345).unwrap();
+        assert_eq!(pid, nix::unistd::Pid::from_raw(12345));
+    }
+
+    #[test]
+    fn storage_maps_error_to_supervision() {
+        let error = crate::StorageError::InvalidData("test".into());
+        let mapped = storage(error);
+        match mapped {
+            ProcessError::Supervision(msg) => assert!(msg.contains("test")),
+            other => panic!("expected Supervision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supervise_git_diff_works_in_temp_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        // Initialize a git repo with a committed file.
+        std::fs::write(repo.join("file.txt"), "content\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        // Modify the file to produce a diff.
+        std::fs::write(repo.join("file.txt"), "modified content\n").unwrap();
+        let (output, truncated) = supervise_git_diff(repo, 65536).unwrap();
+        assert!(!output.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn supervise_git_changed_files_lists_modified_and_untracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("tracked.txt"), "content\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        // Modify tracked + add untracked.
+        std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        let (output, _truncated) = supervise_git_changed_files(repo, 65536).unwrap();
+        assert!(output.contains("tracked.txt"));
+        assert!(output.contains("untracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn drain_reads_until_eof_and_truncates() {
+        let data = b"hello world";
+        let (output, truncated) = drain(&data[..], 100).await.unwrap();
+        assert_eq!(output, "hello world");
+        assert!(!truncated);
+        // Truncation when cap is smaller than data.
+        let (output, truncated) = drain(&data[..], 5).await.unwrap();
+        assert_eq!(output, "hello");
+        assert!(truncated);
+        // Empty input.
+        let (output, truncated) = drain(&b""[..], 100).await.unwrap();
+        assert_eq!(output, "");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn group_probe_returns_override() {
+        assert_eq!(
+            group_probe(99999, Some(GroupProbe::Present)).unwrap(),
+            GroupProbe::Present
+        );
+        assert_eq!(
+            group_probe(99999, Some(GroupProbe::Absent)).unwrap(),
+            GroupProbe::Absent
+        );
+        assert_eq!(
+            group_probe(99999, Some(GroupProbe::Uncertain)).unwrap(),
+            GroupProbe::Uncertain
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_group_succeeds_when_already_absent() {
+        // probe_override=Absent means the group is already gone → immediate success.
+        shutdown_group(99999, 10, Some(GroupProbe::Absent))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_group_fails_when_uncertain() {
+        let result = shutdown_group(99999, 10, Some(GroupProbe::Uncertain)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn await_group_absent_returns_true_when_absent() {
+        let result = await_group_absent(99999, 10, Some(GroupProbe::Absent))
+            .await
+            .unwrap();
+        assert!(result);
+    }
 }
