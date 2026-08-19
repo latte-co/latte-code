@@ -1713,14 +1713,11 @@ mod tests {
 
     #[test]
     fn tui_setup_reports_configuration_error_for_invalid_config() {
-        // Create a temp dir with an invalid config file, then chdir into it.
+        // Create a temp dir with an invalid config file, then set HOME to it.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
         std::fs::write(dir.path().join(".latte/latte-code.jsonc"), "{invalid json").unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let result = tui_setup();
-        std::env::set_current_dir(&original).unwrap();
+        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], tui_setup);
         assert!(result.is_err());
         assert_eq!(result.err().unwrap(), EXIT_USAGE);
     }
@@ -1730,8 +1727,6 @@ mod tests {
         // With LATTE_CODE_HOME set to an empty string, storage_home() fails
         // and tui_setup returns EXIT_USAGE from the database_path branch.
         let dir = tempfile::tempdir().unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
         let result = temp_env::with_vars(
             [
                 ("HOME", Some(dir.path().as_os_str())),
@@ -1739,7 +1734,6 @@ mod tests {
             ],
             tui_setup,
         );
-        std::env::set_current_dir(&original).unwrap();
         assert!(result.is_err());
         assert_eq!(result.err().unwrap(), EXIT_USAGE);
     }
