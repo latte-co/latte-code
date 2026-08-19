@@ -2934,4 +2934,184 @@ mod tests {
             1
         );
     }
+
+    // ------------------------------------------------------------------
+    // Session command coverage (execute_session_command / _inner)
+    // ------------------------------------------------------------------
+
+    /// Starts a minimal HTTP mock server. `handler` receives (method, path)
+    /// and returns (status, content_type, body). One request per connection.
+    fn start_session_mock_server<F>(mut handler: F) -> (String, std::thread::JoinHandle<()>)
+    where
+        F: FnMut(&str, &str) -> (u16, String, String) + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else { continue };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                let (status, content_type, body) = handler(method, path);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// A terminal-ready snapshot JSON for mock server responses.
+    fn terminal_snapshot_json(thread_id: &str, run_id: &str) -> String {
+        format!(
+            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":null,"runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_rejects_unknown_subcommand() {
+        let args = vec!["bogus".to_string()];
+        let code = super::execute_session_command(true, &args).await;
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn execute_session_command_reports_unreachable_server() {
+        let temp = tempfile::tempdir().unwrap();
+        temp_env::with_vars(
+            [("LATTE_CODE_HOME", Some(temp.path().as_os_str()))],
+            || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let args = vec![
+                        "list".to_string(),
+                        "--server".to_string(),
+                        "http://127.0.0.1:0".to_string(),
+                        "--token".to_string(),
+                        "dummy".to_string(),
+                    ];
+                    let code = super::execute_session_command(true, &args).await;
+                    assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+                });
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_list_returns_sessions() {
+        let (url, _handle) = start_session_mock_server(|method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"sessions":[]}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_show_returns_snapshot() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Show {
+            session_id: thread_id,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_run_completes() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/bindings" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"bindings":[{"is_default":true,"binding":{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}}]}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":1}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Run {
+            prompt: "hello".to_string(),
+            focus: None,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
 }

@@ -4337,3 +4337,81 @@ fn final_binary_cli_run_with_server_error_workspace_response_fails() {
     assert!(!output.status.success());
     assert_eq!(json(&output)["error"]["code"], "internal");
 }
+
+#[test]
+fn final_binary_cli_list_with_server_error_fails() {
+    // GET /v1/workspaces returns 500 → map_error_status → Internal.
+    let (url, _handle) = start_healthy_mock_server(|_method, _path| {
+        (
+            500,
+            "application/json".into(),
+            "{\"error\":{\"message\":\"boom\"}}".into(),
+        )
+    });
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "list", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "internal");
+}
+
+#[test]
+fn final_binary_cli_show_with_invalid_session_id_reports_usage() {
+    // A non-UUID session id is a usage error from parse_session_id.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &["--json", "show", "not-a-uuid"],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_resume_with_invalid_session_id_reports_usage() {
+    // A non-UUID session id is a usage error from parse_session_id.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &["--json", "resume", "not-a-uuid", "hello"],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_run_without_prompt_reports_usage() {
+    // run requires a prompt; missing it is a usage error.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &["--json", "run"],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_list_with_unhealthy_server_reports_unreachable() {
+    // health_check returns non-success → connect fails with Unreachable.
+    let (url, _handle) =
+        start_error_mock_server(|_method, _path| (500, "application/json".into(), String::new()));
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &[
+            "--json", "list", "--server", &url, "--token", "dummy",
+        ],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "server_unreachable");
+}
