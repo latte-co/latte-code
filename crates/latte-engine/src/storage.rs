@@ -3868,6 +3868,7 @@ impl Storage {
         tx.commit()?;
         Ok(LeaseLossRecovery::Interrupted(state))
     }
+    #[cfg(test)]
     pub(crate) fn reconcile_unknown_and_abort(
         &self,
         run_id: RunId,

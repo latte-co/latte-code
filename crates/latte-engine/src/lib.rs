@@ -2207,6 +2207,7 @@ impl EngineHandle {
             .interrupt_after_lease_loss(run_id, stale, expected_revision, now_ms)
     }
     /// Atomically reconciles one run-owned unknown effect and aborts that exact run.
+    #[cfg(test)]
     pub fn resolve_unknown_effect_and_abort(
         &self,
         run_id: RunId,
