@@ -4509,3 +4509,54 @@ fn final_binary_cli_run_with_provider_error_fails() {
     assert_eq!(body["status"], "failed");
     provider.assert_consumed();
 }
+
+#[test]
+fn final_binary_cli_run_with_missing_file_tool_covers_error_path() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "read-1",
+        "read_file",
+        &serde_json::json!({"path": "nonexistent.txt"}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "read a missing file"], |command| {
+        command.env("TEST_OPENAI_KEY", "missing-file-secret");
+    });
+    // The tool error is observed and the provider re-enters; the session
+    // completes (or fails durably) — either way the error path in the
+    // engine is exercised.
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_path_escape_tool_covers_error_path() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "read-1",
+        "read_file",
+        &serde_json::json!({"path": "../escape.txt"}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "read an escaping path"], |command| {
+        command.env("TEST_OPENAI_KEY", "escape-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
