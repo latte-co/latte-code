@@ -14,11 +14,16 @@ latte-engine.workspace=true
 latte-headless={path="../latte-headless",version="0.1.0"}
 latte-server={path="../latte-server",version="0.1.0"}
 latte-tui={path="../latte-tui",version="0.1.0"}
-tokio.workspace=true
+tokio={workspace=true,features=["net"]}
 serde_json.workspace=true
 serde.workspace=true
 json5.workspace=true
 thiserror.workspace=true
+reqwest={workspace=true,features=["stream"]}
+futures="0.3"
+bytes="1"
+anyhow="1"
+uuid.workspace=true
 [dev-dependencies]
 tempfile.workspace=true
 uuid.workspace=true
@@ -27,5 +32,7 @@ nix={workspace=true,features=["term"]}
 ratatui.workspace=true
 crossterm.workspace=true
 temp-env="0.3"
+axum="0.8"
+tokio={workspace=true,features=["net","macros","rt-multi-thread"]}
 [lints]
 workspace=true

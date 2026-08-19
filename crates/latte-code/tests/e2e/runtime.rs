@@ -1,37 +1,42 @@
-use super::support::{ProviderReply, Scenario, ScriptedProvider, assert_process_group_gone, json};
+use super::recovery::{ServerChild, server_binding};
+use super::support::{ProviderReply, Scenario, ScriptedProvider, assert_process_group_gone};
 use std::time::Duration;
 
-fn run_id_from_waiting(output: &std::process::Output) -> String {
-    assert_eq!(
-        output.status.code(),
-        Some(10),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    json(output)["error"]["message"]
-        .as_str()
-        .unwrap()
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .to_owned()
-}
-
-fn run_then_allow(
+/// Drives a `process` tool call through the v2 HTTP contract: the session
+/// parks at `WaitingPermission`, the decision is `POSTed` over HTTP, and the
+/// supervised process runs to completion. Returns the server (kept alive for
+/// provider/process-group assertions), the session id, and the consumed
+/// permission coordinates (for idempotency re-decision checks).
+fn allow_process_to_completion(
     scenario: &Scenario,
     provider: &ScriptedProvider,
     prompt: &str,
-) -> (String, std::process::Output) {
+) -> (ServerChild, String, String, u64, u64) {
     scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
-    let waiting = scenario.output(&["--json", "run", prompt], |command| {
-        command.env("TEST_OPENAI_KEY", "secret");
-    });
-    let run_id = run_id_from_waiting(&waiting);
-    let completed = scenario.output(&["--json", "resume", &run_id, "--allow"], |command| {
-        command.env("TEST_OPENAI_KEY", "secret");
-    });
-    (run_id, completed)
+    let server = ServerChild::start(scenario);
+    let workspace = server.create_workspace(scenario);
+    let binding = server_binding(scenario);
+    let session_id = server.create_session(&workspace, prompt, &binding);
+    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (allow_status, allow_body) =
+        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+    assert_eq!(allow_status, 200, "allow: {allow_body:?}");
+    let terminal = server.wait_for_terminal(&session_id);
+    assert_eq!(terminal["lifecycle"], "ready");
+    assert_eq!(terminal["runs"][0]["status"], "completed");
+    (server, session_id, request_id, revision, run_revision)
+}
+
+/// Extracts the tool-result message content from the provider's second request.
+fn tool_result_content(requests: &[super::support::ProviderRequest]) -> &str {
+    requests[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
 }
 
 #[cfg(unix)]
@@ -55,36 +60,27 @@ fn legacy_process_argv_approval_preserves_bounded_dual_stream_result() {
         ProviderReply::tool_call("legacy-argv-process", "process", &process),
         ProviderReply::completion("legacy argv observed"),
     ]);
-    let (run_id, completed) = run_then_allow(&scenario, &provider, "run bounded argv");
+    let (server, session_id, request_id, revision, run_revision) =
+        allow_process_to_completion(&scenario, &provider, "run bounded argv");
 
-    assert!(
-        completed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&completed.stdout),
-        String::from_utf8_lossy(&completed.stderr)
-    );
-    assert_eq!(json(&completed)["data"]["run"]["status"], "completed");
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let result = requests[1].body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let result = tool_result_content(&requests);
     assert!(result.contains("12345"));
     assert!(result.contains("abcd"));
     assert!(result.contains("\"stdout_truncated\":true"));
     assert!(result.contains("\"stderr_truncated\":true"));
     assert!(result.contains("\"exit_code\":7"));
 
-    let repeated = scenario.output(&["--json", "resume", &run_id, "--allow"], |command| {
-        command.env("TEST_OPENAI_KEY", "secret");
-    });
-    assert_eq!(repeated.status.code(), Some(1));
+    // A repeated permission decision on the consumed request is rejected and
+    // never re-executes the effect or re-enters the provider.
+    let (repeat_status, _) =
+        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+    assert!(
+        repeat_status == 404 || repeat_status == 409,
+        "repeat permission returned {repeat_status}"
+    );
     assert_eq!(provider.requests().len(), 2);
 }
 
@@ -110,14 +106,9 @@ fn legacy_process_timeout_reaps_group_then_reenters_provider_once() {
         ProviderReply::tool_call("legacy-timeout-process", "process", &process),
         ProviderReply::completion("timeout observed"),
     ]);
-    let (_, completed) = run_then_allow(&scenario, &provider, "run timeout process");
+    let (_server, _session_id, _request_id, _revision, _run_revision) =
+        allow_process_to_completion(&scenario, &provider, "run timeout process");
 
-    assert!(
-        completed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&completed.stdout),
-        String::from_utf8_lossy(&completed.stderr)
-    );
     let pgid = std::fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -127,14 +118,7 @@ fn legacy_process_timeout_reaps_group_then_reenters_provider_once() {
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let result = requests[1].body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let result = tool_result_content(&requests);
     assert!(result.contains("timed_out"));
 }
 
@@ -165,14 +149,9 @@ fn legacy_process_exit_with_live_group_reaps_survivors_then_reenters_provider_on
         ProviderReply::tool_call("legacy-exit-live-group-process", "process", &process),
         ProviderReply::completion("exit with live group observed"),
     ]);
-    let (_, completed) = run_then_allow(&scenario, &provider, "run exit-with-live-group process");
+    let (_server, _session_id, _request_id, _revision, _run_revision) =
+        allow_process_to_completion(&scenario, &provider, "run exit-with-live-group process");
 
-    assert!(
-        completed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&completed.stdout),
-        String::from_utf8_lossy(&completed.stderr)
-    );
     let pgid = std::fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -182,14 +161,7 @@ fn legacy_process_exit_with_live_group_reaps_survivors_then_reenters_provider_on
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let result = requests[1].body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let result = tool_result_content(&requests);
     // The leader exited cleanly, so the observed outcome is a normal exit, not a
     // timeout or cancellation, even though the supervisor still reaped the group.
     assert!(result.contains("\"exit_code\":0"));
@@ -222,14 +194,9 @@ fn legacy_process_timeout_escalates_to_sigkill_when_group_ignores_sigterm() {
         ProviderReply::tool_call("legacy-sigkill-escalation-process", "process", &process),
         ProviderReply::completion("sigkill escalation observed"),
     ]);
-    let (_, completed) = run_then_allow(&scenario, &provider, "run sigkill escalation process");
+    let (_server, _session_id, _request_id, _revision, _run_revision) =
+        allow_process_to_completion(&scenario, &provider, "run sigkill escalation process");
 
-    assert!(
-        completed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&completed.stdout),
-        String::from_utf8_lossy(&completed.stderr)
-    );
     let pgid = std::fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -239,13 +206,6 @@ fn legacy_process_timeout_escalates_to_sigkill_when_group_ignores_sigterm() {
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let result = requests[1].body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let result = tool_result_content(&requests);
     assert!(result.contains("timed_out"));
 }

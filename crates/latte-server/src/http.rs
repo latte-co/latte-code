@@ -992,7 +992,7 @@ async fn list_bindings(
         .ok_or_else(|| not_found("workspace not found"))?;
     let bindings = workspace
         .bindings()
-        .map_err(|e| failed(&format!("cannot build binding catalog: {e}")))?;
+        .map_err(|e| bad_request(&format!("cannot build binding catalog: {e}")))?;
     Ok(Json(serde_json::json!({ "bindings": bindings })))
 }
 

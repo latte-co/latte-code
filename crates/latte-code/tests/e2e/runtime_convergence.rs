@@ -1,9 +1,7 @@
 use super::support::{ProviderReply, Scenario, ScriptedProvider, json};
 use serde_json::Value;
-use std::{
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::process::Command;
+use std::time::Duration;
 
 fn git(scenario: &Scenario, args: &[&str]) {
     let status = Command::new("git")
@@ -19,25 +17,6 @@ fn invoke(scenario: &Scenario, args: &[&str]) -> std::process::Output {
     scenario.output(args, |command| {
         command.env("TEST_OPENAI_KEY", "runtime-convergence-secret");
     })
-}
-
-fn waiting_run_id(output: &std::process::Output) -> String {
-    assert_eq!(
-        output.status.code(),
-        Some(10),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(json(output)["status"], "waiting");
-    assert_eq!(json(output)["error"]["code"], "permission_required");
-    json(output)["error"]["message"]
-        .as_str()
-        .unwrap()
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .to_owned()
 }
 
 fn tool_messages(request: &Value) -> Vec<&Value> {
@@ -93,7 +72,7 @@ fn assert_declares_read_only_tools(request: &Value) {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn headless_multi_round_read_only_history_converges_after_cross_process_verification_allow() {
+fn headless_multi_round_read_only_history_converges_in_one_shot() {
     let scenario = Scenario::new();
     scenario.init_git();
     std::fs::create_dir_all(scenario.root().join("src/nested")).unwrap();
@@ -171,6 +150,8 @@ fn headless_multi_round_read_only_history_converges_after_cross_process_verifica
         r#"["/bin/sh","-c","test -f notes.txt && grep -q 'needle after' notes.txt && git diff -- notes.txt | grep -q '^+round-sentinel after'"]"#,
     );
 
+    // v2: a read-only run converges in one shot — no file change means no
+    // verification permission phase, so the embedded `run` exits 0 completed.
     let first = invoke(
         &scenario,
         &[
@@ -181,37 +162,24 @@ fn headless_multi_round_read_only_history_converges_after_cross_process_verifica
             "inspect the workspace over several durable provider rounds",
         ],
     );
-    let run_id = waiting_run_id(&first);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(json(&first)["status"], "completed");
+    let session_id = json(&first)["data"]["session"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        json(&first)["data"]["session"]["runs"][0]["status"],
+        "completed"
+    );
     assert!(provider.wait_for_calls(6, Duration::from_secs(5)));
     provider.assert_consumed();
-
-    let waiting = invoke(&scenario, &["--json", "show", &run_id]);
-    assert_eq!(waiting.status.code(), Some(10));
-    assert_eq!(json(&waiting)["status"], "waiting");
-    assert_eq!(
-        json(&waiting)["data"]["run"]["status"],
-        "waiting_permission"
-    );
-    let pending = &json(&waiting)["data"]["run"]["pending_permission"];
-    assert!(
-        pending["request_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("verify-")
-    );
-    assert_eq!(pending["description"], "allow verification command");
-    assert_eq!(pending["operation_digest"].as_str().unwrap().len(), 64);
-
-    let waiting_list = invoke(&scenario, &["--json", "list"]);
-    assert!(waiting_list.status.success());
-    let waiting_runs = json(&waiting_list)["data"]["runs"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(waiting_runs.len(), 1);
-    assert_eq!(waiting_runs[0]["run_id"], run_id);
-    assert_eq!(waiting_runs[0]["status"], "waiting_permission");
-    assert_eq!(provider.requests().len(), 6);
 
     let requests = provider.requests();
     for request in &requests {
@@ -297,61 +265,35 @@ fn headless_multi_round_read_only_history_converges_after_cross_process_verifica
             .contains("runtime-convergence-fixture")
     );
 
-    let completed = invoke(&scenario, &["--json", "resume", &run_id, "--allow"]);
-    assert!(
-        completed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&completed.stdout),
-        String::from_utf8_lossy(&completed.stderr)
-    );
-    assert_eq!(json(&completed)["status"], "completed");
-    assert_eq!(json(&completed)["data"]["run"]["run_id"], run_id);
-    assert_eq!(json(&completed)["data"]["run"]["status"], "completed");
-    assert_eq!(
-        json(&completed)["data"]["run"]["handoff"]["summary"],
-        "multi-round read-only convergence verified"
-    );
-    assert_eq!(
-        json(&completed)["data"]["run"]["handoff"]["evidence"][0]["status"],
-        "passed"
-    );
-    assert_eq!(provider.requests().len(), 6);
-
-    let mut show_command = scenario.command(&["--json", "show", &run_id]);
-    let mut list_command = scenario.command(&["--json", "list"]);
-    show_command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    list_command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let show_child = show_command.spawn().unwrap();
-    let list_child = list_command.spawn().unwrap();
-    let shown = show_child.wait_with_output().unwrap();
-    let listed = list_child.wait_with_output().unwrap();
+    // The completed session is durable and visible through the v2 show/list
+    // contract (`data.session` / `data.sessions[]`).
+    let shown = invoke(&scenario, &["--json", "show", &session_id]);
     assert!(shown.status.success());
-    assert!(listed.status.success());
-    assert_eq!(json(&shown)["data"]["run"]["status"], "completed");
     assert_eq!(
-        json(&shown)["data"]["run"]["handoff"]["summary"],
-        "multi-round read-only convergence verified"
+        json(&shown)["data"]["session"]["runs"][0]["status"],
+        "completed"
     );
-    let runs = json(&listed)["data"]["runs"].as_array().unwrap().clone();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["run_id"], run_id);
-    assert_eq!(runs[0]["status"], "completed");
-    assert_eq!(provider.requests().len(), 6);
-
-    let redundant = invoke(&scenario, &["--json", "resume", &run_id, "--allow"]);
-    assert_eq!(redundant.status.code(), Some(1));
-    assert_eq!(json(&redundant)["status"], "failed");
-    assert!(
-        !json(&redundant)["error"]["message"]
-            .as_str()
+    assert_eq!(
+        json(&shown)["data"]["session"]["transcript"]["entries"]
+            .as_array()
             .unwrap()
-            .is_empty()
+            .iter()
+            .find(|entry| entry["kind"] == "completion")
+            .and_then(|entry| entry["payload"]["handoff"]["summary"].as_str()),
+        Some("multi-round read-only convergence verified")
     );
+    let listed = invoke(&scenario, &["--json", "list"]);
+    assert!(listed.status.success());
+    let listed_json = json(&listed);
+    let sessions = listed_json["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["thread_id"], session_id);
+    assert_eq!(sessions[0]["lifecycle"], "ready");
     assert_eq!(provider.requests().len(), 6);
 }
 
 #[test]
-fn headless_provider_round_limit_fails_durably_without_an_unbounded_extra_request() {
+fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_requests() {
     let scenario = Scenario::new();
     std::fs::write(
         scenario.root().join("bounded.txt"),
@@ -359,11 +301,19 @@ fn headless_provider_round_limit_fails_durably_without_an_unbounded_extra_reques
     )
     .unwrap();
     let read = serde_json::json!({"path": "bounded.txt", "max_output": 1024});
-    // Each provider tool-call response and its subsequent tool execution consume
-    // one bounded drive step, so 16 complete read-only rounds exhaust 32 steps.
-    let provider = ScriptedProvider::start((0..16).map(|index| {
-        ProviderReply::tool_call(&format!("bounded-round-{index}"), "read_file", &read)
-    }));
+    // The v2 thread runtime has no agent step limit: the loop is bounded by the
+    // provider. 16 read-only tool rounds are served, then the provider errors,
+    // which must terminate the run durably without an unbounded extra request.
+    let provider = ScriptedProvider::start(
+        (0..16)
+            .map(|index| {
+                ProviderReply::tool_call(&format!("bounded-round-{index}"), "read_file", &read)
+            })
+            .chain(std::iter::once(ProviderReply::error(
+                400,
+                "simulated bounded-round termination",
+            ))),
+    );
     scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
 
     let output = invoke(
@@ -383,29 +333,34 @@ fn headless_provider_round_limit_fails_durably_without_an_unbounded_extra_reques
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(json(&output)["status"], "failed");
-    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+    let session = &json(&output)["data"]["session"];
+    assert_eq!(session["runs"][0]["status"], "failed");
+    // The provider error is recorded durably in the transcript failure card.
     assert!(
-        json(&output)["data"]["run"]["failure"]["message"]
-            .as_str()
+        session["transcript"]["entries"]
+            .as_array()
             .unwrap()
-            .contains("agent step limit exceeded")
+            .iter()
+            .any(|entry| entry["kind"] == "failure"
+                && entry["text"].as_str().unwrap_or("").contains("provider"))
     );
     provider.assert_consumed();
     let requests = provider.requests();
-    assert_eq!(requests.len(), 16);
+    // 16 tool rounds + 1 terminating provider error, and no retry storm.
+    assert_eq!(requests.len(), 17);
     assert_eq!(tool_messages(&requests[0].body).len(), 0);
-    assert_eq!(tool_messages(&requests[15].body).len(), 15);
+    assert_eq!(tool_messages(&requests[16].body).len(), 16);
     assert_eq!(
-        assistant_tool_calls(&requests[15].body).last(),
-        Some(&("bounded-round-14", "read_file"))
+        assistant_tool_calls(&requests[16].body).last(),
+        Some(&("bounded-round-15", "read_file"))
     );
 
-    let run_id = json(&output)["data"]["run"]["run_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let shown = invoke(&scenario, &["--json", "show", &run_id]);
-    assert_eq!(shown.status.code(), Some(1));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "failed");
-    assert_eq!(provider.requests().len(), 16);
+    let session_id = session["thread_id"].as_str().unwrap().to_owned();
+    let shown = invoke(&scenario, &["--json", "show", &session_id]);
+    assert!(shown.status.success());
+    assert_eq!(
+        json(&shown)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
+    assert_eq!(provider.requests().len(), 17);
 }

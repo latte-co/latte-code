@@ -1,4 +1,4 @@
-use super::support::{Scenario, json};
+use super::support::Scenario;
 use latte_core::{
     FailureCode, IdSource, PermissionDecision, RunId, RunStatus, RuntimeCommand, SystemIdSource,
 };
@@ -121,10 +121,12 @@ fn run_from(result: CommandResult) -> Box<latte_core::RunState> {
     run
 }
 
-fn final_show(scenario: &Scenario, run_id: RunId) -> std::process::Output {
-    scenario.output(&["--json", "show", &run_id.to_string()], |command| {
-        command.env("TEST_OPENAI_KEY", "service-boundary-secret");
-    })
+/// Reads a run's durable state through a fresh engine after the service and
+/// its engine have been dropped. v2 CLI `show`/`list` only see v2 threads, but
+/// these tests drive the v1 `RuntimeCommandService` (which creates v1 runs), so
+/// durability is verified through the same durable store via a new engine.
+fn final_run_state(scenario: &Scenario, run_id: RunId) -> latte_core::RunState {
+    build_engine(scenario).show(run_id).unwrap()
 }
 
 #[cfg(unix)]
@@ -275,14 +277,10 @@ async fn public_command_service_input_cancel_actor_and_error_matrix_is_final_cli
     drop(actor);
     drop(service);
     drop(engine);
-    let shown = final_show(&scenario, run_id);
-    assert!(shown.status.success());
-    assert_eq!(json(&shown)["data"]["run"]["status"], "completed");
-    let listed = scenario.output(&["--json", "list"], |command| {
-        command.env("TEST_OPENAI_KEY", "service-boundary-secret");
-    });
-    assert!(listed.status.success());
-    assert!(json(&listed)["data"]["runs"].as_array().unwrap().len() >= 2);
+    let shown = final_run_state(&scenario, run_id);
+    assert_eq!(shown.status, RunStatus::Completed);
+    let listed = build_engine(&scenario).list().unwrap();
+    assert!(listed.len() >= 2);
 
     let cancel_scenario = Scenario::new();
     cancel_scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
@@ -326,11 +324,10 @@ async fn public_command_service_input_cancel_actor_and_error_matrix_is_final_cli
     );
     drop(cancel_service);
     drop(cancel_engine);
-    let cancelled = final_show(&cancel_scenario, cancel_id);
-    assert_eq!(cancelled.status.code(), Some(1));
+    let cancelled = final_run_state(&cancel_scenario, cancel_id);
     assert_eq!(
-        json(&cancelled)["data"]["run"]["failure"]["code"],
-        "cancelled"
+        cancelled.failure.as_ref().unwrap().code,
+        FailureCode::Cancelled
     );
 }
 
@@ -439,9 +436,8 @@ async fn public_agent_runtime_provider_capability_and_outcome_matrix_is_final_cl
             Err(RuntimeError::Engine(message)) if message.contains("1..=16384")
         ));
         runtime.cancel();
-        let listed = scenario.output(&["--json", "list"], |_| {});
-        assert!(listed.status.success());
-        assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 1);
+        let listed = build_engine(&scenario).list().unwrap();
+        assert_eq!(listed.len(), 1, "{prompt}");
     }
 
     let scenario = Scenario::new();
@@ -468,9 +464,8 @@ async fn public_agent_runtime_provider_capability_and_outcome_matrix_is_final_cl
     .unwrap();
     assert_eq!(cancelled.status, RunStatus::Interrupted);
 
-    let listed = scenario.output(&["--json", "list"], |_| {});
-    assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"].as_array().unwrap().len(), 1);
+    let listed = build_engine(&scenario).list().unwrap();
+    assert_eq!(listed.len(), 1);
 }
 
 #[cfg(unix)]
@@ -539,9 +534,8 @@ async fn public_command_service_permission_allow_and_deny_are_final_cli_visible(
 
     drop(service);
     drop(engine);
-    let allowed = final_show(&scenario, allow_id);
-    assert!(allowed.status.success());
-    assert_eq!(json(&allowed)["data"]["run"]["status"], "completed");
+    let allowed = final_run_state(&scenario, allow_id);
+    assert_eq!(allowed.status, RunStatus::Completed);
 
     let deny_scenario = Scenario::new();
     deny_scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
@@ -588,11 +582,10 @@ async fn public_command_service_permission_allow_and_deny_are_final_cli_visible(
     assert!(!deny_scenario.root().join("service-deny.txt").exists());
     drop(deny_service);
     drop(deny_engine);
-    let denied = final_show(&deny_scenario, deny_id);
-    assert_eq!(denied.status.code(), Some(11));
+    let denied = final_run_state(&deny_scenario, deny_id);
     assert_eq!(
-        json(&denied)["data"]["run"]["failure"]["code"],
-        "permission_denied"
+        denied.failure.as_ref().unwrap().code,
+        FailureCode::PermissionDenied
     );
 }
 

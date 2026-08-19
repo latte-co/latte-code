@@ -1,27 +1,21 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
-use latte_core::{
-    FailureCode, IdSource, RunState, RunStatus, SystemIdSource, ThreadId, ThreadProviderBindingV2,
-    wall_time_ms,
-};
-use latte_engine::{EngineBuilder, StorageError};
+use latte_core::{IdSource, SystemIdSource, ThreadId, ThreadProviderBindingV2, wall_time_ms};
+use latte_engine::EngineBuilder;
 use latte_headless::{
-    HeadlessCommand,
     registry::ProviderRegistry,
-    runtime::{AgentRuntime, RuntimeError, VerificationPlan},
+    runtime::VerificationPlan,
     thread::{ThreadHistoryPolicy, ThreadRuntimeService},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-const JSON_VERSION: u8 = 1;
+mod server_client;
+
+const JSON_VERSION: u8 = 2;
 const EXIT_COMPLETED: i32 = 0;
-const EXIT_FAILED: i32 = 1;
 const EXIT_USAGE: i32 = 2;
-const EXIT_NOT_FOUND: i32 = 4;
-const EXIT_WAITING: i32 = 10;
-const EXIT_DENIED: i32 = 11;
 const EXIT_INTERNAL: i32 = 70;
 const EXIT_INTERRUPTED: i32 = 130;
 const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
@@ -42,7 +36,7 @@ const DEFAULT_CONFIG: &str = r#"{
   },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] <prompt>\n  latte-code [--json] resume <run-id> (--allow|--deny)\n  latte-code [--json] show <run-id>\n  latte-code [--json] list\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] [--server url] [--token token] <prompt>\n  latte-code [--json] resume <session-id> <prompt> [--server url] [--token token]\n  latte-code [--json] show <session-id> [--server url] [--token token]\n  latte-code [--json] list [--server url] [--token token]\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. run/list/show/resume are session commands served over HTTP+SSE: by default the server is embedded in this process (random loopback port, token kept in memory); --server connects to a standalone server, reading its token from $LATTE_CODE_HOME/server.token or --token. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -422,12 +416,24 @@ async fn execute() -> i32 {
         return EXIT_COMPLETED;
     }
 
-    let command = match latte_headless::parse(&args) {
-        Ok(command) => command,
-        Err(error) => return emit_error(json, "usage", "usage", &error, EXIT_USAGE, true),
+    // run/list/show/resume are session commands served over HTTP+SSE: the
+    // server is the single engine host (embedded by default, or standalone
+    // via --server).
+    execute_session_command(json, &args).await
+}
+
+/// Executes the v2 session commands (`run`/`list`/`show`/`resume`) over
+/// HTTP+SSE. By default the server is embedded in this process on a random
+/// loopback port; `--server` connects to a standalone server instead.
+async fn execute_session_command(json: bool, args: &[String]) -> i32 {
+    let parsed = match server_client::parse_session_command(args) {
+        Ok(parsed) => parsed,
+        Err(message) => return emit_error(json, "usage", "usage", &message, EXIT_USAGE, true),
     };
+    // `--json` is accepted both as a global prefix and after the subcommand.
+    let json = json || parsed.json;
     let root = match std::env::current_dir() {
-        Ok(root) => discover_workspace_root(&root),
+        Ok(cwd) => discover_workspace_root(&cwd),
         Err(error) => {
             return emit_error(
                 json,
@@ -439,235 +445,114 @@ async fn execute() -> i32 {
             );
         }
     };
-    let (config, registry) = match AppConfig::load(&root) {
-        Ok(value) => value,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
-        }
-    };
-    let database_path = match storage_database_path() {
+    let storage_home = match storage_home() {
         Ok(path) => path,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
+        Err(message) => {
+            return emit_error(json, "usage", "configuration", &message, EXIT_USAGE, false);
         }
     };
-    let conversation_root = match storage_conversation_root() {
-        Ok(path) => path,
-        Err(error) => {
-            return emit_error(json, "usage", "configuration", &error, EXIT_USAGE, false);
-        }
-    };
-    let Some(database_parent) = database_path.parent() else {
-        return emit_error(
-            json,
-            "usage",
-            "configuration",
-            "global storage database must have a parent directory",
-            EXIT_USAGE,
-            false,
-        );
-    };
-    if let Err(error) = std::fs::create_dir_all(database_parent) {
-        return emit_error(
-            json,
-            "internal",
-            "database_directory",
-            &format!("cannot create {}: {error}", database_parent.display()),
-            EXIT_INTERNAL,
-            false,
-        );
+    let (mut client, embedded) =
+        match server_client::connect(parsed.server, parsed.token, &root, &storage_home).await {
+            Ok(connected) => connected,
+            Err(error) => return emit_client_error(json, &error),
+        };
+    let outcome = execute_session_command_inner(&mut client, parsed.command, &root, json, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
+    // Close the client (dropping any open SSE stream) before stopping the
+    // embedded server so graceful shutdown does not wait on it.
+    drop(client);
+    if let Some(embedded) = embedded {
+        embedded.shutdown().await;
     }
-    let engine = match EngineBuilder::new()
-        .workspace_root(&root)
-        .database_path(database_path)
-        .conversation_root(conversation_root)
-        .build()
-    {
-        Ok(engine) => engine,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "engine_initialization",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    if let Err(error) =
-        engine.import_legacy_workspace_database(config.legacy_database_path(&root), wall_time_ms())
-    {
-        return emit_error(
-            json,
-            "internal",
-            "legacy_import",
-            &error.to_string(),
-            EXIT_INTERNAL,
-            false,
-        );
+    match outcome {
+        Ok(code) => code,
+        Err(error) => emit_client_error(json, &error),
     }
+}
 
+async fn execute_session_command_inner(
+    client: &mut server_client::ServerClient,
+    command: server_client::SessionCommand,
+    root: &Path,
+    json: bool,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<i32, server_client::ClientError> {
+    use server_client::SessionServer;
+    let mut progress = |text: &str| {
+        eprint!("{text}");
+        let _ = std::io::stderr().flush();
+    };
     match command {
-        HeadlessCommand::Show { run_id } => match engine.show(run_id) {
-            Ok(run) => render_run(&run, json),
-            Err(StorageError::RunNotFound(_)) => emit_error(
-                json,
-                "not_found",
-                "run_not_found",
-                &format!("run {run_id} was not found"),
-                EXIT_NOT_FOUND,
-                false,
-            ),
-            Err(error) => emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            ),
-        },
-        HeadlessCommand::List => match engine.list() {
-            Ok(runs) => {
-                if json {
-                    emit_data("completed", &json!({ "runs": runs }));
-                } else {
-                    for run in runs {
-                        println!("{}\t{:?}\trev {}", run.run_id, run.status, run.revision)
-                    }
-                }
-                EXIT_COMPLETED
+        server_client::SessionCommand::Run { prompt, focus } => {
+            let result = server_client::run_session(
+                client,
+                root,
+                &prompt,
+                focus.as_deref(),
+                &mut progress,
+                cancel,
+            )
+            .await?;
+            if json {
+                println!("{}", server_client::run_envelope(&result));
+            } else if let Some(snapshot) = result.snapshot() {
+                println!("{}", server_client::render_session_text(snapshot));
             }
-            Err(error) => emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            ),
-        },
-        HeadlessCommand::Resume {
-            run_id,
-            allow: false,
-        } => deny_headless(&engine, run_id, json),
-        command @ (HeadlessCommand::Run { .. } | HeadlessCommand::Resume { .. }) => {
-            let provider = match registry.resolve_default(&engine.tool_descriptors()) {
-                Ok(value) => value,
-                Err(error) => {
-                    return emit_error(
-                        json,
-                        "usage",
-                        "configuration",
-                        &error.to_string(),
-                        EXIT_USAGE,
-                        false,
-                    );
-                }
-            };
-            let runtime = AgentRuntime::from_bound_provider(
-                engine,
-                provider.provider,
-                provider.binding,
-                &root,
-                config.plan(),
-            );
-            let result = match command {
-                HeadlessCommand::Run { prompt, focus } => {
-                    runtime.run_with_focus(&prompt, focus.as_deref()).await
-                }
-                HeadlessCommand::Resume { run_id, allow } => runtime.resume(run_id, allow).await,
-                _ => unreachable!(),
-            };
-            match result {
-                Ok(run) => render_run(&run, json),
-                Err(RuntimeError::PermissionRequired { run_id }) => emit_error(
-                    json,
-                    "waiting",
-                    "permission_required",
-                    &format!("permission required for run {run_id}"),
-                    EXIT_WAITING,
-                    false,
-                ),
-                Err(error) => emit_error(
-                    json,
-                    "failed",
-                    "runtime",
-                    &error.to_string(),
-                    EXIT_FAILED,
-                    false,
-                ),
+            Ok(result.exit_code())
+        }
+        server_client::SessionCommand::Resume { session_id, prompt } => {
+            let result = server_client::resume_session(
+                client,
+                root,
+                &session_id,
+                &prompt,
+                &mut progress,
+                cancel,
+            )
+            .await?;
+            if json {
+                println!("{}", server_client::run_envelope(&result));
+            } else if let Some(snapshot) = result.snapshot() {
+                println!("{}", server_client::render_session_text(snapshot));
             }
+            Ok(result.exit_code())
+        }
+        server_client::SessionCommand::List => {
+            let workspace_id = client.resolve_workspace(root).await?;
+            let sessions = client.list_sessions(&workspace_id).await?;
+            if json {
+                println!("{}", server_client::list_envelope(&sessions));
+            } else {
+                for session in &sessions {
+                    println!("{}", server_client::render_session_row(session));
+                }
+            }
+            Ok(EXIT_COMPLETED)
+        }
+        server_client::SessionCommand::Show { session_id } => {
+            let thread_id = server_client::parse_session_id(&session_id)?;
+            let snapshot = client.snapshot(&thread_id).await?;
+            if json {
+                println!("{}", server_client::session_envelope(&snapshot));
+            } else {
+                println!("{}", server_client::render_session_text(&snapshot));
+            }
+            Ok(EXIT_COMPLETED)
         }
     }
 }
 
-fn deny_headless(
-    engine: &latte_engine::EngineHandle,
-    run_id: latte_core::RunId,
-    json: bool,
-) -> i32 {
-    let state = match engine.show(run_id) {
-        Ok(state) => state,
-        Err(StorageError::RunNotFound(_)) => {
-            return emit_error(
-                json,
-                "not_found",
-                "run_not_found",
-                &format!("run {run_id} was not found"),
-                EXIT_NOT_FOUND,
-                false,
-            );
-        }
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    if state.status != RunStatus::WaitingPermission || state.pending_permission.is_none() {
-        return emit_error(
-            json,
-            "failed",
-            "invalid_state",
-            "run is not waiting for permission",
-            EXIT_FAILED,
-            false,
-        );
+/// Emits a v2 error envelope (JSON) or plain stderr line and returns the
+/// classified exit code.
+fn emit_client_error(json: bool, error: &server_client::ClientError) -> i32 {
+    if json {
+        println!("{}", server_client::error_envelope(error));
+    } else {
+        eprintln!("{}", error.message());
     }
-    let now = wall_time_ms();
-    let lease = match engine.acquire_run_lease(run_id, &format!("agent-{run_id}"), now, 60_000) {
-        Ok(lease) => lease,
-        Err(error) => {
-            return emit_error(
-                json,
-                "internal",
-                "storage",
-                &error.to_string(),
-                EXIT_INTERNAL,
-                false,
-            );
-        }
-    };
-    let denied = engine.deny_waiting_permission(run_id, state.revision, &lease, now);
-    let _ = engine.release_lease(&lease);
-    match denied {
-        Ok(run) => render_run(&run, json),
-        Err(error) => emit_error(
-            json,
-            "failed",
-            "storage",
-            &error.to_string(),
-            EXIT_FAILED,
-            false,
-        ),
-    }
+    error.exit_code()
 }
 
 /// Executes the single v2 reconciliation command exposed by the transcript
@@ -1379,6 +1264,14 @@ fn prepare_server(
                 .conversation_root(&builder_conv)
                 .build()
                 .map_err(|error| error.to_string())?;
+            // Import any v1 legacy workspace database once, the same way the
+            // in-process TUI path does, so server-driven sessions see history.
+            engine
+                .import_legacy_workspace_database(
+                    config.legacy_database_path(workspace_root),
+                    wall_time_ms(),
+                )
+                .map_err(|error| format!("legacy import: {error}"))?;
             let factory_engine = engine.clone();
             let factory_registry = registry.clone();
             let factory: latte_headless::thread::ThreadProviderFactory =
@@ -1501,40 +1394,6 @@ fn write_server_token(path: &Path, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn render_run(run: &RunState, json_output: bool) -> i32 {
-    let (status, code) = outcome(run);
-    if json_output {
-        emit_data(status, &json!({ "run": run }));
-    } else {
-        println!(
-            "run {}: {:?} (revision {})",
-            run.run_id, run.status, run.revision
-        );
-        if let Some(handoff) = &run.handoff {
-            println!("{}", handoff.summary)
-        }
-    }
-    code
-}
-
-fn outcome(run: &RunState) -> (&'static str, i32) {
-    match run.status {
-        RunStatus::Completed => ("completed", EXIT_COMPLETED),
-        RunStatus::WaitingPermission | RunStatus::WaitingInput => ("waiting", EXIT_WAITING),
-        RunStatus::Interrupted | RunStatus::Cancelling => ("interrupted", EXIT_INTERRUPTED),
-        RunStatus::Failed
-            if run
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.code == FailureCode::PermissionDenied) =>
-        {
-            ("denied", EXIT_DENIED)
-        }
-        RunStatus::Failed => ("failed", EXIT_FAILED),
-        RunStatus::Queued | RunStatus::Running => ("internal", EXIT_INTERNAL),
-    }
-}
-
 fn emit_data(status: &str, data: &Value) {
     println!(
         "{}",
@@ -1571,30 +1430,23 @@ fn emit_error(
 mod tests {
     use super::bind_local_listener;
     use super::{
-        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_DENIED, EXIT_FAILED,
-        EXIT_INTERNAL, EXIT_INTERRUPTED, EXIT_NOT_FOUND, EXIT_USAGE, EXIT_WAITING, ThreadConfig,
-        ThreadEngineProjection, VerificationConfig, deny_headless, discover_workspace_root,
+        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_COMPLETED, EXIT_INTERNAL, EXIT_USAGE,
+        ThreadConfig, ThreadEngineProjection, VerificationConfig, discover_workspace_root,
         dispatch_session_management_action, dot, emit_data, emit_error, execute_serve, execute_tui,
         exit_for_setup, generate_server_token, merge_optional_config, merge_value, open_tui_engine,
-        outcome, parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action,
-        render_run, serve_bound, storage_home_with, tui_startup_presentation, verify_timeout,
-        workspace_display_path, workspace_display_path_with_home, workspace_identity,
-        write_server_token,
+        parse_serve_port, prepare_server, readiness_envelope, reconcile_thread_action, serve_bound,
+        storage_home_with, tui_startup_presentation, verify_timeout, workspace_display_path,
+        workspace_display_path_with_home, workspace_identity, write_server_token,
     };
     use latte_core::{
-        Evidence, FailureCode, Handoff, IdSource, Retryability, RunFailure, RunId, RunState,
-        RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
-        ThreadProviderBindingV2, VerificationStatus,
+        IdSource, RunId, RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
+        ThreadProviderBindingV2,
     };
     use latte_engine::{
         CommitThreadRunUpdate, EngineBuilder, ThreadCommitRequest, ThreadEffectDescriptor,
         ThreadEffectRequest, ThreadEffectStartRequest,
     };
-    use latte_headless::{
-        provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall},
-        runtime::{AgentRuntime, RuntimeError},
-        thread::{ThreadHistoryPolicy, ThreadRuntimeService},
-    };
+    use latte_headless::thread::{ThreadHistoryPolicy, ThreadRuntimeService};
     use latte_tui::thread::{
         SessionManagementOutcome, ThreadProjectionClient, ThreadProjectionPoll, ThreadUiAction,
         ThreadUiFeedback,
@@ -1608,42 +1460,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    fn state(status: RunStatus) -> RunState {
-        let mut state =
-            RunState::queued(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
-        state.status = status;
-        state
-    }
-
-    #[test]
-    fn run_statuses_have_stable_exit_codes() {
-        assert_eq!(outcome(&state(RunStatus::Completed)).1, EXIT_COMPLETED);
-        assert_eq!(
-            outcome(&state(RunStatus::WaitingPermission)).1,
-            EXIT_WAITING
-        );
-        assert_eq!(outcome(&state(RunStatus::Failed)).1, EXIT_FAILED);
-        assert_eq!(outcome(&state(RunStatus::Interrupted)).1, EXIT_INTERRUPTED);
-    }
-
-    #[test]
-    fn permission_denial_has_distinct_exit_code() {
-        let mut run = state(RunStatus::Failed);
-        run.failure = Some(RunFailure {
-            code: FailureCode::PermissionDenied,
-            message: "denied".into(),
-            retryability: Retryability::Terminal,
-        });
-        assert_eq!(outcome(&run).1, EXIT_DENIED);
-    }
-
     #[test]
     fn remaining_run_statuses_and_config_value_objects_are_exact() {
-        assert_eq!(outcome(&state(RunStatus::WaitingInput)).1, EXIT_WAITING);
-        assert_eq!(outcome(&state(RunStatus::Cancelling)).1, EXIT_INTERRUPTED);
-        assert_eq!(outcome(&state(RunStatus::Queued)).1, EXIT_INTERNAL);
-        assert_eq!(outcome(&state(RunStatus::Running)).1, EXIT_INTERNAL);
-
         let threads = ThreadConfig::default();
         let policy = ThreadHistoryPolicy::default();
         assert_eq!(threads.max_request_bytes, policy.max_request_bytes);
@@ -1815,23 +1633,6 @@ mod tests {
         assert_eq!(config.verification.timeout_ms, verify_timeout());
         assert_eq!(config.database.path, ".latte/latte-code.db");
 
-        let mut completed = state(RunStatus::Completed);
-        completed.revision = 4;
-        completed.handoff = Some(Handoff {
-            summary: "verified handoff".into(),
-            files_changed: vec!["src/lib.rs".into()],
-            evidence: vec![Evidence {
-                name: "unit".into(),
-                status: VerificationStatus::Passed,
-                summary: "all green".into(),
-            }],
-        });
-        assert_eq!(render_run(&completed, false), EXIT_COMPLETED);
-        assert_eq!(render_run(&completed, true), EXIT_COMPLETED);
-
-        let waiting = state(RunStatus::WaitingInput);
-        assert_eq!(render_run(&waiting, false), EXIT_WAITING);
-        assert_eq!(render_run(&waiting, true), EXIT_WAITING);
         emit_data("completed", &json!({"kind":"contract-probe"}));
         assert_eq!(
             emit_error(true, "usage", "bad_argument", "bad", EXIT_USAGE, true),
@@ -1852,93 +1653,6 @@ mod tests {
             ),
             EXIT_INTERNAL
         );
-    }
-
-    #[tokio::test]
-    async fn deny_headless_distinguishes_missing_invalid_and_prepared_permission_states() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("note.txt"), "original").unwrap();
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .database_path(root.path().join("state.db"))
-            .build()
-            .unwrap();
-        let ids = SystemIdSource::default();
-        let missing = RunId::from_uuid(ids.next_uuid_v7());
-        assert_eq!(deny_headless(&engine, missing, true), EXIT_NOT_FOUND);
-
-        let queued_id = RunId::from_uuid(ids.next_uuid_v7());
-        engine.create_run(queued_id, 1).unwrap();
-        assert_eq!(deny_headless(&engine, queued_id, false), EXIT_FAILED);
-
-        let runtime = AgentRuntime::new(
-            engine.clone(),
-            FakeProvider::scripted([
-                ProviderResponse {
-                    message: Some("I will inspect the current file first".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "call_read_1".into(),
-                        name: "read_file".into(),
-                        input: json!({"path":"note.txt"}),
-                    }],
-                    input_request: None,
-                    usage: ProviderUsage::default(),
-                    finish_reason: None,
-                    provider_state: None,
-                },
-                ProviderResponse {
-                    message: Some("I need permission to update the file".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "call_write_1".into(),
-                        name: "write_file".into(),
-                        input: json!({
-                            "path":"note.txt",
-                            "content":"updated",
-                            "create_intent":false,
-                            "precondition":"0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5"
-                        }),
-                    }],
-                    input_request: None,
-                    usage: ProviderUsage::default(),
-                    finish_reason: None,
-                    provider_state: None,
-                },
-            ]),
-            root.path(),
-            latte_headless::runtime::VerificationPlan {
-                argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
-                cwd: ".".into(),
-                timeout_ms: 1_000,
-                grace_ms: 100,
-                stdout_cap: 1_024,
-                stderr_cap: 1_024,
-            },
-        );
-        let run_id = match runtime.run("update note.txt").await.unwrap_err() {
-            RuntimeError::PermissionRequired { run_id } => run_id,
-            error => panic!("expected permission boundary, got {error}"),
-        };
-        let waiting = engine.show(run_id).unwrap();
-        assert_eq!(waiting.status, RunStatus::WaitingPermission);
-        assert!(waiting.pending_permission.is_some());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
-            "original"
-        );
-
-        assert_eq!(deny_headless(&engine, run_id, true), EXIT_DENIED);
-        let denied = engine.show(run_id).unwrap();
-        assert_eq!(denied.status, RunStatus::Failed);
-        assert_eq!(
-            denied.failure.as_ref().map(|failure| failure.code),
-            Some(FailureCode::PermissionDenied)
-        );
-        assert!(denied.pending_permission.is_none());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
-            "original"
-        );
-        assert_eq!(deny_headless(&engine, run_id, false), EXIT_FAILED);
     }
 
     #[test]

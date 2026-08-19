@@ -55,19 +55,9 @@ fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Val
     (body, command_id)
 }
 
-fn run_id(output: &std::process::Output) -> String {
-    json(output)["data"]["run"]["run_id"]
+fn session_id(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["thread_id"]
         .as_str()
-        .unwrap()
-        .to_owned()
-}
-
-fn waiting_run_id(output: &std::process::Output) -> String {
-    json(output)["error"]["message"]
-        .as_str()
-        .unwrap()
-        .split_whitespace()
-        .last()
         .unwrap()
         .to_owned()
 }
@@ -82,12 +72,12 @@ fn final_binary_creates_and_reopens_its_configured_sqlite_database() {
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
-    assert_eq!(json(&first)["data"]["runs"], serde_json::json!([]));
+    assert_eq!(json(&first)["data"]["sessions"], serde_json::json!([]));
     assert!(scenario.database_path().is_file());
 
     let reopened = scenario.output(&["--json", "list"], |_| {});
     assert!(reopened.status.success());
-    assert_eq!(json(&reopened)["data"]["runs"], serde_json::json!([]));
+    assert_eq!(json(&reopened)["data"]["sessions"], serde_json::json!([]));
 }
 
 #[test]
@@ -108,20 +98,31 @@ fn global_storage_home_ignores_workspace_database_redirect_and_is_shared_across_
     let first = scenario.output(&["--json", "run", "persist globally"], |command| {
         command.env("TEST_OPENAI_KEY", "global-storage-secret");
     });
-    assert_eq!(first.status.code(), Some(1));
-    let persisted_run_id = waiting_run_id(&first);
+    assert_eq!(first.status.code(), Some(10));
+    assert_eq!(json(&first)["status"], "waiting");
+    let persisted_session_id = session_id(&first);
     provider.assert_consumed();
     assert!(scenario.database_path().is_file());
     assert!(!scenario.root().join("workspace-redirect.db").exists());
 
     let second_workspace = scenario.root().join("second-workspace");
     std::fs::create_dir_all(second_workspace.join(".git")).unwrap();
+    // Sessions are workspace-scoped in v2: the second workspace lists nothing,
+    // but both workspaces share the global durable store (no local db file).
     let second = scenario.output(&["--json", "list"], |command| {
         command.current_dir(&second_workspace);
     });
     assert!(second.status.success());
-    assert_eq!(json(&second)["data"]["runs"][0]["run_id"], persisted_run_id);
+    assert_eq!(json(&second)["data"]["sessions"], serde_json::json!([]));
     assert!(!second_workspace.join(".latte/latte-code.db").exists());
+
+    // The session is visible from its owning workspace via the shared store.
+    let listed = scenario.output(&["--json", "list"], |_| {});
+    assert!(listed.status.success());
+    assert_eq!(
+        json(&listed)["data"]["sessions"][0]["thread_id"],
+        persisted_session_id
+    );
 }
 
 #[test]
@@ -203,10 +204,13 @@ fn final_binary_parses_loopback_provider_input_and_persists_waiting_projection()
     let output = scenario.output(&["--json", "run", "portable provider journey"], |command| {
         command.env("TEST_OPENAI_KEY", secret);
     });
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(json(&output)["status"], "failed");
-    assert_eq!(json(&output)["error"]["code"], "runtime");
-    let waiting_id = waiting_run_id(&output);
+    assert_eq!(output.status.code(), Some(10));
+    assert_eq!(json(&output)["status"], "waiting");
+    let waiting_id = session_id(&output);
+    assert_eq!(
+        json(&output)["data"]["session"]["pending"]["request_id"],
+        "portable-input"
+    );
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
@@ -218,15 +222,21 @@ fn final_binary_parses_loopback_provider_input_and_persists_waiting_projection()
     );
 
     let shown = scenario.output(&["--json", "show", &waiting_id], |_| {});
-    assert_eq!(shown.status.code(), Some(10));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "waiting_input");
+    assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["run"]["pending_input"]["request_id"],
+        json(&shown)["data"]["session"]["lifecycle"],
+        "waiting_input"
+    );
+    assert_eq!(
+        json(&shown)["data"]["session"]["pending"]["request_id"],
         "portable-input"
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    assert_eq!(json(&listed)["data"]["runs"][0]["run_id"], waiting_id);
+    assert_eq!(
+        json(&listed)["data"]["sessions"][0]["thread_id"],
+        waiting_id
+    );
 
     let database = std::fs::read(scenario.database_path()).unwrap();
     assert_secret_absent(
@@ -260,8 +270,12 @@ fn final_binary_uses_inline_provider_secret_without_environment_inheritance() {
 
     let output = scenario.output(&["--json", "run", "inline provider journey"], |_| {});
 
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(json(&output)["error"]["code"], "runtime");
+    assert_eq!(output.status.code(), Some(10));
+    assert_eq!(json(&output)["status"], "waiting");
+    assert_eq!(
+        json(&output)["data"]["session"]["pending"]["request_id"],
+        "inline-portable-input"
+    );
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
@@ -298,19 +312,30 @@ fn final_binary_persists_terminal_provider_failure_without_retrying() {
     });
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(json(&output)["status"], "failed");
-    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["failure_code"],
+        "runtime_failed"
+    );
     provider.assert_consumed();
     assert_eq!(provider.requests().len(), 1);
 
-    let id = run_id(&output);
+    let id = session_id(&output);
     let shown = scenario.output(&["--json", "show", &id], |_| {});
-    assert_eq!(shown.status.code(), Some(1));
-    assert_eq!(json(&shown)["data"]["run"]["status"], "failed");
+    assert!(shown.status.success());
+    assert_eq!(
+        json(&shown)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
     assert!(
-        json(&shown)["data"]["run"]["failure"]["message"]
-            .as_str()
+        json(&shown)["data"]["session"]["transcript"]["entries"]
+            .as_array()
             .unwrap()
-            .contains("http 400")
+            .iter()
+            .any(|entry| entry["text"].as_str().unwrap_or("").contains("http 400"))
     );
 }
 

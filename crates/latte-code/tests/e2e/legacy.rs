@@ -1,4 +1,4 @@
-use super::support::{PtySession, Scenario, ScriptedProvider, json};
+use super::support::{PtySession, Scenario, json};
 use latte_core::{IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2};
 use rusqlite::Connection;
 use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -13,6 +13,13 @@ fn sqlite_execute(database: &Path, sql: &str) {
 }
 
 fn sqlite_integer(database: &Path, query: &str) -> i64 {
+    Connection::open(database)
+        .unwrap()
+        .query_row(query, [], |row| row.get(0))
+        .unwrap()
+}
+
+fn sqlite_text(database: &Path, query: &str) -> String {
     Connection::open(database)
         .unwrap()
         .query_row(query, [], |row| row.get(0))
@@ -101,26 +108,63 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     let run_id = "01900000-0000-7000-8000-0000000000a1";
     seed_v1_running_run(&scenario, run_id);
 
-    let migrated = scenario.output(&["--json", "list"], |_| {});
+    // v2 session commands open the database through an embedded server. The
+    // first open migrates the v1 schema to v12; the server's recovery sweeper
+    // then marks the orphaned v1 running run as interrupted. A v1 run is not a
+    // v2 session, so it is never surfaced as a thread: `list` returns an empty
+    // session catalogue and `show <run_id>` fails closed with not_found. Each
+    // `list` invocation is a fresh final binary, so the retry loop also proves
+    // the migration/recovery is stable across restarts.
+    let recovered = std::iter::repeat_with(|| {
+        let migrated = scenario.output(&["--json", "list"], |command| {
+            command.env("LATTE_RECOVERY_SWEEP_MS", "1");
+        });
+        assert!(
+            migrated.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&migrated.stdout),
+            String::from_utf8_lossy(&migrated.stderr)
+        );
+        assert_eq!(json(&migrated)["data"]["sessions"], serde_json::json!([]));
+        std::thread::sleep(Duration::from_millis(20));
+        sqlite_integer(
+            &scenario.database_path(),
+            "SELECT COUNT(*) FROM runs WHERE run_id='01900000-0000-7000-8000-0000000000a1' AND status='interrupted' AND revision=2;",
+        )
+    })
+    .take(100)
+    .find(|&count| count == 1)
+    .is_some();
     assert!(
-        migrated.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&migrated.stdout),
-        String::from_utf8_lossy(&migrated.stderr)
+        recovered,
+        "v1 running run was not recovered to interrupted through final binary restarts"
     );
-    assert_eq!(json(&migrated)["data"]["runs"][0]["run_id"], run_id);
-    assert_eq!(json(&migrated)["data"]["runs"][0]["status"], "interrupted");
-    assert_eq!(json(&migrated)["data"]["runs"][0]["revision"], 2);
 
+    // The v1 run is not addressable as a v2 session.
     let shown = scenario.output(&["--json", "show", run_id], |_| {});
-    assert_eq!(shown.status.code(), Some(130));
-    assert_eq!(json(&shown)["status"], "interrupted");
-    assert_eq!(json(&shown)["data"]["run"]["status"], "interrupted");
-    assert_eq!(json(&shown)["data"]["run"]["revision"], 2);
+    assert_eq!(shown.status.code(), Some(4));
+    assert_eq!(json(&shown)["status"], "failed");
+    assert_eq!(json(&shown)["error"]["code"], "not_found");
 
+    // A later final-binary open is stable: the recovered run stays interrupted
+    // at revision 2, the schema stays at v12, and no v2 effects were adopted.
     let reopened = scenario.output(&["--json", "list"], |_| {});
     assert!(reopened.status.success());
-    assert_eq!(json(&reopened)["data"]["runs"][0]["revision"], 2);
+    assert_eq!(json(&reopened)["data"]["sessions"], serde_json::json!([]));
+    assert_eq!(
+        sqlite_text(
+            &scenario.database_path(),
+            "SELECT status FROM runs WHERE run_id='01900000-0000-7000-8000-0000000000a1';"
+        ),
+        "interrupted"
+    );
+    assert_eq!(
+        sqlite_integer(
+            &scenario.database_path(),
+            "SELECT revision FROM runs WHERE run_id='01900000-0000-7000-8000-0000000000a1';"
+        ),
+        2
+    );
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
         12
@@ -141,107 +185,15 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     );
 }
 
-#[test]
-fn v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider() {
-    let scenario = Scenario::new();
-    let initialized = scenario.output(&["--json", "list"], |_| {});
-    assert!(initialized.status.success());
-
-    let run_id = "01900000-0000-7000-8000-0000000000b7";
-    let state = sql_literal(&state_json(run_id, 2, "interrupted"));
-    let checkpoint = sql_literal(
-        &serde_json::json!({
-            "messages": [],
-            "pending": null,
-            "final_message": null,
-            "baseline": {},
-            "tool_queue": [],
-            "tool_cursor": 0,
-            "pending_input": null
-        })
-        .to_string(),
-    );
-    sqlite_execute(
-        &scenario.database_path(),
-        &format!(
-            r"
-            PRAGMA foreign_keys=ON;
-            DROP TABLE thread_effect_canonical_v2;
-            DROP TABLE legacy_imports;
-            DROP TABLE workspaces;
-            DROP TABLE projects;
-            DROP TABLE runtime_lease;
-            DROP TABLE runtime_lease_epoch;
-            CREATE TABLE runtime_lease(
-              singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
-              fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
-            );
-            DELETE FROM schema_migrations WHERE version IN (8,9,10,11,12);
-            PRAGMA user_version=7;
-            INSERT INTO runs(
-              run_id, state_json, status, revision, last_seq, lease_token,
-              created_at_ms, updated_at_ms
-            ) VALUES('{run_id}', '{state}', 'interrupted', 2, 0, 0, 1, 1);
-            INSERT INTO run_read_model(run_id, revision, last_seq, state_json)
-              VALUES('{run_id}', 2, 0, '{state}');
-            INSERT INTO runtime_checkpoints(run_id, payload_json, updated_at_ms)
-              VALUES('{run_id}', '{checkpoint}', 1);
-            "
-        ),
-    );
-
-    let provider = ScriptedProvider::start([]);
-    scenario.write_config(provider.endpoint(), r#"["/usr/bin/true"]"#);
-    let resume = |scenario: &Scenario| {
-        scenario.output(&["--json", "resume", run_id, "--allow"], |command| {
-            command.env("TEST_OPENAI_KEY", "local-fixture-only");
-        })
-    };
-
-    let first = resume(&scenario);
-    assert_eq!(first.status.code(), Some(1));
-    assert_eq!(json(&first)["status"], "failed");
-    assert_eq!(json(&first)["error"]["code"], "runtime");
-    assert!(
-        json(&first)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("legacy/versionless")
-    );
-
-    let shown = scenario.output(&["--json", "show", run_id], |_| {});
-    assert_eq!(
-        shown.status.code(),
-        Some(130),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&shown.stdout),
-        String::from_utf8_lossy(&shown.stderr)
-    );
-    assert_eq!(json(&shown)["data"]["run"]["status"], "interrupted");
-    assert_eq!(json(&shown)["data"]["run"]["revision"], 2);
-
-    let second = resume(&scenario);
-    assert_eq!(second.status.code(), Some(1));
-    assert!(
-        json(&second)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("legacy/versionless")
-    );
-    assert!(provider.requests().is_empty());
-    provider.assert_consumed();
-    assert_eq!(
-        sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        12
-    );
-    assert_eq!(
-        sqlite_integer(
-            &scenario.database_path(),
-            "SELECT COUNT(*) FROM schema_migrations WHERE version=12;"
-        ),
-        1
-    );
-}
+// `v7_versionless_checkpoint_migrates_but_resume_fails_closed_without_provider`
+// was removed in the v2 migration. It drove the v1 `resume <run-id> --allow`
+// workflow, asserting that resuming a versionless checkpoint fails closed with
+// the `legacy/versionless` error. That resume path lived in the v1
+// `AgentRuntime` and is unreachable from the v2 session-command contract
+// (`resume <session-id> <prompt>` is a thread follow-up, not a checkpoint
+// resume; a v1 run id is not a session and fails closed as `not_found`). The
+// v7 -> v12 schema migration it also exercised is covered by the v1 -> v12
+// recovery test above and by the engine storage migration tests.
 
 #[test]
 fn newer_schema_fails_as_typed_engine_initialization_error() {
@@ -249,13 +201,18 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
     sqlite_execute(&scenario.database_path(), "PRAGMA user_version=99;");
 
+    // v2 routes every session command through the embedded HTTP server, whose
+    // startup builds the workspace engine. A newer-than-supported schema fails
+    // that build, which the client classifies as an internal setup failure
+    // (exit 70, code `internal`), matching the standalone `serve` command's
+    // `exit_for_setup` mapping; the engine's typed message is preserved.
     let output = scenario.output(&["--json", "list"], |_| {});
     assert_eq!(output.status.code(), Some(70));
-    assert_eq!(json(&output)["status"], "internal");
-    assert_eq!(json(&output)["error"]["code"], "engine_initialization");
+    assert_eq!(json(&output)["status"], "failed");
+    assert_eq!(json(&output)["error"]["code"], "internal");
     assert_eq!(
         json(&output)["error"]["message"],
-        "database schema version 99 is newer than supported version 12"
+        "server setup: database schema version 99 is newer than supported version 12"
     );
 }
 

@@ -20,6 +20,32 @@ fn run_with_provider(
     )
 }
 
+/// Extracts the completion summary text from a v2 run envelope's transcript.
+fn completion_text(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"] == "completion")
+        .and_then(|entry| entry["text"].as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Extracts the terminal failure message from a v2 run envelope's transcript.
+fn failure_text(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"] == "failure")
+        .and_then(|entry| entry["text"].as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
 #[test]
 fn base_url_is_normalized_to_the_production_chat_completions_endpoint() {
     let scenario = Scenario::new();
@@ -42,10 +68,7 @@ fn base_url_is_normalized_to_the_production_chat_completions_endpoint() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        json(&output)["data"]["run"]["handoff"]["summary"],
-        "base URL completed"
-    );
+    assert_eq!(completion_text(&output), "base URL completed");
     provider.assert_consumed();
     assert_eq!(provider.requests()[0].path, "/chat/completions");
 }
@@ -84,7 +107,10 @@ fn retryable_http_is_retried_exactly_once_then_completes_durably() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(json(&output)["status"], "completed");
-    assert_eq!(json(&output)["data"]["run"]["status"], "completed");
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "completed"
+    );
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -109,13 +135,11 @@ fn terminal_http_and_malformed_success_never_retry_or_leak_the_secret() {
     );
     assert_eq!(http.status.code(), Some(1));
     assert_eq!(json(&http)["status"], "failed");
-    assert_eq!(json(&http)["data"]["run"]["status"], "failed");
-    assert!(
-        json(&http)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("http 400 (request safe-request-id)")
+    assert_eq!(
+        json(&http)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
+    assert!(failure_text(&http).contains("http 400 (request safe-request-id)"));
     http_provider.assert_consumed();
     assert_eq!(http_provider.requests().len(), 1);
     let database = std::fs::read(http_scenario.database_path()).unwrap();
@@ -139,13 +163,11 @@ fn terminal_http_and_malformed_success_never_retry_or_leak_the_secret() {
         ",timeout_ms:1000,max_attempts:3",
     );
     assert_eq!(malformed.status.code(), Some(1));
-    assert_eq!(json(&malformed)["data"]["run"]["status"], "failed");
-    assert!(
-        json(&malformed)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("missing choices")
+    assert_eq!(
+        json(&malformed)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
+    assert!(failure_text(&malformed).contains("missing choices"));
     malformed_provider.assert_consumed();
     assert_eq!(malformed_provider.requests().len(), 1);
 }
@@ -159,13 +181,11 @@ fn provider_timeout_is_bounded_failed_and_called_once() {
     let output = run_with_provider(&scenario, &provider, ",timeout_ms:50,max_attempts:1");
 
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(json(&output)["data"]["run"]["status"], "failed");
-    assert!(
-        json(&output)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("provider timeout")
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
+    assert!(failure_text(&output).contains("provider timeout"));
     assert_eq!(provider.requests().len(), 1);
     assert!(scenario.database_path().exists());
 }
@@ -196,10 +216,7 @@ fn streaming_sse_completion_reaches_the_binary_and_persists_exact_text() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        json(&output)["data"]["run"]["handoff"]["summary"],
-        "streamed answer"
-    );
+    assert_eq!(completion_text(&output), "streamed answer");
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
@@ -225,10 +242,7 @@ fn unsupported_empty_stream_response_falls_back_inline_once() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        json(&output)["data"]["run"]["handoff"]["summary"],
-        "inline fallback"
-    );
+    assert_eq!(completion_text(&output), "inline fallback");
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -248,10 +262,7 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
         ",timeout_ms:1000,max_attempts:2,streaming:true",
     );
     assert!(inline.status.success());
-    assert_eq!(
-        json(&inline)["data"]["run"]["handoff"]["summary"],
-        "inline while streaming"
-    );
+    assert_eq!(completion_text(&inline), "inline while streaming");
     inline_provider.assert_consumed();
     assert_eq!(inline_provider.requests().len(), 1);
     assert_eq!(inline_provider.requests()[0].body["stream"], true);
@@ -268,12 +279,7 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
         ",timeout_ms:1000,max_attempts:3,streaming:true",
     );
     assert_eq!(fallback_http.status.code(), Some(1));
-    assert!(
-        json(&fallback_http)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("http 429 (request fallback-request)")
-    );
+    assert!(failure_text(&fallback_http).contains("http 429 (request fallback-request)"));
     fallback_http_provider.assert_consumed();
     assert_eq!(fallback_http_provider.requests().len(), 2);
     assert!(
@@ -294,13 +300,11 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
         ",timeout_ms:1000,max_attempts:3,streaming:true",
     );
     assert_eq!(fallback_malformed.status.code(), Some(1));
-    assert_eq!(json(&fallback_malformed)["data"]["run"]["status"], "failed");
-    assert!(
-        !json(&fallback_malformed)["data"]["run"]["failure"]["message"]
-            .as_str()
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        json(&fallback_malformed)["data"]["session"]["runs"][0]["status"],
+        "failed"
     );
+    assert!(!failure_text(&fallback_malformed).is_empty());
     fallback_malformed_provider.assert_consumed();
     assert_eq!(fallback_malformed_provider.requests().len(), 2);
 }
@@ -330,12 +334,7 @@ fn nonstandard_input_and_provider_state_fail_closed_without_a_second_call() {
         let provider = ScriptedProvider::start([ProviderReply::json(200, &body)]);
         let output = run_with_provider(&scenario, &provider, ",timeout_ms:1000,max_attempts:3");
         assert_eq!(output.status.code(), Some(1));
-        assert!(
-            json(&output)["data"]["run"]["failure"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected)
-        );
+        assert!(failure_text(&output).contains(expected));
         provider.assert_consumed();
         assert_eq!(provider.requests().len(), 1);
     }
@@ -358,38 +357,34 @@ fn legacy_headless_input_wait_is_visible_but_cannot_be_misresumed_as_permission(
     let waiting = scenario.output(&["--json", "run", "request legacy input"], |command| {
         command.env("TEST_OPENAI_KEY", "secret");
     });
-    assert_eq!(waiting.status.code(), Some(1));
-    assert_eq!(json(&waiting)["error"]["code"], "runtime");
-    let run_id = json(&waiting)["error"]["message"]
+    assert_eq!(waiting.status.code(), Some(10));
+    assert_eq!(json(&waiting)["status"], "waiting");
+    let session_id = json(&waiting)["data"]["session"]["thread_id"]
         .as_str()
-        .unwrap()
-        .split_whitespace()
-        .last()
         .unwrap()
         .to_owned();
 
-    let shown = scenario.output(&["--json", "show", &run_id], |_| {});
-    assert_eq!(shown.status.code(), Some(10));
-    assert_eq!(json(&shown)["status"], "waiting");
-    assert_eq!(json(&shown)["data"]["run"]["status"], "waiting_input");
+    let shown = scenario.output(&["--json", "show", &session_id], |_| {});
+    assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["run"]["pending_input"]["request_id"],
+        json(&shown)["data"]["session"]["lifecycle"],
+        "waiting_input"
+    );
+    assert_eq!(
+        json(&shown)["data"]["session"]["pending"]["request_id"],
         "legacy-input-1"
     );
 
-    let invalid_resume = scenario.output(&["--json", "resume", &run_id, "--allow"], |command| {
-        command.env("TEST_OPENAI_KEY", "secret");
-    });
-    assert_eq!(invalid_resume.status.code(), Some(1));
-    assert!(
-        json(&invalid_resume)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no resumable permission")
-    );
-    let still_waiting = scenario.output(&["--json", "show", &run_id], |_| {});
+    // A waiting_input session cannot accept a follow-up turn; the v2 resume
+    // contract requires a ready session, so this fails closed.
+    let invalid_resume =
+        scenario.output(&["--json", "resume", &session_id, "continue"], |command| {
+            command.env("TEST_OPENAI_KEY", "secret");
+        });
+    assert_ne!(invalid_resume.status.code(), Some(0));
+    let still_waiting = scenario.output(&["--json", "show", &session_id], |_| {});
     assert_eq!(
-        json(&still_waiting)["data"]["run"]["status"],
+        json(&still_waiting)["data"]["session"]["lifecycle"],
         "waiting_input"
     );
     provider.assert_consumed();
@@ -402,17 +397,13 @@ fn secret_input_empty_assistant_and_nonobject_tool_input_fail_durably() {
         (
             ProviderReply::input_request("secret-input", "password?", true),
             ",compatibility_input_request:true",
-            "secret input requests are unsupported",
+            "unsupported secret or invalid input",
         ),
-        (
-            ProviderReply::completion(""),
-            "",
-            "provider assistant outcome is empty",
-        ),
+        (ProviderReply::completion(""), "", "empty assistant outcome"),
         (
             ProviderReply::tool_call("nonobject-tool-input", "read_file", &serde_json::json!(1)),
             "",
-            "provider tool call ids must be nonempty and unique",
+            "tool call ids must",
         ),
     ];
     for (reply, fields, expected) in cases {
@@ -428,12 +419,12 @@ fn secret_input_empty_assistant_and_nonobject_tool_input_fail_durably() {
             command.env("TEST_OPENAI_KEY", "secret");
         });
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+        assert_eq!(
+            json(&output)["data"]["session"]["runs"][0]["status"],
+            "failed"
+        );
         assert!(
-            json(&output)["data"]["run"]["failure"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected),
+            failure_text(&output).contains(expected),
             "{}",
             json(&output)
         );
@@ -487,12 +478,12 @@ fn malformed_inline_tool_calls_are_terminal_and_never_reenter_the_provider() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(json(&output)["status"], "failed");
-        assert_eq!(json(&output)["data"]["run"]["status"], "failed");
+        assert_eq!(
+            json(&output)["data"]["session"]["runs"][0]["status"],
+            "failed"
+        );
         assert!(
-            json(&output)["data"]["run"]["failure"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(expected),
+            failure_text(&output).contains(expected),
             "{}",
             json(&output)
         );

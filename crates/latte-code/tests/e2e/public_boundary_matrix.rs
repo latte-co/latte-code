@@ -18,16 +18,6 @@ fn build_engine(scenario: &Scenario) -> EngineHandle {
         .unwrap()
 }
 
-fn final_show(scenario: &Scenario, run_id: RunId) -> serde_json::Value {
-    let output = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
-    assert!(
-        !output.stdout.is_empty(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    json(&output)["data"]["run"].clone()
-}
-
 #[test]
 #[allow(clippy::too_many_lines)]
 fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
@@ -186,21 +176,18 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
         engine.runtime_checkpoint(run_id).unwrap().as_deref(),
         Some(r#"{"boundary":"stable","attempt":1}"#)
     );
-    let shown = final_show(&scenario, run_id);
-    assert_eq!(shown["status"], "running");
-    assert_eq!(shown["revision"], 1);
-    assert!(shown["failure"].is_null());
+    // v2 boundary: legacy v1 runs are not projected as v2 sessions.
+    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    assert_eq!(shown.status.code(), Some(4));
+    assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
-    let projected = json(&listed)["data"]["runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|value| value["run_id"] == run_id.to_string())
-        .unwrap()
-        .clone();
-    assert_eq!(projected["status"], "running");
-    assert_eq!(projected["revision"], 1);
+    assert!(
+        json(&listed)["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     foreign_engine.release_lease(&foreign).unwrap();
     engine.release_lease(&lease).unwrap();
@@ -321,21 +308,22 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
     );
     engine.release_lease(&lease).unwrap();
 
+    // v2 removed `resume <run-id> --allow|--deny`; the flag is now a usage error.
     let redundant = scenario.output(&["--json", "resume", &run_id.to_string(), "--deny"], |_| {});
-    assert_eq!(redundant.status.code(), Some(1));
+    assert_eq!(redundant.status.code(), Some(2));
+    assert_eq!(json(&redundant)["error"]["code"], "usage");
 
-    let shown = final_show(&scenario, run_id);
-    assert_eq!(shown["status"], "failed");
-    assert_eq!(shown["failure"]["code"], "permission_denied");
-    assert!(shown["pending_permission"].is_null());
+    // v2 boundary: legacy v1 runs are not projected as v2 sessions.
+    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    assert_eq!(shown.status.code(), Some(4));
+    assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert!(
-        json(&listed)["data"]["runs"]
+        json(&listed)["data"]["sessions"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|value| value["run_id"] == run_id.to_string() && value["status"] == "failed")
+            .is_empty()
     );
 }
 
@@ -527,8 +515,10 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
     engine.release_lease(&lease).unwrap();
     drop(engine);
 
-    let shown = final_show(&scenario, run_id);
-    assert_eq!(shown["status"], "interrupted");
+    // v2 boundary: legacy v1 runs are not projected as v2 sessions.
+    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    assert_eq!(shown.status.code(), Some(4));
+    assert_eq!(json(&shown)["error"]["code"], "not_found");
 }
 
 #[test]
@@ -567,22 +557,17 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
     assert_eq!(engine.show(run_id).unwrap(), running);
     drop(engine);
 
-    let shown = final_show(&scenario, run_id);
-    assert_eq!(shown["status"], "interrupted");
-    assert_eq!(shown["revision"], 2);
-    assert!(shown["failure"].is_null());
+    // v2 boundary: legacy v1 runs are not projected as v2 sessions.
+    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    assert_eq!(shown.status.code(), Some(4));
+    assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
     assert!(
-        json(&listed)["data"]["runs"]
+        json(&listed)["data"]["sessions"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|value| {
-                value["run_id"] == run_id.to_string()
-                    && value["status"] == "interrupted"
-                    && value["revision"] == 2
-            })
+            .is_empty()
     );
 
     let reopened = build_engine(&scenario);
@@ -611,8 +596,8 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
             .status,
         RunStatus::Interrupted
     );
-    let shown_again = final_show(&scenario, run_id);
-    assert_eq!(shown_again["status"], "interrupted");
-    assert_eq!(shown_again["revision"], 2);
+    let shown_again = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    assert_eq!(shown_again.status.code(), Some(4));
+    assert_eq!(json(&shown_again)["error"]["code"], "not_found");
     reopened.release_lease(&fresh).unwrap();
 }
