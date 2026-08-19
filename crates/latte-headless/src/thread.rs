@@ -5264,7 +5264,7 @@ mod tests {
                 model: String::new(),
                 config_fingerprint: String::new(),
                 tools_fingerprint: String::new(),
-                aliases: Default::default(),
+                aliases: std::collections::BTreeMap::default(),
                 credential_ref_id: String::new(),
                 data_scope_id: String::new(),
                 credential_generation: 0,

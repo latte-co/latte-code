@@ -3038,7 +3038,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Starts a minimal HTTP mock server. `handler` receives (method, path)
-    /// and returns (status, content_type, body). One request per connection.
+    /// and returns (status, `content_type`, body). One request per connection.
     fn start_session_mock_server<F>(mut handler: F) -> (String, std::thread::JoinHandle<()>)
     where
         F: FnMut(&str, &str) -> (u16, String, String) + Send + 'static,
