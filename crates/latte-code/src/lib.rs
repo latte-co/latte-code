@@ -677,42 +677,48 @@ fn tui_startup_presentation(
     Ok((startup_binding, startup))
 }
 
-/// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
-/// the TUI reads only v2 snapshots and submits v2 conversation requests.
-#[allow(clippy::too_many_lines)]
-fn execute_tui() -> i32 {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        eprintln!(
-            "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
-        );
-        return EXIT_USAGE;
-    }
+/// Holds the fully-resolved state the TUI main loop needs.
+struct TuiSetup {
+    engine: latte_engine::EngineHandle,
+    startup_binding: Option<ThreadProviderBindingV2>,
+    startup: latte_tui::thread::ThreadStartupPresentation,
+    progress_rx: std::sync::mpsc::Receiver<latte_core::ThreadTransientProgress>,
+    service: ThreadRuntimeService,
+    projection: ThreadEngineProjection,
+    feedback_tx: std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
+    feedback_rx: std::sync::mpsc::Receiver<latte_tui::thread::ThreadUiFeedback>,
+    action_registry: latte_headless::registry::ProviderRegistry,
+}
+
+/// Resolves config, engine, and runtime state for the TUI. Separated from
+/// [`execute_tui`] so the setup paths are testable without a TTY.
+fn tui_setup() -> Result<TuiSetup, i32> {
     let root = match std::env::current_dir() {
         Ok(root) => discover_workspace_root(&root),
         Err(error) => {
             eprintln!("{error}");
-            return EXIT_INTERNAL;
+            return Err(EXIT_INTERNAL);
         }
     };
     let (config, registry) = match AppConfig::load(&root) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let database_path = match storage_database_path() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let conversation_root = match storage_conversation_root() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let engine = match open_tui_engine(
@@ -725,14 +731,14 @@ fn execute_tui() -> i32 {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("{error}");
-            return EXIT_INTERNAL;
+            return Err(EXIT_INTERNAL);
         }
     };
     let (startup_binding, startup) = match tui_startup_presentation(&root, &registry, &engine) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("configuration: {error}");
-            return EXIT_USAGE;
+            return Err(EXIT_USAGE);
         }
     };
     let resolver_registry = registry.clone();
@@ -752,20 +758,63 @@ fn execute_tui() -> i32 {
     let service = ThreadRuntimeService::new(engine.clone(), &root, config.thread_policy(), factory)
         .with_progress_sink(progress_sink)
         .with_verification(config.plan());
-    let mut projection = ThreadEngineProjection {
+    let projection = ThreadEngineProjection {
         engine: engine.clone(),
         subscription: engine.subscribe_threads(),
         workspace_root: match workspace_identity(&root) {
             Ok(identity) => identity,
             Err(error) => {
                 eprintln!("configuration: {error}");
-                return EXIT_USAGE;
+                return Err(EXIT_USAGE);
             }
         },
     };
     let (feedback_tx, feedback_rx) =
         std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
     let action_registry = registry.clone();
+    Ok(TuiSetup {
+        engine,
+        startup_binding,
+        startup,
+        progress_rx,
+        service,
+        projection,
+        feedback_tx,
+        feedback_rx,
+        action_registry,
+    })
+}
+
+/// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
+/// the TUI reads only v2 snapshots and submits v2 conversation requests.
+fn execute_tui() -> i32 {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!(
+            "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
+        );
+        return EXIT_USAGE;
+    }
+    let setup = match tui_setup() {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    tui_main_loop(setup)
+}
+
+/// The TUI main loop: runs the terminal UI and dispatches actions.
+#[allow(clippy::too_many_lines)]
+fn tui_main_loop(setup: TuiSetup) -> i32 {
+    let TuiSetup {
+        engine,
+        startup_binding,
+        startup,
+        progress_rx,
+        service,
+        mut projection,
+        feedback_tx,
+        feedback_rx,
+        action_registry,
+    } = setup;
     match latte_tui::thread::run_with_feedback_and_progress(
         &mut projection,
         startup,
@@ -1437,9 +1486,9 @@ mod tests {
         dispatch_session_management_action, dot, emit_client_error, emit_data, emit_error,
         execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
         merge_value, open_tui_engine, parse_serve_port, prepare_server, readiness_envelope,
-        reconcile_thread_action, serve_bound, storage_home_with, tui_startup_presentation,
-        verify_timeout, workspace_display_path, workspace_display_path_with_home,
-        workspace_identity, write_server_token,
+        reconcile_thread_action, serve_bound, storage_home_with, tui_setup,
+        tui_startup_presentation, verify_timeout, workspace_display_path,
+        workspace_display_path_with_home, workspace_identity, write_server_token,
     };
     use latte_core::{
         IdSource, RunId, RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
@@ -1661,6 +1710,20 @@ mod tests {
     #[test]
     fn tui_entrypoint_rejects_non_terminal_processes_before_loading_authority() {
         assert_eq!(execute_tui(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn tui_setup_reports_configuration_error_for_invalid_config() {
+        // Create a temp dir with an invalid config file, then chdir into it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
+        std::fs::write(dir.path().join(".latte/latte-code.jsonc"), "{invalid json").unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = tui_setup();
+        std::env::set_current_dir(&original).unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), EXIT_USAGE);
     }
 
     #[test]
