@@ -669,10 +669,7 @@ pub trait SessionServer {
         query: &str,
     ) -> Result<Vec<ThreadSessionSummary>, ClientError>;
     /// Returns the full binding catalog for the workspace.
-    async fn bindings_catalog(
-        &mut self,
-        workspace_id: &str,
-    ) -> Result<Vec<Value>, ClientError>;
+    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,9 +1078,7 @@ impl ServerHandle {
 
     /// Fetches the authoritative snapshot for one session.
     pub async fn snapshot(&self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
-        let value = self
-            .get(&format!("/v1/sessions/{session_id}"))
-            .await?;
+        let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
         let snapshot = value
             .get("snapshot")
             .cloned()
@@ -1311,19 +1306,13 @@ impl ServerHandle {
                 urlencoding::encode(query)
             ))
             .await?;
-        let sessions = value
-            .get("sessions")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
         serde_json::from_value(sessions)
             .map_err(|error| ClientError::Failed(format!("invalid search results: {error}")))
     }
 
     /// Returns the full binding catalog for the workspace.
-    pub async fn bindings_catalog(
-        &self,
-        workspace_id: &str,
-    ) -> Result<Vec<Value>, ClientError> {
+    pub async fn bindings_catalog(&self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
         let value = self
             .get(&format!("/v1/workspaces/{workspace_id}/bindings"))
             .await?;
@@ -1706,10 +1695,7 @@ impl SessionServer for ServerClient {
         self.handle.search_sessions(workspace_id, query).await
     }
 
-    async fn bindings_catalog(
-        &mut self,
-        workspace_id: &str,
-    ) -> Result<Vec<Value>, ClientError> {
+    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
         self.handle.bindings_catalog(workspace_id).await
     }
 }
@@ -2746,7 +2732,10 @@ mod tests {
 
         // -- TUI endpoint handlers -------------------------------------------
 
-        async fn rename(Path(id): Path<String>, axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+        async fn rename(
+            Path(id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
             assert!(body.get("title").is_some(), "rename requires title");
             (
                 axum::http::StatusCode::OK,
@@ -2766,7 +2755,10 @@ mod tests {
             Path(_id): Path<String>,
             axum::Json(body): axum::Json<Value>,
         ) -> impl IntoResponse {
-            assert!(body.get("binding").is_some(), "switch_model requires binding");
+            assert!(
+                body.get("binding").is_some(),
+                "switch_model requires binding"
+            );
             assert!(
                 body.get("expected_thread_revision").is_some(),
                 "switch_model requires expected_thread_revision"
@@ -2774,7 +2766,10 @@ mod tests {
             axum::http::StatusCode::OK
         }
 
-        async fn queue(Path(_id): Path<String>, axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+        async fn queue(
+            Path(_id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
             assert!(body.get("prompt").is_some(), "queue requires prompt");
             (
                 axum::http::StatusCode::ACCEPTED,
@@ -2805,7 +2800,9 @@ mod tests {
 
         async fn search(
             Path(ws): Path<String>,
-            axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+            axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
         ) -> impl IntoResponse {
             assert_eq!(ws, "ws-1");
             assert!(query.contains_key("q"), "search requires q param");
@@ -2847,7 +2844,10 @@ mod tests {
             .route("/v1/sessions/{id}/fork", axum::routing::post(fork))
             .route("/v1/sessions/{id}/model", axum::routing::post(switch_model))
             .route("/v1/sessions/{id}/queue", axum::routing::post(queue))
-            .route("/v1/sessions/{id}/input", axum::routing::post(provide_input))
+            .route(
+                "/v1/sessions/{id}/input",
+                axum::routing::post(provide_input),
+            )
             .route(
                 "/v1/sessions/{id}/permissions/{req_id}",
                 axum::routing::post(resolve_permission),
@@ -2950,10 +2950,12 @@ mod tests {
             .await
             .unwrap();
         // TUI operations through the SessionServer trait (delegates to ServerHandle).
-        let session_id = ThreadId::from_uuid(
-            Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
-        );
-        client.rename_session(&session_id, "new title").await.unwrap();
+        let session_id =
+            ThreadId::from_uuid(Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap());
+        client
+            .rename_session(&session_id, "new title")
+            .await
+            .unwrap();
         let fork_id = client.fork_session(&session_id, None).await.unwrap();
         assert_ne!(fork_id, session_id);
         client
@@ -3258,10 +3260,7 @@ mod tests {
             base_url: embedded.base_url().to_string(),
             token: embedded.token().to_string(),
         };
-        let workspace_id = handle
-            .resolve_workspace_id(temp.path())
-            .await
-            .unwrap();
+        let workspace_id = handle.resolve_workspace_id(temp.path()).await.unwrap();
         // Leak temp dirs so the server can read the config for the test's lifetime.
         std::mem::forget(temp);
         std::mem::forget(home);

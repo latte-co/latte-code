@@ -2,9 +2,7 @@
 use latte_core::{IdSource, SystemIdSource, ThreadId, ThreadProviderBindingV2, wall_time_ms};
 use latte_engine::EngineBuilder;
 use latte_headless::{
-    registry::ProviderRegistry,
-    runtime::VerificationPlan,
-    thread::ThreadHistoryPolicy,
+    registry::ProviderRegistry, runtime::VerificationPlan, thread::ThreadHistoryPolicy,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -357,9 +355,9 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
         query: &str,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
         // If the query is a valid thread ID, fetch that session directly.
-        if let Ok(thread_id) = serde_json::from_value::<ThreadId>(serde_json::Value::String(
-            query.to_string(),
-        )) {
+        if let Ok(thread_id) =
+            serde_json::from_value::<ThreadId>(serde_json::Value::String(query.to_string()))
+        {
             // A missing session is not an error — return an empty catalog
             // so the TUI shows "session not found" rather than failing.
             return match self.block_on(self.handle.try_snapshot(&thread_id)) {
@@ -428,9 +426,7 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
 
     fn poll(&mut self) -> latte_tui::thread::ThreadProjectionPoll {
         match self.event_rx.try_recv() {
-            Ok(ProjectionEvent::ThreadChanged) => {
-                latte_tui::thread::ThreadProjectionPoll::Event
-            }
+            Ok(ProjectionEvent::ThreadChanged) => latte_tui::thread::ThreadProjectionPoll::Event,
             Ok(ProjectionEvent::Closed) => latte_tui::thread::ThreadProjectionPoll::Closed,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 latte_tui::thread::ThreadProjectionPoll::Empty
@@ -708,20 +704,19 @@ async fn tui_setup() -> Result<TuiSetup, i32> {
 #[allow(clippy::too_many_lines)]
 async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i32> {
     // Connect to the embedded server (the server is the single engine host).
-    let (client, embedded) =
-        match server_client::connect(None, None, root, storage_home).await {
-            Ok(connected) => connected,
-            Err(error) => {
-                // Prefix usage errors with "configuration:" so E2E tests can
-                // assert on the error category.
-                if matches!(error, server_client::ClientError::Usage(_)) {
-                    eprintln!("configuration: {error}");
-                } else {
-                    eprintln!("{error}");
-                }
-                return Err(error.exit_code());
+    let (client, embedded) = match server_client::connect(None, None, root, storage_home).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Prefix usage errors with "configuration:" so E2E tests can
+            // assert on the error category.
+            if matches!(error, server_client::ClientError::Usage(_)) {
+                eprintln!("configuration: {error}");
+            } else {
+                eprintln!("{error}");
             }
-        };
+            return Err(error.exit_code());
+        }
+    };
     let server_handle = client.handle();
     // Resolve the workspace and fetch the binding catalog.
     let workspace_id = match server_handle.resolve_workspace_id(root).await {
@@ -749,11 +744,9 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
         })
         .or_else(|| bindings.first());
     let startup_binding = default_entry.and_then(|entry| {
-        entry
-            .get("binding")
-            .and_then(|binding| {
-                serde_json::from_value::<ThreadProviderBindingV2>(binding.clone()).ok()
-            })
+        entry.get("binding").and_then(|binding| {
+            serde_json::from_value::<ThreadProviderBindingV2>(binding.clone()).ok()
+        })
     });
     let startup = latte_tui::thread::ThreadStartupPresentation {
         default_provider: startup_binding
@@ -775,10 +768,7 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                name: entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                name: entry.get("name").and_then(Value::as_str).map(str::to_owned),
                 is_default: entry
                     .get("is_default")
                     .and_then(Value::as_bool)
@@ -928,18 +918,11 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         latte_core::SystemIdSource::default().next_uuid_v7(),
                     );
                     let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
-                    let binding_value = serde_json::to_value(&binding).map_err(|error| {
-                        error.to_string()
-                    })?;
+                    let binding_value =
+                        serde_json::to_value(&binding).map_err(|error| error.to_string())?;
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(
-                                &ws,
-                                thread_id,
-                                command_id,
-                                &prompt,
-                                &binding_value,
-                            )
+                            .create_session(&ws, thread_id, command_id, &prompt, &binding_value)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -955,9 +938,7 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let Some(binding_value) = resolve_binding(&provider_name, &model) else {
                         let _ = feedback_tx.send(ThreadUiFeedback::submission(
                             submission_id,
-                            Err(format!(
-                                "no binding found for {provider_name}/{model}"
-                            )),
+                            Err(format!("no binding found for {provider_name}/{model}")),
                         ));
                         return Ok(());
                     };
@@ -972,13 +953,7 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(
-                                &ws,
-                                thread_id,
-                                command_id,
-                                &prompt,
-                                &binding_value,
-                            )
+                            .create_session(&ws, thread_id, command_id, &prompt, &binding_value)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -1074,9 +1049,8 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                             }
                             Err(error) => Err(error.to_string()),
                         };
-                        let _ = feedback.send(ThreadUiFeedback::input_submission(
-                            submission_id, result,
-                        ));
+                        let _ = feedback
+                            .send(ThreadUiFeedback::input_submission(submission_id, result));
                     });
                 }
                 ThreadUiAction::ResolvePermission {
@@ -1539,17 +1513,14 @@ mod tests {
     use super::bind_local_listener;
     use super::{
         AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
-        VerificationConfig, discover_workspace_root,
-        dot, emit_client_error, emit_data, emit_error,
+        VerificationConfig, discover_workspace_root, dot, emit_client_error, emit_data, emit_error,
         execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
-        merge_value, parse_serve_port, prepare_server, readiness_envelope,
-        serve_bound, storage_home_with, tui_setup,
-        verify_timeout,
-        workspace_display_path_with_home, write_server_token,
+        merge_value, parse_serve_port, prepare_server, readiness_envelope, serve_bound,
+        storage_home_with, tui_setup, verify_timeout, workspace_display_path_with_home,
+        write_server_token,
     };
     use latte_core::{
-        IdSource, RunId, SystemIdSource, ThreadId, ThreadLifecycle,
-        ThreadProviderBindingV2,
+        IdSource, RunId, SystemIdSource, ThreadId, ThreadLifecycle, ThreadProviderBindingV2,
     };
     use latte_headless::thread::ThreadHistoryPolicy;
     use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
@@ -1761,9 +1732,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
         std::fs::write(dir.path().join(".latte/latte-code.jsonc"), "{invalid json").unwrap();
         let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], || {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(tui_setup())
-            })
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(tui_setup()))
         });
         assert!(result.is_err());
         assert_eq!(result.err().unwrap(), EXIT_USAGE);
@@ -1926,10 +1895,6 @@ mod tests {
         assert_eq!(config.verification.argv, ["echo", "home"]);
     }
 
-
-
-
-
     #[test]
     fn workspace_configuration_recursively_overrides_user_configuration() {
         let root = tempfile::tempdir().unwrap();
@@ -2009,7 +1974,6 @@ mod tests {
         );
         assert_eq!(workspace_display_path_with_home(home, Some(home)), "~");
     }
-
 
     #[test]
     fn serve_port_parsing_covers_default_explicit_and_error_shapes() {
@@ -2203,10 +2167,7 @@ mod tests {
         assert_eq!(exact.len(), 1);
 
         // List all threads (not workspace-filtered) with conversation enrichment.
-        let all_threads = workspace
-            .engine
-            .list_threads_v2()
-            .expect("list_threads_v2");
+        let all_threads = workspace.engine.list_threads_v2().expect("list_threads_v2");
         assert!(!all_threads.is_empty());
 
         // Get session metadata.
@@ -3160,8 +3121,7 @@ mod tests {
         std::sync::mpsc::Sender<super::ProjectionEvent>,
     ) {
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
-        let client =
-            crate::server_client::ServerClient::new(base_url.to_string(), "token".into());
+        let client = crate::server_client::ServerClient::new(base_url.to_string(), "token".into());
         let projection = super::HttpProjectionClient {
             handle: client.handle(),
             workspace_id: workspace_id.to_string(),
@@ -3177,10 +3137,7 @@ mod tests {
             "01900000-0000-7000-8000-000000000001",
             &projection_user_entry("first prompt", 1000),
         );
-        let no_title = projection_snapshot_body(
-            "01900000-0000-7000-8000-000000000002",
-            "",
-        );
+        let no_title = projection_snapshot_body("01900000-0000-7000-8000-000000000002", "");
         let body = format!(r#"{{"sessions":[{with_title},{no_title}],"next_cursor":null}}"#);
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path == "/v1/workspaces/ws-1/sessions" {
@@ -3212,10 +3169,7 @@ mod tests {
         );
         let body = format!(
             r#"{{"snapshot":{}}}"#,
-            projection_snapshot_body(
-                &thread_id.to_string(),
-                &projection_user_entry("hi", 1000)
-            )
+            projection_snapshot_body(&thread_id.to_string(), &projection_user_entry("hi", 1000))
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
@@ -3241,7 +3195,10 @@ mod tests {
             r#"{{"snapshot":{}}}"#,
             projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
         );
-        let search_body = format!(r#"{{"sessions":[{}]}}"#, projection_summary_json(thread_id, "hello"));
+        let search_body = format!(
+            r#"{{"sessions":[{}]}}"#,
+            projection_summary_json(thread_id, "hello")
+        );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (200, "application/json".into(), snapshot_body.clone())
@@ -3274,11 +3231,7 @@ mod tests {
                 (200, "application/json".into(), snapshot_body.clone())
             } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
                 // Session exists but belongs to another workspace.
-                (
-                    200,
-                    "application/json".into(),
-                    r#"{"sessions":[]}"#.into(),
-                )
+                (200, "application/json".into(), r#"{"sessions":[]}"#.into())
             } else {
                 (
                     404,
@@ -3311,10 +3264,7 @@ mod tests {
     async fn http_projection_client_exact_catalog_falls_back_to_title_search() {
         let body = format!(
             r#"{{"sessions":[{}]}}"#,
-            projection_summary_json(
-                "01900000-0000-7000-8000-000000000001",
-                "my session"
-            )
+            projection_summary_json("01900000-0000-7000-8000-000000000001", "my session")
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
@@ -3387,8 +3337,8 @@ mod tests {
         use axum::response::sse::{Event, Sse};
         use futures::stream;
 
-        async fn events(
-        ) -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+        async fn events() -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>>
+        {
             let stream = stream::iter(vec![
                 Ok(Event::default()
                     .event("thread_changed")
@@ -3400,8 +3350,8 @@ mod tests {
             Sse::new(stream)
         }
 
-        let app = axum::Router::new()
-            .route("/v1/workspaces/ws-1/events", axum::routing::get(events));
+        let app =
+            axum::Router::new().route("/v1/workspaces/ws-1/events", axum::routing::get(events));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -3586,10 +3536,7 @@ mod tests {
         temp_env::with_vars(
             [
                 ("HOME", Some(dir.path().as_os_str())),
-                (
-                    "LATTE_LEASE_TTL_MS",
-                    Some(std::ffi::OsStr::new("5000")),
-                ),
+                ("LATTE_LEASE_TTL_MS", Some(std::ffi::OsStr::new("5000"))),
             ],
             || {
                 tokio::task::block_in_place(|| {
@@ -3651,10 +3598,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_list_renders_rows_without_json() {
         let thread_id = "01900000-0000-7000-8000-000000000001";
-        let session = projection_snapshot_body(
-            thread_id,
-            &projection_user_entry("first prompt", 1000),
-        );
+        let session =
+            projection_snapshot_body(thread_id, &projection_user_entry("first prompt", 1000));
         let body = format!(r#"{{"sessions":[{session}],"next_cursor":null}}"#);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path == "/v1/workspaces" {
@@ -3796,10 +3741,7 @@ mod tests {
         let code = temp_env::with_vars(
             [
                 ("HOME", Some(dir.path().as_os_str())),
-                (
-                    "LATTE_CODE_HOME",
-                    Some(std::ffi::OsStr::new("")),
-                ),
+                ("LATTE_CODE_HOME", Some(std::ffi::OsStr::new(""))),
             ],
             || {
                 tokio::task::block_in_place(|| {
@@ -3823,11 +3765,7 @@ mod tests {
                     r#"{"workspace_id":"ws-test"}"#.into(),
                 )
             } else if path == "/v1/workspaces/ws-test/sessions" {
-                (
-                    200,
-                    "application/json".into(),
-                    r#"{"sessions":[]}"#.into(),
-                )
+                (200, "application/json".into(), r#"{"sessions":[]}"#.into())
             } else {
                 (
                     404,
