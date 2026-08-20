@@ -1066,6 +1066,109 @@ impl ServerHandle {
             .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))
     }
 
+    /// Lists all durable sessions in the workspace.
+    pub async fn list_sessions(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ThreadSnapshot>, ClientError> {
+        let value = self
+            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
+            .await?;
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+        serde_json::from_value(sessions)
+            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+    }
+
+    /// Fetches the authoritative snapshot for one session.
+    pub async fn snapshot(&self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
+        let value = self
+            .get(&format!("/v1/sessions/{session_id}"))
+            .await?;
+        let snapshot = value
+            .get("snapshot")
+            .cloned()
+            .ok_or_else(|| ClientError::Failed("snapshot response missing snapshot".into()))?;
+        serde_json::from_value(snapshot)
+            .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))
+    }
+
+    /// Fetches a session snapshot, returning `None` if the session does not exist.
+    pub async fn try_snapshot(
+        &self,
+        session_id: &ThreadId,
+    ) -> Result<Option<ThreadSnapshot>, ClientError> {
+        match self.snapshot(session_id).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(ClientError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates a session and starts its first turn.
+    pub async fn create_session(
+        &self,
+        workspace_id: &str,
+        thread_id: ThreadId,
+        command_id: ThreadCommandId,
+        prompt: &str,
+        binding: &Value,
+    ) -> Result<u64, ClientError> {
+        let body = json!({
+            "thread_id": thread_id.to_string(),
+            "command_id": command_id.to_string(),
+            "prompt": prompt,
+            "binding": binding,
+        });
+        let value = self
+            .post(
+                &format!("/v1/workspaces/{workspace_id}/sessions"),
+                body,
+                Some(&command_id.to_string()),
+            )
+            .await?;
+        value
+            .get("accepted_revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
+    }
+
+    /// Appends a follow-up turn to an existing session.
+    pub async fn follow_up(
+        &self,
+        session_id: &ThreadId,
+        expected_revision: u64,
+        prompt: &str,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "prompt": prompt,
+            "expected_thread_revision": expected_revision,
+        });
+        let idempotency_key = Uuid::now_v7().to_string();
+        self.post(
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            body,
+            Some(&idempotency_key),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Requests cancellation of the active run.
+    pub async fn cancel(
+        &self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "expected_thread_revision": thread_revision,
+            "expected_run_revision": run_revision,
+        });
+        self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
+            .await?;
+        Ok(())
+    }
+
     /// Renames a session.
     pub async fn rename_session(
         &self,

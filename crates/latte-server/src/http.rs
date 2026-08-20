@@ -333,16 +333,32 @@ async fn create_workspace(
 ) -> Result<Json<WorkspaceResponse>, HandlerError> {
     let path = PathBuf::from(&req.path);
     let workspace = state.workspaces.get_or_create(&path).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: ErrorBody {
-                    error_type: "rejected".to_string(),
-                    message: format!("invalid workspace: {e}"),
-                    current_revision: None,
-                },
-            }),
-        )
+        // Canonicalize failures (non-existent path) are usage errors (400);
+        // builder failures (engine init, legacy import, storage) are internal (500).
+        let message = e.to_string();
+        if message.contains("invalid workspace path") {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message,
+                        current_revision: None,
+                    },
+                }),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "failed".to_string(),
+                        message: format!("workspace initialization failed: {message}"),
+                        current_revision: None,
+                    },
+                }),
+            )
+        }
     })?;
 
     Ok(Json(WorkspaceResponse {

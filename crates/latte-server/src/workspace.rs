@@ -116,7 +116,10 @@ impl WorkspaceInstance {
         &self,
         thread_id: latte_core::ThreadId,
     ) -> Result<latte_core::ThreadSnapshot, latte_engine::StorageError> {
-        self.engine.thread_snapshot_v2(thread_id, None, 500)
+        // Use the tail (newest 500 entries) to match the TUI's
+        // `thread_snapshot_tail_v2` behavior: the TUI shows the latest
+        // transcript page, not the oldest.
+        self.engine.thread_snapshot_tail_v2(thread_id, 500)
     }
 
     /// Lists the durable sessions bound to this workspace, newest transcript

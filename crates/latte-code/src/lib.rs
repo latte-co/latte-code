@@ -4,7 +4,7 @@ use latte_engine::EngineBuilder;
 use latte_headless::{
     registry::ProviderRegistry,
     runtime::VerificationPlan,
-    thread::{ThreadHistoryPolicy, ThreadRuntimeService},
+    thread::ThreadHistoryPolicy,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 mod server_client;
+use server_client::SessionServer;
 
 const JSON_VERSION: u8 = 2;
 const EXIT_COMPLETED: i32 = 0;
@@ -200,14 +201,6 @@ fn storage_home_with(
     Ok(path)
 }
 
-fn storage_database_path() -> Result<PathBuf, String> {
-    Ok(storage_home()?.join("state.db"))
-}
-
-fn storage_conversation_root() -> Result<PathBuf, String> {
-    Ok(storage_home()?.join("sessions"))
-}
-
 fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -281,103 +274,220 @@ fn workspace_display_path_with_home(root: &Path, home: Option<&Path>) -> String 
     }
 }
 
-fn workspace_identity(root: &Path) -> Result<String, String> {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
-    canonical
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "workspace root is not valid UTF-8".into())
+// ---------------------------------------------------------------------------
+// HTTP-backed projection client (v2: server is the single engine host)
+// ---------------------------------------------------------------------------
+
+/// Events bridged from the SSE stream to the synchronous TUI poll loop.
+#[derive(Clone, Debug)]
+enum ProjectionEvent {
+    /// A thread changed or a resync was requested; the TUI should refresh.
+    ThreadChanged,
+    /// The SSE stream was closed (server shut down or unrecoverable error).
+    Closed,
 }
 
-struct ThreadEngineProjection {
-    engine: latte_engine::EngineHandle,
-    subscription: latte_engine::ThreadSubscription,
-    workspace_root: String,
+/// HTTP-backed [`ThreadProjectionClient`] that reads snapshots from the server
+/// and polls a bridged SSE event channel for change notifications.
+///
+/// The TUI main loop is synchronous; async HTTP calls are made through
+/// `block_in_place` + `block_on` (safe on the multi-threaded tokio runtime).
+struct HttpProjectionClient {
+    handle: server_client::ServerHandle,
+    workspace_id: String,
+    event_rx: std::sync::mpsc::Receiver<ProjectionEvent>,
+    runtime: tokio::runtime::Handle,
 }
-impl latte_tui::thread::ThreadProjectionClient for ThreadEngineProjection {
+
+impl HttpProjectionClient {
+    /// Runs an async HTTP call from the synchronous TUI loop.
+    ///
+    /// `block_in_place` moves the current task to a blocking thread so
+    /// `block_on` can drive the HTTP future without deadlocking the runtime.
+    fn block_on<F, T>(&self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, server_client::ClientError>>,
+    {
+        tokio::task::block_in_place(|| self.runtime.block_on(future))
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
     fn snapshots(&mut self) -> Result<Vec<latte_core::ThreadSnapshot>, String> {
-        self.engine
-            .list_threads_v2_for_workspace(&self.workspace_root)
-            .map_err(|error| error.to_string())
+        self.block_on(self.handle.list_sessions(&self.workspace_id))
     }
+
     fn session_catalog(&mut self) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
-        self.engine
-            .list_thread_sessions_v2_for_workspace(&self.workspace_root, 200)
-            .map_err(|error| error.to_string())
+        // Use the default impl (converts snapshots to summaries) — the server's
+        // list endpoint returns full snapshots, which is the authoritative view.
+        self.snapshots().map(|snapshots| {
+            snapshots
+                .into_iter()
+                .map(|snapshot| latte_core::ThreadSessionSummary {
+                    thread_id: snapshot.thread_id,
+                    title: snapshot
+                        .transcript
+                        .entries
+                        .iter()
+                        .find(|entry| entry.kind == latte_core::TranscriptKind::User)
+                        .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
+                    workspace_root: String::new(),
+                    parent_thread_id: None,
+                    lifecycle: snapshot.lifecycle,
+                    provider_name: snapshot.binding.provider_name,
+                    model: snapshot.binding.model,
+                    created_at_ms: snapshot
+                        .transcript
+                        .entries
+                        .first()
+                        .map_or(0, |entry| entry.created_at_ms),
+                    updated_at_ms: snapshot
+                        .transcript
+                        .entries
+                        .last()
+                        .map_or(0, |entry| entry.created_at_ms),
+                })
+                .collect()
+        })
     }
+
     fn exact_session_catalog(
         &mut self,
         query: &str,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
-        if let Ok(thread_id) =
-            serde_json::from_value::<ThreadId>(serde_json::Value::String(query.into()))
-        {
-            let Some(metadata) = self
-                .engine
-                .thread_session_v2(thread_id)
-                .map_err(|error| error.to_string())?
-            else {
-                return Ok(Vec::new());
+        // If the query is a valid thread ID, fetch that session directly.
+        if let Ok(thread_id) = serde_json::from_value::<ThreadId>(serde_json::Value::String(
+            query.to_string(),
+        )) {
+            // A missing session is not an error — return an empty catalog
+            // so the TUI shows "session not found" rather than failing.
+            return match self.block_on(self.handle.try_snapshot(&thread_id)) {
+                Ok(Some(snapshot)) => {
+                    // Verify the session belongs to this workspace. The server
+                    // returns snapshots for any session ID, so we must check
+                    // the workspace membership on the client side (mirroring
+                    // the old engine's workspace_root check).
+                    let search_results = self.block_on(
+                        self.handle
+                            .search_sessions(&self.workspace_id, &thread_id.to_string()),
+                    )?;
+                    if !search_results
+                        .iter()
+                        .any(|summary| summary.thread_id == thread_id)
+                    {
+                        return Err(format!(
+                            "session {thread_id} belongs to another workspace; explicit rebinding is required"
+                        ));
+                    }
+                    Ok(vec![latte_core::ThreadSessionSummary {
+                        thread_id: snapshot.thread_id,
+                        title: snapshot
+                            .transcript
+                            .entries
+                            .iter()
+                            .find(|entry| entry.kind == latte_core::TranscriptKind::User)
+                            .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
+                        workspace_root: String::new(),
+                        parent_thread_id: None,
+                        lifecycle: snapshot.lifecycle,
+                        provider_name: snapshot.binding.provider_name,
+                        model: snapshot.binding.model,
+                        created_at_ms: snapshot
+                            .transcript
+                            .entries
+                            .first()
+                            .map_or(0, |entry| entry.created_at_ms),
+                        updated_at_ms: snapshot
+                            .transcript
+                            .entries
+                            .last()
+                            .map_or(0, |entry| entry.created_at_ms),
+                    }])
+                }
+                Ok(None) => Ok(Vec::new()),
+                Err(error) => Err(error),
             };
-            if metadata.workspace_root != self.workspace_root {
-                return Err(format!(
-                    "session {thread_id} belongs to another workspace; explicit rebinding is required"
-                ));
-            }
-            return Ok(vec![metadata]);
         }
-        self.engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(&self.workspace_root, query, 200)
-            .map_err(|error| error.to_string())
+        // Otherwise, search by exact title.
+        self.block_on(self.handle.search_sessions(&self.workspace_id, query))
     }
+
     fn search_session_catalog(
         &mut self,
         query: &str,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
-        self.engine
-            .search_thread_sessions_v2(query, 200)
-            .map_err(|error| error.to_string())
+        self.block_on(self.handle.search_sessions(&self.workspace_id, query))
     }
+
     fn session(&mut self, thread_id: ThreadId) -> Result<latte_core::ThreadSnapshot, String> {
-        let metadata = self
-            .engine
-            .thread_session_v2(thread_id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("session {thread_id} was not found"))?;
-        if metadata.workspace_root != self.workspace_root {
-            return Err(format!(
-                "session {thread_id} belongs to another workspace; explicit rebinding is required"
-            ));
-        }
-        self.engine
-            .thread_snapshot_tail_v2(thread_id, 500)
-            .map_err(|error| error.to_string())
+        // The server returns the tail (newest 500 entries) via
+        // `thread_snapshot_tail_v2`, matching the old engine behavior.
+        self.block_on(self.handle.snapshot(&thread_id))
     }
-    fn exact_session(&mut self, query: &str) -> Result<Option<latte_core::ThreadSnapshot>, String> {
-        let matches = self.exact_session_catalog(query)?;
-        let [metadata] = matches.as_slice() else {
-            return Ok(None);
-        };
-        self.engine
-            .thread_snapshot_tail_v2(metadata.thread_id, 500)
-            .map(Some)
-            .map_err(|error| error.to_string())
-    }
+
     fn poll(&mut self) -> latte_tui::thread::ThreadProjectionPoll {
-        match self.subscription.try_recv() {
-            Ok(Some(_)) => latte_tui::thread::ThreadProjectionPoll::Event,
-            Ok(None) => latte_tui::thread::ThreadProjectionPoll::Empty,
-            Err(latte_engine::SubscriptionError::Lagged(count)) => {
-                latte_tui::thread::ThreadProjectionPoll::Lagged(count)
+        match self.event_rx.try_recv() {
+            Ok(ProjectionEvent::ThreadChanged) => {
+                latte_tui::thread::ThreadProjectionPoll::Event
             }
-            Err(latte_engine::SubscriptionError::Closed) => {
+            Ok(ProjectionEvent::Closed) => latte_tui::thread::ThreadProjectionPoll::Closed,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                latte_tui::thread::ThreadProjectionPoll::Empty
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 latte_tui::thread::ThreadProjectionPoll::Closed
             }
         }
     }
 }
 
-/// Executes the process-level CLI and returns its documented exit code.
+/// Spawns a background task that bridges the server's SSE event stream to
+/// synchronous mpsc channels for the TUI.
+///
+/// The task reconnects automatically on stream end or read error (§8.1:
+/// resync → reconnect → resync). Thread change events go to `event_tx`;
+/// progress events go to `progress_tx`.
+fn spawn_sse_bridge(
+    mut client: server_client::ServerClient,
+    workspace_id: String,
+    event_tx: std::sync::mpsc::Sender<ProjectionEvent>,
+    progress_tx: std::sync::mpsc::Sender<latte_core::ThreadTransientProgress>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            // Open the SSE stream for this workspace.
+            if client.open_events(&workspace_id).await.is_err() {
+                let _ = event_tx.send(ProjectionEvent::Closed);
+                return;
+            }
+            // Read events until the stream ends or errors.
+            loop {
+                match client.next_event().await {
+                    Ok(Some(
+                        server_client::StreamEvent::ThreadChanged { .. }
+                        | server_client::StreamEvent::ResyncRequired,
+                    )) => {
+                        if event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+                            return; // TUI dropped the receiver
+                        }
+                    }
+                    Ok(Some(server_client::StreamEvent::Progress { progress, .. })) => {
+                        if let Ok(progress) =
+                            serde_json::from_value::<latte_core::ThreadTransientProgress>(progress)
+                        {
+                            let _ = progress_tx.send(progress);
+                        }
+                    }
+                    // Stream ended or read error: reconnect.
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            // Brief backoff before reconnecting.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    })
+}
 ///
 /// Keeping orchestration in the library lets process-level integration tests
 /// exercise the exact controller used by the binary.
@@ -397,7 +507,7 @@ async fn execute() -> i32 {
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
     if implicit_tui || matches!(args.as_slice(), [command] if command == "tui") {
-        return execute_tui();
+        return execute_tui().await;
     }
     if matches!(args.first().map(String::as_str), Some("serve")) {
         return execute_serve(&args[1..], json).await;
@@ -558,144 +668,24 @@ fn emit_client_error(json: bool, error: &server_client::ClientError) -> i32 {
     error.exit_code()
 }
 
-/// Executes the single v2 reconciliation command exposed by the transcript
-/// TUI. Keeping this adapter small and synchronous makes the CLI boundary
-/// testable while the actual mutation remains in `ThreadRuntimeService` and
-/// its exact engine-owned fenced commit path.
-fn reconcile_thread_action(
-    service: &ThreadRuntimeService,
-    thread_id: ThreadId,
-    effect_id: &str,
-) -> Result<String, String> {
-    service
-        .reconcile_unknown_effect(thread_id, effect_id)
-        .map(|_| "unknown effect acknowledged; child aborted".into())
-        .map_err(|error| error.to_string())
-}
-
-#[allow(clippy::too_many_lines)]
-fn dispatch_session_management_action(
-    engine: &latte_engine::EngineHandle,
-    feedback_tx: &std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
-    action: latte_tui::thread::ThreadUiAction,
-) -> Option<latte_tui::thread::ThreadUiAction> {
-    use latte_tui::thread::{SessionManagementOutcome, ThreadUiAction, ThreadUiFeedback};
-
-    match action {
-        ThreadUiAction::RenameSession { thread_id, title } => {
-            let engine = engine.clone();
-            let feedback = feedback_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                let result = engine
-                    .rename_thread_session_v2(thread_id, &title)
-                    .map(|session| {
-                        SessionManagementOutcome::Updated(format!(
-                            "Session renamed to {}",
-                            session.title
-                        ))
-                    })
-                    .map_err(|error| error.to_string());
-                let _ = feedback.send(ThreadUiFeedback::session_management(result));
-            });
-            None
-        }
-        ThreadUiAction::ForkSession { thread_id, title } => {
-            let engine = engine.clone();
-            let feedback = feedback_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                let fork_id =
-                    ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
-                let result = engine
-                    .fork_thread_session_v2(thread_id, fork_id, title.as_deref(), wall_time_ms())
-                    .map(|snapshot| SessionManagementOutcome::Forked(snapshot.thread_id))
-                    .map_err(|error| error.to_string());
-                let _ = feedback.send(ThreadUiFeedback::session_management(result));
-            });
-            None
-        }
-        action => Some(action),
-    }
-}
-
-fn open_tui_engine(
-    root: &Path,
-    config: &AppConfig,
-    database_path: &Path,
-    conversation_root: &Path,
-    now_ms: u64,
-) -> Result<latte_engine::EngineHandle, String> {
-    let parent = database_path
-        .parent()
-        .ok_or_else(|| "global storage database must have a parent directory".to_string())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    let engine = EngineBuilder::new()
-        .workspace_root(root)
-        .database_path(database_path)
-        .conversation_root(conversation_root)
-        .build()
-        .map_err(|error| error.to_string())?;
-    engine
-        .import_legacy_workspace_database(config.legacy_database_path(root), now_ms)
-        .map_err(|error| format!("legacy import: {error}"))?;
-    Ok(engine)
-}
-
-fn tui_startup_presentation(
-    root: &Path,
-    registry: &latte_headless::registry::ProviderRegistry,
-    engine: &latte_engine::EngineHandle,
-) -> Result<
-    (
-        Option<ThreadProviderBindingV2>,
-        latte_tui::thread::ThreadStartupPresentation,
-    ),
-    String,
-> {
-    let startup_binding = match registry.thread_binding_for_default(&engine.tool_descriptors()) {
-        Ok(binding) => Some(binding),
-        Err(_) if registry.model_catalog().is_empty() => None,
-        Err(error) => return Err(error.to_string()),
-    };
-    let startup = latte_tui::thread::ThreadStartupPresentation {
-        default_provider: startup_binding
-            .as_ref()
-            .map_or_else(String::new, |binding| binding.provider_name.clone()),
-        default_model: startup_binding
-            .as_ref()
-            .map_or_else(String::new, |binding| binding.model.clone()),
-        model_catalog: registry
-            .model_catalog()
-            .into_iter()
-            .map(|entry| latte_tui::thread::ThreadModelOption {
-                provider_name: entry.provider_name,
-                model: entry.model,
-                name: entry.name,
-                is_default: entry.is_default,
-            })
-            .collect(),
-        workspace_display: workspace_display_path(root),
-        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
-    };
-    Ok((startup_binding, startup))
-}
-
 /// Holds the fully-resolved state the TUI main loop needs.
 struct TuiSetup {
-    engine: latte_engine::EngineHandle,
+    projection: HttpProjectionClient,
     startup_binding: Option<ThreadProviderBindingV2>,
     startup: latte_tui::thread::ThreadStartupPresentation,
     progress_rx: std::sync::mpsc::Receiver<latte_core::ThreadTransientProgress>,
-    service: ThreadRuntimeService,
-    projection: ThreadEngineProjection,
     feedback_tx: std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
     feedback_rx: std::sync::mpsc::Receiver<latte_tui::thread::ThreadUiFeedback>,
-    action_registry: latte_headless::registry::ProviderRegistry,
+    server_handle: server_client::ServerHandle,
+    workspace_id: String,
+    bindings: Vec<Value>,
+    embedded: Option<server_client::EmbeddedServer>,
+    sse_task: tokio::task::JoinHandle<()>,
 }
 
-/// Resolves config, engine, and runtime state for the TUI. Separated from
-/// [`execute_tui`] so the setup paths are testable without a TTY.
-fn tui_setup() -> Result<TuiSetup, i32> {
+/// Resolves config, server connection, and runtime state for the TUI.
+/// Separated from [`execute_tui`] so the setup paths are testable without a TTY.
+async fn tui_setup() -> Result<TuiSetup, i32> {
     let root = match std::env::current_dir() {
         Ok(root) => discover_workspace_root(&root),
         Err(error) => {
@@ -703,423 +693,478 @@ fn tui_setup() -> Result<TuiSetup, i32> {
             return Err(EXIT_INTERNAL);
         }
     };
-    let (config, registry) = match AppConfig::load(&root) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("configuration: {error}");
-            return Err(EXIT_USAGE);
-        }
-    };
-    let database_path = match storage_database_path() {
+    let storage_home = match storage_home() {
         Ok(path) => path,
         Err(error) => {
             eprintln!("configuration: {error}");
             return Err(EXIT_USAGE);
         }
     };
-    let conversation_root = match storage_conversation_root() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("configuration: {error}");
-            return Err(EXIT_USAGE);
-        }
-    };
-    let engine = match open_tui_engine(
-        &root,
-        &config,
-        &database_path,
-        &conversation_root,
-        wall_time_ms(),
-    ) {
-        Ok(engine) => engine,
+    tui_setup_with(&root, &storage_home).await
+}
+
+/// Core setup logic with injected paths (unit-testable without a TTY or a
+/// process-wide working directory).
+#[allow(clippy::too_many_lines)]
+async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i32> {
+    // Connect to the embedded server (the server is the single engine host).
+    let (client, embedded) =
+        match server_client::connect(None, None, root, storage_home).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                // Prefix usage errors with "configuration:" so E2E tests can
+                // assert on the error category.
+                if matches!(error, server_client::ClientError::Usage(_)) {
+                    eprintln!("configuration: {error}");
+                } else {
+                    eprintln!("{error}");
+                }
+                return Err(error.exit_code());
+            }
+        };
+    let server_handle = client.handle();
+    // Resolve the workspace and fetch the binding catalog.
+    let workspace_id = match server_handle.resolve_workspace_id(root).await {
+        Ok(id) => id,
         Err(error) => {
             eprintln!("{error}");
-            return Err(EXIT_INTERNAL);
+            return Err(error.exit_code());
         }
     };
-    let (startup_binding, startup) = match tui_startup_presentation(&root, &registry, &engine) {
-        Ok(value) => value,
+    let bindings = match server_handle.bindings_catalog(&workspace_id).await {
+        Ok(bindings) => bindings,
         Err(error) => {
-            eprintln!("configuration: {error}");
-            return Err(EXIT_USAGE);
+            eprintln!("{error}");
+            return Err(error.exit_code());
         }
     };
-    let resolver_registry = registry.clone();
-    let resolver_engine = engine.clone();
-    let factory: latte_headless::thread::ThreadProviderFactory =
-        std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
-            resolver_registry
-                .resolve_thread_bound(binding, &resolver_engine.tool_descriptors())
-                .map_err(|error| error.to_string())
-        });
+    // Build the startup presentation from the binding catalog.
+    let default_entry = bindings
+        .iter()
+        .find(|entry| {
+            entry
+                .get("is_default")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| bindings.first());
+    let startup_binding = default_entry.and_then(|entry| {
+        entry
+            .get("binding")
+            .and_then(|binding| {
+                serde_json::from_value::<ThreadProviderBindingV2>(binding.clone()).ok()
+            })
+    });
+    let startup = latte_tui::thread::ThreadStartupPresentation {
+        default_provider: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.provider_name.clone()),
+        default_model: startup_binding
+            .as_ref()
+            .map_or_else(String::new, |binding| binding.model.clone()),
+        model_catalog: bindings
+            .iter()
+            .map(|entry| latte_tui::thread::ThreadModelOption {
+                provider_name: entry
+                    .get("provider_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                model: entry
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                is_default: entry
+                    .get("is_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+            .collect(),
+        workspace_display: workspace_display_path(root),
+        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
+    };
+    // Spawn the SSE bridge: background task → mpsc channels for the sync TUI.
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<ProjectionEvent>();
     let (progress_tx, progress_rx) =
         std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
-    let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
-        std::sync::Arc::new(move |_thread_id, progress| {
-            let _ = progress_tx.send(progress);
-        });
-    let service = ThreadRuntimeService::new(engine.clone(), &root, config.thread_policy(), factory)
-        .with_progress_sink(progress_sink)
-        .with_verification(config.plan());
-    let projection = ThreadEngineProjection {
-        engine: engine.clone(),
-        subscription: engine.subscribe_threads(),
-        workspace_root: match workspace_identity(&root) {
-            Ok(identity) => identity,
-            Err(error) => {
-                eprintln!("configuration: {error}");
-                return Err(EXIT_USAGE);
-            }
-        },
+    let sse_task = spawn_sse_bridge(client, workspace_id.clone(), event_tx, progress_tx);
+    let projection = HttpProjectionClient {
+        handle: server_handle.clone(),
+        workspace_id: workspace_id.clone(),
+        event_rx,
+        runtime: tokio::runtime::Handle::current(),
     };
     let (feedback_tx, feedback_rx) =
         std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
-    let action_registry = registry.clone();
     Ok(TuiSetup {
-        engine,
+        projection,
         startup_binding,
         startup,
         progress_rx,
-        service,
-        projection,
         feedback_tx,
         feedback_rx,
-        action_registry,
+        server_handle,
+        workspace_id,
+        bindings,
+        embedded,
+        sse_task,
     })
 }
 
-/// Transcript-first interactive entrypoint. The legacy v1 CLI remains intact;
-/// the TUI reads only v2 snapshots and submits v2 conversation requests.
-fn execute_tui() -> i32 {
+/// Transcript-first interactive entrypoint. The TUI reads v2 snapshots and
+/// submits v2 conversation requests over HTTP+SSE (the server is the single
+/// engine host; there is no in-process engine in the TUI path).
+async fn execute_tui() -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!(
             "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
         );
         return EXIT_USAGE;
     }
-    let setup = match tui_setup() {
+    let setup = match tui_setup().await {
         Ok(setup) => setup,
         Err(code) => return code,
     };
     tui_main_loop(setup)
 }
 
-/// The TUI main loop: runs the terminal UI and dispatches actions.
+/// The TUI main loop: runs the terminal UI and dispatches actions over HTTP.
 #[allow(clippy::too_many_lines)]
 fn tui_main_loop(setup: TuiSetup) -> i32 {
     let TuiSetup {
-        engine,
+        mut projection,
         startup_binding,
         startup,
         progress_rx,
-        service,
-        mut projection,
         feedback_tx,
         feedback_rx,
-        action_registry,
+        server_handle,
+        workspace_id,
+        bindings,
+        embedded,
+        sse_task,
+        ..
     } = setup;
-    match latte_tui::thread::run_with_feedback_and_progress(
+    // Resolve a provider+model pair to a binding from the cached catalog.
+    let resolve_binding = |provider_name: &str, model: &str| -> Option<Value> {
+        bindings
+            .iter()
+            .find(|entry| {
+                entry
+                    .get("provider_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == provider_name)
+                    && entry
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .is_some_and(|m| m == model)
+            })
+            .and_then(|entry| entry.get("binding").cloned())
+    };
+    let result = latte_tui::thread::run_with_feedback_and_progress(
         &mut projection,
         startup,
         move |action| {
-            let Some(action) = dispatch_session_management_action(&engine, &feedback_tx, action)
-            else {
-                return Ok(());
+            use latte_tui::thread::{SessionManagementOutcome, ThreadUiAction, ThreadUiFeedback};
+            // Session management actions (rename/fork) are dispatched first.
+            let action = match action {
+                ThreadUiAction::RenameSession { thread_id, title } => {
+                    let handle = server_handle.clone();
+                    let feedback = feedback_tx.clone();
+                    tokio::spawn(async move {
+                        let result = handle
+                            .rename_session(&thread_id, &title)
+                            .await
+                            .map(|()| {
+                                SessionManagementOutcome::Updated(format!(
+                                    "Session renamed to {title}"
+                                ))
+                            })
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(ThreadUiFeedback::session_management(result));
+                    });
+                    return Ok(());
+                }
+                ThreadUiAction::ForkSession { thread_id, title } => {
+                    let handle = server_handle.clone();
+                    let feedback = feedback_tx.clone();
+                    tokio::spawn(async move {
+                        let result = handle
+                            .fork_session(&thread_id, title.as_deref())
+                            .await
+                            .map(SessionManagementOutcome::Forked)
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(ThreadUiFeedback::session_management(result));
+                    });
+                    return Ok(());
+                }
+                other => other,
             };
             match action {
-                latte_tui::thread::ThreadUiAction::Start {
+                ThreadUiAction::Start {
                     submission_id,
                     prompt,
                 } => {
                     let Some(binding) = startup_binding.clone() else {
                         let _ = feedback_tx.send(
-                            latte_tui::thread::ThreadUiFeedback::submission(
+                            ThreadUiFeedback::submission(
                                 submission_id,
                                 Err("configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code".into()),
                             ),
                         );
                         return Ok(());
                     };
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
+                    let ws = workspace_id.clone();
                     let thread_id =
                         ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
-                    let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::assigned(
-                        submission_id,
-                        thread_id,
-                    ));
+                    let command_id = latte_core::ThreadCommandId::from_uuid(
+                        latte_core::SystemIdSource::default().next_uuid_v7(),
+                    );
+                    let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
+                    let binding_value = serde_json::to_value(&binding).map_err(|error| {
+                        error.to_string()
+                    })?;
                     tokio::spawn(async move {
-                        let result = service
-                            .start(thread_id, prompt, binding, None)
+                        let result = handle
+                            .create_session(
+                                &ws,
+                                thread_id,
+                                command_id,
+                                &prompt,
+                                &binding_value,
+                            )
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
-                            submission_id,
-                            result,
-                        ));
+                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::StartWithModel {
+                ThreadUiAction::StartWithModel {
                     submission_id,
                     prompt,
                     provider_name,
                     model,
                 } => {
-                    let binding = match action_registry.thread_binding_for_model(
-                        &provider_name,
-                        &model,
-                        &engine.tool_descriptors(),
-                    ) {
-                        Ok(binding) => binding,
-                        Err(error) => {
-                            let _ =
-                                feedback_tx.send(latte_tui::thread::ThreadUiFeedback::submission(
-                                    submission_id,
-                                    Err(error.to_string()),
-                                ));
-                            return Ok(());
-                        }
+                    let Some(binding_value) = resolve_binding(&provider_name, &model) else {
+                        let _ = feedback_tx.send(ThreadUiFeedback::submission(
+                            submission_id,
+                            Err(format!(
+                                "no binding found for {provider_name}/{model}"
+                            )),
+                        ));
+                        return Ok(());
                     };
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
+                    let ws = workspace_id.clone();
                     let thread_id =
                         ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
-                    let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::assigned(
-                        submission_id,
-                        thread_id,
-                    ));
+                    let command_id = latte_core::ThreadCommandId::from_uuid(
+                        latte_core::SystemIdSource::default().next_uuid_v7(),
+                    );
+                    let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
                     tokio::spawn(async move {
-                        let result = service
-                            .start(thread_id, prompt, binding, None)
+                        let result = handle
+                            .create_session(
+                                &ws,
+                                thread_id,
+                                command_id,
+                                &prompt,
+                                &binding_value,
+                            )
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
-                            submission_id,
-                            result,
-                        ));
+                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::FollowUp {
+                ThreadUiAction::FollowUp {
                     submission_id,
                     thread_id,
                     expected_thread_revision,
                     prompt,
                 } => {
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
-                        let result = service
-                            .follow_up(thread_id, expected_thread_revision, prompt)
+                        let result = handle
+                            .follow_up(&thread_id, expected_thread_revision, &prompt)
                             .await
-                            .map(|_| "follow-up completed".into())
+                            .map(|()| "follow-up completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::submission(
-                            submission_id,
-                            result,
-                        ));
+                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::QueueFollowUp {
+                ThreadUiAction::QueueFollowUp {
                     submission_id,
                     thread_id,
                     prompt,
                 } => {
-                    let result = service
-                        .queue_follow_up(thread_id, prompt)
-                        .map(|position| format!("follow-up queued at position {position}"))
-                        .map_err(|error| error.to_string());
-                    let _ = feedback_tx.send(latte_tui::thread::ThreadUiFeedback::submission(
-                        submission_id,
-                        result,
-                    ));
-                }
-                latte_tui::thread::ThreadUiAction::Cancel { thread_id } => {
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
-                    let cancel_engine = engine.clone();
-                    tokio::task::spawn_blocking(move || {
-                        // The TUI cancels the session's current active run, so
-                        // fence against the live snapshot's revisions.
-                        let result = cancel_engine
-                            .thread_snapshot_v2(thread_id, None, 1)
-                            .map_err(|error| error.to_string())
-                            .and_then(|snapshot| {
+                    tokio::spawn(async move {
+                        let result = handle
+                            .queue_follow_up(&thread_id, &prompt)
+                            .await
+                            .map(|position| format!("follow-up queued at position {position}"))
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
+                    });
+                }
+                ThreadUiAction::Cancel { thread_id } => {
+                    let handle = server_handle.clone();
+                    let feedback = feedback_tx.clone();
+                    tokio::spawn(async move {
+                        let snapshot = handle.snapshot(&thread_id).await;
+                        let result = match snapshot {
+                            Ok(snapshot) => {
                                 let run_revision = snapshot
                                     .active_run_id
                                     .and_then(|run_id| {
                                         snapshot.runs.iter().find(|run| run.run_id == run_id)
                                     })
-                                    .map(|run| run.run_revision)
-                                    .unwrap_or_default();
-                                service
-                                    .cancel_durable(thread_id, snapshot.revision, run_revision)
-                                    .map(|_| "interruption requested".into())
+                                    .map_or(0, |run| run.run_revision);
+                                handle
+                                    .cancel(&thread_id, snapshot.revision, run_revision)
+                                    .await
+                                    .map(|()| "interruption requested".into())
                                     .map_err(|error| error.to_string())
-                            });
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                        let _ = feedback.send(ThreadUiFeedback::command(result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::ProvideInput {
+                ThreadUiAction::ProvideInput {
                     submission_id,
                     thread_id,
                     request_id,
                     value,
                 } => {
-                    let snapshot = engine
-                        .thread_snapshot_v2(thread_id, None, 1)
-                        .map_err(|error| error.to_string());
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
-                    match snapshot {
-                        Ok(snapshot) => {
-                            let run_revision = snapshot
-                                .active_run_id
-                                .and_then(|run_id| {
-                                    snapshot
-                                        .runs
-                                        .iter()
-                                        .find(|r| r.run_id == run_id)
-                                        .map(|r| r.run_revision)
-                                })
-                                .unwrap_or(0);
-                            tokio::spawn(async move {
-                                let result = service
+                    tokio::spawn(async move {
+                        let snapshot = handle.snapshot(&thread_id).await;
+                        let result = match snapshot {
+                            Ok(snapshot) => {
+                                let run_revision = snapshot
+                                    .active_run_id
+                                    .and_then(|run_id| {
+                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                    })
+                                    .map_or(0, |r| r.run_revision);
+                                handle
                                     .provide_input(
-                                        thread_id,
+                                        &thread_id,
                                         snapshot.revision,
                                         run_revision,
-                                        request_id,
-                                        value,
+                                        &request_id,
+                                        &value,
                                     )
                                     .await
-                                    .map(|_| "input accepted".into())
-                                    .map_err(|error| error.to_string());
-                                let _ = feedback.send(
-                                    latte_tui::thread::ThreadUiFeedback::input_submission(
-                                        submission_id,
-                                        result,
-                                    ),
-                                );
-                            });
-                        }
-                        Err(error) => {
-                            let _ = feedback.send(
-                                latte_tui::thread::ThreadUiFeedback::input_submission(
-                                    submission_id,
-                                    Err(error),
-                                ),
-                            );
-                        }
-                    }
+                                    .map(|()| "input accepted".into())
+                                    .map_err(|error| error.to_string())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                        let _ = feedback.send(ThreadUiFeedback::input_submission(
+                            submission_id, result,
+                        ));
+                    });
                 }
-                latte_tui::thread::ThreadUiAction::ResolvePermission {
+                ThreadUiAction::ResolvePermission {
                     thread_id,
                     request_id,
                     allow,
                 } => {
-                    let snapshot = engine
-                        .thread_snapshot_v2(thread_id, None, 1)
-                        .map_err(|error| error.to_string());
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
-                    match snapshot {
-                        Ok(snapshot) => {
-                            let run_revision = snapshot
-                                .active_run_id
-                                .and_then(|run_id| {
-                                    snapshot
-                                        .runs
-                                        .iter()
-                                        .find(|r| r.run_id == run_id)
-                                        .map(|r| r.run_revision)
-                                })
-                                .unwrap_or(0);
-                            tokio::spawn(async move {
-                                let result = service
+                    tokio::spawn(async move {
+                        let snapshot = handle.snapshot(&thread_id).await;
+                        let result = match snapshot {
+                            Ok(snapshot) => {
+                                let run_revision = snapshot
+                                    .active_run_id
+                                    .and_then(|run_id| {
+                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                    })
+                                    .map_or(0, |r| r.run_revision);
+                                handle
                                     .resolve_permission(
-                                        thread_id,
+                                        &thread_id,
                                         snapshot.revision,
                                         run_revision,
-                                        request_id,
+                                        &request_id,
                                         allow,
                                     )
                                     .await
-                                    .map(|_| {
+                                    .map(|()| {
                                         if allow {
                                             "permission allowed".into()
                                         } else {
                                             "permission denied".into()
                                         }
                                     })
-                                    .map_err(|error| error.to_string());
-                                let _ = feedback
-                                    .send(latte_tui::thread::ThreadUiFeedback::command(result));
-                            });
-                        }
-                        Err(error) => {
-                            let _ = feedback_tx
-                                .send(latte_tui::thread::ThreadUiFeedback::command(Err(error)));
-                        }
-                    }
+                                    .map_err(|error| error.to_string())
+                            }
+                            Err(error) => Err(error.to_string()),
+                        };
+                        let _ = feedback.send(ThreadUiFeedback::command(result));
+                    });
                 }
-                latte_tui::thread::ThreadUiAction::ReconcileUnknown {
+                ThreadUiAction::ReconcileUnknown {
                     thread_id,
                     effect_id,
                 } => {
-                    let service = service.clone();
+                    let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        // The reducer has already required Ctrl+R followed by
-                        // Ctrl+A. The service re-loads the authoritative
-                        // snapshot and uses the exact v2 fenced reconciliation
-                        // path; its emitted thread event refreshes the TUI
-                        // projection after the terminal transition.
-                        let result = reconcile_thread_action(&service, thread_id, &effect_id);
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::command(result));
+                    tokio::spawn(async move {
+                        let result = handle
+                            .reconcile_effect(&thread_id, &effect_id)
+                            .await
+                            .map(|()| "unknown effect acknowledged; child aborted".into())
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(ThreadUiFeedback::command(result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::SwitchModel {
+                ThreadUiAction::SwitchModel {
                     switch_id,
                     thread_id,
                     expected_thread_revision,
                     provider_name,
                     model,
                 } => {
-                    let binding = action_registry
-                        .thread_binding_for_model(
-                            &provider_name,
-                            &model,
-                            &engine.tool_descriptors(),
-                        )
-                        .map_err(|error| error.to_string());
-                    let service = service.clone();
-                    let feedback = feedback_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let result = binding.and_then(|binding| {
-                            service
-                                .switch_model(thread_id, expected_thread_revision, &binding)
-                                .map(|snapshot| {
-                                    format!(
-                                        "Model switched to {}/{}",
-                                        snapshot.binding.provider_name, snapshot.binding.model
-                                    )
-                                })
-                                .map_err(|error| error.to_string())
-                        });
-                        let _ = feedback.send(latte_tui::thread::ThreadUiFeedback::model_switch(
-                            switch_id, result,
+                    let Some(binding_value) = resolve_binding(&provider_name, &model) else {
+                        let _ = feedback_tx.send(ThreadUiFeedback::model_switch(
+                            switch_id,
+                            Err(format!("no binding found for {provider_name}/{model}")),
                         ));
+                        return Ok(());
+                    };
+                    let handle = server_handle.clone();
+                    let feedback = feedback_tx.clone();
+                    tokio::spawn(async move {
+                        let result = handle
+                            .switch_model(&thread_id, expected_thread_revision, &binding_value)
+                            .await
+                            .map(|()| format!("Model switched to {provider_name}/{model}"))
+                            .map_err(|error| error.to_string());
+                        let _ = feedback.send(ThreadUiFeedback::model_switch(switch_id, result));
                     });
                 }
-                latte_tui::thread::ThreadUiAction::RefreshSnapshots
-                | latte_tui::thread::ThreadUiAction::ShowSessions { .. }
-                | latte_tui::thread::ThreadUiAction::SearchSessions { .. }
-                | latte_tui::thread::ThreadUiAction::OpenSession { .. }
-                | latte_tui::thread::ThreadUiAction::Quit => {}
-                latte_tui::thread::ThreadUiAction::RenameSession { .. }
-                | latte_tui::thread::ThreadUiAction::ForkSession { .. } => {
+                ThreadUiAction::RefreshSnapshots
+                | ThreadUiAction::ShowSessions { .. }
+                | ThreadUiAction::SearchSessions { .. }
+                | ThreadUiAction::OpenSession { .. }
+                | ThreadUiAction::Quit => {}
+                ThreadUiAction::RenameSession { .. } | ThreadUiAction::ForkSession { .. } => {
                     unreachable!("session management actions are dispatched before this match")
                 }
             }
@@ -1127,7 +1172,17 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
         },
         &feedback_rx,
         &progress_rx,
-    ) {
+    );
+    // Abort the SSE bridge task first so its connection does not block
+    // the embedded server's graceful shutdown.
+    sse_task.abort();
+    // Shut down the embedded server (if any) before exiting.
+    if let Some(embedded) = embedded {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(embedded.shutdown());
+        });
+    }
+    match result {
         Ok(()) => EXIT_COMPLETED,
         Err(error) => {
             eprintln!("{error}");
@@ -1484,31 +1539,23 @@ mod tests {
     use super::bind_local_listener;
     use super::{
         AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
-        ThreadEngineProjection, VerificationConfig, discover_workspace_root,
-        dispatch_session_management_action, dot, emit_client_error, emit_data, emit_error,
+        VerificationConfig, discover_workspace_root,
+        dot, emit_client_error, emit_data, emit_error,
         execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
-        merge_value, open_tui_engine, parse_serve_port, prepare_server, readiness_envelope,
-        reconcile_thread_action, serve_bound, storage_home_with, tui_setup,
-        tui_startup_presentation, verify_timeout, workspace_display_path,
-        workspace_display_path_with_home, workspace_identity, write_server_token,
+        merge_value, parse_serve_port, prepare_server, readiness_envelope,
+        serve_bound, storage_home_with, tui_setup,
+        verify_timeout,
+        workspace_display_path_with_home, write_server_token,
     };
     use latte_core::{
-        IdSource, RunId, RunStatus, SystemIdSource, ThreadCommandId, ThreadId, ThreadLifecycle,
+        IdSource, RunId, SystemIdSource, ThreadId, ThreadLifecycle,
         ThreadProviderBindingV2,
     };
-    use latte_engine::{
-        CommitThreadRunUpdate, EngineBuilder, ThreadCommitRequest, ThreadEffectDescriptor,
-        ThreadEffectRequest, ThreadEffectStartRequest,
-    };
-    use latte_headless::thread::{ThreadHistoryPolicy, ThreadRuntimeService};
-    use latte_tui::thread::{
-        SessionManagementOutcome, ThreadProjectionClient, ThreadProjectionPoll, ThreadUiAction,
-        ThreadUiFeedback,
-    };
+    use latte_headless::thread::ThreadHistoryPolicy;
+    use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},
-        sync::Arc,
         time::Duration,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1549,15 +1596,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_identity_and_global_storage_home_are_canonical_and_explicit() {
+    fn global_storage_home_is_canonical_and_explicit() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(
-            workspace_identity(root.path()).unwrap(),
-            std::fs::canonicalize(root.path())
-                .unwrap()
-                .to_str()
-                .unwrap()
-        );
         assert_eq!(
             storage_home_with(None, Some(root.path())).unwrap(),
             root.path().join(".latte/latte-code")
@@ -1709,33 +1749,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tui_entrypoint_rejects_non_terminal_processes_before_loading_authority() {
-        assert_eq!(execute_tui(), EXIT_USAGE);
+    #[tokio::test]
+    async fn tui_entrypoint_rejects_non_terminal_processes_before_loading_authority() {
+        assert_eq!(execute_tui().await, EXIT_USAGE);
     }
 
-    #[test]
-    fn tui_setup_reports_configuration_error_for_invalid_config() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_setup_reports_configuration_error_for_invalid_config() {
         // Create a temp dir with an invalid config file, then set HOME to it.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
         std::fs::write(dir.path().join(".latte/latte-code.jsonc"), "{invalid json").unwrap();
-        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], tui_setup);
+        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(tui_setup())
+            })
+        });
         assert!(result.is_err());
         assert_eq!(result.err().unwrap(), EXIT_USAGE);
     }
 
-    #[test]
-    fn tui_setup_reports_configuration_error_when_storage_home_empty() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_setup_reports_configuration_error_when_storage_home_empty() {
         // With LATTE_CODE_HOME set to an empty string, storage_home() fails
-        // and tui_setup returns EXIT_USAGE from the database_path branch.
+        // and tui_setup returns EXIT_USAGE.
         let dir = tempfile::tempdir().unwrap();
         let result = temp_env::with_vars(
             [
                 ("HOME", Some(dir.path().as_os_str())),
                 ("LATTE_CODE_HOME", Some(std::ffi::OsStr::new(""))),
             ],
-            tui_setup,
+            || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(tui_setup())
+                })
+            },
         );
         assert!(result.is_err());
         assert_eq!(result.err().unwrap(), EXIT_USAGE);
@@ -1754,31 +1802,6 @@ mod tests {
         // Zero → None (filtered out).
         temp_env::with_vars([("LATTE_LEASE_TTL_MS", Some("0"))], || {
             assert_eq!(super::server_lease_ttl_ms(), None);
-        });
-    }
-
-    #[test]
-    fn storage_paths_fail_without_home() {
-        temp_env::with_vars(
-            [
-                ("HOME", None::<&std::ffi::OsStr>),
-                ("LATTE_CODE_HOME", None::<&std::ffi::OsStr>),
-            ],
-            || {
-                assert!(super::storage_database_path().is_err());
-                assert!(super::storage_conversation_root().is_err());
-            },
-        );
-    }
-
-    #[test]
-    fn storage_paths_succeed_with_home() {
-        let temp = tempfile::tempdir().unwrap();
-        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
-            let db = super::storage_database_path().unwrap();
-            assert_eq!(db, temp.path().join("state.db"));
-            let conv = super::storage_conversation_root().unwrap();
-            assert_eq!(conv, temp.path().join("sessions"));
         });
     }
 
@@ -1903,360 +1926,9 @@ mod tests {
         assert_eq!(config.verification.argv, ["echo", "home"]);
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn workspace_and_projection_adapters_cover_empty_event_and_lagged_states() {
-        let root = tempfile::tempdir().unwrap();
-        let nested = root.path().join("no/git/here");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(discover_workspace_root(&nested), nested);
-        assert_eq!(
-            workspace_display_path_with_home(root.path(), None),
-            root.path().display().to_string()
-        );
-        assert!(!workspace_display_path(root.path()).is_empty());
 
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .build()
-            .unwrap();
-        let canonical_root = workspace_identity(root.path()).unwrap();
-        let mut projection = ThreadEngineProjection {
-            subscription: engine.subscribe_threads(),
-            engine: engine.clone(),
-            workspace_root: canonical_root.clone(),
-        };
-        assert!(projection.snapshots().unwrap().is_empty());
-        assert_eq!(projection.poll(), ThreadProjectionPoll::Empty);
 
-        let ids = SystemIdSource::default();
-        let binding = ThreadProviderBindingV2 {
-            version: 1,
-            provider_name: "test".into(),
-            provider_type: "openai-chat".into(),
-            protocol: "chat".into(),
-            model: "test".into(),
-            config_fingerprint: "config".into(),
-            tools_fingerprint: "tools".into(),
-            aliases: std::collections::BTreeMap::new(),
-            credential_ref_id: "env:TEST".into(),
-            data_scope_id: "workspace".into(),
-            credential_generation: 1,
-        };
-        let mut created = Vec::new();
-        for index in 0..510 {
-            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
-            engine
-                .create_thread_v2(
-                    thread_id,
-                    run_id,
-                    binding.clone(),
-                    &format!("thread-{index}"),
-                    u64::try_from(index + 1).unwrap(),
-                )
-                .unwrap();
-            created.push((thread_id, run_id));
-        }
-        let first_thread_id = created[0].0;
-        let catalog = projection.session_catalog().unwrap();
-        assert_eq!(catalog.len(), 200);
-        assert!(
-            catalog
-                .iter()
-                .all(|session| session.workspace_root == canonical_root)
-        );
-        assert_eq!(
-            projection.search_session_catalog("thread-0").unwrap()[0].thread_id,
-            first_thread_id
-        );
-        assert!(
-            projection
-                .search_session_catalog("missing title")
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            projection.session(first_thread_id).unwrap().thread_id,
-            first_thread_id
-        );
-        assert_eq!(
-            projection
-                .exact_session(&first_thread_id.to_string())
-                .unwrap()
-                .unwrap()
-                .thread_id,
-            first_thread_id,
-            "exact resume must not inherit the recent catalog cap"
-        );
-        assert_eq!(
-            projection
-                .exact_session("thread-0")
-                .unwrap()
-                .unwrap()
-                .thread_id,
-            first_thread_id,
-            "exact title resume must search beyond the recent catalog cap"
-        );
 
-        let mut foreign_projection = ThreadEngineProjection {
-            subscription: engine.subscribe_threads(),
-            engine: engine.clone(),
-            workspace_root: "/another/workspace".into(),
-        };
-        assert!(foreign_projection.session_catalog().unwrap().is_empty());
-        assert!(
-            foreign_projection
-                .session(first_thread_id)
-                .unwrap_err()
-                .contains("belongs to another workspace")
-        );
-        assert!(
-            foreign_projection
-                .exact_session(&first_thread_id.to_string())
-                .unwrap_err()
-                .contains("belongs to another workspace")
-        );
-        assert!(
-            projection
-                .exact_session("not-a-session-id")
-                .unwrap()
-                .is_none()
-        );
-        let missing_thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        assert!(
-            projection
-                .session(missing_thread_id)
-                .unwrap_err()
-                .contains("was not found")
-        );
-        assert!(
-            projection
-                .exact_session(&missing_thread_id.to_string())
-                .unwrap()
-                .is_none()
-        );
-        for (index, (thread_id, run_id)) in created.iter().copied().take(70).enumerate() {
-            let lease = engine.acquire_thread_lease(thread_id, 100, 10_000).unwrap();
-            engine
-                .commit_thread_run_update(
-                    ThreadCommitRequest {
-                        thread_id,
-                        run_id,
-                        expected_thread_revision: 0,
-                        expected_run_revision: 0,
-                        command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                        request_id: None,
-                        effect_id: None,
-                        update: CommitThreadRunUpdate::Start {
-                            source_key: format!("projection:start:{index}"),
-                        },
-                    },
-                    &lease,
-                    u64::try_from(index + 200).unwrap(),
-                )
-                .unwrap();
-        }
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Lagged(count) if count > 0));
-        assert_eq!(projection.poll(), ThreadProjectionPoll::Event);
-        let refreshed = projection.snapshots().unwrap();
-        assert_eq!(refreshed.len(), 510);
-    }
-
-    #[tokio::test]
-    async fn tui_session_management_adapter_renames_and_forks() {
-        let root = tempfile::tempdir().unwrap();
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .database_path(root.path().join("state.db"))
-            .conversation_root(root.path().join("sessions"))
-            .build()
-            .unwrap();
-        let ids = SystemIdSource::default();
-        let source = ThreadId::from_uuid(ids.next_uuid_v7());
-        engine
-            .create_thread_v2(
-                source,
-                RunId::from_uuid(ids.next_uuid_v7()),
-                ThreadProviderBindingV2 {
-                    version: 1,
-                    provider_name: "test".into(),
-                    provider_type: "openai-chat".into(),
-                    protocol: "chat".into(),
-                    model: "test".into(),
-                    config_fingerprint: "config".into(),
-                    tools_fingerprint: "tools".into(),
-                    aliases: std::collections::BTreeMap::new(),
-                    credential_ref_id: "env:TEST".into(),
-                    data_scope_id: "workspace".into(),
-                    credential_generation: 1,
-                },
-                "source prompt",
-                1,
-            )
-            .unwrap();
-        let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
-
-        assert!(
-            dispatch_session_management_action(
-                &engine,
-                &feedback_tx,
-                ThreadUiAction::ForkSession {
-                    thread_id: source,
-                    title: Some("branch title".into()),
-                },
-            )
-            .is_none()
-        );
-        let fork = match feedback_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-        {
-            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Forked(
-                thread_id,
-            ))) => thread_id,
-            feedback => panic!("unexpected feedback: {feedback:?}"),
-        };
-
-        assert!(
-            dispatch_session_management_action(
-                &engine,
-                &feedback_tx,
-                ThreadUiAction::RenameSession {
-                    thread_id: fork,
-                    title: "renamed branch".into(),
-                },
-            )
-            .is_none()
-        );
-        match feedback_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-        {
-            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Updated(message))) => {
-                assert!(message.contains("renamed branch"));
-            }
-            feedback => panic!("unexpected feedback: {feedback:?}"),
-        }
-
-        let missing = ThreadId::from_uuid(ids.next_uuid_v7());
-        assert!(
-            dispatch_session_management_action(
-                &engine,
-                &feedback_tx,
-                ThreadUiAction::RenameSession {
-                    thread_id: missing,
-                    title: "missing".into(),
-                },
-            )
-            .is_none()
-        );
-        assert!(matches!(
-            feedback_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap(),
-            ThreadUiFeedback::SessionManagement(Err(_))
-        ));
-        assert!(matches!(
-            dispatch_session_management_action(&engine, &feedback_tx, ThreadUiAction::Quit,),
-            Some(ThreadUiAction::Quit)
-        ));
-    }
-
-    #[test]
-    fn complete_example_config_loads_application_and_provider_sections() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join(".latte");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("latte-code.jsonc"),
-            include_str!("../../../latte-code.config.example.jsonc"),
-        )
-        .unwrap();
-
-        let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
-        assert_eq!(config.thread.max_request_bytes, 524_288);
-        assert_eq!(config.thread.reserved_output_bytes, 131_072);
-        assert_eq!(registry.default_name(), Some("primary"));
-        assert_eq!(registry.default_model(), Some("model-id"));
-        let engine = open_tui_engine(
-            root.path(),
-            &config,
-            &root.path().join("global/state.db"),
-            &root.path().join("global/sessions"),
-            1,
-        )
-        .unwrap();
-        let (binding, startup) = tui_startup_presentation(root.path(), &registry, &engine).unwrap();
-        assert_eq!(binding.unwrap().model, "model-id");
-        assert_eq!(startup.default_provider, "primary");
-        assert_eq!(startup.default_model, "model-id");
-        assert_eq!(startup.model_catalog.len(), 1);
-        assert!(!startup.workspace_display.is_empty());
-    }
-
-    #[test]
-    fn missing_provider_configuration_keeps_read_only_state_commands_available() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-
-        let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
-
-        assert!(config.default_model.is_empty());
-        assert_eq!(config.database.path, ".latte/latte-code.db");
-        assert!(registry.model_catalog().is_empty());
-        assert!(registry.thread_binding_for_default(&[]).is_err());
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .build()
-            .unwrap();
-        let (binding, startup) = tui_startup_presentation(root.path(), &registry, &engine).unwrap();
-        assert!(binding.is_none());
-        assert!(startup.default_provider.is_empty());
-        assert!(startup.default_model.is_empty());
-        assert!(startup.model_catalog.is_empty());
-        assert!(
-            open_tui_engine(
-                root.path(),
-                &config,
-                Path::new(""),
-                &root.path().join("sessions"),
-                1,
-            )
-            .is_err()
-        );
-        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
-        std::fs::write(config.legacy_database_path(root.path()), b"not sqlite").unwrap();
-        assert!(
-            open_tui_engine(
-                root.path(),
-                &config,
-                &root.path().join("global/state.db"),
-                &root.path().join("global/sessions"),
-                2,
-            )
-            .is_err()
-        );
-        let configured_without_default = latte_headless::registry::ProviderRegistry::parse_jsonc(
-            r#"{
-                version: 1,
-                default_model: "primary/model-id",
-                providers: { primary: {
-                    type: "openai-chat",
-                    models: { "model-id": {} },
-                    base_url: "https://provider.example/v1",
-                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" },
-                    aliases: { unknown_tool: "unknown_alias" }
-                } }
-            }"#,
-        )
-        .unwrap();
-        assert!(!configured_without_default.model_catalog().is_empty());
-        assert!(
-            tui_startup_presentation(root.path(), &configured_without_default, &engine).is_err()
-        );
-    }
 
     #[test]
     fn workspace_configuration_recursively_overrides_user_configuration() {
@@ -2338,128 +2010,6 @@ mod tests {
         assert_eq!(workspace_display_path_with_home(home, Some(home)), "~");
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn tui_reconciliation_adapter_uses_exact_v2_effect_and_terminalizes_child() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("note.txt"), "fixture").unwrap();
-        let engine = EngineBuilder::new()
-            .workspace_root(root.path())
-            .database_path(root.path().join("state.db"))
-            .build()
-            .unwrap();
-        let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let binding = ThreadProviderBindingV2 {
-            version: 1,
-            provider_name: "test".into(),
-            provider_type: "openai-chat".into(),
-            protocol: "chat".into(),
-            model: "test".into(),
-            config_fingerprint: "config".into(),
-            tools_fingerprint: "tools".into(),
-            aliases: std::collections::BTreeMap::new(),
-            credential_ref_id: "env:TEST".into(),
-            data_scope_id: "workspace".into(),
-            credential_generation: 1,
-        };
-        engine
-            .create_thread_v2(thread_id, run_id, binding, "recover", 1)
-            .unwrap();
-        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
-        let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: 0,
-                    expected_run_revision: 0,
-                    command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                    request_id: None,
-                    effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
-                        source_key: "test:start".into(),
-                    },
-                },
-                &lease,
-                3,
-            )
-            .unwrap()
-            .snapshot;
-        let descriptor = ThreadEffectDescriptor {
-            effect_id: format!("thread-effect:{run_id}:tui-reconcile"),
-            tool_call_id: "tui-reconcile".into(),
-            name: "read_file".into(),
-            input: serde_json::json!({"path":"note.txt"}),
-            attempt: 1,
-        };
-        let prepared = engine
-            .prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: running.revision,
-                    expected_run_revision: running.runs[0].run_revision,
-                    command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                    source_key: "test:prepare".into(),
-                    descriptor: descriptor.clone(),
-                },
-                &lease,
-                4,
-            )
-            .unwrap();
-        let started = engine
-            .start_thread_effect(
-                ThreadEffectStartRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: prepared.snapshot.revision,
-                    expected_run_revision: prepared.snapshot.runs[0].run_revision,
-                    command_id: ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                    source_key: "test:start-effect".into(),
-                    effect_id: descriptor.effect_id.clone(),
-                },
-                prepared.operation_digest,
-                &lease,
-                5,
-            )
-            .unwrap();
-        let unknown = engine
-            .mark_thread_effect_unknown(
-                &started,
-                "test:unknown".into(),
-                ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                &lease,
-                6,
-            )
-            .unwrap();
-        assert_eq!(unknown.lifecycle, ThreadLifecycle::ReconciliationRequired);
-        engine.release_lease(&lease).unwrap();
-        let service = ThreadRuntimeService::new(
-            engine.clone(),
-            root.path(),
-            ThreadHistoryPolicy::default(),
-            Arc::new(|_| Err("provider is unused for reconciliation".into())),
-        );
-
-        assert_eq!(
-            reconcile_thread_action(&service, thread_id, &descriptor.effect_id).unwrap(),
-            "unknown effect acknowledged; child aborted"
-        );
-        assert_eq!(
-            engine
-                .thread_snapshot_v2(thread_id, None, 100)
-                .unwrap()
-                .lifecycle,
-            ThreadLifecycle::Failed
-        );
-        assert_eq!(
-            engine.effect_status(&descriptor.effect_id).unwrap(),
-            latte_engine::EffectStatus::ObservedFailed
-        );
-        assert_eq!(engine.show(run_id).unwrap().status, RunStatus::Failed);
-    }
 
     #[test]
     fn serve_port_parsing_covers_default_explicit_and_error_shapes() {
@@ -2565,6 +2115,133 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_engine_supports_full_session_lifecycle() {
+        // Exercises the engine session operations (create/list/rename/fork/
+        // snapshot/search) through the server's workspace runtime, covering
+        // the durable storage paths that the v1 in-process TUI tests covered.
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::write(
+            root.path().join(".latte/latte-code.jsonc"),
+            r#"{
+                version: 1,
+                default_model: "primary/model",
+                providers: { primary: {
+                    type: "openai-chat",
+                    models: { "model": {} },
+                    base_url: "https://provider.example/v1",
+                    api_key: { source: "env", name: "TEST_PROVIDER_KEY" }
+                } },
+                verification: { argv: ["true"] }
+            }"#,
+        )
+        .unwrap();
+        let storage_home = home.path().join(".latte/latte-code");
+        let (state, _token, _token_path) =
+            prepare_server(root.path(), &storage_home).expect("prepare_server");
+        let workspace = state
+            .workspaces
+            .get_or_create(root.path())
+            .await
+            .expect("workspace");
+
+        // Get a binding for session creation.
+        let bindings = workspace.bindings().expect("bindings");
+        let binding = bindings
+            .iter()
+            .find(|entry| entry.is_default)
+            .or_else(|| bindings.first())
+            .expect("at least one binding")
+            .binding
+            .clone();
+
+        // Create a session.
+        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let snapshot = workspace
+            .engine
+            .create_thread_v2(thread_id, run_id, binding, "hello world", 1000)
+            .expect("create_thread_v2");
+        assert_eq!(snapshot.thread_id, thread_id);
+
+        // List sessions.
+        let sessions = workspace.list_sessions().expect("list_sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].thread_id, thread_id);
+
+        // Search sessions.
+        let results = workspace
+            .search_sessions("hello", 10)
+            .expect("search_sessions");
+        assert!(!results.is_empty());
+
+        // List session summaries (metadata-only, different from full snapshots).
+        let workspace_root = std::fs::canonicalize(&workspace.path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let summaries = workspace
+            .engine
+            .list_thread_sessions_v2_for_workspace(&workspace_root, 200)
+            .expect("list_thread_sessions_v2_for_workspace");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].thread_id, thread_id);
+
+        // Find by exact title.
+        let exact = workspace
+            .engine
+            .find_thread_sessions_v2_by_exact_title_for_workspace(
+                &workspace_root,
+                "hello world",
+                200,
+            )
+            .expect("find_thread_sessions_v2_by_exact_title_for_workspace");
+        assert_eq!(exact.len(), 1);
+
+        // List all threads (not workspace-filtered) with conversation enrichment.
+        let all_threads = workspace
+            .engine
+            .list_threads_v2()
+            .expect("list_threads_v2");
+        assert!(!all_threads.is_empty());
+
+        // Get session metadata.
+        let metadata = workspace
+            .engine
+            .thread_session_v2(thread_id)
+            .expect("thread_session_v2")
+            .expect("session exists");
+        assert_eq!(metadata.thread_id, thread_id);
+
+        // Subscribe to thread events.
+        let _subscription = workspace.engine.subscribe_threads();
+
+        // Get a snapshot.
+        let fetched = workspace.snapshot(thread_id).expect("snapshot");
+        assert_eq!(fetched.thread_id, thread_id);
+
+        // Rename the session.
+        let renamed = workspace
+            .engine
+            .rename_thread_session_v2(thread_id, "renamed session")
+            .expect("rename_thread_session_v2");
+        assert_eq!(renamed.title, "renamed session");
+
+        // Fork the session.
+        let fork_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let forked = workspace
+            .engine
+            .fork_thread_session_v2(thread_id, fork_id, None, 2000)
+            .expect("fork_thread_session_v2");
+        assert_eq!(forked.thread_id, fork_id);
+
+        // List now shows both sessions.
+        let sessions = workspace.list_sessions().expect("list_sessions after fork");
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
@@ -3125,6 +2802,64 @@ mod tests {
         });
     }
 
+    #[test]
+    fn execute_session_command_reports_unreachable_server_without_json() {
+        let temp = tempfile::tempdir().unwrap();
+        temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let args = vec![
+                    "list".to_string(),
+                    "--server".to_string(),
+                    "http://127.0.0.1:0".to_string(),
+                    "--token".to_string(),
+                    "dummy".to_string(),
+                ];
+                let code = super::execute_session_command(false, &args).await;
+                assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_propagates_server_errors() {
+        // When the server returns 500 for a session command, the error
+        // propagates through execute_session_command_inner to the caller.
+        let (url, _handle) = start_session_mock_server(|method, path| {
+            if path == "/health" {
+                (200, "text/plain".into(), "ok".into())
+            } else if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" {
+                (
+                    500,
+                    "application/json".into(),
+                    r#"{"error":"internal"}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn execute_session_command_inner_list_returns_sessions() {
         let (url, _handle) = start_session_mock_server(|method, path| {
@@ -3385,5 +3120,736 @@ mod tests {
             "--unknown".to_string(),
         ];
         assert!(crate::server_client::parse_session_command(&args).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP projection client + SSE bridge coverage (Phase 1 TUI migration)
+    // ------------------------------------------------------------------
+
+    /// A minimal valid session snapshot body (the object inside `snapshot`).
+    fn projection_snapshot_body(thread_id: &str, entries: &str) -> String {
+        format!(
+            r#"{{"thread_id":"{thread_id}","revision":1,"sequence":0,"lifecycle":"ready",
+               "binding":{{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"c","tools_fingerprint":"t","aliases":{{}},"credential_ref_id":"env:K","data_scope_id":"main/mock","credential_generation":0}},
+               "latest_run_id":null,"active_run_id":null,"runs":[],
+               "transcript":{{"entries":[{entries}],"next_after":null,"has_more":false}}}}"#
+        )
+    }
+
+    /// A user transcript entry with the given text and timestamp.
+    fn projection_user_entry(text: &str, created_at_ms: u64) -> String {
+        format!(
+            r#"{{"entry_id":"01900000-0000-7000-8000-0000000000a1","sequence":0,"run_id":null,"kind":"user","text":"{text}","source_key":"user","created_at_ms":{created_at_ms}}}"#
+        )
+    }
+
+    /// A minimal session summary JSON for search results.
+    fn projection_summary_json(thread_id: &str, title: &str) -> String {
+        format!(
+            r#"{{"thread_id":"{thread_id}","title":"{title}","workspace_root":"","lifecycle":"ready","provider_name":"main","model":"mock","created_at_ms":1000,"updated_at_ms":2000}}"#
+        )
+    }
+
+    /// Constructs an [`HttpProjectionClient`] backed by a (possibly dead) HTTP
+    /// server, plus the sender side of its event channel.
+    fn http_projection_client(
+        base_url: &str,
+        workspace_id: &str,
+    ) -> (
+        super::HttpProjectionClient,
+        std::sync::mpsc::Sender<super::ProjectionEvent>,
+    ) {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let client =
+            crate::server_client::ServerClient::new(base_url.to_string(), "token".into());
+        let projection = super::HttpProjectionClient {
+            handle: client.handle(),
+            workspace_id: workspace_id.to_string(),
+            event_rx,
+            runtime: tokio::runtime::Handle::current(),
+        };
+        (projection, event_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_lists_sessions_and_builds_catalog() {
+        let with_title = projection_snapshot_body(
+            "01900000-0000-7000-8000-000000000001",
+            &projection_user_entry("first prompt", 1000),
+        );
+        let no_title = projection_snapshot_body(
+            "01900000-0000-7000-8000-000000000002",
+            "",
+        );
+        let body = format!(r#"{{"sessions":[{with_title},{no_title}],"next_cursor":null}}"#);
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path == "/v1/workspaces/ws-1/sessions" {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let snapshots = projection.snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let catalog = projection.session_catalog().unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].title, "first prompt");
+        assert_eq!(catalog[0].created_at_ms, 1000);
+        assert_eq!(catalog[0].updated_at_ms, 1000);
+        assert_eq!(catalog[1].title, "Untitled session");
+        assert_eq!(catalog[1].created_at_ms, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_session_fetches_snapshot() {
+        let thread_id = ThreadId::from_uuid(
+            uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
+        );
+        let body = format!(
+            r#"{{"snapshot":{}}}"#,
+            projection_snapshot_body(
+                &thread_id.to_string(),
+                &projection_user_entry("hi", 1000)
+            )
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let snapshot = projection.session(thread_id).unwrap();
+        assert_eq!(snapshot.thread_id, thread_id);
+        assert_eq!(snapshot.revision, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_by_id_verifies_workspace() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let snapshot_body = format!(
+            r#"{{"snapshot":{}}}"#,
+            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+        );
+        let search_body = format!(r#"{{"sessions":[{}]}}"#, projection_summary_json(thread_id, "hello"));
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot_body.clone())
+            } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), search_body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let catalog = projection.exact_session_catalog(thread_id).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].thread_id.to_string(), thread_id);
+        assert_eq!(catalog[0].title, "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_rejects_foreign_workspace() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let snapshot_body = format!(
+            r#"{{"snapshot":{}}}"#,
+            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot_body.clone())
+            } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                // Session exists but belongs to another workspace.
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"sessions":[]}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        assert!(error.contains("belongs to another workspace"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_missing_returns_empty() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let (url, _server) = start_session_mock_server(move |_method, _path| {
+            (
+                404,
+                "application/json".into(),
+                r#"{"error":"not found"}"#.into(),
+            )
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let catalog = projection.exact_session_catalog(thread_id).unwrap();
+        assert!(catalog.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_falls_back_to_title_search() {
+        let body = format!(
+            r#"{{"sessions":[{}]}}"#,
+            projection_summary_json(
+                "01900000-0000-7000-8000-000000000001",
+                "my session"
+            )
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        // Not a valid UUID → title search path.
+        let results = projection.exact_session_catalog("my session").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "my session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_search_catalog() {
+        let body = format!(
+            r#"{{"sessions":[{}]}}"#,
+            projection_summary_json("01900000-0000-7000-8000-000000000001", "hello")
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let results = projection.search_session_catalog("hello").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_poll_returns_empty_when_idle() {
+        let (mut projection, _tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Empty));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_poll_forwards_thread_changed() {
+        let (mut projection, tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
+        tx.send(super::ProjectionEvent::ThreadChanged).unwrap();
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Event));
+        // Event consumed → back to Empty.
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Empty));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_poll_returns_closed_on_disconnect() {
+        let (mut projection, tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
+        tx.send(super::ProjectionEvent::Closed).unwrap();
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Closed));
+        // Sender dropped → Disconnected → Closed.
+        drop(tx);
+        assert!(matches!(projection.poll(), ThreadProjectionPoll::Closed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_forwards_thread_changed_and_progress() {
+        use axum::response::sse::{Event, Sse};
+        use futures::stream;
+
+        async fn events(
+        ) -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+            let stream = stream::iter(vec![
+                Ok(Event::default()
+                    .event("thread_changed")
+                    .data(r#"{"session_id":"s1","revision":7}"#)),
+                Ok(Event::default().event("progress").data(
+                    r#"{"session_id":"s1","run_id":"01900000-0000-7000-8000-000000000001","progress":{"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"hello"}}"#,
+                )),
+            ]);
+            Sse::new(stream)
+        }
+
+        let app = axum::Router::new()
+            .route("/v1/workspaces/ws-1/events", axum::routing::get(events));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // ThreadChanged forwarded.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for ThreadChanged");
+        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+
+        // Progress forwarded.
+        let progress = progress_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for progress");
+        assert_eq!(
+            progress,
+            latte_core::ThreadTransientProgress::AssistantDelta {
+                run_id: RunId::from_uuid(
+                    uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap()
+                ),
+                text: "hello".into(),
+            }
+        );
+
+        bridge.abort();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_emits_closed_on_connect_failure() {
+        // Bind and immediately drop a listener to get a definitely-closed port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, _progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for Closed");
+        assert!(matches!(event, super::ProjectionEvent::Closed));
+        bridge.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_setup_with_connects_to_embedded_server_and_builds_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{version:1,default_model:"main/mock",providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},verification:{argv:["/usr/bin/true"]}}"#,
+        )
+        .unwrap();
+        let storage_home = dir.path().join("storage");
+        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(super::tui_setup_with(&root, &storage_home))
+            })
+        });
+        let setup = result.expect("tui_setup_with should succeed");
+        assert!(!setup.workspace_id.is_empty());
+        assert!(!setup.bindings.is_empty());
+        assert_eq!(setup.startup.default_provider, "main");
+        assert_eq!(setup.startup.default_model, "mock");
+        assert!(setup.startup_binding.is_some());
+        assert_eq!(setup.startup.model_catalog.len(), setup.bindings.len());
+        // Clean up: abort the SSE bridge and shut down the embedded server.
+        setup.sse_task.abort();
+        if let Some(embedded) = setup.embedded {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(embedded.shutdown());
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_propagates_search_error() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let snapshot_body = format!(
+            r#"{{"snapshot":{}}}"#,
+            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot_body.clone())
+            } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (
+                    500,
+                    "application/json".into(),
+                    r#"{"error":"internal"}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        assert!(error.contains("500"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_propagates_snapshot_error() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (
+                    500,
+                    "application/json".into(),
+                    r#"{"error":"internal"}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        assert!(error.contains("500"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_setup_with_reports_internal_error_when_storage_home_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{version:1,default_model:"main/mock",providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},verification:{argv:["/usr/bin/true"]}}"#,
+        )
+        .unwrap();
+        // A file where the storage home directory would be created.
+        std::fs::write(dir.path().join("blocked"), "not a directory").unwrap();
+        let storage_home = dir.path().join("blocked/storage");
+        let result = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(super::tui_setup_with(&root, &storage_home))
+            })
+        });
+        let Err(code) = result else {
+            panic!("tui_setup_with should fail");
+        };
+        assert_eq!(code, EXIT_INTERNAL);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_server_honors_lease_ttl_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{version:1,default_model:"main/mock",providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},verification:{argv:["/usr/bin/true"]}}"#,
+        )
+        .unwrap();
+        let storage_home = dir.path().join("storage");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str())),
+                (
+                    "LATTE_LEASE_TTL_MS",
+                    Some(std::ffi::OsStr::new("5000")),
+                ),
+            ],
+            || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let result = super::prepare_server(&root, &storage_home);
+                        assert!(result.is_ok());
+                    });
+                })
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_run_renders_text_without_json() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/bindings" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"bindings":[{"is_default":true,"binding":{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}}]}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":1}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Run {
+            prompt: "hello".to_string(),
+            focus: None,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_list_renders_rows_without_json() {
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session = projection_snapshot_body(
+            thread_id,
+            &projection_user_entry("first prompt", 1000),
+        );
+        let body = format!(r#"{{"sessions":[{session}],"next_cursor":null}}"#);
+        let (url, _handle) = start_session_mock_server(move |_method, path| {
+            if path == "/v1/workspaces" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_show_renders_text_without_json() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Show {
+            session_id: thread_id,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_resume_completes() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") && path.ends_with("/follow-up") {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":2,"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Resume {
+            session_id: thread_id,
+            prompt: "continue".to_string(),
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_resume_renders_text_without_json() {
+        let thread_id = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") && path.ends_with("/follow-up") {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":2,"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Resume {
+            session_id: thread_id,
+            prompt: "continue".to_string(),
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_session_command_reports_configuration_error_for_empty_storage_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec!["list".to_string()];
+        let code = temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str())),
+                (
+                    "LATTE_CODE_HOME",
+                    Some(std::ffi::OsStr::new("")),
+                ),
+            ],
+            || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(super::execute_session_command(true, &args))
+                })
+            },
+        );
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_session_command_connects_to_remote_server_and_returns() {
+        let (url, _handle) = start_session_mock_server(|method, path| {
+            if path == "/health" {
+                (200, "text/plain".into(), "ok".into())
+            } else if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"sessions":[]}"#.into(),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "list".to_string(),
+            "--server".to_string(),
+            url,
+            "--token".to_string(),
+            "dummy".to_string(),
+        ];
+        let code = temp_env::with_vars([("HOME", Some(dir.path().as_os_str()))], || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(super::execute_session_command(true, &args))
+            })
+        });
+        assert_eq!(code, EXIT_COMPLETED);
     }
 }

@@ -177,8 +177,10 @@ fn filesystem_startup_failures_are_typed_before_command_execution() {
         )
         .unwrap();
     });
-    assert_eq!(invalid_legacy_database.status.code(), Some(2));
-    assert_eq!(json(&invalid_legacy_database)["error"]["code"], "usage");
+    // Legacy import failures are internal errors (the database is corrupted),
+    // not usage errors — the server returns 500, the client maps to exit 70.
+    assert_eq!(invalid_legacy_database.status.code(), Some(70));
+    assert_eq!(json(&invalid_legacy_database)["error"]["code"], "internal");
     assert!(
         json(&invalid_legacy_database)["error"]["message"]
             .as_str()
