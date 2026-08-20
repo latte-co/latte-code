@@ -317,37 +317,11 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
     }
 
     fn session_catalog(&mut self) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
-        // Use the default impl (converts snapshots to summaries) — the server's
-        // list endpoint returns full snapshots, which is the authoritative view.
-        self.snapshots().map(|snapshots| {
-            snapshots
-                .into_iter()
-                .map(|snapshot| latte_core::ThreadSessionSummary {
-                    thread_id: snapshot.thread_id,
-                    title: snapshot
-                        .transcript
-                        .entries
-                        .iter()
-                        .find(|entry| entry.kind == latte_core::TranscriptKind::User)
-                        .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
-                    workspace_root: String::new(),
-                    parent_thread_id: None,
-                    lifecycle: snapshot.lifecycle,
-                    provider_name: snapshot.binding.provider_name,
-                    model: snapshot.binding.model,
-                    created_at_ms: snapshot
-                        .transcript
-                        .entries
-                        .first()
-                        .map_or(0, |entry| entry.created_at_ms),
-                    updated_at_ms: snapshot
-                        .transcript
-                        .entries
-                        .last()
-                        .map_or(0, |entry| entry.created_at_ms),
-                })
-                .collect()
-        })
+        // Use the search endpoint with an empty query to get all sessions
+        // with their durable metadata (including renamed titles), rather than
+        // reconstructing summaries from snapshots (which drops the durable
+        // title and shows the original prompt instead).
+        self.block_on(self.handle.search_sessions(&self.workspace_id, ""))
     }
 
     fn exact_session_catalog(
@@ -361,54 +335,34 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
             // A missing session is not an error — return an empty catalog
             // so the TUI shows "session not found" rather than failing.
             return match self.block_on(self.handle.try_snapshot(&thread_id)) {
-                Ok(Some(snapshot)) => {
-                    // Verify the session belongs to this workspace. The server
-                    // returns snapshots for any session ID, so we must check
-                    // the workspace membership on the client side (mirroring
-                    // the old engine's workspace_root check).
+                Ok(Some(_snapshot)) => {
+                    // Verify the session belongs to this workspace and get
+                    // its durable summary (with the renamed title, if any).
                     let search_results = self.block_on(
                         self.handle
                             .search_sessions(&self.workspace_id, &thread_id.to_string()),
                     )?;
-                    if !search_results
-                        .iter()
-                        .any(|summary| summary.thread_id == thread_id)
-                    {
-                        return Err(format!(
-                            "session {thread_id} belongs to another workspace; explicit rebinding is required"
-                        ));
-                    }
-                    Ok(vec![latte_core::ThreadSessionSummary {
-                        thread_id: snapshot.thread_id,
-                        title: snapshot
-                            .transcript
-                            .entries
-                            .iter()
-                            .find(|entry| entry.kind == latte_core::TranscriptKind::User)
-                            .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
-                        workspace_root: String::new(),
-                        parent_thread_id: None,
-                        lifecycle: snapshot.lifecycle,
-                        provider_name: snapshot.binding.provider_name,
-                        model: snapshot.binding.model,
-                        created_at_ms: snapshot
-                            .transcript
-                            .entries
-                            .first()
-                            .map_or(0, |entry| entry.created_at_ms),
-                        updated_at_ms: snapshot
-                            .transcript
-                            .entries
-                            .last()
-                            .map_or(0, |entry| entry.created_at_ms),
-                    }])
+                    let summary = search_results
+                        .into_iter()
+                        .find(|summary| summary.thread_id == thread_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "session {thread_id} belongs to another workspace; explicit rebinding is required"
+                            )
+                        })?;
+                    Ok(vec![summary])
                 }
                 Ok(None) => Ok(Vec::new()),
                 Err(error) => Err(error),
             };
         }
-        // Otherwise, search by exact title.
-        self.block_on(self.handle.search_sessions(&self.workspace_id, query))
+        // Otherwise, search by exact title (filter substring results to
+        // preserve the pre-migration exact-title contract).
+        let results = self.block_on(self.handle.search_sessions(&self.workspace_id, query))?;
+        Ok(results
+            .into_iter()
+            .filter(|summary| summary.title == query)
+            .collect())
     }
 
     fn search_session_catalog(
@@ -3138,10 +3092,19 @@ mod tests {
             &projection_user_entry("first prompt", 1000),
         );
         let no_title = projection_snapshot_body("01900000-0000-7000-8000-000000000002", "");
-        let body = format!(r#"{{"sessions":[{with_title},{no_title}],"next_cursor":null}}"#);
+        let list_body = format!(r#"{{"sessions":[{with_title},{no_title}],"next_cursor":null}}"#);
+        // session_catalog now uses search with empty query to get durable
+        // summaries (with renamed titles) instead of reconstructing from snapshots.
+        let search_body = format!(
+            r#"{{"sessions":[{},{}]}}"#,
+            projection_summary_json("01900000-0000-7000-8000-000000000001", "first prompt"),
+            projection_summary_json("01900000-0000-7000-8000-000000000002", "Untitled session"),
+        );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path == "/v1/workspaces/ws-1/sessions" {
-                (200, "application/json".into(), body.clone())
+                (200, "application/json".into(), list_body.clone())
+            } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), search_body.clone())
             } else {
                 (
                     404,
@@ -3156,10 +3119,7 @@ mod tests {
         let catalog = projection.session_catalog().unwrap();
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].title, "first prompt");
-        assert_eq!(catalog[0].created_at_ms, 1000);
-        assert_eq!(catalog[0].updated_at_ms, 1000);
         assert_eq!(catalog[1].title, "Untitled session");
-        assert_eq!(catalog[1].created_at_ms, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3282,6 +3242,69 @@ mod tests {
         let results = projection.exact_session_catalog("my session").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "my session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_exact_catalog_filters_substring_matches() {
+        // The search endpoint returns substring matches, but exact_session_catalog
+        // must filter to exact-title matches only (pre-migration contract).
+        let body = format!(
+            r#"{{"sessions":[{},{}]}}"#,
+            projection_summary_json("01900000-0000-7000-8000-000000000001", "foobar"),
+            projection_summary_json("01900000-0000-7000-8000-000000000002", "foo"),
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        // "foo" must NOT match "foobar" — only the exact "foo" session.
+        let results = projection.exact_session_catalog("foo").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "foo");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_projection_client_session_catalog_uses_durable_title() {
+        // session_catalog must use the durable title from the search endpoint,
+        // not the transcript-derived title (which drops renamed titles).
+        let snapshot_body = format!(
+            r#"{{"snapshot":{}}}"#,
+            projection_snapshot_body(
+                "01900000-0000-7000-8000-000000000001",
+                &projection_user_entry("original prompt", 1000)
+            )
+        );
+        // The search endpoint returns the durable (renamed) title.
+        let search_body = format!(
+            r#"{{"sessions":[{}]}}"#,
+            projection_summary_json("01900000-0000-7000-8000-000000000001", "renamed session")
+        );
+        let (url, _server) = start_session_mock_server(move |_method, path| {
+            if path.starts_with("/v1/sessions/") {
+                (200, "application/json".into(), snapshot_body.clone())
+            } else if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+                (200, "application/json".into(), search_body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let (mut projection, _tx) = http_projection_client(&url, "ws-1");
+        let catalog = projection.session_catalog().unwrap();
+        assert_eq!(catalog.len(), 1);
+        // The durable title is "renamed session", not the transcript's "original prompt".
+        assert_eq!(catalog[0].title, "renamed session");
     }
 
     #[tokio::test(flavor = "multi_thread")]
