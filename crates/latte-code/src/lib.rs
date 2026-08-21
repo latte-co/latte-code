@@ -356,13 +356,14 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
                 Err(error) => Err(error),
             };
         }
-        // Otherwise, search by exact title (filter substring results to
-        // preserve the pre-migration exact-title contract).
-        let results = self.block_on(self.handle.search_sessions(&self.workspace_id, query))?;
-        Ok(results
-            .into_iter()
-            .filter(|summary| summary.title == query)
-            .collect())
+        // Otherwise, look up by exact title on the server. The exact-title
+        // endpoint uses the engine's exact-title index rather than a capped
+        // substring search, so older matches are not truncated by pagination
+        // (the old in-process exact-title contract).
+        self.block_on(
+            self.handle
+                .find_sessions_by_exact_title(&self.workspace_id, query),
+        )
     }
 
     fn search_session_catalog(
@@ -405,12 +406,22 @@ fn spawn_sse_bridge(
     progress_tx: std::sync::mpsc::Sender<latte_core::ThreadTransientProgress>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut first = true;
         loop {
             // Open the SSE stream for this workspace.
             if client.open_events(&workspace_id).await.is_err() {
                 let _ = event_tx.send(ProjectionEvent::Closed);
                 return;
             }
+            // On reconnect, refresh once the new subscription is live. The
+            // pre-reconnect refresh (below) races the disconnect: events that
+            // land after it but before resubscription are lost from the
+            // stream, so a second resync after reconnect closes that window
+            // (§8.1: resync → reconnect → resync).
+            if !first && event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+                return; // TUI dropped the receiver
+            }
+            first = false;
             // Read events until the stream ends or errors.
             loop {
                 match client.next_event().await {
@@ -3234,7 +3245,7 @@ mod tests {
             projection_summary_json("01900000-0000-7000-8000-000000000001", "my session")
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
-            if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+            if path.starts_with("/v1/workspaces/ws-1/sessions/exact-title") {
                 (200, "application/json".into(), body.clone())
             } else {
                 (
@@ -3245,23 +3256,23 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        // Not a valid UUID → title search path.
+        // Not a valid UUID → exact-title lookup path.
         let results = projection.exact_session_catalog("my session").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "my session");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn http_projection_client_exact_catalog_filters_substring_matches() {
-        // The search endpoint returns substring matches, but exact_session_catalog
-        // must filter to exact-title matches only (pre-migration contract).
+    async fn http_projection_client_exact_catalog_uses_exact_title_endpoint() {
+        // The title path must call the server's exact-title endpoint (which
+        // indexes by exact title and is not truncated by the substring search
+        // page cap), returning the server's matches verbatim.
         let body = format!(
-            r#"{{"sessions":[{},{}]}}"#,
-            projection_summary_json("01900000-0000-7000-8000-000000000001", "foobar"),
-            projection_summary_json("01900000-0000-7000-8000-000000000002", "foo"),
+            r#"{{"sessions":[{}]}}"#,
+            projection_summary_json("01900000-0000-7000-8000-000000000002", "foo")
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
-            if path.starts_with("/v1/workspaces/ws-1/sessions/search") {
+            if path.starts_with("/v1/workspaces/ws-1/sessions/exact-title") {
                 (200, "application/json".into(), body.clone())
             } else {
                 (
@@ -3272,7 +3283,6 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        // "foo" must NOT match "foobar" — only the exact "foo" session.
         let results = projection.exact_session_catalog("foo").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "foo");
@@ -3423,6 +3433,78 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for resync ThreadChanged after stream end");
         assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+
+        bridge.abort();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_resyncs_after_reconnect() {
+        // When the stream ends and the bridge reconnects, it must signal a
+        // second ThreadChanged once the new subscription is live, so events
+        // lost in the reconnect window (stream end → resubscribe) are picked
+        // up by the TUI. Without the post-reconnect resync, the TUI would
+        // stay stale after a drop.
+        use axum::response::sse::{Event, Sse};
+        use futures::stream::{self, BoxStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/workspaces/ws-1/events",
+            axum::routing::get({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        let stream: BoxStream<'static, Result<Event, std::convert::Infallible>> =
+                            if n == 0 {
+                                // First subscription: end immediately to force a reconnect.
+                                Box::pin(stream::iter(Vec::new()))
+                            } else {
+                                // Subsequent subscriptions: stay open with no events.
+                                Box::pin(stream::pending())
+                            };
+                        Sse::new(stream)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, _progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // First resync: the initial stream ended, so the bridge signals
+        // ThreadChanged before reconnecting.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for pre-reconnect resync");
+        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+
+        // Second resync: after the bridge resubscribes, it signals
+        // ThreadChanged again so the TUI refreshes against the live stream.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for post-reconnect resync");
+        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+
+        // The new stream stays open, so no further events arrive.
+        assert!(
+            event_rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "unexpected extra event from an idle stream"
+        );
 
         bridge.abort();
         server.abort();

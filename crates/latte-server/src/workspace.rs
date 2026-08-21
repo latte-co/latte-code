@@ -146,6 +146,26 @@ impl WorkspaceInstance {
         self.engine.search_thread_sessions_v2(query, limit)
     }
 
+    /// Finds sessions whose title exactly matches `title` in this workspace.
+    /// Unlike `search_sessions` (substring match with a result cap), this
+    /// uses the engine's exact-title index so the match is not truncated by
+    /// pagination.
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched.
+    pub fn find_sessions_by_exact_title(
+        &self,
+        title: &str,
+        limit: usize,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, latte_engine::StorageError> {
+        self.engine
+            .find_thread_sessions_v2_by_exact_title_for_workspace(
+                &self.workspace_root,
+                title,
+                limit,
+            )
+    }
+
     /// Returns the provider binding catalog for model discovery.
     ///
     /// # Errors

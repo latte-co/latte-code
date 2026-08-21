@@ -1311,6 +1311,26 @@ impl ServerHandle {
             .map_err(|error| ClientError::Failed(format!("invalid search results: {error}")))
     }
 
+    /// Finds sessions whose title exactly matches `title`. Unlike
+    /// [`search_sessions`](Self::search_sessions) (substring match capped at
+    /// the server's page size), this uses the server's exact-title index so
+    /// older matches are not truncated by pagination.
+    pub async fn find_sessions_by_exact_title(
+        &self,
+        workspace_id: &str,
+        title: &str,
+    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+        let value = self
+            .get(&format!(
+                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}",
+                urlencoding::encode(title)
+            ))
+            .await?;
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+        serde_json::from_value(sessions)
+            .map_err(|error| ClientError::Failed(format!("invalid exact-title results: {error}")))
+    }
+
     /// Returns the full binding catalog for the workspace.
     pub async fn bindings_catalog(&self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
         let value = self
@@ -2107,7 +2127,9 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
+    // `unknown_lints` keeps this portable across clippy versions: the lint
+    // exists on CI's stable (1.98+) but not on older local toolchains.
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     impl SessionServer for MockServer {
         async fn resolve_workspace(&mut self, _root: &Path) -> Result<String, ClientError> {
             if self.fail_resolve {
