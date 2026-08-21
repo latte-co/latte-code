@@ -429,8 +429,15 @@ fn spawn_sse_bridge(
                             let _ = progress_tx.send(progress);
                         }
                     }
-                    // Stream ended or read error: reconnect.
-                    Ok(None) | Err(_) => break,
+                    // Stream ended or read error: signal the TUI to refresh
+                    // before reconnecting so it doesn't stay stale (§8.1:
+                    // resync → reconnect → resync).
+                    Ok(None) | Err(_) => {
+                        if event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+                            return; // TUI dropped the receiver
+                        }
+                        break;
+                    }
                 }
             }
             // Brief backoff before reconnecting.
@@ -3409,6 +3416,13 @@ mod tests {
                 text: "hello".into(),
             }
         );
+
+        // After the stream ends, the bridge sends a ThreadChanged resync
+        // signal before reconnecting so the TUI doesn't stay stale.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for resync ThreadChanged after stream end");
+        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
 
         bridge.abort();
         server.abort();
