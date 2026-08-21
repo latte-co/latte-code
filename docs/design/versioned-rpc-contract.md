@@ -37,6 +37,9 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
   只做向后兼容变更（见 §7）。
 - **v2 演进**：breaking change 走 `/v2/` 前缀，v1 和 v2 并存一个 deprecation
   窗口（至少 2 个 minor release），v1 在窗口后移除。
+- **早期例外（已决策 2026-08-21）**：项目早期、无外部用户期间，允许 breaking change
+  直接改 v1，不强制走 /v2/ 并存。但必须在 CHANGELOG 和 PR 描述中明确标注 breaking。
+  第一个外部用户出现后，恢复正式 v2 政策。
 
 ### 2.2 什么是 breaking change
 
@@ -122,6 +125,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 | `rejected` | 400 | 请求参数无效 | 否 |
 | `unauthorized` | 401 | Bearer token 缺失/无效 | 否 |
 | `not_found` | 404 | session/workspace 不存在 | 否 |
+| `idempotency_mismatch` | 422 | 同一 Idempotency-Key 搭配不同 payload | 否（客户端 bug，不应重试） |
 | `conflict` | 409 | revision fence 冲突 | 是（刷新 snapshot 后重试） |
 | `failed` | 500 | server 内部错误 | 是（指数退避） |
 
@@ -205,16 +209,27 @@ server.md §5.5 当前描述了 `id: 42` 和 `Last-Event-ID`，与实现不符�
 
 ## 6. 分页契约
 
-### 6.1 Cursor 格式
+### 6.1 当前实现（v1 实际行为）
+
+- **List**（`GET /v1/workspaces/{ws}/sessions`）：完全忽略 `PaginationQuery`（cursor 和
+  limit 都不生效），返回 workspace 全部 session，`next_cursor` 恒为 `null`。
+- **Search**（`GET /v1/workspaces/{ws}/sessions/search`）：只消费 `limit`，
+  `limit.unwrap_or(50).clamp(1, 200)`；忽略 cursor，`next_cursor` 恒为 `null`。
+- **Exact-title**（`GET /v1/workspaces/{ws}/sessions/exact-title`）：同 Search。
+- `limit=0` 会被 clamp 为 1（不是空页）。
+- cursor 参数被接受但不生效（客户端传了不报错，但不影响结果）。
+
+### 6.2 目标行为（Phase B 实施）
+
+当前实现是 single-page 的。正式分页契约需要 server 侧实现 cursor 分页：
 
 - cursor 是不透明字符串，客户端不解析。
-- 当前实现是 offset-based（`u32` 序列化为字符串），但客户端必须视为不透明。
-- `next_cursor` 为 `null` 或空字符串表示无更多页。
-
-### 6.2 Limit
-
+- `next_cursor` 为 `null` 表示无更多页。
 - 默认 50，最大 200。超过 200 截断为 200。
 - `limit=0` 返回空页（不是错误）。
+
+**实施要求**：Phase B 必须先实现 server 侧 cursor 分页（list + search + exact-title），
+再把 §6.2 升格为正式契约。在实现落地前，§6.1 是 v1 的实际契约。
 
 ## 7. 兼容性规则
 
@@ -250,29 +265,29 @@ v1 客户端必须：
 - [ ] 修正 server.md §5.6：移除 `unavailable`，对齐错误类型枚举
 - [ ] 本设计文档合并到 `docs/design/`
 
-### Phase B：DTO 类型化（~1 天）
+### Phase B：DTO 类型化 + 分页实现（~1.5 天）
 
 - [ ] `CreateSessionRequest.binding` / `SwitchModelRequest.binding` 改为
       `ThreadProviderBindingV2`
 - [ ] `BindingCatalogEntry.binding` 改为 `ThreadProviderBindingV2`
 - [ ] 响应体从 `Json<Value>` 改为类型化 struct（§3.3 清单）
+- [ ] 实现 server 侧 cursor 分页（list + search + exact-title），使 §6.2 升格为正式契约
 - [ ] UT + E2E 覆盖
 
 ### Phase C：契约测试（~1 天）
 
 - [ ] 新增 contract test：每个端点的请求/响应 JSON schema 快照
-- [ ] 新增 contract test：错误类型枚举完整性
+- [ ] 新增 contract test：错误类型枚举完整性（含 422 idempotency_mismatch）
 - [ ] 新增 contract test：SSE event type 完整性
 - [ ] CI 中运行 contract test，防止意外 breaking change
 
-**总计：~2.5 个工作日。**
+**总计：~3 个工作日。**
 
-## 9. 开放问题
+## 9. 已决策
 
-- **v2 触发条件**：什么规模的 breaking change 值得开 v2？当前政策是"任何
-  breaking 都走 v2"，但可能存在"小 breaking 直接改 v1"的场景（项目早期、
-  无外部用户）。建议：在第一个外部用户出现前，允许直接改 v1，但必须在
-  CHANGELOG 中明确标注 breaking。
+- **v2 触发条件（已决策 2026-08-21）**：项目早期、无外部用户期间，允许 breaking change
+  直接改 v1，不强制走 /v2/ 并存。但必须在 CHANGELOG 和 PR 描述中明确标注 breaking。
+  第一个外部用户出现后，恢复"任何 breaking 走 v2"的正式政策。
 - **binding 类型化的迁移**：现有 session 的 binding 已持久化为 JSON。类型化后
   反序列化是否兼容？（`ThreadProviderBindingV2` 派生了 `Deserialize`，且字段
   未变，应该兼容，但需要测试验证。）
