@@ -220,6 +220,7 @@ Windows 已支持任意外部进程执行。
 - [事件、投影与回放](design/agent-harness/event-projection-and-replay.md)
 - [TUI Runtime 契约](design/agent-harness/tui-runtime-contract.md)
 - [验证 Harness 与确定性测试](design/agent-harness/verification-harness.md)
+- [版本化 RPC 与 Event Backpressure 契约](design/versioned-rpc-contract.md)
 
 ## 横向参考后的范围校准
 
