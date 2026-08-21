@@ -565,7 +565,6 @@ pub fn error_envelope(error: &ClientError) -> Value {
 
 /// The server surface the session commands drive. [`ServerClient`] is the
 /// HTTP+SSE implementation; tests use a scripted mock.
-#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
 pub trait SessionServer {
     /// Resolves (creating if needed) the workspace id for `root`.
     async fn resolve_workspace(&mut self, root: &Path) -> Result<String, ClientError>;
@@ -610,66 +609,6 @@ pub trait SessionServer {
     async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError>;
     /// Reads the next event, or `None` when the stream has ended.
     async fn next_event(&mut self) -> Result<Option<StreamEvent>, ClientError>;
-
-    // -- TUI operations ------------------------------------------------------
-
-    /// Renames a session.
-    async fn rename_session(
-        &mut self,
-        session_id: &ThreadId,
-        title: &str,
-    ) -> Result<(), ClientError>;
-    /// Forks a session. Returns the new fork's thread id.
-    async fn fork_session(
-        &mut self,
-        session_id: &ThreadId,
-        title: Option<&str>,
-    ) -> Result<ThreadId, ClientError>;
-    /// Switches the model binding for a session.
-    async fn switch_model(
-        &mut self,
-        session_id: &ThreadId,
-        expected_revision: u64,
-        binding: &Value,
-    ) -> Result<(), ClientError>;
-    /// Queues a follow-up prompt for a busy session. Returns the queue position.
-    async fn queue_follow_up(
-        &mut self,
-        session_id: &ThreadId,
-        prompt: &str,
-    ) -> Result<u64, ClientError>;
-    /// Provides input for a waiting-input session.
-    async fn provide_input(
-        &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
-        request_id: &str,
-        value: &str,
-    ) -> Result<(), ClientError>;
-    /// Resolves a pending permission request.
-    async fn resolve_permission(
-        &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
-        request_id: &str,
-        allow: bool,
-    ) -> Result<(), ClientError>;
-    /// Reconciles an unknown effect (aborts the child process).
-    async fn reconcile_effect(
-        &mut self,
-        session_id: &ThreadId,
-        effect_id: &str,
-    ) -> Result<(), ClientError>;
-    /// Searches sessions by title or ID fragment.
-    async fn search_sessions(
-        &mut self,
-        workspace_id: &str,
-        query: &str,
-    ) -> Result<Vec<ThreadSessionSummary>, ClientError>;
-    /// Returns the full binding catalog for the workspace.
-    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,14 +914,12 @@ impl EventStream {
 /// It holds only the HTTP client + connection details (no SSE state),
 /// so it can be shared across tasks (e.g. TUI action dispatch + projection).
 #[derive(Clone)]
-#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
 pub struct ServerHandle {
     http: reqwest::Client,
     base_url: String,
     token: String,
 }
 
-#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
 impl ServerHandle {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
@@ -1048,8 +985,6 @@ impl ServerHandle {
     }
 
     // -- TUI operations (inherent async methods) -----------------------------
-    // These will be consumed by the TUI HTTP+SSE migration (Phase 1).
-    // #[allow(dead_code)] is removed once the TUI adapter lands.
 
     /// Resolves (creating if needed) the workspace id for `root`.
     pub async fn resolve_workspace_id(&self, root: &Path) -> Result<String, ClientError> {
@@ -1392,7 +1327,6 @@ impl ServerClient {
 
     /// Returns a cloneable handle for making HTTP calls without SSE state.
     #[must_use]
-    #[allow(dead_code)] // consumed by TUI Phase 1 migration
     pub fn handle(&self) -> ServerHandle {
         self.handle.clone()
     }
@@ -1635,89 +1569,6 @@ impl SessionServer for ServerClient {
             }
         }
     }
-
-    // -- TUI operations ------------------------------------------------------
-
-    async fn rename_session(
-        &mut self,
-        session_id: &ThreadId,
-        title: &str,
-    ) -> Result<(), ClientError> {
-        self.handle.rename_session(session_id, title).await
-    }
-
-    async fn fork_session(
-        &mut self,
-        session_id: &ThreadId,
-        title: Option<&str>,
-    ) -> Result<ThreadId, ClientError> {
-        self.handle.fork_session(session_id, title).await
-    }
-
-    async fn switch_model(
-        &mut self,
-        session_id: &ThreadId,
-        expected_revision: u64,
-        binding: &Value,
-    ) -> Result<(), ClientError> {
-        self.handle
-            .switch_model(session_id, expected_revision, binding)
-            .await
-    }
-
-    async fn queue_follow_up(
-        &mut self,
-        session_id: &ThreadId,
-        prompt: &str,
-    ) -> Result<u64, ClientError> {
-        self.handle.queue_follow_up(session_id, prompt).await
-    }
-
-    async fn provide_input(
-        &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
-        request_id: &str,
-        value: &str,
-    ) -> Result<(), ClientError> {
-        self.handle
-            .provide_input(session_id, thread_revision, run_revision, request_id, value)
-            .await
-    }
-
-    async fn resolve_permission(
-        &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
-        request_id: &str,
-        allow: bool,
-    ) -> Result<(), ClientError> {
-        self.handle
-            .resolve_permission(session_id, thread_revision, run_revision, request_id, allow)
-            .await
-    }
-
-    async fn reconcile_effect(
-        &mut self,
-        session_id: &ThreadId,
-        effect_id: &str,
-    ) -> Result<(), ClientError> {
-        self.handle.reconcile_effect(session_id, effect_id).await
-    }
-
-    async fn search_sessions(
-        &mut self,
-        workspace_id: &str,
-        query: &str,
-    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-        self.handle.search_sessions(workspace_id, query).await
-    }
-
-    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
-        self.handle.bindings_catalog(workspace_id).await
-    }
 }
 
 #[cfg(test)]
@@ -1853,6 +1704,47 @@ mod tests {
         // run/resume accept unknown --flag tokens as prompt content.
         assert!(parse_session_command(&args(&["run", "--bogus"])).is_ok());
         assert!(parse_session_command(&args(&["run", "--server"])).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_v1_permission_flags() {
+        let args = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let error = parse_session_command(&args(&["run", "--allow", "fix"])).unwrap_err();
+        assert!(
+            error.contains("--allow") && error.contains("permission API"),
+            "unexpected error: {error}"
+        );
+        let error = parse_session_command(&args(&[
+            "resume",
+            "01900000-0000-7000-8000-000000000001",
+            "--deny",
+            "x",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("--deny") && error.contains("permission API"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_name_covers_every_variant() {
+        assert_eq!(lifecycle_name(ThreadLifecycle::Ready), "ready");
+        assert_eq!(lifecycle_name(ThreadLifecycle::Running), "running");
+        assert_eq!(
+            lifecycle_name(ThreadLifecycle::WaitingPermission),
+            "waiting_permission"
+        );
+        assert_eq!(
+            lifecycle_name(ThreadLifecycle::WaitingInput),
+            "waiting_input"
+        );
+        assert_eq!(lifecycle_name(ThreadLifecycle::Interrupted), "interrupted");
+        assert_eq!(lifecycle_name(ThreadLifecycle::Failed), "failed");
+        assert_eq!(
+            lifecycle_name(ThreadLifecycle::ReconciliationRequired),
+            "reconciliation_required"
+        );
     }
 
     // -- classification ------------------------------------------------------
@@ -2256,86 +2148,6 @@ mod tests {
                 },
                 (_, other) => other,
             }))
-        }
-
-        // -- TUI operations --------------------------------------------------
-
-        async fn rename_session(
-            &mut self,
-            _session_id: &ThreadId,
-            _title: &str,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-
-        async fn fork_session(
-            &mut self,
-            _session_id: &ThreadId,
-            _title: Option<&str>,
-        ) -> Result<ThreadId, ClientError> {
-            Ok(ThreadId::from_uuid(Uuid::now_v7()))
-        }
-
-        async fn switch_model(
-            &mut self,
-            _session_id: &ThreadId,
-            _expected_revision: u64,
-            _binding: &Value,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-
-        async fn queue_follow_up(
-            &mut self,
-            _session_id: &ThreadId,
-            _prompt: &str,
-        ) -> Result<u64, ClientError> {
-            Ok(1)
-        }
-
-        async fn provide_input(
-            &mut self,
-            _session_id: &ThreadId,
-            _thread_revision: u64,
-            _run_revision: u64,
-            _request_id: &str,
-            _value: &str,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-
-        async fn resolve_permission(
-            &mut self,
-            _session_id: &ThreadId,
-            _thread_revision: u64,
-            _run_revision: u64,
-            _request_id: &str,
-            _allow: bool,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-
-        async fn reconcile_effect(
-            &mut self,
-            _session_id: &ThreadId,
-            _effect_id: &str,
-        ) -> Result<(), ClientError> {
-            Ok(())
-        }
-
-        async fn search_sessions(
-            &mut self,
-            _workspace_id: &str,
-            _query: &str,
-        ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-            Ok(Vec::new())
-        }
-
-        async fn bindings_catalog(
-            &mut self,
-            _workspace_id: &str,
-        ) -> Result<Vec<Value>, ClientError> {
-            Ok(Vec::new())
         }
     }
 
@@ -2972,70 +2784,52 @@ mod tests {
             )
             .await
             .unwrap();
-        // TUI operations through the SessionServer trait (delegates to ServerHandle).
+        // TUI operations go through ServerHandle (the TUI's production path),
+        // not the SessionServer trait.
         let session_id =
             ThreadId::from_uuid(Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap());
         client
+            .handle()
             .rename_session(&session_id, "new title")
             .await
             .unwrap();
-        let fork_id = client.fork_session(&session_id, None).await.unwrap();
+        let fork_id = client
+            .handle()
+            .fork_session(&session_id, None)
+            .await
+            .unwrap();
         assert_ne!(fork_id, session_id);
         client
+            .handle()
             .switch_model(&session_id, 1, &json!({"version": 1}))
             .await
             .unwrap();
-        let position = client.queue_follow_up(&session_id, "queued").await.unwrap();
+        let position = client
+            .handle()
+            .queue_follow_up(&session_id, "queued")
+            .await
+            .unwrap();
         assert_eq!(position, 1);
         client
+            .handle()
             .provide_input(&session_id, 1, 1, "req-1", "answer")
             .await
             .unwrap();
         client
+            .handle()
             .resolve_permission(&session_id, 1, 1, "req-1", true)
             .await
             .unwrap();
         client
+            .handle()
             .reconcile_effect(&session_id, "effect-1")
             .await
             .unwrap();
-        let results = client.search_sessions(&ws, "test").await.unwrap();
+        let results = client.handle().search_sessions(&ws, "test").await.unwrap();
         assert!(results.is_empty());
-        let catalog = client.bindings_catalog(&ws).await.unwrap();
+        let catalog = client.handle().bindings_catalog(&ws).await.unwrap();
         assert!(!catalog.is_empty());
         let _ = mock;
-    }
-
-    #[tokio::test]
-    async fn mock_server_covers_tui_operations() {
-        let mut server = MockServer::new();
-        let session_id = ThreadId::from_uuid(Uuid::now_v7());
-        // Exercise every TUI operation on the mock to cover its implementations.
-        server.rename_session(&session_id, "title").await.unwrap();
-        let fork_id = server.fork_session(&session_id, None).await.unwrap();
-        assert_ne!(fork_id, session_id);
-        server
-            .switch_model(&session_id, 1, &json!({"version": 1}))
-            .await
-            .unwrap();
-        let position = server.queue_follow_up(&session_id, "prompt").await.unwrap();
-        assert_eq!(position, 1);
-        server
-            .provide_input(&session_id, 1, 1, "req-1", "value")
-            .await
-            .unwrap();
-        server
-            .resolve_permission(&session_id, 1, 1, "req-1", true)
-            .await
-            .unwrap();
-        server
-            .reconcile_effect(&session_id, "effect-1")
-            .await
-            .unwrap();
-        let results = server.search_sessions("ws-1", "query").await.unwrap();
-        assert!(results.is_empty());
-        let catalog = server.bindings_catalog("ws-1").await.unwrap();
-        assert!(catalog.is_empty());
     }
 
     #[tokio::test]
