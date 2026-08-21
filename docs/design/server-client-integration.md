@@ -1,7 +1,7 @@
 # Server 客户端集成方案（v2.5 修订）
 
-状态：**Friday 定点终审后修正，待 Approve**
-日期：2026-08-17
+状态：**已全部实现并合并（Phase 0/1/2/3 完成）**
+日期：2026-08-17（v2.5 修订）；2026-08-21 收尾
 评审：Monday × Friday 联合评审（基于 `32f902e`），11 个 P0 已闭合；Friday 五轮复审共 15 组 blocker 已修复
 
 ## 1. 背景与目标
@@ -406,13 +406,13 @@ const WAKE_ERROR: u8 = 4;
 | `ForkSession` | POST /v1/sessions/{id}/fork | `SessionManagement(Forked)` |
 | `RefreshSnapshots` / `ShowSessions` / `SearchSessions` / `OpenSession` / `Quit` | UI 内部，无 HTTP | 无 |
 
-**409 Conflict 处理**：revision fence 冲突时，发送 feedback 触发 snapshot 刷新（不报错退出）。**注意**：现有 reducer 中 `SubmissionResult(Err)` / `InputSubmissionResult(Err)` 会触发刷新，但 `Command(Err)` 和 `ModelSwitchResult(Err)` 只显示错误（`thread.rs:4715-4747`）。HTTP worker 在收到 409 时必须同时置 projection dirty 原子位，确保下一次 `poll()` 返回 `Event` 触发 `RefreshSnapshots`。
+**409 Conflict 处理**：revision fence 冲突时，发送 feedback 触发 snapshot 刷新（不报错退出）。**注意**：现有 reducer 中 `SubmissionResult(Err)` / `InputSubmissionResult(Err)` 会触发刷新，但 `Command(Err)` 和 `ModelSwitchResult(Err)` 只显示错误（`thread.rs:4734-4748`）。HTTP worker 在收到 409 时必须同时置 projection dirty 原子位，确保下一次 `poll()` 返回 `Event` 触发 `RefreshSnapshots`。
 
-**StartWithModel 不能"客户端合成 binding"**：`thread_binding_for_model` 需要 `&[ToolDescriptor]`（`registry.rs:376`），客户端没有 engine 的 tool descriptors。客户端从 `/bindings` catalog 选取完整 binding 透传（`resolve_thread_bound` 会重新派生比对，透传安全）。
+**StartWithModel 不能"客户端合成 binding"**：`thread_binding_for_model` 需要 `&[ToolDescriptor]`（`registry.rs:387`），客户端没有 engine 的 tool descriptors。客户端从 `/bindings` catalog 选取完整 binding 透传（`resolve_thread_bound` 会重新派生比对，透传安全）。
 
 ### 5.4 执行模型（P0-11 闭合）
 
-当前 `#[tokio::main]` → async `execute()` → 同步 `execute_tui()`（`lib.rs:395-406`），TUI loop 占住 Tokio worker。`Handle::block_on` 在同 runtime 线程上会 panic；`std::thread::spawn` + `handle.join()` 仍在 Tokio worker 上阻塞。
+迁移前 `#[tokio::main]` → async `execute()` → 同步 `execute_tui()`，TUI loop 占住 Tokio worker。`Handle::block_on` 在同 runtime 线程上会 panic；`std::thread::spawn` + `handle.join()` 仍在 Tokio worker 上阻塞。Phase 1 落地后 `execute_tui` 本身是 async，TUI loop 经 `spawn_blocking` 运行在阻塞线程池（见下方固定执行模型）。
 
 **固定执行模型**：
 
@@ -686,7 +686,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 
 - sink 绝不返回 `Err`（返回 Err = 退出 TUI）。
 - HTTP 失败通过 feedback 通道回送，reducer 在状态栏显示错误。
-- 409 Conflict：HTTP worker 同时置 projection Dirty 原子位，确保下一次 `poll()` 返回 `Event` 触发 `RefreshSnapshots`。注意 `Command(Err)` 和 `ModelSwitchResult(Err)` 在 reducer 中只显示错误不触发刷新（`thread.rs:4715-4747`），必须靠 Dirty 位补偿。
+- 409 Conflict：HTTP worker 同时置 projection Dirty 原子位，确保下一次 `poll()` 返回 `Event` 触发 `RefreshSnapshots`。注意 `Command(Err)` 和 `ModelSwitchResult(Err)` 在 reducer 中只显示错误不触发刷新（`thread.rs:4734-4748`），必须靠 Dirty 位补偿。
 
 ## 8. 协议时序契约
 
@@ -739,75 +739,74 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 
 ## 9. AgentRuntime 退役
 
-迁移完成后：
+迁移完成后的实际状态（比原计划更彻底）：
 
-- `AgentRuntime`（`headless/src/runtime.rs`）不再被 CLI `run` 使用。
-- `RuntimeCommandService`（`headless/src/service.rs`）是 v1 遗留，无前端使用。
-- 两者标记 `#[deprecated]`，保留一个 release cycle，后续移除。
-- `latte-headless` 保留 `ThreadRuntimeService`、`ProviderRegistry`、`context`、`provider` 等共享模块。
+- `AgentRuntime`（原 `headless/src/runtime.rs`）与 `RuntimeCommandService`（原 `headless/src/service.rs`）已**直接删除**，未走 `#[deprecated]` + 保留一个 release cycle 的过渡。项目处于早期阶段，无外部用户依赖 v1 内部 API，删除比长期共存更干净。
+- `latte-headless` 保留 `ThreadRuntimeService`、`ProviderRegistry`、`context`、`provider` 等共享模块；`runtime.rs` 仅保留 `VerificationPlan`（v2 `ThreadRuntimeService` 仍消费它）。
 - v1 `HeadlessCommand`（Run/Resume/Show/List）从 CLI 移除，替换为 session 语义命令。
+- `SessionServer` trait 收窄为 CLI session 命令的抽象（run/list/show/resume/cancel + snapshot/events）；TUI 操作（rename/fork/switch_model/queue/input/permission/reconcile/search/bindings）只存在于 `ServerHandle` 的 inherent 方法上，TUI 直接使用 `ServerHandle`，不经 trait。
 
 ## 10. 分阶段实施
 
 ### Phase 0：Server 基础设施（~4 天）
 
-- [ ] `BuiltWorkspace` 增加 `registry: Arc<ProviderRegistry>` 字段
-- [ ] `ProviderRegistry::thread_binding_catalog` 方法
-- [ ] `GET /v1/workspaces/{ws}/bindings` 端点（返回 `BindingCatalogEntry` 含 name/is_default/binding）
-- [ ] `CreateSessionRequest` 增加 `thread_id`、`command_id`、`focus` 字段
-- [ ] `ThreadRuntimeService`：`start`/`start_accepted`/`start_one` 签名增加 `focus: Option<&Path>`
-- [ ] `initial_messages` / `history_with_prompt` 透传 focus
-- [ ] focus 持久化：`threads_v2` 表新增 `focus` 列，`ThreadSnapshot` 新增 `focus` 字段；**Schema 11 → 12 迁移**（`SCHEMA_VERSION` 升级 + `ALTER TABLE` + fresh schema 含 focus）
-- [ ] **Legacy import 兼容**：`import_legacy_database` 的 `threads_v2` INSERT 改显式列清单，旧库映射 `NULL AS focus`；v9/v10 还需 `NULL AS parent_thread_id`；测试 v11 原地升级 + v9-v11 导入
-- [ ] **Fork 继承 focus**：`create_thread_session_fork` 的 SELECT/INSERT 包含 focus；测试 fork 后 focus 持久化
-- [ ] `ThreadCommand::Start` 增加 `focus` 字段
-- [ ] **Digest 绑定完整命令身份**：`operation_kind + protocol_version + workspace_identity + thread_id + prompt + binding + normalized_focus`
-- [ ] **Idempotency-Key 与 body command_id 一致性校验**（不一致 → 400）
-- [ ] **Dedup lookup 先于 lease acquire**：engine create 入口先查 `thread_command_dedup_v2`（无 lease），命中 → `Replayed`；miss → acquire + 事务内二次检查 → `Created`
-- [ ] engine create 返回 `Created | Replayed`；只有 `Created` 启动 provider runner
-- [ ] engine create 路径接入 `thread_command_dedup_v2`（同 command_id+digest replay，mismatch 409）
-- [ ] **Recovery sweeper task**：server 侧周期 task（如每 30s）调用 engine-level recovery API（恢复事务提交后广播 `ResyncRequired` 或 committed `ThreadEventEnvelope`）；测试活 owner 续租不误恢复 / owner crash 只恢复一次 / 多 server sweeper 竞争 / **客户端保持 SSE 时 recovery 后收到 wake 并退出**
-- [ ] `PATCH /v1/sessions/{id}` 重命名端点（+ThreadChanged 事件）
-- [ ] `POST /v1/sessions/{id}/fork` 分叉端点（+ThreadChanged 事件）
-- [ ] `ThreadProgressSink` trait 增加 `thread_id` 参数；`ProviderProgress` 增加 `thread_id` 字段
-- [ ] `ServerEvent::Progress` 增加 `run_id` 字段
-- [ ] Progress 事件接线（`WorkspaceInstance::new` 中 `with_progress_sink`）
-- [ ] SSE 桥接转发所有 durable ThreadEvent（不只 LifecycleChanged）
-- [ ] server builder 补 `.with_verification(config.plan())`
-- [ ] `ThreadRunSummary` 增加 `failure_code: Option<FailureCode>` 字段（typed enum）
-- [ ] UT + E2E 覆盖
+- [x] `BuiltWorkspace` 增加 `registry: Arc<ProviderRegistry>` 字段
+- [x] `ProviderRegistry::thread_binding_catalog` 方法
+- [x] `GET /v1/workspaces/{ws}/bindings` 端点（返回 `BindingCatalogEntry` 含 name/is_default/binding）
+- [x] `CreateSessionRequest` 增加 `thread_id`、`command_id`、`focus` 字段
+- [x] `ThreadRuntimeService`：`start`/`start_accepted`/`start_one` 签名增加 `focus: Option<&Path>`
+- [x] `initial_messages` / `history_with_prompt` 透传 focus
+- [x] focus 持久化：`threads_v2` 表新增 `focus` 列，`ThreadSnapshot` 新增 `focus` 字段；**Schema 11 → 12 迁移**（`SCHEMA_VERSION` 升级 + `ALTER TABLE` + fresh schema 含 focus）
+- [x] **Legacy import 兼容**：`import_legacy_database` 的 `threads_v2` INSERT 改显式列清单，旧库映射 `NULL AS focus`；v9/v10 还需 `NULL AS parent_thread_id`；测试 v11 原地升级 + v9-v11 导入
+- [x] **Fork 继承 focus**：`create_thread_session_fork` 的 SELECT/INSERT 包含 focus；测试 fork 后 focus 持久化
+- [x] `ThreadCommand::Start` 增加 `focus` 字段
+- [x] **Digest 绑定完整命令身份**：`operation_kind + protocol_version + workspace_identity + thread_id + prompt + binding + normalized_focus`
+- [x] **Idempotency-Key 与 body command_id 一致性校验**（不一致 → 400）
+- [x] **Dedup lookup 先于 lease acquire**：engine create 入口先查 `thread_command_dedup_v2`（无 lease），命中 → `Replayed`；miss → acquire + 事务内二次检查 → `Created`
+- [x] engine create 返回 `Created | Replayed`；只有 `Created` 启动 provider runner
+- [x] engine create 路径接入 `thread_command_dedup_v2`（同 command_id+digest replay，mismatch 409）
+- [x] **Recovery sweeper task**：server 侧周期 task（如每 30s）调用 engine-level recovery API（恢复事务提交后广播 `ResyncRequired` 或 committed `ThreadEventEnvelope`）；测试活 owner 续租不误恢复 / owner crash 只恢复一次 / 多 server sweeper 竞争 / **客户端保持 SSE 时 recovery 后收到 wake 并退出**
+- [x] `PATCH /v1/sessions/{id}` 重命名端点（+ThreadChanged 事件）
+- [x] `POST /v1/sessions/{id}/fork` 分叉端点（+ThreadChanged 事件）
+- [x] `ThreadProgressSink` trait 增加 `thread_id` 参数；`ProviderProgress` 增加 `thread_id` 字段
+- [x] `ServerEvent::Progress` 增加 `run_id` 字段
+- [x] Progress 事件接线（`WorkspaceInstance::new` 中 `with_progress_sink`）
+- [x] SSE 桥接转发所有 durable ThreadEvent（不只 LifecycleChanged）
+- [x] server builder 补 `.with_verification(config.plan())`
+- [x] `ThreadRunSummary` 增加 `failure_code: Option<FailureCode>` 字段（typed enum）
+- [x] UT + E2E 覆盖
 
 ### Phase 1：TUI HTTP Client（~4 天）
 
-- [ ] `HttpProjectionClient` 实现（REST reads + 5 态 sticky 原子位 poll：Idle/Dirty/Lagged/Closed/Error）
-- [ ] `HttpActionSink` 实现（非阻塞，6 种 feedback 全覆盖，绝不返回 Err，409 置 dirty 位，queue 满发失败 feedback）
-- [ ] SSE 线程（专用 OS 线程，reqwest::blocking，demux：progress scoped accumulator / dirty 原子位 / 带退避重连）
-- [ ] Progress scoped accumulator（按 thread_id+run_id+kind 分桶，AssistantDelta 有界追加，交付前按 active thread demux）
-- [ ] 执行模型：TUI loop 用 `spawn_blocking(...).await`，bounded action queue + 固定 OS 线程 worker，per-session 顺序
-- [ ] `ClientWorkers` RAII owner（所有模式：cancel + join SSE/action workers）
-- [ ] TUI 启动时内嵌 server（serve_with_shutdown + 独立 server shutdown token）+ HTTP client 接线
-- [ ] `--server` 连接独立 server 模式
-- [ ] TUI reducer/renderer 不变
-- [ ] E2E：TUI → 内嵌 server → engine 全链路（真实 PTY，`e2e_unix`）
-- [ ] HTTP/SSE client 跨平台 E2E（`e2e_portable`，Linux/macOS/Windows）
+- [x] `HttpProjectionClient` 实现（REST reads + mpsc `ProjectionEvent` 通道 poll：ThreadChanged/Closed；原设计的 5 态 sticky 原子位在评审中简化为通道）
+- [x] Action dispatch 实现（闭包 over `ServerHandle`，非阻塞，6 种 feedback 全覆盖，绝不返回 Err，409 置 dirty 位，queue 满发失败 feedback；原设计的 `HttpActionSink` struct 在评审中简化为闭包）
+- [x] SSE 线程（专用 OS 线程，reqwest::blocking，demux：progress scoped accumulator / dirty 信号 / 带退避重连）
+- [x] Progress scoped accumulator（按 thread_id+run_id+kind 分桶，AssistantDelta 有界追加，交付前按 active thread demux）
+- [x] 执行模型：TUI loop 用 `spawn_blocking(...).await`，bounded action queue + 固定 OS 线程 worker，per-session 顺序
+- [x] `ClientWorkers` RAII owner（所有模式：cancel + join SSE/action workers）
+- [x] TUI 启动时内嵌 server（serve_with_shutdown + 独立 server shutdown token）+ HTTP client 接线
+- [x] `--server` 连接独立 server 模式
+- [x] TUI reducer/renderer 不变
+- [x] E2E：TUI → 内嵌 server → engine 全链路（真实 PTY，`e2e_unix`）
+- [x] HTTP/SSE client 跨平台 E2E（`e2e_portable`，Linux/macOS/Windows）
 
 ### Phase 2：CLI `run` HTTP Client（~3 天）
 
-- [ ] `run` 命令改为内嵌 server + HTTP client（breaking change，session 语义）
-- [ ] SSE 流式 progress 输出到 stderr（`--json` 模式 stdout 只输出最终 envelope）
-- [ ] Exit code 映射（lifecycle + latest run status + failure_code + 本地 Ctrl+C 完整表）
-- [ ] `--focus` / `--json` / `--server` 支持
-- [ ] `list` / `show` / `resume` 改为 session 语义
-- [ ] v1 `HeadlessCommand` 移除
-- [ ] JSON envelope v2
-- [ ] E2E：CLI → 内嵌 server → engine 全链路（`e2e_portable`）
+- [x] `run` 命令改为内嵌 server + HTTP client（breaking change，session 语义）
+- [x] SSE 流式 progress 输出到 stderr（`--json` 模式 stdout 只输出最终 envelope）
+- [x] Exit code 映射（lifecycle + latest run status + failure_code + 本地 Ctrl+C 完整表）
+- [x] `--focus` / `--json` / `--server` 支持
+- [x] `list` / `show` / `resume` 改为 session 语义
+- [x] v1 `HeadlessCommand` 移除
+- [x] JSON envelope v2
+- [x] E2E：CLI → 内嵌 server → engine 全链路（`e2e_portable`）
 
 ### Phase 3：清理（~1 天）
 
-- [ ] 标记 `AgentRuntime` / `RuntimeCommandService` 为 deprecated
-- [ ] 移除 binary 中的 in-process engine 直连路径
-- [ ] 更新文档（server 设计文档、roadmap、HELP 文本）
-- [ ] 覆盖率补齐
+- [x] ~~标记 `AgentRuntime` / `RuntimeCommandService` 为 deprecated~~ → 实际直接删除（见 §9）
+- [x] 移除 binary 中的 in-process engine 直连路径
+- [x] 更新文档（server 设计文档、roadmap、HELP 文本）
+- [x] 覆盖率补齐（CI 三门全绿；另清理了 `SessionServer` trait 上无生产调用方的 TUI 操作方法，收窄为 CLI session 命令抽象）
 
 **总计：~12 个工作日。**（v1 估算 8 天，两轮评审后因 P0 闭合 + schema 迁移 + crash runner 恢复增加 4 天）
 
@@ -851,4 +850,4 @@ PR #7 后存量 lib.rs CLI 代码距 95% UT 门余量较薄。本方案新增 ~1
 - `run/show/list/resume` 命令语义和 ID 类型变更。
 - JSON envelope 升级 v2。
 - 旧 v1 run 的 `show/list/resume` 从 CLI 移除。
-- AgentRuntime / RuntimeCommandService 标记 deprecated。
+- AgentRuntime / RuntimeCommandService 直接删除（见 §9，未走 deprecated 过渡）。
