@@ -2537,7 +2537,141 @@ fn final_binary_server_renames_forks_and_lists_bindings() {
     assert_eq!(unauthorized, 401, "missing bearer token must be 401");
 }
 
-/// CLI `run --server` drives a full session through a standalone server,
+/// The exact-title endpoint returns only sessions whose title matches exactly,
+/// so substring siblings ("foo" vs "foobar") never leak into an exact lookup,
+/// and the result is not truncated by the substring-search page cap.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_server_exact_title_lookup_returns_only_exact_matches() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first"),
+        ProviderReply::completion("second"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+    // Create two sessions with distinct-but-related titles.
+    let binding = server_binding(&scenario);
+    let (_, foo_created) = server.create_session(&workspace_id, "foo", &binding);
+    let foo_id = foo_created["session_id"].as_str().unwrap().to_string();
+    let (_, foobar_created) = server.create_session(&workspace_id, "foobar", &binding);
+    let foobar_id = foobar_created["session_id"].as_str().unwrap().to_string();
+
+    // Wait for both sessions to reach a durable idle state.
+    for session_id in [&foo_id, &foobar_id] {
+        let mut ready = false;
+        for _ in 0..300 {
+            let (status, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            ready,
+            "session {session_id} never reached a durable idle state"
+        );
+    }
+
+    // Rename both sessions so the durable catalog titles are exact.
+    for (session_id, title) in [(&foo_id, "foo"), (&foobar_id, "foobar")] {
+        let (status, body) = server.request(
+            "PATCH",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            Some(&serde_json::json!({ "title": title })),
+            &[],
+        );
+        assert_eq!(status, 200, "rename returned {body:?}");
+    }
+
+    // Exact-title lookup for "foo" must not return "foobar".
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=foo"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "exact-title returned {body:?}");
+    let sessions = body["sessions"]
+        .as_array()
+        .expect("sessions must be an array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exact-title 'foo' must return only 'foo'"
+    );
+    assert_eq!(sessions[0]["thread_id"].as_str(), Some(foo_id.as_str()));
+    assert_eq!(sessions[0]["title"].as_str(), Some("foo"));
+
+    // Exact-title lookup for "foobar" must not return "foo".
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=foobar"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "exact-title returned {body:?}");
+    let sessions = body["sessions"]
+        .as_array()
+        .expect("sessions must be an array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exact-title 'foobar' must return only 'foobar'"
+    );
+    assert_eq!(sessions[0]["thread_id"].as_str(), Some(foobar_id.as_str()));
+
+    // A missing exact title returns an empty array, not an error.
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=no-such-title"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "exact-title returned {body:?}");
+    assert!(body["sessions"].as_array().unwrap().is_empty());
+
+    // A missing workspace fails closed with 404.
+    let (missing_status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws_does_not_exist/sessions/exact-title?q=foo",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(missing_status, 404);
+}
 /// covering the remote `connect` path, `resolve_remote_token`, and SSE
 /// observation over HTTP (not the embedded server).
 #[test]
