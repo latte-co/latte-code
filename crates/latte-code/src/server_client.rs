@@ -2107,6 +2107,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unused_async)]
     impl SessionServer for MockServer {
         async fn resolve_workspace(&mut self, _root: &Path) -> Result<String, ClientError> {
             if self.fail_resolve {
