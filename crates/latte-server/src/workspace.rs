@@ -116,7 +116,10 @@ impl WorkspaceInstance {
         &self,
         thread_id: latte_core::ThreadId,
     ) -> Result<latte_core::ThreadSnapshot, latte_engine::StorageError> {
-        self.engine.thread_snapshot_v2(thread_id, None, 500)
+        // Use the tail (newest 500 entries) to match the TUI's
+        // `thread_snapshot_tail_v2` behavior: the TUI shows the latest
+        // transcript page, not the oldest.
+        self.engine.thread_snapshot_tail_v2(thread_id, 500)
     }
 
     /// Lists the durable sessions bound to this workspace, newest transcript
@@ -141,6 +144,26 @@ impl WorkspaceInstance {
         limit: usize,
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, latte_engine::StorageError> {
         self.engine.search_thread_sessions_v2(query, limit)
+    }
+
+    /// Finds sessions whose title exactly matches `title` in this workspace.
+    /// Unlike `search_sessions` (substring match with a result cap), this
+    /// uses the engine's exact-title index so the match is not truncated by
+    /// pagination.
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched.
+    pub fn find_sessions_by_exact_title(
+        &self,
+        title: &str,
+        limit: usize,
+    ) -> Result<Vec<latte_core::ThreadSessionSummary>, latte_engine::StorageError> {
+        self.engine
+            .find_thread_sessions_v2_by_exact_title_for_workspace(
+                &self.workspace_root,
+                title,
+                limit,
+            )
     }
 
     /// Returns the provider binding catalog for model discovery.

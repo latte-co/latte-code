@@ -8,8 +8,8 @@
 use crate::prepare_server;
 use futures::StreamExt;
 use latte_core::{
-    FailureCode, ThreadCommandId, ThreadId, ThreadLifecycle, ThreadRunStatus, ThreadSnapshot,
-    ThreadTransientProgress, TranscriptKind,
+    FailureCode, ThreadCommandId, ThreadId, ThreadLifecycle, ThreadRunStatus, ThreadSessionSummary,
+    ThreadSnapshot, ThreadTransientProgress, TranscriptKind,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -92,7 +92,8 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
-fn network(error: &reqwest::Error) -> ClientError {
+#[allow(clippy::needless_pass_by_value)]
+fn network(error: reqwest::Error) -> ClientError {
     if error.is_connect() || error.is_timeout() {
         ClientError::Unreachable(error.to_string())
     } else {
@@ -564,6 +565,7 @@ pub fn error_envelope(error: &ClientError) -> Value {
 
 /// The server surface the session commands drive. [`ServerClient`] is the
 /// HTTP+SSE implementation; tests use a scripted mock.
+#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
 pub trait SessionServer {
     /// Resolves (creating if needed) the workspace id for `root`.
     async fn resolve_workspace(&mut self, root: &Path) -> Result<String, ClientError>;
@@ -608,6 +610,66 @@ pub trait SessionServer {
     async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError>;
     /// Reads the next event, or `None` when the stream has ended.
     async fn next_event(&mut self) -> Result<Option<StreamEvent>, ClientError>;
+
+    // -- TUI operations ------------------------------------------------------
+
+    /// Renames a session.
+    async fn rename_session(
+        &mut self,
+        session_id: &ThreadId,
+        title: &str,
+    ) -> Result<(), ClientError>;
+    /// Forks a session. Returns the new fork's thread id.
+    async fn fork_session(
+        &mut self,
+        session_id: &ThreadId,
+        title: Option<&str>,
+    ) -> Result<ThreadId, ClientError>;
+    /// Switches the model binding for a session.
+    async fn switch_model(
+        &mut self,
+        session_id: &ThreadId,
+        expected_revision: u64,
+        binding: &Value,
+    ) -> Result<(), ClientError>;
+    /// Queues a follow-up prompt for a busy session. Returns the queue position.
+    async fn queue_follow_up(
+        &mut self,
+        session_id: &ThreadId,
+        prompt: &str,
+    ) -> Result<u64, ClientError>;
+    /// Provides input for a waiting-input session.
+    async fn provide_input(
+        &mut self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        value: &str,
+    ) -> Result<(), ClientError>;
+    /// Resolves a pending permission request.
+    async fn resolve_permission(
+        &mut self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<(), ClientError>;
+    /// Reconciles an unknown effect (aborts the child process).
+    async fn reconcile_effect(
+        &mut self,
+        session_id: &ThreadId,
+        effect_id: &str,
+    ) -> Result<(), ClientError>;
+    /// Searches sessions by title or ID fragment.
+    async fn search_sessions(
+        &mut self,
+        workspace_id: &str,
+        query: &str,
+    ) -> Result<Vec<ThreadSessionSummary>, ClientError>;
+    /// Returns the full binding catalog for the workspace.
+    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,16 +969,389 @@ impl EventStream {
     }
 }
 
+/// A cloneable handle for making HTTP calls to the server.
+///
+/// This is the lightweight, cloneable counterpart to [`ServerClient`].
+/// It holds only the HTTP client + connection details (no SSE state),
+/// so it can be shared across tasks (e.g. TUI action dispatch + projection).
+#[derive(Clone)]
+#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
+pub struct ServerHandle {
+    http: reqwest::Client,
+    base_url: String,
+    token: String,
+}
+
+#[allow(dead_code)] // TUI operations consumed by Phase 1 migration
+impl ServerHandle {
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    async fn get(&self, path: &str) -> Result<Value, ClientError> {
+        let response = self
+            .http
+            .get(self.url(path))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(network)?;
+        Self::json(response).await
+    }
+
+    async fn post(
+        &self,
+        path: &str,
+        body: Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let mut request = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(&self.token)
+            .json(&body);
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
+        }
+        let response = request.send().await.map_err(network)?;
+        Self::json(response).await
+    }
+
+    async fn patch(&self, path: &str, body: Value) -> Result<Value, ClientError> {
+        let response = self
+            .http
+            .patch(self.url(path))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(network)?;
+        Self::json(response).await
+    }
+
+    async fn json(response: reqwest::Response) -> Result<Value, ClientError> {
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ClientError::Failed(format!("cannot read response body: {error}")))?;
+        if status.is_success() {
+            if bytes.is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_slice(&bytes).map_err(|error| {
+                ClientError::Failed(format!("invalid JSON from server: {error}"))
+            });
+        }
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Err(map_error_status(status, &value))
+    }
+
+    // -- TUI operations (inherent async methods) -----------------------------
+    // These will be consumed by the TUI HTTP+SSE migration (Phase 1).
+    // #[allow(dead_code)] is removed once the TUI adapter lands.
+
+    /// Resolves (creating if needed) the workspace id for `root`.
+    pub async fn resolve_workspace_id(&self, root: &Path) -> Result<String, ClientError> {
+        let value = self
+            .post("/v1/workspaces", json!({ "path": root }), None)
+            .await?;
+        value
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))
+    }
+
+    /// Lists all durable sessions in the workspace.
+    pub async fn list_sessions(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ThreadSnapshot>, ClientError> {
+        let value = self
+            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
+            .await?;
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+        serde_json::from_value(sessions)
+            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+    }
+
+    /// Fetches the authoritative snapshot for one session.
+    pub async fn snapshot(&self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
+        let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
+        let snapshot = value
+            .get("snapshot")
+            .cloned()
+            .ok_or_else(|| ClientError::Failed("snapshot response missing snapshot".into()))?;
+        serde_json::from_value(snapshot)
+            .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))
+    }
+
+    /// Fetches a session snapshot, returning `None` if the session does not exist.
+    pub async fn try_snapshot(
+        &self,
+        session_id: &ThreadId,
+    ) -> Result<Option<ThreadSnapshot>, ClientError> {
+        match self.snapshot(session_id).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(ClientError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Creates a session and starts its first turn.
+    pub async fn create_session(
+        &self,
+        workspace_id: &str,
+        thread_id: ThreadId,
+        command_id: ThreadCommandId,
+        prompt: &str,
+        binding: &Value,
+    ) -> Result<u64, ClientError> {
+        let body = json!({
+            "thread_id": thread_id.to_string(),
+            "command_id": command_id.to_string(),
+            "prompt": prompt,
+            "binding": binding,
+        });
+        let value = self
+            .post(
+                &format!("/v1/workspaces/{workspace_id}/sessions"),
+                body,
+                Some(&command_id.to_string()),
+            )
+            .await?;
+        value
+            .get("accepted_revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
+    }
+
+    /// Appends a follow-up turn to an existing session.
+    pub async fn follow_up(
+        &self,
+        session_id: &ThreadId,
+        expected_revision: u64,
+        prompt: &str,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "prompt": prompt,
+            "expected_thread_revision": expected_revision,
+        });
+        let idempotency_key = Uuid::now_v7().to_string();
+        self.post(
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            body,
+            Some(&idempotency_key),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Requests cancellation of the active run.
+    pub async fn cancel(
+        &self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "expected_thread_revision": thread_revision,
+            "expected_run_revision": run_revision,
+        });
+        self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Renames a session.
+    pub async fn rename_session(
+        &self,
+        session_id: &ThreadId,
+        title: &str,
+    ) -> Result<(), ClientError> {
+        self.patch(
+            &format!("/v1/sessions/{session_id}"),
+            json!({ "title": title }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Forks a session. Returns the new fork's thread id.
+    pub async fn fork_session(
+        &self,
+        session_id: &ThreadId,
+        title: Option<&str>,
+    ) -> Result<ThreadId, ClientError> {
+        let body = match title {
+            Some(title) => json!({ "title": title }),
+            None => json!({}),
+        };
+        let value = self
+            .post(&format!("/v1/sessions/{session_id}/fork"), body, None)
+            .await?;
+        let snapshot = value
+            .get("snapshot")
+            .ok_or_else(|| ClientError::Failed("fork response missing snapshot".into()))?;
+        let thread_id = snapshot
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ClientError::Failed("fork snapshot missing thread_id".into()))?;
+        parse_session_id(thread_id)
+    }
+
+    /// Switches the model binding for a session.
+    pub async fn switch_model(
+        &self,
+        session_id: &ThreadId,
+        expected_revision: u64,
+        binding: &Value,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "binding": binding,
+            "expected_thread_revision": expected_revision,
+        });
+        self.post(&format!("/v1/sessions/{session_id}/model"), body, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Queues a follow-up prompt for a busy session. Returns the queue position.
+    pub async fn queue_follow_up(
+        &self,
+        session_id: &ThreadId,
+        prompt: &str,
+    ) -> Result<u64, ClientError> {
+        let value = self
+            .post(
+                &format!("/v1/sessions/{session_id}/queue"),
+                json!({ "prompt": prompt }),
+                None,
+            )
+            .await?;
+        value
+            .get("position")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ClientError::Failed("queue response missing position".into()))
+    }
+
+    /// Provides input for a waiting-input session.
+    pub async fn provide_input(
+        &self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        value: &str,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "request_id": request_id,
+            "value": value,
+            "expected_thread_revision": thread_revision,
+            "expected_run_revision": run_revision,
+        });
+        self.post(&format!("/v1/sessions/{session_id}/input"), body, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolves a pending permission request.
+    pub async fn resolve_permission(
+        &self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<(), ClientError> {
+        let body = json!({
+            "allow": allow,
+            "expected_thread_revision": thread_revision,
+            "expected_run_revision": run_revision,
+        });
+        self.post(
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            body,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reconciles an unknown effect (aborts the child process).
+    pub async fn reconcile_effect(
+        &self,
+        session_id: &ThreadId,
+        effect_id: &str,
+    ) -> Result<(), ClientError> {
+        self.post(
+            &format!("/v1/sessions/{session_id}/effects/{effect_id}/reconcile"),
+            json!({}),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Searches sessions by title or ID fragment.
+    pub async fn search_sessions(
+        &self,
+        workspace_id: &str,
+        query: &str,
+    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+        let value = self
+            .get(&format!(
+                "/v1/workspaces/{workspace_id}/sessions/search?q={}",
+                urlencoding::encode(query)
+            ))
+            .await?;
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+        serde_json::from_value(sessions)
+            .map_err(|error| ClientError::Failed(format!("invalid search results: {error}")))
+    }
+
+    /// Finds sessions whose title exactly matches `title`. Unlike
+    /// [`search_sessions`](Self::search_sessions) (substring match capped at
+    /// the server's page size), this uses the server's exact-title index so
+    /// older matches are not truncated by pagination.
+    pub async fn find_sessions_by_exact_title(
+        &self,
+        workspace_id: &str,
+        title: &str,
+    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+        let value = self
+            .get(&format!(
+                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}",
+                urlencoding::encode(title)
+            ))
+            .await?;
+        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+        serde_json::from_value(sessions)
+            .map_err(|error| ClientError::Failed(format!("invalid exact-title results: {error}")))
+    }
+
+    /// Returns the full binding catalog for the workspace.
+    pub async fn bindings_catalog(&self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
+        let value = self
+            .get(&format!("/v1/workspaces/{workspace_id}/bindings"))
+            .await?;
+        let bindings = value
+            .get("bindings")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ClientError::Failed("bindings response missing bindings".into()))?;
+        Ok(bindings.clone())
+    }
+}
+
 /// The HTTP+SSE implementation of [`SessionServer`].
 ///
 /// Two reqwest clients are used: `http` for REST calls (30s total timeout)
 /// and `sse_http` for the long-lived SSE stream (connect timeout only, no
 /// total timeout — healthy streams must not be forcibly closed; §8.3).
 pub struct ServerClient {
-    http: reqwest::Client,
+    handle: ServerHandle,
     sse_http: reqwest::Client,
-    base_url: String,
-    token: String,
     workspace_id: Option<String>,
     events: Option<EventStream>,
 }
@@ -944,26 +1379,36 @@ impl ServerClient {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http,
+            handle: ServerHandle {
+                http,
+                base_url,
+                token,
+            },
             sse_http,
-            base_url,
-            token,
             workspace_id: None,
             events: None,
         }
     }
 
+    /// Returns a cloneable handle for making HTTP calls without SSE state.
+    #[must_use]
+    #[allow(dead_code)] // consumed by TUI Phase 1 migration
+    pub fn handle(&self) -> ServerHandle {
+        self.handle.clone()
+    }
+
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        self.handle.url(path)
     }
 
     async fn health_check(&self) -> Result<(), ClientError> {
         let response = self
+            .handle
             .http
             .get(self.url("/health"))
             .send()
             .await
-            .map_err(|error| network(&error))?;
+            .map_err(network)?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -975,14 +1420,7 @@ impl ServerClient {
     }
 
     async fn get(&self, path: &str) -> Result<Value, ClientError> {
-        let response = self
-            .http
-            .get(self.url(path))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|error| network(&error))?;
-        Self::json(response).await
+        self.handle.get(path).await
     }
 
     async fn post(
@@ -991,34 +1429,7 @@ impl ServerClient {
         body: Value,
         idempotency_key: Option<&str>,
     ) -> Result<Value, ClientError> {
-        let mut request = self
-            .http
-            .post(self.url(path))
-            .bearer_auth(&self.token)
-            .json(&body);
-        if let Some(key) = idempotency_key {
-            request = request.header("Idempotency-Key", key);
-        }
-        let response = request.send().await.map_err(|error| network(&error))?;
-        Self::json(response).await
-    }
-
-    async fn json(response: reqwest::Response) -> Result<Value, ClientError> {
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ClientError::Failed(format!("cannot read response body: {error}")))?;
-        if status.is_success() {
-            if bytes.is_empty() {
-                return Ok(Value::Null);
-            }
-            return serde_json::from_slice(&bytes).map_err(|error| {
-                ClientError::Failed(format!("invalid JSON from server: {error}"))
-            });
-        }
-        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        Err(map_error_status(status, &value))
+        self.handle.post(path, body, idempotency_key).await
     }
 }
 
@@ -1175,10 +1586,10 @@ impl SessionServer for ServerClient {
         let response = self
             .sse_http
             .get(self.url(&format!("/v1/workspaces/{workspace_id}/events")))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.handle.token)
             .send()
             .await
-            .map_err(|error| network(&error))?;
+            .map_err(network)?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.json::<Value>().await.unwrap_or_default();
@@ -1223,6 +1634,89 @@ impl SessionServer for ServerClient {
                 return events.drain_lines().map_or(Ok(None), Ok);
             }
         }
+    }
+
+    // -- TUI operations ------------------------------------------------------
+
+    async fn rename_session(
+        &mut self,
+        session_id: &ThreadId,
+        title: &str,
+    ) -> Result<(), ClientError> {
+        self.handle.rename_session(session_id, title).await
+    }
+
+    async fn fork_session(
+        &mut self,
+        session_id: &ThreadId,
+        title: Option<&str>,
+    ) -> Result<ThreadId, ClientError> {
+        self.handle.fork_session(session_id, title).await
+    }
+
+    async fn switch_model(
+        &mut self,
+        session_id: &ThreadId,
+        expected_revision: u64,
+        binding: &Value,
+    ) -> Result<(), ClientError> {
+        self.handle
+            .switch_model(session_id, expected_revision, binding)
+            .await
+    }
+
+    async fn queue_follow_up(
+        &mut self,
+        session_id: &ThreadId,
+        prompt: &str,
+    ) -> Result<u64, ClientError> {
+        self.handle.queue_follow_up(session_id, prompt).await
+    }
+
+    async fn provide_input(
+        &mut self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        value: &str,
+    ) -> Result<(), ClientError> {
+        self.handle
+            .provide_input(session_id, thread_revision, run_revision, request_id, value)
+            .await
+    }
+
+    async fn resolve_permission(
+        &mut self,
+        session_id: &ThreadId,
+        thread_revision: u64,
+        run_revision: u64,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<(), ClientError> {
+        self.handle
+            .resolve_permission(session_id, thread_revision, run_revision, request_id, allow)
+            .await
+    }
+
+    async fn reconcile_effect(
+        &mut self,
+        session_id: &ThreadId,
+        effect_id: &str,
+    ) -> Result<(), ClientError> {
+        self.handle.reconcile_effect(session_id, effect_id).await
+    }
+
+    async fn search_sessions(
+        &mut self,
+        workspace_id: &str,
+        query: &str,
+    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+        self.handle.search_sessions(workspace_id, query).await
+    }
+
+    async fn bindings_catalog(&mut self, workspace_id: &str) -> Result<Vec<Value>, ClientError> {
+        self.handle.bindings_catalog(workspace_id).await
     }
 }
 
@@ -1633,6 +2127,9 @@ mod tests {
         }
     }
 
+    // `unknown_lints` keeps this portable across clippy versions: the lint
+    // exists on CI's stable (1.98+) but not on older local toolchains.
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     impl SessionServer for MockServer {
         async fn resolve_workspace(&mut self, _root: &Path) -> Result<String, ClientError> {
             if self.fail_resolve {
@@ -1759,6 +2256,86 @@ mod tests {
                 },
                 (_, other) => other,
             }))
+        }
+
+        // -- TUI operations --------------------------------------------------
+
+        async fn rename_session(
+            &mut self,
+            _session_id: &ThreadId,
+            _title: &str,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn fork_session(
+            &mut self,
+            _session_id: &ThreadId,
+            _title: Option<&str>,
+        ) -> Result<ThreadId, ClientError> {
+            Ok(ThreadId::from_uuid(Uuid::now_v7()))
+        }
+
+        async fn switch_model(
+            &mut self,
+            _session_id: &ThreadId,
+            _expected_revision: u64,
+            _binding: &Value,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn queue_follow_up(
+            &mut self,
+            _session_id: &ThreadId,
+            _prompt: &str,
+        ) -> Result<u64, ClientError> {
+            Ok(1)
+        }
+
+        async fn provide_input(
+            &mut self,
+            _session_id: &ThreadId,
+            _thread_revision: u64,
+            _run_revision: u64,
+            _request_id: &str,
+            _value: &str,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn resolve_permission(
+            &mut self,
+            _session_id: &ThreadId,
+            _thread_revision: u64,
+            _run_revision: u64,
+            _request_id: &str,
+            _allow: bool,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn reconcile_effect(
+            &mut self,
+            _session_id: &ThreadId,
+            _effect_id: &str,
+        ) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn search_sessions(
+            &mut self,
+            _workspace_id: &str,
+            _query: &str,
+        ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+            Ok(Vec::new())
+        }
+
+        async fn bindings_catalog(
+            &mut self,
+            _workspace_id: &str,
+        ) -> Result<Vec<Value>, ClientError> {
+            Ok(Vec::new())
         }
     }
 
@@ -2176,6 +2753,88 @@ mod tests {
             axum::http::StatusCode::OK
         }
 
+        // -- TUI endpoint handlers -------------------------------------------
+
+        async fn rename(
+            Path(id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert!(body.get("title").is_some(), "rename requires title");
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(json!({ "snapshot": { "thread_id": id, "revision": 1 } })),
+            )
+        }
+
+        async fn fork(Path(_id): Path<String>) -> impl IntoResponse {
+            let fork_id = Uuid::now_v7().to_string();
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(json!({ "snapshot": { "thread_id": fork_id, "revision": 1 } })),
+            )
+        }
+
+        async fn switch_model(
+            Path(_id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert!(
+                body.get("binding").is_some(),
+                "switch_model requires binding"
+            );
+            assert!(
+                body.get("expected_thread_revision").is_some(),
+                "switch_model requires expected_thread_revision"
+            );
+            axum::http::StatusCode::OK
+        }
+
+        async fn queue(
+            Path(_id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert!(body.get("prompt").is_some(), "queue requires prompt");
+            (
+                axum::http::StatusCode::ACCEPTED,
+                axum::Json(json!({ "position": 1 })),
+            )
+        }
+
+        async fn provide_input(
+            Path(_id): Path<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert!(body.get("request_id").is_some());
+            assert!(body.get("value").is_some());
+            axum::http::StatusCode::OK
+        }
+
+        async fn resolve_permission(
+            Path((_id, _req_id)): Path<(String, String)>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert!(body.get("allow").is_some());
+            axum::http::StatusCode::OK
+        }
+
+        async fn reconcile(Path((_id, _effect_id)): Path<(String, String)>) -> impl IntoResponse {
+            axum::http::StatusCode::OK
+        }
+
+        async fn search(
+            Path(ws): Path<String>,
+            axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+        ) -> impl IntoResponse {
+            assert_eq!(ws, "ws-1");
+            assert!(query.contains_key("q"), "search requires q param");
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(json!({ "sessions": [], "next_cursor": null })),
+            )
+        }
+
         async fn events() -> impl IntoResponse {
             let stream = futures::stream::iter([Ok::<_, std::convert::Infallible>(
                 axum::response::sse::Event::default()
@@ -2204,6 +2863,26 @@ mod tests {
                 axum::routing::post(follow_up),
             )
             .route("/v1/sessions/{id}/cancel", axum::routing::post(cancel))
+            .route("/v1/sessions/{id}", axum::routing::patch(rename))
+            .route("/v1/sessions/{id}/fork", axum::routing::post(fork))
+            .route("/v1/sessions/{id}/model", axum::routing::post(switch_model))
+            .route("/v1/sessions/{id}/queue", axum::routing::post(queue))
+            .route(
+                "/v1/sessions/{id}/input",
+                axum::routing::post(provide_input),
+            )
+            .route(
+                "/v1/sessions/{id}/permissions/{req_id}",
+                axum::routing::post(resolve_permission),
+            )
+            .route(
+                "/v1/sessions/{id}/effects/{effect_id}/reconcile",
+                axum::routing::post(reconcile),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions/search",
+                axum::routing::get(search),
+            )
             .with_state(api);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2293,7 +2972,70 @@ mod tests {
             )
             .await
             .unwrap();
+        // TUI operations through the SessionServer trait (delegates to ServerHandle).
+        let session_id =
+            ThreadId::from_uuid(Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap());
+        client
+            .rename_session(&session_id, "new title")
+            .await
+            .unwrap();
+        let fork_id = client.fork_session(&session_id, None).await.unwrap();
+        assert_ne!(fork_id, session_id);
+        client
+            .switch_model(&session_id, 1, &json!({"version": 1}))
+            .await
+            .unwrap();
+        let position = client.queue_follow_up(&session_id, "queued").await.unwrap();
+        assert_eq!(position, 1);
+        client
+            .provide_input(&session_id, 1, 1, "req-1", "answer")
+            .await
+            .unwrap();
+        client
+            .resolve_permission(&session_id, 1, 1, "req-1", true)
+            .await
+            .unwrap();
+        client
+            .reconcile_effect(&session_id, "effect-1")
+            .await
+            .unwrap();
+        let results = client.search_sessions(&ws, "test").await.unwrap();
+        assert!(results.is_empty());
+        let catalog = client.bindings_catalog(&ws).await.unwrap();
+        assert!(!catalog.is_empty());
         let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn mock_server_covers_tui_operations() {
+        let mut server = MockServer::new();
+        let session_id = ThreadId::from_uuid(Uuid::now_v7());
+        // Exercise every TUI operation on the mock to cover its implementations.
+        server.rename_session(&session_id, "title").await.unwrap();
+        let fork_id = server.fork_session(&session_id, None).await.unwrap();
+        assert_ne!(fork_id, session_id);
+        server
+            .switch_model(&session_id, 1, &json!({"version": 1}))
+            .await
+            .unwrap();
+        let position = server.queue_follow_up(&session_id, "prompt").await.unwrap();
+        assert_eq!(position, 1);
+        server
+            .provide_input(&session_id, 1, 1, "req-1", "value")
+            .await
+            .unwrap();
+        server
+            .resolve_permission(&session_id, 1, 1, "req-1", true)
+            .await
+            .unwrap();
+        server
+            .reconcile_effect(&session_id, "effect-1")
+            .await
+            .unwrap();
+        let results = server.search_sessions("ws-1", "query").await.unwrap();
+        assert!(results.is_empty());
+        let catalog = server.bindings_catalog("ws-1").await.unwrap();
+        assert!(catalog.is_empty());
     }
 
     #[tokio::test]
@@ -2517,5 +3259,151 @@ mod tests {
             resolve_remote_token(None, tmp.path()).unwrap(),
             "file-token"
         );
+    }
+
+    // -- TUI operation integration tests (embedded server) -------------------
+
+    /// Sets up an embedded server with a workspace that has a provider config.
+    /// Returns the server handle and the workspace id.
+    async fn tui_test_server() -> (EmbeddedServer, String, ServerHandle) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".latte")).unwrap();
+        std::fs::write(
+            temp.path().join(".latte/latte-code.jsonc"),
+            r#"{version:1,default_model:"main/mock",providers:{main:{type:"openai-chat",models:["mock"],base_url:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},verification:{argv:["true"]}}"#,
+        )
+        .unwrap();
+        let embedded = EmbeddedServer::start(temp.path(), home.path())
+            .await
+            .unwrap();
+        let handle = ServerHandle {
+            http: reqwest::Client::new(),
+            base_url: embedded.base_url().to_string(),
+            token: embedded.token().to_string(),
+        };
+        let workspace_id = handle.resolve_workspace_id(temp.path()).await.unwrap();
+        // Leak temp dirs so the server can read the config for the test's lifetime.
+        std::mem::forget(temp);
+        std::mem::forget(home);
+        (embedded, workspace_id, handle)
+    }
+
+    #[tokio::test]
+    async fn tui_bindings_catalog_returns_configured_bindings() {
+        let (embedded, workspace_id, handle) = tui_test_server().await;
+        let bindings = handle.bindings_catalog(&workspace_id).await.unwrap();
+        assert!(!bindings.is_empty(), "bindings catalog must not be empty");
+        assert!(
+            bindings[0].get("binding").is_some(),
+            "binding entry must have binding field"
+        );
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_search_sessions_returns_empty_for_unknown_query() {
+        let (embedded, workspace_id, handle) = tui_test_server().await;
+        let results = handle
+            .search_sessions(&workspace_id, "nonexistent-session-xyz")
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_rename_session_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle.rename_session(&unknown_id, "new title").await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_fork_session_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle.fork_session(&unknown_id, None).await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_switch_model_returns_error_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        // The server may reject the invalid binding (400) before checking
+        // the session (404); either proves the HTTP round-trip works.
+        let result = handle
+            .switch_model(&unknown_id, 0, &json!({"version": 1}))
+            .await;
+        assert!(result.is_err(), "switch_model on unknown session must fail");
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_queue_follow_up_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle.queue_follow_up(&unknown_id, "prompt").await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_provide_input_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle
+            .provide_input(&unknown_id, 0, 0, "req-1", "value")
+            .await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_resolve_permission_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle
+            .resolve_permission(&unknown_id, 0, 0, "req-1", true)
+            .await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_reconcile_effect_returns_not_found_for_unknown_id() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let result = handle.reconcile_effect(&unknown_id, "effect-1").await;
+        assert!(matches!(result, Err(ClientError::NotFound(_))));
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_server_handle_is_cloneable() {
+        let (embedded, _workspace_id, handle) = tui_test_server().await;
+        let cloned = handle.clone();
+        assert_eq!(handle.base_url, cloned.base_url);
+        assert_eq!(handle.token, cloned.token);
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tui_client_handle_returns_cloneable_handle() {
+        let (embedded, workspace_id, _handle) = tui_test_server().await;
+        let client = ServerClient::new(
+            embedded.base_url().to_string(),
+            embedded.token().to_string(),
+        );
+        let handle = client.handle();
+        // The handle can make independent HTTP calls.
+        let bindings = handle.bindings_catalog(&workspace_id).await.unwrap();
+        assert!(!bindings.is_empty());
+        embedded.shutdown().await;
     }
 }

@@ -170,6 +170,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
             get(search_sessions),
         )
         .route(
+            "/v1/workspaces/{workspace_id}/sessions/exact-title",
+            get(find_sessions_by_exact_title),
+        )
+        .route(
             "/v1/workspaces/{workspace_id}/events",
             get(workspace_events),
         )
@@ -333,16 +337,32 @@ async fn create_workspace(
 ) -> Result<Json<WorkspaceResponse>, HandlerError> {
     let path = PathBuf::from(&req.path);
     let workspace = state.workspaces.get_or_create(&path).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: ErrorBody {
-                    error_type: "rejected".to_string(),
-                    message: format!("invalid workspace: {e}"),
-                    current_revision: None,
-                },
-            }),
-        )
+        // Canonicalize failures (non-existent path) are usage errors (400);
+        // builder failures (engine init, legacy import, storage) are internal (500).
+        let message = e.to_string();
+        if message.contains("invalid workspace path") {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "rejected".to_string(),
+                        message,
+                        current_revision: None,
+                    },
+                }),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: ErrorBody {
+                        error_type: "failed".to_string(),
+                        message: format!("workspace initialization failed: {message}"),
+                        current_revision: None,
+                    },
+                }),
+            )
+        }
     })?;
 
     Ok(Json(WorkspaceResponse {
@@ -528,6 +548,29 @@ async fn search_sessions(
     let sessions = workspace
         .search_sessions(&query.q, limit)
         .map_err(|e| failed(&format!("cannot search sessions: {e}")))?;
+    Ok(Json(
+        serde_json::json!({ "sessions": sessions, "next_cursor": null }),
+    ))
+}
+
+/// Finds sessions whose title exactly matches `q`. Unlike `search_sessions`
+/// (substring match capped at `limit`), this uses the engine's exact-title
+/// index so older matches are not truncated by pagination.
+async fn find_sessions_by_exact_title(
+    State(state): State<Arc<ServerState>>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, HandlerError> {
+    let workspace = state
+        .workspaces
+        .get_by_id(&workspace_id)
+        .await
+        .ok_or_else(|| not_found("workspace not found"))?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let sessions = workspace
+        .find_sessions_by_exact_title(&query.q, limit)
+        .map_err(|e| failed(&format!("cannot find sessions by exact title: {e}")))?;
     Ok(Json(
         serde_json::json!({ "sessions": sessions, "next_cursor": null }),
     ))
@@ -2280,6 +2323,65 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["sessions"].as_array().unwrap().is_empty());
         assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn exact_title_lookup_returns_only_exact_matches() {
+        // The exact-title endpoint must not return substring matches: a
+        // session titled "foo" must not appear when looking up "foobar" and
+        // vice versa, regardless of the search result cap.
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (foo_id, _) = completed_session(&state, &workspace_id).await;
+        let (foobar_id, _) = completed_session(&state, &workspace_id).await;
+        for (id, title) in [(&foo_id, "foo"), (&foobar_id, "foobar")] {
+            let (status, _) = call(
+                &state,
+                "PATCH",
+                &format!("/v1/sessions/{id}"),
+                Some(serde_json::json!({ "title": title })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=foo"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "exact-title must return only 'foo'");
+        assert_eq!(sessions[0]["thread_id"].as_str(), Some(foo_id.as_str()));
+        assert_eq!(sessions[0]["title"].as_str(), Some("foo"));
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=foobar"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "exact-title must return only 'foobar'");
+        assert_eq!(sessions[0]["thread_id"].as_str(), Some(foobar_id.as_str()));
+
+        // A missing exact title returns an empty array, not an error.
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=nope"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["sessions"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
