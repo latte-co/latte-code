@@ -546,16 +546,11 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
             Ok(connected) => connected,
             Err(error) => return emit_client_error(json, &error),
         };
-    let outcome = execute_session_command_inner(
-        &mut client,
-        parsed.command,
-        &root,
-        json,
-        async move {
+    let outcome =
+        execute_session_command_inner(&mut client, parsed.command, &root, json, async move {
             let _ = cancel_rx.await;
-        },
-    )
-    .await;
+        })
+        .await;
     // Close the client (dropping any open SSE stream) before stopping the
     // embedded server so graceful shutdown does not wait on it.
     drop(client);
