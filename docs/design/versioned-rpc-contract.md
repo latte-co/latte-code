@@ -80,7 +80,10 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 |---|---|---|---|
 | `POST /v1/workspaces/{ws}/sessions` | `binding` | `serde_json::Value` | `ThreadProviderBindingV2` |
 | `POST /v1/sessions/{id}/model` | `binding` | `serde_json::Value` | `ThreadProviderBindingV2` |
-| `GET /v1/workspaces/{ws}/bindings` | `binding`（在 catalog entry 内） | `serde_json::Value` | `ThreadProviderBindingV2` |
+
+`GET /v1/workspaces/{ws}/bindings` 的 `binding` 字段**已经是**
+`ThreadProviderBindingV2`（`BindingCatalogEntry` 在 `latte-headless/src/registry.rs`
+中已类型化），无需改动。
 
 `ThreadProviderBindingV2` 已在 `latte-core` 定义且派生 `Serialize/Deserialize`，
 直接引用即可。server 侧的 `resolve_thread_bound` 已经消费这个类型，类型化后
@@ -101,7 +104,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 （非 breaking，因为 JSON 结构不变）：
 
 - `GET /v1/sessions/{id}` → `SessionResponse { snapshot: ThreadSnapshot }`
-- `POST /v1/sessions/{id}/follow-up` → `FollowUpResponse { accepted_revision: u64 }`
+- `POST /v1/sessions/{id}/follow-up` → `FollowUpResponse { accepted_revision: u64, workspace_id: String }`（`workspace_id` 是客户端订阅正确事件流的必需字段，当前实现已返回）
 - `POST /v1/sessions/{id}/cancel` → `SessionResponse`
 - `POST /v1/sessions/{id}/model` → `SessionResponse`
 - `POST /v1/sessions/{id}/queue` → `QueueResponse { position: u64 }`
