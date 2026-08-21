@@ -532,14 +532,29 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
             return emit_error(json, "usage", "configuration", &message, EXIT_USAGE, false);
         }
     };
+    // Register the SIGINT handler early (before embedded-server startup) so
+    // a Ctrl+C during slow initialization still maps to exit 130 instead of
+    // the default process-kill. The handler runs in a spawned task and
+    // signals through a oneshot channel; the receiver is the cancel future.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = cancel_tx.send(());
+    });
     let (mut client, embedded) =
         match server_client::connect(parsed.server, parsed.token, &root, &storage_home).await {
             Ok(connected) => connected,
             Err(error) => return emit_client_error(json, &error),
         };
-    let outcome = execute_session_command_inner(&mut client, parsed.command, &root, json, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    let outcome = execute_session_command_inner(
+        &mut client,
+        parsed.command,
+        &root,
+        json,
+        async move {
+            let _ = cancel_rx.await;
+        },
+    )
     .await;
     // Close the client (dropping any open SSE stream) before stopping the
     // embedded server so graceful shutdown does not wait on it.

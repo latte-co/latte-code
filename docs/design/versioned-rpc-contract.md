@@ -271,8 +271,7 @@ v1 客户端必须：
 ### Phase B：DTO 类型化 + 分页实现（~1.5 天）
 
 - [ ] `CreateSessionRequest.binding` / `SwitchModelRequest.binding` 改为
-      `ThreadProviderBindingV2`
-- [ ] `BindingCatalogEntry.binding` 改为 `ThreadProviderBindingV2`
+      `ThreadProviderBindingV2`（`BindingCatalogEntry.binding` 已经是该类型，无需改动）
 - [ ] 响应体从 `Json<Value>` 改为类型化 struct（§3.3 清单）
 - [ ] 实现 server 侧 cursor 分页（list + search + exact-title），使 §6.2 升格为正式契约
 - [ ] UT + E2E 覆盖
