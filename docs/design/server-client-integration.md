@@ -850,4 +850,4 @@ PR #7 后存量 lib.rs CLI 代码距 95% UT 门余量较薄。本方案新增 ~1
 - `run/show/list/resume` 命令语义和 ID 类型变更。
 - JSON envelope 升级 v2。
 - 旧 v1 run 的 `show/list/resume` 从 CLI 移除。
-- AgentRuntime / RuntimeCommandService 标记 deprecated。
+- AgentRuntime / RuntimeCommandService 直接删除（见 §9，未走 deprecated 过渡）。
