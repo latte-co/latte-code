@@ -550,6 +550,9 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
             Ok(connected) => connected,
             Err(error) => return emit_client_error(json, &error),
         },
+        // oneshot::Receiver yields Result<(), RecvError>, not `()`; the
+        // ignored_unit_patterns lint only applies to unit-typed futures, so
+        // `_` is the correct (and lint-free) pattern here.
         _ = &mut cancel_rx => {
             return EXIT_INTERRUPTED;
         }
@@ -622,11 +625,11 @@ async fn execute_session_command_inner(
         server_client::SessionCommand::List => {
             let workspace_id = tokio::select! {
                 result = client.resolve_workspace(root) => result?,
-                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
             };
             let sessions = tokio::select! {
                 result = client.list_sessions(&workspace_id) => result?,
-                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
             };
             if json {
                 println!("{}", server_client::list_envelope(&sessions));
@@ -641,7 +644,7 @@ async fn execute_session_command_inner(
             let thread_id = server_client::parse_session_id(&session_id)?;
             let snapshot = tokio::select! {
                 result = client.snapshot(&thread_id) => result?,
-                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
             };
             if json {
                 println!("{}", server_client::session_envelope(&snapshot));

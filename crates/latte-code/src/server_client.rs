@@ -628,11 +628,11 @@ pub async fn run_session(
     let mut cancel = std::pin::pin!(cancel);
     let workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
     };
     let binding = tokio::select! {
         result = server.default_binding(&workspace_id) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
     };
     let thread_id = ThreadId::from_uuid(Uuid::now_v7());
     let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
@@ -645,7 +645,12 @@ pub async fn run_session(
             focus,
             &binding,
         ) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => {
+            // The session may have been created server-side even though the
+            // response hasn't arrived; best-effort cancel to avoid leaving
+            // a background provider run.
+            return Ok(cancel_session(server, &thread_id).await);
+        }
     };
     observe_session(server, &workspace_id, &thread_id, on_progress, cancel).await
 }
@@ -662,16 +667,16 @@ pub async fn resume_session(
     let mut cancel = std::pin::pin!(cancel);
     let _workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
     };
     let thread_id = parse_session_id(session_id)?;
     let snapshot = tokio::select! {
         result = server.snapshot(&thread_id) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
     let (_, event_workspace_id) = tokio::select! {
         result = server.follow_up(&thread_id, snapshot.revision, prompt) => result?,
-        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
     observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
 }
@@ -685,16 +690,27 @@ async fn observe_session(
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<RunResult, ClientError> {
-    // Resync before subscribing: a fast turn may already be terminal.
-    if let Some(result) = check_terminal(server, session_id).await? {
-        return Ok(result);
-    }
-    server.open_events(workspace_id).await?;
-    // Unconditional resync after connecting (§8.1).
-    if let Some(result) = check_terminal(server, session_id).await? {
-        return Ok(result);
-    }
     let mut cancel = std::pin::pin!(cancel);
+    // Resync before subscribing: a fast turn may already be terminal.
+    let pre_terminal = tokio::select! {
+        result = check_terminal(server, session_id) => result?,
+        () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+    };
+    if let Some(result) = pre_terminal {
+        return Ok(result);
+    }
+    tokio::select! {
+        result = server.open_events(workspace_id) => result?,
+        () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+    };
+    // Unconditional resync after connecting (§8.1).
+    let post_terminal = tokio::select! {
+        result = check_terminal(server, session_id) => result?,
+        () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+    };
+    if let Some(result) = post_terminal {
+        return Ok(result);
+    }
     let session_id_str = session_id.to_string();
     loop {
         tokio::select! {
@@ -2007,6 +2023,16 @@ mod tests {
         fail_resolve: bool,
         fail_binding: bool,
         read_error_once: Mutex<bool>,
+        // When true, `resolve_workspace` parks forever. Tests use this to fire
+        // cancel into a select! where the init branch is the only other
+        // contender and is pending — the cancel outcome is then deterministic
+        // (an immediately-ready cancel future would race the sync mock methods
+        // and lose ~1/2^n of the time).
+        park_resolve: bool,
+        // Fired once from `open_events` so tests can park a cancel future until
+        // the session has entered the observe phase (deterministic alternative
+        // to `yield_now`, which races the init phase on loaded CI runners).
+        observe_signal: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     impl MockServer {
@@ -2042,6 +2068,9 @@ mod tests {
         async fn resolve_workspace(&mut self, _root: &Path) -> Result<String, ClientError> {
             if self.fail_resolve {
                 return Err(ClientError::Failed("resolve failed".into()));
+            }
+            if self.park_resolve {
+                std::future::pending::<()>().await;
             }
             Ok(self.workspace_id.clone())
         }
@@ -2119,6 +2148,9 @@ mod tests {
 
         async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError> {
             self.opened.lock().unwrap().push(workspace_id.to_string());
+            if let Some(signal) = self.observe_signal.take() {
+                let _ = signal.send(());
+            }
             Ok(())
         }
 
@@ -2265,15 +2297,18 @@ mod tests {
 
     #[tokio::test]
     async fn run_session_cancels_on_ctrl_c() {
+        let (observe_tx, observe_rx) = tokio::sync::oneshot::channel::<()>();
         let mut server = MockServer::new();
+        server.observe_signal = Some(observe_tx);
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        // Yield once so the (synchronous) MockServer initialization completes
-        // before the cancel fires; this exercises the observe-phase cancel
-        // path that calls `cancel_session`.
+        // The cancel future can only complete after `open_events` fires, which
+        // happens inside `observe_session` — so init (resolve/binding/create)
+        // is guaranteed to have finished and the cancel deterministically
+        // exercises the observe-phase `cancel_session` path.
         let cancel = async {
-            tokio::task::yield_now().await;
+            let _ = observe_rx.await;
         };
         let result = run_session(
             &mut server,
@@ -2293,7 +2328,10 @@ mod tests {
     #[tokio::test]
     async fn run_session_cancel_during_initialization_returns_cancelled_without_cancel_call() {
         let mut server = MockServer::new();
-        // No snapshots needed: the cancel fires before any session is created.
+        // Park the init phase forever: cancel is then the only ready branch in
+        // the first select!, so it wins deterministically (no snapshots, no
+        // create_session, no cancel_session).
+        server.park_resolve = true;
         let result = run_session(
             &mut server,
             Path::new("/workspace"),
