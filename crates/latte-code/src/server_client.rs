@@ -725,13 +725,30 @@ async fn observe_session(
                 let event = event.unwrap_or_default();
                 match event {
                     None => {
-                        // Stream ended: resync, reconnect, resync.
-                        if let Some(result) = check_terminal(server, session_id).await? {
+                        // Stream ended: resync, reconnect, resync. Every await
+                        // in this window polls cancel so Ctrl+C returns 130
+                        // promptly instead of waiting out the full reconnect
+                        // sequence (including the 250ms backoff).
+                        let reconnect_terminal = tokio::select! {
+                            result = check_terminal(server, session_id) => result?,
+                            () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+                        };
+                        if let Some(result) = reconnect_terminal {
                             return Ok(result);
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        server.open_events(workspace_id).await?;
-                        if let Some(result) = check_terminal(server, session_id).await? {
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                            () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+                        }
+                        tokio::select! {
+                            result = server.open_events(workspace_id) => result?,
+                            () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+                        };
+                        let post_reconnect_terminal = tokio::select! {
+                            result = check_terminal(server, session_id) => result?,
+                            () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+                        };
+                        if let Some(result) = post_reconnect_terminal {
                             return Ok(result);
                         }
                     }
@@ -748,7 +765,11 @@ async fn observe_session(
                         // Progress for another session in the same workspace.
                     }
                     Some(StreamEvent::ThreadChanged { .. } | StreamEvent::ResyncRequired) => {
-                        if let Some(result) = check_terminal(server, session_id).await? {
+                        let changed_terminal = tokio::select! {
+                            result = check_terminal(server, session_id) => result?,
+                            () = &mut cancel => return Ok(cancel_session(server, session_id).await),
+                        };
+                        if let Some(result) = changed_terminal {
                             return Ok(result);
                         }
                     }
@@ -2010,6 +2031,9 @@ mod tests {
     // -- mock server + orchestration ----------------------------------------
 
     #[derive(Default)]
+    // Behavioral flags for a test mock; explicit bools read clearer than an
+    // enum of mutually-compatible toggles.
+    #[allow(clippy::struct_excessive_bools)]
     struct MockServer {
         workspace_id: String,
         binding: Value,
@@ -2033,6 +2057,12 @@ mod tests {
         // the session has entered the observe phase (deterministic alternative
         // to `yield_now`, which races the init phase on loaded CI runners).
         observe_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        // Fired once from the second `open_events` call (the reconnect after a
+        // stream end/read error), paired with `park_reconnect` to park that
+        // call forever — lets tests fire cancel into a pending reconnect
+        // select! with no timing race.
+        reconnect_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_reconnect: bool,
     }
 
     impl MockServer {
@@ -2147,9 +2177,24 @@ mod tests {
         }
 
         async fn open_events(&mut self, workspace_id: &str) -> Result<(), ClientError> {
-            self.opened.lock().unwrap().push(workspace_id.to_string());
-            if let Some(signal) = self.observe_signal.take() {
-                let _ = signal.send(());
+            let call = {
+                let mut opened = self.opened.lock().unwrap();
+                opened.push(workspace_id.to_string());
+                opened.len()
+            };
+            if call == 1 {
+                if let Some(signal) = self.observe_signal.take() {
+                    let _ = signal.send(());
+                }
+            } else {
+                if let Some(signal) = self.reconnect_signal.take() {
+                    let _ = signal.send(());
+                }
+                if self.park_reconnect {
+                    // Park forever so tests can fire cancel into a pending
+                    // reconnect select! (cancel is the only ready branch).
+                    std::future::pending::<()>().await;
+                }
             }
             Ok(())
         }
@@ -2348,6 +2393,42 @@ mod tests {
         // cancel_session was never called.
         assert_eq!(server.cancelled.lock().unwrap().len(), 0);
         assert!(server.created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_reconnect_cancels_session() {
+        // Stream end enters the reconnect branch (resync → 250ms backoff →
+        // open_events → resync). The reconnect open_events parks forever and
+        // signals `reconnect_rx`, so cancel fires deterministically into a
+        // pending reconnect select! — proving the reconnect window is
+        // cancel-aware and best-effort cancels the session.
+        let (reconnect_tx, reconnect_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.reconnect_signal = Some(reconnect_tx);
+        server.park_reconnect = true;
+        // observe: pre-subscribe resync (running), post-connect resync (running)
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // reconnect: resync (running), then cancel_session's snapshot
+        server.end_stream();
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = reconnect_rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
