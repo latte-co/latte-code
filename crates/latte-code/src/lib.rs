@@ -583,6 +583,7 @@ async fn execute_session_command_inner(
         eprint!("{text}");
         let _ = std::io::stderr().flush();
     };
+    let mut cancel = std::pin::pin!(cancel);
     match command {
         server_client::SessionCommand::Run { prompt, focus } => {
             let result = server_client::run_session(
@@ -619,8 +620,14 @@ async fn execute_session_command_inner(
             Ok(result.exit_code())
         }
         server_client::SessionCommand::List => {
-            let workspace_id = client.resolve_workspace(root).await?;
-            let sessions = client.list_sessions(&workspace_id).await?;
+            let workspace_id = tokio::select! {
+                result = client.resolve_workspace(root) => result?,
+                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
+            let sessions = tokio::select! {
+                result = client.list_sessions(&workspace_id) => result?,
+                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
             if json {
                 println!("{}", server_client::list_envelope(&sessions));
             } else {
@@ -632,7 +639,10 @@ async fn execute_session_command_inner(
         }
         server_client::SessionCommand::Show { session_id } => {
             let thread_id = server_client::parse_session_id(&session_id)?;
-            let snapshot = client.snapshot(&thread_id).await?;
+            let snapshot = tokio::select! {
+                result = client.snapshot(&thread_id) => result?,
+                _ = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
             if json {
                 println!("{}", server_client::session_envelope(&snapshot));
             } else {

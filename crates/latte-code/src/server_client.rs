@@ -625,20 +625,28 @@ pub async fn run_session(
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<RunResult, ClientError> {
-    let workspace_id = server.resolve_workspace(root).await?;
-    let binding = server.default_binding(&workspace_id).await?;
+    let mut cancel = std::pin::pin!(cancel);
+    let workspace_id = tokio::select! {
+        result = server.resolve_workspace(root) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
+    let binding = tokio::select! {
+        result = server.default_binding(&workspace_id) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
     let thread_id = ThreadId::from_uuid(Uuid::now_v7());
     let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
-    server
-        .create_session(
+    tokio::select! {
+        result = server.create_session(
             &workspace_id,
             thread_id,
             command_id,
             prompt,
             focus,
             &binding,
-        )
-        .await?;
+        ) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
     observe_session(server, &workspace_id, &thread_id, on_progress, cancel).await
 }
 
@@ -651,12 +659,20 @@ pub async fn resume_session(
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<RunResult, ClientError> {
-    let _workspace_id = server.resolve_workspace(root).await?;
+    let mut cancel = std::pin::pin!(cancel);
+    let _workspace_id = tokio::select! {
+        result = server.resolve_workspace(root) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
     let thread_id = parse_session_id(session_id)?;
-    let snapshot = server.snapshot(&thread_id).await?;
-    let (_, event_workspace_id) = server
-        .follow_up(&thread_id, snapshot.revision, prompt)
-        .await?;
+    let snapshot = tokio::select! {
+        result = server.snapshot(&thread_id) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
+    let (_, event_workspace_id) = tokio::select! {
+        result = server.follow_up(&thread_id, snapshot.revision, prompt) => result?,
+        _ = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+    };
     observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
 }
 
@@ -2253,6 +2269,31 @@ mod tests {
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
         server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // Yield once so the (synchronous) MockServer initialization completes
+        // before the cancel fires; this exercises the observe-phase cancel
+        // path that calls `cancel_session`.
+        let cancel = async {
+            tokio::task::yield_now().await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_initialization_returns_cancelled_without_cancel_call() {
+        let mut server = MockServer::new();
+        // No snapshots needed: the cancel fires before any session is created.
         let result = run_session(
             &mut server,
             Path::new("/workspace"),
@@ -2265,7 +2306,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.exit_code(), 130);
         assert_eq!(result.status(), "cancelled");
-        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+        // Cancel fired during initialization: no session was created, so
+        // cancel_session was never called.
+        assert_eq!(server.cancelled.lock().unwrap().len(), 0);
+        assert!(server.created.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
