@@ -536,16 +536,24 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
     // a Ctrl+C during slow initialization still maps to exit 130 instead of
     // the default process-kill. The handler runs in a spawned task and
     // signals through a oneshot channel; the receiver is the cancel future.
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = cancel_tx.send(());
     });
-    let (mut client, embedded) =
-        match server_client::connect(parsed.server, parsed.token, &root, &storage_home).await {
+    // Race the connection (which may start an embedded server or do a remote
+    // health check) against the cancel receiver so a Ctrl+C during slow
+    // initialization exits 130 instead of being silently swallowed.
+    let connect_future = server_client::connect(parsed.server, parsed.token, &root, &storage_home);
+    let (mut client, embedded) = tokio::select! {
+        result = connect_future => match result {
             Ok(connected) => connected,
             Err(error) => return emit_client_error(json, &error),
-        };
+        },
+        _ = &mut cancel_rx => {
+            return EXIT_INTERRUPTED;
+        }
+    };
     let outcome =
         execute_session_command_inner(&mut client, parsed.command, &root, json, async move {
             let _ = cancel_rx.await;
