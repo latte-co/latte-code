@@ -532,15 +532,36 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
             return emit_error(json, "usage", "configuration", &message, EXIT_USAGE, false);
         }
     };
-    let (mut client, embedded) =
-        match server_client::connect(parsed.server, parsed.token, &root, &storage_home).await {
+    // Register the SIGINT handler early (before embedded-server startup) so
+    // a Ctrl+C during slow initialization still maps to exit 130 instead of
+    // the default process-kill. The handler runs in a spawned task and
+    // signals through a oneshot channel; the receiver is the cancel future.
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = cancel_tx.send(());
+    });
+    // Race the connection (which may start an embedded server or do a remote
+    // health check) against the cancel receiver so a Ctrl+C during slow
+    // initialization exits 130 instead of being silently swallowed.
+    let connect_future = server_client::connect(parsed.server, parsed.token, &root, &storage_home);
+    let (mut client, embedded) = tokio::select! {
+        result = connect_future => match result {
             Ok(connected) => connected,
             Err(error) => return emit_client_error(json, &error),
-        };
-    let outcome = execute_session_command_inner(&mut client, parsed.command, &root, json, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await;
+        },
+        // oneshot::Receiver yields Result<(), RecvError>, not `()`; the
+        // ignored_unit_patterns lint only applies to unit-typed futures, so
+        // `_` is the correct (and lint-free) pattern here.
+        _ = &mut cancel_rx => {
+            return EXIT_INTERRUPTED;
+        }
+    };
+    let outcome =
+        execute_session_command_inner(&mut client, parsed.command, &root, json, async move {
+            let _ = cancel_rx.await;
+        })
+        .await;
     // Close the client (dropping any open SSE stream) before stopping the
     // embedded server so graceful shutdown does not wait on it.
     drop(client);
@@ -565,6 +586,7 @@ async fn execute_session_command_inner(
         eprint!("{text}");
         let _ = std::io::stderr().flush();
     };
+    let mut cancel = std::pin::pin!(cancel);
     match command {
         server_client::SessionCommand::Run { prompt, focus } => {
             let result = server_client::run_session(
@@ -601,8 +623,14 @@ async fn execute_session_command_inner(
             Ok(result.exit_code())
         }
         server_client::SessionCommand::List => {
-            let workspace_id = client.resolve_workspace(root).await?;
-            let sessions = client.list_sessions(&workspace_id).await?;
+            let workspace_id = tokio::select! {
+                result = client.resolve_workspace(root) => result?,
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
+            let sessions = tokio::select! {
+                result = client.list_sessions(&workspace_id) => result?,
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
             if json {
                 println!("{}", server_client::list_envelope(&sessions));
             } else {
@@ -614,7 +642,10 @@ async fn execute_session_command_inner(
         }
         server_client::SessionCommand::Show { session_id } => {
             let thread_id = server_client::parse_session_id(&session_id)?;
-            let snapshot = client.snapshot(&thread_id).await?;
+            let snapshot = tokio::select! {
+                result = client.snapshot(&thread_id) => result?,
+                () = &mut cancel => return Ok(EXIT_INTERRUPTED),
+            };
             if json {
                 println!("{}", server_client::session_envelope(&snapshot));
             } else {
