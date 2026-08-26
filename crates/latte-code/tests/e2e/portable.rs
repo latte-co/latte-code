@@ -5756,6 +5756,112 @@ fn engine_rename_and_fork_thread() {
     assert!(!exact.is_empty());
 }
 
+/// Engine-level effect lifecycle: covers the `PrepareEffect` commit path.
+#[test]
+fn engine_effect_lifecycle_covers_prepare() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "effect test", 1)
+        .unwrap();
+
+    // Start the run.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Prepare an effect.
+    let effect_id = "effect-1".to_string();
+    let _ = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: Some(effect_id.clone()),
+                update: latte_engine::CommitThreadRunUpdate::PrepareEffect {
+                    source_key: "prepare".into(),
+                    effect_id: effect_id.clone(),
+                    operation_digest: "a".repeat(64),
+                    descriptor_json: serde_json::json!({
+                        "effect_id": effect_id,
+                        "tool_call_id": "call-1",
+                        "name": "read_file",
+                        "input": {"path": "test.txt"},
+                        "attempt": 1
+                    })
+                    .to_string(),
+                    canonical_descriptor_json: serde_json::json!({
+                        "effect_id": effect_id,
+                        "tool_call_id": "call-1",
+                        "name": "read_file",
+                        "input": {"path": "test.txt"},
+                        "attempt": 1
+                    })
+                    .to_string(),
+                    policy: latte_engine::ThreadEffectPolicy::Ask,
+                    description: "test effect".into(),
+                    checkpoint_json: "{}".into(),
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+
+    engine.release_lease(&lease).unwrap();
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
