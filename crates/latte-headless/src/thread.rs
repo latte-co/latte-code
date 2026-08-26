@@ -5283,6 +5283,103 @@ mod tests {
         assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
     }
 
+    #[tokio::test]
+    async fn follow_up_accepted_replays_durable_acceptance_and_rejects_mismatch() {
+        // A same-command_id same-payload retry after the turn completes replays
+        // the original acceptance (Replayed, no duplicate turn); a same-id
+        // different-payload retry is a durable mismatch.
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), Vec::new()),
+                response(Some("second"), Vec::new()),
+                response(Some("third"), Vec::new()),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+
+        // First follow-up → Created.
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().expect("follow-up accepted");
+        let first_revision = match accepted {
+            latte_core::CreateOutcome::Created(snapshot) => snapshot.revision,
+            latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
+        };
+        handle.await.unwrap().unwrap();
+
+        // Wait for the follow-up turn to complete.
+        let ready2 = loop {
+            let snap = service.load_full(thread_id).unwrap();
+            if snap.lifecycle == ThreadLifecycle::Ready {
+                break snap;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        // Replay with the same command_id + payload → Replayed (no new turn).
+        let replay = service
+            .follow_up(thread_id, ready2.revision, "second".into())
+            .await;
+        // follow_up mints a fresh command_id, so this is a new follow-up, not
+        // a replay. To test the durable replay, use follow_up_accepted with
+        // the same command_id.
+        let (tx, rx) = oneshot::channel();
+        let replayed = service
+            .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+            .await
+            .unwrap();
+        match replayed {
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                assert_eq!(snapshot.revision, first_revision);
+            }
+            latte_core::CreateOutcome::Created(_) => {
+                panic!("same command_id replay must be Replayed")
+            }
+        }
+        let _ = replay;
+        let _ = rx.await;
+
+        // Same command_id, different prompt → mismatch error.
+        let (tx, rx) = oneshot::channel();
+        let mismatch = service
+            .follow_up_accepted(
+                thread_id,
+                command_id,
+                ready.revision,
+                "DIFFERENT".into(),
+                tx,
+            )
+            .await;
+        assert!(matches!(
+            mismatch,
+            Err(ThreadRuntimeError::Storage(
+                latte_engine::StorageError::ThreadCommandReplayMismatch
+            ))
+        ));
+        let _ = rx.await;
+    }
+
     // -- Pure helper coverage ------------------------------------------------
 
     #[test]

@@ -2475,6 +2475,118 @@ fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
     );
 }
 
+/// A follow-up accepted by one server instance must reject a same-command_id
+/// different-payload retry after a server restart with 422 (not 409), so the
+/// client doesn't retry as a revision conflict.
+#[cfg(unix)]
+#[test]
+fn final_binary_follow_up_durable_mismatch_after_restart_returns_422() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first done"),
+        ProviderReply::completion("follow-up done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // First server instance: create + follow-up, then shut down.
+    let (session_id, revision, command_id) = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "mismatch test", &binding);
+        assert_eq!(create_status, 202);
+        let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait for the initial turn to complete.
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Send a follow-up with a stable command_id.
+        let command_id = "01900000-0000-7000-8000-0000000000b2".to_string();
+        let (f_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "original prompt",
+                "expected_thread_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up must be accepted");
+
+        // Wait for the follow-up turn to complete.
+        loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (session_id, revision, command_id)
+        // `server` drops here → SIGTERM → graceful shutdown.
+    };
+
+    // Second instance: replay with the same command_id but a DIFFERENT prompt.
+    // The durable dedup must reject this as 422, not 409.
+    let server = ServeChild::start(&scenario);
+    let (mismatch_status, mismatch_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": command_id,
+            "prompt": "DIFFERENT prompt",
+            "expected_thread_revision": revision,
+        })),
+        &[("Idempotency-Key", &command_id)],
+    );
+    assert_eq!(
+        mismatch_status, 422,
+        "durable mismatch must be 422, got {mismatch_status}: {mismatch_body:?}"
+    );
+    assert_eq!(
+        mismatch_body["error"]["type"].as_str(),
+        Some("idempotency_mismatch"),
+        "error type must be idempotency_mismatch: {mismatch_body:?}"
+    );
+}
+
 /// Exercises the session-management surface end to end against the final
 /// binary: once a session is durably idle it is renamed (verified through the
 /// catalog search projection), forked into a fresh thread id, and the provider
