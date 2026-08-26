@@ -6670,3 +6670,59 @@ fn final_binary_cli_run_with_multiple_tool_calls_completes() {
     assert_eq!(body["status"], "completed");
     provider.assert_consumed();
 }
+
+/// Engine-level error paths: covers validation and not-found errors for
+/// session management operations.
+#[test]
+fn engine_session_management_error_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "error paths", 1)
+        .unwrap();
+
+    // Rename with empty title should fail.
+    let rename_result = engine.rename_thread_session_v2(thread_id, "");
+    assert!(rename_result.is_err());
+
+    // Fork with a duplicate thread_id should fail.
+    let fork_result = engine.fork_thread_session_v2(thread_id, thread_id, Some("dup"), 20);
+    assert!(fork_result.is_err());
+
+    // Switch binding with wrong revision should fail.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let switch_result = engine.switch_thread_binding_v2(
+        thread_id, 999, // wrong revision
+        &binding, &lease, 3,
+    );
+    assert!(switch_result.is_err());
+    engine.release_lease(&lease).unwrap();
+
+    // Operations on a missing thread should fail.
+    let missing = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    assert!(engine.thread_session_v2(missing).unwrap().is_none());
+    assert!(engine.thread_snapshot_v2(missing, None, 10).is_err());
+}
