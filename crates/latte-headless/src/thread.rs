@@ -2079,7 +2079,7 @@ fn effect_provider_result(snapshot: &ThreadSnapshot, tool_call_id: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{FakeProvider, InputRequest, ProviderFuture, ProviderResponse};
+    use crate::provider::{FakeProvider, InputRequest, ProviderResponse};
     use latte_engine::EngineBuilder;
 
     struct DelayedProvider {

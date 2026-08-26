@@ -10553,4 +10553,240 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
     }
+
+    #[test]
+    fn complete_verified_rejects_thread_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let (run_id, _) = ids();
+        let thread_lease = store.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        let manifest = std::collections::BTreeMap::new();
+        assert!(matches!(
+            store.complete_verified(
+                run_id,
+                0,
+                &thread_lease,
+                "summary".into(),
+                &manifest,
+                "digest",
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn import_legacy_database_rejects_invalid_workspace_root_and_fingerprint() {
+        let store = Storage::memory().unwrap();
+        let (dir, path) = db();
+        // Create a minimal legacy database file.
+        std::fs::write(&path, "not a database").unwrap();
+        // Invalid workspace root (control character) → InvalidData.
+        assert!(matches!(
+            store.import_legacy_database(
+                &path,
+                "/source/path",
+                "fingerprint",
+                "bad\nroot",
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Invalid fingerprint (control character) → InvalidData.
+        assert!(matches!(
+            store.import_legacy_database(
+                &path,
+                "/source/path",
+                "bad\nfingerprint",
+                "/workspace",
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        drop(dir);
+    }
+
+    #[test]
+    fn lookup_create_replay_rejects_invalid_workspace_root_and_returns_none_for_missing() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let command_id = latte_core::ThreadCommandId::from_uuid(id_source.next_uuid_v7());
+        let binding = thread_binding();
+        // Invalid workspace root → InvalidData.
+        assert!(matches!(
+            store.lookup_create_replay(
+                &command_id,
+                thread_id,
+                "bad\nroot",
+                "prompt",
+                &binding,
+                None,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // No existing command → Ok(None).
+        assert!(store
+            .lookup_create_replay(
+                &command_id,
+                thread_id,
+                "/workspace",
+                "prompt",
+                &binding,
+                None,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reconcile_unknown_and_abort_rejects_stale_revision() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Wrong expected revision → StaleRevision.
+        assert!(matches!(
+            store.reconcile_unknown_and_abort(run_id, "effect", 99, &lease, 3),
+            Err(StorageError::StaleRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn interrupt_after_lease_loss_rejects_still_authoritative_lease() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Lease is still valid → InvalidData.
+        assert!(matches!(
+            store.interrupt_after_lease_loss(run_id, &lease, 0, 3),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn apply_transition_rejects_stale_lease_token() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // A lease with a higher fencing token → LeaseLost.
+        let stale = Lease {
+            scope: lease.scope.clone(),
+            owner: lease.owner.clone(),
+            fencing_token: lease.fencing_token + 1,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.apply_transition(
+                run_id,
+                0,
+                Transition::Start,
+                3,
+                &stale,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn create_thread_v2_rejects_invalid_binding_workspace_and_duplicate() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let baseline = std::collections::BTreeMap::new();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let run_id = RunId::from_uuid(id_source.next_uuid_v7());
+        // Invalid binding (empty provider_name) → InvalidData.
+        let mut bad_binding = thread_binding();
+        bad_binding.provider_name = String::new();
+        assert!(matches!(
+            store.create_thread_v2(
+                thread_id,
+                run_id,
+                &bad_binding,
+                "/workspace",
+                "prompt",
+                &baseline,
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Invalid workspace root (control character) → InvalidData.
+        assert!(matches!(
+            store.create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "bad\nroot",
+                "prompt",
+                &baseline,
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Create the thread, then duplicate → replays the existing snapshot.
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "prompt",
+                &baseline,
+                1,
+            )
+            .unwrap();
+        let run_id2 = RunId::from_uuid(id_source.next_uuid_v7());
+        let duplicate = store
+            .create_thread_v2(
+                thread_id,
+                run_id2,
+                &thread_binding(),
+                "/workspace",
+                "prompt",
+                &baseline,
+                2,
+            )
+            .unwrap();
+        assert_eq!(duplicate.thread_id, thread_id);
+    }
+
+    #[test]
+    fn create_thread_follow_up_v2_rejects_unknown_thread_and_wrong_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let baseline = std::collections::BTreeMap::new();
+        let (thread_id, _run_id, queued) =
+            create_linked_fixture(&store, &id_source, "follow-up errors", 11);
+        // Unknown thread → ThreadNotFound.
+        let unknown = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let follow_up = RunId::from_uuid(id_source.next_uuid_v7());
+        assert!(matches!(
+            store.create_thread_follow_up_v2(
+                unknown,
+                follow_up,
+                queued.revision,
+                "next",
+                &baseline,
+                12,
+            ),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+        // Wrong lease scope (runtime lease instead of thread lease) → LeaseLost.
+        let runtime_lease = store.acquire_lease("owner", 10, 10_000).unwrap();
+        assert!(matches!(
+            store.create_started_thread_follow_up_v2(
+                thread_id,
+                follow_up,
+                queued.revision,
+                "next",
+                &baseline,
+                &runtime_lease,
+                12,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
 }

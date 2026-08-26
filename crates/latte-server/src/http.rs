@@ -4562,7 +4562,8 @@ mod tests {
     async fn session_registered_with_missing_workspace_path_is_not_found() {
         // A session registered against a workspace path that no longer exists
         // resolves the index entry, then get_or_create fails to canonicalize it
-        // and the handler returns 404 (covers the lookup_workspace error arm).
+        // and the handler returns 404 (covers the lookup_workspace error arm in
+        // get_session, rename_session, and fork_session).
         let state = state();
         let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
         state
@@ -4574,6 +4575,24 @@ mod tests {
             .await;
 
         let (status, _) = call(&state, "GET", &format!("/v1/sessions/{ghost}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &format!("/v1/sessions/{ghost}"),
+            Some(serde_json::json!({ "title": "renamed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{ghost}/fork"),
+            Some(serde_json::json!({ "title": "forked" })),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

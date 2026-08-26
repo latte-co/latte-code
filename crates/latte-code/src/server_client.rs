@@ -3727,6 +3727,14 @@ mod tests {
             parse_sse_frame(Some("thread_changed"), r#"{"session_id":7,"revision":1}"#),
             None
         );
+        // Fields present but wrong type.
+        assert_eq!(
+            parse_sse_frame(
+                Some("thread_changed"),
+                r#"{"session_id":"s","revision":"not-a-number"}"#
+            ),
+            None
+        );
         // progress missing session_id / run_id / progress.
         assert_eq!(parse_sse_frame(Some("progress"), "{}"), None);
         assert_eq!(
@@ -3736,6 +3744,26 @@ mod tests {
         assert_eq!(
             parse_sse_frame(Some("progress"), r#"{"session_id":"s","run_id":"r"}"#),
             None
+        );
+        // progress fields present but wrong type.
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":123,"progress":{}}"#
+            ),
+            None
+        );
+        // progress is cloned verbatim (type not validated at parse time).
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":"r","progress":"not-an-object"}"#
+            ),
+            Some(StreamEvent::Progress {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                progress: json!("not-an-object"),
+            })
         );
         // progress with all fields decodes.
         assert_eq!(

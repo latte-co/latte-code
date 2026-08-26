@@ -4308,9 +4308,16 @@ mod tests {
     async fn execute_session_command_inner_run_streams_progress() {
         // A run that receives SSE progress events exercises the progress
         // closure body (lines 585-588) before reaching a terminal snapshot.
+        // The mock is stateful: the first two snapshot fetches return a
+        // Running (non-terminal) snapshot so the SSE stream is opened, and
+        // the third returns a terminal snapshot to complete the run.
         let thread_id = "01900000-0000-7000-8000-000000000001";
         let run_id = "01900000-0000-7000-8000-000000000002";
-        let snapshot = terminal_snapshot_json(thread_id, run_id);
+        let running_snapshot = format!(
+            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":"{run_id}","runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"running","run_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+        );
+        let terminal_snapshot = terminal_snapshot_json(thread_id, run_id);
+        let snapshot_queue = std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -4338,7 +4345,13 @@ mod tests {
                 );
                 (200, "text/event-stream".into(), body)
             } else if path.starts_with("/v1/sessions/") {
-                (200, "application/json".into(), snapshot.clone())
+                let mut queue = snapshot_queue.lock().unwrap();
+                let snapshot = if queue.len() > 1 {
+                    queue.remove(0)
+                } else {
+                    queue[0].clone()
+                };
+                (200, "application/json".into(), snapshot)
             } else {
                 (
                     404,

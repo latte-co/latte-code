@@ -1775,4 +1775,631 @@ mod tests {
                 .input_request
         );
     }
+
+    // -- Message / Provider trait coverage ----------------------------------
+
+    #[test]
+    fn message_content_covers_all_variants() {
+        assert_eq!(
+            Message::System {
+                content: "s".into()
+            }
+            .content(),
+            Some("s")
+        );
+        assert_eq!(
+            Message::User {
+                content: "u".into()
+            }
+            .content(),
+            Some("u")
+        );
+        assert_eq!(
+            Message::Tool {
+                tool_call_id: "t".into(),
+                name: None,
+                content: "r".into(),
+            }
+            .content(),
+            Some("r")
+        );
+        assert_eq!(
+            Message::Assistant {
+                content: Some("a".into()),
+                tool_calls: vec![],
+            }
+            .content(),
+            Some("a")
+        );
+        assert_eq!(
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![],
+            }
+            .content(),
+            None
+        );
+    }
+
+    #[test]
+    fn default_provider_capabilities_are_full() {
+        struct BareProvider;
+        impl Provider for BareProvider {
+            fn complete(
+                &self,
+                _: ProviderRequest,
+                _: ProviderContext,
+            ) -> ProviderFuture<'_> {
+                Box::pin(async {
+                    Ok(ProviderResponse {
+                        message: None,
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                })
+            }
+        }
+        let caps = BareProvider.capabilities();
+        assert!(caps.tools && caps.parallel_tool_calls && caps.input_request);
+    }
+
+    #[test]
+    fn tool_schema_default_covers_unknown_tools() {
+        let schema = tool_schema("unknown_tool");
+        assert!(schema.is_object());
+    }
+
+    // -- HTTP error paths ----------------------------------------------------
+
+    fn header_server(status: &str, body: &str, headers: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let headers = headers.to_owned();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn http_timeout_returns_timeout_error() {
+        let endpoint = server("200 OK", "{}", 500);
+        let provider =
+            OpenAiProvider::new(endpoint, "m", "k", Duration::from_millis(50)).unwrap();
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn connect_error_retries_before_transport_failure() {
+        let provider = OpenAiProvider::new("http://127.0.0.1:1", "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_controls_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            // First request: 503 with Retry-After: 0 (no wait).
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut buffer);
+            let _ = socket.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            // Second request: 200.
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut buffer);
+            let body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+            let _ = socket.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let provider = OpenAiProvider::new(format!("http://{address}"), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_max_attempts(2);
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.message.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn request_id_header_is_reported_in_http_error() {
+        let endpoint = header_server(
+            "500 Internal Server Error",
+            "{}",
+            "x-request-id: req-123\r\n",
+        );
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1)).unwrap();
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::Http { request_id, .. } => assert!(request_id.contains("req-123")),
+            other => panic!("expected Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_second_failure_is_http_error() {
+        let (endpoint, _attempts) =
+            sequence_server(vec![("400 Bad Request", ""), ("500 Internal Server Error", "{}")]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true)
+            .with_max_attempts(3);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Http {
+                status: 500,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_invalid_json_is_malformed() {
+        let (endpoint, _attempts) =
+            sequence_server(vec![("400 Bad Request", ""), ("200 OK", "not json")]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true)
+            .with_max_attempts(3);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_are_malformed() {
+        let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call-1","function":{"name":"read_file","arguments":"not json"}}]}}]}"#;
+        let provider =
+            OpenAiProvider::new(server("200 OK", body, 0), "m", "k", Duration::from_secs(1)).unwrap();
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed(_)));
+    }
+
+    // -- SSE error paths -----------------------------------------------------
+
+    #[tokio::test]
+    async fn sse_cancellation_returns_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer);
+            let _ = socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            thread::sleep(Duration::from_secs(5));
+        });
+        let provider = OpenAiProvider::new(format!("http://{address}"), "m", "k", Duration::from_secs(5))
+            .unwrap()
+            .with_streaming(true);
+        let cancellation = latte_engine::CancellationToken::new();
+        let cancellation_clone = cancellation.clone();
+        let context = ProviderContext {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+            events: None,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancellation_clone.cancel();
+        });
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn sse_line_without_colon_is_ignored() {
+        let chunks = vec![
+            b"no-colon-line\r\n\r\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n".to_vec(),
+            b"data: [DONE]\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.message.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn sse_oversized_event_is_malformed() {
+        let large = "x".repeat(MAX_SSE_EVENT_BYTES + 1);
+        let chunks = vec![format!("data: {large}\r\n\r\n").into_bytes()];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("SSE event exceeds limit")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_non_utf8_data_is_malformed() {
+        let chunks = vec![b"data: \xFF\xFE\r\n\r\n".to_vec()];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("not UTF-8")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_without_done_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("[DONE]")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_tool_call_missing_id_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\r\n\r\n".to_vec(),
+            b"data: [DONE]\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("missing id")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_tool_call_missing_name_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"arguments\":\"{}\"}}]}}]}\r\n\r\n".to_vec(),
+            b"data: [DONE]\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("missing name")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_invalid_tool_arguments_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"not json\"}}]}}]}\r\n\r\n".to_vec(),
+            b"data: [DONE]\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn sse_invalid_json_event_is_malformed() {
+        let chunks = vec![b"data: not-json\r\n\r\n".to_vec()];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("invalid SSE JSON")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_event_without_choices_is_ignored() {
+        let chunks = vec![
+            b"data: {\"usage\":{\"total_tokens\":1}}\r\n\r\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n".to_vec(),
+            b"data: [DONE]\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.message.as_deref(), Some("ok"));
+        assert_eq!(response.usage.total_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn sse_too_many_tool_calls_is_malformed() {
+        let mut chunks = Vec::new();
+        for index in 0..=MAX_SSE_TOOL_CALLS {
+            chunks.push(
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index}}}]}}]}}\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+        }
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("too many stream tool calls")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_tool_id_changed_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\"}]}}]}\r\n\r\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"b\"}]}}]}\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("tool id changed")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_tool_name_changed_is_malformed() {
+        let chunks = vec![
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"a\"}}]}}]}\r\n\r\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"b\"}}]}}]}\r\n\r\n".to_vec(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("tool name changed")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_tool_arguments_oversized_is_malformed() {
+        let large = "x".repeat(200_000);
+        let chunks = vec![
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"function\":{{\"name\":\"r\",\"arguments\":\"{large}\"}}}}]}}}}]}}\r\n\r\n"
+            )
+            .into_bytes(),
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{large}\"}}}}]}}}}]}}\r\n\r\n"
+            )
+            .into_bytes(),
+        ];
+        let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true);
+        let err = provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed(ref m) if m.contains("arguments exceed limit")),
+            "{err:?}"
+        );
+    }
 }
