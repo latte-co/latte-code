@@ -654,7 +654,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         Some(&create_body_json),
         &[("Idempotency-Key", &create_command_id)],
     );
-    assert_eq!(replay_status, 202);
+    assert_eq!(replay_status, 200);
     assert_eq!(replay_body["session_id"].as_str().unwrap(), session_id);
 
     // A keyed create that fails (invalid binding) releases its reservation, so
@@ -811,7 +811,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "again", "expected_thread_revision": revision })),
         &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
-    assert_eq!(replay_follow_status, 202);
+    assert_eq!(replay_follow_status, 200);
     assert_eq!(
         replay_follow_body["accepted_revision"].as_u64().unwrap(),
         follow_revision
@@ -2333,7 +2333,7 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000015", "prompt": "again", "expected_thread_revision": revision })),
         &[("Idempotency-Key", "01900000-0000-7000-8000-000000000015")],
     );
-    assert_eq!(f2, 202);
+    assert_eq!(f2, 200);
     assert_eq!(f2_body, f1_body, "keyed follow-up retry must replay");
 }
 
@@ -2440,10 +2440,10 @@ fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
         })),
         &[("Idempotency-Key", &follow_command_id)],
     );
-    // The replay returns the original acceptance (200 or 202) without
-    // appending a new turn.
-    assert!(
-        replay_status == 200 || replay_status == 202,
+    // The replay returns 200 (not the original 202) without appending a new
+    // turn.
+    assert_eq!(
+        replay_status, 200,
         "replay returned {replay_status}: {replay_body:?}"
     );
     assert_eq!(

@@ -33,6 +33,9 @@ use crate::workspace::{WorkspaceInstance, WorkspaceManager};
 /// stored; the durable turn continues under supervised background execution.
 #[derive(Clone)]
 struct IdempotentRecord {
+    /// The original status code; retained for debugging. Replays always return
+    /// 200 OK regardless of this value.
+    #[allow(dead_code)]
     status: StatusCode,
     body: serde_json::Value,
     payload_digest: String,
@@ -1144,12 +1147,14 @@ fn payload_mismatch_with_message(message: &str) -> HandlerError {
 
 /// Replays a completed idempotent result as its typed response. A corrupt
 /// record (fails to deserialize back to the DTO) is a server-side failure.
+/// Replays always return 200 OK (not the original 202) to distinguish a
+/// replay from a fresh acceptance.
 fn replay_idempotent_record<T: DeserializeOwned>(
     record: IdempotentRecord,
 ) -> Result<(StatusCode, Json<T>), HandlerError> {
     let body =
         serde_json::from_value(record.body).map_err(|_| failed("corrupt idempotent record"))?;
-    Ok((record.status, Json(body)))
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// Computes a stable SHA-256 hex digest of the canonical JSON serialization.
@@ -2823,7 +2828,7 @@ mod tests {
             &[("idempotency-key", "01900000-0000-7000-8000-000000000001")],
         )
         .await;
-        assert_eq!(replay_status, StatusCode::ACCEPTED);
+        assert_eq!(replay_status, StatusCode::OK);
         assert_eq!(replay_body["accepted_revision"].as_u64().unwrap(), accepted);
     }
 
@@ -4380,8 +4385,8 @@ mod tests {
     #[tokio::test]
     async fn create_session_replays_in_memory_idempotent_record() {
         // Same process, same key, identical payload: the in-memory ledger
-        // replays the stored 202 verbatim (covers the Replay arm in
-        // create_session, distinct from the durable dedup's crash-restart 200).
+        // replays the stored result as 200 (same as the durable dedup's
+        // crash-restart replay).
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
@@ -4398,7 +4403,7 @@ mod tests {
         assert_eq!(first, StatusCode::ACCEPTED);
 
         let (second, second_body) = create_call(&state, &workspace_id, body).await;
-        assert_eq!(second, StatusCode::ACCEPTED);
+        assert_eq!(second, StatusCode::OK);
         assert_eq!(
             second_body["session_id"].as_str(),
             Some(thread_id.as_str()),
