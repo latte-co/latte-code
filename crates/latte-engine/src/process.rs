@@ -1893,4 +1893,49 @@ mod tests {
             .unwrap();
         assert!(result);
     }
+    #[tokio::test]
+    async fn reissue_process_permission_rebinds_ask_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let ask = invocation(Some("echo test"), &[], "reissue-effect", &lease, None);
+
+        // First request: Ask decision, no approval → PermissionRequired.
+        let err = engine
+            .execute_process(run, &lease, 3, &ask, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        let digest = match err {
+            ProcessError::PermissionRequired { digest } => digest,
+            other => panic!("expected PermissionRequired, got {other:?}"),
+        };
+
+        // Acquire a new lease (new fencing token).
+        let renewed = engine.acquire_lease("owner", 200, 100).unwrap();
+        assert_ne!(renewed.fencing_token, lease.fencing_token);
+
+        // Reissue with the new lease → success, returns a digest.
+        let new_digest = engine
+            .reissue_process_permission(
+                "reissue-effect",
+                run,
+                &renewed,
+                201,
+                &ProcessInvocation {
+                    effect_id: "reissue-effect-2",
+                    lease_owner: &renewed.owner,
+                    lease_token: renewed.fencing_token,
+                    ..ask
+                },
+            )
+            .unwrap();
+        assert!(!new_digest.is_empty());
+    }
 }
+
+
