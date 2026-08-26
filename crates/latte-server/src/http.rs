@@ -3,16 +3,17 @@
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    body::Bytes,
+    extract::{FromRequest, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, patch, post},
 };
 use futures::stream::Stream;
-use latte_core::ThreadId;
+use latte_core::{ThreadId, ThreadProviderBindingV2, ThreadSnapshot};
 use latte_headless::thread::ThreadRuntimeError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -251,26 +252,40 @@ pub struct CreateSessionRequest {
     /// `Idempotency-Key` header; drives durable dedup.
     pub command_id: latte_core::ThreadCommandId,
     pub prompt: String,
-    pub binding: serde_json::Value,
+    pub binding: ThreadProviderBindingV2,
     #[serde(default)]
     pub focus: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionCreatedResponse {
     pub session_id: String,
     pub accepted_revision: u64,
 }
 
-#[derive(Debug, Deserialize)]
+/// Typed body of every endpoint that returns the session's current snapshot.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionResponse {
+    pub snapshot: ThreadSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FollowUpRequest {
     pub prompt: String,
     pub expected_thread_revision: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FollowUpResponse {
+    pub accepted_revision: u64,
+    /// The workspace that owns the session; clients use it to subscribe to the
+    /// correct event stream.
+    pub workspace_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SwitchModelRequest {
-    pub binding: serde_json::Value,
+    pub binding: ThreadProviderBindingV2,
     pub expected_thread_revision: u64,
 }
 
@@ -327,13 +342,57 @@ pub struct SearchQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct QueueResponse {
+    pub position: u64,
+}
+
+/// One page of sessions. `next_cursor` is an opaque server token; `null` means
+/// no further pages. The item type differs per endpoint (full snapshots for
+/// list, summaries for search) but the envelope is identical.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionListResponse<T> {
+    pub sessions: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BindingsResponse {
+    pub bindings: Vec<latte_headless::registry::BindingCatalogEntry>,
+}
+
+/// JSON extractor that maps every body error (syntax, content-type, shape) to
+/// the contract's `400 rejected` [`ErrorResponse`] instead of axum's default
+/// plain-text 422, so clients always receive the typed error envelope.
+struct ValidatedJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ValidatedJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = HandlerError;
+
+    async fn from_request(
+        request: axum::http::Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bytes = Bytes::from_request(request, state)
+            .await
+            .map_err(|_| bad_request("invalid request body"))?;
+        let value = serde_json::from_slice::<T>(&bytes)
+            .map_err(|error| bad_request(&format!("invalid request body: {error}")))?;
+        Ok(ValidatedJson(value))
+    }
+}
+
 type HandlerError = (StatusCode, Json<ErrorResponse>);
 
 // Handlers
 
 async fn create_workspace(
     State(state): State<Arc<ServerState>>,
-    Json(req): Json<CreateWorkspaceRequest>,
+    ValidatedJson(req): ValidatedJson<CreateWorkspaceRequest>,
 ) -> Result<Json<WorkspaceResponse>, HandlerError> {
     let path = PathBuf::from(&req.path);
     let workspace = state.workspaces.get_or_create(&path).await.map_err(|e| {
@@ -382,8 +441,8 @@ async fn create_session(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
+    ValidatedJson(req): ValidatedJson<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<SessionCreatedResponse>), HandlerError> {
     // The Idempotency-Key header must equal the body command_id: one identity
     // source for both the in-memory ledger and the durable dedup record.
     let raw_key = headers
@@ -401,14 +460,16 @@ async fn create_session(
         "thread_id": req.thread_id.to_string(),
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
-        "binding": &req.binding,
+        "binding": serde_json::to_value(&req.binding).unwrap_or(serde_json::Value::Null),
         "focus": req.focus,
     }));
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key, &payload_digest) {
-            IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
+            IdempotencyClaim::Replay(record) => {
+                return replay_idempotent_record(record);
+            }
             IdempotencyClaim::InFlight => return Err(in_flight()),
             IdempotencyClaim::PayloadMismatch => return Err(payload_mismatch()),
             IdempotencyClaim::Owner => {}
@@ -422,7 +483,7 @@ async fn create_session(
                 &key,
                 IdempotentRecord {
                     status,
-                    body: body.clone(),
+                    body: serde_json::to_value(&body).expect("session response serializes"),
                     payload_digest,
                 },
             );
@@ -445,17 +506,15 @@ async fn create_session_owned(
     state: &Arc<ServerState>,
     workspace_id: &str,
     req: CreateSessionRequest,
-) -> Result<(StatusCode, serde_json::Value), HandlerError> {
+) -> Result<(StatusCode, SessionCreatedResponse), HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
 
-    // Parse and validate the complete non-secret binding before acceptance.
-    let binding: latte_core::ThreadProviderBindingV2 = serde_json::from_value(req.binding)
-        .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
-    binding
+    // Validate the complete non-secret binding before acceptance.
+    req.binding
         .validate()
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
@@ -464,6 +523,7 @@ async fn create_session_owned(
     let runtime = workspace.runtime.clone();
     let prompt = req.prompt;
     let focus = req.focus.map(std::path::PathBuf::from);
+    let binding = req.binding;
 
     // Run the turn under supervised background execution, but only acknowledge
     // 202 after the runtime signals the submission is durably accepted.
@@ -506,51 +566,53 @@ async fn create_session_owned(
         revision: outcome.revision,
     });
 
-    let body = serde_json::to_value(SessionCreatedResponse {
+    let body = SessionCreatedResponse {
         session_id: thread_id.to_string(),
         accepted_revision: outcome.revision,
-    })
-    .expect("session response serializes");
+    };
     Ok((status, body))
 }
 
 async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
-    Query(_pagination): Query<PaginationQuery>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    Query(pagination): Query<PaginationQuery>,
+) -> Result<Json<SessionListResponse<ThreadSnapshot>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
 
-    let sessions = workspace
-        .list_sessions()
-        .map_err(|e| failed(&format!("cannot list sessions: {e}")))?;
-    Ok(Json(
-        serde_json::json!({ "sessions": sessions, "next_cursor": null }),
-    ))
+    let limit = pagination.limit.unwrap_or(50).min(200) as usize;
+    let page = workspace
+        .list_sessions_paged(pagination.cursor.as_deref(), limit)
+        .map_err(|e| map_catalog_error(e, "list"))?;
+    Ok(Json(SessionListResponse {
+        sessions: page.items,
+        next_cursor: page.next_cursor,
+    }))
 }
 
 async fn search_sessions(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+) -> Result<Json<SessionListResponse<latte_core::ThreadSessionSummary>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
 
-    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
-    let sessions = workspace
-        .search_sessions(&query.q, limit)
-        .map_err(|e| failed(&format!("cannot search sessions: {e}")))?;
-    Ok(Json(
-        serde_json::json!({ "sessions": sessions, "next_cursor": null }),
-    ))
+    let limit = query.limit.unwrap_or(50).min(200) as usize;
+    let page = workspace
+        .search_sessions_paged(&query.q, query.cursor.as_deref(), limit)
+        .map_err(|e| map_catalog_error(e, "search"))?;
+    Ok(Json(SessionListResponse {
+        sessions: page.items,
+        next_cursor: page.next_cursor,
+    }))
 }
 
 /// Finds sessions whose title exactly matches `q`. Unlike `search_sessions`
@@ -560,32 +622,46 @@ async fn find_sessions_by_exact_title(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+) -> Result<Json<SessionListResponse<latte_core::ThreadSessionSummary>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
         .await
         .ok_or_else(|| not_found("workspace not found"))?;
 
-    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
-    let sessions = workspace
-        .find_sessions_by_exact_title(&query.q, limit)
-        .map_err(|e| failed(&format!("cannot find sessions by exact title: {e}")))?;
-    Ok(Json(
-        serde_json::json!({ "sessions": sessions, "next_cursor": null }),
-    ))
+    let limit = query.limit.unwrap_or(50).min(200) as usize;
+    let page = workspace
+        .find_sessions_by_exact_title_paged(&query.q, query.cursor.as_deref(), limit)
+        .map_err(|e| map_catalog_error(e, "find exact-title sessions"))?;
+    Ok(Json(SessionListResponse {
+        sessions: page.items,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+/// Maps a catalog read error to its HTTP response: a malformed cursor is a
+/// client-side `400 rejected`; every other storage failure is `500 failed`.
+fn map_catalog_error(error: latte_engine::StorageError, action: &str) -> HandlerError {
+    match error {
+        latte_engine::StorageError::InvalidData(ref message)
+            if message.contains("invalid session cursor") =>
+        {
+            bad_request(message)
+        }
+        other => failed(&format!("cannot {action} sessions: {other}")),
+    }
 }
 
 async fn get_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
     let snapshot = workspace
         .snapshot(thread_id)
         .map_err(|_| not_found("session not found"))?;
-    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
+    Ok(Json(SessionResponse { snapshot }))
 }
 
 /// Continues a session with a new user turn. Like create, this awaits durable
@@ -595,8 +671,8 @@ async fn follow_up(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<FollowUpRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
+    ValidatedJson(req): ValidatedJson<FollowUpRequest>,
+) -> Result<(StatusCode, Json<FollowUpResponse>), HandlerError> {
     // Follow-up appends a durable child turn, so the Idempotency-Key header
     // is required (same fail-closed posture as create).
     let raw_key = headers
@@ -616,7 +692,9 @@ async fn follow_up(
     }));
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key, &payload_digest) {
-            IdempotencyClaim::Replay(record) => return Ok((record.status, Json(record.body))),
+            IdempotencyClaim::Replay(record) => {
+                return replay_idempotent_record(record);
+            }
             IdempotencyClaim::InFlight => return Err(in_flight()),
             IdempotencyClaim::PayloadMismatch => return Err(payload_mismatch()),
             IdempotencyClaim::Owner => {}
@@ -629,7 +707,7 @@ async fn follow_up(
                 &key,
                 IdempotentRecord {
                     status,
-                    body: body.clone(),
+                    body: serde_json::to_value(&body).expect("follow-up response serializes"),
                     payload_digest,
                 },
             );
@@ -648,7 +726,7 @@ async fn follow_up_owned(
     state: &Arc<ServerState>,
     id: &str,
     req: FollowUpRequest,
-) -> Result<(StatusCode, serde_json::Value), HandlerError> {
+) -> Result<(StatusCode, FollowUpResponse), HandlerError> {
     let thread_id = parse_thread_id(id)?;
     let workspace = lookup_workspace(state, thread_id).await?;
     let runtime = workspace.runtime.clone();
@@ -680,30 +758,27 @@ async fn follow_up_owned(
         revision: accepted.revision,
     });
 
-    let body = serde_json::json!({
-        "accepted_revision": accepted.revision,
-        "workspace_id": workspace.id,
-    });
+    let body = FollowUpResponse {
+        accepted_revision: accepted.revision,
+        workspace_id: workspace.id.clone(),
+    };
     Ok((StatusCode::ACCEPTED, body))
 }
 
 async fn switch_model(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<SwitchModelRequest>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<SwitchModelRequest>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
-    let binding: latte_core::ThreadProviderBindingV2 = serde_json::from_value(req.binding)
-        .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
-
     let workspace = lookup_workspace(&state, thread_id).await?;
     // The revision fence is validated atomically inside the engine operation;
     // no TOCTOU precheck here.
     match workspace
         .runtime
-        .switch_model(thread_id, req.expected_thread_revision, &binding)
+        .switch_model(thread_id, req.expected_thread_revision, &req.binding)
     {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
             let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
@@ -718,8 +793,8 @@ async fn switch_model(
 async fn cancel_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<CancelRequest>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<CancelRequest>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
@@ -728,7 +803,7 @@ async fn cancel_session(
         req.expected_thread_revision,
         req.expected_run_revision,
     ) {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
             // On a fence/state rejection, surface the current revision so the
             // client can re-fetch and retry.
@@ -741,16 +816,17 @@ async fn cancel_session(
 async fn queue_follow_up(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<QueueFollowUpRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), HandlerError> {
+    ValidatedJson(req): ValidatedJson<QueueFollowUpRequest>,
+) -> Result<(StatusCode, Json<QueueResponse>), HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
     match workspace.runtime.queue_follow_up(thread_id, req.prompt) {
-        Ok(position) => Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "position": position })),
-        )),
+        Ok(position) => {
+            let position =
+                u64::try_from(position).map_err(|_| failed("queue position exceeds u64"))?;
+            Ok((StatusCode::ACCEPTED, Json(QueueResponse { position })))
+        }
         Err(ThreadRuntimeError::MailboxFull) => Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse {
@@ -770,8 +846,8 @@ async fn queue_follow_up(
 async fn resolve_permission(
     State(state): State<Arc<ServerState>>,
     Path((id, request_id)): Path<(String, String)>,
-    Json(req): Json<ResolvePermissionRequest>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<ResolvePermissionRequest>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
@@ -788,7 +864,7 @@ async fn resolve_permission(
         )
         .await
     {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
             let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
@@ -801,8 +877,8 @@ async fn resolve_permission(
 async fn provide_input(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<ProvideInputRequest>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<ProvideInputRequest>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
@@ -819,7 +895,7 @@ async fn provide_input(
         )
         .await
     {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
             let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
@@ -830,7 +906,7 @@ async fn provide_input(
 async fn reconcile_effect(
     State(state): State<Arc<ServerState>>,
     Path((id, effect_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let workspace = lookup_workspace(&state, thread_id).await?;
 
@@ -838,7 +914,7 @@ async fn reconcile_effect(
         .runtime
         .reconcile_unknown_effect(thread_id, &effect_id)
     {
-        Ok(snapshot) => Ok(Json(serde_json::json!({ "snapshot": snapshot }))),
+        Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(_) => Err(not_found("session not found")),
     }
 }
@@ -847,8 +923,8 @@ async fn reconcile_effect(
 async fn rename_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<serde_json::Value>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let title = req
         .get("title")
@@ -866,15 +942,15 @@ async fn rename_session(
         session_id: thread_id.to_string(),
         revision: snapshot.revision,
     });
-    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
+    Ok(Json(SessionResponse { snapshot }))
 }
 
 /// Forks a session.
 async fn fork_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
-    Json(req): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    ValidatedJson(req): ValidatedJson<serde_json::Value>,
+) -> Result<Json<SessionResponse>, HandlerError> {
     let thread_id = parse_thread_id(&id)?;
     let title = req
         .get("title")
@@ -894,7 +970,7 @@ async fn fork_session(
         session_id: fork_id.to_string(),
         revision: snapshot.revision,
     });
-    Ok(Json(serde_json::json!({ "snapshot": snapshot })))
+    Ok(Json(SessionResponse { snapshot }))
 }
 
 // Helper functions
@@ -1031,6 +1107,16 @@ fn payload_mismatch() -> HandlerError {
     )
 }
 
+/// Replays a completed idempotent result as its typed response. A corrupt
+/// record (fails to deserialize back to the DTO) is a server-side failure.
+fn replay_idempotent_record<T: DeserializeOwned>(
+    record: IdempotentRecord,
+) -> Result<(StatusCode, Json<T>), HandlerError> {
+    let body =
+        serde_json::from_value(record.body).map_err(|_| failed("corrupt idempotent record"))?;
+    Ok((record.status, Json(body)))
+}
+
 /// Computes a stable SHA-256 hex digest of the canonical JSON serialization.
 fn canonical_digest(value: &serde_json::Value) -> String {
     use sha2::Digest;
@@ -1042,7 +1128,7 @@ fn canonical_digest(value: &serde_json::Value) -> String {
 async fn list_bindings(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+) -> Result<Json<BindingsResponse>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
@@ -1051,7 +1137,7 @@ async fn list_bindings(
     let bindings = workspace
         .bindings()
         .map_err(|e| bad_request(&format!("cannot build binding catalog: {e}")))?;
-    Ok(Json(serde_json::json!({ "bindings": bindings })))
+    Ok(Json(BindingsResponse { bindings }))
 }
 
 async fn workspace_events(
@@ -1826,7 +1912,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_requires_client_ids() {
         // The contract requires client-supplied thread_id and command_id; a
-        // body omitting them is rejected by the request extractor (422).
+        // body omitting them is rejected by the ValidatedJson extractor (400).
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
@@ -1838,7 +1924,7 @@ mod tests {
             &[("idempotency-key", "some-key")],
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1893,6 +1979,159 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(listed, "list route did not surface the durable session");
+    }
+
+    /// Creates `count` durable sessions and waits until all are listable.
+    async fn create_durable_sessions(
+        state: &Arc<ServerState>,
+        workspace_id: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            let (status, body) = create_call(
+                state,
+                workspace_id,
+                serde_json::json!({ "prompt": "hello", "binding": valid_binding() }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            ids.push(body["session_id"].as_str().unwrap().to_string());
+        }
+        for _ in 0..50 {
+            let (status, body) = call(
+                state,
+                "GET",
+                &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            if body["sessions"]
+                .as_array()
+                .is_some_and(|s| s.len() >= count)
+            {
+                return ids;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("created sessions did not become listable");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_paginates_with_cursor() {
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let created = create_durable_sessions(&state, &workspace_id, 3).await;
+
+        // First page: two sessions and a cursor.
+        let (status, page1) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions?limit=2"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions1 = page1["sessions"].as_array().unwrap();
+        assert_eq!(sessions1.len(), 2);
+        let cursor = page1["next_cursor"]
+            .as_str()
+            .expect("next_cursor must be present");
+
+        // Second page: the remaining session, no further cursor.
+        let (status, page2) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions?limit=2&cursor={cursor}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sessions2 = page2["sessions"].as_array().unwrap();
+        assert_eq!(sessions2.len(), 1);
+        assert!(page2["next_cursor"].is_null());
+
+        // The two pages partition the created set without overlap.
+        let mut listed: std::collections::HashSet<String> = sessions1
+            .iter()
+            .chain(sessions2.iter())
+            .map(|session| session["thread_id"].as_str().unwrap().to_string())
+            .collect();
+        for id in &created {
+            assert!(listed.remove(id), "session {id} missing from pages");
+        }
+        assert!(listed.is_empty(), "unexpected sessions in pages");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_limit_zero_returns_empty_page() {
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        create_durable_sessions(&state, &workspace_id, 2).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions?limit=0"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["sessions"].as_array().unwrap().is_empty());
+        assert!(body["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_rejects_invalid_cursor() {
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions?cursor=not-a-cursor"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"].as_str(), Some("rejected"));
+    }
+
+    #[tokio::test]
+    async fn search_sessions_paginates_with_cursor() {
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        // All four sessions share the "hello" title (derived from the prompt).
+        create_durable_sessions(&state, &workspace_id, 4).await;
+
+        let (status, page1) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/search?q=hello&limit=2"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page1["sessions"].as_array().unwrap().len(), 2);
+        let cursor = page1["next_cursor"].as_str().expect("cursor present");
+
+        let (status, page2) = call(
+            &state,
+            "GET",
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/search?q=hello&limit=2&cursor={cursor}"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page2["sessions"].as_array().unwrap().len(), 2);
+        assert!(page2["next_cursor"].is_null());
     }
 
     #[tokio::test]
@@ -3170,7 +3409,8 @@ mod tests {
     #[tokio::test]
     async fn switch_model_binding_validates_before_engine() {
         // switch_model with a binding missing required fields fails
-        // deserialization and returns 400.
+        // deserialization in the ValidatedJson extractor and returns 400
+        // before the engine is touched.
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
@@ -3188,7 +3428,7 @@ mod tests {
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("invalid binding")
+                .contains("invalid request body")
         );
     }
 

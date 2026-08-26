@@ -166,6 +166,60 @@ impl WorkspaceInstance {
             )
     }
 
+    /// Lists one page of this workspace's durable sessions, newest transcript
+    /// tail included. `cursor` is the opaque `next_cursor` of the previous
+    /// page; `limit == 0` returns an empty page.
+    ///
+    /// # Errors
+    /// Returns a storage error when the session catalog cannot be read or the
+    /// cursor is malformed.
+    pub fn list_sessions_paged(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSnapshot>, latte_engine::StorageError> {
+        self.engine
+            .list_threads_v2_for_workspace_paged(&self.workspace_root, cursor, limit)
+    }
+
+    /// Searches this workspace's local session catalog by title/id one page at
+    /// a time.
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched or the
+    /// cursor is malformed.
+    pub fn search_sessions_paged(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, latte_engine::StorageError>
+    {
+        self.engine
+            .search_thread_sessions_v2_paged(query, cursor, limit)
+    }
+
+    /// Finds sessions whose title exactly matches `title` one page at a time.
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched or the
+    /// cursor is malformed.
+    pub fn find_sessions_by_exact_title_paged(
+        &self,
+        title: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, latte_engine::StorageError>
+    {
+        self.engine
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                &self.workspace_root,
+                title,
+                cursor,
+                limit,
+            )
+    }
+
     /// Returns the provider binding catalog for model discovery.
     ///
     /// # Errors

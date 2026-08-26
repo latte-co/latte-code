@@ -259,6 +259,16 @@ pub struct ThreadSessionSummary {
     pub updated_at_ms: u64,
 }
 
+/// One page of a cursor-paged query. `next_cursor` is an opaque token supplied
+/// by the server; clients must not parse or construct it. A `None` cursor means
+/// no further pages exist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paged<T> {
+    pub items: Vec<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// The active request needed for explicit in-thread UI actions. Secret values
 /// are never representable here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

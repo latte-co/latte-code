@@ -1369,6 +1369,62 @@ impl EngineHandle {
         self.storage
             .find_thread_sessions_v2_by_exact_title_for_workspace(workspace_root, title, limit)
     }
+
+    /// Lists one page of thread projections belonging to one exact workspace
+    /// identity, ordered by `(updated_at_ms, rowid)` descending. `cursor` is
+    /// the opaque `next_cursor` of the previous page.
+    pub fn list_threads_v2_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<ThreadSnapshot>, StorageError> {
+        let mut page =
+            self.storage
+                .list_threads_v2_for_workspace_paged(workspace_root, cursor, limit)?;
+        if workspace_root == self.workspace_root.as_ref() {
+            for snapshot in &mut page.items {
+                if let Some(transcript) =
+                    self.conversation_page(snapshot.thread_id, None, 500, true)?
+                {
+                    snapshot.transcript = transcript;
+                }
+            }
+        }
+        Ok(page)
+    }
+
+    /// Searches the current workspace's local Session catalog one page at a
+    /// time, in the same order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    pub fn search_thread_sessions_v2_paged(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .search_thread_sessions_paged(&self.workspace_root, query, cursor, limit)
+    }
+
+    /// Finds sessions whose title exactly matches `title` one page at a time,
+    /// in the same order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    pub fn find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                workspace_root,
+                title,
+                cursor,
+                limit,
+            )
+    }
     /// Reads exact Session metadata without applying a recent-list cap.
     pub fn thread_session_v2(
         &self,

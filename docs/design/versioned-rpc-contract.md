@@ -1,6 +1,6 @@
 # 版本化 RPC 与 Event Backpressure 契约
 
-状态：**设计中**
+状态：**已实施**（Phase A/B/C 于 2026-08-26 落地）
 日期：2026-08-21
 关联：[server.md](server.md)、[server-client-integration.md](server-client-integration.md)
 
@@ -200,7 +200,8 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 
 ### 5.4 心跳
 
-- server 每 15s 发送 SSE keep-alive 注释行（`: heartbeat`），防止中间代理超时。
+- server 周期性发送 SSE keep-alive 注释行（`: heartbeat`），防止中间代理超时；
+  当前实现间隔 2s（同时保证 embedded-server 关闭时空闲流不挂起）。
 - 客户端 30s 无事件/心跳判定断线，触发重连 + resync。
 
 ### 5.5 与 server.md 的对齐
@@ -212,27 +213,22 @@ server.md §5.5 当前描述了 `id: 42` 和 `Last-Event-ID`，与实现不符�
 
 ## 6. 分页契约
 
-### 6.1 当前实现（v1 实际行为）
+### 6.1 历史行为（已被 6.2 取代）
 
-- **List**（`GET /v1/workspaces/{ws}/sessions`）：完全忽略 `PaginationQuery`（cursor 和
-  limit 都不生效），返回 workspace 全部 session，`next_cursor` 恒为 `null`。
-- **Search**（`GET /v1/workspaces/{ws}/sessions/search`）：只消费 `limit`，
-  `limit.unwrap_or(50).clamp(1, 200)`；忽略 cursor，`next_cursor` 恒为 `null`。
-- **Exact-title**（`GET /v1/workspaces/{ws}/sessions/exact-title`）：同 Search。
-- `limit=0` 会被 clamp 为 1（不是空页）。
-- cursor 参数被接受但不生效（客户端传了不报错，但不影响结果）。
+初版 server 是 single-page 的：list 忽略 `PaginationQuery` 返回全部 session；
+search/exact-title 只消费 `limit`（`limit=0` 被 clamp 为 1）；cursor 被接受但
+不生效。Phase B 已实现 cursor 分页，**§6.2 是当前正式契约**。
 
-### 6.2 目标行为（Phase B 实施）
-
-当前实现是 single-page 的。正式分页契约需要 server 侧实现 cursor 分页：
+### 6.2 正式契约（Phase B 已实施）
 
 - cursor 是不透明字符串，客户端不解析。
 - `next_cursor` 为 `null` 表示无更多页。
 - 默认 50，最大 200。超过 200 截断为 200。
 - `limit=0` 返回空页（不是错误）。
+- 非法 cursor 返回 `400 rejected`。
 
-**实施要求**：Phase B 必须先实现 server 侧 cursor 分页（list + search + exact-title），
-再把 §6.2 升格为正式契约。在实现落地前，§6.1 是 v1 的实际契约。
+实现位于 engine 的 keyset 分页（`(updated_at_ms, rowid)` 降序），list 返回
+`ThreadSnapshot` 页，search/exact-title 返回 `ThreadSessionSummary` 页。
 
 ## 7. 兼容性规则
 
@@ -264,26 +260,34 @@ v1 客户端必须：
 
 ### Phase A：文档对齐（~0.5 天）
 
-- [ ] 修正 server.md §5.5：移除 event ID/Last-Event-ID，补充 resync 契约
-- [ ] 修正 server.md §5.6：移除 `unavailable`，对齐错误类型枚举
-- [ ] 本设计文档合并到 `docs/design/`
+- [x] 修正 server.md §5.5：移除 event ID/Last-Event-ID，补充 resync 契约
+- [x] 修正 server.md §5.6：移除 `unavailable`，对齐错误类型枚举
+- [x] 本设计文档合并到 `docs/design/`
 
 ### Phase B：DTO 类型化 + 分页实现（~1.5 天）
 
-- [ ] `CreateSessionRequest.binding` / `SwitchModelRequest.binding` 改为
+- [x] `CreateSessionRequest.binding` / `SwitchModelRequest.binding` 改为
       `ThreadProviderBindingV2`（`BindingCatalogEntry.binding` 已经是该类型，无需改动）
-- [ ] 响应体从 `Json<Value>` 改为类型化 struct（§3.3 清单）
-- [ ] 实现 server 侧 cursor 分页（list + search + exact-title），使 §6.2 升格为正式契约
-- [ ] UT + E2E 覆盖
+- [x] 响应体从 `Json<Value>` 改为类型化 struct（§3.3 清单）
+- [x] 实现 server 侧 cursor 分页（list + search + exact-title），使 §6.2 升格为正式契约
+- [x] UT + E2E 覆盖
 
 ### Phase C：契约测试（~1 天）
 
-- [ ] 新增 contract test：每个端点的请求/响应 JSON schema 快照
-- [ ] 新增 contract test：错误类型枚举完整性（含 422 idempotency_mismatch）
-- [ ] 新增 contract test：SSE event type 完整性
-- [ ] CI 中运行 contract test，防止意外 breaking change
+- [x] 新增 contract test：每个端点的请求/响应 JSON schema 快照
+- [x] 新增 contract test：错误类型枚举完整性（含 422 idempotency_mismatch）
+- [x] 新增 contract test：SSE event type 完整性
+- [x] CI 中运行 contract test，防止意外 breaking change
 
 **总计：~3 个工作日。**
+
+实施备注（2026-08-26）：
+
+- 请求体错误统一走 `ValidatedJson` 提取器，映射为 `400 rejected` 类型化错误信封
+  （原先 axum 默认 422 纯文本）；422 现在只表示 `idempotency_mismatch`。
+- list 端点从"返回全部 session"变为默认 50 条/页（早期 v1 breaking，按 §9 决策执行）。
+- binding 类型化的持久化兼容性由 `typed_binding_round_trips_through_persistence`
+  契约测试守护（§9 开放问题已闭环）。
 
 ## 9. 已决策
 
@@ -291,5 +295,6 @@ v1 客户端必须：
   直接改 v1，不强制走 /v2/ 并存。但必须在 CHANGELOG 和 PR 描述中明确标注 breaking。
   第一个外部用户出现后，恢复"任何 breaking 走 v2"的正式政策。
 - **binding 类型化的迁移**：现有 session 的 binding 已持久化为 JSON。类型化后
-  反序列化是否兼容？（`ThreadProviderBindingV2` 派生了 `Deserialize`，且字段
-  未变，应该兼容，但需要测试验证。）
+  反序列化是否兼容？——**已验证**：`ThreadProviderBindingV2` 派生了 `Deserialize`
+  且字段未变，契约测试 `typed_binding_round_trips_through_persistence` 覆盖
+  发送 → 持久化 → snapshot 读回的完整 round-trip。
