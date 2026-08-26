@@ -10847,4 +10847,39 @@ mod tests {
         let presentation = permission_presentation(&thread, "effect-1", "do thing");
         assert_eq!(presentation.operation, "Repository operation");
     }
+#[test]
+fn debug_refresh_test() {
+    // This is a debug test to understand the issue
+    let fixture = TestRepo::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit_all("initial");
+    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
+    
+    println!("Initial focus: {:?}", app.focused_pane);
+    println!("Initial content mode: {:?}", app.tab().content.mode);
+    
+    app.handle_key(key(KeyCode::Char('l')));
+    println!("After l: focus = {:?}", app.focused_pane);
+    
+    app.handle_key(key(KeyCode::Char('r')));
+    println!("After r: is_refreshing = {}, is_content_loading = {}", 
+             app.is_refreshing(), app.is_content_loading());
+    
+    app.handle_key(key(KeyCode::Down));
+    println!("After Down: is_refreshing = {}, is_content_loading = {}", 
+             app.is_refreshing(), app.is_content_loading());
+}
+#[test]
+fn debug_layout_at_20x5() {
+    let model = ThreadUiModel::with_startup(test_startup());
+    let state = visual_state(&model);
+    let layout = viewport_layout(Rect::new(0, 0, 20, 5), state, &model);
+    eprintln!("state={state:?} tier={:?} idle={:?} header={} composer={} transcript={}",
+        ViewportTier::for_width(20), layout.idle_composition,
+        layout.header.height, layout.composer.height, layout.transcript.height);
+    let data_rows = layout.header.height.saturating_sub(2);
+    eprintln!("data_rows={data_rows}");
+}
+
 }
