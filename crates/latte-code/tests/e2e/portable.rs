@@ -5092,6 +5092,66 @@ fn engine_session_management_covers_switch_rename_and_fork() {
     assert!(!exact.is_empty());
 }
 
+/// Engine-level paged queries: covers the paged list/search/exact-title
+/// storage paths.
+#[test]
+fn engine_paged_queries_and_changed_files() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create two threads.
+    for i in 0..2 {
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(thread_id, run_id, binding.clone(), &format!("paged {i}"), 1)
+            .unwrap();
+    }
+
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Paged list.
+    let page = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 1)
+        .unwrap();
+    assert!(!page.items.is_empty());
+
+    // Paged search.
+    let search = engine
+        .search_thread_sessions_v2_paged("paged", None, 10)
+        .unwrap();
+    assert!(!search.items.is_empty());
+
+    // Paged exact-title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(&workspace, "paged 0", None, 10)
+        .unwrap();
+    assert!(!exact.items.is_empty());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
