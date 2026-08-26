@@ -3155,9 +3155,10 @@ mod tests {
     async fn shutdown_signal_awaits_without_a_signal() {
         // Poll the real shutdown future briefly: it installs the ctrl-c/SIGTERM
         // waiters and parks on the select without a signal, so the timeout
-        // elapses. This exercises the signal-wiring construction path.
+        // elapses. This exercises the signal-wiring construction path. Use a
+        // generous timeout (200ms) to avoid flakiness under CI load.
         let elapsed =
-            tokio::time::timeout(std::time::Duration::from_millis(50), shutdown_signal()).await;
+            tokio::time::timeout(std::time::Duration::from_millis(200), shutdown_signal()).await;
         assert!(
             elapsed.is_err(),
             "no signal was sent, so it must not resolve"
