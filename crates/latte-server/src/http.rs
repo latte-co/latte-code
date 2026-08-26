@@ -4207,6 +4207,23 @@ mod tests {
         // SAFETY: single-threaded #[test]; we set and immediately clear the var
         // within this test's own scope. No other test reads this variable.
         let key = "LATTE_RECOVERY_SWEEP_MS";
+        let saved = std::env::var(key).ok();
+
+        // Run the sequence with the var unset first (the helper observes
+        // previous=None) and then pre-set (previous=Some), so both arms of the
+        // helper's restore match are exercised.
+        unsafe { std::env::remove_var(key) };
+        run_recovery_sweep_interval_sequence(key);
+        unsafe { std::env::set_var(key, "preset") };
+        run_recovery_sweep_interval_sequence(key);
+
+        match saved {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    fn run_recovery_sweep_interval_sequence(key: &str) {
         let previous = std::env::var(key).ok();
 
         unsafe { std::env::set_var(key, "250") };
@@ -4240,5 +4257,452 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(key, value) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_as_bad_request() {
+        // The default 2MB body limit makes the Bytes extractor fail, mapping to
+        // the typed 400 envelope (covers the Bytes error arm of ValidatedJson).
+        let state = state();
+        let big = "x".repeat(3_000_000);
+        let response = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/workspaces")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::from(format!("{{\"path\":\"{big}\"}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_builder_failure_is_internal_error() {
+        // A path that canonicalizes but whose runtime build fails (`.latte`
+        // exists as a file, so the builder's create_dir_all fails) is a 500,
+        // distinct from the 400 canonicalize-failure path.
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(".latte"), b"not a directory").unwrap();
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/workspaces",
+            Some(serde_json::json!({ "path": workspace.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "failed");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace initialization failed"),
+            "unexpected message: {}",
+            body["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_replays_in_memory_idempotent_record() {
+        // Same process, same key, identical payload: the in-memory ledger
+        // replays the stored 202 verbatim (covers the Replay arm in
+        // create_session, distinct from the durable dedup's crash-restart 200).
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let body = serde_json::json!({
+            "thread_id": thread_id,
+            "command_id": command_id,
+            "prompt": "hello",
+            "binding": valid_binding(),
+        });
+
+        let (first, _) = create_call(&state, &workspace_id, body.clone()).await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+
+        let (second, second_body) = create_call(&state, &workspace_id, body).await;
+        assert_eq!(second, StatusCode::ACCEPTED);
+        assert_eq!(
+            second_body["session_id"].as_str(),
+            Some(thread_id.as_str()),
+            "in-memory replay returns the original session"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sessions_rejects_invalid_cursor() {
+        // A malformed cursor on the search endpoint maps to 400 via
+        // map_catalog_error (covers the search error arm).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/search?q=hello&cursor=not-a-cursor"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn exact_title_lookup_on_missing_workspace_is_not_found() {
+        // The exact-title endpoint fails closed with 404 for an unknown
+        // workspace (covers its workspace-not-found arm). The request also
+        // exercises call_with_headers without a body.
+        let state = state();
+        let (status, _) = call_with_headers(
+            &state,
+            "GET",
+            "/v1/workspaces/ws_missing/sessions/exact-title?q=hello",
+            None,
+            &[("idempotency-key", "unused-for-get")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn exact_title_lookup_rejects_invalid_cursor() {
+        // A malformed cursor on the exact-title endpoint maps to 400 (covers
+        // its map_catalog_error arm).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=hello&cursor=not-a-cursor"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[test]
+    fn map_catalog_error_maps_unknown_storage_errors_to_failed() {
+        // A storage error that is not an invalid-cursor InvalidData maps to a
+        // 500 failed envelope (covers the `other` arm).
+        let (status, body) = map_catalog_error(latte_engine::StorageError::EffectFenced, "list");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.error.error_type, "failed");
+        assert!(
+            body.0
+                .error
+                .message
+                .contains("cannot list sessions"),
+            "unexpected message: {}",
+            body.0.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_registered_but_undurable_is_not_found() {
+        // A session registered in the in-memory index but absent from durable
+        // storage resolves its workspace, then fails the snapshot read with 404
+        // (covers the get_session snapshot error arm).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        state
+            .workspaces
+            .register_session(ghost, ws.path.clone())
+            .await;
+
+        let (status, _) = call(&state, "GET", &format!("/v1/sessions/{ghost}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn follow_up_with_invalid_session_id_and_key_is_bad_request() {
+        // The Idempotency-Key header is present (so the key-required check
+        // passes) but the session id is not a UUID: parse_thread_id in
+        // follow_up_owned rejects it as 400.
+        let state = state();
+        let (status, body) = call_with_headers(
+            &state,
+            "POST",
+            "/v1/sessions/not-a-uuid/follow-up",
+            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
+            &[("idempotency-key", "follow-invalid-id")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn mutation_routes_reject_invalid_session_id() {
+        // Every session-scoped mutation route parses the session id before
+        // touching the runtime; a non-UUID id is a 400 on each route.
+        let state = state();
+        let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/model",
+                serde_json::json!({ "binding": valid_binding(), "expected_thread_revision": 0 }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/cancel",
+                serde_json::json!({ "expected_thread_revision": 0, "expected_run_revision": 0 }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/queue",
+                serde_json::json!({ "prompt": "x" }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/permissions/req-1",
+                serde_json::json!({ "allow": true, "expected_thread_revision": 0, "expected_run_revision": 0 }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/input",
+                serde_json::json!({ "request_id": "req-1", "value": "v", "expected_thread_revision": 0, "expected_run_revision": 0 }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/effects/effect-1/reconcile",
+                serde_json::Value::Null,
+            ),
+            (
+                "PATCH",
+                "/v1/sessions/not-a-uuid",
+                serde_json::json!({ "title": "x" }),
+            ),
+            (
+                "POST",
+                "/v1/sessions/not-a-uuid/fork",
+                serde_json::json!({ "title": "x" }),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let payload = (!body.is_null()).then_some(body);
+            let (status, _) = call(&state, method, uri, payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_on_undurable_session_fails() {
+        // A registered-but-undurable session resolves its workspace, then the
+        // engine rename fails (no such session) with a 500 (covers the rename
+        // error arm).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        state
+            .workspaces
+            .register_session(ghost, ws.path.clone())
+            .await;
+
+        let (status, _) = call(
+            &state,
+            "PATCH",
+            &format!("/v1/sessions/{ghost}"),
+            Some(serde_json::json!({ "title": "renamed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn fork_on_undurable_session_fails() {
+        // A registered-but-undurable session resolves its workspace, then the
+        // engine fork fails (no such session) with a 500 (covers the fork error
+        // arm).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
+        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        state
+            .workspaces
+            .register_session(ghost, ws.path.clone())
+            .await;
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{ghost}/fork"),
+            Some(serde_json::json!({ "title": "forked" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn session_registered_with_missing_workspace_path_is_not_found() {
+        // A session registered against a workspace path that no longer exists
+        // resolves the index entry, then get_or_create fails to canonicalize it
+        // and the handler returns 404 (covers the lookup_workspace error arm).
+        let state = state();
+        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        state
+            .workspaces
+            .register_session(
+                ghost,
+                std::path::PathBuf::from("/nonexistent/workspace/for/lookup"),
+            )
+            .await;
+
+        let (status, _) = call(&state, "GET", &format!("/v1/sessions/{ghost}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_create_error_maps_failed_to_internal_error() {
+        // CreateAcceptError::Failed maps to a 500 failed envelope (covers the
+        // Failed arm of map_create_error).
+        let (status, body) =
+            map_create_error(&latte_core::CreateAcceptError::Failed("boom".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.error.error_type, "failed");
+        assert!(
+            body.0.error.message.contains("boom"),
+            "unexpected message: {}",
+            body.0.error.message
+        );
+    }
+
+    #[test]
+    fn replay_idempotent_record_rejects_corrupt_body() {
+        // A stored record whose body cannot deserialize back to the DTO is a
+        // server-side failure (covers the corrupt-record arm).
+        let record = IdempotentRecord {
+            status: StatusCode::ACCEPTED,
+            body: serde_json::json!({ "unexpected": "shape" }),
+            payload_digest: "d".to_string(),
+        };
+        let (status, body) = replay_idempotent_record::<SessionCreatedResponse>(record).unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.error.error_type, "failed");
+    }
+
+    #[tokio::test]
+    async fn list_bindings_fails_closed_on_broken_registry() {
+        // A workspace whose registry cannot build the binding catalog fails
+        // closed with 400 rather than returning a partial catalog (covers the
+        // list_bindings error arm).
+        let state = broken_registry_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/workspaces/{workspace_id}/bindings"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_resolves_on_ctrl_c() {
+        // Sending SIGINT to self resolves the ctrl_c arm of shutdown_signal
+        // (the SIGTERM arm is covered by serve_on_returns_after_sigterm). An
+        // early handler keeps the process alive past the default disposition.
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let mut early =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let waiter = tokio::spawn(shutdown_signal());
+        // Let the waiter install its own signal handlers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        kill(Pid::from_raw(std::process::id() as i32), Signal::SIGINT).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("shutdown_signal did not resolve after SIGINT");
+        assert!(result.is_ok(), "shutdown_signal task panicked");
+
+        // Consume the signal so it does not leak to other waiters.
+        let _ = early.recv().await;
+    }
+
+    #[tokio::test]
+    async fn blocking_provider_completes_after_gate_release() {
+        // Releasing the gate lets the blocked turn finish, covering the
+        // Blocking provider's response-construction path.
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = blocking_state(gate.clone());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (_, created) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({ "prompt": "slow", "binding": valid_binding() }),
+        )
+        .await;
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+
+        // The turn is parked; release it and wait for the durable idle state.
+        gate.notify_waiters();
+        let mut completed = false;
+        for _ in 0..200 {
+            let (status, body) =
+                call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
+            if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(completed, "session did not complete after gate release");
+    }
+
+    #[test]
+    fn blocking_provider_capabilities() {
+        // The Blocking provider advertises the default capability set (covers
+        // its capabilities override).
+        use latte_headless::provider::Provider;
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let caps = Blocking(gate).capabilities();
+        assert!(caps.tools);
+        assert!(caps.parallel_tool_calls);
+        assert!(caps.input_request);
+    }
+
+    #[tokio::test]
+    async fn create_call_with_non_object_body_reaches_handler() {
+        // create_call tolerates a non-object body (it skips the client-id
+        // injection); the request then fails the ValidatedJson extractor with
+        // 400 (covers the helper's non-object branch).
+        let state = state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        let (status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!(["not", "an", "object"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

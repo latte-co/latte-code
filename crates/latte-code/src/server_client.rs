@@ -3144,9 +3144,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_client_maps_response_contract_violations() {
-        use axum::extract::Path;
-        use axum::response::IntoResponse;
-
         // Every endpoint returns 200 with a body that violates the response
         // contract, exercising each method's field-extraction error path.
         let app = axum::Router::new()
@@ -3212,7 +3209,7 @@ mod tests {
 
         // resolve_workspace_id: missing workspace_id.
         let error = handle
-            .resolve_workspace_id(Path::new("/tmp"))
+            .resolve_workspace_id(std::path::Path::new("/tmp"))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing workspace_id"), "{error}");
@@ -3245,8 +3242,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_client_maps_malformed_payloads_and_status_failures() {
-        use axum::extract::Path;
-
         // Endpoints that return 200 with syntactically invalid JSON or a
         // snapshot field that cannot deserialize.
         let app = axum::Router::new()
@@ -3362,14 +3357,15 @@ mod tests {
         let mock = mock_http_app(app).await;
         let mut client = mock.client("token");
         // First resolve hits the server; the second is cached.
-        let first = client.resolve_workspace(Path::new("/tmp")).await.unwrap();
-        let second = client.resolve_workspace(Path::new("/tmp")).await.unwrap();
+        let first = client.resolve_workspace(std::path::Path::new("/tmp")).await.unwrap();
+        let second = client.resolve_workspace(std::path::Path::new("/tmp")).await.unwrap();
         assert_eq!(first, "ws-cached");
         assert_eq!(second, "ws-cached");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // try_snapshot maps NotFound → None.
         let id = ThreadId::from_uuid(Uuid::now_v7());
-        assert!(client.try_snapshot(&id).await.unwrap().is_none());
+        let handle = client.handle();
+        assert!(handle.try_snapshot(&id).await.unwrap().is_none());
         let _ = mock;
     }
 
