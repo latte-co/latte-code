@@ -5264,6 +5264,54 @@ fn engine_paged_queries_and_changed_files() {
     assert!(!exact.items.is_empty());
 }
 
+/// Engine-level lease recovery: an expired thread lease is reclaimed by the
+/// recovery sweeper, covering the storage recovery path.
+#[test]
+fn engine_lease_recovery_reclaims_expired_thread_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lease recovery", 1)
+        .unwrap();
+
+    // Acquire a lease with a very short TTL.
+    let _lease = engine.acquire_thread_lease(thread_id, 2, 100).unwrap();
+
+    // Wait for the lease to expire.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // The lease should be expired — a new acquisition should succeed (the old
+    // lease is reclaimed by the recovery sweeper).
+    engine.recover_expired_leases().unwrap();
+
+    // After recovery, the thread should be recoverable (no active lease).
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
