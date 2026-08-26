@@ -5411,6 +5411,51 @@ fn engine_non_atomic_follow_up_queues_child() {
     );
 }
 
+/// Engine-level changed-files and workspace manifest: covers the
+/// `thread_run_changed_files` read path and workspace manifest computation.
+#[test]
+fn engine_changed_files_and_workspace_manifest() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "changed files", 1)
+        .unwrap();
+
+    // Changed files for a fresh run (covers the read path).
+    let _changed = engine.thread_run_changed_files(run_id).unwrap();
+
+    // Workspace manifest.
+    let manifest = engine.workspace_manifest().unwrap();
+    let _ = manifest;
+
+    // Tool descriptors.
+    let descriptors = engine.tool_descriptors();
+    assert!(!descriptors.is_empty(), "engine should have built-in tools");
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
