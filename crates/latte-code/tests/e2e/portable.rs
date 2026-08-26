@@ -4952,6 +4952,146 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
     assert!(unknown.unwrap().is_none());
 }
 
+/// Engine-level session management: switch binding, rename, and fork — covers
+/// storage mutation paths CLI E2E can't reach directly.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_session_management_covers_switch_rename_and_fork() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "manage me", 1)
+        .unwrap();
+
+    // Start and fail the run (retryable) so the thread becomes ready for
+    // management operations.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+    engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Switch the provider binding.
+    let switched_binding = latte_core::ThreadProviderBindingV2 {
+        model: "switched-model".into(),
+        ..binding.clone()
+    };
+    let lease = engine.acquire_thread_lease(thread_id, 5, 10_000).unwrap();
+    engine
+        .switch_thread_binding_v2(thread_id, 2, &switched_binding, &lease, 6)
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Verify the switch persisted.
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.binding.model, "switched-model");
+
+    // Rename the session.
+    engine
+        .rename_thread_session_v2(thread_id, "renamed session")
+        .unwrap();
+    let summary = engine.thread_session_v2(thread_id).unwrap().unwrap();
+    assert_eq!(summary.title, "renamed session");
+
+    // Fork the session.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+    assert_eq!(fork.thread_id, fork_id);
+
+    // Both threads appear in the list.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+
+    // Search finds the renamed session.
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "renamed session", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
