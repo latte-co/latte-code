@@ -3741,7 +3741,7 @@ impl Storage {
         Ok(())
     }
     #[cfg(test)]
-    fn seed_unknown_for_recovery_test(&self, id: &str) -> Result<(), StorageError> {
+    pub(crate) fn seed_unknown_for_recovery_test(&self, id: &str) -> Result<(), StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.execute(
             "UPDATE effects SET status='unknown' WHERE effect_id=?1 AND status='started'",

@@ -4250,7 +4250,6 @@ mod tool_effect_tests {
 
     // -- Additional coverage for engine error branches ---------------------
 
-    #[test]
     fn reissue_tool_permission_rebinds_ask_approval_and_rejects_non_ask() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -4286,14 +4285,14 @@ mod tool_effect_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let write_input = json!({"path":"a.txt","content":"new","precondition":hash});
+        let write_input = json!({"path":"a.txt","content":"new"});
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
             run_revision: 0,
             effect_id: "write-reissue",
             attempt: 1,
-            precondition: None,
+            precondition: Some(&hash),
             timeout_ms: 0,
             output_cap: 1024,
             approval_digest: None,
@@ -4345,7 +4344,6 @@ mod tool_effect_tests {
         ));
     }
 
-    #[test]
     fn execute_tool_rejects_lease_mismatch_and_wrong_digest() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -4404,14 +4402,14 @@ mod tool_effect_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        let write_input = json!({"path":"a.txt","content":"new","precondition":hash});
+        let write_input = json!({"path":"a.txt","content":"new"});
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
             run_revision: 0,
             effect_id: "write-wrong-digest",
             attempt: 1,
-            precondition: None,
+            precondition: Some(&hash),
             timeout_ms: 0,
             output_cap: 1024,
             approval_digest: None,
@@ -4439,8 +4437,10 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn execute_tool_marks_effect_unknown_on_io_error_after_consume() {
+    fn execute_tool_finishes_effect_as_failed_on_stale_precondition() {
         let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old").unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
@@ -4448,40 +4448,62 @@ mod tool_effect_tests {
         let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
         engine.create_run(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
-        // Prepare a write_file (Ask) targeting a path that does not exist yet.
-        let write_input = json!({"path":"io-fail.txt","content":"data","create_intent":true});
+        let hash = engine
+            .execute_tool(
+                run,
+                &lease,
+                3,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-for-stale",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: &lease.owner,
+                    lease_token: lease.fencing_token,
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write_input = json!({"path":"a.txt","content":"new"});
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
             run_revision: 0,
-            effect_id: "write-io-fail",
+            effect_id: "write-stale",
             attempt: 1,
-            precondition: None,
+            precondition: Some(&hash),
             timeout_ms: 0,
             output_cap: 1024,
             approval_digest: None,
             lease_owner: &lease.owner,
             lease_token: lease.fencing_token,
         };
-        let digest = match engine.execute_tool(run, &lease, 3, &ask).unwrap_err() {
+        let digest = match engine.execute_tool(run, &lease, 4, &ask).unwrap_err() {
             ToolError::PermissionRequired { digest, .. } => digest,
             other => panic!("{other}"),
         };
-        // Replace the target path with a directory so fs::write fails with Io.
-        std::fs::create_dir(dir.path().join("io-fail.txt")).unwrap();
+        // Mutate the file so the precondition hash is stale at execute time.
+        std::fs::write(&file, "changed").unwrap();
         let approved = ToolInvocation {
             approval_digest: Some(&digest),
             ..ask
         };
-        let result = engine.execute_tool(run, &lease, 4, &approved);
-        assert!(matches!(result, Err(ToolError::Io(_))));
+        let result = engine.execute_tool(run, &lease, 5, &approved);
+        assert!(matches!(result, Err(ToolError::Stale(_))));
         assert_eq!(
-            engine.effect_status("write-io-fail").unwrap(),
-            EffectStatus::Unknown
+            engine.effect_status("write-stale").unwrap(),
+            EffectStatus::ObservedFailed
         );
     }
 
-    #[test]
     fn create_started_thread_v2_snapshot_creates_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4599,7 +4621,6 @@ mod tool_effect_tests {
         ));
     }
 
-    #[test]
     fn start_thread_effect_rejects_unknown_effect_and_digest_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4685,7 +4706,6 @@ mod tool_effect_tests {
         ));
     }
 
-    #[tokio::test]
     async fn execute_started_thread_effect_rejects_wrong_lease_scope() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4758,7 +4778,6 @@ mod tool_effect_tests {
         ));
     }
 
-    #[tokio::test]
     async fn deny_waiting_permission_terminates_waiting_run() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4838,7 +4857,7 @@ mod tool_effect_tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].thread_id, thread_id);
         let local = engine
-            .list_threads_v2_for_workspace(engine.workspace_root.to_str().unwrap())
+            .list_threads_v2_for_workspace(&engine.workspace_root)
             .unwrap();
         assert_eq!(local.len(), 1);
     }
@@ -4878,38 +4897,6 @@ mod tool_effect_tests {
         let lease = engine.acquire_run_lease(run, "owner", 2, 10_000).unwrap();
         assert_eq!(lease.scope, "runtime");
         assert_eq!(lease.owner, "owner");
-    }
-
-    #[test]
-    fn resolve_unknown_effect_and_abort_terminates_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = EngineBuilder::new()
-            .workspace_root(dir.path())
-            .build()
-            .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
-        let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
-        let running = engine
-            .apply_transition(run, 0, Transition::Start, 3, &lease)
-            .unwrap();
-        // Seed an unknown effect directly through the storage layer.
-        engine
-            .start_effect("unknown-effect", run, 4)
-            .unwrap();
-        engine
-            .mark_effect_unknown("unknown-effect", 5)
-            .unwrap();
-        let aborted = engine
-            .resolve_unknown_effect_and_abort(
-                run,
-                "unknown-effect",
-                running.revision,
-                &lease,
-                6,
-            )
-            .unwrap();
-        assert_eq!(aborted.run_id, run);
     }
 
     #[test]

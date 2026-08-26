@@ -2126,6 +2126,12 @@ mod tests {
             if self.fail_binding {
                 return Err(ClientError::Usage("no binding".into()));
             }
+            if self.park_binding {
+                if let Some(signal) = self.binding_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             Ok(self.binding.clone())
         }
 
@@ -2138,6 +2144,15 @@ mod tests {
             focus: Option<&Path>,
             _binding: &Value,
         ) -> Result<u64, ClientError> {
+            if self.fail_create {
+                return Err(ClientError::Failed("create rejected".into()));
+            }
+            if self.park_create {
+                if let Some(signal) = self.create_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             self.created.lock().unwrap().push((
                 thread_id.to_string(),
                 prompt.to_string(),
@@ -2153,6 +2168,12 @@ mod tests {
             expected_revision: u64,
             prompt: &str,
         ) -> Result<(u64, String), ClientError> {
+            if self.park_follow_up {
+                if let Some(signal) = self.follow_up_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             self.followed_up.lock().unwrap().push((
                 session_id.to_string(),
                 expected_revision,
@@ -2165,6 +2186,24 @@ mod tests {
             &mut self,
             _session_id: &ThreadId,
         ) -> Result<ThreadSnapshot, ClientError> {
+            let should_fire = {
+                let mut guard = self.snapshot_gate.lock().unwrap();
+                match guard.as_mut() {
+                    Some((remaining, _)) => {
+                        *remaining = remaining.saturating_sub(1);
+                        *remaining == 0
+                    }
+                    None => false,
+                }
+            };
+            if should_fire {
+                let (_, signal) = self.snapshot_gate.lock().unwrap().take().unwrap();
+                let _ = signal.send(());
+                if self.park_snapshot {
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+            }
             self.snapshots
                 .lock()
                 .unwrap()
@@ -2203,9 +2242,15 @@ mod tests {
                 if let Some(signal) = self.observe_signal.take() {
                     let _ = signal.send(());
                 }
+                if self.park_open {
+                    std::future::pending::<()>().await;
+                }
             } else {
                 if let Some(signal) = self.reconnect_signal.take() {
                     let _ = signal.send(());
+                }
+                if self.fail_reopen {
+                    return Err(ClientError::Failed("reconnect rejected".into()));
                 }
                 if self.park_reconnect {
                     // Park forever so tests can fire cancel into a pending
@@ -3379,5 +3424,526 @@ mod tests {
         let bindings = handle.bindings_catalog(&workspace_id).await.unwrap();
         assert!(!bindings.is_empty());
         embedded.shutdown().await;
+    }
+
+    // -- SSE parsing edge cases ---------------------------------------------
+
+    #[test]
+    fn parse_sse_frame_rejects_malformed_and_missing_fields() {
+        // Invalid JSON data.
+        assert_eq!(parse_sse_frame(Some("thread_changed"), "not json"), None);
+        // thread_changed missing session_id / revision.
+        assert_eq!(parse_sse_frame(Some("thread_changed"), "{}"), None);
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"session_id":"s"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"revision":3}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"session_id":7,"revision":1}"#),
+            None
+        );
+        // progress missing session_id / run_id / progress.
+        assert_eq!(parse_sse_frame(Some("progress"), "{}"), None);
+        assert_eq!(
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s","run_id":"r"}"#),
+            None
+        );
+        // progress with all fields decodes.
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"r","text":"hi"}}"#
+            ),
+            Some(StreamEvent::Progress {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                progress: json!({"type":"assistant_delta","run_id":"r","text":"hi"}),
+            })
+        );
+        // resync_required ignores the payload shape.
+        assert_eq!(
+            parse_sse_frame(Some("resync_required"), "{}"),
+            Some(StreamEvent::ResyncRequired)
+        );
+        // Unknown / absent event types.
+        assert_eq!(parse_sse_frame(Some("unknown"), "{}"), None);
+        assert_eq!(parse_sse_frame(None, "{}"), None);
+    }
+
+    #[test]
+    fn sse_decoder_accumulates_multiline_data_and_ignores_comments() {
+        let mut decoder = SseDecoder::default();
+        // Comments and unknown fields are ignored.
+        assert_eq!(decoder.line(": keepalive"), None);
+        assert_eq!(decoder.line("id: 42"), None);
+        assert_eq!(decoder.line("event: thread_changed"), None);
+        // Multi-line data payloads are joined with newlines.
+        assert_eq!(decoder.line("data: {\"session_id\":\"s\","), None);
+        assert_eq!(decoder.line("data: \"revision\": 7}"), None);
+        assert_eq!(
+            decoder.line(""),
+            Some(StreamEvent::ThreadChanged {
+                session_id: "s".into(),
+                revision: 7,
+            })
+        );
+        // State is reset after dispatch.
+        assert_eq!(decoder.event_type, None);
+        assert_eq!(decoder.data, "");
+        assert_eq!(decoder.line(""), None);
+    }
+
+    // -- rendering edge cases ------------------------------------------------
+
+    #[test]
+    fn render_session_text_covers_non_terminal_and_message_kinds() {
+        // Non-terminal snapshot: status comes from lifecycle_name, not classify.
+        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "working on it".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 1,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains(": running (revision 1)"), "{text}");
+        assert!(text.contains("working on it"), "{text}");
+
+        // Failure entries are surfaced too.
+        let mut snap = snapshot(ThreadLifecycle::Failed, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Failure,
+            text: "boom".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 2,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains("boom"), "{text}");
+
+        // Only the latest assistant/failure entry is appended.
+        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "first".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 3,
+        });
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 1,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "second".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 4,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains("second"), "{text}");
+        assert!(!text.contains("first"), "{text}");
+
+        // No assistant/failure entry → no message appended.
+        let snap = snapshot(ThreadLifecycle::Running, vec![]);
+        let text = render_session_text(&snap);
+        assert!(!text.contains('\n'), "{text}");
+    }
+
+    // -- cancel injection into every select! arm -----------------------------
+
+    #[tokio::test]
+    async fn run_session_cancel_during_binding_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.park_binding = true;
+        server.binding_signal = Some(tx);
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert!(server.created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_create_cancels_session() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.park_create = true;
+        server.create_signal = Some(tx);
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        // The session may have been created server-side, so cancel_session
+        // best-effort cancels it.
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_propagates_create_failure() {
+        let mut server = MockServer::new();
+        server.fail_create = true;
+        let error = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ClientError::Failed("create rejected".into()));
+    }
+
+    #[tokio::test]
+    async fn resume_session_rejects_bad_session_id() {
+        let mut server = MockServer::new();
+        let error = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "not-a-uuid",
+            "continue",
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ClientError::Usage(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_resolve_returns_cancelled() {
+        let mut server = MockServer::new();
+        server.park_resolve = true;
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_snapshot_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((1, tx));
+        server.park_snapshot = true;
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_follow_up_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.park_follow_up = true;
+        server.follow_up_signal = Some(tx);
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_pre_terminal_check() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((1, tx));
+        server.park_snapshot = true;
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_open_events() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.observe_signal = Some(tx);
+        server.park_open = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_post_terminal_check() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((2, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_reconnect_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((3, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // reconnect resync snapshot + cancel_session snapshot.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_reconnect_backoff() {
+        // The mock responds instantly, so by the time the 250ms reconnect
+        // backoff starts the timed cancel is already pending — the backoff
+        // select! is cancel-aware without any parking.
+        let mut server = MockServer::new();
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // reconnect resync snapshot + cancel_session snapshot.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = tokio::time::sleep(Duration::from_millis(50));
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_post_reconnect_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((4, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // reconnect resync snapshot; the gate parks the post-reconnect resync.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_changed_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((3, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_event(StreamEvent::ThreadChanged {
+            session_id: "self".into(),
+            revision: 2,
+        });
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_propagates_reconnect_open_failure() {
+        let mut server = MockServer::new();
+        server.fail_reopen = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // The reconnect resync needs a snapshot before open_events fails.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let error = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ClientError::Failed("reconnect rejected".into()));
     }
 }
