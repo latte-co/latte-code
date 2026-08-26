@@ -6726,3 +6726,39 @@ fn engine_session_management_error_paths() {
     assert!(engine.thread_session_v2(missing).unwrap().is_none());
     assert!(engine.thread_snapshot_v2(missing, None, 10).is_err());
 }
+
+/// Engine-level run lease and transition paths: covers `acquire_run_lease`,
+/// `renew_lease`, and `apply_transition` for non-thread-linked runs.
+#[test]
+fn engine_run_lease_and_transition_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+
+    // Create a standalone run (not linked to a thread).
+    engine.create_run(run_id, 1).unwrap();
+
+    // Acquire a run lease.
+    let lease = engine
+        .acquire_run_lease(run_id, "owner-1", 2, 10_000)
+        .unwrap();
+    assert_eq!(lease.owner(), "owner-1");
+
+    // Renew the lease.
+    let renewed = engine.renew_lease(&lease, 3, 20_000).unwrap();
+    assert_eq!(renewed.owner(), "owner-1");
+
+    // Apply a transition.
+    let _ = engine
+        .apply_transition(run_id, 0, latte_core::Transition::Start, 4, &renewed)
+        .unwrap();
+
+    // Show the run.
+    let loaded = engine.show(run_id).unwrap();
+    assert_eq!(loaded.run_id, run_id);
+}
