@@ -5390,22 +5390,12 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .start_accepted(
-                        thread_id,
-                        command_id.clone(),
-                        "hello".into(),
-                        binding(),
-                        None,
-                        tx,
-                    )
+                    .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
                     .await
             })
         };
         let accepted = rx.await.unwrap().unwrap();
-        assert!(matches!(
-            accepted,
-            latte_core::CreateOutcome::Created(_)
-        ));
+        assert!(matches!(accepted, latte_core::CreateOutcome::Created(_)));
         let first = handle.await.unwrap().unwrap();
         assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
 
@@ -5413,26 +5403,16 @@ mod tests {
         // acquiring a lease or calling the provider.
         let (tx, rx) = oneshot::channel();
         let replayed = service
-            .start_accepted(
-                thread_id,
-                command_id,
-                "hello".into(),
-                binding(),
-                None,
-                tx,
-            )
+            .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
             .await
             .unwrap();
         let replayed_snapshot = match replayed {
             latte_core::CreateOutcome::Replayed(s) => s,
-            other => panic!("expected replay, got {other:?}"),
+            latte_core::CreateOutcome::Created(_) => panic!("expected replay, got Created"),
         };
         assert_eq!(replayed_snapshot.thread_id, thread_id);
         let accepted = rx.await.unwrap().unwrap();
-        assert!(matches!(
-            accepted,
-            latte_core::CreateOutcome::Replayed(_)
-        ));
+        assert!(matches!(accepted, latte_core::CreateOutcome::Replayed(_)));
     }
 
     #[tokio::test]
@@ -5741,11 +5721,7 @@ mod tests {
             .unwrap();
         let service = scripted_service(root.path(), engine, vec![]);
         let err = service
-            .switch_model(
-                ThreadId::from_uuid(Uuid::now_v7()),
-                0,
-                &binding(),
-            )
+            .switch_model(ThreadId::from_uuid(Uuid::now_v7()), 0, &binding())
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
     }
@@ -5787,11 +5763,7 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let service = scripted_service(
-            root.path(),
-            engine,
-            vec![response(Some("first"), vec![])],
-        );
+        let service = scripted_service(root.path(), engine, vec![response(Some("first"), vec![])]);
         let ready = service
             .start(
                 ThreadId::from_uuid(Uuid::now_v7()),
@@ -5822,11 +5794,7 @@ mod tests {
             .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
             .unwrap();
         let err = service
-            .cancel_durable(
-                thread_id,
-                running.revision + 1,
-                test_run_revision(&running),
-            )
+            .cancel_durable(thread_id, running.revision + 1, test_run_revision(&running))
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::InvalidState));
     }
@@ -5946,12 +5914,8 @@ mod tests {
                 })
             }
         });
-        let service = ThreadRuntimeService::new(
-            engine,
-            root.path(),
-            ThreadHistoryPolicy::default(),
-            factory,
-        );
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
         let waiting = service
             .start(
                 ThreadId::from_uuid(Uuid::now_v7()),
@@ -6009,12 +5973,8 @@ mod tests {
                 })
             }
         });
-        let service = ThreadRuntimeService::new(
-            engine,
-            root.path(),
-            ThreadHistoryPolicy::default(),
-            factory,
-        );
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
         let waiting = service
             .start(
                 ThreadId::from_uuid(Uuid::now_v7()),
@@ -6129,15 +6089,9 @@ mod tests {
             })
         };
         let accepted = rx.await.unwrap().unwrap();
-        assert!(matches!(
-            accepted,
-            latte_core::CreateOutcome::Created(_)
-        ));
+        assert!(matches!(accepted, latte_core::CreateOutcome::Created(_)));
         let finished = handle.await.unwrap().unwrap();
-        assert!(matches!(
-            finished,
-            latte_core::CreateOutcome::Created(_)
-        ));
+        assert!(matches!(finished, latte_core::CreateOutcome::Created(_)));
     }
 
     #[tokio::test]
@@ -6187,9 +6141,10 @@ mod tests {
             .await
             .unwrap();
         let events = observed.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, ThreadTransientProgress::ProviderAttempt { number: 1, .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ThreadTransientProgress::ProviderAttempt { number: 1, .. }
+        )));
     }
 
     #[test]

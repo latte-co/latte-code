@@ -4250,6 +4250,7 @@ mod tool_effect_tests {
 
     // -- Additional coverage for engine error branches ---------------------
 
+    #[test]
     fn reissue_tool_permission_rebinds_ask_approval_and_rejects_non_ask() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -4318,7 +4319,12 @@ mod tool_effect_tests {
                 },
             )
             .unwrap();
-        assert_eq!(new_digest, digest);
+        // The digest is rebound to the new invocation: it is a fresh 64-char
+        // hex digest computed from the new effect_id and lease token, so it
+        // must not equal the original approval digest.
+        assert_ne!(new_digest, digest);
+        assert_eq!(new_digest.len(), 64);
+        assert!(new_digest.chars().all(|c| c.is_ascii_hexdigit()));
         // Non-ask tools (read_file is Allow) cannot be reissued.
         assert!(matches!(
             engine.reissue_tool_permission(
@@ -4344,6 +4350,7 @@ mod tool_effect_tests {
         ));
     }
 
+    #[test]
     fn execute_tool_rejects_lease_mismatch_and_wrong_digest() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -4560,10 +4567,7 @@ mod tool_effect_tests {
                 None,
             )
             .unwrap();
-        assert!(matches!(
-            replayed,
-            latte_core::CreateOutcome::Replayed(_)
-        ));
+        assert!(matches!(replayed, latte_core::CreateOutcome::Replayed(_)));
     }
 
     #[test]
@@ -4577,7 +4581,13 @@ mod tool_effect_tests {
         let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
         let run_id = RunId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "prepare errors", 1)
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                test_thread_binding(),
+                "prepare errors",
+                1,
+            )
             .unwrap();
         let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
         let running = engine
@@ -4675,22 +4685,24 @@ mod tool_effect_tests {
             .unwrap()
             .snapshot;
         // Unknown effect → error from thread_effect_canonical_descriptor.
-        assert!(engine
-            .start_thread_effect(
-                ThreadEffectStartRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: running.revision,
-                    expected_run_revision: running.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                    source_key: "test:unknown".into(),
-                    effect_id: "effect-nonexistent".into(),
-                },
-                "digest".into(),
-                &lease,
-                4,
-            )
-            .is_err());
+        assert!(
+            engine
+                .start_thread_effect(
+                    ThreadEffectStartRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: running.revision,
+                        expected_run_revision: running.runs[0].run_revision,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: "test:unknown".into(),
+                        effect_id: "effect-nonexistent".into(),
+                    },
+                    "digest".into(),
+                    &lease,
+                    4,
+                )
+                .is_err()
+        );
         // Prepare a real effect, then start with a wrong digest.
         let desc = descriptor("read_file", json!({"path":"read.txt"}));
         let prepared = engine
@@ -4775,11 +4787,7 @@ mod tool_effect_tests {
         let runtime_lease = engine.acquire_lease("other", 4, 10_000).unwrap();
         assert!(matches!(
             engine
-                .execute_started_thread_effect(
-                    &started,
-                    &runtime_lease,
-                    &CancellationToken::new(),
-                )
+                .execute_started_thread_effect(&started, &runtime_lease, &CancellationToken::new(),)
                 .await,
             Err(ThreadEffectExecutionError::Uncertain(_))
         ));
@@ -4801,6 +4809,7 @@ mod tool_effect_tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn deny_waiting_permission_terminates_waiting_run() {
         let dir = tempfile::tempdir().unwrap();

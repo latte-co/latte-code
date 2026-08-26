@@ -380,3 +380,30 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
     assert_eq!(status.code(), Some(70));
     assert!(String::from_utf8_lossy(&output).contains("legacy import"));
 }
+
+#[cfg(unix)]
+#[test]
+fn final_tui_slash_unknown_command_with_special_char_falls_through_to_prompt() {
+    // /foo_bar is an unknown command with a valid name (underscore exercises
+    // valid_name's special-char branch). No builtin matches, so no slash
+    // popup intercepts Enter; resolve_slash returns Prompt and the text falls
+    // through to normal prompt submission.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
+    let mut pty = PtySession::spawn(scenario.command(&["tui"]));
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+
+    pty.write(b"/foo_bar\r");
+    // The TUI must not render a slash validation error for an unknown
+    // command; it falls through to prompt submission.
+    assert!(
+        !pty.wait_for_visible_text("requires an argument", Duration::from_secs(2)),
+        "unknown command should not produce a validation error: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+
+    pty.write(ESCAPE);
+    pty.write(F10);
+    let (status, _output) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+}

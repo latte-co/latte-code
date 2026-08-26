@@ -1910,7 +1910,7 @@ mod tests {
             .execute_process(run, &lease, 3, &ask, &CancellationToken::new())
             .await
             .unwrap_err();
-        let digest = match err {
+        let _digest = match err {
             ProcessError::PermissionRequired { digest } => digest,
             other => panic!("expected PermissionRequired, got {other:?}"),
         };
@@ -1937,5 +1937,3 @@ mod tests {
         assert!(!new_digest.is_empty());
     }
 }
-
-

@@ -786,7 +786,10 @@ mod tests {
 
     impl TerminalOps for StageFailureOps {
         fn enable_raw(&self) -> io::Result<()> {
-            self.operations.lock().unwrap().push(MockOperation::EnableRaw);
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::EnableRaw);
             if self.fail_raw {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -931,10 +934,7 @@ mod tests {
             panic!("raw-stage failure must be returned as I/O");
         };
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(
-            *operations.lock().unwrap(),
-            vec![MockOperation::EnableRaw]
-        );
+        assert_eq!(*operations.lock().unwrap(), vec![MockOperation::EnableRaw]);
     }
 
     #[test]

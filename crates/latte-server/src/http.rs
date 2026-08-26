@@ -4014,7 +4014,7 @@ mod tests {
         // Sending SIGTERM resolves shutdown_signal, serve_with_shutdown stops
         // gracefully, and serve_on returns Ok (covers lib.rs L33 and the
         // shutdown_signal terminate arm / closing lines).
-        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
@@ -4022,6 +4022,7 @@ mod tests {
         // default (terminating) disposition before serve_on installs its own.
         let mut early_sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        drop(guard);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = tokio::spawn(crate::serve_on(state(), listener));
@@ -4392,7 +4393,9 @@ mod tests {
         let (status, body) = call(
             &state,
             "GET",
-            &format!("/v1/workspaces/{workspace_id}/sessions/exact-title?q=hello&cursor=not-a-cursor"),
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/exact-title?q=hello&cursor=not-a-cursor"
+            ),
             None,
         )
         .await;
@@ -4408,10 +4411,7 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.error.error_type, "failed");
         assert!(
-            body.0
-                .error
-                .message
-                .contains("cannot list sessions"),
+            body.0.error.message.contains("cannot list sessions"),
             "unexpected message: {}",
             body.0.error.message
         );
@@ -4620,7 +4620,8 @@ mod tests {
             body: serde_json::json!({ "unexpected": "shape" }),
             payload_digest: "d".to_string(),
         };
-        let (status, body) = replay_idempotent_record::<SessionCreatedResponse>(record).unwrap_err();
+        let (status, body) =
+            replay_idempotent_record::<SessionCreatedResponse>(record).unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.error.error_type, "failed");
     }
@@ -4651,12 +4652,13 @@ mod tests {
         // Sending SIGINT to self resolves the ctrl_c arm of shutdown_signal
         // (the SIGTERM arm is covered by serve_on_returns_after_sigterm). An
         // early handler keeps the process alive past the default disposition.
-        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
         let mut early =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        drop(guard);
         let waiter = tokio::spawn(shutdown_signal());
         // Let the waiter install its own signal handlers.
         tokio::time::sleep(Duration::from_millis(100)).await;

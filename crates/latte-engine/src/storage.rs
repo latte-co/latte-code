@@ -10003,11 +10003,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn commit_thread_run_update_rejects_invalid_effect_fields() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let (thread_id, run_id, queued) =
-            create_linked_fixture(&store, &ids, "validation", 11);
+        let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "validation", 11);
         let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
         let running = commit_linked(
             &store,
@@ -10421,7 +10421,7 @@ mod tests {
     fn switch_thread_binding_v2_rejects_invalid_binding_and_unknown_thread() {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
-        let (thread_id, run_id, queued) =
+        let (thread_id, _run_id, queued) =
             create_linked_fixture(&store, &id_source, "binding switch", 11);
         let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
         // Invalid binding (empty provider_name) → InvalidData.
@@ -10584,13 +10584,7 @@ mod tests {
         std::fs::write(&path, "not a database").unwrap();
         // Invalid workspace root (control character) → InvalidData.
         assert!(matches!(
-            store.import_legacy_database(
-                &path,
-                "/source/path",
-                "fingerprint",
-                "bad\nroot",
-                1,
-            ),
+            store.import_legacy_database(&path, "/source/path", "fingerprint", "bad\nroot", 1,),
             Err(StorageError::InvalidData(_))
         ));
         // Invalid fingerprint (control character) → InvalidData.
@@ -10627,17 +10621,19 @@ mod tests {
             Err(StorageError::InvalidData(_))
         ));
         // No existing command → Ok(None).
-        assert!(store
-            .lookup_create_replay(
-                &command_id,
-                thread_id,
-                "/workspace",
-                "prompt",
-                &binding,
-                None,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .lookup_create_replay(
+                    &command_id,
+                    thread_id,
+                    "/workspace",
+                    "prompt",
+                    &binding,
+                    None,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -10680,13 +10676,7 @@ mod tests {
             expires_at_ms: lease.expires_at_ms,
         };
         assert!(matches!(
-            store.apply_transition(
-                run_id,
-                0,
-                Transition::Start,
-                3,
-                &stale,
-            ),
+            store.apply_transition(run_id, 0, Transition::Start, 3, &stale,),
             Err(StorageError::LeaseLost)
         ));
     }

@@ -3113,6 +3113,26 @@ fn final_binary_cli_serve_rejects_unknown_argument() {
     assert_eq!(json(&output)["error"]["code"], "usage");
 }
 
+#[test]
+fn final_binary_cli_serve_without_port_value_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "serve", "--port"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_serve_with_invalid_port_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "serve", "--port", "not-a-port"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
 /// CLI `tui` without a TTY reports a usage error.
 #[test]
 fn final_binary_cli_tui_without_tty_fails() {
@@ -3849,7 +3869,9 @@ fn handle_mock_request(mut stream: std::net::TcpStream, count: &std::sync::atomi
         return;
     }
     let method = parts[0];
-    let path = parts[1];
+    // Query strings are opaque to these mocks; strip them so pagination
+    // parameters (limit/cursor) do not break path matching.
+    let path = parts[1].split_once('?').map_or(parts[1], |(path, _)| path);
 
     // Read headers until the blank line.
     let mut content_length = 0usize;
@@ -3998,7 +4020,9 @@ fn handle_lifecycle_request(mut stream: std::net::TcpStream, snapshot_json: &str
         return;
     }
     let method = parts[0];
-    let path = parts[1];
+    // Query strings are opaque to these mocks; strip them so pagination
+    // parameters (limit/cursor) do not break path matching.
+    let path = parts[1].split_once('?').map_or(parts[1], |(path, _)| path);
 
     // Read headers until the blank line.
     let mut content_length = 0usize;
@@ -4161,6 +4185,149 @@ fn final_binary_cli_list_renders_interrupted_and_reconciliation_lifecycles() {
         text.contains("reconciliation_required"),
         "list output: {text}"
     );
+}
+
+/// CLI `list` follows `next_cursor` until every page is fetched, so sessions
+/// beyond the first page are not silently dropped.
+#[test]
+fn final_binary_cli_list_follows_pagination_cursor() {
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let session = |id: &str| {
+        format!(
+            r#"{{"thread_id":"{id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}"#
+        )
+    };
+    let page1 = format!(
+        r#"{{"sessions":[{}],"next_cursor":"page-2"}}"#,
+        session("01a0194a-0000-7000-8000-000000000001")
+    );
+    let page2 = format!(
+        r#"{{"sessions":[{}],"next_cursor":null}}"#,
+        session("01a0194a-0000-7000-8000-000000000002")
+    );
+    let (url, _handle) = start_healthy_mock_server(move |method, path| {
+        if method == "POST" && path == "/v1/workspaces" {
+            return (
+                200,
+                "application/json".into(),
+                r#"{"workspace_id":"ws-1"}"#.into(),
+            );
+        }
+        if method == "GET" && path.starts_with("/v1/workspaces/ws-1/sessions") {
+            if path.contains("cursor=page-2") {
+                return (200, "application/json".into(), page2.clone());
+            }
+            return (200, "application/json".into(), page1.clone());
+        }
+        (
+            404,
+            "application/json".into(),
+            r#"{"error":"not found"}"#.into(),
+        )
+    });
+
+    let output = Scenario::new().output(&["list", "--server", &url, "--token", "t"], |_| {});
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("01a0194a-0000-7000-8000-000000000001"),
+        "page 1 session missing: {text}"
+    );
+    assert!(
+        text.contains("01a0194a-0000-7000-8000-000000000002"),
+        "page 2 session missing (cursor not followed): {text}"
+    );
+}
+
+/// Engine-level cursor pagination: creating more threads than the page limit
+/// forces `encode_session_cursor` to emit a cursor, and following it exercises
+/// `decode_session_cursor` and the keyset WHERE clause.
+#[test]
+fn engine_paged_list_follows_cursor_across_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+    let ids = latte_core::SystemIdSource::default();
+    for index in 0..3u64 {
+        let thread_id = latte_core::ThreadId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
+        let run_id = latte_core::RunId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
+        engine
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                binding.clone(),
+                &format!("session {index}"),
+                index + 1,
+            )
+            .unwrap();
+    }
+    let workspace = dir.path().to_string_lossy().into_owned();
+
+    // Page 1: limit=1 → 1 item + cursor.
+    let page1 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 1)
+        .unwrap();
+    assert_eq!(page1.items.len(), 1);
+    assert!(page1.next_cursor.is_some(), "page 1 must carry a cursor");
+
+    // Page 2: follow the cursor → 1 item + cursor.
+    let cursor = page1.next_cursor.unwrap();
+    let page2 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, Some(&cursor), 1)
+        .unwrap();
+    assert_eq!(page2.items.len(), 1);
+    assert!(page2.next_cursor.is_some(), "page 2 must carry a cursor");
+    assert_ne!(
+        page1.items[0].thread_id, page2.items[0].thread_id,
+        "pages must not repeat sessions"
+    );
+
+    // Page 3: follow the cursor → 1 item, no cursor (exhausted).
+    let cursor = page2.next_cursor.unwrap();
+    let page3 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, Some(&cursor), 1)
+        .unwrap();
+    assert_eq!(page3.items.len(), 1);
+    assert!(page3.next_cursor.is_none(), "page 3 must be the last page");
+
+    // Search paged: query matches all 3 sessions.
+    let search = engine
+        .search_thread_sessions_v2_paged("session", None, 2)
+        .unwrap();
+    assert_eq!(search.items.len(), 2);
+    assert!(search.next_cursor.is_some());
+
+    // Exact-title paged: unique title → 1 item, no cursor.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+            &workspace,
+            "session 1",
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(exact.items.len(), 1);
+    assert!(exact.next_cursor.is_none());
 }
 
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
@@ -4531,6 +4698,121 @@ fn final_binary_cli_run_without_prompt_reports_usage() {
 }
 
 #[test]
+fn final_binary_cli_unknown_command_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "bogus"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_list_with_positional_arg_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "extra"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_show_without_session_id_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "show"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_resume_without_prompt_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &["--json", "resume", "01900000-0000-7000-8000-000000000001"],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_focus_flag_with_list_reports_usage() {
+    // --focus is only valid with `run`.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "--focus", "/tmp"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_removed_allow_flag_reports_usage() {
+    // v1 --allow/--deny flags must remain hard errors.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--allow", "true", "prompt"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_unknown_option_for_list_reports_usage() {
+    // Unknown --flag tokens are rejected for list (only run/resume treat
+    // them as prompt content).
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "--bogus"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_server_flag_without_value_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--server"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_run_with_dash_dash_treats_flags_as_prompt() {
+    // `--` makes everything after it positional, so --flag-like tokens are
+    // part of the prompt rather than rejected options. Parsing succeeds; the
+    // command then fails at server connection (not at usage parsing).
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--", "--flag-like", "text"], |_| {});
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_ne!(
+        body["error"]["code"], "usage",
+        "-- must pass parsing; flags after it are prompt content"
+    );
+}
+
+#[test]
+fn final_binary_cli_json_flag_after_subcommand_is_accepted() {
+    // --json may appear after the subcommand (not just as a global prefix);
+    // parse_session_command must still recognize it and emit a JSON envelope.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["list", "--json"], |_| {});
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert!(
+        body["data"]["sessions"].is_array(),
+        "--json after subcommand must produce a JSON envelope"
+    );
+}
+
+#[test]
 fn final_binary_cli_list_with_unhealthy_server_reports_unreachable() {
     // health_check returns non-success → connect fails with Unreachable.
     let (url, _handle) =
@@ -4563,6 +4845,72 @@ fn final_binary_cli_run_with_write_file_tool_prepares_and_waits_for_permission()
     let body = json(&output);
     assert_eq!(body["status"], "waiting");
     assert_eq!(body["data"]["session"]["lifecycle"], "waiting_permission");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_edit_file_tool_prepares_and_waits_for_permission() {
+    // edit_file is a Modify tool: it requires a precondition (sha256 of the
+    // target file) and waits for permission before executing.
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("editable.txt"), "before text\n").unwrap();
+    // sha256("before text\n") — keeps the scripted mutation bound to the
+    // exact fixture.
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "editable.txt",
+            "before": "before text",
+            "after": "after text",
+            "precondition": "28a55c8567f548f31faa8bf32a1dfbb28c6944abb01da0c79a7cf498df2c62d3"
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit the file"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-tool-secret");
+    });
+    // edit_file is a modify tool → session waits for permission.
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_eq!(body["status"], "waiting");
+    assert_eq!(body["data"]["session"]["lifecycle"], "waiting_permission");
+    provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_process_tool_completes() {
+    // /bin/pwd is an Allow-class process: it executes without a permission
+    // round-trip and completes the session.
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "argv": ["/bin/pwd"],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("pwd-1", "process", &process),
+        ProviderReply::completion("pwd complete"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "print the directory"], |command| {
+        command.env("TEST_OPENAI_KEY", "process-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
     provider.assert_consumed();
 }
 

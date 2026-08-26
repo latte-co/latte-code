@@ -10095,10 +10095,12 @@ mod tests {
             snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
             poll: ThreadProjectionPoll::Empty,
         };
-        assert!(projection
-            .exact_session("no-such-session")
-            .unwrap()
-            .is_none());
+        assert!(
+            projection
+                .exact_session("no-such-session")
+                .unwrap()
+                .is_none()
+        );
         let id = ready.thread_id.to_string();
         let found = projection.search_session_catalog(&id).unwrap();
         assert_eq!(found.len(), 1);
@@ -10184,9 +10186,15 @@ mod tests {
             },
         );
         assert!(model.pending_submission.is_none());
-        reduce(&mut model, ThreadUiInput::SubmissionCompleted { submission_id: 99 });
+        reduce(
+            &mut model,
+            ThreadUiInput::SubmissionCompleted { submission_id: 99 },
+        );
         assert!(model.pending_submission.is_none());
-        reduce(&mut model, ThreadUiInput::InputSubmissionError { submission_id: 99 });
+        reduce(
+            &mut model,
+            ThreadUiInput::InputSubmissionError { submission_id: 99 },
+        );
         assert!(model.pending_input_submission.is_none());
         reduce(
             &mut model,
@@ -10213,9 +10221,11 @@ mod tests {
 
     #[test]
     fn slash_popup_accepts_ctrl_enter_as_a_submit() {
-        let mut model = ThreadUiModel::default();
-        model.connection = ConnectionState::Connected;
-        model.composer = "/help".into();
+        let mut model = ThreadUiModel {
+            connection: ConnectionState::Connected,
+            composer: "/help".into(),
+            ..Default::default()
+        };
         let actions = reduce(&mut model, key(KeyCode::Enter, KeyModifiers::CONTROL));
         assert!(actions.is_empty());
         assert!(model.help);
@@ -10226,10 +10236,7 @@ mod tests {
         let mut model = ThreadUiModel::with_startup(test_startup());
         open_model_picker(&mut model);
         assert!(model.model_picker.is_some());
-        reduce(
-            &mut model,
-            key(KeyCode::Char('\u{1}'), KeyModifiers::NONE),
-        );
+        reduce(&mut model, key(KeyCode::Char('\u{1}'), KeyModifiers::NONE));
         assert_eq!(model.model_picker.as_ref().unwrap().query, "");
     }
 
@@ -10238,39 +10245,34 @@ mod tests {
         let mut model = ThreadUiModel::default();
         let actions = dispatch_builtin(&mut model, BuiltinCommand::Rename, "new title".into());
         assert!(actions.is_empty());
-        assert_eq!(
-            model.status,
-            "This command requires an open saved session"
-        );
+        assert_eq!(model.status, "This command requires an open saved session");
         let actions = dispatch_builtin(&mut model, BuiltinCommand::Fork, String::new());
         assert!(actions.is_empty());
-        assert_eq!(
-            model.status,
-            "This command requires an open saved session"
-        );
+        assert_eq!(model.status, "This command requires an open saved session");
     }
 
     #[test]
     fn paste_in_navigation_focus_does_not_edit_the_composer() {
-        let mut model = ThreadUiModel::default();
-        model.focus = ThreadFocus::Navigation;
+        let mut model = ThreadUiModel {
+            focus: ThreadFocus::Navigation,
+            ..Default::default()
+        };
         reduce(&mut model, ThreadUiInput::Paste("text".into()));
         assert!(model.composer.is_empty());
     }
 
     #[test]
     fn progress_buffer_caps_at_sixty_four_entries() {
-        let mut model = ThreadUiModel::default();
-        model.connection = ConnectionState::Connected;
+        let mut model = ThreadUiModel {
+            connection: ConnectionState::Connected,
+            ..Default::default()
+        };
         let ids = SystemIdSource::default();
         for _ in 0..64 {
             let run_id = RunId::from_uuid(ids.next_uuid_v7());
             record_progress(
                 &mut model,
-                ThreadTransientProgress::ProviderAttempt {
-                    run_id,
-                    number: 1,
-                },
+                ThreadTransientProgress::ProviderAttempt { run_id, number: 1 },
             );
         }
         assert_eq!(model.progress.len(), 64);
@@ -10284,10 +10286,7 @@ mod tests {
         );
         record_progress(
             &mut model,
-            ThreadTransientProgress::ProviderAttempt {
-                run_id,
-                number: 2,
-            },
+            ThreadTransientProgress::ProviderAttempt { run_id, number: 2 },
         );
         record_progress(
             &mut model,
@@ -10335,7 +10334,7 @@ mod tests {
 
     #[test]
     fn stranded_follow_up_is_restored_after_snapshot() {
-        let ids = SystemIdSource::default();
+        let _ids = SystemIdSource::default();
         let mut thread = snapshot(ThreadLifecycle::Running);
         thread.active_run_id = None;
         let mut model = ThreadUiModel {
@@ -10353,25 +10352,23 @@ mod tests {
         reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
         assert!(model.pending_submission.is_none());
         assert_eq!(model.composer, "queued prompt");
-        assert!(
-            model
-                .status
-                .contains("Queued follow-up was not submitted")
-        );
+        assert!(model.status.contains("Queued follow-up was not submitted"));
     }
 
     #[test]
     fn snapshot_with_pending_input_submission_skips_input_target_sync() {
         let ids = SystemIdSource::default();
-        let mut model = ThreadUiModel::default();
-        model.pending_input_submission = Some(PendingInputSubmission {
-            submission_id: 1,
-            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
-            run_id: RunId::from_uuid(ids.next_uuid_v7()),
-            request_id: "request-1".into(),
-            value: "answer".into(),
-            after_sequence: 0,
-        });
+        let mut model = ThreadUiModel {
+            pending_input_submission: Some(PendingInputSubmission {
+                submission_id: 1,
+                thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+                run_id: RunId::from_uuid(ids.next_uuid_v7()),
+                request_id: "request-1".into(),
+                value: "answer".into(),
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
         reduce(&mut model, ThreadUiInput::Snapshot(vec![]));
         assert!(model.pending_input_submission.is_some());
     }
@@ -10472,13 +10469,15 @@ mod tests {
         let _ = rendered_buffer(&ThreadUiModel::default(), 0, 0);
 
         // Active state without a selected thread renders a one-row header.
-        let mut active_no_thread = ThreadUiModel::default();
-        active_no_thread.pending_submission = Some(PendingSubmission {
-            submission_id: 1,
-            prompt: "prompt".into(),
-            thread_id: None,
-            after_sequence: 0,
-        });
+        let active_no_thread = ThreadUiModel {
+            pending_submission: Some(PendingSubmission {
+                submission_id: 1,
+                prompt: "prompt".into(),
+                thread_id: None,
+                after_sequence: 0,
+            }),
+            ..Default::default()
+        };
         let _ = rendered_buffer(&active_no_thread, 20, 3);
 
         // Idle constrained header with an unconfigured provider.
@@ -10612,9 +10611,7 @@ mod tests {
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::SearchSessions {
-                query: "q".into(),
-            }],
+            vec![ThreadUiAction::SearchSessions { query: "q".into() }],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
 
@@ -10800,10 +10797,12 @@ mod tests {
         let ids = SystemIdSource::default();
         let mut model = working_model();
         let other_run = RunId::from_uuid(ids.next_uuid_v7());
-        model.progress.push(ThreadTransientProgress::AssistantDelta {
-            run_id: other_run,
-            text: "unrelated".into(),
-        });
+        model
+            .progress
+            .push(ThreadTransientProgress::AssistantDelta {
+                run_id: other_run,
+                text: "unrelated".into(),
+            });
         // Rendering must not panic and the unrelated progress is skipped.
         let _ = rendered_buffer(&model, 100, 30);
     }

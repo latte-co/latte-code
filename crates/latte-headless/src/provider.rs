@@ -1825,11 +1825,7 @@ mod tests {
     fn default_provider_capabilities_are_full() {
         struct BareProvider;
         impl Provider for BareProvider {
-            fn complete(
-                &self,
-                _: ProviderRequest,
-                _: ProviderContext,
-            ) -> ProviderFuture<'_> {
+            fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
                 Box::pin(async {
                     Ok(ProviderResponse {
                         message: None,
@@ -1876,8 +1872,7 @@ mod tests {
     #[tokio::test]
     async fn http_timeout_returns_timeout_error() {
         let endpoint = server("200 OK", "{}", 500);
-        let provider =
-            OpenAiProvider::new(endpoint, "m", "k", Duration::from_millis(50)).unwrap();
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_millis(50)).unwrap();
         let err = provider
             .complete(
                 ProviderRequest {
@@ -1933,9 +1928,14 @@ mod tests {
                 .as_bytes(),
             );
         });
-        let provider = OpenAiProvider::new(format!("http://{address}"), "m", "k", Duration::from_secs(1))
-            .unwrap()
-            .with_max_attempts(2);
+        let provider = OpenAiProvider::new(
+            format!("http://{address}"),
+            "m",
+            "k",
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_max_attempts(2);
         let response = provider
             .complete(
                 ProviderRequest {
@@ -1975,8 +1975,10 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_fallback_second_failure_is_http_error() {
-        let (endpoint, _attempts) =
-            sequence_server(vec![("400 Bad Request", ""), ("500 Internal Server Error", "{}")]);
+        let (endpoint, _attempts) = sequence_server(vec![
+            ("400 Bad Request", ""),
+            ("500 Internal Server Error", "{}"),
+        ]);
         let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
             .unwrap()
             .with_streaming(true)
@@ -1991,13 +1993,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            ProviderError::Http {
-                status: 500,
-                ..
-            }
-        ));
+        assert!(matches!(err, ProviderError::Http { status: 500, .. }));
     }
 
     #[tokio::test]
@@ -2025,7 +2021,8 @@ mod tests {
     async fn invalid_tool_arguments_are_malformed() {
         let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call-1","function":{"name":"read_file","arguments":"not json"}}]}}]}"#;
         let provider =
-            OpenAiProvider::new(server("200 OK", body, 0), "m", "k", Duration::from_secs(1)).unwrap();
+            OpenAiProvider::new(server("200 OK", body, 0), "m", "k", Duration::from_secs(1))
+                .unwrap();
         let err = provider
             .complete(
                 ProviderRequest {
@@ -2054,9 +2051,14 @@ mod tests {
             );
             thread::sleep(Duration::from_secs(5));
         });
-        let provider = OpenAiProvider::new(format!("http://{address}"), "m", "k", Duration::from_secs(5))
-            .unwrap()
-            .with_streaming(true);
+        let provider = OpenAiProvider::new(
+            format!("http://{address}"),
+            "m",
+            "k",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_streaming(true);
         let cancellation = latte_engine::CancellationToken::new();
         let cancellation_clone = cancellation.clone();
         let context = ProviderContext {
@@ -2151,9 +2153,8 @@ mod tests {
 
     #[tokio::test]
     async fn sse_stream_without_done_is_malformed() {
-        let chunks = vec![
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n".to_vec(),
-        ];
+        let chunks =
+            vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\r\n\r\n".to_vec()];
         let provider = OpenAiProvider::new(sse_server(chunks), "m", "k", Duration::from_secs(1))
             .unwrap()
             .with_streaming(true);

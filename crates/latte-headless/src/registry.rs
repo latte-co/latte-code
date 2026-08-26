@@ -1498,7 +1498,7 @@ mod tests {
         let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"unknown_alias","arguments":"{}"}}]}}]}"#;
         let (endpoint, _rx) = capturing_server(body);
         let registry = ProviderRegistry::parse_jsonc(&format!(
-            r#"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'{endpoint}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}"#
+            "{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'{endpoint}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}"
         ))
         .unwrap();
         let resolved = registry

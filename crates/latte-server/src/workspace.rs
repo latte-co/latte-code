@@ -964,17 +964,19 @@ mod tests {
         let workspace = manager.get_or_create(dir.path()).await.unwrap();
 
         // No sessions yet: exact-title lookup is empty, not an error.
-        assert!(workspace
-            .find_sessions_by_exact_title("anything", 50)
-            .unwrap()
-            .is_empty());
+        assert!(
+            workspace
+                .find_sessions_by_exact_title("anything", 50)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn progress_sink_forwards_provider_events_to_workspace_channel() {
         use latte_headless::provider::{
-            FinishReason, Provider, ProviderContext, ProviderEvent, ProviderFuture, ProviderRequest,
-            ProviderResponse, ProviderUsage,
+            FinishReason, Provider, ProviderContext, ProviderEvent, ProviderFuture,
+            ProviderRequest, ProviderResponse, ProviderUsage,
         };
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 

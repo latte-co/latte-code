@@ -112,8 +112,7 @@ mod tests {
 
     #[test]
     fn permission_policy_decide_covers_deny_allow_and_ask() {
-        let policy =
-            PermissionPolicy::new(&["**/secret/**".to_string()], 1).expect("valid glob");
+        let policy = PermissionPolicy::new(&["**/secret/**".to_string()], 1).expect("valid glob");
         assert_eq!(
             policy.decide(EffectClass::Read, "workspace/secret/file.txt"),
             PolicyDecision::Deny

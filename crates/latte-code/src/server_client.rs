@@ -1051,17 +1051,62 @@ impl ServerHandle {
             .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))
     }
 
-    /// Lists all durable sessions in the workspace.
+    /// Maximum number of cursor pages a single list call will fetch. The
+    /// server caps each page at 200 sessions, so this bounds one call to
+    /// 12,800 sessions and guards against a cursor chain that never
+    /// terminates.
+    const MAX_SESSION_PAGES: usize = 64;
+
+    /// Fetches every page of a cursor-paged `sessions` endpoint, following
+    /// `next_cursor` until the server reports no more pages. `base_path` must
+    /// not already carry a `cursor` parameter. `what` labels the item kind in
+    /// deserialization errors.
+    async fn fetch_all_sessions<T: serde::de::DeserializeOwned>(
+        &self,
+        base_path: &str,
+        what: &str,
+    ) -> Result<Vec<T>, ClientError> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..Self::MAX_SESSION_PAGES {
+            let path = match &cursor {
+                None => base_path.to_owned(),
+                Some(cursor) => {
+                    let separator = if base_path.contains('?') { '&' } else { '?' };
+                    format!(
+                        "{base_path}{separator}cursor={}",
+                        urlencoding::encode(cursor)
+                    )
+                }
+            };
+            let value = self.get(&path).await?;
+            let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+            all.extend(
+                serde_json::from_value::<Vec<T>>(sessions)
+                    .map_err(|error| ClientError::Failed(format!("invalid {what}: {error}")))?,
+            );
+            match value.get("next_cursor").and_then(Value::as_str) {
+                None => return Ok(all),
+                Some(next) => cursor = Some(next.to_owned()),
+            }
+        }
+        Err(ClientError::Failed(format!(
+            "session listing exceeded {} pages",
+            Self::MAX_SESSION_PAGES
+        )))
+    }
+
+    /// Lists all durable sessions in the workspace, following cursor
+    /// pagination until every page has been fetched.
     pub async fn list_sessions(
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ThreadSnapshot>, ClientError> {
-        let value = self
-            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+        self.fetch_all_sessions(
+            &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
+            "sessions list",
+        )
+        .await
     }
 
     /// Fetches the authoritative snapshot for one session.
@@ -1282,41 +1327,39 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Searches sessions by title or ID fragment.
+    /// Searches sessions by title or ID fragment, following cursor pagination
+    /// until every page has been fetched.
     pub async fn search_sessions(
         &self,
         workspace_id: &str,
         query: &str,
     ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-        let value = self
-            .get(&format!(
-                "/v1/workspaces/{workspace_id}/sessions/search?q={}",
+        self.fetch_all_sessions(
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/search?q={}&limit=200",
                 urlencoding::encode(query)
-            ))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid search results: {error}")))
+            ),
+            "search results",
+        )
+        .await
     }
 
-    /// Finds sessions whose title exactly matches `title`. Unlike
-    /// [`search_sessions`](Self::search_sessions) (substring match capped at
-    /// the server's page size), this uses the server's exact-title index so
-    /// older matches are not truncated by pagination.
+    /// Finds sessions whose title exactly matches `title`, following cursor
+    /// pagination until every page has been fetched. Uses the server's
+    /// exact-title index.
     pub async fn find_sessions_by_exact_title(
         &self,
         workspace_id: &str,
         title: &str,
     ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-        let value = self
-            .get(&format!(
-                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}",
+        self.fetch_all_sessions(
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}&limit=200",
                 urlencoding::encode(title)
-            ))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid exact-title results: {error}")))
+            ),
+            "exact-title results",
+        )
+        .await
     }
 
     /// Returns the full binding catalog for the workspace.
@@ -1543,12 +1586,14 @@ impl SessionServer for ServerClient {
         &mut self,
         workspace_id: &str,
     ) -> Result<Vec<ThreadSnapshot>, ClientError> {
-        let value = self
-            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+        // Follow cursor pagination so sessions beyond the first page are not
+        // silently dropped (regression guard: clients must honor next_cursor).
+        self.handle
+            .fetch_all_sessions(
+                &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
+                "sessions list",
+            )
+            .await
     }
 
     async fn cancel(
@@ -3111,6 +3156,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_sessions_follows_next_cursor_until_exhausted() {
+        // The mock returns three pages; the client must follow next_cursor
+        // and return every session instead of silently dropping later pages.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let summary = |id: &str| {
+            json!({
+                "thread_id": id,
+                "title": format!("session {id}"),
+                "workspace_root": "/tmp/ws",
+                "lifecycle": "ready",
+                "provider_name": "main",
+                "model": "mock",
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+            })
+        };
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/sessions/search",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let requests = server_requests.clone();
+                    async move {
+                        let page = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let (sessions, next_cursor) = match page {
+                            1 => (
+                                vec![summary("01900000-0000-7000-8000-000000000100")],
+                                Some("cursor-2".to_owned()),
+                            ),
+                            2 => {
+                                assert_eq!(
+                                    query.get("cursor").map(String::as_str),
+                                    Some("cursor-2"),
+                                    "page 2 must carry the page-1 cursor"
+                                );
+                                (
+                                    vec![summary("01900000-0000-7000-8000-000000000200")],
+                                    Some("cursor-3".to_owned()),
+                                )
+                            }
+                            _ => {
+                                assert_eq!(
+                                    query.get("cursor").map(String::as_str),
+                                    Some("cursor-3"),
+                                    "page 3 must carry the page-2 cursor"
+                                );
+                                (vec![summary("01900000-0000-7000-8000-000000000300")], None)
+                            }
+                        };
+                        axum::Json(json!({ "sessions": sessions, "next_cursor": next_cursor }))
+                    }
+                },
+            ),
+        );
+        let mock = mock_http_app(app).await;
+        let results = mock
+            .client("token")
+            .handle()
+            .search_sessions("ws-1", "session")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3, "all three pages must be fetched");
+        assert_eq!(
+            results[0].thread_id.to_string(),
+            "01900000-0000-7000-8000-000000000100"
+        );
+        assert_eq!(
+            results[2].thread_id.to_string(),
+            "01900000-0000-7000-8000-000000000300"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "client must stop once next_cursor is null"
+        );
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn search_sessions_caps_cursor_chain_length() {
+        // A server that always returns a cursor must not loop forever: the
+        // client aborts after MAX_SESSION_PAGES requests.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/sessions/search",
+            axum::routing::get(move || {
+                let requests = server_requests.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({ "sessions": [], "next_cursor": "forever" }))
+                }
+            }),
+        );
+        let mock = mock_http_app(app).await;
+        let error = mock
+            .client("token")
+            .handle()
+            .search_sessions("ws-1", "loop")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            ServerHandle::MAX_SESSION_PAGES
+        );
+        let _ = mock;
+    }
+
+    #[tokio::test]
     async fn http_client_reports_unreachable() {
         // Nothing listens on this port.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3215,18 +3375,30 @@ mod tests {
             .resolve_workspace_id(std::path::Path::new("/tmp"))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("missing workspace_id"), "{error}");
+        assert!(
+            error.to_string().contains("missing workspace_id"),
+            "{error}"
+        );
         // list_sessions: malformed sessions array.
         let error = handle.list_sessions("ws").await.unwrap_err();
-        assert!(error.to_string().contains("invalid sessions list"), "{error}");
+        assert!(
+            error.to_string().contains("invalid sessions list"),
+            "{error}"
+        );
         // bindings_catalog: missing bindings.
         let error = handle.bindings_catalog("ws").await.unwrap_err();
         assert!(error.to_string().contains("missing bindings"), "{error}");
         // search_sessions: malformed results.
         let error = handle.search_sessions("ws", "q").await.unwrap_err();
-        assert!(error.to_string().contains("invalid search results"), "{error}");
+        assert!(
+            error.to_string().contains("invalid search results"),
+            "{error}"
+        );
         // find_sessions_by_exact_title: malformed results.
-        let error = handle.find_sessions_by_exact_title("ws", "q").await.unwrap_err();
+        let error = handle
+            .find_sessions_by_exact_title("ws", "q")
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("invalid exact-title results"),
             "{error}"
@@ -3251,10 +3423,7 @@ mod tests {
             .route(
                 "/v1/workspaces/{ws}/sessions",
                 axum::routing::get(|| async {
-                    (
-                        axum::http::StatusCode::OK,
-                        "this is not json".to_string(),
-                    )
+                    (axum::http::StatusCode::OK, "this is not json".to_string())
                 }),
             )
             .route(
@@ -3296,7 +3465,10 @@ mod tests {
 
         // Invalid JSON body → Failed("invalid JSON from server").
         let error = handle.list_sessions("ws").await.unwrap_err();
-        assert!(error.to_string().contains("invalid JSON from server"), "{error}");
+        assert!(
+            error.to_string().contains("invalid JSON from server"),
+            "{error}"
+        );
         // Snapshot field that cannot deserialize → Failed("invalid snapshot").
         let error = handle.snapshot(&id).await.unwrap_err();
         assert!(error.to_string().contains("invalid snapshot"), "{error}");
@@ -3360,8 +3532,14 @@ mod tests {
         let mock = mock_http_app(app).await;
         let mut client = mock.client("token");
         // First resolve hits the server; the second is cached.
-        let first = client.resolve_workspace(std::path::Path::new("/tmp")).await.unwrap();
-        let second = client.resolve_workspace(std::path::Path::new("/tmp")).await.unwrap();
+        let first = client
+            .resolve_workspace(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
+        let second = client
+            .resolve_workspace(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
         assert_eq!(first, "ws-cached");
         assert_eq!(second, "ws-cached");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -3377,7 +3555,10 @@ mod tests {
         let client = ServerClient::new("http://127.0.0.1:1".into(), "token".into());
         let mut client = client;
         let error = client.next_event().await.unwrap_err();
-        assert!(error.to_string().contains("event stream not open"), "{error}");
+        assert!(
+            error.to_string().contains("event stream not open"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

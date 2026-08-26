@@ -2716,7 +2716,11 @@ mod tests {
                 let request_line = request.lines().next().unwrap_or("");
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().unwrap_or("GET");
-                let path = parts.next().unwrap_or("/");
+                let raw_path = parts.next().unwrap_or("/");
+                // Query strings are opaque to these mock handlers; strip them
+                // so pagination parameters (limit/cursor) do not break exact
+                // path matches.
+                let path = raw_path.split_once('?').map_or(raw_path, |(path, _)| path);
                 let (status, content_type, body) = handler(method, path);
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4082,7 +4086,10 @@ mod tests {
         drop(event_rx);
 
         let result = tokio::time::timeout(Duration::from_secs(15), bridge).await;
-        assert!(result.is_ok(), "bridge should exit after reconnect resync fails");
+        assert!(
+            result.is_ok(),
+            "bridge should exit after reconnect resync fails"
+        );
         server.abort();
     }
 
@@ -4215,9 +4222,10 @@ mod tests {
                 let path = request_line.split_whitespace().nth(1).unwrap_or("/");
                 if path.starts_with(park_path_prefix) {
                     // Park forever; the client's cancel will fire first.
-                    std::thread::sleep(Duration::from_secs(60));
+                    std::thread::sleep(Duration::from_mins(1));
                     continue;
                 }
+
                 let body = r#"{"workspace_id":"ws-test"}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4317,7 +4325,8 @@ mod tests {
             r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":"{run_id}","runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"running","run_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
         );
         let terminal_snapshot = terminal_snapshot_json(thread_id, run_id);
-        let snapshot_queue = std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
+        let snapshot_queue =
+            std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -4413,5 +4422,4 @@ mod tests {
             },
         );
     }
-
 }
