@@ -5312,6 +5312,105 @@ fn engine_lease_recovery_reclaims_expired_thread_lease() {
     assert_eq!(snapshot.thread_id, thread_id);
 }
 
+/// Engine-level non-atomic follow-up: covers the legacy `create_thread_follow_up_v2`
+/// path that queues a follow-up without acquiring a lease.
+#[test]
+fn engine_non_atomic_follow_up_queues_child() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and complete its first run.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "non-atomic", 1)
+        .unwrap();
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+    engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Non-atomic follow-up (no lease): queues a child in Queued state.
+    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let snapshot = engine
+        .create_thread_follow_up_v2(thread_id, follow_run_id, 2, "queued follow-up", 5)
+        .unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+    // The follow-up child should appear in the snapshot.
+    assert!(
+        snapshot.runs.iter().any(|run| run.run_id == follow_run_id),
+        "follow-up child must appear in snapshot: {:?}",
+        snapshot.runs
+    );
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
