@@ -918,4 +918,192 @@ mod tests {
             .expect("sweeper task did not join after shutdown")
             .expect("sweeper task panicked");
     }
+
+    /// Builds a manager whose per-workspace runtimes use the given provider
+    /// factory (each workspace still gets its own engine under a temp dir).
+    fn manager_with_factory(
+        factory: latte_headless::thread::ThreadProviderFactory,
+    ) -> WorkspaceManager {
+        let builder: WorkspaceRuntimeBuilder = Arc::new(move |root: &Path| {
+            let db = root.join(".latte/state.db");
+            std::fs::create_dir_all(db.parent().unwrap()).map_err(|error| error.to_string())?;
+            let engine = latte_engine::EngineBuilder::new()
+                .workspace_root(root)
+                .database_path(&db)
+                .conversation_root(root.join(".latte/sessions"))
+                .build()
+                .map_err(|error| error.to_string())?;
+            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                engine.clone(),
+                root,
+                Default::default(),
+                factory.clone(),
+            );
+            let registry = std::sync::Arc::new(
+                latte_headless::registry::ProviderRegistry::parse_jsonc(
+                    r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            Ok(BuiltWorkspace {
+                engine,
+                runtime,
+                registry,
+            })
+        });
+        let locator: SessionLocator = Arc::new(|_| None);
+        WorkspaceManager::new(builder, locator)
+    }
+
+    #[tokio::test]
+    async fn find_sessions_by_exact_title_reads_durable_catalog() {
+        // The exact-title index must be readable through the workspace wrapper
+        // (covers the thin engine delegation).
+        let manager = manager();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = manager.get_or_create(dir.path()).await.unwrap();
+
+        // No sessions yet: exact-title lookup is empty, not an error.
+        assert!(workspace
+            .find_sessions_by_exact_title("anything", 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn progress_sink_forwards_provider_events_to_workspace_channel() {
+        use latte_headless::provider::{
+            FinishReason, Provider, ProviderContext, ProviderEvent, ProviderFuture, ProviderRequest,
+            ProviderResponse, ProviderUsage,
+        };
+        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+
+        // A provider that emits progress events through the context sink before
+        // returning a one-step completion, so the workspace progress closure is
+        // exercised end to end.
+        struct ProgressProvider;
+        impl Provider for ProgressProvider {
+            fn complete(&self, _: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
+                Box::pin(async move {
+                    if let Some(sink) = &context.events {
+                        sink.observe(ProviderEvent::Attempt { number: 1 });
+                        sink.observe(ProviderEvent::AssistantDelta {
+                            text: "hello".into(),
+                        });
+                    }
+                    Ok(ProviderResponse {
+                        message: Some("done".into()),
+                        tool_calls: Vec::new(),
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: Some(FinishReason::Stop),
+                        provider_state: None,
+                    })
+                })
+            }
+        }
+
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+                Ok(ResolvedProvider {
+                    provider: std::sync::Arc::new(ProgressProvider),
+                    binding: ProviderBinding {
+                        version: binding.version,
+                        provider_name: binding.provider_name.clone(),
+                        provider_type: binding.provider_type.clone(),
+                        protocol: binding.protocol.clone(),
+                        model: binding.model.clone(),
+                        config_fingerprint: binding.config_fingerprint.clone(),
+                        tools_fingerprint: binding.tools_fingerprint.clone(),
+                        aliases: binding.aliases.clone(),
+                    },
+                })
+            });
+        let manager = manager_with_factory(factory);
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = manager.get_or_create(dir.path()).await.unwrap();
+
+        // Subscribe before starting the turn so the progress events are not
+        // missed (broadcast channels only deliver to existing receivers).
+        let mut events = workspace.event_tx.subscribe();
+
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let binding = latte_core::ThreadProviderBindingV2 {
+            version: 1,
+            provider_name: "test".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "test".into(),
+            config_fingerprint: "config".into(),
+            tools_fingerprint: "tools".into(),
+            aliases: std::collections::BTreeMap::new(),
+            credential_ref_id: "env:TEST".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let snapshot = workspace
+            .runtime
+            .start(thread_id, "hello".into(), binding, None)
+            .await
+            .expect("start completes with the progress provider");
+        assert_eq!(snapshot.thread_id, thread_id);
+
+        // The workspace progress closure must have forwarded both event kinds
+        // as ServerEvent::Progress frames.
+        let mut saw_attempt = false;
+        let mut saw_delta = false;
+        for _ in 0..50 {
+            while let Ok(event) = events.try_recv() {
+                if let ServerEvent::Progress { progress, .. } = event {
+                    if progress["type"] == "provider_attempt" {
+                        saw_attempt = true;
+                    }
+                    if progress["type"] == "assistant_delta" {
+                        saw_delta = true;
+                    }
+                }
+            }
+            if saw_attempt && saw_delta {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_attempt, "progress sink did not forward ProviderAttempt");
+        assert!(saw_delta, "progress sink did not forward AssistantDelta");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_or_create_double_checks_after_write_lock() {
+        // The double-check after acquiring the write lock only runs when a
+        // creator's read-check missed but another creator inserted before the
+        // write lock was granted. Holding a read lock parks both creators on
+        // the write lock; releasing it lets the first build and insert, so the
+        // second hits the double-check and returns the same instance.
+        let manager = Arc::new(manager());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Hold the read lock: both creators can read concurrently (miss the
+        // lookup) but neither can acquire the write lock.
+        let instances = manager.instances.read().await;
+
+        let manager_a = Arc::clone(&manager);
+        let path_a = path.clone();
+        let first = tokio::spawn(async move { manager_a.get_or_create(&path_a).await });
+
+        let manager_b = Arc::clone(&manager);
+        let path_b = path.clone();
+        let second = tokio::spawn(async move { manager_b.get_or_create(&path_b).await });
+
+        // Let both tasks park on the write lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(instances);
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "double-check must return the first creator's instance"
+        );
+    }
 }

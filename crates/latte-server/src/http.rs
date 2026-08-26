@@ -3487,37 +3487,37 @@ mod tests {
 
     /// A provider whose turn blocks until released, keeping the session's runner
     /// (and its mailbox) active so queue-accepted / mailbox-full are reachable.
-    fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
-        use latte_headless::provider::{
-            Provider, ProviderCapabilities, ProviderContext, ProviderFuture, ProviderRequest,
-            ProviderResponse, ProviderUsage,
-        };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
-
-        struct Blocking(std::sync::Arc<tokio::sync::Notify>);
-        impl Provider for Blocking {
-            fn complete(&self, _: ProviderRequest, _: ProviderContext) -> ProviderFuture<'_> {
-                let gate = self.0.clone();
-                Box::pin(async move {
-                    gate.notified().await;
-                    Ok(ProviderResponse {
-                        message: Some("done".into()),
-                        tool_calls: Vec::new(),
-                        input_request: None,
-                        usage: ProviderUsage::default(),
-                        finish_reason: Some(latte_headless::provider::FinishReason::Stop),
-                        provider_state: None,
-                    })
+    struct Blocking(std::sync::Arc<tokio::sync::Notify>);
+    impl latte_headless::provider::Provider for Blocking {
+        fn complete(
+            &self,
+            _: latte_headless::provider::ProviderRequest,
+            _: latte_headless::provider::ProviderContext,
+        ) -> latte_headless::provider::ProviderFuture<'_> {
+            let gate = self.0.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                Ok(latte_headless::provider::ProviderResponse {
+                    message: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    input_request: None,
+                    usage: latte_headless::provider::ProviderUsage::default(),
+                    finish_reason: Some(latte_headless::provider::FinishReason::Stop),
+                    provider_state: None,
                 })
-            }
-            fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities {
-                    tools: true,
-                    parallel_tool_calls: true,
-                    input_request: true,
-                }
+            })
+        }
+        fn capabilities(&self) -> latte_headless::provider::ProviderCapabilities {
+            latte_headless::provider::ProviderCapabilities {
+                tools: true,
+                parallel_tool_calls: true,
+                input_request: true,
             }
         }
+    }
+
+    fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
+        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
         let factory: latte_headless::thread::ThreadProviderFactory =
             std::sync::Arc::new(move |binding: &latte_core::ThreadProviderBindingV2| {
@@ -3538,8 +3538,49 @@ mod tests {
         state_with_factory(factory)
     }
 
+    /// Server state whose workspace registry references an alias for a tool the
+    /// engine does not expose, so the binding catalog fails closed and the
+    /// `list_bindings` error branch is reachable.
+    fn broken_registry_state() -> Arc<ServerState> {
+        let factory: latte_headless::thread::ThreadProviderFactory =
+            std::sync::Arc::new(|_| Err("unused in this test".to_string()));
+        let builder: crate::workspace::WorkspaceRuntimeBuilder = std::sync::Arc::new(
+            move |root: &std::path::Path| {
+                let db = root.join(".latte/state.db");
+                std::fs::create_dir_all(db.parent().unwrap()).map_err(|e| e.to_string())?;
+                let engine = latte_engine::EngineBuilder::new()
+                    .workspace_root(root)
+                    .database_path(&db)
+                    .conversation_root(root.join(".latte/sessions"))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                    engine.clone(),
+                    root,
+                    Default::default(),
+                    factory.clone(),
+                );
+                // The `nonexistent_tool` alias cannot be built against the
+                // engine's descriptor set, so the catalog fails closed.
+                let registry = std::sync::Arc::new(
+                    latte_headless::registry::ProviderRegistry::parse_jsonc(
+                        r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'},aliases:{nonexistent_tool:'x'}}}}"#,
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+                Ok(crate::workspace::BuiltWorkspace {
+                    engine,
+                    runtime,
+                    registry,
+                })
+            },
+        );
+        let locator: crate::workspace::SessionLocator = std::sync::Arc::new(|_| None);
+        new_state("test-token".to_string(), builder, locator)
+    }
+
     #[tokio::test]
-    async fn queue_accepts_then_reports_full_during_active_turn() {
+    async fn queue_follow_up_reports_positions_until_mailbox_full() {
         // A blocking provider keeps the turn (and runner mailbox) alive while we
         // queue: the first queues are accepted with positions, then the bounded
         // mailbox reports full — covering both queue arms.

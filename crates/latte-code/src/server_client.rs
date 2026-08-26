@@ -3120,6 +3120,291 @@ mod tests {
         assert_eq!(error.code(), "server_unreachable");
     }
 
+    /// Starts an axum mock server and returns its [`MockHttp`] handle.
+    async fn mock_http_app(app: axum::Router) -> MockHttp {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown = async move {
+            let _ = shutdown_rx.wait_for(|stop| *stop).await;
+        };
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        MockHttp {
+            base_url: format!("http://127.0.0.1:{port}"),
+            _server: server,
+            shutdown: shutdown_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_client_maps_response_contract_violations() {
+        use axum::extract::Path;
+        use axum::response::IntoResponse;
+
+        // Every endpoint returns 200 with a body that violates the response
+        // contract, exercising each method's field-extraction error path.
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces",
+                axum::routing::post(|| async { axum::Json(json!({})) }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/bindings",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions/search",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions/exact-title",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}/fork",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}/queue",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            );
+        let mock = mock_http_app(app).await;
+        let client = mock.client("token");
+        let handle = client.handle();
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+
+        // resolve_workspace_id: missing workspace_id.
+        let error = handle
+            .resolve_workspace_id(Path::new("/tmp"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing workspace_id"), "{error}");
+        // list_sessions: malformed sessions array.
+        let error = handle.list_sessions("ws").await.unwrap_err();
+        assert!(error.to_string().contains("invalid sessions list"), "{error}");
+        // bindings_catalog: missing bindings.
+        let error = handle.bindings_catalog("ws").await.unwrap_err();
+        assert!(error.to_string().contains("missing bindings"), "{error}");
+        // search_sessions: malformed results.
+        let error = handle.search_sessions("ws", "q").await.unwrap_err();
+        assert!(error.to_string().contains("invalid search results"), "{error}");
+        // find_sessions_by_exact_title: malformed results.
+        let error = handle.find_sessions_by_exact_title("ws", "q").await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid exact-title results"),
+            "{error}"
+        );
+        // snapshot: missing snapshot field.
+        let error = handle.snapshot(&id).await.unwrap_err();
+        assert!(error.to_string().contains("missing snapshot"), "{error}");
+        // fork_session: missing snapshot field.
+        let error = handle.fork_session(&id, None).await.unwrap_err();
+        assert!(error.to_string().contains("missing snapshot"), "{error}");
+        // queue_follow_up: missing position.
+        let error = handle.queue_follow_up(&id, "p").await.unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_maps_malformed_payloads_and_status_failures() {
+        use axum::extract::Path;
+
+        // Endpoints that return 200 with syntactically invalid JSON or a
+        // snapshot field that cannot deserialize.
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces/{ws}/sessions",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        "this is not json".to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "snapshot": "not-a-snapshot-object" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/bindings",
+                axum::routing::get(|| async {
+                    // Entry without a binding field → default_binding fails.
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "bindings": [{"is_default": true}] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/events",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({ "error": { "message": "boom" } })),
+                    )
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        let handle = client.handle();
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+
+        // Invalid JSON body → Failed("invalid JSON from server").
+        let error = handle.list_sessions("ws").await.unwrap_err();
+        assert!(error.to_string().contains("invalid JSON from server"), "{error}");
+        // Snapshot field that cannot deserialize → Failed("invalid snapshot").
+        let error = handle.snapshot(&id).await.unwrap_err();
+        assert!(error.to_string().contains("invalid snapshot"), "{error}");
+        // Binding entry missing the binding field → Failed.
+        let error = client.default_binding("ws").await.unwrap_err();
+        assert!(error.to_string().contains("missing binding"), "{error}");
+        // open_events on a 500 → Internal.
+        let error = client.open_events("ws").await.unwrap_err();
+        assert!(matches!(error, ClientError::Internal(_)), "{error:?}");
+        // health_check on a 500 → Unreachable.
+        let error = client.health_check().await.unwrap_err();
+        assert_eq!(error.code(), "server_unreachable");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_default_binding_rejects_empty_catalog() {
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/bindings",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({ "bindings": [] })),
+                )
+            }),
+        );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        let error = client.default_binding("ws").await.unwrap_err();
+        assert!(matches!(error, ClientError::Usage(_)), "{error:?}");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_caches_workspace_id_and_maps_try_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces",
+                axum::routing::post({
+                    let calls = calls.clone();
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(json!({ "workspace_id": "ws-cached" }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({ "error": { "message": "missing" } })),
+                    )
+                }),
+            );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        // First resolve hits the server; the second is cached.
+        let first = client.resolve_workspace(Path::new("/tmp")).await.unwrap();
+        let second = client.resolve_workspace(Path::new("/tmp")).await.unwrap();
+        assert_eq!(first, "ws-cached");
+        assert_eq!(second, "ws-cached");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // try_snapshot maps NotFound → None.
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+        assert!(client.try_snapshot(&id).await.unwrap().is_none());
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_next_event_without_open_fails() {
+        let client = ServerClient::new("http://127.0.0.1:1".into(), "token".into());
+        let mut client = client;
+        let error = client.next_event().await.unwrap_err();
+        assert!(error.to_string().contains("event stream not open"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn http_client_reports_body_read_failure() {
+        // A raw TCP server that sends a successful response header with a
+        // Content-Length larger than the body it actually sends, then closes
+        // the connection — reqwest fails while reading the body.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"short\":",
+                );
+                let _ = stream.flush();
+                // Drop the stream without sending the remaining bytes.
+            }
+        });
+        let client = ServerClient::new(format!("http://127.0.0.1:{port}"), "token".into());
+        let error = client.handle().list_sessions("ws").await.unwrap_err();
+        // The body read failure maps to a Failed error (not Unreachable).
+        assert!(matches!(error, ClientError::Failed(_)), "{error:?}");
+        handle.join().unwrap();
+    }
+
     #[tokio::test]
     async fn sse_stream_survives_rest_client_timeout() {
         // The SSE stream must NOT inherit the REST client's total timeout.
