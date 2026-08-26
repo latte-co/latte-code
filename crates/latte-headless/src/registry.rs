@@ -1493,19 +1493,10 @@ mod tests {
 
     #[tokio::test]
     async fn aliased_provider_rejects_unknown_alias_in_response() {
-        let registry = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://127.0.0.1:1',api_key:{source:'env',name:'PATH'},aliases:{read_file:'rf'}}}}",
-        )
-        .unwrap();
-        let resolved = registry
-            .resolve_model("main", "m", &[tool("read_file")])
-            .unwrap();
         // The inner provider returns a tool call with a name not in the reverse
         // alias map.
         let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"unknown_alias","arguments":"{}"}}]}}]}"#;
         let (endpoint, _rx) = capturing_server(body);
-        // Rebuild the registry with the mock endpoint so the inner provider
-        // actually connects.
         let registry = ProviderRegistry::parse_jsonc(&format!(
             r#"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'{endpoint}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}"#
         ))

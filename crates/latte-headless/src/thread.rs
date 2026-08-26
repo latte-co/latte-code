@@ -5368,6 +5368,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_accepted_replays_same_command_id_without_restarting_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), vec![]),
+                response(Some("must not be called"), vec![]),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        // First create with this command id.
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_accepted(
+                        thread_id,
+                        command_id.clone(),
+                        "hello".into(),
+                        binding(),
+                        None,
+                        tx,
+                    )
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().unwrap();
+        assert!(matches!(
+            accepted,
+            latte_core::CreateOutcome::Created(_)
+        ));
+        let first = handle.await.unwrap().unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Second create with the SAME command id must replay durably without
+        // acquiring a lease or calling the provider.
+        let (tx, rx) = oneshot::channel();
+        let replayed = service
+            .start_accepted(
+                thread_id,
+                command_id,
+                "hello".into(),
+                binding(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+        let replayed_snapshot = match replayed {
+            latte_core::CreateOutcome::Replayed(s) => s,
+            other => panic!("expected replay, got {other:?}"),
+        };
+        assert_eq!(replayed_snapshot.thread_id, thread_id);
+        let accepted = rx.await.unwrap().unwrap();
+        assert!(matches!(
+            accepted,
+            latte_core::CreateOutcome::Replayed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_accepted_fails_when_lease_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![
+                response(Some("first"), vec![]),
+                response(Some("unused"), vec![]),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        // Hold the lease so the next create's acquire fails.
+        let _held = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        let err = service
+            .start_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "second".into(),
+                binding(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        let accepted = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(accepted, latte_core::CreateAcceptError::Failed(_)),
+            "{accepted:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn start_rejects_while_runner_is_active() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()

@@ -10510,14 +10510,25 @@ mod tests {
 
         // Wide graphemes at one-column transcript width stay within the
         // wrapping contract (app width 5 minus two-column insets leaves 1).
+        // Assistant text is wrapped (not clipped like user cards), so the
+        // wide grapheme reaches the line-height state machine.
         let ids = SystemIdSource::default();
         let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.transcript.entries[0].text = "界".into();
+        thread.transcript.entries = vec![transcript_entry(
+            &ids,
+            1,
+            None,
+            TranscriptKind::Assistant,
+            "界",
+            None,
+        )];
         let wide = ThreadUiModel {
             sessions: vec![thread],
             ..Default::default()
         };
         let _ = rendered_buffer(&wide, 5, 10);
+        // Zero-width transcript band returns early from the line counter.
+        let _ = rendered_buffer(&wide, 1, 10);
     }
 
     #[test]
@@ -10847,39 +10858,4 @@ mod tests {
         let presentation = permission_presentation(&thread, "effect-1", "do thing");
         assert_eq!(presentation.operation, "Repository operation");
     }
-#[test]
-fn debug_refresh_test() {
-    // This is a debug test to understand the issue
-    let fixture = TestRepo::new();
-    fixture.write("a.txt", "a\n");
-    fixture.write("b.txt", "b\n");
-    fixture.commit_all("initial");
-    let mut app = ready_app(fixture.root().to_path_buf()).unwrap();
-    
-    println!("Initial focus: {:?}", app.focused_pane);
-    println!("Initial content mode: {:?}", app.tab().content.mode);
-    
-    app.handle_key(key(KeyCode::Char('l')));
-    println!("After l: focus = {:?}", app.focused_pane);
-    
-    app.handle_key(key(KeyCode::Char('r')));
-    println!("After r: is_refreshing = {}, is_content_loading = {}", 
-             app.is_refreshing(), app.is_content_loading());
-    
-    app.handle_key(key(KeyCode::Down));
-    println!("After Down: is_refreshing = {}, is_content_loading = {}", 
-             app.is_refreshing(), app.is_content_loading());
-}
-#[test]
-fn debug_layout_at_20x5() {
-    let model = ThreadUiModel::with_startup(test_startup());
-    let state = visual_state(&model);
-    let layout = viewport_layout(Rect::new(0, 0, 20, 5), state, &model);
-    eprintln!("state={state:?} tier={:?} idle={:?} header={} composer={} transcript={}",
-        ViewportTier::for_width(20), layout.idle_composition,
-        layout.header.height, layout.composer.height, layout.transcript.height);
-    let data_rows = layout.header.height.saturating_sub(2);
-    eprintln!("data_rows={data_rows}");
-}
-
 }
