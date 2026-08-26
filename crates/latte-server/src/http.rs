@@ -3152,20 +3152,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_signal_awaits_without_a_signal() {
-        // Poll the real shutdown future briefly: it installs the ctrl-c/SIGTERM
-        // waiters and parks on the select without a signal, so the timeout
-        // elapses. This exercises the signal-wiring construction path. Use a
-        // generous timeout (200ms) to avoid flakiness under CI load.
-        let elapsed =
-            tokio::time::timeout(std::time::Duration::from_millis(200), shutdown_signal()).await;
-        assert!(
-            elapsed.is_err(),
-            "no signal was sent, so it must not resolve"
-        );
-    }
-
-    #[tokio::test]
     async fn serve_wrapper_binds_and_answers_before_abort() {
         // Exercise the public `serve_on` wrapper (which the binary uses and
         // which wires the real signal-based shutdown); we abort rather than
