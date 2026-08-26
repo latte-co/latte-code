@@ -4504,6 +4504,7 @@ mod tool_effect_tests {
         );
     }
 
+    #[test]
     fn create_started_thread_v2_snapshot_creates_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4514,7 +4515,7 @@ mod tool_effect_tests {
         let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
         let run_id = RunId::from_uuid(ids.next_uuid_v7());
         let lease = engine.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
-        let command_id = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        // First create via the snapshot convenience wrapper.
         let snapshot = engine
             .create_started_thread_v2_snapshot(
                 thread_id,
@@ -4528,16 +4529,34 @@ mod tool_effect_tests {
             .unwrap();
         assert_eq!(snapshot.thread_id, thread_id);
         assert_eq!(snapshot.active_run_id, Some(run_id));
+        // A second thread exercises the explicit command-id replay path.
+        let thread_id2 = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id2 = RunId::from_uuid(ids.next_uuid_v7());
+        let lease2 = engine.acquire_thread_lease(thread_id2, 3, 10_000).unwrap();
+        let command_id2 = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        let created = engine
+            .create_started_thread_v2(
+                &command_id2,
+                thread_id2,
+                run_id2,
+                test_thread_binding(),
+                "replay test",
+                &lease2,
+                4,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(created, latte_core::CreateOutcome::Created(_)));
         // Replaying the same command id returns the same snapshot.
         let replayed = engine
             .create_started_thread_v2(
-                &command_id,
-                thread_id,
-                run_id,
+                &command_id2,
+                thread_id2,
+                run_id2,
                 test_thread_binding(),
-                "started snapshot",
-                &lease,
-                3,
+                "replay test",
+                &lease2,
+                5,
                 None,
             )
             .unwrap();
@@ -4621,8 +4640,10 @@ mod tool_effect_tests {
         ));
     }
 
+    #[test]
     fn start_thread_effect_rejects_unknown_effect_and_digest_mismatch() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
@@ -4706,8 +4727,10 @@ mod tool_effect_tests {
         ));
     }
 
+    #[tokio::test]
     async fn execute_started_thread_effect_rejects_wrong_lease_scope() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
@@ -4778,6 +4801,7 @@ mod tool_effect_tests {
         ));
     }
 
+    #[tokio::test]
     async fn deny_waiting_permission_terminates_waiting_run() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -4834,7 +4858,7 @@ mod tool_effect_tests {
             .unwrap();
         assert_eq!(
             denied.failure.unwrap().code,
-            latte_core::FailureCode::Cancelled
+            latte_core::FailureCode::PermissionDenied
         );
     }
 

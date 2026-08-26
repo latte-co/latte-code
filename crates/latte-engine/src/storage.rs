@@ -10001,4 +10001,286 @@ mod tests {
         assert!(!redacted.evidence[0].name.contains('\x1b'));
         assert!(!redacted.evidence[0].summary.contains('\x1b'));
     }
+
+    #[test]
+    fn commit_thread_run_update_rejects_invalid_effect_fields() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let (thread_id, run_id, queued) =
+            create_linked_fixture(&store, &ids, "validation", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "validate:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        let valid_digest = "a".repeat(64);
+        let canonical = crate::ThreadEffectDescriptor {
+            effect_id: "effect-validate".into(),
+            tool_call_id: "call-validate".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+            attempt: 1,
+        };
+        let canonical_json = serde_json::to_string(&canonical).unwrap();
+        let thread_rev = running.revision;
+        let run_rev = running.runs[0].run_revision;
+
+        // PrepareEffect: invalid source key (control character).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "bad\nsource".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                13,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid effect id (empty).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some(String::new()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:empty-id".into(),
+                        effect_id: String::new(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                14,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid digest (not 64 hex chars).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-digest".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: "short".into(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                15,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid descriptor JSON.
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-descriptor".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "not json".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                16,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid checkpoint JSON.
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-checkpoint".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "not json".into(),
+                    },
+                },
+                &lease,
+                17,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // StartEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: Some(eid.into()),
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::StartEffect {
+                            source_key: "validate:start-effect".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    18,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // ObserveEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::ObserveEffect {
+                            source_key: "validate:observe".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            success: true,
+                            result: "ok".into(),
+                            payload: None,
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    19,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // UnknownEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::UnknownEffect {
+                            source_key: "validate:unknown".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    20,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // ReconcileUnknownEffect: invalid effect id, checkpoint.
+        for (eid, cp) in [("", "{}"), ("effect-validate", "not json")] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::ReconcileUnknownEffect {
+                            source_key: "validate:reconcile".into(),
+                            effect_id: eid.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    21,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+    }
 }

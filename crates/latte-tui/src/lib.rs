@@ -371,6 +371,7 @@ fn restore_once_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IsTerminal;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum MockOperation {
@@ -774,5 +775,302 @@ mod tests {
         });
         // No operations performed.
         assert_eq!(operations.lock().unwrap().len(), 0);
+    }
+
+    struct StageFailureOps {
+        operations: Arc<Mutex<Vec<MockOperation>>>,
+        fail_raw: bool,
+        fail_alternate: bool,
+        fail_paste: bool,
+    }
+
+    impl TerminalOps for StageFailureOps {
+        fn enable_raw(&self) -> io::Result<()> {
+            self.operations.lock().unwrap().push(MockOperation::EnableRaw);
+            if self.fail_raw {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected raw stage failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn push_keyboard(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::PushKeyboard);
+            Ok(())
+        }
+
+        fn enter_alternate(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::EnterAlternate);
+            if self.fail_alternate {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected alternate stage failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn enable_mouse(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::EnableMouse);
+            Ok(())
+        }
+
+        fn enable_paste(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::EnablePaste);
+            if self.fail_paste {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected paste stage failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn disable_paste(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::DisablePaste);
+            Ok(())
+        }
+
+        fn disable_mouse(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::DisableMouse);
+            Ok(())
+        }
+
+        fn leave_alternate(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::LeaveAlternate);
+            Ok(())
+        }
+
+        fn pop_keyboard(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::PopKeyboard);
+            Ok(())
+        }
+
+        fn disable_raw(&self) -> io::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(MockOperation::DisableRaw);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn crossterm_ops_emit_escape_sequences_and_raw_mode_transitions_without_a_tty() {
+        let ops = CrosstermTerminalOps;
+        // Raw mode requires a controlling TTY; the transition is still
+        // exercised here and any failure is ignored because the test host is
+        // allowed to lack a terminal.
+        let _ = ops.enable_raw();
+        ops.push_keyboard().unwrap();
+        ops.enter_alternate().unwrap();
+        ops.enable_paste().unwrap();
+        ops.disable_paste().unwrap();
+        ops.leave_alternate().unwrap();
+        ops.pop_keyboard().unwrap();
+        let _ = ops.disable_raw();
+    }
+
+    #[test]
+    fn enter_without_a_tty_reports_the_io_failure_or_restores_transactionally() {
+        let result = TerminalGuard::enter();
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let _guard = result.expect("TTY entry must succeed and restore on drop");
+        } else {
+            assert!(matches!(result, Err(TuiError::Io(_))));
+        }
+    }
+
+    #[test]
+    fn enter_with_hook_without_a_tty_reports_the_io_failure_or_restores_transactionally() {
+        let result = TerminalGuard::enter_with_hook(|_| {});
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let _guard = result.expect("TTY entry must succeed and restore on drop");
+        } else {
+            assert!(matches!(result, Err(TuiError::Io(_))));
+        }
+    }
+
+    #[test]
+    fn raw_stage_failure_aborts_entry_before_any_other_stage() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(StageFailureOps {
+            operations: Arc::clone(&operations),
+            fail_raw: true,
+            fail_alternate: false,
+            fail_paste: false,
+        });
+        let result = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops);
+        let Err(TuiError::Io(error)) = result else {
+            panic!("raw-stage failure must be returned as I/O");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![MockOperation::EnableRaw]
+        );
+    }
+
+    #[test]
+    fn alternate_stage_failure_rolls_back_keyboard_and_raw_modes() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(StageFailureOps {
+            operations: Arc::clone(&operations),
+            fail_raw: false,
+            fail_alternate: true,
+            fail_paste: false,
+        });
+        let result = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops);
+        let Err(TuiError::Io(error)) = result else {
+            panic!("alternate-stage failure must be returned as I/O");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                MockOperation::EnableRaw,
+                MockOperation::PushKeyboard,
+                MockOperation::EnterAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
+    }
+
+    #[test]
+    fn paste_stage_failure_rolls_back_mouse_alternate_keyboard_and_raw_modes() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(StageFailureOps {
+            operations: Arc::clone(&operations),
+            fail_raw: false,
+            fail_alternate: false,
+            fail_paste: true,
+        });
+        let result = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops);
+        let Err(TuiError::Io(error)) = result else {
+            panic!("paste-stage failure must be returned as I/O");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                MockOperation::EnableRaw,
+                MockOperation::PushKeyboard,
+                MockOperation::EnterAlternate,
+                MockOperation::EnableMouse,
+                MockOperation::EnablePaste,
+                MockOperation::DisableMouse,
+                MockOperation::LeaveAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_once_is_safe_when_the_restored_flag_is_poisoned() {
+        let restored = Arc::new(Mutex::new(false));
+        let poisoned = Arc::clone(&restored);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the restored flag on purpose");
+        })
+        .join();
+        assert!(restored.is_poisoned());
+        let stages = Arc::new(Mutex::new(TerminalStages::default()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(CrosstermTerminalOps);
+        restore_once(&restored, &stages, &ops);
+    }
+
+    #[test]
+    fn restore_once_marks_done_when_stages_are_poisoned() {
+        let restored = Arc::new(Mutex::new(false));
+        let stages = Arc::new(Mutex::new(TerminalStages {
+            raw: true,
+            ..TerminalStages::default()
+        }));
+        let poisoned = Arc::clone(&stages);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the stages on purpose");
+        })
+        .join();
+        assert!(stages.is_poisoned());
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+            mouse_error: None,
+        });
+        restore_once(&restored, &stages, &ops);
+        assert!(*restored.lock().unwrap());
+        assert!(operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn panic_hook_restores_terminal_and_chains_to_the_previous_hook() {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let ops: Arc<dyn TerminalOps> = Arc::new(MockTerminalOps {
+            operations: Arc::clone(&operations),
+            keyboard_error: None,
+            mouse_error: None,
+        });
+        let previous_observed = Arc::new(Mutex::new(false));
+        let original_hook = panic::take_hook();
+        panic::set_hook(Box::new({
+            let previous_observed = Arc::clone(&previous_observed);
+            move |_info| {
+                *previous_observed.lock().unwrap() = true;
+            }
+        }));
+        let guard = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops).unwrap();
+        // Panic on a worker thread so the process-wide TERMINAL_LOCK held by
+        // the guard is never poisoned; the installed hook still runs.
+        let _ = std::thread::spawn(|| panic!("trigger scoped panic hook")).join();
+        drop(guard);
+        let _ = panic::take_hook();
+        panic::set_hook(original_hook);
+        assert!(*previous_observed.lock().unwrap());
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![
+                MockOperation::EnableRaw,
+                MockOperation::PushKeyboard,
+                MockOperation::EnterAlternate,
+                MockOperation::EnableMouse,
+                MockOperation::EnablePaste,
+                MockOperation::DisablePaste,
+                MockOperation::DisableMouse,
+                MockOperation::LeaveAlternate,
+                MockOperation::PopKeyboard,
+                MockOperation::DisableRaw,
+            ]
+        );
     }
 }
