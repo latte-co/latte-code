@@ -2063,6 +2063,23 @@ mod tests {
         // select! with no timing race.
         reconnect_signal: Option<tokio::sync::oneshot::Sender<()>>,
         park_reconnect: bool,
+        // Deterministic cancel injection for the remaining select! arms: the
+        // phase fires its paired signal once and then parks forever, so a
+        // cancel future awaiting the signal is the only ready branch.
+        park_binding: bool,
+        binding_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_create: bool,
+        create_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_follow_up: bool,
+        follow_up_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_open: bool,
+        // On the nth snapshot call (1-based) the gate fires its signal; when
+        // `park_snapshot` is set the call then parks forever, letting a cancel
+        // future awaiting the signal win the surrounding select! deterministically.
+        snapshot_gate: Mutex<Option<(usize, tokio::sync::oneshot::Sender<()>)>>,
+        park_snapshot: bool,
+        fail_create: bool,
+        fail_reopen: bool,
     }
 
     impl MockServer {
