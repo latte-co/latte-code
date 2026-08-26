@@ -2297,7 +2297,7 @@ mod tests {
         for index in 0..=MAX_SSE_TOOL_CALLS {
             chunks.push(
                 format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index}}}]}}]}}\r\n\r\n"
+                    "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index}}}]}}}}]}}\r\n\r\n"
                 )
                 .into_bytes(),
             );

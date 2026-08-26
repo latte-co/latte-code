@@ -1757,6 +1757,9 @@ mod tests {
         // run/resume accept unknown --flag tokens as prompt content.
         assert!(parse_session_command(&args(&["run", "--bogus"])).is_ok());
         assert!(parse_session_command(&args(&["run", "--server"])).is_err());
+        // --token without a value.
+        assert!(parse_session_command(&args(&["run", "--token"])).is_err());
+        assert!(parse_session_command(&args(&["list", "--token"])).is_err());
     }
 
     #[test]
