@@ -556,4 +556,16 @@ mod tests {
         overwrite_records(&malformed_path, &valid_header, &[oversized_line]);
         assert!(store.read(malformed_thread).is_err());
     }
+
+    #[test]
+    fn repair_rejects_file_with_no_newline() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConversationStore::open(root.path(), "workspace-torn").unwrap();
+        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        // Write a file with content but no newline at all — the header is torn.
+        let path = session_path(root.path(), "workspace-torn", thread_id);
+        fs::write(&path, b"{\"record\":\"header\"").unwrap();
+        // read should fail because the header cannot be parsed.
+        assert!(store.read(thread_id).is_err());
+    }
 }
