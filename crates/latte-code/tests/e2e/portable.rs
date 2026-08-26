@@ -5456,6 +5456,61 @@ fn engine_changed_files_and_workspace_manifest() {
     assert!(!descriptors.is_empty(), "engine should have built-in tools");
 }
 
+/// Engine-level lease lifecycle and subscriptions: covers acquire/renew/release
+/// and the event subscription paths.
+#[test]
+fn engine_lease_lifecycle_and_subscriptions() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lease test", 1)
+        .unwrap();
+
+    // Acquire, renew, and release a thread lease.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    engine.renew_lease(&lease, 3, 20_000).unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // After release, a new lease can be acquired.
+    let lease2 = engine.acquire_thread_lease(thread_id, 4, 10_000).unwrap();
+    engine.release_lease(&lease2).unwrap();
+
+    // Subscriptions.
+    let _events = engine.subscribe();
+    let _thread_events = engine.subscribe_threads();
+
+    // Show a run.
+    let state = engine.show(run_id).unwrap();
+    assert_eq!(state.run_id, run_id);
+
+    // List runs.
+    let runs = engine.list().unwrap();
+    assert!(!runs.is_empty());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
