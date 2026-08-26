@@ -5686,6 +5686,76 @@ fn engine_permission_and_input_request_paths() {
     engine.release_lease(&lease).unwrap();
 }
 
+/// Engine-level rename and fork: covers the `rename_thread_session_v2` and
+/// `fork_thread_session_v2` storage paths.
+#[test]
+fn engine_rename_and_fork_thread() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "original", 1)
+        .unwrap();
+
+    // Rename.
+    engine
+        .rename_thread_session_v2(thread_id, "renamed")
+        .unwrap();
+    let summary = engine.thread_session_v2(thread_id).unwrap().unwrap();
+    assert_eq!(summary.title, "renamed");
+
+    // Fork.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+    assert_eq!(fork.thread_id, fork_id);
+
+    // Both threads appear in the list.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+
+    // Search finds the renamed thread.
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "renamed", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
