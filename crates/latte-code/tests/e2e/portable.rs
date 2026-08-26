@@ -6762,3 +6762,56 @@ fn engine_run_lease_and_transition_paths() {
     let loaded = engine.show(run_id).unwrap();
     assert_eq!(loaded.run_id, run_id);
 }
+
+/// Engine-level validation error paths: covers binding validation and
+/// workspace-scoped query errors.
+#[test]
+fn engine_validation_error_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+
+    // Invalid binding (empty provider name) should fail.
+    let invalid_binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: String::new(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test".into(),
+        config_fingerprint: "c".into(),
+        tools_fingerprint: "t".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let result = engine.create_thread_v2(thread_id, run_id, invalid_binding, "test", 1);
+    assert!(result.is_err());
+
+    // Workspace-scoped queries on missing workspace should return empty.
+    let missing_ws = dir.path().join("nonexistent");
+    let ws_list = engine
+        .list_threads_v2_for_workspace(missing_ws.to_str().unwrap())
+        .unwrap();
+    assert!(ws_list.is_empty());
+
+    // Search in missing workspace.
+    let search = engine.search_thread_sessions_v2("nonexistent", 10).unwrap();
+    assert!(search.is_empty());
+
+    // Exact title in missing workspace.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(
+            missing_ws.to_str().unwrap(),
+            "nonexistent",
+            10,
+        )
+        .unwrap();
+    assert!(exact.is_empty());
+}
