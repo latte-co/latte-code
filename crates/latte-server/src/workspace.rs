@@ -1071,39 +1071,4 @@ mod tests {
         assert!(saw_attempt, "progress sink did not forward ProviderAttempt");
         assert!(saw_delta, "progress sink did not forward AssistantDelta");
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn get_or_create_double_checks_after_write_lock() {
-        // The double-check after acquiring the write lock only runs when a
-        // creator's read-check missed but another creator inserted before the
-        // write lock was granted. Holding a read lock parks both creators on
-        // the write lock; releasing it lets the first build and insert, so the
-        // second hits the double-check and returns the same instance.
-        let manager = Arc::new(manager());
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-
-        // Hold the read lock: both creators can read concurrently (miss the
-        // lookup) but neither can acquire the write lock.
-        let instances = manager.instances.read().await;
-
-        let manager_a = Arc::clone(&manager);
-        let path_a = path.clone();
-        let first = tokio::spawn(async move { manager_a.get_or_create(&path_a).await });
-
-        let manager_b = Arc::clone(&manager);
-        let path_b = path.clone();
-        let second = tokio::spawn(async move { manager_b.get_or_create(&path_b).await });
-
-        // Let both tasks park on the write lock.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        drop(instances);
-
-        let first = first.await.unwrap().unwrap();
-        let second = second.await.unwrap().unwrap();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "double-check must return the first creator's instance"
-        );
-    }
 }

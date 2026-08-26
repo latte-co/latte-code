@@ -10283,4 +10283,274 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn legacy_runtime_functions_reject_thread_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let (run_id, _event_id) = ids();
+        let thread_lease = store.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        let digest = "a".repeat(64);
+        // cancel_waiting with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &thread_lease, 2, false),
+            Err(StorageError::LeaseLost)
+        ));
+        // append_event with a thread lease → LeaseLost.
+        let state = RunState::queued(run_id);
+        let event = RuntimeEvent::StateChanged {
+            status: RunStatus::Queued,
+        };
+        assert!(matches!(
+            store.append_event(
+                &state,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                2,
+                &thread_lease,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // replace_pending_effect with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.replace_pending_effect(
+                "old-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "{}",
+                &digest,
+                &thread_lease,
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // create_prepared_permission with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.create_prepared_permission(
+                "effect",
+                run_id,
+                0,
+                0,
+                1,
+                "{}",
+                &digest,
+                &thread_lease,
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // consume_permission_and_start with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.consume_permission_and_start("effect", run_id, 0, &thread_lease, &digest, 2),
+            Err(StorageError::LeaseLost)
+        ));
+        // reconcile_unknown_and_abort with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.reconcile_unknown_and_abort(run_id, "effect", 0, &thread_lease, 2),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn cancel_waiting_rejects_stale_revision_and_non_waiting_states() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Wrong expected revision → StaleRevision.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 99, &lease, 3, false),
+            Err(StorageError::StaleRevision { .. })
+        ));
+        // Non-waiting run (queued) → InvalidData.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &lease, 3, false),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Denied on a non-WaitingPermission run → InvalidData.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &lease, 3, true),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn append_event_rejects_unknown_run_and_stale_revision() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        let state = RunState::queued(run_id);
+        let event = RuntimeEvent::StateChanged {
+            status: RunStatus::Queued,
+        };
+        // Non-existent run → RunNotFound.
+        assert!(matches!(
+            store.append_event(
+                &state,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                2,
+                &lease,
+            ),
+            Err(StorageError::RunNotFound(_))
+        ));
+        // Create the run, then use a stale revision.
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        let mut next = state.clone();
+        next.revision = 5; // does not match expected_revision + 1
+        assert!(matches!(
+            store.append_event(
+                &next,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                3,
+                &lease,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn switch_thread_binding_v2_rejects_invalid_binding_and_unknown_thread() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let (thread_id, run_id, queued) =
+            create_linked_fixture(&store, &id_source, "binding switch", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
+        // Invalid binding (empty provider_name) → InvalidData.
+        let mut bad_binding = thread_binding();
+        bad_binding.provider_name = String::new();
+        assert!(matches!(
+            store.switch_thread_binding_v2(thread_id, queued.revision, &bad_binding, &lease, 12),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Unknown thread → ThreadNotFound.
+        let unknown = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let unknown_lease = store.acquire_thread_lease(unknown, 10, 10_000).unwrap();
+        assert!(matches!(
+            store.switch_thread_binding_v2(
+                unknown,
+                queued.revision,
+                &thread_binding(),
+                &unknown_lease,
+                12,
+            ),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+        // Stale revision → StaleThreadRevision.
+        assert!(matches!(
+            store.switch_thread_binding_v2(
+                thread_id,
+                queued.revision + 1,
+                &thread_binding(),
+                &lease,
+                12,
+            ),
+            Err(StorageError::StaleThreadRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn create_prepared_permission_rejects_invalid_descriptor_json() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Invalid descriptor JSON → InvalidData.
+        assert!(matches!(
+            store.create_prepared_permission(
+                "effect",
+                run_id,
+                0,
+                0,
+                1,
+                "not json",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn replace_pending_effect_rejects_invalid_json_and_missing_effect() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Invalid descriptor JSON → InvalidData.
+        assert!(matches!(
+            store.replace_pending_effect(
+                "old-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "not json",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // No existing pending permission → LeaseLost (validity check fails).
+        assert!(matches!(
+            store.replace_pending_effect(
+                "missing-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "{}",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn consume_permission_and_start_rejects_missing_permission() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Non-existent permission → InvalidData.
+        assert!(matches!(
+            store.consume_permission_and_start(
+                "missing-effect",
+                run_id,
+                0,
+                &lease,
+                &"a".repeat(64),
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn release_lease_rejects_stale_token() {
+        let store = Storage::memory().unwrap();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        let stale = Lease {
+            scope: lease.scope.clone(),
+            owner: lease.owner.clone(),
+            fencing_token: lease.fencing_token + 1,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.release_lease(&stale),
+            Err(StorageError::LeaseLost)
+        ));
+    }
 }
