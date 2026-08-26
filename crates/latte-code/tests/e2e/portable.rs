@@ -4313,12 +4313,17 @@ fn engine_paged_list_follows_cursor_across_pages() {
     assert_eq!(page3.items.len(), 1);
     assert!(page3.next_cursor.is_none(), "page 3 must be the last page");
 
-    // Search paged: query matches all 3 sessions.
+    // Search paged: query matches all 3 sessions, follow the cursor.
     let search = engine
         .search_thread_sessions_v2_paged("session", None, 2)
         .unwrap();
     assert_eq!(search.items.len(), 2);
     assert!(search.next_cursor.is_some());
+    let search2 = engine
+        .search_thread_sessions_v2_paged("session", search.next_cursor.as_deref(), 2)
+        .unwrap();
+    assert_eq!(search2.items.len(), 1);
+    assert!(search2.next_cursor.is_none());
 
     // Exact-title paged: unique title → 1 item, no cursor.
     let exact = engine
@@ -4331,6 +4336,25 @@ fn engine_paged_list_follows_cursor_across_pages() {
         .unwrap();
     assert_eq!(exact.items.len(), 1);
     assert!(exact.next_cursor.is_none());
+
+    // Exact-title paged with limit=1 → cursor follows.
+    let exact_paged = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+            &workspace,
+            "session 1",
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(exact_paged.items.len(), 1);
+    assert!(exact_paged.next_cursor.is_none());
+
+    // limit=0 → empty page, no cursor.
+    let empty = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 0)
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert!(empty.next_cursor.is_none());
 }
 
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
