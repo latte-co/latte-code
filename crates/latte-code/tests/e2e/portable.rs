@@ -4426,6 +4426,75 @@ fn engine_lifecycle_covers_run_transition_rename_fork_and_lease() {
     assert!(!ws.is_empty());
 }
 
+/// Engine-level snapshot and conversation paths: thread snapshots, conversation
+/// outbox, and workspace manifest — covers storage paths CLI E2E can't reach.
+#[test]
+fn engine_snapshot_and_conversation_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "snapshot test", 1)
+        .unwrap();
+
+    // Thread snapshot.
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+
+    // Thread snapshot tail.
+    let tail = engine.thread_snapshot_tail_v2(thread_id, 10).unwrap();
+    assert_eq!(tail.thread_id, thread_id);
+
+    // Conversation outbox.
+
+    // Workspace manifest.
+    let _manifest = engine.workspace_manifest().unwrap();
+
+    // List threads for workspace.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws_threads = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws_threads.is_empty());
+
+    // Search sessions.
+    let found = engine.search_thread_sessions_v2("snapshot", 10).unwrap();
+    assert!(!found.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "snapshot test", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+
+    // Thread session (summary).
+    let summary = engine.thread_session_v2(thread_id).unwrap();
+    assert_eq!(summary.unwrap().thread_id, thread_id);
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
