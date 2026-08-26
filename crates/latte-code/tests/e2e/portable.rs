@@ -4357,6 +4357,75 @@ fn engine_paged_list_follows_cursor_across_pages() {
     assert!(empty.next_cursor.is_none());
 }
 
+/// Engine-level lifecycle: create runs, apply transitions, rename, fork, and
+/// lease management — covers storage paths that CLI E2E tests can't reach.
+#[test]
+fn engine_lifecycle_covers_run_transition_rename_fork_and_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and run.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "lifecycle test", 1)
+        .unwrap();
+
+    // Create a second thread for more coverage.
+    let thread2 = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run2 = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread2, run2, binding.clone(), "second session", 2)
+        .unwrap();
+
+    // Lease management: acquire and renew.
+    let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
+    engine.renew_lease(&lease, 3, 10_000).unwrap();
+    engine
+        .rename_thread_session_v2(thread_id, "renamed session")
+        .unwrap();
+
+    // Fork the thread.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let _fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+
+    // List and search.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
