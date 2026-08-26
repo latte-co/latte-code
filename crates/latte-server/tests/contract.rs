@@ -357,7 +357,7 @@ async fn error_enum_completeness() {
     let workspace_id = create_workspace(&state, &workspace.path().to_string_lossy()).await;
     let (session_id, revision) = completed_session(&state, &workspace_id).await;
 
-    // unauthorized（401）：无 token。
+    // unauthorized（401）：无 token → 类型化错误信封。
     let response = router(state.clone())
         .oneshot(
             Request::builder()
@@ -370,6 +370,15 @@ async fn error_enum_completeness() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "unauthorized");
+    assert!(
+        body["error"]["message"].is_string(),
+        "401 body must carry a typed error envelope: {body}"
+    );
 
     // rejected（400）：JSON 语法错误 → 类型化错误信封。
     let response = router(state.clone())

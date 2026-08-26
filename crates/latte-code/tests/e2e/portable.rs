@@ -4281,7 +4281,10 @@ fn engine_paged_list_follows_cursor_across_pages() {
             )
             .unwrap();
     }
-    let workspace = dir.path().to_string_lossy().into_owned();
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
     // Page 1: limit=1 → 1 item + cursor.
     let page1 = engine

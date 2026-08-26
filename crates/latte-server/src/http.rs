@@ -7,7 +7,10 @@ use axum::{
     extract::{FromRequest, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::sse::{Event, KeepAlive, Sse},
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, patch, post},
 };
 use futures::stream::Stream;
@@ -213,10 +216,10 @@ async fn auth_middleware(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
-) -> Result<axum::response::Response, StatusCode> {
+) -> axum::response::Response {
     // Skip auth for health check
     if request.uri().path() == "/health" {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     let auth = headers
@@ -225,8 +228,17 @@ async fn auth_middleware(
         .and_then(|s| s.strip_prefix("Bearer "));
 
     match auth {
-        Some(token) if token == state.token => Ok(next.run(request).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+        Some(token) if token == state.token => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "unauthorized",
+                    "message": "missing or invalid bearer token"
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1260,6 +1272,7 @@ mod tests {
     /// Serializes tests that send process-wide signals (SIGINT/SIGTERM) so a
     /// concurrent signal from one test cannot resolve another test's
     /// `shutdown_signal` waiter via the wrong select arm.
+    #[cfg(unix)]
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn valid_binding() -> serde_json::Value {
