@@ -1888,9 +1888,19 @@ mod tests {
 
     #[tokio::test]
     async fn connect_error_retries_before_transport_failure() {
-        let provider = OpenAiProvider::new("http://127.0.0.1:1", "m", "k", Duration::from_secs(1))
-            .unwrap()
-            .with_max_attempts(2);
+        // Bind-and-drop gives a port that refuses connections on every
+        // platform (port 1 is handled inconsistently by Windows http.sys).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let provider = OpenAiProvider::new(
+            format!("http://127.0.0.1:{port}"),
+            "m",
+            "k",
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_max_attempts(2);
         let err = provider
             .complete(
                 ProviderRequest {
@@ -1901,7 +1911,14 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Transport(_)));
+        // A refused connection is a Transport error; on some Windows
+        // configurations the OS withholds the RST and the request times out
+        // instead. Both outcomes prove the retry path ran and propagated the
+        // failure rather than panicking or returning a success.
+        assert!(
+            matches!(err, ProviderError::Transport(_) | ProviderError::Timeout),
+            "expected transport or timeout error, got {err:?}"
+        );
     }
 
     #[tokio::test]

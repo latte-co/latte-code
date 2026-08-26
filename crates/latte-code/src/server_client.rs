@@ -583,10 +583,13 @@ pub trait SessionServer {
     ) -> Result<u64, ClientError>;
     /// Appends a follow-up turn. Returns the accepted revision and the
     /// workspace id that owns the session (so the caller can subscribe to
-    /// the correct event stream when the cwd workspace differs).
+    /// the correct event stream when the cwd workspace differs). The
+    /// `command_id` is the stable identity of the turn: retries of the same
+    /// turn must reuse it so the server replays instead of duplicating.
     async fn follow_up(
         &mut self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError>;
@@ -674,8 +677,12 @@ pub async fn resume_session(
         result = server.snapshot(&thread_id) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
+    // One stable command identity for the whole turn: every HTTP attempt of
+    // this resume reuses it, so a crash-safe retry replays the acceptance
+    // instead of appending a duplicate turn.
+    let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
     let (_, event_workspace_id) = tokio::select! {
-        result = server.follow_up(&thread_id, snapshot.revision, prompt) => result?,
+        result = server.follow_up(&thread_id, &command_id, snapshot.revision, prompt) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
     observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
@@ -1160,22 +1167,26 @@ impl ServerHandle {
             .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
     }
 
-    /// Appends a follow-up turn to an existing session.
+    /// Appends a follow-up turn to an existing session. The caller supplies a
+    /// stable `command_id` for the turn: every HTTP attempt of the same turn
+    /// reuses it, so a crash-safe retry replays the durable acceptance
+    /// instead of appending a duplicate turn.
     pub async fn follow_up(
         &self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(), ClientError> {
         let body = json!({
+            "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
         });
-        let idempotency_key = Uuid::now_v7().to_string();
         self.post(
             &format!("/v1/sessions/{session_id}/follow-up"),
             body,
-            Some(&idempotency_key),
+            Some(&command_id.to_string()),
         )
         .await?;
         Ok(())
@@ -1541,21 +1552,23 @@ impl SessionServer for ServerClient {
     async fn follow_up(
         &mut self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError> {
         let body = json!({
+            "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
         });
-        // Follow-up is a durable mutation: send an idempotency key so a
-        // timeout/retry cannot append a duplicate turn.
-        let idempotency_key = Uuid::now_v7().to_string();
+        // Follow-up is a durable mutation: the stable command_id doubles as
+        // the Idempotency-Key so a timeout/retry replays instead of
+        // appending a duplicate turn.
         let value = self
             .post(
                 &format!("/v1/sessions/{session_id}/follow-up"),
                 body,
-                Some(&idempotency_key),
+                Some(&command_id.to_string()),
             )
             .await?;
         let revision = value
@@ -2088,7 +2101,7 @@ mod tests {
         snapshots: Mutex<std::collections::VecDeque<Result<ThreadSnapshot, ClientError>>>,
         events: Mutex<std::collections::VecDeque<Option<StreamEvent>>>,
         created: Mutex<Vec<(String, String, Option<String>)>>,
-        followed_up: Mutex<Vec<(String, u64, String)>>,
+        followed_up: Mutex<Vec<(String, String, u64, String)>>,
         cancelled: Mutex<Vec<(u64, u64)>>,
         opened: Mutex<Vec<String>>,
         listed: Mutex<u32>,
@@ -2213,6 +2226,7 @@ mod tests {
         async fn follow_up(
             &mut self,
             session_id: &ThreadId,
+            command_id: &ThreadCommandId,
             expected_revision: u64,
             prompt: &str,
         ) -> Result<(u64, String), ClientError> {
@@ -2224,6 +2238,7 @@ mod tests {
             }
             self.followed_up.lock().unwrap().push((
                 session_id.to_string(),
+                command_id.to_string(),
                 expected_revision,
                 prompt.to_string(),
             ));
@@ -2660,8 +2675,8 @@ mod tests {
         let followed = server.followed_up.lock().unwrap().clone();
         assert_eq!(followed.len(), 1);
         assert_eq!(followed[0].0, id);
-        assert_eq!(followed[0].1, 1); // expected revision from the snapshot
-        assert_eq!(followed[0].2, "continue");
+        assert_eq!(followed[0].2, 1); // expected revision from the snapshot
+        assert_eq!(followed[0].3, "continue");
     }
 
     #[tokio::test]
@@ -2824,8 +2839,15 @@ mod tests {
         ) -> impl IntoResponse {
             assert_eq!(body["expected_thread_revision"], 1);
             assert!(
-                headers.get("idempotency-key").is_some(),
-                "follow-up must send Idempotency-Key"
+                body["command_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "follow-up body must carry a stable command_id"
+            );
+            assert_eq!(
+                headers.get("idempotency-key").and_then(|v| v.to_str().ok()),
+                body["command_id"].as_str(),
+                "Idempotency-Key must equal body command_id"
             );
             (
                 axum::http::StatusCode::ACCEPTED,
@@ -3029,6 +3051,7 @@ mod tests {
                 &ThreadId::from_uuid(
                     Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
                 ),
+                &ThreadCommandId::from_uuid(Uuid::now_v7()),
                 1,
                 "more",
             )

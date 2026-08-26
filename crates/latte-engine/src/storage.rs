@@ -1069,6 +1069,38 @@ impl Storage {
         Ok(Some(snapshot))
     }
 
+    /// Pre-acquire durable dedup lookup for a follow-up command. A hit means
+    /// the follow-up was already durably accepted (possibly by a process that
+    /// crashed before responding); the caller replays the snapshot and must
+    /// not acquire a lease or start a runner. A same-id different-digest
+    /// retry fails with [`StorageError::ThreadCommandReplayMismatch`].
+    pub(crate) fn lookup_follow_up_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: latte_core::ThreadId,
+        expected_thread_revision: u64,
+        prompt: &str,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        let prompt = redact_thread_text(prompt);
+        let digest = follow_up_command_digest(thread_id, expected_thread_revision, &prompt);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [command_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, result_json)) = row else {
+            return Ok(None);
+        };
+        if stored_digest != digest {
+            return Err(StorageError::ThreadCommandReplayMismatch);
+        }
+        let snapshot: ThreadSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
+        Ok(Some(snapshot))
+    }
+
     /// Atomically creates the Session, durable user card, linked child, and
     /// started run under the exact thread lease. There is no committed token-0
     /// child for a caller to strand between acceptance and `Start`.
@@ -1331,6 +1363,7 @@ impl Storage {
         now_ms: u64,
     ) -> Result<ThreadSnapshot, StorageError> {
         self.create_thread_follow_up_v2_inner(
+            None,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1339,12 +1372,25 @@ impl Storage {
             None,
             now_ms,
         )
-        .map(|(snapshot, _)| snapshot)
+        .map(|(outcome, _)| match outcome {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        })
     }
 
+    /// Atomically accepts and starts a follow-up child under the exact Session
+    /// lease, preserving the completed parent if any precondition fails.
+    ///
+    /// When `command_id` is provided, the follow-up is crash-safe idempotent:
+    /// the command is deduplicated against `thread_command_dedup_v2` *inside*
+    /// the write transaction (recheck after the pre-acquire lookup), a
+    /// same-id different-digest retry fails with
+    /// [`StorageError::ThreadCommandReplayMismatch`], and a same-id
+    /// same-digest retry returns `Replayed` without starting a runner.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_started_thread_follow_up_v2(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
@@ -1352,8 +1398,15 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadCommitResponse, StorageError> {
-        let (snapshot, thread_event) = self.create_thread_follow_up_v2_inner(
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<ThreadSnapshot>,
+            Option<StoredThreadEvent>,
+        ),
+        StorageError,
+    > {
+        self.create_thread_follow_up_v2_inner(
+            command_id,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1361,18 +1414,13 @@ impl Storage {
             baseline,
             Some(lease),
             now_ms,
-        )?;
-        Ok(ThreadCommitResponse {
-            snapshot,
-            thread_event: thread_event.ok_or_else(|| {
-                StorageError::InvalidData("atomic follow-up start omitted its durable event".into())
-            })?,
-        })
+        )
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn create_thread_follow_up_v2_inner(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
@@ -1380,7 +1428,13 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         initial_lease: Option<&Lease>,
         now_ms: u64,
-    ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<ThreadSnapshot>,
+            Option<StoredThreadEvent>,
+        ),
+        StorageError,
+    > {
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
@@ -1401,6 +1455,30 @@ impl Storage {
             )?;
             if !authoritative {
                 return Err(StorageError::LeaseLost);
+            }
+        }
+        // Durable command dedup, rechecked inside the write transaction so a
+        // concurrent pair that both missed the pre-acquire lookup cannot both
+        // append a turn. A same-id same-digest retry replays; a same-id
+        // different-digest retry is a conflict.
+        let follow_up_digest =
+            follow_up_command_digest(thread_id, expected_thread_revision, &prompt);
+        if let Some(command_id) = command_id {
+            let previous: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                    [command_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_digest, result_json)) = previous {
+                if stored_digest != follow_up_digest {
+                    return Err(StorageError::ThreadCommandReplayMismatch);
+                }
+                let snapshot: ThreadSnapshot =
+                    serde_json::from_str(&result_json).map_err(invalid_json)?;
+                tx.commit()?;
+                return Ok((latte_core::CreateOutcome::Replayed(snapshot), None));
             }
         }
         let (revision, lifecycle, latest, fork_parent): (
@@ -1595,8 +1673,21 @@ impl Storage {
             None
         };
         let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+        // Durable dedup record: a crash-safe retry with the same command_id
+        // replays this acceptance instead of appending a duplicate turn.
+        if let Some(command_id) = command_id {
+            tx.execute(
+                "INSERT INTO thread_command_dedup_v2(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+                params![
+                    command_id.to_string(),
+                    follow_up_digest,
+                    serde_json::to_string(&snapshot).map_err(invalid_json)?,
+                    to_i64(now_ms)?
+                ],
+            )?;
+        }
         tx.commit()?;
-        Ok((snapshot, thread_event))
+        Ok((latte_core::CreateOutcome::Created(snapshot), thread_event))
     }
 
     pub(crate) fn switch_thread_binding_v2(
@@ -5395,6 +5486,27 @@ fn create_command_digest(
         "prompt": prompt,
         "binding": binding,
         "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
+/// Stable digest of a follow-up command's complete identity. A same-command
+/// retry must reproduce it byte-for-byte; any payload change is a conflict.
+fn follow_up_command_digest(
+    thread_id: latte_core::ThreadId,
+    expected_thread_revision: u64,
+    prompt: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "thread.follow_up",
+        "protocol_version": latte_core::THREAD_PROTOCOL_VERSION,
+        "thread_id": thread_id.to_string(),
+        "expected_thread_revision": expected_thread_revision,
+        "prompt": prompt,
     });
     format!(
         "{:x}",
@@ -10768,6 +10880,7 @@ mod tests {
         let runtime_lease = store.acquire_lease("owner", 10, 10_000).unwrap();
         assert!(matches!(
             store.create_started_thread_follow_up_v2(
+                None,
                 thread_id,
                 follow_up,
                 queued.revision,

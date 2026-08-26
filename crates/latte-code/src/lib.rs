@@ -972,8 +972,13 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
+                        // One stable command identity per follow-up turn: a
+                        // retry of this submission replays instead of
+                        // appending a duplicate turn.
+                        let command_id =
+                            latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
                         let result = handle
-                            .follow_up(&thread_id, expected_thread_revision, &prompt)
+                            .follow_up(&thread_id, &command_id, expected_thread_revision, &prompt)
                             .await
                             .map(|()| "follow-up completed".into())
                             .map_err(|error| error.to_string());

@@ -1518,9 +1518,14 @@ mod tests {
 
     #[tokio::test]
     async fn aliased_provider_propagates_inner_error() {
-        let registry = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://127.0.0.1:1',api_key:{source:'env',name:'PATH'},aliases:{read_file:'rf'}}}}",
-        )
+        // Bind-and-drop gives a port that refuses connections on every
+        // platform (port 1 is handled inconsistently by Windows http.sys).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let registry = ProviderRegistry::parse_jsonc(&format!(
+            r"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'https://127.0.0.1:{port}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}",
+        ))
         .unwrap();
         let resolved = registry
             .resolve_model("main", "m", &[tool("read_file")])
@@ -1529,12 +1534,16 @@ mod tests {
             messages: vec![],
             tools: vec![],
         };
-        // The inner provider cannot connect → Transport error propagated.
+        // The inner provider cannot connect → Transport or Timeout (depending
+        // on how the OS reports the refused connection) propagated.
         let err = resolved
             .provider
             .complete(request, test_provider_context())
             .await
             .unwrap_err();
-        assert!(matches!(err, ProviderError::Transport(_)));
+        assert!(
+            matches!(err, ProviderError::Transport(_) | ProviderError::Timeout),
+            "expected transport or timeout error, got {err:?}"
+        );
     }
 }

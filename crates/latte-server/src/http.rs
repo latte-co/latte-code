@@ -283,6 +283,10 @@ pub struct SessionResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FollowUpRequest {
+    /// Stable client-generated command identity. The `Idempotency-Key`
+    /// header must equal this value: one identity source for both the
+    /// in-memory ledger and the durable dedup record.
+    pub command_id: latte_core::ThreadCommandId,
     pub prompt: String,
     pub expected_thread_revision: u64,
 }
@@ -678,27 +682,29 @@ async fn get_session(
 
 /// Continues a session with a new user turn. Like create, this awaits durable
 /// acceptance before returning 202 and runs the turn in the background; a
-/// durable `Idempotency-Key` retry replays the original acceptance.
+/// crash-safe retry with the same `command_id` + payload replays the original
+/// acceptance as 200, and a same-`command_id` different-payload retry is 409.
 async fn follow_up(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<FollowUpRequest>,
 ) -> Result<(StatusCode, Json<FollowUpResponse>), HandlerError> {
-    // Follow-up appends a durable child turn, so the Idempotency-Key header
-    // is required (same fail-closed posture as create).
+    // The Idempotency-Key header must equal the body command_id: one identity
+    // source for both the in-memory ledger and the durable dedup record.
     let raw_key = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if raw_key.is_none() {
+    if raw_key != Some(req.command_id.to_string().as_str()) {
         return Err(bad_request(
-            "Idempotency-Key header is required for follow-up",
+            "Idempotency-Key header must equal body command_id",
         ));
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
     let payload_digest = canonical_digest(&serde_json::json!({
+        "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "expected_thread_revision": req.expected_thread_revision,
     }));
@@ -742,13 +748,14 @@ async fn follow_up_owned(
     let thread_id = parse_thread_id(id)?;
     let workspace = lookup_workspace(state, thread_id).await?;
     let runtime = workspace.runtime.clone();
+    let command_id = req.command_id;
     let prompt = req.prompt;
     let expected = req.expected_thread_revision;
 
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .follow_up_accepted(thread_id, expected, prompt, accept_tx)
+            .follow_up_accepted(thread_id, command_id, expected, prompt, accept_tx)
             .await
         {
             warn!("session {thread_id} background follow-up failed: {error}");
@@ -765,16 +772,21 @@ async fn follow_up_owned(
             )
         })?;
 
+    let (outcome, status) = match accepted {
+        latte_core::CreateOutcome::Created(snapshot) => (snapshot, StatusCode::ACCEPTED),
+        latte_core::CreateOutcome::Replayed(snapshot) => (snapshot, StatusCode::OK),
+    };
+
     let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
         session_id: thread_id.to_string(),
-        revision: accepted.revision,
+        revision: outcome.revision,
     });
 
     let body = FollowUpResponse {
-        accepted_revision: accepted.revision,
+        accepted_revision: outcome.revision,
         workspace_id: workspace.id.clone(),
     };
-    Ok((StatusCode::ACCEPTED, body))
+    Ok((status, body))
 }
 
 async fn switch_model(
@@ -2470,7 +2482,7 @@ mod tests {
             (
                 "POST",
                 format!("/v1/sessions/{missing}/follow-up"),
-                serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 }),
+                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000008", "prompt": "x", "expected_thread_revision": 0 }),
             ),
             (
                 "POST",
@@ -2515,7 +2527,7 @@ mod tests {
                     method,
                     &uri,
                     payload,
-                    &[("idempotency-key", "test-missing-session-key")],
+                    &[("idempotency-key", "01900000-0000-7000-8000-000000000008")],
                 )
                 .await
             } else {
@@ -2779,8 +2791,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-            &[("idempotency-key", "follow-key-1")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000001")],
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "follow-up returned {body:?}");
@@ -2794,8 +2806,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-            &[("idempotency-key", "follow-key-1")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000001")],
         )
         .await;
         assert_eq!(replay_status, StatusCode::ACCEPTED);
@@ -2813,8 +2825,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
-            &[("idempotency-key", "stale-revision-key")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000002", "prompt": "again", "expected_thread_revision": 999 })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000002")],
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3061,8 +3073,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "original", "expected_thread_revision": revision })),
-            &[("idempotency-key", "follow-mismatch")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "original", "expected_thread_revision": revision })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000003")],
         )
         .await;
         assert_eq!(first, StatusCode::ACCEPTED);
@@ -3073,9 +3085,9 @@ mod tests {
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
             Some(
-                serde_json::json!({ "prompt": "DIFFERENT", "expected_thread_revision": revision }),
+                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "DIFFERENT", "expected_thread_revision": revision }),
             ),
-            &[("idempotency-key", "follow-mismatch")],
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000003")],
         )
         .await;
         assert_eq!(mismatch, StatusCode::UNPROCESSABLE_ENTITY);
@@ -3316,8 +3328,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{missing}/follow-up"),
-            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
-            &[("idempotency-key", "fu-retry")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_thread_revision": 0 })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000004")],
         )
         .await;
         assert_eq!(first, StatusCode::NOT_FOUND);
@@ -3326,8 +3338,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{missing}/follow-up"),
-            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
-            &[("idempotency-key", "fu-retry")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_thread_revision": 0 })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000004")],
         )
         .await;
         // Released, so the retry re-runs (still 404) rather than a 409 in-flight.
@@ -3401,17 +3413,38 @@ mod tests {
     #[tokio::test]
     async fn follow_up_without_key_is_rejected() {
         // Follow-up appends a durable child turn, so the Idempotency-Key
-        // header is required (fail-closed, same posture as create).
+        // header must equal the body command_id (fail-closed, same posture
+        // as create).
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let (session_id, revision) = completed_session(&state, &workspace_id).await;
 
-        let (status, body) = call(
+        // A body command_id without the matching header is rejected.
+        let (status, body) = call_with_headers(
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "no key", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000005", "prompt": "no key", "expected_thread_revision": revision })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "follow-up: {body:?}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Idempotency-Key"),
+            "unexpected body: {body:?}"
+        );
+
+        // A header that does not match the body command_id is rejected.
+        let (status, body) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000006", "prompt": "mismatch", "expected_thread_revision": revision })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000099")],
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "follow-up: {body:?}");
@@ -3667,11 +3700,12 @@ mod tests {
 
         // Pre-claim with the exact payload digest the handler will compute.
         let payload_digest = canonical_digest(&serde_json::json!({
+            "command_id": "01900000-0000-7000-8000-000000000007",
             "prompt": "again",
             "expected_thread_revision": revision,
         }));
         state.idempotency_claim(
-            &format!("test-token:follow-up:{session_id}:inflight-key"),
+            &format!("test-token:follow-up:{session_id}:01900000-0000-7000-8000-000000000007"),
             &payload_digest,
         );
 
@@ -3679,8 +3713,8 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-            &[("idempotency-key", "inflight-key")],
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000007", "prompt": "again", "expected_thread_revision": revision })),
+            &[("idempotency-key", "01900000-0000-7000-8000-000000000007")],
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);

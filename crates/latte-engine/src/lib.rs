@@ -1128,19 +1128,29 @@ impl EngineHandle {
     }
     /// Atomically accepts and starts a follow-up child under the exact Session
     /// lease, preserving the completed parent if any precondition fails.
+    ///
+    /// When `command_id` is provided, the follow-up is crash-safe idempotent:
+    /// a same-id same-digest retry returns `Replayed` without starting a
+    /// runner (callers should first consult
+    /// [`Self::lookup_follow_up_replay`] before acquiring a lease), and a
+    /// same-id different-digest retry fails with
+    /// [`StorageError::ThreadCommandReplayMismatch`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_started_thread_follow_up_v2(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let response = self.storage.create_started_thread_follow_up_v2(
+        let (outcome, thread_event) = self.storage.create_started_thread_follow_up_v2(
+            command_id,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1149,8 +1159,44 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        Ok(self.finish_thread_response(response)?.snapshot)
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                let response = self.finish_thread_response(ThreadCommitResponse {
+                    snapshot,
+                    thread_event: thread_event.ok_or_else(|| {
+                        StorageError::InvalidData(
+                            "atomic follow-up start omitted its durable event".into(),
+                        )
+                    })?,
+                })?;
+                Ok(latte_core::CreateOutcome::Created(response.snapshot))
+            }
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
     }
+
+    /// Pre-acquire durable dedup lookup for a follow-up command. A hit means
+    /// the follow-up was already durably accepted (possibly by a process that
+    /// crashed before responding); the caller replays the snapshot and must
+    /// not acquire a lease or start a runner. A miss proceeds to lease
+    /// acquisition and [`Self::create_started_thread_follow_up_v2`].
+    pub fn lookup_follow_up_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        prompt: &str,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        self.storage.lookup_follow_up_replay(
+            command_id,
+            thread_id,
+            expected_thread_revision,
+            prompt,
+        )
+    }
+
     /// Switches the provider/model binding for subsequent children of an idle
     /// Session and publishes the durable binding-change event.
     pub fn switch_thread_binding_v2(

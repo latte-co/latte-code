@@ -466,21 +466,39 @@ impl ThreadRuntimeService {
         prompt: String,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt, None)
-            .await?;
+        // The legacy in-process path mints a fresh command id so the durable
+        // dedup record is still written (it will never replay, but the
+        // follow-up contract is uniform).
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        let snapshot = match self
+            .follow_up_one(
+                thread_id,
+                expected_thread_revision,
+                prompt,
+                Some(command_id),
+                None,
+            )
+            .await?
+        {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        };
         self.drain_mailbox(snapshot, runner).await
     }
 
     /// Like [`Self::follow_up`], but signals `accept` once the follow-up
-    /// submission is durably persisted, before the provider turn runs.
+    /// submission is durably persisted, before the provider turn runs. The
+    /// signal carries the accepted snapshot wrapped in
+    /// [`latte_core::CreateOutcome`]: `Created` (202) or `Replayed` (200,
+    /// crash-safe idempotent replay).
     pub async fn follow_up_accepted(
         &self,
         thread_id: ThreadId,
+        command_id: ThreadCommandId,
         expected_thread_revision: u64,
         prompt: String,
-        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        accept: oneshot::Sender<Result<latte_core::CreateOutcome<ThreadSnapshot>, String>>,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let runner = match self.begin_runner(thread_id) {
             Ok(runner) => runner,
             Err(error) => {
@@ -488,10 +506,28 @@ impl ThreadRuntimeService {
                 return Err(error);
             }
         };
-        let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt, Some(accept))
+        let outcome = self
+            .follow_up_one(
+                thread_id,
+                expected_thread_revision,
+                prompt,
+                Some(command_id),
+                Some(accept),
+            )
             .await?;
-        self.drain_mailbox(snapshot, runner).await
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                let drained = self.drain_mailbox(snapshot, runner).await?;
+                Ok(latte_core::CreateOutcome::Created(drained))
+            }
+            // A replay owns no runner: the accepted submission is already
+            // durable and the pre-crash provider task is gone, so there is
+            // nothing to drain. Recovery of the expired lease is the
+            // sweeper's job.
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
     }
 
     async fn follow_up_one(
@@ -499,8 +535,9 @@ impl ThreadRuntimeService {
         thread_id: ThreadId,
         expected_thread_revision: u64,
         prompt: String,
-        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        command_id: Option<ThreadCommandId>,
+        accept: Option<oneshot::Sender<Result<latte_core::CreateOutcome<ThreadSnapshot>, String>>>,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let snapshot = match self.load_full(thread_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -508,6 +545,33 @@ impl ThreadRuntimeService {
                 return Err(error);
             }
         };
+        // Crash-safe idempotency: look up the durable dedup record BEFORE the
+        // revision check and lease acquisition. A retry after a crash hits the
+        // record and replays without blocking on the dead owner's
+        // still-unexpired lease, and without failing the revision fence (the
+        // client's expected revision predates the accepted follow-up).
+        if let Some(command_id) = &command_id {
+            match self.engine.lookup_follow_up_replay(
+                command_id,
+                thread_id,
+                expected_thread_revision,
+                &prompt,
+            ) {
+                Ok(Some(snapshot)) => {
+                    signal_accept(
+                        accept,
+                        Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                    );
+                    return Ok(latte_core::CreateOutcome::Replayed(snapshot));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = ThreadRuntimeError::from(error);
+                    signal_accept(accept, Err(error.to_string()));
+                    return Err(error);
+                }
+            }
+        }
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
             signal_accept(accept, Err(ThreadRuntimeError::InvalidState.to_string()));
@@ -529,6 +593,7 @@ impl ThreadRuntimeService {
             }
         };
         let started = match self.engine.create_started_thread_follow_up_v2(
+            command_id.as_ref(),
             thread_id,
             run_id,
             expected_thread_revision,
@@ -536,27 +601,46 @@ impl ThreadRuntimeService {
             &lease,
             now_ms(),
         ) {
-            Ok(started) => started,
+            Ok(outcome) => outcome,
             Err(error) => {
                 let error = ThreadRuntimeError::from(error);
                 signal_accept(accept, Err(error.to_string()));
                 return Err(error);
             }
         };
+        let started = match started {
+            latte_core::CreateOutcome::Created(snapshot) => snapshot,
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                // The in-transaction recheck caught a concurrent follow-up (or
+                // a retry that raced the pre-acquire lookup). Don't restart
+                // the provider; return the existing snapshot.
+                signal_accept(
+                    accept,
+                    Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                );
+                return Ok(latte_core::CreateOutcome::Replayed(snapshot));
+            }
+        };
         // The follow-up submission is now durable — acknowledge acceptance.
-        signal_accept(accept, Ok(started.clone()));
+        signal_accept(
+            accept,
+            Ok(latte_core::CreateOutcome::Created(started.clone())),
+        );
         let Ok(provider) = (self.provider)(&started.binding) else {
-            return self.fail_retryable(
-                thread_id,
-                run_id,
-                started.revision,
-                active_run_revision(&started)?,
-                provider_configuration_failure_message(),
-                &lease,
-            );
+            return self
+                .fail_retryable(
+                    thread_id,
+                    run_id,
+                    started.revision,
+                    active_run_revision(&started)?,
+                    provider_configuration_failure_message(),
+                    &lease,
+                )
+                .map(latte_core::CreateOutcome::Created);
         };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
+            .map(latte_core::CreateOutcome::Created)
     }
 
     /// Enqueues a user turn behind the active turn for this session. The
@@ -619,9 +703,22 @@ impl ThreadRuntimeService {
             let Some(prompt) = prompt else {
                 return Ok(snapshot);
             };
-            snapshot = self
-                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt, None)
-                .await?;
+            // Queued mailbox turns are process-local by design; mint a fresh
+            // command id so the durable dedup record is still written.
+            let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+            snapshot = match self
+                .follow_up_one(
+                    snapshot.thread_id,
+                    snapshot.revision,
+                    prompt,
+                    Some(command_id),
+                    None,
+                )
+                .await?
+            {
+                latte_core::CreateOutcome::Created(snapshot)
+                | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+            };
         }
     }
 
@@ -2351,7 +2448,13 @@ mod tests {
         // follow_up_accepted must also reject while the runner is active.
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
-            .follow_up_accepted(thread_id, 0, "second follow-up".into(), accept_tx)
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                0,
+                "second follow-up".into(),
+                accept_tx,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::InvalidState));
@@ -5131,18 +5234,34 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .follow_up_accepted(thread_id, ready.revision, "second".into(), tx)
+                    .follow_up_accepted(
+                        thread_id,
+                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        ready.revision,
+                        "second".into(),
+                        tx,
+                    )
                     .await
             })
         };
         let accepted = rx.await.unwrap().expect("follow-up accepted");
+        let accepted = match accepted {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        };
         assert_eq!(accepted.thread_id, thread_id);
         assert!(handle.await.unwrap().is_ok());
 
         // A stale follow-up signals rejection and errors (call errors directly).
         let (tx, rx) = oneshot::channel();
         let stale = service
-            .follow_up_accepted(thread_id, 999, "stale".into(), tx)
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                999,
+                "stale".into(),
+                tx,
+            )
             .await;
         assert!(rx.await.unwrap().is_err());
         assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
@@ -5637,7 +5756,13 @@ mod tests {
             .unwrap();
         let (tx, rx) = oneshot::channel();
         let err = service
-            .follow_up_accepted(thread_id, ready.revision, "second".into(), tx)
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                ready.revision,
+                "second".into(),
+                tx,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");

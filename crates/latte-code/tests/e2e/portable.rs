@@ -796,8 +796,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
     assert_eq!(follow_status, 202, "follow-up returned {follow_body:?}");
     let follow_revision = follow_body["accepted_revision"].as_u64().unwrap();
@@ -808,8 +808,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
     assert_eq!(replay_follow_status, 202);
     assert_eq!(
@@ -833,8 +833,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
-        &[("Idempotency-Key", "stale-revision-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000012", "prompt": "again", "expected_thread_revision": 999 })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000012")],
     );
     assert_eq!(follow_conflict, 409);
 
@@ -963,8 +963,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "DIFFERENT", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "DIFFERENT", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
     assert_eq!(follow_mismatch_status, 422);
     assert_eq!(
@@ -1009,8 +1009,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "continue", "expected_thread_revision": no_key_rev })),
-        &[("Idempotency-Key", "second-session-follow-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000014", "prompt": "continue", "expected_thread_revision": no_key_rev })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000014")],
     );
     assert_eq!(no_key_follow_status, 202);
 
@@ -1019,7 +1019,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "no key", "expected_thread_revision": no_key_rev })),
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000014", "prompt": "no key", "expected_thread_revision": no_key_rev })),
         &[],
     );
     assert_eq!(missing_key_status, 400);
@@ -1056,8 +1056,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "stale", "expected_thread_revision": 999 })),
-        &[("Idempotency-Key", "stale-revision-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000012", "prompt": "stale", "expected_thread_revision": 999 })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000012")],
     );
     assert_eq!(no_key_stale_status, 409);
 }
@@ -2321,8 +2321,8 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "switch-follow")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000015", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000015")],
     );
     assert_eq!(f1, 202, "follow-up returned {f1_body:?}");
     // Retry with the same key replays the original accepted body.
@@ -2330,11 +2330,149 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "switch-follow")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000015", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000015")],
     );
     assert_eq!(f2, 202);
     assert_eq!(f2_body, f1_body, "keyed follow-up retry must replay");
+}
+
+/// A follow-up accepted by one server instance must replay identically after a
+/// server restart: the durable `thread_command_dedup_v2` record prevents a
+/// duplicate turn when the client retries with the same `command_id`.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first done"),
+        ProviderReply::completion("follow-up done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // First server instance: create + follow-up, then shut down.
+    let (session_id, original_revision, follow_revision, follow_command_id) = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "restart replay", &binding);
+        assert_eq!(create_status, 202);
+        let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait for the initial turn to complete.
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Send a follow-up with a stable command_id.
+        let command_id = "01900000-0000-7000-8000-0000000000a1".to_string();
+        let (f_status, f_body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "after restart",
+                "expected_thread_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up returned {f_body:?}");
+        let follow_revision = f_body["accepted_revision"].as_u64().unwrap();
+
+        // Wait for the follow-up turn to complete.
+        loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (session_id, revision, follow_revision, command_id)
+        // `server` drops here → SIGTERM → graceful shutdown.
+    };
+
+    // Second instance: replay the same follow-up. The durable dedup record
+    // must prevent a duplicate turn.
+    let server = ServeChild::start(&scenario);
+    let (replay_status, replay_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": follow_command_id,
+            "prompt": "after restart",
+            "expected_thread_revision": original_revision,
+        })),
+        &[("Idempotency-Key", &follow_command_id)],
+    );
+    // The replay returns the original acceptance (200 or 202) without
+    // appending a new turn.
+    assert!(
+        replay_status == 200 || replay_status == 202,
+        "replay returned {replay_status}: {replay_body:?}"
+    );
+    assert_eq!(
+        replay_body["accepted_revision"].as_u64().unwrap(),
+        follow_revision,
+        "replay must return the original accepted revision, not advance it"
+    );
+
+    // The transcript must not contain a duplicate user turn.
+    let (_, snap) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let user_turns = snap["snapshot"]["transcript"]["entries"]
+        .as_array()
+        .map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|e| e["kind"].as_str() == Some("user"))
+                .count()
+        });
+    assert_eq!(
+        user_turns, 2,
+        "expected exactly 2 user turns (initial + follow-up), got {user_turns}: \
+         a duplicate turn was appended after restart"
+    );
 }
 
 /// Exercises the session-management surface end to end against the final
@@ -4493,6 +4631,132 @@ fn engine_snapshot_and_conversation_paths() {
     // Thread session (summary).
     let summary = engine.thread_session_v2(thread_id).unwrap();
     assert_eq!(summary.unwrap().thread_id, thread_id);
+}
+
+/// Engine-level run lifecycle: create thread, start a linked run through the
+/// v2 thread commit path, append transcript entries, and verify the run state
+/// transitions — covers storage transition paths CLI E2E can't reach.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_run_lifecycle_covers_transitions() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lifecycle", 1)
+        .unwrap();
+
+    // The thread's initial run should be in Queued state.
+    let state = engine.show(run_id).unwrap();
+    assert_eq!(state.status, latte_core::RunStatus::Queued);
+
+    // Linked v2 runs mutate exclusively through thread commits, scoped to a
+    // thread lease — the legacy run-transition path rejects them by design.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    assert_eq!(started.snapshot.thread_id, thread_id);
+    assert_eq!(started.snapshot.active_run_id, Some(run_id));
+    assert_eq!(
+        engine.show(run_id).unwrap().status,
+        latte_core::RunStatus::Running
+    );
+    let mut revision = started.snapshot.revision;
+    let mut run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .expect("started run appears in snapshot")
+        .run_revision;
+
+    // Append transcript entries on both sides of the conversation.
+    for (kind, text) in [
+        (latte_core::TranscriptKind::User, "first prompt"),
+        (latte_core::TranscriptKind::Assistant, "first reply"),
+    ] {
+        let committed = engine
+            .commit_thread_run_update(
+                latte_engine::ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: revision,
+                    expected_run_revision: run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: latte_engine::CommitThreadRunUpdate::AppendTranscript {
+                        source_key: format!("append-{text}"),
+                        kind,
+                        text: text.into(),
+                        payload: None,
+                    },
+                },
+                &lease,
+                4,
+            )
+            .unwrap();
+        revision = committed.snapshot.revision;
+        run_revision = committed
+            .snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .expect("run still appears in snapshot")
+            .run_revision;
+    }
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    // Start writes its own transcript entry, so the two appends make three.
+    let texts: Vec<&str> = snapshot
+        .transcript
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect();
+    assert!(texts.contains(&"first prompt"), "texts={texts:?}");
+    assert!(texts.contains(&"first reply"), "texts={texts:?}");
+
+    // List runs.
+    let runs = engine.list().unwrap();
+    assert!(!runs.is_empty());
 }
 
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a

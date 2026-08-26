@@ -294,6 +294,7 @@ async fn response_schema_snapshots() {
         Method::POST,
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(serde_json::json!({
+            "command_id": command_id,
             "prompt": "again",
             "expected_thread_revision": body["snapshot"]["revision"].as_u64().unwrap_or(1),
         })),
