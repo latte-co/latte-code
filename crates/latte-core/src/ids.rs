@@ -104,3 +104,16 @@ impl<C: Clock> IdSource for SystemIdSource<C> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_id_as_uuid_round_trips() {
+        let uuid = Uuid::now_v7();
+        let id = ThreadId::from_uuid(uuid);
+        assert_eq!(id.as_uuid(), uuid);
+        assert_eq!(id.to_string(), uuid.to_string());
+    }
+}
