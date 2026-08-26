@@ -1257,6 +1257,11 @@ mod tests {
     use std::time::Duration;
     use tower::util::ServiceExt;
 
+    /// Serializes tests that send process-wide signals (SIGINT/SIGTERM) so a
+    /// concurrent signal from one test cannot resolve another test's
+    /// `shutdown_signal` waiter via the wrong select arm.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn valid_binding() -> serde_json::Value {
         serde_json::json!({
             "version": 1,
@@ -4009,6 +4014,7 @@ mod tests {
         // Sending SIGTERM resolves shutdown_signal, serve_with_shutdown stops
         // gracefully, and serve_on returns Ok (covers lib.rs L33 and the
         // shutdown_signal terminate arm / closing lines).
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
@@ -4626,6 +4632,7 @@ mod tests {
         // Sending SIGINT to self resolves the ctrl_c arm of shutdown_signal
         // (the SIGTERM arm is covered by serve_on_returns_after_sigterm). An
         // early handler keeps the process alive past the default disposition.
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
