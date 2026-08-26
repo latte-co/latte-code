@@ -96,8 +96,11 @@ pub enum CreateOutcome<T = ThreadSnapshot> {
 /// code without inspecting error strings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateAcceptError {
-    /// A durable command-id reuse with a different payload, or a non-replay
-    /// create for an already-existing thread. Maps to 409 Conflict.
+    /// A durable command-id reuse with a different payload. Maps to 422
+    /// Unprocessable Entity (idempotency mismatch).
+    IdempotencyMismatch(String),
+    /// A non-replay create for an already-existing thread, or a revision
+    /// conflict. Maps to 409 Conflict.
     Conflict(String),
     /// Any other acceptance failure. Maps to 500.
     Failed(String),

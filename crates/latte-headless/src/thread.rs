@@ -497,12 +497,14 @@ impl ThreadRuntimeService {
         command_id: ThreadCommandId,
         expected_thread_revision: u64,
         prompt: String,
-        accept: oneshot::Sender<Result<latte_core::CreateOutcome<ThreadSnapshot>, String>>,
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+        >,
     ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let runner = match self.begin_runner(thread_id) {
             Ok(runner) => runner,
             Err(error) => {
-                let _ = accept.send(Err(error.to_string()));
+                let _ = accept.send(Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -530,18 +532,23 @@ impl ThreadRuntimeService {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn follow_up_one(
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
         prompt: String,
         command_id: Option<ThreadCommandId>,
-        accept: Option<oneshot::Sender<Result<latte_core::CreateOutcome<ThreadSnapshot>, String>>>,
+        accept: Option<
+            oneshot::Sender<
+                Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+            >,
+        >,
     ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let snapshot = match self.load_full(thread_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -567,20 +574,25 @@ impl ThreadRuntimeService {
                 Ok(None) => {}
                 Err(error) => {
                     let error = ThreadRuntimeError::from(error);
-                    signal_accept(accept, Err(error.to_string()));
+                    signal_accept(accept, Err(classify_create_error(&error)));
                     return Err(error);
                 }
             }
         }
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
-            signal_accept(accept, Err(ThreadRuntimeError::InvalidState.to_string()));
+            signal_accept(
+                accept,
+                Err(latte_core::CreateAcceptError::Conflict(
+                    ThreadRuntimeError::InvalidState.to_string(),
+                )),
+            );
             return Err(ThreadRuntimeError::InvalidState);
         }
         let messages = match self.history_with_prompt(&snapshot, &prompt) {
             Ok(messages) => messages,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -588,7 +600,7 @@ impl ThreadRuntimeService {
         let lease = match self.acquire(thread_id) {
             Ok(lease) => lease,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -604,7 +616,7 @@ impl ThreadRuntimeService {
             Ok(outcome) => outcome,
             Err(error) => {
                 let error = ThreadRuntimeError::from(error);
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -2054,15 +2066,19 @@ fn signal_accept<T, E>(accept: Option<oneshot::Sender<Result<T, E>>>, result: Re
     }
 }
 
-/// Classifies a create-acceptance error for the HTTP layer: a durable
-/// command-id reuse with a different payload, or a non-replay create for an
-/// existing thread, is a 409 conflict; everything else is a 500.
+/// Classifies a create/follow-up acceptance error for the HTTP layer: a
+/// durable command-id reuse with a different payload is a 422 idempotency
+/// mismatch; a non-replay create for an existing thread, or a stale revision
+/// / invalid state, is a 409 conflict; everything else is a 500.
 fn classify_create_error(error: &ThreadRuntimeError) -> latte_core::CreateAcceptError {
     match error {
-        ThreadRuntimeError::Storage(
-            latte_engine::StorageError::ThreadCommandReplayMismatch
-            | latte_engine::StorageError::ThreadAlreadyExists(_),
-        ) => latte_core::CreateAcceptError::Conflict(error.to_string()),
+        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch) => {
+            latte_core::CreateAcceptError::IdempotencyMismatch(error.to_string())
+        }
+        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(_))
+        | ThreadRuntimeError::InvalidState => {
+            latte_core::CreateAcceptError::Conflict(error.to_string())
+        }
         _ => latte_core::CreateAcceptError::Failed(error.to_string()),
     }
 }
@@ -5352,13 +5368,28 @@ mod tests {
 
     #[test]
     fn classify_create_error_maps_conflict_and_failed() {
-        let conflict =
+        let mismatch =
             ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch);
+        assert!(matches!(
+            classify_create_error(&mismatch),
+            latte_core::CreateAcceptError::IdempotencyMismatch(_)
+        ));
+        let conflict =
+            ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(
+                latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()),
+            ));
         assert!(matches!(
             classify_create_error(&conflict),
             latte_core::CreateAcceptError::Conflict(_)
         ));
-        let failed = ThreadRuntimeError::InvalidState;
+        // InvalidState (stale revision / not accepting follow-up) is a
+        // client-side conflict, not a server failure.
+        let invalid_state = ThreadRuntimeError::InvalidState;
+        assert!(matches!(
+            classify_create_error(&invalid_state),
+            latte_core::CreateAcceptError::Conflict(_)
+        ));
+        let failed = ThreadRuntimeError::MailboxFull;
         assert!(matches!(
             classify_create_error(&failed),
             latte_core::CreateAcceptError::Failed(_)
@@ -5767,7 +5798,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
         let accepted = rx.await.unwrap().unwrap_err();
-        assert!(accepted.contains("thread storage"));
+        let message = match accepted {
+            latte_core::CreateAcceptError::Conflict(message)
+            | latte_core::CreateAcceptError::IdempotencyMismatch(message)
+            | latte_core::CreateAcceptError::Failed(message) => message,
+        };
+        assert!(message.contains("thread storage"));
     }
 
     #[tokio::test]

@@ -4759,6 +4759,199 @@ fn engine_run_lifecycle_covers_transitions() {
     assert!(!runs.is_empty());
 }
 
+/// Engine-level follow-up durable idempotency: a same-command_id retry replays
+/// the original acceptance without appending a duplicate turn, and a
+/// same-command_id different-payload retry is a conflict.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and complete its first run so the thread is ready for
+    // follow-up.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "dedup", 1)
+        .unwrap();
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let mut revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Fail the run (retryable) so the thread becomes ready for follow-up.
+    let committed = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test failure".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    revision = committed.snapshot.revision;
+    engine.release_lease(&lease).unwrap();
+
+    // First follow-up with a stable command_id → Created.
+    let command_id = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let follow_lease = engine.acquire_thread_lease(thread_id, 5, 10_000).unwrap();
+    let first = engine
+        .create_started_thread_follow_up_v2(
+            Some(&command_id),
+            thread_id,
+            follow_run_id,
+            revision,
+            "follow-up turn",
+            &follow_lease,
+            6,
+        )
+        .unwrap();
+    let first_snapshot = match first {
+        latte_core::CreateOutcome::Created(snapshot) => snapshot,
+        latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
+    };
+    assert_eq!(first_snapshot.active_run_id, Some(follow_run_id));
+
+    // Replay with the same command_id + payload → Replayed, no duplicate turn.
+    let replay_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let replay = engine
+        .create_started_thread_follow_up_v2(
+            Some(&command_id),
+            thread_id,
+            replay_run_id,
+            revision,
+            "follow-up turn",
+            &follow_lease,
+            7,
+        )
+        .unwrap();
+    let replayed_snapshot = match replay {
+        latte_core::CreateOutcome::Created(_) => panic!("replay must be Replayed"),
+        latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
+    // The replay returns the original acceptance, not a new turn.
+    assert_eq!(replayed_snapshot.thread_id, thread_id);
+    assert_eq!(replayed_snapshot.revision, first_snapshot.revision);
+
+    // Same command_id but different prompt → ThreadCommandReplayMismatch.
+    let mismatch_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let mismatch = engine.create_started_thread_follow_up_v2(
+        Some(&command_id),
+        thread_id,
+        mismatch_run_id,
+        revision,
+        "DIFFERENT prompt",
+        &follow_lease,
+        8,
+    );
+    assert!(matches!(
+        mismatch,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Same command_id but different expected revision → mismatch (digest
+    // includes expected_thread_revision).
+    let mismatch2 = engine.create_started_thread_follow_up_v2(
+        Some(&command_id),
+        thread_id,
+        mismatch_run_id,
+        revision + 1,
+        "follow-up turn",
+        &follow_lease,
+        9,
+    );
+    assert!(matches!(
+        mismatch2,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Pre-acquire lookup also finds the record (the headless replay path).
+    let looked_up = engine
+        .lookup_follow_up_replay(&command_id, thread_id, revision, "follow-up turn")
+        .unwrap();
+    assert!(
+        looked_up.is_some(),
+        "pre-acquire lookup must find the record"
+    );
+    let looked_up = looked_up.unwrap();
+    assert_eq!(looked_up.revision, first_snapshot.revision);
+
+    // Pre-acquire lookup with a different prompt → mismatch.
+    let lookup_mismatch = engine.lookup_follow_up_replay(&command_id, thread_id, revision, "WRONG");
+    assert!(matches!(
+        lookup_mismatch,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Pre-acquire lookup with an unknown command_id → None.
+    let unknown = engine.lookup_follow_up_replay(
+        &latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+        thread_id,
+        revision,
+        "follow-up turn",
+    );
+    assert!(unknown.unwrap().is_none());
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.

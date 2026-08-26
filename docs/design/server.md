@@ -81,21 +81,21 @@ Server 会规范化路径并返回稳定的 `workspace_id`。后续请求使用�
 ```
 POST /v1/workspaces/{workspace_id}/sessions
 Headers: Idempotency-Key: <uuid>
-Body: { "prompt": "...", "binding": {...} }
+Body: { "thread_id": "<uuid>", "command_id": "<uuid>", "prompt": "...", "binding": {...} }
 Response: 202 { "session_id": "...", "accepted_revision": 42 }
 ```
 
-返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。
+`thread_id` 和 `command_id` 由客户端生成（UUID v7）。`Idempotency-Key` 头必须等于 `command_id`。返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复创建。
 
 **Follow Up**
 ```
 POST /v1/sessions/{id}/follow-up
 Headers: Idempotency-Key: <uuid>
-Body: { "prompt": "...", "expected_thread_revision": 42 }
+Body: { "command_id": "<uuid>", "prompt": "...", "expected_thread_revision": 42 }
 Response: 202 { "accepted_revision": 43, "workspace_id": "ws_..." }
 ```
 
-`workspace_id` 用于订阅正确的 workspace 事件流。
+`command_id` 由客户端生成（UUID v7），`Idempotency-Key` 头必须等于 `command_id`。`workspace_id` 用于订阅正确的 workspace 事件流。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复追加 turn；同一 `command_id` + 不同 payload 返回 422 `idempotency_mismatch`。
 
 **切换模型**
 ```

@@ -765,12 +765,7 @@ async fn follow_up_owned(
     let accepted = accept_rx
         .await
         .map_err(|_| failed("session runtime dropped before acceptance"))?
-        .map_err(|_| {
-            conflict(
-                "thread revision mismatch or session not accepting follow-up",
-                None,
-            )
-        })?;
+        .map_err(|error| map_create_error(&error))?;
 
     let (outcome, status) = match accepted {
         latte_core::CreateOutcome::Created(snapshot) => (snapshot, StatusCode::ACCEPTED),
@@ -1098,11 +1093,15 @@ fn failed(message: &str) -> HandlerError {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed", message, None)
 }
 
-/// Maps a session-create acceptance error to an HTTP response. A durable
-/// command-id reuse with a different payload, or a non-replay create for an
-/// already-existing thread, is a 409 conflict; other failures are 500.
+/// Maps a session-create/follow-up acceptance error to an HTTP response. A
+/// durable command-id reuse with a different payload is a 422 idempotency
+/// mismatch; a revision conflict or existing-thread error is 409; other
+/// failures are 500.
 fn map_create_error(error: &latte_core::CreateAcceptError) -> HandlerError {
     match error {
+        latte_core::CreateAcceptError::IdempotencyMismatch(message) => {
+            payload_mismatch_with_message(message)
+        }
         latte_core::CreateAcceptError::Conflict(message) => conflict(message, None),
         latte_core::CreateAcceptError::Failed(message) => {
             failed(&format!("failed to accept session: {message}"))
@@ -1127,6 +1126,18 @@ fn payload_mismatch() -> HandlerError {
         StatusCode::UNPROCESSABLE_ENTITY,
         "idempotency_mismatch",
         "this idempotency key was used with a different request payload",
+        None,
+    )
+}
+
+/// Like [`payload_mismatch`], but carries the durable dedup layer's own
+/// diagnostic so a restart-retry mismatch is distinguishable from a
+/// same-process ledger mismatch.
+fn payload_mismatch_with_message(message: &str) -> HandlerError {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "idempotency_mismatch",
+        message,
         None,
     )
 }
@@ -1864,9 +1875,9 @@ mod tests {
     async fn create_session_same_command_different_payload_conflicts() {
         // The durable dedup binds command_id to the complete command identity.
         // A crash-restart retry that reuses the command_id but changes the
-        // payload is a replay conflict (409), not a silent success. The fresh
-        // ServerState models the restart so the durable path (not the
-        // in-memory ledger's 422) is exercised.
+        // payload is a durable idempotency mismatch (422), not a silent
+        // success. The fresh ServerState models the restart so the durable
+        // path (not the in-memory ledger's 422) is exercised.
         let workspace = tempfile::tempdir().unwrap();
         let workspace_path = workspace.path().to_string_lossy().to_string();
         let state = completing_state();
@@ -1898,7 +1909,9 @@ mod tests {
         }
 
         // Fresh process, same DB: a *new* thread_id but the *same* command_id
-        // with a different payload is a durable command-id reuse → 409.
+        // with a different payload is a durable command-id reuse → 422
+        // idempotency mismatch (not 409, so the client doesn't retry as a
+        // revision conflict).
         let restarted = completing_state();
         let restarted_id = create_workspace_id(&restarted, &workspace_path).await;
         let (status, body) = create_call(
@@ -1912,8 +1925,8 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"]["type"], "conflict");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["type"], "idempotency_mismatch");
     }
 
     #[tokio::test]
@@ -4653,6 +4666,22 @@ mod tests {
         assert_eq!(body.0.error.error_type, "failed");
         assert!(
             body.0.error.message.contains("boom"),
+            "unexpected message: {}",
+            body.0.error.message
+        );
+    }
+
+    #[test]
+    fn map_create_error_maps_idempotency_mismatch_to_422() {
+        // CreateAcceptError::IdempotencyMismatch maps to 422 (covers the
+        // IdempotencyMismatch arm of map_create_error).
+        let (status, body) = map_create_error(&latte_core::CreateAcceptError::IdempotencyMismatch(
+            "durable dedup mismatch".into(),
+        ));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.0.error.error_type, "idempotency_mismatch");
+        assert!(
+            body.0.error.message.contains("durable dedup mismatch"),
             "unexpected message: {}",
             body.0.error.message
         );
