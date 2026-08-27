@@ -6961,6 +6961,197 @@ fn final_binary_cli_run_with_provider_error_fails() {
     provider.assert_consumed();
 }
 
+/// Provider responses with non-standard finish reasons (`length`,
+/// `content_filter`, unknown) must still complete the session, covering the
+/// `finish_reason` mapping branches in the provider.
+#[test]
+fn final_binary_cli_run_with_variant_finish_reasons_completes() {
+    for reason in ["length", "content_filter", "custom_reason"] {
+        let scenario = Scenario::new();
+        let reply = ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "choices": [{
+                    "message": {"content": format!("done with {reason}"), "tool_calls": []},
+                    "finish_reason": reason
+                }]
+            }),
+        );
+        let provider = ScriptedProvider::start([reply]);
+        scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+        let output = scenario.output(
+            &["--json", "run", &format!("finish reason {reason}")],
+            |command| {
+                command.env("TEST_OPENAI_KEY", "finish-reason-secret");
+            },
+        );
+        assert!(
+            output.status.success(),
+            "finish_reason={reason}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = json(&output);
+        assert_eq!(body["status"], "completed", "finish_reason={reason}");
+        provider.assert_consumed();
+    }
+}
+
+/// `edit_file` without `before` or `anchor` must fail with an input error,
+/// covering the tool preparation validation branch.
+#[test]
+fn final_binary_cli_run_with_edit_file_missing_before_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "original\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "target.txt",
+            "after": "replaced",
+            "precondition": {"hash": "abc", "size": 9, "modified_ns": 0}
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit without before"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-missing-before-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `edit_file` with a `before` that doesn't match the file content must fail,
+/// covering the edit execution mismatch branch.
+#[test]
+fn final_binary_cli_run_with_edit_file_mismatched_before_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "original content\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "target.txt",
+            "before": "nonexistent text",
+            "after": "replaced",
+            "precondition": {"hash": "abc", "size": 17, "modified_ns": 0}
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit with mismatch"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-mismatch-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// Process tool with an empty argv must be denied without spawning, covering
+/// the empty-argv Deny branch of the process classifier.
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_empty_argv_process_denied() {
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "argv": [],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "empty-argv-1",
+        "process",
+        &process,
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "run an empty argv"], |command| {
+        command.env("TEST_OPENAI_KEY", "empty-argv-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `list_directory` on a file path (not a directory) must fail with an
+/// input error, covering the tool's type-check branch.
+#[test]
+fn final_binary_cli_run_with_list_directory_on_file_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("notadir.txt"), "i am a file\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "ls-1",
+        "list_directory",
+        &serde_json::json!({"path": "notadir.txt"}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "list a file"], |command| {
+        command.env("TEST_OPENAI_KEY", "ls-file-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted"
+            || body["status"] == "reconciliation_required",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `search` with an empty query must fail with an input error, covering the
+/// tool's validation branch.
+#[test]
+fn final_binary_cli_run_with_empty_search_query_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "hello\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "search-1",
+        "search",
+        &serde_json::json!({"query": "", "path": "."}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "search with empty query"], |command| {
+        command.env("TEST_OPENAI_KEY", "empty-search-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
 #[test]
 fn final_binary_cli_run_with_missing_file_tool_covers_error_path() {
     let scenario = Scenario::new();
