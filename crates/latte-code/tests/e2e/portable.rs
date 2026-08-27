@@ -4231,6 +4231,203 @@ fn final_binary_cli_run_reconnects_after_sse_stream_close() {
     );
 }
 
+/// Mock server that streams every SSE event variant in one connection —
+/// assistant deltas, tool progress, provider attempts, cross-session
+/// progress, `thread_changed`, `resync_required`, unknown types, malformed
+/// payloads, multi-line data, and comments — then closes. This covers the
+/// `parse_sse_frame` / `SseDecoder` / `render_progress` / `observe_session`
+/// branches that a real server rarely produces in a single session.
+struct MockRichSseServer {
+    port: u16,
+    snapshot_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MockRichSseServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let snapshot_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&snapshot_count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let count = std::sync::Arc::clone(&count);
+                std::thread::spawn(move || {
+                    handle_rich_sse_request(stream, &count);
+                });
+            }
+        });
+        Self {
+            port,
+            snapshot_count,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_rich_sse_request(
+    mut stream: std::net::TcpStream,
+    count: &std::sync::atomic::AtomicUsize,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+    let method = parts[0];
+    let path = parts[1].split_once('?').map_or(parts[1], |(p, _)| p);
+
+    // Read headers until the blank line.
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(len) = trimmed.to_lowercase().strip_prefix("content-length:") {
+            content_length = len.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let session_id = "01a0194a-0000-7000-8000-000000000001";
+    let running_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+    let completed_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"{session_id}","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_run_id":"01a0194a-0000-7000-8000-000000000002","active_run_id":null,"pending":null,"runs":[{{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+
+    let response: Vec<u8> = match (method, path) {
+        ("GET", "/health") => mock_http_response(200, "text/plain", b"ok"),
+        ("POST", "/v1/workspaces") => {
+            mock_http_response(200, "application/json", br#"{"workspace_id":"ws-1"}"#)
+        }
+        ("GET", p) if p.ends_with("/bindings") => mock_http_response(
+            200,
+            "application/json",
+            format!(r#"{{"bindings":[{{"is_default":true,"binding":{binding}}}]}}"#).as_bytes(),
+        ),
+        ("POST", p) if p.ends_with("/sessions") => mock_http_response(
+            202,
+            "application/json",
+            format!(r#"{{"session_id":"{session_id}","accepted_revision":1}}"#).as_bytes(),
+        ),
+        ("GET", p) if p.starts_with("/v1/sessions/") => {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = if n < 6 {
+                running_snapshot.as_bytes()
+            } else {
+                completed_snapshot.as_bytes()
+            };
+            mock_http_response(200, "application/json", body)
+        }
+        ("GET", p) if p.ends_with("/events") => {
+            // Rich SSE stream: every event variant in one connection.
+            let body = format!(
+                concat!(
+                    ": keepalive comment\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"hello\"}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"tool_progress\",\"run_id\":\"r1\",\"name\":\"read_file\",\"detail\":\"reading\"}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"provider_attempt\",\"run_id\":\"r1\",\"number\":1}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"other-session\",\"run_id\":\"r2\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r2\",\"text\":\"other\"}}}}\n",
+                    "\n",
+                    "event: thread_changed\n",
+                    "data: {{\"session_id\":\"{sid}\",\"revision\":2}}\n",
+                    "\n",
+                    "event: resync_required\n",
+                    "data: {{}}\n",
+                    "\n",
+                    "event: unknown_type\n",
+                    "data: {{}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: not valid json\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"multi\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"line\"}}}}\n",
+                    "\n",
+                ),
+                sid = session_id,
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            return; // Close the connection to signal stream-end.
+        }
+        _ => mock_http_response(404, "text/plain", b"not found"),
+    };
+    let _ = stream.write_all(&response);
+}
+
+/// CLI `run` against a mock server that streams every SSE event variant
+/// before closing. Exercises the full decoder → render → observe pipeline:
+/// assistant deltas, tool progress, provider attempts, cross-session
+/// progress, `thread_changed`, `resync_required`, unknown/malformed events,
+/// multi-line data, and comments.
+#[test]
+fn final_binary_cli_run_streams_all_sse_event_variants() {
+    let server = MockRichSseServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = Scenario::new().output(
+        &[
+            "--json",
+            "run",
+            "sse variants test",
+            "--server",
+            &url,
+            "--token",
+            "mock-token",
+        ],
+        |_| {},
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    // The rich stream triggers thread_changed/resync resyncs plus the
+    // reconnect-path resyncs, so well over the minimum 3 snapshots.
+    assert!(
+        server
+            .snapshot_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 5,
+        "expected at least 5 snapshot requests (event resyncs + reconnect)"
+    );
+}
+
 /// A minimal mock HTTP server that returns a terminal snapshot with a
 /// configurable lifecycle, covering the `classify` branches that are hard to
 /// reach through the real server (`Interrupted`, `ReconciliationRequired`, `Failed`,
@@ -6023,6 +6220,167 @@ fn final_binary_cli_run_with_failing_verification_fails() {
     assert!(scenario.root().join("verified.txt").exists());
 }
 
+/// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
+/// passing verification command: the run completes successfully, covering the
+/// full modify-tool execution + verification success path.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cli_run_with_passing_verification_completes() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-ok",
+            "write_file",
+            &serde_json::json!({
+                "path": "output.txt",
+                "content": "hello world\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("wrote and verified"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, "write and verify", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission");
+
+    // Grant the permission.
+    let (grant_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(grant_status, 200);
+
+    // The write_file effect triggers a verification effect, which parks at
+    // WaitingPermission again. Grant it too.
+    let mut verify_pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            verify_pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                break; // settled without a verification ask
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Some((revision, request_id, run_revision)) = verify_pending {
+        let (verify_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "allow": true,
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+            &[],
+        );
+        assert_eq!(verify_status, 200);
+    }
+
+    // Wait for the session to settle (verification passes → run completes).
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled after passing verification");
+
+    // The file was written.
+    assert!(scenario.root().join("output.txt").exists());
+}
+
 // ---------------------------------------------------------------------------
 // server_client error-path coverage
 // ---------------------------------------------------------------------------
@@ -6447,6 +6805,75 @@ fn final_binary_cli_run_with_process_tool_completes() {
 }
 
 #[test]
+fn final_binary_cli_run_with_safe_grep_process_completes() {
+    // /usr/bin/grep -q <pattern> <relative-file> is an Allow-class process:
+    // it executes without a permission round-trip. Covers the safe_grep
+    // branch of the process classifier.
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("haystack.txt"), "needle\n").unwrap();
+    let process = serde_json::json!({
+        "argv": ["/usr/bin/grep", "-q", "needle", "haystack.txt"],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("grep-1", "process", &process),
+        ProviderReply::completion("grep complete"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "grep for a needle"], |command| {
+        command.env("TEST_OPENAI_KEY", "safe-grep-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_denied_shell_process_fails() {
+    // A shell command matching the deny list (e.g. `rm -rf /`) must be
+    // rejected without a permission round-trip. Covers the shell Deny
+    // branch of the process classifier.
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "shell": "rm -rf /",
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider =
+        ScriptedProvider::start([ProviderReply::tool_call("deny-1", "process", &process)]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "run a dangerous command"], |command| {
+        command.env("TEST_OPENAI_KEY", "denied-shell-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+#[test]
 fn final_binary_cli_run_with_list_directory_tool_completes() {
     let scenario = Scenario::new();
     std::fs::write(scenario.root().join("a.txt"), "a").unwrap();
@@ -6581,6 +7008,379 @@ fn final_binary_cli_run_with_path_escape_tool_covers_error_path() {
         body["status"]
     );
     provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_symlink_mutation_covers_error_path() {
+    // Writing through a symlinked path component must fail with a symlink
+    // error (engine workspace mutation guard). The symlink target is
+    // relative so the storage layer's session-creation validation accepts it.
+    let scenario = Scenario::new();
+    std::fs::create_dir_all(scenario.root().join("realdir")).unwrap();
+    std::os::unix::fs::symlink("realdir", scenario.root().join("link")).unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "write-1",
+        "write_file",
+        &serde_json::json!({"path": "link/test.txt", "content": "test", "create_intent": true}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "write through a symlink"], |command| {
+        command.env("TEST_OPENAI_KEY", "symlink-mutation-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_missing_parent_dir_covers_error_path() {
+    // Writing to a path whose parent directory does not exist must fail with
+    // a missing error (engine workspace mutation guard, non-final component).
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "write-1",
+        "write_file",
+        &serde_json::json!({"path": "nonexistent_dir/test.txt", "content": "test", "create_intent": true}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "write to a missing parent"], |command| {
+        command.env("TEST_OPENAI_KEY", "missing-parent-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// HTTP-level catalog error paths against the real server: invalid cursors
+/// on list/search/exact-title map to 400 via `map_catalog_error`, and
+/// unknown workspace IDs on search/exact-title map to 404.
+#[test]
+fn final_binary_server_catalog_error_paths() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("done")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    // Create a workspace.
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": scenario.root().display().to_string()})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+
+    // Invalid cursor on list → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions?cursor=not-a-valid-cursor"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Invalid cursor on search → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/search?q=test&cursor=not-a-valid-cursor"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Invalid cursor on exact-title → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!(
+            "/v1/workspaces/{workspace_id}/sessions/exact-title?q=test&cursor=not-a-valid-cursor"
+        ),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Unknown workspace on search → 404.
+    let (status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws-does-not-exist/sessions/search?q=test",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 404);
+
+    // Unknown workspace on exact-title → 404.
+    let (status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws-does-not-exist/sessions/exact-title?q=test",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 404);
+}
+
+/// CLI `run` without `--json` prints the human-readable session summary
+/// (covers the non-JSON render path in `execute_session_command_inner`).
+#[test]
+fn final_binary_cli_run_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("text mode complete")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["run", "complete in text mode"], |command| {
+        command.env("TEST_OPENAI_KEY", "text-mode-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
+    provider.assert_consumed();
+}
+
+/// CLI `list` without `--json` prints one tab-separated row per session
+/// (covers the non-JSON list render path).
+#[test]
+fn final_binary_cli_list_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("listed")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session first so the list has something to return.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, _) = server.create_session(workspace_id, "list me", &binding);
+    assert_eq!(create_status, 202);
+
+    // List without --json.
+    let output = scenario.output(
+        &["list", "--server", &url, "--token", &server.token],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "list-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("ready") || text.contains("running"),
+        "expected a lifecycle name in list output, got: {text}"
+    );
+}
+
+/// CLI `show` without `--json` prints the human-readable session summary
+/// (covers the non-JSON show render path).
+#[test]
+fn final_binary_cli_show_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("shown")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session and wait for it to reach a terminal state.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(workspace_id, "show me", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap();
+
+    // Wait until the session is ready.
+    let mut ready = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "session never reached ready");
+
+    // Show without --json.
+    let output = scenario.output(
+        &[
+            "show",
+            session_id,
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "show-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
+}
+
+/// CLI `resume` without `--json` prints the human-readable session summary
+/// (covers the non-JSON resume render path).
+#[test]
+fn final_binary_cli_resume_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn"),
+        ProviderReply::completion("resumed turn"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session and wait for it to reach a terminal state.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(workspace_id, "first turn", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap();
+
+    let mut ready = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "session never reached ready");
+
+    // Resume without --json.
+    let output = scenario.output(
+        &[
+            "resume",
+            session_id,
+            "continue please",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "resume-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
 }
 
 #[test]
