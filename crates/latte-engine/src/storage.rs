@@ -214,8 +214,8 @@ pub enum ThreadEffectPolicy {
 }
 
 /// Exact mutation preconditions.  `command_id` is deduplicated using a
-/// canonical redacted digest; replaying it with different content fails
-/// closed before any write.
+/// canonical digest of the raw request identity; replaying it with different
+/// content fails closed (422 `idempotency_mismatch`) before any write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThreadCommitRequest {
     pub thread_id: latte_core::ThreadId,
@@ -1048,9 +1048,8 @@ impl Storage {
         binding: &ThreadProviderBindingV2,
         focus: Option<&str>,
     ) -> Result<Option<ThreadSnapshot>, StorageError> {
-        let prompt = redact_thread_text(prompt);
         let workspace_root = validate_workspace_root(workspace_root)?;
-        let digest = create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
+        let digest = create_command_digest(thread_id, workspace_root, prompt, binding, focus);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1081,8 +1080,7 @@ impl Storage {
         expected_thread_revision: u64,
         prompt: &str,
     ) -> Result<Option<ThreadSnapshot>, StorageError> {
-        let prompt = redact_thread_text(prompt);
-        let digest = follow_up_command_digest(thread_id, expected_thread_revision, &prompt);
+        let digest = follow_up_command_digest(thread_id, expected_thread_revision, prompt);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1163,23 +1161,25 @@ impl Storage {
         StorageError,
     > {
         binding.validate().map_err(StorageError::InvalidData)?;
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        // Durable idempotency digest binds the raw request identity so that
+        // payloads which collapse under redaction still produce distinct
+        // digests and fail with 422 idempotency_mismatch on replay.
+        let command_digest =
+            create_command_digest(thread_id, workspace_root, prompt, binding, focus);
+        // Redacted text is used for all durable readable records (transcript,
+        // title); the raw prompt is never persisted.
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
                 "thread prompt must not be empty".into(),
             ));
         }
-        let workspace_root = validate_workspace_root(workspace_root)?;
         let title = session_title(&prompt);
         let expected_scope = thread_lease_scope(thread_id);
         if let Some(lease) = initial_lease {
             require_lease_scope(lease, &expected_scope)?;
         }
-        // Compute the durable command digest once (before `prompt` is moved
-        // into the transcript card) and reuse it for both the in-transaction
-        // recheck and the dedup insert.
-        let command_digest =
-            create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = initial_lease {
@@ -1195,7 +1195,7 @@ impl Storage {
         // Durable command dedup, rechecked inside the write transaction so a
         // concurrent pair that both missed the pre-acquire lookup cannot both
         // create. A same-id same-digest retry replays; a same-id
-        // different-digest retry is a conflict.
+        // different-digest retry fails with 422 idempotency_mismatch.
         if let Some(command_id) = command_id {
             let previous: Option<(String, String)> = tx
                 .query_row(
@@ -1435,6 +1435,10 @@ impl Storage {
         ),
         StorageError,
     > {
+        // Durable idempotency digest binds the raw request identity.
+        let follow_up_digest =
+            follow_up_command_digest(thread_id, expected_thread_revision, prompt);
+        // Redacted text is used for all durable readable records.
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
@@ -1460,9 +1464,7 @@ impl Storage {
         // Durable command dedup, rechecked inside the write transaction so a
         // concurrent pair that both missed the pre-acquire lookup cannot both
         // append a turn. A same-id same-digest retry replays; a same-id
-        // different-digest retry is a conflict.
-        let follow_up_digest =
-            follow_up_command_digest(thread_id, expected_thread_revision, &prompt);
+        // different-digest retry fails with 422 idempotency_mismatch.
         if let Some(command_id) = command_id {
             let previous: Option<(String, String)> = tx
                 .query_row(
@@ -5469,7 +5471,7 @@ fn validate_thread_source(source: &str) -> Result<(), StorageError> {
 /// Computes the durable digest that binds a session-create command to its
 /// complete identity: operation kind, protocol version, workspace, thread,
 /// prompt, binding, and normalized focus. Two creates with the same
-/// `command_id` but different digests are a replay conflict (409).
+/// `command_id` but different digests fail with 422 `idempotency_mismatch`.
 fn create_command_digest(
     thread_id: latte_core::ThreadId,
     workspace_root: &str,
@@ -5494,7 +5496,8 @@ fn create_command_digest(
 }
 
 /// Stable digest of a follow-up command's complete identity. A same-command
-/// retry must reproduce it byte-for-byte; any payload change is a conflict.
+/// retry must reproduce it byte-for-byte; any payload change fails with
+/// 422 `idempotency_mismatch`.
 fn follow_up_command_digest(
     thread_id: latte_core::ThreadId,
     expected_thread_revision: u64,
@@ -9865,6 +9868,68 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(second, latte_core::CreateOutcome::Replayed(_)));
+    }
+
+    #[test]
+    fn durable_digest_distinguishes_raw_payloads_that_collapse_under_redaction() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let command_id = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+
+        // First create with a secret-bearing prompt.
+        let first = store
+            .create_started_thread_v2(
+                Some(&command_id),
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello sk-this-is-a-secret-123456789",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Same command_id, different raw secret that redacts to the same
+        // value.  Must fail with 422 idempotency_mismatch, not replay.
+        let result = store.create_started_thread_v2(
+            Some(&command_id),
+            thread_id,
+            run_id,
+            &thread_binding(),
+            "/workspace",
+            "hello sk-this-is-a-secret-987654321",
+            &std::collections::BTreeMap::new(),
+            &lease,
+            3,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(StorageError::ThreadCommandReplayMismatch)
+        ));
+
+        // The pre-acquire lookup must agree: same command_id with a
+        // different raw payload is a 422 idempotency_mismatch.
+        let replay = store.lookup_create_replay(
+            &command_id,
+            thread_id,
+            "/workspace",
+            "hello sk-this-is-a-secret-987654321",
+            &thread_binding(),
+            None,
+        );
+        assert!(
+            matches!(replay, Err(StorageError::ThreadCommandReplayMismatch)),
+            "mismatched raw payload must return 422, got {replay:?}"
+        );
     }
 
     // -- Pure helper coverage ------------------------------------------------
