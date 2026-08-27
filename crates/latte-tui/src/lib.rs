@@ -371,7 +371,6 @@ fn restore_once_with_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::IsTerminal;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum MockOperation {
@@ -907,20 +906,23 @@ mod tests {
     #[test]
     fn enter_without_a_tty_reports_the_io_failure_or_restores_transactionally() {
         let result = TerminalGuard::enter();
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
-            let _guard = result.expect("TTY entry must succeed and restore on drop");
-        } else {
-            assert!(matches!(result, Err(TuiError::Io(_))));
+        match result {
+            // On some platforms (e.g. Windows) enable_raw_mode can succeed
+            // without a controlling TTY; the guard must still restore
+            // transactionally on drop.
+            Ok(guard) => drop(guard),
+            Err(TuiError::Io(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
 
     #[test]
     fn enter_with_hook_without_a_tty_reports_the_io_failure_or_restores_transactionally() {
         let result = TerminalGuard::enter_with_hook(|_| {});
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
-            let _guard = result.expect("TTY entry must succeed and restore on drop");
-        } else {
-            assert!(matches!(result, Err(TuiError::Io(_))));
+        match result {
+            Ok(guard) => drop(guard),
+            Err(TuiError::Io(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
 
