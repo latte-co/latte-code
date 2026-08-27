@@ -360,15 +360,17 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
     // A follow-up on a ready (completed) session is accepted (the session is
     // not terminal in v2 — ready sessions accept follow-up turns).
     let thread_revision = snapshot["revision"].as_u64().unwrap();
+    let follow_command_id = "01900000-0000-7000-8000-0000000000b1".to_string();
     let (follow_status, _) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
         Some(&serde_json::json!({
+            "command_id": follow_command_id,
             "prompt": "continue",
             "expected_thread_revision": thread_revision
         })),
-        &[("Idempotency-Key", "permission-chain-follow-key")],
+        &[("Idempotency-Key", &follow_command_id)],
     );
     assert!(
         follow_status == 202 || follow_status == 409,

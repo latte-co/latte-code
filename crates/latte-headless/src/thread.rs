@@ -466,57 +466,133 @@ impl ThreadRuntimeService {
         prompt: String,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let runner = self.begin_runner(thread_id)?;
-        let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt, None)
-            .await?;
+        // The legacy in-process path mints a fresh command id so the durable
+        // dedup record is still written (it will never replay, but the
+        // follow-up contract is uniform).
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        let snapshot = match self
+            .follow_up_one(
+                thread_id,
+                expected_thread_revision,
+                prompt,
+                Some(command_id),
+                None,
+            )
+            .await?
+        {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        };
         self.drain_mailbox(snapshot, runner).await
     }
 
     /// Like [`Self::follow_up`], but signals `accept` once the follow-up
-    /// submission is durably persisted, before the provider turn runs.
+    /// submission is durably persisted, before the provider turn runs. The
+    /// signal carries the accepted snapshot wrapped in
+    /// [`latte_core::CreateOutcome`]: `Created` (202) or `Replayed` (200,
+    /// crash-safe idempotent replay).
     pub async fn follow_up_accepted(
         &self,
         thread_id: ThreadId,
+        command_id: ThreadCommandId,
         expected_thread_revision: u64,
         prompt: String,
-        accept: oneshot::Sender<Result<ThreadSnapshot, String>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let runner = match self.begin_runner(thread_id) {
             Ok(runner) => runner,
             Err(error) => {
-                let _ = accept.send(Err(error.to_string()));
+                let _ = accept.send(Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
-        let snapshot = self
-            .follow_up_one(thread_id, expected_thread_revision, prompt, Some(accept))
+        let outcome = self
+            .follow_up_one(
+                thread_id,
+                expected_thread_revision,
+                prompt,
+                Some(command_id),
+                Some(accept),
+            )
             .await?;
-        self.drain_mailbox(snapshot, runner).await
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                let drained = self.drain_mailbox(snapshot, runner).await?;
+                Ok(latte_core::CreateOutcome::Created(drained))
+            }
+            // A replay owns no runner: the accepted submission is already
+            // durable and the pre-crash provider task is gone, so there is
+            // nothing to drain. Recovery of the expired lease is the
+            // sweeper's job.
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn follow_up_one(
         &self,
         thread_id: ThreadId,
         expected_thread_revision: u64,
         prompt: String,
-        accept: Option<oneshot::Sender<Result<ThreadSnapshot, String>>>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        command_id: Option<ThreadCommandId>,
+        accept: Option<
+            oneshot::Sender<
+                Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+            >,
+        >,
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
         let snapshot = match self.load_full(thread_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
+        // Crash-safe idempotency: look up the durable dedup record BEFORE the
+        // revision check and lease acquisition. A retry after a crash hits the
+        // record and replays without blocking on the dead owner's
+        // still-unexpired lease, and without failing the revision fence (the
+        // client's expected revision predates the accepted follow-up).
+        if let Some(command_id) = &command_id {
+            match self.engine.lookup_follow_up_replay(
+                command_id,
+                thread_id,
+                expected_thread_revision,
+                &prompt,
+            ) {
+                Ok(Some(snapshot)) => {
+                    signal_accept(
+                        accept,
+                        Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                    );
+                    return Ok(latte_core::CreateOutcome::Replayed(snapshot));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = ThreadRuntimeError::from(error);
+                    signal_accept(accept, Err(classify_create_error(&error)));
+                    return Err(error);
+                }
+            }
+        }
         if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
         {
-            signal_accept(accept, Err(ThreadRuntimeError::InvalidState.to_string()));
+            signal_accept(
+                accept,
+                Err(latte_core::CreateAcceptError::Conflict(
+                    ThreadRuntimeError::InvalidState.to_string(),
+                )),
+            );
             return Err(ThreadRuntimeError::InvalidState);
         }
         let messages = match self.history_with_prompt(&snapshot, &prompt) {
             Ok(messages) => messages,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
@@ -524,11 +600,12 @@ impl ThreadRuntimeService {
         let lease = match self.acquire(thread_id) {
             Ok(lease) => lease,
             Err(error) => {
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
         let started = match self.engine.create_started_thread_follow_up_v2(
+            command_id.as_ref(),
             thread_id,
             run_id,
             expected_thread_revision,
@@ -536,27 +613,46 @@ impl ThreadRuntimeService {
             &lease,
             now_ms(),
         ) {
-            Ok(started) => started,
+            Ok(outcome) => outcome,
             Err(error) => {
                 let error = ThreadRuntimeError::from(error);
-                signal_accept(accept, Err(error.to_string()));
+                signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
+        let started = match started {
+            latte_core::CreateOutcome::Created(snapshot) => snapshot,
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                // The in-transaction recheck caught a concurrent follow-up (or
+                // a retry that raced the pre-acquire lookup). Don't restart
+                // the provider; return the existing snapshot.
+                signal_accept(
+                    accept,
+                    Ok(latte_core::CreateOutcome::Replayed(snapshot.clone())),
+                );
+                return Ok(latte_core::CreateOutcome::Replayed(snapshot));
+            }
+        };
         // The follow-up submission is now durable — acknowledge acceptance.
-        signal_accept(accept, Ok(started.clone()));
+        signal_accept(
+            accept,
+            Ok(latte_core::CreateOutcome::Created(started.clone())),
+        );
         let Ok(provider) = (self.provider)(&started.binding) else {
-            return self.fail_retryable(
-                thread_id,
-                run_id,
-                started.revision,
-                active_run_revision(&started)?,
-                provider_configuration_failure_message(),
-                &lease,
-            );
+            return self
+                .fail_retryable(
+                    thread_id,
+                    run_id,
+                    started.revision,
+                    active_run_revision(&started)?,
+                    provider_configuration_failure_message(),
+                    &lease,
+                )
+                .map(latte_core::CreateOutcome::Created);
         };
         self.run_provider_turn(started, messages, provider.provider, lease)
             .await
+            .map(latte_core::CreateOutcome::Created)
     }
 
     /// Enqueues a user turn behind the active turn for this session. The
@@ -619,9 +715,22 @@ impl ThreadRuntimeService {
             let Some(prompt) = prompt else {
                 return Ok(snapshot);
             };
-            snapshot = self
-                .follow_up_one(snapshot.thread_id, snapshot.revision, prompt, None)
-                .await?;
+            // Queued mailbox turns are process-local by design; mint a fresh
+            // command id so the durable dedup record is still written.
+            let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+            snapshot = match self
+                .follow_up_one(
+                    snapshot.thread_id,
+                    snapshot.revision,
+                    prompt,
+                    Some(command_id),
+                    None,
+                )
+                .await?
+            {
+                latte_core::CreateOutcome::Created(snapshot)
+                | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+            };
         }
     }
 
@@ -1957,15 +2066,19 @@ fn signal_accept<T, E>(accept: Option<oneshot::Sender<Result<T, E>>>, result: Re
     }
 }
 
-/// Classifies a create-acceptance error for the HTTP layer: a durable
-/// command-id reuse with a different payload, or a non-replay create for an
-/// existing thread, is a 409 conflict; everything else is a 500.
+/// Classifies a create/follow-up acceptance error for the HTTP layer: a
+/// durable command-id reuse with a different payload is a 422 idempotency
+/// mismatch; a non-replay create for an existing thread, or a stale revision
+/// / invalid state, is a 409 conflict; everything else is a 500.
 fn classify_create_error(error: &ThreadRuntimeError) -> latte_core::CreateAcceptError {
     match error {
-        ThreadRuntimeError::Storage(
-            latte_engine::StorageError::ThreadCommandReplayMismatch
-            | latte_engine::StorageError::ThreadAlreadyExists(_),
-        ) => latte_core::CreateAcceptError::Conflict(error.to_string()),
+        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch) => {
+            latte_core::CreateAcceptError::IdempotencyMismatch(error.to_string())
+        }
+        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(_))
+        | ThreadRuntimeError::InvalidState => {
+            latte_core::CreateAcceptError::Conflict(error.to_string())
+        }
         _ => latte_core::CreateAcceptError::Failed(error.to_string()),
     }
 }
@@ -2351,7 +2464,13 @@ mod tests {
         // follow_up_accepted must also reject while the runner is active.
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
-            .follow_up_accepted(thread_id, 0, "second follow-up".into(), accept_tx)
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                0,
+                "second follow-up".into(),
+                accept_tx,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ThreadRuntimeError::InvalidState));
@@ -5131,21 +5250,134 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .follow_up_accepted(thread_id, ready.revision, "second".into(), tx)
+                    .follow_up_accepted(
+                        thread_id,
+                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        ready.revision,
+                        "second".into(),
+                        tx,
+                    )
                     .await
             })
         };
         let accepted = rx.await.unwrap().expect("follow-up accepted");
+        let accepted = match accepted {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        };
         assert_eq!(accepted.thread_id, thread_id);
         assert!(handle.await.unwrap().is_ok());
 
         // A stale follow-up signals rejection and errors (call errors directly).
         let (tx, rx) = oneshot::channel();
         let stale = service
-            .follow_up_accepted(thread_id, 999, "stale".into(), tx)
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                999,
+                "stale".into(),
+                tx,
+            )
             .await;
         assert!(rx.await.unwrap().is_err());
         assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
+    }
+
+    #[tokio::test]
+    async fn follow_up_accepted_replays_durable_acceptance_and_rejects_mismatch() {
+        // A same-command_id same-payload retry after the turn completes replays
+        // the original acceptance (Replayed, no duplicate turn); a same-id
+        // different-payload retry is a durable mismatch.
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), Vec::new()),
+                response(Some("second"), Vec::new()),
+                response(Some("third"), Vec::new()),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+
+        // First follow-up → Created.
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().expect("follow-up accepted");
+        let first_revision = match accepted {
+            latte_core::CreateOutcome::Created(snapshot) => snapshot.revision,
+            latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
+        };
+        handle.await.unwrap().unwrap();
+
+        // Wait for the follow-up turn to complete.
+        let ready2 = loop {
+            let snap = service.load_full(thread_id).unwrap();
+            if snap.lifecycle == ThreadLifecycle::Ready {
+                break snap;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        // Replay with the same command_id + payload → Replayed (no new turn).
+        let replay = service
+            .follow_up(thread_id, ready2.revision, "second".into())
+            .await;
+        // follow_up mints a fresh command_id, so this is a new follow-up, not
+        // a replay. To test the durable replay, use follow_up_accepted with
+        // the same command_id.
+        let (tx, rx) = oneshot::channel();
+        let replayed = service
+            .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+            .await
+            .unwrap();
+        match replayed {
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                assert_eq!(snapshot.revision, first_revision);
+            }
+            latte_core::CreateOutcome::Created(_) => {
+                panic!("same command_id replay must be Replayed")
+            }
+        }
+        let _ = replay;
+        let _ = rx.await;
+
+        // Same command_id, different prompt → mismatch error.
+        let (tx, rx) = oneshot::channel();
+        let mismatch = service
+            .follow_up_accepted(
+                thread_id,
+                command_id,
+                ready.revision,
+                "DIFFERENT".into(),
+                tx,
+            )
+            .await;
+        assert!(matches!(
+            mismatch,
+            Err(ThreadRuntimeError::Storage(
+                latte_engine::StorageError::ThreadCommandReplayMismatch
+            ))
+        ));
+        let _ = rx.await;
     }
 
     // -- Pure helper coverage ------------------------------------------------
@@ -5233,13 +5465,28 @@ mod tests {
 
     #[test]
     fn classify_create_error_maps_conflict_and_failed() {
-        let conflict =
+        let mismatch =
             ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch);
+        assert!(matches!(
+            classify_create_error(&mismatch),
+            latte_core::CreateAcceptError::IdempotencyMismatch(_)
+        ));
+        let conflict =
+            ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(
+                latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()),
+            ));
         assert!(matches!(
             classify_create_error(&conflict),
             latte_core::CreateAcceptError::Conflict(_)
         ));
-        let failed = ThreadRuntimeError::InvalidState;
+        // InvalidState (stale revision / not accepting follow-up) is a
+        // client-side conflict, not a server failure.
+        let invalid_state = ThreadRuntimeError::InvalidState;
+        assert!(matches!(
+            classify_create_error(&invalid_state),
+            latte_core::CreateAcceptError::Conflict(_)
+        ));
+        let failed = ThreadRuntimeError::MailboxFull;
         assert!(matches!(
             classify_create_error(&failed),
             latte_core::CreateAcceptError::Failed(_)
@@ -5294,5 +5541,1043 @@ mod tests {
         let mut no_active = snapshot.clone();
         no_active.active_run_id = None;
         assert!(active_run_revision(&no_active).is_err());
+    }
+
+    // -- start / start_accepted error paths --------------------------------
+
+    #[tokio::test]
+    async fn start_accepted_rejects_escaping_focus_before_durable_create() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine, vec![response(Some("unused"), vec![])]);
+        let (tx, rx) = oneshot::channel();
+        let err = service
+            .start_accepted(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "prompt".into(),
+                binding(),
+                Some(Path::new("../outside")),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        let accepted = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(accepted, latte_core::CreateAcceptError::Failed(_)),
+            "{accepted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_accepted_on_existing_thread_with_fresh_command_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), vec![]),
+                response(Some("unused"), vec![]),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        let (tx, rx) = oneshot::channel();
+        let err = service
+            .start_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "second".into(),
+                binding(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        let accepted = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(accepted, latte_core::CreateAcceptError::Conflict(_)),
+            "{accepted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_accepted_replays_same_command_id_without_restarting_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first"), vec![]),
+                response(Some("must not be called"), vec![]),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        // First create with this command id.
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().unwrap();
+        assert!(matches!(accepted, latte_core::CreateOutcome::Created(_)));
+        let first = handle.await.unwrap().unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Second create with the SAME command id must replay durably without
+        // acquiring a lease or calling the provider.
+        let (tx, rx) = oneshot::channel();
+        let replayed = service
+            .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
+            .await
+            .unwrap();
+        let replayed_snapshot = match replayed {
+            latte_core::CreateOutcome::Replayed(s) => s,
+            latte_core::CreateOutcome::Created(_) => panic!("expected replay, got Created"),
+        };
+        assert_eq!(replayed_snapshot.thread_id, thread_id);
+        let accepted = rx.await.unwrap().unwrap();
+        assert!(matches!(accepted, latte_core::CreateOutcome::Replayed(_)));
+    }
+
+    #[tokio::test]
+    async fn start_accepted_fails_when_lease_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![
+                response(Some("first"), vec![]),
+                response(Some("unused"), vec![]),
+            ],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        // Hold the lease so the next create's acquire fails.
+        let _held = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        let err = service
+            .start_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                "second".into(),
+                binding(),
+                None,
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        let accepted = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(accepted, latte_core::CreateAcceptError::Failed(_)),
+            "{accepted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_rejects_while_runner_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = delayed_service(
+            root.path(),
+            engine,
+            [(Duration::from_millis(300), simple_response("done"))],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let first = service.clone();
+        let running = tokio::spawn(async move {
+            first
+                .start(thread_id, "slow turn".into(), binding(), None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = service
+            .start(thread_id, "concurrent".into(), binding(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        let completed = running.await.unwrap().unwrap();
+        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+    }
+
+    #[tokio::test]
+    async fn start_with_missing_root_fails_context_build() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(&root.path().join("missing"), engine, vec![]);
+        let err = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "hi".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_history_policy_rejects_start() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let policy = ThreadHistoryPolicy {
+            max_request_bytes: 1024,
+            max_input_bytes: 100,
+            reserved_output_bytes: 100,
+            context_cap_bytes: 64,
+        };
+        let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let err = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "hi".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn prompt_exceeding_budget_fails_start() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let policy = ThreadHistoryPolicy {
+            max_request_bytes: 64,
+            max_input_bytes: 64,
+            reserved_output_bytes: 0,
+            context_cap_bytes: 64,
+        };
+        let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let err = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "x".repeat(10_000),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    // -- follow_up error paths ----------------------------------------------
+
+    #[tokio::test]
+    async fn follow_up_rejects_oversized_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![response(Some("first"), vec![])],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let tiny_policy = ThreadHistoryPolicy {
+            max_request_bytes: 64,
+            max_input_bytes: 64,
+            reserved_output_bytes: 0,
+            context_cap_bytes: 64,
+        };
+        let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let tiny = ThreadRuntimeService::new(engine, root.path(), tiny_policy, factory);
+        let err = tiny
+            .follow_up(thread_id, ready.revision, "x".repeat(10_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn follow_up_accepted_fails_when_lease_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![response(Some("first"), vec![])],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let _held = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        let err = service
+            .follow_up_accepted(
+                thread_id,
+                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                ready.revision,
+                "second".into(),
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        let accepted = rx.await.unwrap().unwrap_err();
+        let message = match accepted {
+            latte_core::CreateAcceptError::Conflict(message)
+            | latte_core::CreateAcceptError::IdempotencyMismatch(message)
+            | latte_core::CreateAcceptError::Failed(message) => message,
+        };
+        assert!(message.contains("thread storage"));
+    }
+
+    #[tokio::test]
+    async fn queue_follow_up_validates_prompt_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let policy = ThreadHistoryPolicy {
+            max_request_bytes: 64,
+            max_input_bytes: 64,
+            reserved_output_bytes: 0,
+            context_cap_bytes: 64,
+        };
+        let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let err = service
+            .queue_follow_up(ThreadId::from_uuid(Uuid::now_v7()), "x".repeat(10_000))
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn follow_up_with_invalid_policy_fails_history_build() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![response(Some("first"), vec![])],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let invalid_policy = ThreadHistoryPolicy {
+            max_request_bytes: 1024,
+            max_input_bytes: 100,
+            reserved_output_bytes: 100,
+            context_cap_bytes: 64,
+        };
+        let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let broken = ThreadRuntimeService::new(engine, root.path(), invalid_policy, factory);
+        let err = broken
+            .follow_up(thread_id, ready.revision, "second".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    // -- switch_model / resolve_permission / cancel_durable -----------------
+
+    #[tokio::test]
+    async fn switch_model_unknown_thread_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine, vec![]);
+        let err = service
+            .switch_model(ThreadId::from_uuid(Uuid::now_v7()), 0, &binding())
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn switch_model_fails_when_lease_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![response(Some("first"), vec![])],
+        );
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(thread_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let mut next = binding();
+        next.provider_name = "other".into();
+        next.model = "reasoning".into();
+        next.config_fingerprint = "other-config".into();
+        let _held = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .unwrap();
+        let err = service
+            .switch_model(thread_id, ready.revision, &next)
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_permission_without_active_run_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine, vec![response(Some("first"), vec![])]);
+        let ready = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "first".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = service
+            .resolve_permission(ready.thread_id, ready.revision, 0, "any".into(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+    }
+
+    #[tokio::test]
+    async fn cancel_durable_rejects_stale_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine.clone(), vec![]);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let running = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let err = service
+            .cancel_durable(thread_id, running.revision + 1, test_run_revision(&running))
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+    }
+
+    #[tokio::test]
+    async fn cancel_durable_fails_when_lease_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine.clone(), vec![]);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let running = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let _held = engine
+            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .unwrap();
+        let err = service
+            .cancel_durable(thread_id, running.revision, test_run_revision(&running))
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+    }
+
+    // -- input request / permission flows -----------------------------------
+
+    fn waiting_input_service(
+        root: &std::path::Path,
+        engine: EngineHandle,
+        policy: ThreadHistoryPolicy,
+    ) -> (ThreadRuntimeService, ThreadId) {
+        let provider = Arc::new(FakeProvider::scripted([ProviderResponse {
+            message: None,
+            tool_calls: vec![],
+            input_request: Some(InputRequest {
+                id: "lang".into(),
+                prompt: "Which language?".into(),
+                secret: false,
+            }),
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
+        }]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = ThreadRuntimeService::new(engine, root, policy, factory);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        (service, thread_id)
+    }
+
+    #[tokio::test]
+    async fn provide_input_rejects_oversized_value() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let policy = ThreadHistoryPolicy {
+            max_request_bytes: 256,
+            max_input_bytes: 256,
+            reserved_output_bytes: 0,
+            context_cap_bytes: 64,
+        };
+        let (service, thread_id) = waiting_input_service(root.path(), engine, policy);
+        let waiting = service
+            .start(thread_id, "hi".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingInput);
+        let err = service
+            .provide_input(
+                thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                "lang".into(),
+                "x".repeat(10_000),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn provide_input_fails_when_provider_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let provider = Arc::new(FakeProvider::scripted([ProviderResponse {
+            message: None,
+            tool_calls: vec![],
+            input_request: Some(InputRequest {
+                id: "lang".into(),
+                prompt: "Which?".into(),
+                secret: false,
+            }),
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
+        }]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err("secret reference unavailable".into())
+            } else {
+                Ok(ResolvedProvider {
+                    provider: provider.clone(),
+                    binding: crate::registry::ProviderBinding::direct(&[]),
+                })
+            }
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let waiting = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "hi".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingInput);
+        let err = service
+            .provide_input(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                "lang".into(),
+                "Rust".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ThreadRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_permission_allow_fails_when_provider_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let provider = Arc::new(FakeProvider::scripted([response(
+            Some("creating"),
+            vec![crate::provider::ToolCall {
+                id: "create-note".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path":"created.txt",
+                    "content":"x",
+                    "create_intent":true
+                }),
+            }],
+        )]));
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err("secret reference unavailable".into())
+            } else {
+                Ok(ResolvedProvider {
+                    provider: provider.clone(),
+                    binding: crate::registry::ProviderBinding::direct(&[]),
+                })
+            }
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let waiting = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "create it".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        let err = service
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ThreadRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_permission_fails_when_lease_held() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![response(
+                Some("creating"),
+                vec![crate::provider::ToolCall {
+                    id: "create-note".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({
+                        "path":"created.txt",
+                        "content":"x",
+                        "create_intent":true
+                    }),
+                }],
+            )],
+        );
+        let waiting = service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "create it".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        let _held = engine
+            .acquire_thread_lease(waiting.thread_id, now_ms(), 60_000)
+            .unwrap();
+        let err = service
+            .resolve_permission(
+                waiting.thread_id,
+                waiting.revision,
+                test_run_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+    }
+
+    // -- focus / progress / helper coverage ---------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_focus_passes_none_to_durable_layer() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(root.path(), engine, vec![response(Some("done"), vec![])]);
+        let focus = Path::new(OsStr::from_bytes(b"caf\xE9/rs"));
+        let (tx, rx) = oneshot::channel();
+        let handle = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_accepted(
+                        ThreadId::from_uuid(Uuid::now_v7()),
+                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        "hi".into(),
+                        binding(),
+                        Some(focus),
+                        tx,
+                    )
+                    .await
+            })
+        };
+        let accepted = rx.await.unwrap().unwrap();
+        assert!(matches!(accepted, latte_core::CreateOutcome::Created(_)));
+        let finished = handle.await.unwrap().unwrap();
+        assert!(matches!(finished, latte_core::CreateOutcome::Created(_)));
+    }
+
+    #[tokio::test]
+    async fn provider_turn_bridges_progress_events_to_sink() {
+        struct EventProvider;
+        impl Provider for EventProvider {
+            fn complete(
+                &self,
+                _: ProviderRequest,
+                context: ProviderContext,
+            ) -> crate::provider::ProviderFuture<'_> {
+                Box::pin(async move {
+                    if let Some(sink) = &context.events {
+                        sink.observe(ProviderEvent::Attempt { number: 1 });
+                    }
+                    Ok(simple_response("done"))
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn ThreadProgressSink> = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |_thread_id, progress| observed.lock().unwrap().push(progress))
+        };
+        let provider = Arc::new(EventProvider);
+        let factory: ThreadProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service =
+            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory)
+                .with_progress_sink(sink);
+        service
+            .start(
+                ThreadId::from_uuid(Uuid::now_v7()),
+                "hi".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        let events = observed.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ThreadTransientProgress::ProviderAttempt { number: 1, .. }
+        )));
+    }
+
+    #[test]
+    fn verification_descriptor_requires_active_run() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let service = ThreadRuntimeService::new(
+            engine,
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            Arc::new(|_| Err("unused".into())),
+        )
+        .with_verification(VerificationPlan {
+            argv: vec!["/bin/true".into()],
+            cwd: ".".into(),
+            timeout_ms: 1_000,
+            grace_ms: 100,
+            stdout_cap: 1_024,
+            stderr_cap: 1_024,
+        });
+        snapshot.active_run_id = None;
+        assert!(matches!(
+            service.verification_descriptor(&snapshot, "done"),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_verification_without_active_run_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        snapshot.active_run_id = None;
+        let service = ThreadRuntimeService::new(
+            engine,
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            Arc::new(|_| Err("unused".into())),
+        );
+        let lease = service.acquire(thread_id).unwrap();
+        let err = service
+            .begin_verification(snapshot, "summary".into(), lease)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+    }
+
+    #[test]
+    fn finish_verification_without_active_run_fails() {
+        use latte_engine::ThreadEffectPresentation;
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let service = ThreadRuntimeService::new(
+            engine,
+            root.path(),
+            ThreadHistoryPolicy::default(),
+            Arc::new(|_| Err("unused".into())),
+        );
+        let lease = service.acquire(thread_id).unwrap();
+        let presentation = ThreadEffectPresentation {
+            effect_id: "e".into(),
+            tool_call_id: "t".into(),
+            name: "process".into(),
+            input: serde_json::json!({}),
+            attempt: 1,
+        };
+        // No active run → InvalidState at the active_run_id guard.
+        snapshot.active_run_id = None;
+        assert!(matches!(
+            service.finish_verification(&snapshot, &presentation, &lease),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+        // Active run id but missing from runs → InvalidState at run_revision.
+        snapshot.active_run_id = Some(run_id);
+        snapshot.runs = vec![];
+        assert!(matches!(
+            service.finish_verification(&snapshot, &presentation, &lease),
+            Err(ThreadRuntimeError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn tool_round_for_call_skips_entries_without_tool_calls() {
+        use latte_core::{TranscriptEntry, TranscriptEntryId};
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        let call = crate::provider::ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+        };
+        snapshot.transcript.entries = vec![
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 1,
+                run_id: Some(run_id),
+                kind: TranscriptKind::Assistant,
+                text: "no calls here".into(),
+                payload: Some(serde_json::json!({})),
+                source_key: "empty".into(),
+                created_at_ms: 1,
+            },
+            TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: 2,
+                run_id: Some(run_id),
+                kind: TranscriptKind::Assistant,
+                text: "with calls".into(),
+                payload: Some(serde_json::json!({"tool_calls":[call.clone()]})),
+                source_key: "real".into(),
+                created_at_ms: 2,
+            },
+        ];
+        let (sequence, calls, ordinal) = tool_round_for_call(&snapshot, "call-1").unwrap();
+        assert_eq!((sequence, ordinal), (2, 0));
+        assert_eq!(calls, vec![call]);
+    }
+
+    #[test]
+    fn effect_request_helpers_reject_missing_run_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let run_id = new_run_id();
+        let mut snapshot = engine
+            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .unwrap();
+        // Active run id set but the run is absent from the summary list.
+        snapshot.active_run_id = Some(run_id);
+        snapshot.runs = vec![];
+        let descriptor = ThreadEffectDescriptor {
+            effect_id: "e".into(),
+            tool_call_id: "t".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({}),
+            attempt: 1,
+        };
+        assert!(thread_effect_request(&snapshot, descriptor.clone(), "k".into()).is_err());
+        assert!(thread_effect_start_request(&snapshot, "e".into(), "k".into()).is_err());
+        // A snapshot without any active run also fails.
+        snapshot.active_run_id = None;
+        assert!(thread_effect_request(&snapshot, descriptor, "k".into()).is_err());
     }
 }

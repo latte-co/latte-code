@@ -201,8 +201,8 @@ Windows 已支持任意外部进程执行。
 - [ ] IDE bridge：编辑器选择、诊断、diff、终端和 Session 的受权互操作。
 - [x] 本地 HTTP Server（`latte-code serve`）：多 Workspace 的 REST + SSE API、Bearer token
   认证、幂等键去重、revision 栅栏、按 Workspace 的事件桥接与 broadcast lag 恢复。
-- [ ] 版本化 RPC 与 event backpressure 的完整契约（当前 SSE 为 best-effort，lag 时发
-  resync_required）。
+- [x] 版本化 RPC 与 event backpressure 的完整契约（类型化 DTO、错误枚举、
+  cursor 分页、resync 契约，由 `latte-server/tests/contract.rs` 守护）。
 - [ ] Web、桌面、移动和 CLI 等多端表面复用相同的公开协议，不复制 Engine authority。
 - [ ] 远程执行、远程 workspace、队列、断线重连与凭据隔离。
 - [ ] 浏览器、计算机使用、多模态输入输出等可选体验能力。

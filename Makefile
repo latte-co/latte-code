@@ -49,6 +49,7 @@ test-unit: ## Run crate-local unit tests
 test-contract: ## Run public contract and component integration targets
 	cargo test -p latte-core --test contracts --all-features --locked
 	cargo test -p latte-engine --test public_lifecycle --all-features --locked
+	cargo test -p latte-server --test contract --all-features --locked
 	cargo test -p latte-code --test architecture --test contract --test markdown_links --all-features --locked
 
 test-e2e: test-e2e-portable test-e2e-unix ## Run every final-binary E2E suite on Unix

@@ -187,7 +187,7 @@ pub struct CreateSessionRequest {
 - **Idempotency-Key 与 body command_id 一致**：HTTP header `Idempotency-Key` 必须等于 body `command_id`，否则 400 拒绝。只保留一个身份来源，避免内存层和 durable 层各认一套。
 - **`ThreadCommand::Start` 增加 focus 字段**：当前 envelope 缺 focus（`thread.rs:279-285`），目标定义需补上，否则 digest 计算和 replay 都不完整。
 - 同 `command_id` + 同 digest → replay 已有 acceptance（200，非 202）
-- 同 `command_id` + 不同 digest → 409 Conflict
+- 同 `command_id` + 不同 digest → 422 idempotency_mismatch
 - 同 `thread_id` 已存在（非 command_id 重放）→ 409 Conflict
 
 **Crash runner 状态闭合**（P0-5 续）：
@@ -716,13 +716,13 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 | 客户端超时，server 存活，ledger 丢失（极端） | client command_id + durable digest replay |
 | server crash 在 durable accept 后、202 前 | client command_id + durable digest replay（重启后命中 `thread_command_dedup_v2`，返回 `Replayed`，不重启 provider） |
 | server crash 在 durable accept 前 | 用同一 thread_id/command_id 重试创建原目标 session（无副作用） |
-| 同 command_id + 不同 payload | 409 Conflict（digest mismatch） |
+| 同 command_id + 不同 payload | 422 idempotency_mismatch（digest mismatch） |
 | 同 thread_id 已存在（非重放） | 409 Conflict |
 
 **契约**：
 - client 生成 `thread_id`（UUID v7）+ `command_id`（UUID v7）。
 - `Idempotency-Key` header 必须等于 body `command_id`，否则 400 拒绝。
-- engine 在 create 的同一事务内检查 `thread_command_dedup_v2`：同 command_id+digest → replay（返回 `Replayed`）；digest mismatch → 409。
+- engine 在 create 的同一事务内检查 `thread_command_dedup_v2`：同 command_id+digest → replay（返回 `Replayed`）；digest mismatch → 422。
 - 只有 `Created` 启动 provider runner；`Replayed` 走 orphan recovery（lease 到期后恢复）。
 - **Exactly-once 范围**：只保证 session admission exactly-once（不重复创建 session），不保证 provider/effect execution exactly-once。
 - 内存 ledger 只做同进程快速 replay，不承担 crash correctness。
@@ -764,7 +764,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 - [x] **Idempotency-Key 与 body command_id 一致性校验**（不一致 → 400）
 - [x] **Dedup lookup 先于 lease acquire**：engine create 入口先查 `thread_command_dedup_v2`（无 lease），命中 → `Replayed`；miss → acquire + 事务内二次检查 → `Created`
 - [x] engine create 返回 `Created | Replayed`；只有 `Created` 启动 provider runner
-- [x] engine create 路径接入 `thread_command_dedup_v2`（同 command_id+digest replay，mismatch 409）
+- [x] engine create 路径接入 `thread_command_dedup_v2`（同 command_id+digest replay，mismatch 422）
 - [x] **Recovery sweeper task**：server 侧周期 task（如每 30s）调用 engine-level recovery API（恢复事务提交后广播 `ResyncRequired` 或 committed `ThreadEventEnvelope`）；测试活 owner 续租不误恢复 / owner crash 只恢复一次 / 多 server sweeper 竞争 / **客户端保持 SSE 时 recovery 后收到 wake 并退出**
 - [x] `PATCH /v1/sessions/{id}` 重命名端点（+ThreadChanged 事件）
 - [x] `POST /v1/sessions/{id}/fork` 分叉端点（+ThreadChanged 事件）

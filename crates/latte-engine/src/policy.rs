@@ -99,3 +99,32 @@ impl PermissionPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_policy_rejects_invalid_glob() {
+        let result = PermissionPolicy::new(&["[invalid".to_string()], 1);
+        assert!(matches!(result, Err(PolicyError::InvalidGlob(_))));
+    }
+
+    #[test]
+    fn permission_policy_decide_covers_deny_allow_and_ask() {
+        let policy = PermissionPolicy::new(&["**/secret/**".to_string()], 1).expect("valid glob");
+        assert_eq!(
+            policy.decide(EffectClass::Read, "workspace/secret/file.txt"),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            policy.decide(EffectClass::Read, "workspace/normal/file.txt"),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.decide(EffectClass::Modify, "workspace/normal/file.txt"),
+            PolicyDecision::Ask
+        );
+        assert_eq!(policy.version, 1);
+    }
+}

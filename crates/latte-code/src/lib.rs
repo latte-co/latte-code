@@ -972,8 +972,13 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
+                        // One stable command identity per follow-up turn: a
+                        // retry of this submission replays instead of
+                        // appending a duplicate turn.
+                        let command_id =
+                            latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
                         let result = handle
-                            .follow_up(&thread_id, expected_thread_revision, &prompt)
+                            .follow_up(&thread_id, &command_id, expected_thread_revision, &prompt)
                             .await
                             .map(|()| "follow-up completed".into())
                             .map_err(|error| error.to_string());
@@ -2716,7 +2721,11 @@ mod tests {
                 let request_line = request.lines().next().unwrap_or("");
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().unwrap_or("GET");
-                let path = parts.next().unwrap_or("/");
+                let raw_path = parts.next().unwrap_or("/");
+                // Query strings are opaque to these mock handlers; strip them
+                // so pagination parameters (limit/cursor) do not break exact
+                // path matches.
+                let path = raw_path.split_once('?').map_or(raw_path, |(path, _)| path);
                 let (status, content_type, body) = handler(method, path);
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3939,5 +3948,483 @@ mod tests {
             })
         });
         assert_eq!(code, EXIT_COMPLETED);
+    }
+
+    // ------------------------------------------------------------------
+    // SSE bridge receiver-drop coverage
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_exits_when_receiver_dropped_after_stream_end() {
+        // When the event receiver is dropped and the stream ends, the bridge's
+        // resync send fails and the task exits cleanly (line 448).
+        use axum::response::sse::{Event, Sse};
+        use futures::stream;
+
+        async fn events() -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>>
+        {
+            Sse::new(stream::iter(Vec::new()))
+        }
+
+        let app =
+            axum::Router::new().route("/v1/workspaces/ws-1/events", axum::routing::get(events));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, _progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // Drop the receiver immediately; the bridge's first resync send (after
+        // the empty stream ends) fails → task exits.
+        drop(event_rx);
+        let result = tokio::time::timeout(Duration::from_secs(10), bridge).await;
+        assert!(result.is_ok(), "bridge should exit when receiver dropped");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_exits_when_receiver_dropped_before_event() {
+        // When the event receiver is dropped and a ThreadChanged event
+        // arrives, the send fails and the bridge exits (line 433).
+        use axum::response::sse::{Event, Sse};
+        use futures::stream;
+
+        async fn events() -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>>
+        {
+            let s = stream::unfold(0u32, |i| async move {
+                if i >= 1 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Some((
+                    Ok(Event::default()
+                        .event("thread_changed")
+                        .data(r#"{"session_id":"s1","revision":1}"#)),
+                    i + 1,
+                ))
+            });
+            Sse::new(s)
+        }
+
+        let app =
+            axum::Router::new().route("/v1/workspaces/ws-1/events", axum::routing::get(events));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, _progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // Drop the receiver before the delayed event arrives.
+        drop(event_rx);
+        let result = tokio::time::timeout(Duration::from_secs(10), bridge).await;
+        assert!(result.is_ok(), "bridge should exit when receiver dropped");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_exits_when_receiver_dropped_between_reconnects() {
+        // The first stream ends → resync sent (receiver alive) → reconnect →
+        // post-reconnect resync send fails (receiver dropped) → exit (line 422).
+        use axum::response::sse::{Event, Sse};
+        use futures::stream::{self, BoxStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/workspaces/ws-1/events",
+            axum::routing::get({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        let stream: BoxStream<'static, Result<Event, std::convert::Infallible>> =
+                            if n == 0 {
+                                Box::pin(stream::iter(Vec::new()))
+                            } else {
+                                Box::pin(stream::pending())
+                            };
+                        Sse::new(stream)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, _progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // Receive the first resync (stream end), then drop the receiver so the
+        // post-reconnect resync send fails.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first resync");
+        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+        drop(event_rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(15), bridge).await;
+        assert!(
+            result.is_ok(),
+            "bridge should exit after reconnect resync fails"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_bridge_drops_unparseable_progress() {
+        // A progress event whose payload cannot deserialize into
+        // ThreadTransientProgress is silently dropped (line 441).
+        use axum::response::sse::{Event, Sse};
+        use futures::stream;
+
+        async fn events() -> Sse<impl stream::Stream<Item = Result<Event, std::convert::Infallible>>>
+        {
+            let stream = stream::iter(vec![Ok(Event::default()
+                .event("progress")
+                .data(r#"{"session_id":"s1","run_id":"r1","progress":{"type":"bogus"}}"#))]);
+            Sse::new(stream)
+        }
+
+        let app =
+            axum::Router::new().route("/v1/workspaces/ws-1/events", axum::routing::get(events));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = crate::server_client::ServerClient::new(url, "token".into());
+        let (event_tx, _event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
+        let (progress_tx, progress_rx) =
+            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
+
+        // The bogus progress must not be forwarded.
+        assert!(
+            progress_rx
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "unparseable progress must be dropped"
+        );
+        bridge.abort();
+        server.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // execute_session_command_inner edge cases
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_session_command_inner_show_rejects_bad_session_id() {
+        let (url, _handle) = start_session_mock_server(|_method, _path| {
+            (
+                404,
+                "application/json".into(),
+                r#"{"error":"not found"}"#.into(),
+            )
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Show {
+            session_id: "not-a-uuid".to_string(),
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_resume_propagates_follow_up_failure() {
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") && path.ends_with("/follow-up") {
+                (
+                    500,
+                    "application/json".into(),
+                    r#"{"error":{"message":"follow-up failed"}}"#.into(),
+                )
+            } else if path.starts_with("/v1/sessions/") {
+                (
+                    200,
+                    "application/json".into(),
+                    terminal_snapshot_json(
+                        "01900000-0000-7000-8000-000000000001",
+                        "01900000-0000-7000-8000-000000000002",
+                    ),
+                )
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Resume {
+            session_id: "01900000-0000-7000-8000-000000000001".to_string(),
+            prompt: "continue".to_string(),
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert!(result.is_err());
+    }
+
+    /// Starts a mock server that parks (never responds) on the given path
+    /// prefix, so a timed cancel deterministically wins the select!.
+    fn start_parking_mock_server(park_path_prefix: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let request_line = request.lines().next().unwrap_or("");
+                let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                if path.starts_with(park_path_prefix) {
+                    // Park forever; the client's cancel will fire first.
+                    std::thread::sleep(Duration::from_mins(1));
+                    continue;
+                }
+
+                let body = r#"{"workspace_id":"ws-test"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_list_cancels_during_resolve() {
+        let url = start_parking_mock_server("/v1/workspaces");
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = tokio::time::sleep(Duration::from_millis(200));
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), super::EXIT_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_list_cancels_during_list() {
+        // Resolve succeeds, then the sessions list parks → cancel fires.
+        let url = start_parking_mock_server("/v1/workspaces/ws-test/sessions");
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::List;
+        let cancel = tokio::time::sleep(Duration::from_millis(200));
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), super::EXIT_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_show_cancels_during_snapshot() {
+        let url = start_parking_mock_server("/v1/sessions/");
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Show {
+            session_id: "01900000-0000-7000-8000-000000000001".to_string(),
+        };
+        let cancel = tokio::time::sleep(Duration::from_millis(200));
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), super::EXIT_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_run_cancels_during_init() {
+        // A run cancelled during resolve returns Cancelled { snapshot: None };
+        // in non-json mode the no-snapshot branch (line 605) is exercised.
+        let url = start_parking_mock_server("/v1/workspaces");
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Run {
+            prompt: "hello".to_string(),
+            focus: None,
+        };
+        let cancel = tokio::time::sleep(Duration::from_millis(200));
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), super::EXIT_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_resume_cancels_during_init() {
+        // A resume cancelled during resolve returns Cancelled { snapshot: None };
+        // in non-json mode the no-snapshot branch (line 622) is exercised.
+        let url = start_parking_mock_server("/v1/workspaces");
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Resume {
+            session_id: "01900000-0000-7000-8000-000000000001".to_string(),
+            prompt: "continue".to_string(),
+        };
+        let cancel = tokio::time::sleep(Duration::from_millis(200));
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
+        assert_eq!(result.unwrap(), super::EXIT_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn execute_session_command_inner_run_streams_progress() {
+        // A run that receives SSE progress events exercises the progress
+        // closure body (lines 585-588) before reaching a terminal snapshot.
+        // The mock is stateful: the first two snapshot fetches return a
+        // Running (non-terminal) snapshot so the SSE stream is opened, and
+        // the third returns a terminal snapshot to complete the run.
+        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let run_id = "01900000-0000-7000-8000-000000000002";
+        let running_snapshot = format!(
+            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":"{run_id}","runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"running","run_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+        );
+        let terminal_snapshot = terminal_snapshot_json(thread_id, run_id);
+        let snapshot_queue =
+            std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
+        let (url, _handle) = start_session_mock_server(move |method, path| {
+            if path == "/v1/workspaces" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"workspace_id":"ws-test"}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/bindings" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"bindings":[{"is_default":true,"binding":{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}}]}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/sessions" && method == "POST" {
+                (
+                    200,
+                    "application/json".into(),
+                    r#"{"accepted_revision":1}"#.into(),
+                )
+            } else if path == "/v1/workspaces/ws-test/events" {
+                // SSE stream with a progress event, then close (stream end →
+                // reconnect → resync finds the terminal snapshot).
+                let body = format!(
+                    "event: progress\ndata: {{\"session_id\":\"{thread_id}\",\"run_id\":\"{run_id}\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"{run_id}\",\"text\":\"working\"}}}}\n\n"
+                );
+                (200, "text/event-stream".into(), body)
+            } else if path.starts_with("/v1/sessions/") {
+                let mut queue = snapshot_queue.lock().unwrap();
+                let snapshot = if queue.len() > 1 {
+                    queue.remove(0)
+                } else {
+                    queue[0].clone()
+                };
+                (200, "application/json".into(), snapshot)
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":"not found"}"#.into(),
+                )
+            }
+        });
+        let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
+        let root = std::path::Path::new("/tmp");
+        let command = crate::server_client::SessionCommand::Run {
+            prompt: "hello".to_string(),
+            focus: None,
+        };
+        let cancel = std::future::pending::<()>();
+        let result =
+            super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
+        assert_eq!(result.unwrap(), EXIT_COMPLETED);
+    }
+
+    // ------------------------------------------------------------------
+    // prepare_server builder closure coverage
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_server_builder_honors_lease_ttl_when_creating_workspace() {
+        // The builder closure's `Some(ttl_ms)` branch (line 1375) is only
+        // exercised when a workspace is actually created with LATTE_LEASE_TTL_MS
+        // set in the environment.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".latte")).unwrap();
+        std::fs::write(
+            root.join(".latte/latte-code.jsonc"),
+            r#"{version:1,default_model:"main/mock",providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},verification:{argv:["/usr/bin/true"]}}"#,
+        )
+        .unwrap();
+        let storage_home = dir.path().join("storage");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str())),
+                ("LATTE_LEASE_TTL_MS", Some(std::ffi::OsStr::new("5000"))),
+            ],
+            || {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let (state, _token, _token_path) =
+                            super::prepare_server(&root, &storage_home).expect("prepare_server");
+                        // Creating the workspace runs the builder closure with
+                        // the lease TTL override applied.
+                        let workspace = state
+                            .workspaces
+                            .get_or_create(&root)
+                            .await
+                            .expect("workspace creation should succeed");
+                        assert!(!workspace.bindings().expect("bindings").is_empty());
+                    });
+                })
+            },
+        );
     }
 }

@@ -1721,6 +1721,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     ));
     assert!(matches!(
         engine.create_started_thread_follow_up_v2(
+            None,
             thread_id,
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             switched.revision,
@@ -1733,6 +1734,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     let child_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let child = engine
         .create_started_thread_follow_up_v2(
+            None,
             thread_id,
             child_id,
             switched.revision,
@@ -1741,6 +1743,10 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
             now + 9,
         )
         .unwrap();
+    let child = match child {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
     assert_eq!(child.active_run_id, Some(child_id));
     assert_eq!(child.runs.len(), 2);
     assert_eq!(
@@ -3368,6 +3374,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let fork_run_id = run_id();
     let fork_running = engine
         .create_started_thread_follow_up_v2(
+            None,
             fork_thread_id,
             fork_run_id,
             fork.revision,
@@ -3376,6 +3383,10 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             now + 24,
         )
         .unwrap();
+    let fork_running = match fork_running {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
     let fork_completed = commit(
         &engine,
         &fork_lease,
@@ -3397,6 +3408,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let follow_up_id = run_id();
     assert!(matches!(
         engine.create_started_thread_follow_up_v2(
+            None,
             thread_id,
             follow_up_id,
             switched.revision - 1,
@@ -3409,6 +3421,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(engine.show(follow_up_id).is_err());
     assert!(matches!(
         engine.create_started_thread_follow_up_v2(
+            None,
             thread_id,
             follow_up_id,
             switched.revision,
@@ -3421,6 +3434,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(engine.show(follow_up_id).is_err());
     let follow_up = engine
         .create_started_thread_follow_up_v2(
+            None,
             thread_id,
             follow_up_id,
             switched.revision,
@@ -3429,6 +3443,10 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             now + 11,
         )
         .unwrap();
+    let follow_up = match follow_up {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
     assert_eq!(follow_up.lifecycle, ThreadLifecycle::Running);
     assert_eq!(active_run(&follow_up), (follow_up_id, 1));
     assert_eq!(follow_up.runs.len(), 2);

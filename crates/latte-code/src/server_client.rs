@@ -583,10 +583,13 @@ pub trait SessionServer {
     ) -> Result<u64, ClientError>;
     /// Appends a follow-up turn. Returns the accepted revision and the
     /// workspace id that owns the session (so the caller can subscribe to
-    /// the correct event stream when the cwd workspace differs).
+    /// the correct event stream when the cwd workspace differs). The
+    /// `command_id` is the stable identity of the turn: retries of the same
+    /// turn must reuse it so the server replays instead of duplicating.
     async fn follow_up(
         &mut self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError>;
@@ -674,8 +677,12 @@ pub async fn resume_session(
         result = server.snapshot(&thread_id) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
+    // One stable command identity for the whole turn: every HTTP attempt of
+    // this resume reuses it, so a crash-safe retry replays the acceptance
+    // instead of appending a duplicate turn.
+    let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
     let (_, event_workspace_id) = tokio::select! {
-        result = server.follow_up(&thread_id, snapshot.revision, prompt) => result?,
+        result = server.follow_up(&thread_id, &command_id, snapshot.revision, prompt) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
     };
     observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
@@ -1051,17 +1058,62 @@ impl ServerHandle {
             .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))
     }
 
-    /// Lists all durable sessions in the workspace.
+    /// Maximum number of cursor pages a single list call will fetch. The
+    /// server caps each page at 200 sessions, so this bounds one call to
+    /// 12,800 sessions and guards against a cursor chain that never
+    /// terminates.
+    const MAX_SESSION_PAGES: usize = 64;
+
+    /// Fetches every page of a cursor-paged `sessions` endpoint, following
+    /// `next_cursor` until the server reports no more pages. `base_path` must
+    /// not already carry a `cursor` parameter. `what` labels the item kind in
+    /// deserialization errors.
+    async fn fetch_all_sessions<T: serde::de::DeserializeOwned>(
+        &self,
+        base_path: &str,
+        what: &str,
+    ) -> Result<Vec<T>, ClientError> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..Self::MAX_SESSION_PAGES {
+            let path = match &cursor {
+                None => base_path.to_owned(),
+                Some(cursor) => {
+                    let separator = if base_path.contains('?') { '&' } else { '?' };
+                    format!(
+                        "{base_path}{separator}cursor={}",
+                        urlencoding::encode(cursor)
+                    )
+                }
+            };
+            let value = self.get(&path).await?;
+            let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
+            all.extend(
+                serde_json::from_value::<Vec<T>>(sessions)
+                    .map_err(|error| ClientError::Failed(format!("invalid {what}: {error}")))?,
+            );
+            match value.get("next_cursor").and_then(Value::as_str) {
+                None => return Ok(all),
+                Some(next) => cursor = Some(next.to_owned()),
+            }
+        }
+        Err(ClientError::Failed(format!(
+            "session listing exceeded {} pages",
+            Self::MAX_SESSION_PAGES
+        )))
+    }
+
+    /// Lists all durable sessions in the workspace, following cursor
+    /// pagination until every page has been fetched.
     pub async fn list_sessions(
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ThreadSnapshot>, ClientError> {
-        let value = self
-            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+        self.fetch_all_sessions(
+            &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
+            "sessions list",
+        )
+        .await
     }
 
     /// Fetches the authoritative snapshot for one session.
@@ -1115,22 +1167,26 @@ impl ServerHandle {
             .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
     }
 
-    /// Appends a follow-up turn to an existing session.
+    /// Appends a follow-up turn to an existing session. The caller supplies a
+    /// stable `command_id` for the turn: every HTTP attempt of the same turn
+    /// reuses it, so a crash-safe retry replays the durable acceptance
+    /// instead of appending a duplicate turn.
     pub async fn follow_up(
         &self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(), ClientError> {
         let body = json!({
+            "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
         });
-        let idempotency_key = Uuid::now_v7().to_string();
         self.post(
             &format!("/v1/sessions/{session_id}/follow-up"),
             body,
-            Some(&idempotency_key),
+            Some(&command_id.to_string()),
         )
         .await?;
         Ok(())
@@ -1282,41 +1338,39 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Searches sessions by title or ID fragment.
+    /// Searches sessions by title or ID fragment, following cursor pagination
+    /// until every page has been fetched.
     pub async fn search_sessions(
         &self,
         workspace_id: &str,
         query: &str,
     ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-        let value = self
-            .get(&format!(
-                "/v1/workspaces/{workspace_id}/sessions/search?q={}",
+        self.fetch_all_sessions(
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/search?q={}&limit=200",
                 urlencoding::encode(query)
-            ))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid search results: {error}")))
+            ),
+            "search results",
+        )
+        .await
     }
 
-    /// Finds sessions whose title exactly matches `title`. Unlike
-    /// [`search_sessions`](Self::search_sessions) (substring match capped at
-    /// the server's page size), this uses the server's exact-title index so
-    /// older matches are not truncated by pagination.
+    /// Finds sessions whose title exactly matches `title`, following cursor
+    /// pagination until every page has been fetched. Uses the server's
+    /// exact-title index.
     pub async fn find_sessions_by_exact_title(
         &self,
         workspace_id: &str,
         title: &str,
     ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
-        let value = self
-            .get(&format!(
-                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}",
+        self.fetch_all_sessions(
+            &format!(
+                "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}&limit=200",
                 urlencoding::encode(title)
-            ))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid exact-title results: {error}")))
+            ),
+            "exact-title results",
+        )
+        .await
     }
 
     /// Returns the full binding catalog for the workspace.
@@ -1498,21 +1552,23 @@ impl SessionServer for ServerClient {
     async fn follow_up(
         &mut self,
         session_id: &ThreadId,
+        command_id: &ThreadCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError> {
         let body = json!({
+            "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_thread_revision": expected_revision,
         });
-        // Follow-up is a durable mutation: send an idempotency key so a
-        // timeout/retry cannot append a duplicate turn.
-        let idempotency_key = Uuid::now_v7().to_string();
+        // Follow-up is a durable mutation: the stable command_id doubles as
+        // the Idempotency-Key so a timeout/retry replays instead of
+        // appending a duplicate turn.
         let value = self
             .post(
                 &format!("/v1/sessions/{session_id}/follow-up"),
                 body,
-                Some(&idempotency_key),
+                Some(&command_id.to_string()),
             )
             .await?;
         let revision = value
@@ -1543,12 +1599,14 @@ impl SessionServer for ServerClient {
         &mut self,
         workspace_id: &str,
     ) -> Result<Vec<ThreadSnapshot>, ClientError> {
-        let value = self
-            .get(&format!("/v1/workspaces/{workspace_id}/sessions"))
-            .await?;
-        let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
-        serde_json::from_value(sessions)
-            .map_err(|error| ClientError::Failed(format!("invalid sessions list: {error}")))
+        // Follow cursor pagination so sessions beyond the first page are not
+        // silently dropped (regression guard: clients must honor next_cursor).
+        self.handle
+            .fetch_all_sessions(
+                &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
+                "sessions list",
+            )
+            .await
     }
 
     async fn cancel(
@@ -1757,6 +1815,9 @@ mod tests {
         // run/resume accept unknown --flag tokens as prompt content.
         assert!(parse_session_command(&args(&["run", "--bogus"])).is_ok());
         assert!(parse_session_command(&args(&["run", "--server"])).is_err());
+        // --token without a value.
+        assert!(parse_session_command(&args(&["run", "--token"])).is_err());
+        assert!(parse_session_command(&args(&["list", "--token"])).is_err());
     }
 
     #[test]
@@ -2040,7 +2101,7 @@ mod tests {
         snapshots: Mutex<std::collections::VecDeque<Result<ThreadSnapshot, ClientError>>>,
         events: Mutex<std::collections::VecDeque<Option<StreamEvent>>>,
         created: Mutex<Vec<(String, String, Option<String>)>>,
-        followed_up: Mutex<Vec<(String, u64, String)>>,
+        followed_up: Mutex<Vec<(String, String, u64, String)>>,
         cancelled: Mutex<Vec<(u64, u64)>>,
         opened: Mutex<Vec<String>>,
         listed: Mutex<u32>,
@@ -2063,6 +2124,23 @@ mod tests {
         // select! with no timing race.
         reconnect_signal: Option<tokio::sync::oneshot::Sender<()>>,
         park_reconnect: bool,
+        // Deterministic cancel injection for the remaining select! arms: the
+        // phase fires its paired signal once and then parks forever, so a
+        // cancel future awaiting the signal is the only ready branch.
+        park_binding: bool,
+        binding_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_create: bool,
+        create_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_follow_up: bool,
+        follow_up_signal: Option<tokio::sync::oneshot::Sender<()>>,
+        park_open: bool,
+        // On the nth snapshot call (1-based) the gate fires its signal; when
+        // `park_snapshot` is set the call then parks forever, letting a cancel
+        // future awaiting the signal win the surrounding select! deterministically.
+        snapshot_gate: Mutex<Option<(usize, tokio::sync::oneshot::Sender<()>)>>,
+        park_snapshot: bool,
+        fail_create: bool,
+        fail_reopen: bool,
     }
 
     impl MockServer {
@@ -2109,6 +2187,12 @@ mod tests {
             if self.fail_binding {
                 return Err(ClientError::Usage("no binding".into()));
             }
+            if self.park_binding {
+                if let Some(signal) = self.binding_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             Ok(self.binding.clone())
         }
 
@@ -2121,6 +2205,15 @@ mod tests {
             focus: Option<&Path>,
             _binding: &Value,
         ) -> Result<u64, ClientError> {
+            if self.fail_create {
+                return Err(ClientError::Failed("create rejected".into()));
+            }
+            if self.park_create {
+                if let Some(signal) = self.create_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             self.created.lock().unwrap().push((
                 thread_id.to_string(),
                 prompt.to_string(),
@@ -2133,11 +2226,19 @@ mod tests {
         async fn follow_up(
             &mut self,
             session_id: &ThreadId,
+            command_id: &ThreadCommandId,
             expected_revision: u64,
             prompt: &str,
         ) -> Result<(u64, String), ClientError> {
+            if self.park_follow_up {
+                if let Some(signal) = self.follow_up_signal.take() {
+                    let _ = signal.send(());
+                }
+                std::future::pending::<()>().await;
+            }
             self.followed_up.lock().unwrap().push((
                 session_id.to_string(),
+                command_id.to_string(),
                 expected_revision,
                 prompt.to_string(),
             ));
@@ -2148,6 +2249,24 @@ mod tests {
             &mut self,
             _session_id: &ThreadId,
         ) -> Result<ThreadSnapshot, ClientError> {
+            let should_fire = {
+                let mut guard = self.snapshot_gate.lock().unwrap();
+                match guard.as_mut() {
+                    Some((remaining, _)) => {
+                        *remaining = remaining.saturating_sub(1);
+                        *remaining == 0
+                    }
+                    None => false,
+                }
+            };
+            if should_fire {
+                let (_, signal) = self.snapshot_gate.lock().unwrap().take().unwrap();
+                let _ = signal.send(());
+                if self.park_snapshot {
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+            }
             self.snapshots
                 .lock()
                 .unwrap()
@@ -2186,9 +2305,15 @@ mod tests {
                 if let Some(signal) = self.observe_signal.take() {
                     let _ = signal.send(());
                 }
+                if self.park_open {
+                    std::future::pending::<()>().await;
+                }
             } else {
                 if let Some(signal) = self.reconnect_signal.take() {
                     let _ = signal.send(());
+                }
+                if self.fail_reopen {
+                    return Err(ClientError::Failed("reconnect rejected".into()));
                 }
                 if self.park_reconnect {
                     // Park forever so tests can fire cancel into a pending
@@ -2550,8 +2675,8 @@ mod tests {
         let followed = server.followed_up.lock().unwrap().clone();
         assert_eq!(followed.len(), 1);
         assert_eq!(followed[0].0, id);
-        assert_eq!(followed[0].1, 1); // expected revision from the snapshot
-        assert_eq!(followed[0].2, "continue");
+        assert_eq!(followed[0].2, 1); // expected revision from the snapshot
+        assert_eq!(followed[0].3, "continue");
     }
 
     #[tokio::test]
@@ -2714,8 +2839,15 @@ mod tests {
         ) -> impl IntoResponse {
             assert_eq!(body["expected_thread_revision"], 1);
             assert!(
-                headers.get("idempotency-key").is_some(),
-                "follow-up must send Idempotency-Key"
+                body["command_id"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "follow-up body must carry a stable command_id"
+            );
+            assert_eq!(
+                headers.get("idempotency-key").and_then(|v| v.to_str().ok()),
+                body["command_id"].as_str(),
+                "Idempotency-Key must equal body command_id"
             );
             (
                 axum::http::StatusCode::ACCEPTED,
@@ -2919,6 +3051,7 @@ mod tests {
                 &ThreadId::from_uuid(
                     Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
                 ),
+                &ThreadCommandId::from_uuid(Uuid::now_v7()),
                 1,
                 "more",
             )
@@ -3046,6 +3179,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_sessions_follows_next_cursor_until_exhausted() {
+        // The mock returns three pages; the client must follow next_cursor
+        // and return every session instead of silently dropping later pages.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let summary = |id: &str| {
+            json!({
+                "thread_id": id,
+                "title": format!("session {id}"),
+                "workspace_root": "/tmp/ws",
+                "lifecycle": "ready",
+                "provider_name": "main",
+                "model": "mock",
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+            })
+        };
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/sessions/search",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let requests = server_requests.clone();
+                    async move {
+                        let page = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let (sessions, next_cursor) = match page {
+                            1 => (
+                                vec![summary("01900000-0000-7000-8000-000000000100")],
+                                Some("cursor-2".to_owned()),
+                            ),
+                            2 => {
+                                assert_eq!(
+                                    query.get("cursor").map(String::as_str),
+                                    Some("cursor-2"),
+                                    "page 2 must carry the page-1 cursor"
+                                );
+                                (
+                                    vec![summary("01900000-0000-7000-8000-000000000200")],
+                                    Some("cursor-3".to_owned()),
+                                )
+                            }
+                            _ => {
+                                assert_eq!(
+                                    query.get("cursor").map(String::as_str),
+                                    Some("cursor-3"),
+                                    "page 3 must carry the page-2 cursor"
+                                );
+                                (vec![summary("01900000-0000-7000-8000-000000000300")], None)
+                            }
+                        };
+                        axum::Json(json!({ "sessions": sessions, "next_cursor": next_cursor }))
+                    }
+                },
+            ),
+        );
+        let mock = mock_http_app(app).await;
+        let results = mock
+            .client("token")
+            .handle()
+            .search_sessions("ws-1", "session")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3, "all three pages must be fetched");
+        assert_eq!(
+            results[0].thread_id.to_string(),
+            "01900000-0000-7000-8000-000000000100"
+        );
+        assert_eq!(
+            results[2].thread_id.to_string(),
+            "01900000-0000-7000-8000-000000000300"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "client must stop once next_cursor is null"
+        );
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn search_sessions_caps_cursor_chain_length() {
+        // A server that always returns a cursor must not loop forever: the
+        // client aborts after MAX_SESSION_PAGES requests.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/sessions/search",
+            axum::routing::get(move || {
+                let requests = server_requests.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({ "sessions": [], "next_cursor": "forever" }))
+                }
+            }),
+        );
+        let mock = mock_http_app(app).await;
+        let error = mock
+            .client("token")
+            .handle()
+            .search_sessions("ws-1", "loop")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            ServerHandle::MAX_SESSION_PAGES
+        );
+        let _ = mock;
+    }
+
+    #[tokio::test]
     async fn http_client_reports_unreachable() {
         // Nothing listens on this port.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3056,6 +3304,308 @@ mod tests {
         let client = ServerClient::new(format!("http://127.0.0.1:{port}"), "token".into());
         let error = client.health_check().await.unwrap_err();
         assert_eq!(error.code(), "server_unreachable");
+    }
+
+    /// Starts an axum mock server and returns its [`MockHttp`] handle.
+    async fn mock_http_app(app: axum::Router) -> MockHttp {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown = async move {
+            let _ = shutdown_rx.wait_for(|stop| *stop).await;
+        };
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        MockHttp {
+            base_url: format!("http://127.0.0.1:{port}"),
+            _server: server,
+            shutdown: shutdown_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_client_maps_response_contract_violations() {
+        // Every endpoint returns 200 with a body that violates the response
+        // contract, exercising each method's field-extraction error path.
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces",
+                axum::routing::post(|| async { axum::Json(json!({})) }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/bindings",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions/search",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/sessions/exact-title",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "sessions": "not-an-array" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}/fork",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}/queue",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::OK, axum::Json(json!({})))
+                }),
+            );
+        let mock = mock_http_app(app).await;
+        let client = mock.client("token");
+        let handle = client.handle();
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+
+        // resolve_workspace_id: missing workspace_id.
+        let error = handle
+            .resolve_workspace_id(std::path::Path::new("/tmp"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing workspace_id"),
+            "{error}"
+        );
+        // list_sessions: malformed sessions array.
+        let error = handle.list_sessions("ws").await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid sessions list"),
+            "{error}"
+        );
+        // bindings_catalog: missing bindings.
+        let error = handle.bindings_catalog("ws").await.unwrap_err();
+        assert!(error.to_string().contains("missing bindings"), "{error}");
+        // search_sessions: malformed results.
+        let error = handle.search_sessions("ws", "q").await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid search results"),
+            "{error}"
+        );
+        // find_sessions_by_exact_title: malformed results.
+        let error = handle
+            .find_sessions_by_exact_title("ws", "q")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid exact-title results"),
+            "{error}"
+        );
+        // snapshot: missing snapshot field.
+        let error = handle.snapshot(&id).await.unwrap_err();
+        assert!(error.to_string().contains("missing snapshot"), "{error}");
+        // fork_session: missing snapshot field.
+        let error = handle.fork_session(&id, None).await.unwrap_err();
+        assert!(error.to_string().contains("missing snapshot"), "{error}");
+        // queue_follow_up: missing position.
+        let error = handle.queue_follow_up(&id, "p").await.unwrap_err();
+        assert!(error.to_string().contains("missing position"), "{error}");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_maps_malformed_payloads_and_status_failures() {
+        // Endpoints that return 200 with syntactically invalid JSON or a
+        // snapshot field that cannot deserialize.
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces/{ws}/sessions",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::OK, "this is not json".to_string())
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "snapshot": "not-a-snapshot-object" })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/bindings",
+                axum::routing::get(|| async {
+                    // Entry without a binding field → default_binding fails.
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({ "bindings": [{"is_default": true}] })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/workspaces/{ws}/events",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({ "error": { "message": "boom" } })),
+                    )
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        let handle = client.handle();
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+
+        // Invalid JSON body → Failed("invalid JSON from server").
+        let error = handle.list_sessions("ws").await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid JSON from server"),
+            "{error}"
+        );
+        // Snapshot field that cannot deserialize → Failed("invalid snapshot").
+        let error = handle.snapshot(&id).await.unwrap_err();
+        assert!(error.to_string().contains("invalid snapshot"), "{error}");
+        // Binding entry missing the binding field → Failed.
+        let error = client.default_binding("ws").await.unwrap_err();
+        assert!(error.to_string().contains("missing binding"), "{error}");
+        // open_events on a 500 → Internal.
+        let error = client.open_events("ws").await.unwrap_err();
+        assert!(matches!(error, ClientError::Internal(_)), "{error:?}");
+        // health_check on a 500 → Unreachable.
+        let error = client.health_check().await.unwrap_err();
+        assert_eq!(error.code(), "server_unreachable");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_default_binding_rejects_empty_catalog() {
+        let app = axum::Router::new().route(
+            "/v1/workspaces/{ws}/bindings",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({ "bindings": [] })),
+                )
+            }),
+        );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        let error = client.default_binding("ws").await.unwrap_err();
+        assert!(matches!(error, ClientError::Usage(_)), "{error:?}");
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_caches_workspace_id_and_maps_try_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/v1/workspaces",
+                axum::routing::post({
+                    let calls = calls.clone();
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(json!({ "workspace_id": "ws-cached" }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({ "error": { "message": "missing" } })),
+                    )
+                }),
+            );
+        let mock = mock_http_app(app).await;
+        let mut client = mock.client("token");
+        // First resolve hits the server; the second is cached.
+        let first = client
+            .resolve_workspace(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
+        let second = client
+            .resolve_workspace(std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
+        assert_eq!(first, "ws-cached");
+        assert_eq!(second, "ws-cached");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // try_snapshot maps NotFound → None.
+        let id = ThreadId::from_uuid(Uuid::now_v7());
+        let handle = client.handle();
+        assert!(handle.try_snapshot(&id).await.unwrap().is_none());
+        let _ = mock;
+    }
+
+    #[tokio::test]
+    async fn http_client_next_event_without_open_fails() {
+        let client = ServerClient::new("http://127.0.0.1:1".into(), "token".into());
+        let mut client = client;
+        let error = client.next_event().await.unwrap_err();
+        assert!(
+            error.to_string().contains("event stream not open"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_client_reports_body_read_failure() {
+        // A raw TCP server that sends a successful response header with a
+        // Content-Length larger than the body it actually sends, then closes
+        // the connection — reqwest fails while reading the body.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"short\":",
+                );
+                let _ = stream.flush();
+                // Drop the stream without sending the remaining bytes.
+            }
+        });
+        let client = ServerClient::new(format!("http://127.0.0.1:{port}"), "token".into());
+        let error = client.handle().list_sessions("ws").await.unwrap_err();
+        // The body read failure maps to a Failed error (not Unreachable).
+        assert!(matches!(error, ClientError::Failed(_)), "{error:?}");
+        handle.join().unwrap();
     }
 
     #[tokio::test]
@@ -3362,5 +3912,554 @@ mod tests {
         let bindings = handle.bindings_catalog(&workspace_id).await.unwrap();
         assert!(!bindings.is_empty());
         embedded.shutdown().await;
+    }
+
+    // -- SSE parsing edge cases ---------------------------------------------
+
+    #[test]
+    fn parse_sse_frame_rejects_malformed_and_missing_fields() {
+        // Invalid JSON data.
+        assert_eq!(parse_sse_frame(Some("thread_changed"), "not json"), None);
+        // thread_changed missing session_id / revision.
+        assert_eq!(parse_sse_frame(Some("thread_changed"), "{}"), None);
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"session_id":"s"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"revision":3}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("thread_changed"), r#"{"session_id":7,"revision":1}"#),
+            None
+        );
+        // Fields present but wrong type.
+        assert_eq!(
+            parse_sse_frame(
+                Some("thread_changed"),
+                r#"{"session_id":"s","revision":"not-a-number"}"#
+            ),
+            None
+        );
+        // progress missing session_id / run_id / progress.
+        assert_eq!(parse_sse_frame(Some("progress"), "{}"), None);
+        assert_eq!(
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s"}"#),
+            None
+        );
+        assert_eq!(
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s","run_id":"r"}"#),
+            None
+        );
+        // progress fields present but wrong type.
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":123,"progress":{}}"#
+            ),
+            None
+        );
+        // progress is cloned verbatim (type not validated at parse time).
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":"r","progress":"not-an-object"}"#
+            ),
+            Some(StreamEvent::Progress {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                progress: json!("not-an-object"),
+            })
+        );
+        // progress with all fields decodes.
+        assert_eq!(
+            parse_sse_frame(
+                Some("progress"),
+                r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"r","text":"hi"}}"#
+            ),
+            Some(StreamEvent::Progress {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                progress: json!({"type":"assistant_delta","run_id":"r","text":"hi"}),
+            })
+        );
+        // resync_required ignores the payload shape.
+        assert_eq!(
+            parse_sse_frame(Some("resync_required"), "{}"),
+            Some(StreamEvent::ResyncRequired)
+        );
+        // Unknown / absent event types.
+        assert_eq!(parse_sse_frame(Some("unknown"), "{}"), None);
+        assert_eq!(parse_sse_frame(None, "{}"), None);
+    }
+
+    #[test]
+    fn sse_decoder_accumulates_multiline_data_and_ignores_comments() {
+        let mut decoder = SseDecoder::default();
+        // Comments and unknown fields are ignored.
+        assert_eq!(decoder.line(": keepalive"), None);
+        assert_eq!(decoder.line("id: 42"), None);
+        assert_eq!(decoder.line("event: thread_changed"), None);
+        // Multi-line data payloads are joined with newlines.
+        assert_eq!(decoder.line("data: {\"session_id\":\"s\","), None);
+        assert_eq!(decoder.line("data: \"revision\": 7}"), None);
+        assert_eq!(
+            decoder.line(""),
+            Some(StreamEvent::ThreadChanged {
+                session_id: "s".into(),
+                revision: 7,
+            })
+        );
+        // State is reset after dispatch.
+        assert_eq!(decoder.event_type, None);
+        assert_eq!(decoder.data, "");
+        assert_eq!(decoder.line(""), None);
+    }
+
+    // -- rendering edge cases ------------------------------------------------
+
+    #[test]
+    fn render_session_text_covers_non_terminal_and_message_kinds() {
+        // Non-terminal snapshot: status comes from lifecycle_name, not classify.
+        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "working on it".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 1,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains(": running (revision 1)"), "{text}");
+        assert!(text.contains("working on it"), "{text}");
+
+        // Failure entries are surfaced too.
+        let mut snap = snapshot(ThreadLifecycle::Failed, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Failure,
+            text: "boom".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 2,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains("boom"), "{text}");
+
+        // Only the latest assistant/failure entry is appended.
+        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 0,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "first".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 3,
+        });
+        snap.transcript.entries.push(TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 1,
+            run_id: None,
+            kind: TranscriptKind::Assistant,
+            text: "second".into(),
+            payload: None,
+            source_key: "test".into(),
+            created_at_ms: 4,
+        });
+        let text = render_session_text(&snap);
+        assert!(text.contains("second"), "{text}");
+        assert!(!text.contains("first"), "{text}");
+
+        // No assistant/failure entry → no message appended.
+        let snap = snapshot(ThreadLifecycle::Running, vec![]);
+        let text = render_session_text(&snap);
+        assert!(!text.contains('\n'), "{text}");
+    }
+
+    // -- cancel injection into every select! arm -----------------------------
+
+    #[tokio::test]
+    async fn run_session_cancel_during_binding_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.park_binding = true;
+        server.binding_signal = Some(tx);
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert!(server.created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_create_cancels_session() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.park_create = true;
+        server.create_signal = Some(tx);
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        // The session may have been created server-side, so cancel_session
+        // best-effort cancels it.
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_propagates_create_failure() {
+        let mut server = MockServer::new();
+        server.fail_create = true;
+        let error = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ClientError::Failed("create rejected".into()));
+    }
+
+    #[tokio::test]
+    async fn resume_session_rejects_bad_session_id() {
+        let mut server = MockServer::new();
+        let error = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "not-a-uuid",
+            "continue",
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ClientError::Usage(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_resolve_returns_cancelled() {
+        let mut server = MockServer::new();
+        server.park_resolve = true;
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_snapshot_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((1, tx));
+        server.park_snapshot = true;
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn resume_session_cancel_during_follow_up_returns_cancelled() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.park_follow_up = true;
+        server.follow_up_signal = Some(tx);
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = resume_session(
+            &mut server,
+            Path::new("/workspace"),
+            "01900000-0000-7000-8000-000000000001",
+            "continue",
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_pre_terminal_check() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((1, tx));
+        server.park_snapshot = true;
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_open_events() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        server.observe_signal = Some(tx);
+        server.park_open = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_post_terminal_check() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((2, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_reconnect_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((3, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // reconnect resync snapshot + cancel_session snapshot.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_reconnect_backoff() {
+        // The mock responds instantly, so by the time the 250ms reconnect
+        // backoff starts the timed cancel is already pending — the backoff
+        // select! is cancel-aware without any parking.
+        let mut server = MockServer::new();
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // reconnect resync snapshot + cancel_session snapshot.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = tokio::time::sleep(Duration::from_millis(50));
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_post_reconnect_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((4, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // reconnect resync snapshot; the gate parks the post-reconnect resync.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_cancel_during_changed_resync() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = MockServer::new();
+        *server.snapshot_gate.lock().unwrap() = Some((3, tx));
+        server.park_snapshot = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        // cancel_session fetches one last snapshot before cancelling.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_event(StreamEvent::ThreadChanged {
+            session_id: "self".into(),
+            revision: 2,
+        });
+        let cancel = async {
+            let _ = rx.await;
+        };
+        let result = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 130);
+        assert_eq!(result.status(), "cancelled");
+        assert_eq!(server.cancelled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_session_propagates_reconnect_open_failure() {
+        let mut server = MockServer::new();
+        server.fail_reopen = true;
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.end_stream();
+        // The reconnect resync needs a snapshot before open_events fails.
+        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        let error = run_session(
+            &mut server,
+            Path::new("/workspace"),
+            "x",
+            None,
+            &mut |_| {},
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, ClientError::Failed("reconnect rejected".into()));
     }
 }

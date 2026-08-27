@@ -10,7 +10,8 @@ expected="$(printf '%s\n' \
   'crates/latte-code/tests/e2e_unix.rs e2e-unix' \
   'crates/latte-code/tests/markdown_links.rs contract' \
   'crates/latte-core/tests/contracts.rs contract' \
-  'crates/latte-engine/tests/public_lifecycle.rs contract')"
+  'crates/latte-engine/tests/public_lifecycle.rs contract' \
+  'crates/latte-server/tests/contract.rs contract')"
 
 actual="$({
   for tests_dir in crates/*/tests; do
@@ -40,4 +41,4 @@ if rg -n '#\[ignore' crates --glob '*.rs'; then
   exit 1
 fi
 
-echo "Test inventory passed: 5 contract targets, portable + Unix E2E targets, no ignored tests."
+echo "Test inventory passed: 6 contract targets, portable + Unix E2E targets, no ignored tests."

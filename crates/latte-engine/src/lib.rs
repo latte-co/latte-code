@@ -1128,19 +1128,29 @@ impl EngineHandle {
     }
     /// Atomically accepts and starts a follow-up child under the exact Session
     /// lease, preserving the completed parent if any precondition fails.
+    ///
+    /// When `command_id` is provided, the follow-up is crash-safe idempotent:
+    /// a same-id same-digest retry returns `Replayed` without starting a
+    /// runner (callers should first consult
+    /// [`Self::lookup_follow_up_replay`] before acquiring a lease), and a
+    /// same-id different-digest retry fails with
+    /// [`StorageError::ThreadCommandReplayMismatch`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_started_thread_follow_up_v2(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let response = self.storage.create_started_thread_follow_up_v2(
+        let (outcome, thread_event) = self.storage.create_started_thread_follow_up_v2(
+            command_id,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1149,8 +1159,44 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        Ok(self.finish_thread_response(response)?.snapshot)
+        match outcome {
+            latte_core::CreateOutcome::Created(snapshot) => {
+                let response = self.finish_thread_response(ThreadCommitResponse {
+                    snapshot,
+                    thread_event: thread_event.ok_or_else(|| {
+                        StorageError::InvalidData(
+                            "atomic follow-up start omitted its durable event".into(),
+                        )
+                    })?,
+                })?;
+                Ok(latte_core::CreateOutcome::Created(response.snapshot))
+            }
+            latte_core::CreateOutcome::Replayed(snapshot) => {
+                Ok(latte_core::CreateOutcome::Replayed(snapshot))
+            }
+        }
     }
+
+    /// Pre-acquire durable dedup lookup for a follow-up command. A hit means
+    /// the follow-up was already durably accepted (possibly by a process that
+    /// crashed before responding); the caller replays the snapshot and must
+    /// not acquire a lease or start a runner. A miss proceeds to lease
+    /// acquisition and [`Self::create_started_thread_follow_up_v2`].
+    pub fn lookup_follow_up_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: ThreadId,
+        expected_thread_revision: u64,
+        prompt: &str,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        self.storage.lookup_follow_up_replay(
+            command_id,
+            thread_id,
+            expected_thread_revision,
+            prompt,
+        )
+    }
+
     /// Switches the provider/model binding for subsequent children of an idle
     /// Session and publishes the durable binding-change event.
     pub fn switch_thread_binding_v2(
@@ -1368,6 +1414,62 @@ impl EngineHandle {
     ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
         self.storage
             .find_thread_sessions_v2_by_exact_title_for_workspace(workspace_root, title, limit)
+    }
+
+    /// Lists one page of thread projections belonging to one exact workspace
+    /// identity, ordered by `(updated_at_ms, rowid)` descending. `cursor` is
+    /// the opaque `next_cursor` of the previous page.
+    pub fn list_threads_v2_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<ThreadSnapshot>, StorageError> {
+        let mut page =
+            self.storage
+                .list_threads_v2_for_workspace_paged(workspace_root, cursor, limit)?;
+        if workspace_root == self.workspace_root.as_ref() {
+            for snapshot in &mut page.items {
+                if let Some(transcript) =
+                    self.conversation_page(snapshot.thread_id, None, 500, true)?
+                {
+                    snapshot.transcript = transcript;
+                }
+            }
+        }
+        Ok(page)
+    }
+
+    /// Searches the current workspace's local Session catalog one page at a
+    /// time, in the same order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    pub fn search_thread_sessions_v2_paged(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .search_thread_sessions_paged(&self.workspace_root, query, cursor, limit)
+    }
+
+    /// Finds sessions whose title exactly matches `title` one page at a time,
+    /// in the same order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    pub fn find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+        self.storage
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                workspace_root,
+                title,
+                cursor,
+                limit,
+            )
     }
     /// Reads exact Session metadata without applying a recent-list cap.
     pub fn thread_session_v2(
@@ -4190,5 +4292,703 @@ mod tool_effect_tests {
             ToolError::Input(msg) => assert!(msg.contains("test error")),
             other => panic!("expected ToolError::Input, got {other:?}"),
         }
+    }
+
+    // -- Additional coverage for engine error branches ---------------------
+
+    #[test]
+    fn reissue_tool_permission_rebinds_ask_approval_and_rejects_non_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let hash = engine
+            .execute_tool(
+                run,
+                &lease,
+                3,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-for-hash",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: &lease.owner,
+                    lease_token: lease.fencing_token,
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write_input = json!({"path":"a.txt","content":"new"});
+        let ask = ToolInvocation {
+            name: "write_file",
+            input: &write_input,
+            run_revision: 0,
+            effect_id: "write-reissue",
+            attempt: 1,
+            precondition: Some(&hash),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: &lease.owner,
+            lease_token: lease.fencing_token,
+        };
+        let digest = match engine.execute_tool(run, &lease, 4, &ask).unwrap_err() {
+            ToolError::PermissionRequired { digest, .. } => digest,
+            other => panic!("{other}"),
+        };
+        // Acquire a new lease after the old one expires (new fencing token).
+        let renewed = engine.acquire_lease("owner", 200, 100).unwrap();
+        assert_ne!(renewed.fencing_token, lease.fencing_token);
+        let new_digest = engine
+            .reissue_tool_permission(
+                "write-reissue",
+                run,
+                &renewed,
+                201,
+                &ToolInvocation {
+                    effect_id: "write-reissue-2",
+                    ..ask
+                },
+            )
+            .unwrap();
+        // The digest is rebound to the new invocation: it is a fresh 64-char
+        // hex digest computed from the new effect_id and lease token, so it
+        // must not equal the original approval digest.
+        assert_ne!(new_digest, digest);
+        assert_eq!(new_digest.len(), 64);
+        assert!(new_digest.chars().all(|c| c.is_ascii_hexdigit()));
+        // Non-ask tools (read_file is Allow) cannot be reissued.
+        assert!(matches!(
+            engine.reissue_tool_permission(
+                "write-reissue-2",
+                run,
+                &renewed,
+                202,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-reissue",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: &renewed.owner,
+                    lease_token: renewed.fencing_token,
+                },
+            ),
+            Err(ToolError::Input(_))
+        ));
+    }
+
+    #[test]
+    fn execute_tool_rejects_lease_mismatch_and_wrong_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
+        // Lease owner mismatch → InvalidApproval.
+        assert!(matches!(
+            engine.execute_tool(
+                run,
+                &lease,
+                3,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-mismatch",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: "wrong-owner",
+                    lease_token: lease.fencing_token,
+                },
+            ),
+            Err(ToolError::InvalidApproval)
+        ));
+        // Prepare an Ask operation, then approve with a wrong digest.
+        let hash = engine
+            .execute_tool(
+                run,
+                &lease,
+                4,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-for-hash-2",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: &lease.owner,
+                    lease_token: lease.fencing_token,
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write_input = json!({"path":"a.txt","content":"new"});
+        let ask = ToolInvocation {
+            name: "write_file",
+            input: &write_input,
+            run_revision: 0,
+            effect_id: "write-wrong-digest",
+            attempt: 1,
+            precondition: Some(&hash),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: &lease.owner,
+            lease_token: lease.fencing_token,
+        };
+        let digest = match engine.execute_tool(run, &lease, 5, &ask).unwrap_err() {
+            ToolError::PermissionRequired { digest, .. } => digest,
+            other => panic!("{other}"),
+        };
+        let mut bad_digest = digest.clone();
+        bad_digest.push('x');
+        assert!(matches!(
+            engine.execute_tool(
+                run,
+                &lease,
+                6,
+                &ToolInvocation {
+                    approval_digest: Some(&bad_digest),
+                    ..ask
+                },
+            ),
+            Err(ToolError::InvalidApproval)
+        ));
+    }
+
+    #[test]
+    fn execute_tool_finishes_effect_as_failed_on_stale_precondition() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
+        let hash = engine
+            .execute_tool(
+                run,
+                &lease,
+                3,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &json!({"path":"a.txt"}),
+                    run_revision: 0,
+                    effect_id: "read-for-stale",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: &lease.owner,
+                    lease_token: lease.fencing_token,
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write_input = json!({"path":"a.txt","content":"new"});
+        let ask = ToolInvocation {
+            name: "write_file",
+            input: &write_input,
+            run_revision: 0,
+            effect_id: "write-stale",
+            attempt: 1,
+            precondition: Some(&hash),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: &lease.owner,
+            lease_token: lease.fencing_token,
+        };
+        let digest = match engine.execute_tool(run, &lease, 4, &ask).unwrap_err() {
+            ToolError::PermissionRequired { digest, .. } => digest,
+            other => panic!("{other}"),
+        };
+        // Mutate the file so the precondition hash is stale at execute time.
+        std::fs::write(&file, "changed").unwrap();
+        let approved = ToolInvocation {
+            approval_digest: Some(&digest),
+            ..ask
+        };
+        let result = engine.execute_tool(run, &lease, 5, &approved);
+        assert!(matches!(result, Err(ToolError::Stale(_))));
+        assert_eq!(
+            engine.effect_status("write-stale").unwrap(),
+            EffectStatus::ObservedFailed
+        );
+    }
+
+    #[test]
+    fn create_started_thread_v2_snapshot_creates_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let lease = engine.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        // First create via the snapshot convenience wrapper.
+        let snapshot = engine
+            .create_started_thread_v2_snapshot(
+                thread_id,
+                run_id,
+                test_thread_binding(),
+                "started snapshot",
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+        assert_eq!(snapshot.thread_id, thread_id);
+        assert_eq!(snapshot.active_run_id, Some(run_id));
+        // A second thread exercises the explicit command-id replay path.
+        let thread_id2 = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id2 = RunId::from_uuid(ids.next_uuid_v7());
+        let lease2 = engine.acquire_thread_lease(thread_id2, 3, 10_000).unwrap();
+        let command_id2 = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        let created = engine
+            .create_started_thread_v2(
+                &command_id2,
+                thread_id2,
+                run_id2,
+                test_thread_binding(),
+                "replay test",
+                &lease2,
+                4,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(created, latte_core::CreateOutcome::Created(_)));
+        // Replaying the same command id returns the same snapshot.
+        let replayed = engine
+            .create_started_thread_v2(
+                &command_id2,
+                thread_id2,
+                run_id2,
+                test_thread_binding(),
+                "replay test",
+                &lease2,
+                5,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(replayed, latte_core::CreateOutcome::Replayed(_)));
+    }
+
+    #[test]
+    fn prepare_thread_effect_rejects_invalid_descriptor_and_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let snapshot = engine
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                test_thread_binding(),
+                "prepare errors",
+                1,
+            )
+            .unwrap();
+        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let running = engine
+            .commit_thread_run_update(
+                ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Start {
+                        source_key: "test:start".into(),
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap()
+            .snapshot;
+        // Invalid descriptor (empty effect_id) → InvalidData.
+        let invalid = ThreadEffectDescriptor {
+            effect_id: String::new(),
+            ..descriptor("write_file", json!({"path":"x.txt","content":"y"}))
+        };
+        assert!(matches!(
+            engine.prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: running.revision,
+                    expected_run_revision: running.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:invalid".into(),
+                    descriptor: invalid,
+                },
+                &lease,
+                4,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Revision overflow → InvalidData.
+        let valid = descriptor("write_file", json!({"path":"x.txt","content":"y"}));
+        assert!(matches!(
+            engine.prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: running.revision,
+                    expected_run_revision: u64::MAX,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:overflow".into(),
+                    descriptor: valid,
+                },
+                &lease,
+                5,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn start_thread_effect_rejects_unknown_effect_and_digest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let snapshot = engine
+            .create_thread_v2(thread_id, run_id, test_thread_binding(), "start errors", 1)
+            .unwrap();
+        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let running = engine
+            .commit_thread_run_update(
+                ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Start {
+                        source_key: "test:start".into(),
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap()
+            .snapshot;
+        // Unknown effect → error from thread_effect_canonical_descriptor.
+        assert!(
+            engine
+                .start_thread_effect(
+                    ThreadEffectStartRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: running.revision,
+                        expected_run_revision: running.runs[0].run_revision,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: "test:unknown".into(),
+                        effect_id: "effect-nonexistent".into(),
+                    },
+                    "digest".into(),
+                    &lease,
+                    4,
+                )
+                .is_err()
+        );
+        // Prepare a real effect, then start with a wrong digest.
+        let desc = descriptor("read_file", json!({"path":"read.txt"}));
+        let prepared = engine
+            .prepare_thread_effect(
+                ThreadEffectRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: running.revision,
+                    expected_run_revision: running.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:prepare".into(),
+                    descriptor: desc.clone(),
+                },
+                &lease,
+                5,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.start_thread_effect(
+                ThreadEffectStartRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: prepared.snapshot.revision,
+                    expected_run_revision: prepared.snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:start-wrong".into(),
+                    effect_id: desc.effect_id,
+                },
+                "wrong-digest".into(),
+                &lease,
+                6,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_started_thread_effect_rejects_wrong_lease_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let snapshot = engine
+            .create_thread_v2(thread_id, run_id, test_thread_binding(), "lease scope", 1)
+            .unwrap();
+        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let running = engine
+            .commit_thread_run_update(
+                ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: snapshot.revision,
+                    expected_run_revision: snapshot.runs[0].run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitThreadRunUpdate::Start {
+                        source_key: "test:start".into(),
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap()
+            .snapshot;
+        let desc = descriptor("read_file", json!({"path":"read.txt"}));
+        let (_, digest) = engine
+            .thread_effect_policy_and_digest(&desc, running.runs[0].run_revision, &lease)
+            .unwrap();
+        let started = ThreadEffectStarted {
+            snapshot: running,
+            presentation: ThreadEffectPresentation::from_descriptor(&desc),
+            operation_digest: digest,
+            descriptor: desc,
+        };
+        // A runtime lease (wrong scope) → Uncertain error.
+        let runtime_lease = engine.acquire_lease("other", 4, 10_000).unwrap();
+        assert!(matches!(
+            engine
+                .execute_started_thread_effect(&started, &runtime_lease, &CancellationToken::new(),)
+                .await,
+            Err(ThreadEffectExecutionError::Uncertain(_))
+        ));
+    }
+
+    #[test]
+    fn engine_sync_thread_conversation_rejects_unknown_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversations = dir.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let unknown = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(matches!(
+            engine.sync_thread_conversation(unknown),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deny_waiting_permission_terminates_waiting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_lease("owner", 2, 100).unwrap();
+        let running = engine
+            .apply_transition(run, 0, Transition::Start, 3, &lease)
+            .unwrap();
+        let argv = vec!["/usr/bin/env".into()];
+        let env = std::collections::BTreeMap::new();
+        let request = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 1000,
+            grace_ms: 10,
+            stdout_cap: 1024,
+            stderr_cap: 1024,
+            run_revision: running.revision + 2,
+            effect_id: "deny-effect",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: lease.owner(),
+            lease_token: lease.fencing_token(),
+        };
+        let digest = match engine
+            .execute_process(run, &lease, 4, &request, &CancellationToken::new())
+            .await
+            .unwrap_err()
+        {
+            ProcessError::PermissionRequired { digest } => digest,
+            error => panic!("{error}"),
+        };
+        let waiting = engine
+            .apply_transition(
+                run,
+                running.revision,
+                Transition::RequestPermission(latte_core::PendingPermission {
+                    request_id: "deny-effect".into(),
+                    operation_digest: digest,
+                    description: "allow".into(),
+                }),
+                5,
+                &lease,
+            )
+            .unwrap();
+        let denied = engine
+            .deny_waiting_permission(run, waiting.revision, &lease, 6)
+            .unwrap();
+        assert_eq!(
+            denied.failure.unwrap().code,
+            latte_core::FailureCode::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn list_threads_v2_returns_local_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversations = dir.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(thread_id, run_id, test_thread_binding(), "list test", 1)
+            .unwrap();
+        let all = engine.list_threads_v2().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].thread_id, thread_id);
+        let local = engine
+            .list_threads_v2_for_workspace(&engine.workspace_root)
+            .unwrap();
+        assert_eq!(local.len(), 1);
+    }
+
+    #[test]
+    fn fork_thread_session_v2_creates_ready_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversations = dir.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(thread_id, run_id, test_thread_binding(), "fork source", 1)
+            .unwrap();
+        let fork_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let forked = engine
+            .fork_thread_session_v2(thread_id, fork_id, Some("forked title"), 2)
+            .unwrap();
+        assert_eq!(forked.thread_id, fork_id);
+        assert_eq!(forked.lifecycle, latte_core::ThreadLifecycle::Ready);
+    }
+
+    #[test]
+    fn acquire_run_lease_binds_legacy_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_run(run, 1).unwrap();
+        let lease = engine.acquire_run_lease(run, "owner", 2, 10_000).unwrap();
+        assert_eq!(lease.scope, "runtime");
+        assert_eq!(lease.owner, "owner");
+    }
+
+    #[test]
+    fn rename_thread_session_rejects_unknown_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let unknown = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        assert!(matches!(
+            engine.rename_thread_session_v2(unknown, "title"),
+            Err(StorageError::ThreadNotFound(_))
+        ));
     }
 }

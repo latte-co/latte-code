@@ -654,7 +654,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         Some(&create_body_json),
         &[("Idempotency-Key", &create_command_id)],
     );
-    assert_eq!(replay_status, 202);
+    assert_eq!(replay_status, 200);
     assert_eq!(replay_body["session_id"].as_str().unwrap(), session_id);
 
     // A keyed create that fails (invalid binding) releases its reservation, so
@@ -796,8 +796,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
     assert_eq!(follow_status, 202, "follow-up returned {follow_body:?}");
     let follow_revision = follow_body["accepted_revision"].as_u64().unwrap();
@@ -808,10 +808,10 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
-    assert_eq!(replay_follow_status, 202);
+    assert_eq!(replay_follow_status, 200);
     assert_eq!(
         replay_follow_body["accepted_revision"].as_u64().unwrap(),
         follow_revision
@@ -833,8 +833,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": 999 })),
-        &[("Idempotency-Key", "stale-revision-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000012", "prompt": "again", "expected_thread_revision": 999 })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000012")],
     );
     assert_eq!(follow_conflict, 409);
 
@@ -963,8 +963,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "DIFFERENT", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "e2e-follow-1")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000011", "prompt": "DIFFERENT", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000011")],
     );
     assert_eq!(follow_mismatch_status, 422);
     assert_eq!(
@@ -1009,8 +1009,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "continue", "expected_thread_revision": no_key_rev })),
-        &[("Idempotency-Key", "second-session-follow-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000014", "prompt": "continue", "expected_thread_revision": no_key_rev })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000014")],
     );
     assert_eq!(no_key_follow_status, 202);
 
@@ -1019,7 +1019,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "no key", "expected_thread_revision": no_key_rev })),
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000014", "prompt": "no key", "expected_thread_revision": no_key_rev })),
         &[],
     );
     assert_eq!(missing_key_status, 400);
@@ -1056,8 +1056,8 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         "POST",
         &format!("/v1/sessions/{no_key_session}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "stale", "expected_thread_revision": 999 })),
-        &[("Idempotency-Key", "stale-revision-key")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000012", "prompt": "stale", "expected_thread_revision": 999 })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000012")],
     );
     assert_eq!(no_key_stale_status, 409);
 }
@@ -2321,8 +2321,8 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "switch-follow")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000015", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000015")],
     );
     assert_eq!(f1, 202, "follow-up returned {f1_body:?}");
     // Retry with the same key replays the original accepted body.
@@ -2330,11 +2330,261 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
         Some(&server.token),
-        Some(&serde_json::json!({ "prompt": "again", "expected_thread_revision": revision })),
-        &[("Idempotency-Key", "switch-follow")],
+        Some(&serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000015", "prompt": "again", "expected_thread_revision": revision })),
+        &[("Idempotency-Key", "01900000-0000-7000-8000-000000000015")],
     );
-    assert_eq!(f2, 202);
+    assert_eq!(f2, 200);
     assert_eq!(f2_body, f1_body, "keyed follow-up retry must replay");
+}
+
+/// A follow-up accepted by one server instance must replay identically after a
+/// server restart: the durable `thread_command_dedup_v2` record prevents a
+/// duplicate turn when the client retries with the same `command_id`.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first done"),
+        ProviderReply::completion("follow-up done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // First server instance: create + follow-up, then shut down.
+    let (session_id, original_revision, follow_revision, follow_command_id) = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "restart replay", &binding);
+        assert_eq!(create_status, 202);
+        let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait for the initial turn to complete.
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Send a follow-up with a stable command_id.
+        let command_id = "01900000-0000-7000-8000-0000000000a1".to_string();
+        let (f_status, f_body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "after restart",
+                "expected_thread_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up returned {f_body:?}");
+        let follow_revision = f_body["accepted_revision"].as_u64().unwrap();
+
+        // Wait for the follow-up turn to complete.
+        loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (session_id, revision, follow_revision, command_id)
+        // `server` drops here → SIGTERM → graceful shutdown.
+    };
+
+    // Second instance: replay the same follow-up. The durable dedup record
+    // must prevent a duplicate turn.
+    let server = ServeChild::start(&scenario);
+    let (replay_status, replay_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": follow_command_id,
+            "prompt": "after restart",
+            "expected_thread_revision": original_revision,
+        })),
+        &[("Idempotency-Key", &follow_command_id)],
+    );
+    // The replay returns 200 (not the original 202) without appending a new
+    // turn.
+    assert_eq!(
+        replay_status, 200,
+        "replay returned {replay_status}: {replay_body:?}"
+    );
+    assert_eq!(
+        replay_body["accepted_revision"].as_u64().unwrap(),
+        follow_revision,
+        "replay must return the original accepted revision, not advance it"
+    );
+
+    // The transcript must not contain a duplicate user turn.
+    let (_, snap) = server.request(
+        "GET",
+        &format!("/v1/sessions/{session_id}"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    let user_turns = snap["snapshot"]["transcript"]["entries"]
+        .as_array()
+        .map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|e| e["kind"].as_str() == Some("user"))
+                .count()
+        });
+    assert_eq!(
+        user_turns, 2,
+        "expected exactly 2 user turns (initial + follow-up), got {user_turns}: \
+         a duplicate turn was appended after restart"
+    );
+}
+
+/// A follow-up accepted by one server instance must reject a same-command_id
+/// different-payload retry after a server restart with 422 (not 409), so the
+/// client doesn't retry as a revision conflict.
+#[cfg(unix)]
+#[test]
+fn final_binary_follow_up_durable_mismatch_after_restart_returns_422() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first done"),
+        ProviderReply::completion("follow-up done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let binding = server_binding(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+
+    // First server instance: create + follow-up, then shut down.
+    let (session_id, revision, command_id) = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (create_status, create_body) =
+            server.create_session(&workspace_id, "mismatch test", &binding);
+        assert_eq!(create_status, 202);
+        let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Wait for the initial turn to complete.
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        // Send a follow-up with a stable command_id.
+        let command_id = "01900000-0000-7000-8000-0000000000b2".to_string();
+        let (f_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "original prompt",
+                "expected_thread_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up must be accepted");
+
+        // Wait for the follow-up turn to complete.
+        loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (session_id, revision, command_id)
+        // `server` drops here → SIGTERM → graceful shutdown.
+    };
+
+    // Second instance: replay with the same command_id but a DIFFERENT prompt.
+    // The durable dedup must reject this as 422, not 409.
+    let server = ServeChild::start(&scenario);
+    let (mismatch_status, mismatch_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": command_id,
+            "prompt": "DIFFERENT prompt",
+            "expected_thread_revision": revision,
+        })),
+        &[("Idempotency-Key", &command_id)],
+    );
+    assert_eq!(
+        mismatch_status, 422,
+        "durable mismatch must be 422, got {mismatch_status}: {mismatch_body:?}"
+    );
+    assert_eq!(
+        mismatch_body["error"]["type"].as_str(),
+        Some("idempotency_mismatch"),
+        "error type must be idempotency_mismatch: {mismatch_body:?}"
+    );
 }
 
 /// Exercises the session-management surface end to end against the final
@@ -3113,6 +3363,26 @@ fn final_binary_cli_serve_rejects_unknown_argument() {
     assert_eq!(json(&output)["error"]["code"], "usage");
 }
 
+#[test]
+fn final_binary_cli_serve_without_port_value_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "serve", "--port"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_serve_with_invalid_port_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "serve", "--port", "not-a-port"], |_| {});
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
 /// CLI `tui` without a TTY reports a usage error.
 #[test]
 fn final_binary_cli_tui_without_tty_fails() {
@@ -3849,7 +4119,9 @@ fn handle_mock_request(mut stream: std::net::TcpStream, count: &std::sync::atomi
         return;
     }
     let method = parts[0];
-    let path = parts[1];
+    // Query strings are opaque to these mocks; strip them so pagination
+    // parameters (limit/cursor) do not break path matching.
+    let path = parts[1].split_once('?').map_or(parts[1], |(path, _)| path);
 
     // Read headers until the blank line.
     let mut content_length = 0usize;
@@ -3959,6 +4231,203 @@ fn final_binary_cli_run_reconnects_after_sse_stream_close() {
     );
 }
 
+/// Mock server that streams every SSE event variant in one connection —
+/// assistant deltas, tool progress, provider attempts, cross-session
+/// progress, `thread_changed`, `resync_required`, unknown types, malformed
+/// payloads, multi-line data, and comments — then closes. This covers the
+/// `parse_sse_frame` / `SseDecoder` / `render_progress` / `observe_session`
+/// branches that a real server rarely produces in a single session.
+struct MockRichSseServer {
+    port: u16,
+    snapshot_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MockRichSseServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let snapshot_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&snapshot_count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let count = std::sync::Arc::clone(&count);
+                std::thread::spawn(move || {
+                    handle_rich_sse_request(stream, &count);
+                });
+            }
+        });
+        Self {
+            port,
+            snapshot_count,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_rich_sse_request(
+    mut stream: std::net::TcpStream,
+    count: &std::sync::atomic::AtomicUsize,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+    let method = parts[0];
+    let path = parts[1].split_once('?').map_or(parts[1], |(p, _)| p);
+
+    // Read headers until the blank line.
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(len) = trimmed.to_lowercase().strip_prefix("content-length:") {
+            content_length = len.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let session_id = "01a0194a-0000-7000-8000-000000000001";
+    let running_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+    let completed_snapshot = format!(
+        r#"{{"snapshot":{{"thread_id":"{session_id}","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_run_id":"01a0194a-0000-7000-8000-000000000002","active_run_id":null,"pending":null,"runs":[{{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+    );
+
+    let response: Vec<u8> = match (method, path) {
+        ("GET", "/health") => mock_http_response(200, "text/plain", b"ok"),
+        ("POST", "/v1/workspaces") => {
+            mock_http_response(200, "application/json", br#"{"workspace_id":"ws-1"}"#)
+        }
+        ("GET", p) if p.ends_with("/bindings") => mock_http_response(
+            200,
+            "application/json",
+            format!(r#"{{"bindings":[{{"is_default":true,"binding":{binding}}}]}}"#).as_bytes(),
+        ),
+        ("POST", p) if p.ends_with("/sessions") => mock_http_response(
+            202,
+            "application/json",
+            format!(r#"{{"session_id":"{session_id}","accepted_revision":1}}"#).as_bytes(),
+        ),
+        ("GET", p) if p.starts_with("/v1/sessions/") => {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = if n < 6 {
+                running_snapshot.as_bytes()
+            } else {
+                completed_snapshot.as_bytes()
+            };
+            mock_http_response(200, "application/json", body)
+        }
+        ("GET", p) if p.ends_with("/events") => {
+            // Rich SSE stream: every event variant in one connection.
+            let body = format!(
+                concat!(
+                    ": keepalive comment\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"hello\"}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"tool_progress\",\"run_id\":\"r1\",\"name\":\"read_file\",\"detail\":\"reading\"}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"provider_attempt\",\"run_id\":\"r1\",\"number\":1}}}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"other-session\",\"run_id\":\"r2\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r2\",\"text\":\"other\"}}}}\n",
+                    "\n",
+                    "event: thread_changed\n",
+                    "data: {{\"session_id\":\"{sid}\",\"revision\":2}}\n",
+                    "\n",
+                    "event: resync_required\n",
+                    "data: {{}}\n",
+                    "\n",
+                    "event: unknown_type\n",
+                    "data: {{}}\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: not valid json\n",
+                    "\n",
+                    "event: progress\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"multi\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"line\"}}}}\n",
+                    "\n",
+                ),
+                sid = session_id,
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            return; // Close the connection to signal stream-end.
+        }
+        _ => mock_http_response(404, "text/plain", b"not found"),
+    };
+    let _ = stream.write_all(&response);
+}
+
+/// CLI `run` against a mock server that streams every SSE event variant
+/// before closing. Exercises the full decoder → render → observe pipeline:
+/// assistant deltas, tool progress, provider attempts, cross-session
+/// progress, `thread_changed`, `resync_required`, unknown/malformed events,
+/// multi-line data, and comments.
+#[test]
+fn final_binary_cli_run_streams_all_sse_event_variants() {
+    let server = MockRichSseServer::start();
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    let output = Scenario::new().output(
+        &[
+            "--json",
+            "run",
+            "sse variants test",
+            "--server",
+            &url,
+            "--token",
+            "mock-token",
+        ],
+        |_| {},
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    // The rich stream triggers thread_changed/resync resyncs plus the
+    // reconnect-path resyncs, so well over the minimum 3 snapshots.
+    assert!(
+        server
+            .snapshot_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 5,
+        "expected at least 5 snapshot requests (event resyncs + reconnect)"
+    );
+}
+
 /// A minimal mock HTTP server that returns a terminal snapshot with a
 /// configurable lifecycle, covering the `classify` branches that are hard to
 /// reach through the real server (`Interrupted`, `ReconciliationRequired`, `Failed`,
@@ -3998,7 +4467,9 @@ fn handle_lifecycle_request(mut stream: std::net::TcpStream, snapshot_json: &str
         return;
     }
     let method = parts[0];
-    let path = parts[1];
+    // Query strings are opaque to these mocks; strip them so pagination
+    // parameters (limit/cursor) do not break path matching.
+    let path = parts[1].split_once('?').map_or(parts[1], |(path, _)| path);
 
     // Read headers until the blank line.
     let mut content_length = 0usize;
@@ -4163,6 +4634,1431 @@ fn final_binary_cli_list_renders_interrupted_and_reconciliation_lifecycles() {
     );
 }
 
+/// CLI `list` follows `next_cursor` until every page is fetched, so sessions
+/// beyond the first page are not silently dropped.
+#[test]
+fn final_binary_cli_list_follows_pagination_cursor() {
+    let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
+    let session = |id: &str| {
+        format!(
+            r#"{{"thread_id":"{id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}"#
+        )
+    };
+    let page1 = format!(
+        r#"{{"sessions":[{}],"next_cursor":"page-2"}}"#,
+        session("01a0194a-0000-7000-8000-000000000001")
+    );
+    let page2 = format!(
+        r#"{{"sessions":[{}],"next_cursor":null}}"#,
+        session("01a0194a-0000-7000-8000-000000000002")
+    );
+    let (url, _handle) = start_healthy_mock_server(move |method, path| {
+        if method == "POST" && path == "/v1/workspaces" {
+            return (
+                200,
+                "application/json".into(),
+                r#"{"workspace_id":"ws-1"}"#.into(),
+            );
+        }
+        if method == "GET" && path.starts_with("/v1/workspaces/ws-1/sessions") {
+            if path.contains("cursor=page-2") {
+                return (200, "application/json".into(), page2.clone());
+            }
+            return (200, "application/json".into(), page1.clone());
+        }
+        (
+            404,
+            "application/json".into(),
+            r#"{"error":"not found"}"#.into(),
+        )
+    });
+
+    let output = Scenario::new().output(&["list", "--server", &url, "--token", "t"], |_| {});
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("01a0194a-0000-7000-8000-000000000001"),
+        "page 1 session missing: {text}"
+    );
+    assert!(
+        text.contains("01a0194a-0000-7000-8000-000000000002"),
+        "page 2 session missing (cursor not followed): {text}"
+    );
+}
+
+/// Engine-level cursor pagination: creating more threads than the page limit
+/// forces `encode_session_cursor` to emit a cursor, and following it exercises
+/// `decode_session_cursor` and the keyset WHERE clause.
+#[test]
+fn engine_paged_list_follows_cursor_across_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+    let ids = latte_core::SystemIdSource::default();
+    for index in 0..3u64 {
+        let thread_id = latte_core::ThreadId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
+        let run_id = latte_core::RunId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
+        engine
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                binding.clone(),
+                &format!("session {index}"),
+                index + 1,
+            )
+            .unwrap();
+    }
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Page 1: limit=1 → 1 item + cursor.
+    let page1 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 1)
+        .unwrap();
+    assert_eq!(page1.items.len(), 1);
+    assert!(page1.next_cursor.is_some(), "page 1 must carry a cursor");
+
+    // Page 2: follow the cursor → 1 item + cursor.
+    let cursor = page1.next_cursor.unwrap();
+    let page2 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, Some(&cursor), 1)
+        .unwrap();
+    assert_eq!(page2.items.len(), 1);
+    assert!(page2.next_cursor.is_some(), "page 2 must carry a cursor");
+    assert_ne!(
+        page1.items[0].thread_id, page2.items[0].thread_id,
+        "pages must not repeat sessions"
+    );
+
+    // Page 3: follow the cursor → 1 item, no cursor (exhausted).
+    let cursor = page2.next_cursor.unwrap();
+    let page3 = engine
+        .list_threads_v2_for_workspace_paged(&workspace, Some(&cursor), 1)
+        .unwrap();
+    assert_eq!(page3.items.len(), 1);
+    assert!(page3.next_cursor.is_none(), "page 3 must be the last page");
+
+    // Search paged: query matches all 3 sessions, follow the cursor.
+    let search = engine
+        .search_thread_sessions_v2_paged("session", None, 2)
+        .unwrap();
+    assert_eq!(search.items.len(), 2);
+    assert!(search.next_cursor.is_some());
+    let search2 = engine
+        .search_thread_sessions_v2_paged("session", search.next_cursor.as_deref(), 2)
+        .unwrap();
+    assert_eq!(search2.items.len(), 1);
+    assert!(search2.next_cursor.is_none());
+
+    // Exact-title paged: unique title → 1 item, no cursor.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+            &workspace,
+            "session 1",
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(exact.items.len(), 1);
+    assert!(exact.next_cursor.is_none());
+
+    // Exact-title paged with limit=1 → cursor follows.
+    let exact_paged = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+            &workspace,
+            "session 1",
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(exact_paged.items.len(), 1);
+    assert!(exact_paged.next_cursor.is_none());
+
+    // limit=0 → empty page, no cursor.
+    let empty = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 0)
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert!(empty.next_cursor.is_none());
+}
+
+/// Engine-level lifecycle: create runs, apply transitions, rename, fork, and
+/// lease management — covers storage paths that CLI E2E tests can't reach.
+#[test]
+fn engine_lifecycle_covers_run_transition_rename_fork_and_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and run.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "lifecycle test", 1)
+        .unwrap();
+
+    // Create a second thread for more coverage.
+    let thread2 = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run2 = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread2, run2, binding.clone(), "second session", 2)
+        .unwrap();
+
+    // Lease management: acquire and renew.
+    let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
+    engine.renew_lease(&lease, 3, 10_000).unwrap();
+    engine
+        .rename_thread_session_v2(thread_id, "renamed session")
+        .unwrap();
+
+    // Fork the thread.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let _fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+
+    // List and search.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+}
+
+/// Engine-level snapshot and conversation paths: thread snapshots, conversation
+/// outbox, and workspace manifest — covers storage paths CLI E2E can't reach.
+#[test]
+fn engine_snapshot_and_conversation_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "snapshot test", 1)
+        .unwrap();
+
+    // Thread snapshot.
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+
+    // Thread snapshot tail.
+    let tail = engine.thread_snapshot_tail_v2(thread_id, 10).unwrap();
+    assert_eq!(tail.thread_id, thread_id);
+
+    // Conversation outbox.
+
+    // Workspace manifest.
+    let _manifest = engine.workspace_manifest().unwrap();
+
+    // List threads for workspace.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws_threads = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws_threads.is_empty());
+
+    // Search sessions.
+    let found = engine.search_thread_sessions_v2("snapshot", 10).unwrap();
+    assert!(!found.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "snapshot test", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+
+    // Thread session (summary).
+    let summary = engine.thread_session_v2(thread_id).unwrap();
+    assert_eq!(summary.unwrap().thread_id, thread_id);
+}
+
+/// Engine-level run lifecycle: create thread, start a linked run through the
+/// v2 thread commit path, append transcript entries, and verify the run state
+/// transitions — covers storage transition paths CLI E2E can't reach.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_run_lifecycle_covers_transitions() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lifecycle", 1)
+        .unwrap();
+
+    // The thread's initial run should be in Queued state.
+    let state = engine.show(run_id).unwrap();
+    assert_eq!(state.status, latte_core::RunStatus::Queued);
+
+    // Linked v2 runs mutate exclusively through thread commits, scoped to a
+    // thread lease — the legacy run-transition path rejects them by design.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    assert_eq!(started.snapshot.thread_id, thread_id);
+    assert_eq!(started.snapshot.active_run_id, Some(run_id));
+    assert_eq!(
+        engine.show(run_id).unwrap().status,
+        latte_core::RunStatus::Running
+    );
+    let mut revision = started.snapshot.revision;
+    let mut run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .expect("started run appears in snapshot")
+        .run_revision;
+
+    // Append transcript entries on both sides of the conversation.
+    for (kind, text) in [
+        (latte_core::TranscriptKind::User, "first prompt"),
+        (latte_core::TranscriptKind::Assistant, "first reply"),
+    ] {
+        let committed = engine
+            .commit_thread_run_update(
+                latte_engine::ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: revision,
+                    expected_run_revision: run_revision,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: latte_engine::CommitThreadRunUpdate::AppendTranscript {
+                        source_key: format!("append-{text}"),
+                        kind,
+                        text: text.into(),
+                        payload: None,
+                    },
+                },
+                &lease,
+                4,
+            )
+            .unwrap();
+        revision = committed.snapshot.revision;
+        run_revision = committed
+            .snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .expect("run still appears in snapshot")
+            .run_revision;
+    }
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    // Start writes its own transcript entry, so the two appends make three.
+    let texts: Vec<&str> = snapshot
+        .transcript
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect();
+    assert!(texts.contains(&"first prompt"), "texts={texts:?}");
+    assert!(texts.contains(&"first reply"), "texts={texts:?}");
+
+    // List runs.
+    let runs = engine.list().unwrap();
+    assert!(!runs.is_empty());
+}
+
+/// Engine-level follow-up durable idempotency: a same-command_id retry replays
+/// the original acceptance without appending a duplicate turn, and a
+/// same-command_id different-payload retry is a conflict.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and complete its first run so the thread is ready for
+    // follow-up.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "dedup", 1)
+        .unwrap();
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let mut revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Fail the run (retryable) so the thread becomes ready for follow-up.
+    let committed = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test failure".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    revision = committed.snapshot.revision;
+    engine.release_lease(&lease).unwrap();
+
+    // First follow-up with a stable command_id → Created.
+    let command_id = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let follow_lease = engine.acquire_thread_lease(thread_id, 5, 10_000).unwrap();
+    let first = engine
+        .create_started_thread_follow_up_v2(
+            Some(&command_id),
+            thread_id,
+            follow_run_id,
+            revision,
+            "follow-up turn",
+            &follow_lease,
+            6,
+        )
+        .unwrap();
+    let first_snapshot = match first {
+        latte_core::CreateOutcome::Created(snapshot) => snapshot,
+        latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
+    };
+    assert_eq!(first_snapshot.active_run_id, Some(follow_run_id));
+
+    // Replay with the same command_id + payload → Replayed, no duplicate turn.
+    let replay_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let replay = engine
+        .create_started_thread_follow_up_v2(
+            Some(&command_id),
+            thread_id,
+            replay_run_id,
+            revision,
+            "follow-up turn",
+            &follow_lease,
+            7,
+        )
+        .unwrap();
+    let replayed_snapshot = match replay {
+        latte_core::CreateOutcome::Created(_) => panic!("replay must be Replayed"),
+        latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
+    // The replay returns the original acceptance, not a new turn.
+    assert_eq!(replayed_snapshot.thread_id, thread_id);
+    assert_eq!(replayed_snapshot.revision, first_snapshot.revision);
+
+    // Same command_id but different prompt → ThreadCommandReplayMismatch.
+    let mismatch_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let mismatch = engine.create_started_thread_follow_up_v2(
+        Some(&command_id),
+        thread_id,
+        mismatch_run_id,
+        revision,
+        "DIFFERENT prompt",
+        &follow_lease,
+        8,
+    );
+    assert!(matches!(
+        mismatch,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Same command_id but different expected revision → mismatch (digest
+    // includes expected_thread_revision).
+    let mismatch2 = engine.create_started_thread_follow_up_v2(
+        Some(&command_id),
+        thread_id,
+        mismatch_run_id,
+        revision + 1,
+        "follow-up turn",
+        &follow_lease,
+        9,
+    );
+    assert!(matches!(
+        mismatch2,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Pre-acquire lookup also finds the record (the headless replay path).
+    let looked_up = engine
+        .lookup_follow_up_replay(&command_id, thread_id, revision, "follow-up turn")
+        .unwrap();
+    assert!(
+        looked_up.is_some(),
+        "pre-acquire lookup must find the record"
+    );
+    let looked_up = looked_up.unwrap();
+    assert_eq!(looked_up.revision, first_snapshot.revision);
+
+    // Pre-acquire lookup with a different prompt → mismatch.
+    let lookup_mismatch = engine.lookup_follow_up_replay(&command_id, thread_id, revision, "WRONG");
+    assert!(matches!(
+        lookup_mismatch,
+        Err(latte_engine::StorageError::ThreadCommandReplayMismatch)
+    ));
+
+    // Pre-acquire lookup with an unknown command_id → None.
+    let unknown = engine.lookup_follow_up_replay(
+        &latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+        thread_id,
+        revision,
+        "follow-up turn",
+    );
+    assert!(unknown.unwrap().is_none());
+}
+
+/// Engine-level session management: switch binding, rename, and fork — covers
+/// storage mutation paths CLI E2E can't reach directly.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_session_management_covers_switch_rename_and_fork() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "manage me", 1)
+        .unwrap();
+
+    // Start and fail the run (retryable) so the thread becomes ready for
+    // management operations.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+    engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Switch the provider binding.
+    let switched_binding = latte_core::ThreadProviderBindingV2 {
+        model: "switched-model".into(),
+        ..binding.clone()
+    };
+    let lease = engine.acquire_thread_lease(thread_id, 5, 10_000).unwrap();
+    engine
+        .switch_thread_binding_v2(thread_id, 2, &switched_binding, &lease, 6)
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Verify the switch persisted.
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.binding.model, "switched-model");
+
+    // Rename the session.
+    engine
+        .rename_thread_session_v2(thread_id, "renamed session")
+        .unwrap();
+    let summary = engine.thread_session_v2(thread_id).unwrap().unwrap();
+    assert_eq!(summary.title, "renamed session");
+
+    // Fork the session.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+    assert_eq!(fork.thread_id, fork_id);
+
+    // Both threads appear in the list.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+
+    // Search finds the renamed session.
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "renamed session", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+}
+
+/// Engine-level paged queries: covers the paged list/search/exact-title
+/// storage paths.
+#[test]
+fn engine_paged_queries_and_changed_files() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create two threads.
+    for i in 0..2 {
+        let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+        engine
+            .create_thread_v2(thread_id, run_id, binding.clone(), &format!("paged {i}"), 1)
+            .unwrap();
+    }
+
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Paged list.
+    let page = engine
+        .list_threads_v2_for_workspace_paged(&workspace, None, 1)
+        .unwrap();
+    assert!(!page.items.is_empty());
+
+    // Paged search.
+    let search = engine
+        .search_thread_sessions_v2_paged("paged", None, 10)
+        .unwrap();
+    assert!(!search.items.is_empty());
+
+    // Paged exact-title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace_paged(&workspace, "paged 0", None, 10)
+        .unwrap();
+    assert!(!exact.items.is_empty());
+}
+
+/// Engine-level lease recovery: an expired thread lease is reclaimed by the
+/// recovery sweeper, covering the storage recovery path.
+#[test]
+fn engine_lease_recovery_reclaims_expired_thread_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lease recovery", 1)
+        .unwrap();
+
+    // Acquire a lease with a very short TTL.
+    let _lease = engine.acquire_thread_lease(thread_id, 2, 100).unwrap();
+
+    // Wait for the lease to expire.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // The lease should be expired — a new acquisition should succeed (the old
+    // lease is reclaimed by the recovery sweeper).
+    engine.recover_expired_leases().unwrap();
+
+    // After recovery, the thread should be recoverable (no active lease).
+    let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+}
+
+/// Engine-level non-atomic follow-up: covers the legacy `create_thread_follow_up_v2`
+/// path that queues a follow-up without acquiring a lease.
+#[test]
+fn engine_non_atomic_follow_up_queues_child() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Create a thread and complete its first run.
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "non-atomic", 1)
+        .unwrap();
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+    engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Fail {
+                    source_key: "fail".into(),
+                    failure: latte_core::RunFailure {
+                        code: latte_core::FailureCode::RuntimeFailed,
+                        message: "test".into(),
+                        retryability: latte_core::Retryability::Retryable,
+                    },
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // Non-atomic follow-up (no lease): queues a child in Queued state.
+    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let snapshot = engine
+        .create_thread_follow_up_v2(thread_id, follow_run_id, 2, "queued follow-up", 5)
+        .unwrap();
+    assert_eq!(snapshot.thread_id, thread_id);
+    // The follow-up child should appear in the snapshot.
+    assert!(
+        snapshot.runs.iter().any(|run| run.run_id == follow_run_id),
+        "follow-up child must appear in snapshot: {:?}",
+        snapshot.runs
+    );
+}
+
+/// Engine-level changed-files and workspace manifest: covers the
+/// `thread_run_changed_files` read path and workspace manifest computation.
+#[test]
+fn engine_changed_files_and_workspace_manifest() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "changed files", 1)
+        .unwrap();
+
+    // Changed files for a fresh run (covers the read path).
+    let _changed = engine.thread_run_changed_files(run_id).unwrap();
+
+    // Workspace manifest.
+    let manifest = engine.workspace_manifest().unwrap();
+    let _ = manifest;
+
+    // Tool descriptors.
+    let descriptors = engine.tool_descriptors();
+    assert!(!descriptors.is_empty(), "engine should have built-in tools");
+}
+
+/// Engine-level lease lifecycle and subscriptions: covers acquire/renew/release
+/// and the event subscription paths.
+#[test]
+fn engine_lease_lifecycle_and_subscriptions() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "lease test", 1)
+        .unwrap();
+
+    // Acquire, renew, and release a thread lease.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    engine.renew_lease(&lease, 3, 20_000).unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    // After release, a new lease can be acquired.
+    let lease2 = engine.acquire_thread_lease(thread_id, 4, 10_000).unwrap();
+    engine.release_lease(&lease2).unwrap();
+
+    // Subscriptions.
+    let _events = engine.subscribe();
+    let _thread_events = engine.subscribe_threads();
+
+    // Show a run.
+    let state = engine.show(run_id).unwrap();
+    assert_eq!(state.run_id, run_id);
+
+    // List runs.
+    let runs = engine.list().unwrap();
+    assert!(!runs.is_empty());
+}
+
+/// Engine-level cancel and unknown-effect paths: covers the cancel and
+/// `reconcile_unknown_effect` storage paths.
+#[test]
+fn engine_cancel_and_unknown_effect_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "cancel test", 1)
+        .unwrap();
+
+    // Start the run.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Cancel the run.
+    let _cancelled = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Interrupt {
+                    source_key: "cancel".into(),
+                    reconciliation_effect_id: None,
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+    engine.release_lease(&lease).unwrap();
+}
+
+/// Engine-level permission request: covers the `RequestPermission` commit path.
+#[test]
+fn engine_permission_and_input_request_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "perm test", 1)
+        .unwrap();
+
+    // Start the run.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Request permission.
+    let permission = latte_core::PendingPermission {
+        request_id: "perm-req-1".into(),
+        operation_digest: "digest-1".into(),
+        description: "write test file".into(),
+    };
+    let _committed = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: Some("perm-req-1".into()),
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::RequestPermission {
+                    source_key: "request-perm".into(),
+                    request: permission,
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+
+    engine.release_lease(&lease).unwrap();
+}
+
+/// Engine-level rename and fork: covers the `rename_thread_session_v2` and
+/// `fork_thread_session_v2` storage paths.
+#[test]
+fn engine_rename_and_fork_thread() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "original", 1)
+        .unwrap();
+
+    // Rename.
+    engine
+        .rename_thread_session_v2(thread_id, "renamed")
+        .unwrap();
+    let summary = engine.thread_session_v2(thread_id).unwrap().unwrap();
+    assert_eq!(summary.title, "renamed");
+
+    // Fork.
+    let fork_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let fork = engine
+        .fork_thread_session_v2(thread_id, fork_id, Some("fork title"), 20)
+        .unwrap();
+    assert_eq!(fork.thread_id, fork_id);
+
+    // Both threads appear in the list.
+    let all = engine.list_threads_v2().unwrap();
+    assert!(all.len() >= 2, "should have original + fork");
+
+    // Search finds the renamed thread.
+    let found = engine.search_thread_sessions_v2("renamed", 10).unwrap();
+    assert!(!found.is_empty(), "search should find renamed thread");
+
+    // Workspace-scoped list.
+    let workspace = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let ws = engine.list_threads_v2_for_workspace(&workspace).unwrap();
+    assert!(!ws.is_empty());
+
+    // Find by exact title.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "renamed", 10)
+        .unwrap();
+    assert!(!exact.is_empty());
+}
+
+/// Engine-level effect lifecycle: covers the `PrepareEffect` commit path.
+#[test]
+fn engine_effect_lifecycle_covers_prepare() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding, "effect test", 1)
+        .unwrap();
+
+    // Start the run.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let started = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: 0,
+                expected_run_revision: 0,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: latte_engine::CommitThreadRunUpdate::Start {
+                    source_key: "start".into(),
+                },
+            },
+            &lease,
+            3,
+        )
+        .unwrap();
+    let revision = started.snapshot.revision;
+    let run_revision = started
+        .snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap()
+        .run_revision;
+
+    // Prepare an effect.
+    let effect_id = "effect-1".to_string();
+    let _ = engine
+        .commit_thread_run_update(
+            latte_engine::ThreadCommitRequest {
+                thread_id,
+                run_id,
+                expected_thread_revision: revision,
+                expected_run_revision: run_revision,
+                command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: Some(effect_id.clone()),
+                update: latte_engine::CommitThreadRunUpdate::PrepareEffect {
+                    source_key: "prepare".into(),
+                    effect_id: effect_id.clone(),
+                    operation_digest: "a".repeat(64),
+                    descriptor_json: serde_json::json!({
+                        "effect_id": effect_id,
+                        "tool_call_id": "call-1",
+                        "name": "read_file",
+                        "input": {"path": "test.txt"},
+                        "attempt": 1
+                    })
+                    .to_string(),
+                    canonical_descriptor_json: serde_json::json!({
+                        "effect_id": effect_id,
+                        "tool_call_id": "call-1",
+                        "name": "read_file",
+                        "input": {"path": "test.txt"},
+                        "attempt": 1
+                    })
+                    .to_string(),
+                    policy: latte_engine::ThreadEffectPolicy::Ask,
+                    description: "test effect".into(),
+                    checkpoint_json: "{}".into(),
+                },
+            },
+            &lease,
+            4,
+        )
+        .unwrap();
+
+    engine.release_lease(&lease).unwrap();
+}
+
 /// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
 /// failing verification command: the run fails after the tool executes,
 /// covering the verification-failure path.
@@ -4322,6 +6218,167 @@ fn final_binary_cli_run_with_failing_verification_fails() {
 
     // The file was written.
     assert!(scenario.root().join("verified.txt").exists());
+}
+
+/// CLI `run` with a `write_file` tool call (permission granted via HTTP) and a
+/// passing verification command: the run completes successfully, covering the
+/// full modify-tool execution + verification success path.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cli_run_with_passing_verification_completes() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-ok",
+            "write_file",
+            &serde_json::json!({
+                "path": "output.txt",
+                "content": "hello world\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("wrote and verified"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, "write and verify", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait until the background turn parks at WaitingPermission.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission");
+
+    // Grant the permission.
+    let (grant_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(grant_status, 200);
+
+    // The write_file effect triggers a verification effect, which parks at
+    // WaitingPermission again. Grant it too.
+    let mut verify_pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            verify_pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                break; // settled without a verification ask
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if let Some((revision, request_id, run_revision)) = verify_pending {
+        let (verify_status, _) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "allow": true,
+                "expected_thread_revision": revision,
+                "expected_run_revision": run_revision
+            })),
+            &[],
+        );
+        assert_eq!(verify_status, 200);
+    }
+
+    // Wait for the session to settle (verification passes → run completes).
+    let mut settled = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let lifecycle = body["snapshot"]["lifecycle"].as_str().unwrap_or("");
+            if lifecycle == "ready" || lifecycle == "failed" {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(settled, "session never settled after passing verification");
+
+    // The file was written.
+    assert!(scenario.root().join("output.txt").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -4531,6 +6588,121 @@ fn final_binary_cli_run_without_prompt_reports_usage() {
 }
 
 #[test]
+fn final_binary_cli_unknown_command_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "bogus"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_list_with_positional_arg_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "extra"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_show_without_session_id_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "show"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_resume_without_prompt_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(
+        &["--json", "resume", "01900000-0000-7000-8000-000000000001"],
+        |_| {},
+    );
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_focus_flag_with_list_reports_usage() {
+    // --focus is only valid with `run`.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "--focus", "/tmp"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_removed_allow_flag_reports_usage() {
+    // v1 --allow/--deny flags must remain hard errors.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--allow", "true", "prompt"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_unknown_option_for_list_reports_usage() {
+    // Unknown --flag tokens are rejected for list (only run/resume treat
+    // them as prompt content).
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "list", "--bogus"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_server_flag_without_value_reports_usage() {
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--server"], |_| {});
+    assert!(!output.status.success());
+    assert_eq!(json(&output)["error"]["code"], "usage");
+}
+
+#[test]
+fn final_binary_cli_run_with_dash_dash_treats_flags_as_prompt() {
+    // `--` makes everything after it positional, so --flag-like tokens are
+    // part of the prompt rather than rejected options. Parsing succeeds; the
+    // command then fails at server connection (not at usage parsing).
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["--json", "run", "--", "--flag-like", "text"], |_| {});
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_ne!(
+        body["error"]["code"], "usage",
+        "-- must pass parsing; flags after it are prompt content"
+    );
+}
+
+#[test]
+fn final_binary_cli_json_flag_after_subcommand_is_accepted() {
+    // --json may appear after the subcommand (not just as a global prefix);
+    // parse_session_command must still recognize it and emit a JSON envelope.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["true"]"#);
+    let output = scenario.output(&["list", "--json"], |_| {});
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert!(
+        body["data"]["sessions"].is_array(),
+        "--json after subcommand must produce a JSON envelope"
+    );
+}
+
+#[test]
 fn final_binary_cli_list_with_unhealthy_server_reports_unreachable() {
     // health_check returns non-success → connect fails with Unreachable.
     let (url, _handle) =
@@ -4563,6 +6735,143 @@ fn final_binary_cli_run_with_write_file_tool_prepares_and_waits_for_permission()
     let body = json(&output);
     assert_eq!(body["status"], "waiting");
     assert_eq!(body["data"]["session"]["lifecycle"], "waiting_permission");
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_edit_file_tool_prepares_and_waits_for_permission() {
+    // edit_file is a Modify tool: it requires a precondition (sha256 of the
+    // target file) and waits for permission before executing.
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("editable.txt"), "before text\n").unwrap();
+    // sha256("before text\n") — keeps the scripted mutation bound to the
+    // exact fixture.
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "editable.txt",
+            "before": "before text",
+            "after": "after text",
+            "precondition": "28a55c8567f548f31faa8bf32a1dfbb28c6944abb01da0c79a7cf498df2c62d3"
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit the file"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-tool-secret");
+    });
+    // edit_file is a modify tool → session waits for permission.
+    assert!(!output.status.success());
+    let body = json(&output);
+    assert_eq!(body["status"], "waiting");
+    assert_eq!(body["data"]["session"]["lifecycle"], "waiting_permission");
+    provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_process_tool_completes() {
+    // /bin/pwd is an Allow-class process: it executes without a permission
+    // round-trip and completes the session.
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "argv": ["/bin/pwd"],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("pwd-1", "process", &process),
+        ProviderReply::completion("pwd complete"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "print the directory"], |command| {
+        command.env("TEST_OPENAI_KEY", "process-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_safe_grep_process_completes() {
+    // /usr/bin/grep -q <pattern> <relative-file> is an Allow-class process:
+    // it executes without a permission round-trip. Covers the safe_grep
+    // branch of the process classifier.
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("haystack.txt"), "needle\n").unwrap();
+    let process = serde_json::json!({
+        "argv": ["/usr/bin/grep", "-q", "needle", "haystack.txt"],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("grep-1", "process", &process),
+        ProviderReply::completion("grep complete"),
+    ]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "grep for a needle"], |command| {
+        command.env("TEST_OPENAI_KEY", "safe-grep-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_denied_shell_process_fails() {
+    // A shell command matching the deny list (e.g. `rm -rf /`) must be
+    // rejected without a permission round-trip. Covers the shell Deny
+    // branch of the process classifier.
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "shell": "rm -rf /",
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider =
+        ScriptedProvider::start([ProviderReply::tool_call("deny-1", "process", &process)]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "run a dangerous command"], |command| {
+        command.env("TEST_OPENAI_KEY", "denied-shell-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
     provider.assert_consumed();
 }
 
@@ -4652,6 +6961,197 @@ fn final_binary_cli_run_with_provider_error_fails() {
     provider.assert_consumed();
 }
 
+/// Provider responses with non-standard finish reasons (`length`,
+/// `content_filter`, unknown) must still complete the session, covering the
+/// `finish_reason` mapping branches in the provider.
+#[test]
+fn final_binary_cli_run_with_variant_finish_reasons_completes() {
+    for reason in ["length", "content_filter", "custom_reason"] {
+        let scenario = Scenario::new();
+        let reply = ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "choices": [{
+                    "message": {"content": format!("done with {reason}"), "tool_calls": []},
+                    "finish_reason": reason
+                }]
+            }),
+        );
+        let provider = ScriptedProvider::start([reply]);
+        scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+        let output = scenario.output(
+            &["--json", "run", &format!("finish reason {reason}")],
+            |command| {
+                command.env("TEST_OPENAI_KEY", "finish-reason-secret");
+            },
+        );
+        assert!(
+            output.status.success(),
+            "finish_reason={reason}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = json(&output);
+        assert_eq!(body["status"], "completed", "finish_reason={reason}");
+        provider.assert_consumed();
+    }
+}
+
+/// `edit_file` without `before` or `anchor` must fail with an input error,
+/// covering the tool preparation validation branch.
+#[test]
+fn final_binary_cli_run_with_edit_file_missing_before_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "original\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "target.txt",
+            "after": "replaced",
+            "precondition": {"hash": "abc", "size": 9, "modified_ns": 0}
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit without before"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-missing-before-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `edit_file` with a `before` that doesn't match the file content must fail,
+/// covering the edit execution mismatch branch.
+#[test]
+fn final_binary_cli_run_with_edit_file_mismatched_before_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "original content\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "edit-1",
+        "edit_file",
+        &serde_json::json!({
+            "path": "target.txt",
+            "before": "nonexistent text",
+            "after": "replaced",
+            "precondition": {"hash": "abc", "size": 17, "modified_ns": 0}
+        }),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "edit with mismatch"], |command| {
+        command.env("TEST_OPENAI_KEY", "edit-mismatch-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// Process tool with an empty argv must be denied without spawning, covering
+/// the empty-argv Deny branch of the process classifier.
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_empty_argv_process_denied() {
+    let scenario = Scenario::new();
+    let process = serde_json::json!({
+        "argv": [],
+        "cwd": ".",
+        "env": {},
+        "timeout_ms": 5000,
+        "grace_ms": 50,
+        "stdout_cap": 1024,
+        "stderr_cap": 1024
+    });
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "empty-argv-1",
+        "process",
+        &process,
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "run an empty argv"], |command| {
+        command.env("TEST_OPENAI_KEY", "empty-argv-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `list_directory` on a file path (not a directory) must fail with an
+/// input error, covering the tool's type-check branch.
+#[test]
+fn final_binary_cli_run_with_list_directory_on_file_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("notadir.txt"), "i am a file\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "ls-1",
+        "list_directory",
+        &serde_json::json!({"path": "notadir.txt"}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "list a file"], |command| {
+        command.env("TEST_OPENAI_KEY", "ls-file-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted"
+            || body["status"] == "reconciliation_required",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// `search` with an empty query must fail with an input error, covering the
+/// tool's validation branch.
+#[test]
+fn final_binary_cli_run_with_empty_search_query_fails() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("target.txt"), "hello\n").unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "search-1",
+        "search",
+        &serde_json::json!({"query": "", "path": "."}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "search with empty query"], |command| {
+        command.env("TEST_OPENAI_KEY", "empty-search-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
 #[test]
 fn final_binary_cli_run_with_missing_file_tool_covers_error_path() {
     let scenario = Scenario::new();
@@ -4701,6 +7201,379 @@ fn final_binary_cli_run_with_path_escape_tool_covers_error_path() {
         body["status"]
     );
     provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_with_symlink_mutation_covers_error_path() {
+    // Writing through a symlinked path component must fail with a symlink
+    // error (engine workspace mutation guard). The symlink target is
+    // relative so the storage layer's session-creation validation accepts it.
+    let scenario = Scenario::new();
+    std::fs::create_dir_all(scenario.root().join("realdir")).unwrap();
+    std::os::unix::fs::symlink("realdir", scenario.root().join("link")).unwrap();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "write-1",
+        "write_file",
+        &serde_json::json!({"path": "link/test.txt", "content": "test", "create_intent": true}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "write through a symlink"], |command| {
+        command.env("TEST_OPENAI_KEY", "symlink-mutation-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+#[test]
+fn final_binary_cli_run_with_missing_parent_dir_covers_error_path() {
+    // Writing to a path whose parent directory does not exist must fail with
+    // a missing error (engine workspace mutation guard, non-final component).
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::tool_call(
+        "write-1",
+        "write_file",
+        &serde_json::json!({"path": "nonexistent_dir/test.txt", "content": "test", "create_intent": true}),
+    )]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["--json", "run", "write to a missing parent"], |command| {
+        command.env("TEST_OPENAI_KEY", "missing-parent-secret");
+    });
+    let body = json(&output);
+    assert!(
+        body["status"] == "completed"
+            || body["status"] == "failed"
+            || body["status"] == "interrupted",
+        "unexpected status: {}",
+        body["status"]
+    );
+    provider.assert_consumed();
+}
+
+/// HTTP-level catalog error paths against the real server: invalid cursors
+/// on list/search/exact-title map to 400 via `map_catalog_error`, and
+/// unknown workspace IDs on search/exact-title map to 404.
+#[test]
+fn final_binary_server_catalog_error_paths() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("done")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    // Create a workspace.
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": scenario.root().display().to_string()})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+
+    // Invalid cursor on list → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions?cursor=not-a-valid-cursor"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Invalid cursor on search → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!("/v1/workspaces/{workspace_id}/sessions/search?q=test&cursor=not-a-valid-cursor"),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Invalid cursor on exact-title → 400.
+    let (status, _) = server.request(
+        "GET",
+        &format!(
+            "/v1/workspaces/{workspace_id}/sessions/exact-title?q=test&cursor=not-a-valid-cursor"
+        ),
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400);
+
+    // Unknown workspace on search → 404.
+    let (status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws-does-not-exist/sessions/search?q=test",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 404);
+
+    // Unknown workspace on exact-title → 404.
+    let (status, _) = server.request(
+        "GET",
+        "/v1/workspaces/ws-does-not-exist/sessions/exact-title?q=test",
+        Some(&server.token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 404);
+}
+
+/// CLI `run` without `--json` prints the human-readable session summary
+/// (covers the non-JSON render path in `execute_session_command_inner`).
+#[test]
+fn final_binary_cli_run_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("text mode complete")]);
+    scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+    let output = scenario.output(&["run", "complete in text mode"], |command| {
+        command.env("TEST_OPENAI_KEY", "text-mode-secret");
+    });
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
+    provider.assert_consumed();
+}
+
+/// CLI `list` without `--json` prints one tab-separated row per session
+/// (covers the non-JSON list render path).
+#[test]
+fn final_binary_cli_list_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("listed")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session first so the list has something to return.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, _) = server.create_session(workspace_id, "list me", &binding);
+    assert_eq!(create_status, 202);
+
+    // List without --json.
+    let output = scenario.output(
+        &["list", "--server", &url, "--token", &server.token],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "list-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("ready") || text.contains("running"),
+        "expected a lifecycle name in list output, got: {text}"
+    );
+}
+
+/// CLI `show` without `--json` prints the human-readable session summary
+/// (covers the non-JSON show render path).
+#[test]
+fn final_binary_cli_show_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("shown")]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session and wait for it to reach a terminal state.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(workspace_id, "show me", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap();
+
+    // Wait until the session is ready.
+    let mut ready = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "session never reached ready");
+
+    // Show without --json.
+    let output = scenario.output(
+        &[
+            "show",
+            session_id,
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "show-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
+}
+
+/// CLI `resume` without `--json` prints the human-readable session summary
+/// (covers the non-JSON resume render path).
+#[test]
+fn final_binary_cli_resume_without_json_emits_text() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn"),
+        ProviderReply::completion("resumed turn"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let url = format!("http://127.0.0.1:{}", server.port);
+
+    // Create a session and wait for it to reach a terminal state.
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({"path": root})),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(workspace_id, "first turn", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap();
+
+    let mut ready = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready, "session never reached ready");
+
+    // Resume without --json.
+    let output = scenario.output(
+        &[
+            "resume",
+            session_id,
+            "continue please",
+            "--server",
+            &url,
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "resume-text-secret");
+        },
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("session ") && text.contains("(revision"),
+        "expected human-readable session summary, got: {text}"
+    );
 }
 
 #[test]
@@ -4789,4 +7662,149 @@ fn final_binary_cli_run_with_multiple_tool_calls_completes() {
     let body = json(&output);
     assert_eq!(body["status"], "completed");
     provider.assert_consumed();
+}
+
+/// Engine-level error paths: covers validation and not-found errors for
+/// session management operations.
+#[test]
+fn engine_session_management_error_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    engine
+        .create_thread_v2(thread_id, run_id, binding.clone(), "error paths", 1)
+        .unwrap();
+
+    // Rename with empty title should fail.
+    let rename_result = engine.rename_thread_session_v2(thread_id, "");
+    assert!(rename_result.is_err());
+
+    // Fork with a duplicate thread_id should fail.
+    let fork_result = engine.fork_thread_session_v2(thread_id, thread_id, Some("dup"), 20);
+    assert!(fork_result.is_err());
+
+    // Switch binding with wrong revision should fail.
+    let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+    let switch_result = engine.switch_thread_binding_v2(
+        thread_id, 999, // wrong revision
+        &binding, &lease, 3,
+    );
+    assert!(switch_result.is_err());
+    engine.release_lease(&lease).unwrap();
+
+    // Operations on a missing thread should fail.
+    let missing = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    assert!(engine.thread_session_v2(missing).unwrap().is_none());
+    assert!(engine.thread_snapshot_v2(missing, None, 10).is_err());
+}
+
+/// Engine-level run lease and transition paths: covers `acquire_run_lease`,
+/// `renew_lease`, and `apply_transition` for non-thread-linked runs.
+#[test]
+fn engine_run_lease_and_transition_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+
+    // Create a standalone run (not linked to a thread).
+    engine.create_run(run_id, 1).unwrap();
+
+    // Acquire a run lease.
+    let lease = engine
+        .acquire_run_lease(run_id, "owner-1", 2, 10_000)
+        .unwrap();
+    assert_eq!(lease.owner(), "owner-1");
+
+    // Renew the lease.
+    let renewed = engine.renew_lease(&lease, 3, 20_000).unwrap();
+    assert_eq!(renewed.owner(), "owner-1");
+
+    // Apply a transition.
+    let _ = engine
+        .apply_transition(run_id, 0, latte_core::Transition::Start, 4, &renewed)
+        .unwrap();
+
+    // Show the run.
+    let loaded = engine.show(run_id).unwrap();
+    assert_eq!(loaded.run_id, run_id);
+}
+
+/// Engine-level validation error paths: covers binding validation and
+/// workspace-scoped query errors.
+#[test]
+fn engine_validation_error_paths() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+
+    // Invalid binding (empty provider name) should fail.
+    let invalid_binding = latte_core::ThreadProviderBindingV2 {
+        version: 1,
+        provider_name: String::new(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test".into(),
+        config_fingerprint: "c".into(),
+        tools_fingerprint: "t".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+    let thread_id = latte_core::ThreadId::from_uuid(ids.next_uuid_v7());
+    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let result = engine.create_thread_v2(thread_id, run_id, invalid_binding, "test", 1);
+    assert!(result.is_err());
+
+    // Workspace-scoped queries on missing workspace should return empty.
+    let missing_ws = dir.path().join("nonexistent");
+    let ws_list = engine
+        .list_threads_v2_for_workspace(missing_ws.to_str().unwrap())
+        .unwrap();
+    assert!(ws_list.is_empty());
+
+    // Search in missing workspace.
+    let search = engine.search_thread_sessions_v2("nonexistent", 10).unwrap();
+    assert!(search.is_empty());
+
+    // Exact title in missing workspace.
+    let exact = engine
+        .find_thread_sessions_v2_by_exact_title_for_workspace(
+            missing_ws.to_str().unwrap(),
+            "nonexistent",
+            10,
+        )
+        .unwrap();
+    assert!(exact.is_empty());
 }

@@ -1378,4 +1378,172 @@ mod tests {
             Err(RegistryError::Invalid(message)) if message.contains("unknown canonical tool")
         ));
     }
+
+    // -- additional branch coverage -----------------------------------------
+
+    #[test]
+    fn empty_config_validates_and_rejects_provider_use() {
+        let registry = ProviderRegistry::parse_jsonc(r"{version:1,providers:{}}").unwrap();
+        assert!(registry.default_name().is_none());
+        assert!(registry.resolve_default(&[]).is_err());
+        assert!(registry.thread_binding_for_default(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_jsonc_strips_owned_thread_section() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',thread:{max_request_bytes:4096},providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
+        )
+        .unwrap();
+        assert_eq!(registry.default_name(), Some("main"));
+    }
+
+    #[test]
+    fn direct_binding_with_tools_builds_aliases() {
+        let binding = ProviderBinding::direct(&[tool("read_file")]);
+        assert!(!binding.aliases.is_empty());
+        assert_eq!(binding.aliases["read_file"], "read_file");
+    }
+
+    #[test]
+    fn configured_model_display_name_resolves_and_missing_returns_none() {
+        let definition = ProviderDefinition::OpenaiChat {
+            models: OpenAiChatModels::Configured(BTreeMap::from([(
+                "m".into(),
+                OpenAiChatModelConfig {
+                    name: Some("Display".into()),
+                    options: OpenAiChatModelOptions::default(),
+                },
+            )])),
+            base_url: Some("https://x".into()),
+            endpoint: None,
+            api_key: SecretRef::Literal("k".into()),
+            timeout_ms: default_timeout(),
+            max_attempts: default_attempts(),
+            temperature: None,
+            max_tokens: None,
+            compatibility_input_request: false,
+            streaming: false,
+            aliases: BTreeMap::default(),
+        };
+        assert_eq!(definition.model_name("m"), Some("Display"));
+        assert_eq!(definition.model_name("missing"), None);
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_provider_and_model() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
+        )
+        .unwrap();
+        assert!(registry.resolve_model("unknown", "m", &[]).is_err());
+        assert!(registry.resolve_model("main", "unknown", &[]).is_err());
+    }
+
+    #[test]
+    fn resolve_model_rejects_alias_referencing_unknown_tool() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'},aliases:{unknown_tool:'wire'}}}}",
+        )
+        .unwrap();
+        assert!(registry.resolve_model("main", "m", &[]).is_err());
+    }
+
+    #[test]
+    fn model_options_temperature_is_validated() {
+        assert!(ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:{m:{options:{temperature:3}}},endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
+        )
+        .is_err());
+    }
+
+    fn test_provider_context() -> ProviderContext {
+        ProviderContext {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            cancellation: latte_engine::CancellationToken::new(),
+            events: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn aliased_provider_rejects_unknown_tool_in_request() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://127.0.0.1:1',api_key:{source:'env',name:'PATH'},aliases:{read_file:'rf'}}}}",
+        )
+        .unwrap();
+        let resolved = registry
+            .resolve_model("main", "m", &[tool("read_file")])
+            .unwrap();
+        // A Tool message whose name is not in the forward alias map.
+        let request = ProviderRequest {
+            messages: vec![Message::Tool {
+                tool_call_id: "t1".into(),
+                name: Some("unknown".into()),
+                content: "result".into(),
+            }],
+            tools: vec![],
+        };
+        let err = resolved
+            .provider
+            .complete(request, test_provider_context())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn aliased_provider_rejects_unknown_alias_in_response() {
+        // The inner provider returns a tool call with a name not in the reverse
+        // alias map.
+        let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"unknown_alias","arguments":"{}"}}]}}]}"#;
+        let (endpoint, _rx) = capturing_server(body);
+        let registry = ProviderRegistry::parse_jsonc(&format!(
+            "{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'{endpoint}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}"
+        ))
+        .unwrap();
+        let resolved = registry
+            .resolve_model("main", "m", &[tool("read_file")])
+            .unwrap();
+        let request = ProviderRequest {
+            messages: vec![],
+            tools: vec![],
+        };
+        let err = resolved
+            .provider
+            .complete(request, test_provider_context())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn aliased_provider_propagates_inner_error() {
+        // Bind-and-drop gives a port that refuses connections on every
+        // platform (port 1 is handled inconsistently by Windows http.sys).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let registry = ProviderRegistry::parse_jsonc(&format!(
+            r"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'https://127.0.0.1:{port}',api_key:{{source:'env',name:'PATH'}},aliases:{{read_file:'rf'}}}}}}}}",
+        ))
+        .unwrap();
+        let resolved = registry
+            .resolve_model("main", "m", &[tool("read_file")])
+            .unwrap();
+        let request = ProviderRequest {
+            messages: vec![],
+            tools: vec![],
+        };
+        // The inner provider cannot connect → Transport or Timeout (depending
+        // on how the OS reports the refused connection) propagated.
+        let err = resolved
+            .provider
+            .complete(request, test_provider_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Transport(_) | ProviderError::Timeout),
+            "expected transport or timeout error, got {err:?}"
+        );
+    }
 }

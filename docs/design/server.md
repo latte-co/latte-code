@@ -81,19 +81,21 @@ Server 会规范化路径并返回稳定的 `workspace_id`。后续请求使用�
 ```
 POST /v1/workspaces/{workspace_id}/sessions
 Headers: Idempotency-Key: <uuid>
-Body: { "prompt": "...", "binding": {...} }
+Body: { "thread_id": "<uuid>", "command_id": "<uuid>", "prompt": "...", "binding": {...} }
 Response: 202 { "session_id": "...", "accepted_revision": 42 }
 ```
 
-返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。
+`thread_id` 和 `command_id` 由客户端生成（UUID v7）。`Idempotency-Key` 头必须等于 `command_id`。返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复创建。
 
 **Follow Up**
 ```
 POST /v1/sessions/{id}/follow-up
 Headers: Idempotency-Key: <uuid>
-Body: { "prompt": "...", "expected_thread_revision": 42 }
-Response: 202 { "accepted_revision": 43 }
+Body: { "command_id": "<uuid>", "prompt": "...", "expected_thread_revision": 42 }
+Response: 202 { "accepted_revision": 43, "workspace_id": "ws_..." }
 ```
+
+`command_id` 由客户端生成（UUID v7），`Idempotency-Key` 头必须等于 `command_id`。`workspace_id` 用于订阅正确的 workspace 事件流。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复追加 turn；同一 `command_id` + 不同 payload 返回 422 `idempotency_mismatch`。
 
 **切换模型**
 ```
@@ -164,44 +166,63 @@ Accept: text/event-stream
 按 workspace 的事件流。事件包含 `session_id` 用于路由。
 
 ```
-id: 42
 event: thread_changed
 data: {"session_id": "...", "revision": 42}
 
-id: 43
 event: progress
-data: {"session_id": "...", "progress": {...}}
+data: {"session_id": "...", "run_id": "...", "progress": {...}}
 
-id: 44
 event: resync_required
 data: {}
 ```
 
-**重连**：客户端使用 `Last-Event-ID` 头。如果 server 没有重放缓冲区，会发送 `resync_required`，客户端重新拉取状态。
+SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，server 不缓存历史事件、
+不支持 replay，客户端不发送 `Last-Event-ID`。所有状态权威来自
+`GET /v1/sessions/{id}` 的 snapshot。
+
+**重连**：重连后客户端立即全量 resync（拉取订阅的 session snapshot），不依赖
+断线期间的事件补发。
 
 **事件类型**：
 - `thread_changed`：持久化唤醒信号。客户端应拉取 session 快照。
-- `progress`：尽力而为的进度通知。重连时不重放。
+- `progress`：瞬态流式进度通知，丢失只影响 UI 流畅度，不影响正确性。
 - `resync_required`：客户端必须重新拉取全部状态。
+- 未知 event type：客户端必须忽略（不报错、不断开），以便 v1 内新增事件类型。
 
-**背压**：慢客户端会被断开。progress 事件可以丢弃；`thread_changed` 事件有限排队。
+**背压**：server 用 broadcast channel 扇出事件，每个客户端有独立 receiver，
+慢消费者不影响其他客户端。receiver 落后于 channel 容量时，server 发送
+`resync_required`，客户端全量拉 snapshot——**不断开连接**。
+
+**心跳**：server 周期性发送 SSE keep-alive 注释行（`: heartbeat`，当前实现间隔
+2s），防止中间代理超时并保持关闭响应及时。客户端 30s 无事件/心跳判定断线，
+触发重连 + resync。
 
 ### 5.6 错误
 
 ```json
 {
   "error": {
-    "type": "rejected|unauthorized|failed|unavailable|conflict",
+    "type": "rejected|unauthorized|not_found|idempotency_mismatch|conflict|failed",
     "message": "...",
     "current_revision": 42
   }
 }
 ```
 
-- `409 Conflict`：版本不匹配。包含 `current_revision` 供客户端重试。
-- `401 Unauthorized`：token 无效或缺失。
-- `400 Bad Request`：输入无效。
-- `503 Unavailable`：server 暂时不可用。
+正式错误类型枚举（`error.type` 的合法值）：
+
+| type | HTTP 状态码 | 含义 | 可重试? |
+|---|---|---|---|
+| `rejected` | 400 | 请求参数无效（含 JSON 解析/反序列化失败） | 否 |
+| `unauthorized` | 401 | Bearer token 缺失/无效 | 否 |
+| `not_found` | 404 | session/workspace 不存在 | 否 |
+| `idempotency_mismatch` | 422 | 同一 Idempotency-Key 搭配不同 payload | 否（客户端 bug） |
+| `conflict` | 409 | revision fence 冲突 | 是（刷新 snapshot 后重试） |
+| `failed` | 500 | server 内部错误 | 是（指数退避） |
+
+- `current_revision` 仅在 `conflict` 时出现，供客户端刷新后重试。
+- `message` 是人类可读的英文诊断，不保证稳定；客户端应基于 `type` 编程。
+- 客户端必须容忍未知错误 type（当作 `failed` 处理）。
 
 ### 5.7 幂等性
 
@@ -255,7 +276,6 @@ data: {}
 
 ### 待办
 - [ ] Binding 发现端点，让远程（非 co-located）客户端能获取有效的 `ThreadProviderBindingV2`
-- [ ] list/search 的分页游标（当前返回单页）
 - [ ] 性能测试
 - [ ] 远程访问认证（v2）
 

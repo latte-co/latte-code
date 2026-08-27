@@ -96,8 +96,11 @@ pub enum CreateOutcome<T = ThreadSnapshot> {
 /// code without inspecting error strings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateAcceptError {
-    /// A durable command-id reuse with a different payload, or a non-replay
-    /// create for an already-existing thread. Maps to 409 Conflict.
+    /// A durable command-id reuse with a different payload. Maps to 422
+    /// Unprocessable Entity (idempotency mismatch).
+    IdempotencyMismatch(String),
+    /// A non-replay create for an already-existing thread, or a revision
+    /// conflict. Maps to 409 Conflict.
     Conflict(String),
     /// Any other acceptance failure. Maps to 500.
     Failed(String),
@@ -257,6 +260,16 @@ pub struct ThreadSessionSummary {
     pub model: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// One page of a cursor-paged query. `next_cursor` is an opaque token supplied
+/// by the server; clients must not parse or construct it. A `None` cursor means
+/// no further pages exist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paged<T> {
+    pub items: Vec<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// The active request needed for explicit in-thread UI actions. Secret values

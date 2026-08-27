@@ -304,4 +304,47 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn load_path_reads_parses_and_validates() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{
+                // JSONC with trailing comma
+                database: { path: "/tmp/latte-test.db" },
+                providers: { p: { base_url: "http://localhost", api_key: "literal-key" } },
+            }"#,
+        )
+        .unwrap();
+        let config = Config::load_path(&config_path).unwrap();
+        assert_eq!(config.database.path, "/tmp/latte-test.db");
+        assert_eq!(config.providers["p"].api_key, "literal-key");
+    }
+
+    #[test]
+    fn load_path_rejects_malformed_jsonc() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("bad.jsonc");
+        std::fs::write(&config_path, "{ invalid").unwrap();
+        assert!(matches!(
+            Config::load_path(&config_path),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn database_path_placeholder_resolves() {
+        let mut config: Config = json5::from_str(
+            r#"{database:{path:"${DB_PLACEHOLDER}"},providers:{p:{base_url:"x",api_key:"y"}}}"#,
+        )
+        .unwrap();
+        config
+            .resolve_environment_with(|name| {
+                (name == "DB_PLACEHOLDER").then(|| "resolved.db".into())
+            })
+            .unwrap();
+        assert_eq!(config.database.path, "resolved.db");
+    }
 }

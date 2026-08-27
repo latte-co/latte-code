@@ -2,7 +2,7 @@
 use crate::VerificationEvidence;
 use latte_core::{
     CompletionPolicy, EventEnvelope, EventId, Evidence, FailureCode, Handoff, PROTOCOL_VERSION,
-    Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, ThreadEvent,
+    Paged, Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, ThreadEvent,
     ThreadEventEnvelope, ThreadEventId, ThreadLifecycle, ThreadPendingRequest,
     ThreadProviderBindingV2, ThreadRunStatus, ThreadRunSummary, ThreadSessionSummary,
     ThreadSnapshot, TranscriptEntry, TranscriptEntryId, TranscriptKind, TranscriptPage, Transition,
@@ -214,8 +214,8 @@ pub enum ThreadEffectPolicy {
 }
 
 /// Exact mutation preconditions.  `command_id` is deduplicated using a
-/// canonical redacted digest; replaying it with different content fails
-/// closed before any write.
+/// canonical digest of the raw request identity; replaying it with different
+/// content fails closed (422 `idempotency_mismatch`) before any write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThreadCommitRequest {
     pub thread_id: latte_core::ThreadId,
@@ -1048,9 +1048,39 @@ impl Storage {
         binding: &ThreadProviderBindingV2,
         focus: Option<&str>,
     ) -> Result<Option<ThreadSnapshot>, StorageError> {
-        let prompt = redact_thread_text(prompt);
         let workspace_root = validate_workspace_root(workspace_root)?;
-        let digest = create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
+        let digest = create_command_digest(thread_id, workspace_root, prompt, binding, focus);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                [command_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_digest, result_json)) = row else {
+            return Ok(None);
+        };
+        if stored_digest != digest {
+            return Err(StorageError::ThreadCommandReplayMismatch);
+        }
+        let snapshot: ThreadSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
+        Ok(Some(snapshot))
+    }
+
+    /// Pre-acquire durable dedup lookup for a follow-up command. A hit means
+    /// the follow-up was already durably accepted (possibly by a process that
+    /// crashed before responding); the caller replays the snapshot and must
+    /// not acquire a lease or start a runner. A same-id different-digest
+    /// retry fails with [`StorageError::ThreadCommandReplayMismatch`].
+    pub(crate) fn lookup_follow_up_replay(
+        &self,
+        command_id: &latte_core::ThreadCommandId,
+        thread_id: latte_core::ThreadId,
+        expected_thread_revision: u64,
+        prompt: &str,
+    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+        let digest = follow_up_command_digest(thread_id, expected_thread_revision, prompt);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1131,23 +1161,25 @@ impl Storage {
         StorageError,
     > {
         binding.validate().map_err(StorageError::InvalidData)?;
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        // Durable idempotency digest binds the raw request identity so that
+        // payloads which collapse under redaction still produce distinct
+        // digests and fail with 422 idempotency_mismatch on replay.
+        let command_digest =
+            create_command_digest(thread_id, workspace_root, prompt, binding, focus);
+        // Redacted text is used for all durable readable records (transcript,
+        // title); the raw prompt is never persisted.
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
                 "thread prompt must not be empty".into(),
             ));
         }
-        let workspace_root = validate_workspace_root(workspace_root)?;
         let title = session_title(&prompt);
         let expected_scope = thread_lease_scope(thread_id);
         if let Some(lease) = initial_lease {
             require_lease_scope(lease, &expected_scope)?;
         }
-        // Compute the durable command digest once (before `prompt` is moved
-        // into the transcript card) and reuse it for both the in-transaction
-        // recheck and the dedup insert.
-        let command_digest =
-            create_command_digest(thread_id, workspace_root, &prompt, binding, focus);
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(lease) = initial_lease {
@@ -1163,7 +1195,7 @@ impl Storage {
         // Durable command dedup, rechecked inside the write transaction so a
         // concurrent pair that both missed the pre-acquire lookup cannot both
         // create. A same-id same-digest retry replays; a same-id
-        // different-digest retry is a conflict.
+        // different-digest retry fails with 422 idempotency_mismatch.
         if let Some(command_id) = command_id {
             let previous: Option<(String, String)> = tx
                 .query_row(
@@ -1331,6 +1363,7 @@ impl Storage {
         now_ms: u64,
     ) -> Result<ThreadSnapshot, StorageError> {
         self.create_thread_follow_up_v2_inner(
+            None,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1339,12 +1372,25 @@ impl Storage {
             None,
             now_ms,
         )
-        .map(|(snapshot, _)| snapshot)
+        .map(|(outcome, _)| match outcome {
+            latte_core::CreateOutcome::Created(snapshot)
+            | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+        })
     }
 
+    /// Atomically accepts and starts a follow-up child under the exact Session
+    /// lease, preserving the completed parent if any precondition fails.
+    ///
+    /// When `command_id` is provided, the follow-up is crash-safe idempotent:
+    /// the command is deduplicated against `thread_command_dedup_v2` *inside*
+    /// the write transaction (recheck after the pre-acquire lookup), a
+    /// same-id different-digest retry fails with
+    /// [`StorageError::ThreadCommandReplayMismatch`], and a same-id
+    /// same-digest retry returns `Replayed` without starting a runner.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_started_thread_follow_up_v2(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
@@ -1352,8 +1398,15 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadCommitResponse, StorageError> {
-        let (snapshot, thread_event) = self.create_thread_follow_up_v2_inner(
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<ThreadSnapshot>,
+            Option<StoredThreadEvent>,
+        ),
+        StorageError,
+    > {
+        self.create_thread_follow_up_v2_inner(
+            command_id,
             thread_id,
             run_id,
             expected_thread_revision,
@@ -1361,18 +1414,13 @@ impl Storage {
             baseline,
             Some(lease),
             now_ms,
-        )?;
-        Ok(ThreadCommitResponse {
-            snapshot,
-            thread_event: thread_event.ok_or_else(|| {
-                StorageError::InvalidData("atomic follow-up start omitted its durable event".into())
-            })?,
-        })
+        )
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn create_thread_follow_up_v2_inner(
         &self,
+        command_id: Option<&latte_core::ThreadCommandId>,
         thread_id: latte_core::ThreadId,
         run_id: RunId,
         expected_thread_revision: u64,
@@ -1380,7 +1428,17 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         initial_lease: Option<&Lease>,
         now_ms: u64,
-    ) -> Result<(ThreadSnapshot, Option<StoredThreadEvent>), StorageError> {
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<ThreadSnapshot>,
+            Option<StoredThreadEvent>,
+        ),
+        StorageError,
+    > {
+        // Durable idempotency digest binds the raw request identity.
+        let follow_up_digest =
+            follow_up_command_digest(thread_id, expected_thread_revision, prompt);
+        // Redacted text is used for all durable readable records.
         let prompt = redact_thread_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
@@ -1401,6 +1459,28 @@ impl Storage {
             )?;
             if !authoritative {
                 return Err(StorageError::LeaseLost);
+            }
+        }
+        // Durable command dedup, rechecked inside the write transaction so a
+        // concurrent pair that both missed the pre-acquire lookup cannot both
+        // append a turn. A same-id same-digest retry replays; a same-id
+        // different-digest retry fails with 422 idempotency_mismatch.
+        if let Some(command_id) = command_id {
+            let previous: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT digest,result_json FROM thread_command_dedup_v2 WHERE command_id=?1",
+                    [command_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_digest, result_json)) = previous {
+                if stored_digest != follow_up_digest {
+                    return Err(StorageError::ThreadCommandReplayMismatch);
+                }
+                let snapshot: ThreadSnapshot =
+                    serde_json::from_str(&result_json).map_err(invalid_json)?;
+                tx.commit()?;
+                return Ok((latte_core::CreateOutcome::Replayed(snapshot), None));
             }
         }
         let (revision, lifecycle, latest, fork_parent): (
@@ -1595,8 +1675,21 @@ impl Storage {
             None
         };
         let snapshot = current_thread_snapshot(&tx, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+        // Durable dedup record: a crash-safe retry with the same command_id
+        // replays this acceptance instead of appending a duplicate turn.
+        if let Some(command_id) = command_id {
+            tx.execute(
+                "INSERT INTO thread_command_dedup_v2(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+                params![
+                    command_id.to_string(),
+                    follow_up_digest,
+                    serde_json::to_string(&snapshot).map_err(invalid_json)?,
+                    to_i64(now_ms)?
+                ],
+            )?;
+        }
         tx.commit()?;
-        Ok((snapshot, thread_event))
+        Ok((latte_core::CreateOutcome::Created(snapshot), thread_event))
     }
 
     pub(crate) fn switch_thread_binding_v2(
@@ -1872,7 +1965,7 @@ impl Storage {
         let limit = limit.min(500);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
+            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
              FROM threads_v2 WHERE workspace_root=?1 AND title=?2 \
              ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
         )?;
@@ -1884,45 +1977,281 @@ impl Storage {
                     StorageError::InvalidData("session title limit exceeds u64".into())
                 })?)?
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            },
+            session_summary_row,
         )?;
-        rows.map(|row| {
-            let (
-                thread_id,
-                title,
-                workspace_root,
-                parent,
-                lifecycle,
-                binding_json,
-                created,
-                updated,
-            ) = row?;
-            let binding: ThreadProviderBindingV2 =
-                serde_json::from_str(&binding_json).map_err(invalid_json)?;
-            Ok(ThreadSessionSummary {
-                thread_id: parse_thread_id(&thread_id)?,
-                title,
-                workspace_root,
-                parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
-                lifecycle: parse_lifecycle(&lifecycle)?,
-                provider_name: binding.provider_name,
-                model: binding.model,
-                created_at_ms: from_i64(created)?,
-                updated_at_ms: from_i64(updated)?,
+        rows.map(|row| Ok(row?.0)).collect()
+    }
+
+    /// Lists one page of durable sessions bound to this workspace, newest
+    /// transcript tail included, ordered by `(updated_at_ms, rowid)` descending.
+    /// `cursor` is the opaque `next_cursor` of the previous page; an invalid
+    /// cursor fails closed. `limit == 0` returns an empty page.
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be read or the cursor
+    /// is malformed.
+    pub(crate) fn list_threads_v2_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Paged<ThreadSnapshot>, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        if limit == 0 {
+            return Ok(Paged {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let limit = limit.min(500);
+        let keyset = cursor.map(decode_session_cursor).transpose()?;
+        let fetch = limit
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("session list limit overflow".into()))?
+            .min(501);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let page_rows: Vec<(String, i64, i64)> = match keyset {
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,updated_at_ms,rowid FROM threads_v2 \
+                     WHERE workspace_root=?1 \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?2",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session list limit exceeds u64".into())
+                        })?)?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            Some((updated, rowid)) => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,updated_at_ms,rowid FROM threads_v2 \
+                     WHERE workspace_root=?1 \
+                     AND (updated_at_ms<?2 OR (updated_at_ms=?2 AND rowid<?3)) \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        updated,
+                        rowid,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session list limit exceeds u64".into())
+                        })?)?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let next_cursor = if page_rows.len() > limit {
+            let (_, updated, rowid) = page_rows[limit - 1];
+            Some(encode_session_cursor(updated, rowid))
+        } else {
+            None
+        };
+        let items = page_rows
+            .into_iter()
+            .take(limit)
+            .map(|(id, _, _)| -> Result<ThreadSnapshot, StorageError> {
+                let thread_id = parse_thread_id(&id)?;
+                let mut snapshot = thread_snapshot(&conn, thread_id, None, 1)?;
+                snapshot.transcript =
+                    thread_transcript_tail(&conn, thread_id, THREAD_PROJECTION_TRANSCRIPT_LIMIT)?;
+                Ok(snapshot)
             })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Paged { items, next_cursor })
+    }
+
+    /// Searches this workspace's local session catalog by title/id, one page at
+    /// a time, in the same `(updated_at_ms, rowid)` descending order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched or the
+    /// cursor is malformed.
+    pub(crate) fn search_thread_sessions_paged(
+        &self,
+        workspace_root: &str,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Paged<ThreadSessionSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Paged {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let limit = limit.min(500);
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let query = query.trim().to_lowercase();
+        let keyset = cursor.map(decode_session_cursor).transpose()?;
+        let fetch = limit
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("session search limit overflow".into()))?
+            .min(501);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let page_rows: Vec<(ThreadSessionSummary, i64, i64)> = match keyset {
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
+                     FROM threads_v2 WHERE workspace_root=?1 AND \
+                     (?2='' OR instr(lower(title),?2)>0 OR instr(lower(thread_id),?2)>0) \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        query,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session search limit exceeds u64".into())
+                        })?)?
+                    ],
+                    session_summary_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            Some((updated, rowid)) => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
+                     FROM threads_v2 WHERE workspace_root=?1 AND \
+                     (?2='' OR instr(lower(title),?2)>0 OR instr(lower(thread_id),?2)>0) \
+                     AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND rowid<?4)) \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?5",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        query,
+                        updated,
+                        rowid,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session search limit exceeds u64".into())
+                        })?)?
+                    ],
+                    session_summary_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let next_cursor = if page_rows.len() > limit {
+            let (_, updated, rowid) = page_rows[limit - 1];
+            Some(encode_session_cursor(updated, rowid))
+        } else {
+            None
+        };
+        Ok(Paged {
+            items: page_rows
+                .into_iter()
+                .take(limit)
+                .map(|(item, _, _)| item)
+                .collect(),
+            next_cursor,
         })
-        .collect()
+    }
+
+    /// Finds sessions whose title exactly matches `title`, one page at a time,
+    /// in the same `(updated_at_ms, rowid)` descending order as
+    /// [`Self::list_threads_v2_for_workspace_paged`].
+    ///
+    /// # Errors
+    /// Returns a storage error when the catalog cannot be searched or the
+    /// cursor is malformed.
+    pub(crate) fn find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+        &self,
+        workspace_root: &str,
+        title: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Paged<ThreadSessionSummary>, StorageError> {
+        if title.is_empty() || limit == 0 {
+            return Ok(Paged {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let limit = limit.min(500);
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let keyset = cursor.map(decode_session_cursor).transpose()?;
+        let fetch = limit
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidData("session title limit overflow".into()))?
+            .min(501);
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let page_rows: Vec<(ThreadSessionSummary, i64, i64)> = match keyset {
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
+                     FROM threads_v2 WHERE workspace_root=?1 AND title=?2 \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        title,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session title limit exceeds u64".into())
+                        })?)?
+                    ],
+                    session_summary_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            Some((updated, rowid)) => {
+                let mut statement = conn.prepare(
+                    "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
+                     FROM threads_v2 WHERE workspace_root=?1 AND title=?2 \
+                     AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND rowid<?4)) \
+                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?5",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        workspace_root,
+                        title,
+                        updated,
+                        rowid,
+                        to_i64(u64::try_from(fetch).map_err(|_| {
+                            StorageError::InvalidData("session title limit exceeds u64".into())
+                        })?)?
+                    ],
+                    session_summary_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let next_cursor = if page_rows.len() > limit {
+            let (_, updated, rowid) = page_rows[limit - 1];
+            Some(encode_session_cursor(updated, rowid))
+        } else {
+            None
+        };
+        Ok(Paged {
+            items: page_rows
+                .into_iter()
+                .take(limit)
+                .map(|(item, _, _)| item)
+                .collect(),
+            next_cursor,
+        })
     }
 
     pub(crate) fn thread_session_v2(
@@ -1981,7 +2310,7 @@ impl Storage {
         let query = query.trim().to_lowercase();
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
+            "SELECT thread_id,title,workspace_root,parent_thread_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
              FROM threads_v2 WHERE workspace_root=?1 AND \
              (?2='' OR instr(lower(title),?2)>0 OR instr(lower(thread_id),?2)>0) \
              ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
@@ -1994,45 +2323,9 @@ impl Storage {
                     StorageError::InvalidData("session search limit exceeds u64".into())
                 })?)?
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            },
+            session_summary_row,
         )?;
-        rows.map(|row| {
-            let (
-                thread_id,
-                title,
-                workspace_root,
-                parent,
-                lifecycle,
-                binding_json,
-                created,
-                updated,
-            ) = row?;
-            let binding: ThreadProviderBindingV2 =
-                serde_json::from_str(&binding_json).map_err(invalid_json)?;
-            Ok(ThreadSessionSummary {
-                thread_id: parse_thread_id(&thread_id)?,
-                title,
-                workspace_root,
-                parent_thread_id: parent.as_deref().map(parse_thread_id).transpose()?,
-                lifecycle: parse_lifecycle(&lifecycle)?,
-                provider_name: binding.provider_name,
-                model: binding.model,
-                created_at_ms: from_i64(created)?,
-                updated_at_ms: from_i64(updated)?,
-            })
-        })
-        .collect()
+        rows.map(|row| Ok(row?.0)).collect()
     }
 
     pub(crate) fn rename_thread_session(
@@ -3541,7 +3834,7 @@ impl Storage {
         Ok(())
     }
     #[cfg(test)]
-    fn seed_unknown_for_recovery_test(&self, id: &str) -> Result<(), StorageError> {
+    pub(crate) fn seed_unknown_for_recovery_test(&self, id: &str) -> Result<(), StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.execute(
             "UPDATE effects SET status='unknown' WHERE effect_id=?1 AND status='started'",
@@ -4424,6 +4717,100 @@ fn to_i64(value: u64) -> Result<i64, StorageError> {
 fn from_i64(value: i64) -> Result<u64, StorageError> {
     u64::try_from(value).map_err(|_| StorageError::InvalidData("negative sqlite integer".into()))
 }
+
+/// The prefix of every session-list cursor. Cursors are opaque to clients;
+/// the version prefix lets the keyset encoding evolve without ambiguity.
+const SESSION_CURSOR_PREFIX: &str = "v1_";
+
+/// Encodes a `(updated_at_ms, rowid)` keyset position as an opaque cursor.
+fn encode_session_cursor(updated_at_ms: i64, rowid: i64) -> String {
+    // Timestamps and rowids are non-negative by schema; the cursor only ever
+    // encodes values read back from `threads_v2`.
+    format!(
+        "{SESSION_CURSOR_PREFIX}{:x}:{:x}",
+        u64::try_from(updated_at_ms).expect("non-negative timestamp"),
+        u64::try_from(rowid).expect("non-negative rowid")
+    )
+}
+
+/// Decodes an opaque cursor back into its `(updated_at_ms, rowid)` keyset
+/// position, failing closed on any malformed input.
+fn decode_session_cursor(cursor: &str) -> Result<(i64, i64), StorageError> {
+    let invalid = || StorageError::InvalidData("invalid session cursor".into());
+    let body = cursor
+        .strip_prefix(SESSION_CURSOR_PREFIX)
+        .ok_or_else(invalid)?;
+    let (updated, rowid) = body.split_once(':').ok_or_else(invalid)?;
+    let parse = |hex: &str| -> Result<i64, StorageError> {
+        let unsigned = u64::from_str_radix(hex, 16).map_err(|_| invalid())?;
+        i64::try_from(unsigned).map_err(|_| invalid())
+    };
+    Ok((parse(updated)?, parse(rowid)?))
+}
+
+/// Maps a `threads_v2` catalog row (the eight summary columns followed by
+/// `updated_at_ms` and `rowid`) to a [`ThreadSessionSummary`] plus the sort
+/// keys needed for cursor encoding.
+fn session_summary_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(ThreadSessionSummary, i64, i64)> {
+    let thread_id: String = row.get(0)?;
+    let title: String = row.get(1)?;
+    let workspace_root: String = row.get(2)?;
+    let parent: Option<String> = row.get(3)?;
+    let lifecycle: String = row.get(4)?;
+    let binding_json: String = row.get(5)?;
+    let created: i64 = row.get(6)?;
+    let updated: i64 = row.get(7)?;
+    let rowid: i64 = row.get(8)?;
+    let binding: ThreadProviderBindingV2 =
+        serde_json::from_str(&binding_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let summary = ThreadSessionSummary {
+        thread_id: parse_thread_id(&thread_id).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+        })?,
+        title,
+        workspace_root,
+        parent_thread_id: parent
+            .as_deref()
+            .map(parse_thread_id)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?,
+        lifecycle: parse_lifecycle(&lifecycle).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, error.into())
+        })?,
+        provider_name: binding.provider_name,
+        model: binding.model,
+        created_at_ms: from_i64(created).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                error.into(),
+            )
+        })?,
+        updated_at_ms: from_i64(updated).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Integer,
+                error.into(),
+            )
+        })?,
+    };
+    Ok((summary, updated, rowid))
+}
+
 fn status_name(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Queued => "queued",
@@ -5084,7 +5471,7 @@ fn validate_thread_source(source: &str) -> Result<(), StorageError> {
 /// Computes the durable digest that binds a session-create command to its
 /// complete identity: operation kind, protocol version, workspace, thread,
 /// prompt, binding, and normalized focus. Two creates with the same
-/// `command_id` but different digests are a replay conflict (409).
+/// `command_id` but different digests fail with 422 `idempotency_mismatch`.
 fn create_command_digest(
     thread_id: latte_core::ThreadId,
     workspace_root: &str,
@@ -5101,6 +5488,28 @@ fn create_command_digest(
         "prompt": prompt,
         "binding": binding,
         "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
+/// Stable digest of a follow-up command's complete identity. A same-command
+/// retry must reproduce it byte-for-byte; any payload change fails with
+/// 422 `idempotency_mismatch`.
+fn follow_up_command_digest(
+    thread_id: latte_core::ThreadId,
+    expected_thread_revision: u64,
+    prompt: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "thread.follow_up",
+        "protocol_version": latte_core::THREAD_PROTOCOL_VERSION,
+        "thread_id": thread_id.to_string(),
+        "expected_thread_revision": expected_thread_revision,
+        "prompt": prompt,
     });
     format!(
         "{:x}",
@@ -7007,6 +7416,255 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![local_thread]
         );
+    }
+
+    #[test]
+    fn session_cursor_pagination_pages_through_newest_first() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let workspace = "/workspace/paged";
+        let mut created = Vec::new();
+        for index in 0..5u64 {
+            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+            store
+                .create_thread_v2(
+                    thread_id,
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    &thread_binding(),
+                    workspace,
+                    &format!("session {index}"),
+                    &std::collections::BTreeMap::new(),
+                    1_000 + index,
+                )
+                .unwrap();
+            created.push(thread_id);
+        }
+
+        // First page: newest two.
+        let page1 = store
+            .list_threads_v2_for_workspace_paged(workspace, None, 2)
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.items[0].thread_id, created[4]);
+        assert_eq!(page1.items[1].thread_id, created[3]);
+        let cursor = page1.next_cursor.expect("more pages exist");
+
+        // Second page: next two, continuing from the cursor.
+        let page2 = store
+            .list_threads_v2_for_workspace_paged(workspace, Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.items[0].thread_id, created[2]);
+        assert_eq!(page2.items[1].thread_id, created[1]);
+        let cursor = page2.next_cursor.expect("more pages exist");
+
+        // Final page: one item, no further cursor.
+        let page3 = store
+            .list_threads_v2_for_workspace_paged(workspace, Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(page3.items.len(), 1);
+        assert_eq!(page3.items[0].thread_id, created[0]);
+        assert!(page3.next_cursor.is_none());
+
+        // The cursor is opaque: clients cannot infer positions from it.
+        assert!(!cursor.contains("session"));
+    }
+
+    #[test]
+    fn session_cursor_pagination_excludes_foreign_workspace() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        for (workspace, now_ms) in [("/workspace/local", 1u64), ("/workspace/foreign", 2)] {
+            store
+                .create_thread_v2(
+                    ThreadId::from_uuid(ids.next_uuid_v7()),
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    &thread_binding(),
+                    workspace,
+                    "identical prompt",
+                    &std::collections::BTreeMap::new(),
+                    now_ms,
+                )
+                .unwrap();
+        }
+
+        let page = store
+            .list_threads_v2_for_workspace_paged("/workspace/local", None, 50)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.items[0].transcript.entries[0].text, "identical prompt");
+    }
+
+    #[test]
+    fn session_cursor_pagination_limit_zero_is_empty_page() {
+        let store = Storage::memory().unwrap();
+        let page = store
+            .list_threads_v2_for_workspace_paged("/workspace/local", None, 0)
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert!(
+            store
+                .search_thread_sessions_paged("/workspace/local", "anything", None, 0)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(
+            store
+                .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                    "/workspace/local",
+                    "anything",
+                    None,
+                    0
+                )
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_cursor_pagination_rejects_invalid_cursor() {
+        let store = Storage::memory().unwrap();
+        for cursor in ["", "v1_", "v1_xyz", "v1_1:2:3", "garbage", "v2_1:2"] {
+            let result =
+                store.list_threads_v2_for_workspace_paged("/workspace/local", Some(cursor), 10);
+            assert!(
+                matches!(result, Err(StorageError::InvalidData(message)) if message.contains("invalid session cursor")),
+                "cursor {cursor:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn search_and_exact_title_paged_filters_and_pages() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let workspace = "/workspace/search";
+        let mut matching = Vec::new();
+        for index in 0..4u64 {
+            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+            store
+                .create_thread_v2(
+                    thread_id,
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    &thread_binding(),
+                    workspace,
+                    &format!("matching session {index}"),
+                    &std::collections::BTreeMap::new(),
+                    100 + index,
+                )
+                .unwrap();
+            matching.push(thread_id);
+        }
+        // A non-matching session and a foreign-workspace exact-title decoy.
+        store
+            .create_thread_v2(
+                ThreadId::from_uuid(ids.next_uuid_v7()),
+                RunId::from_uuid(ids.next_uuid_v7()),
+                &thread_binding(),
+                workspace,
+                "unrelated",
+                &std::collections::BTreeMap::new(),
+                500,
+            )
+            .unwrap();
+        store
+            .create_thread_v2(
+                ThreadId::from_uuid(ids.next_uuid_v7()),
+                RunId::from_uuid(ids.next_uuid_v7()),
+                &thread_binding(),
+                "/workspace/foreign",
+                "matching session 0",
+                &std::collections::BTreeMap::new(),
+                600,
+            )
+            .unwrap();
+
+        // Substring search pages through matches only, newest first.
+        let page1 = store
+            .search_thread_sessions_paged(workspace, "matching", None, 2)
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.items[0].thread_id, matching[3]);
+        let page2 = store
+            .search_thread_sessions_paged(workspace, "matching", page1.next_cursor.as_deref(), 2)
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.items[0].thread_id, matching[1]);
+        assert!(page2.next_cursor.is_none());
+
+        // Exact-title lookup returns only exact matches in this workspace.
+        let exact = store
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                workspace,
+                "matching session 0",
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(exact.items.len(), 1);
+        assert_eq!(exact.items[0].thread_id, matching[0]);
+        assert!(exact.next_cursor.is_none());
+    }
+
+    #[test]
+    fn exact_title_paged_pages_through_multiple_matches() {
+        use latte_core::{RunId, SystemIdSource, ThreadId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let workspace = "/workspace/exact";
+        let mut matching = Vec::new();
+        for index in 0..4u64 {
+            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+            store
+                .create_thread_v2(
+                    thread_id,
+                    RunId::from_uuid(ids.next_uuid_v7()),
+                    &thread_binding(),
+                    workspace,
+                    "shared title",
+                    &std::collections::BTreeMap::new(),
+                    100 + index,
+                )
+                .unwrap();
+            matching.push(thread_id);
+        }
+
+        // Page 1: two matches + cursor.
+        let page1 = store
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                workspace,
+                "shared title",
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.items[0].thread_id, matching[3]);
+        let cursor = page1.next_cursor.expect("cursor present");
+
+        // Page 2: remaining two matches, no further cursor.
+        let page2 = store
+            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+                workspace,
+                "shared title",
+                Some(&cursor),
+                2,
+            )
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.items[0].thread_id, matching[1]);
+        assert!(page2.next_cursor.is_none());
     }
 
     #[test]
@@ -9212,6 +9870,68 @@ mod tests {
         assert!(matches!(second, latte_core::CreateOutcome::Replayed(_)));
     }
 
+    #[test]
+    fn durable_digest_distinguishes_raw_payloads_that_collapse_under_redaction() {
+        use latte_core::ThreadId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let command_id = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        let lease = store.acquire_thread_lease(thread_id, 1, 100).unwrap();
+
+        // First create with a secret-bearing prompt.
+        let first = store
+            .create_started_thread_v2(
+                Some(&command_id),
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "hello sk-this-is-a-secret-123456789",
+                &std::collections::BTreeMap::new(),
+                &lease,
+                2,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(first, latte_core::CreateOutcome::Created(_)));
+
+        // Same command_id, different raw secret that redacts to the same
+        // value.  Must fail with 422 idempotency_mismatch, not replay.
+        let result = store.create_started_thread_v2(
+            Some(&command_id),
+            thread_id,
+            run_id,
+            &thread_binding(),
+            "/workspace",
+            "hello sk-this-is-a-secret-987654321",
+            &std::collections::BTreeMap::new(),
+            &lease,
+            3,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(StorageError::ThreadCommandReplayMismatch)
+        ));
+
+        // The pre-acquire lookup must agree: same command_id with a
+        // different raw payload is a 422 idempotency_mismatch.
+        let replay = store.lookup_create_replay(
+            &command_id,
+            thread_id,
+            "/workspace",
+            "hello sk-this-is-a-secret-987654321",
+            &thread_binding(),
+            None,
+        );
+        assert!(
+            matches!(replay, Err(StorageError::ThreadCommandReplayMismatch)),
+            "mismatched raw payload must return 422, got {replay:?}"
+        );
+    }
+
     // -- Pure helper coverage ------------------------------------------------
 
     #[test]
@@ -9457,5 +10177,784 @@ mod tests {
         assert!(!redacted.files_changed[0].contains('\x1b'));
         assert!(!redacted.evidence[0].name.contains('\x1b'));
         assert!(!redacted.evidence[0].summary.contains('\x1b'));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn commit_thread_run_update_rejects_invalid_effect_fields() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let (thread_id, run_id, queued) = create_linked_fixture(&store, &ids, "validation", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            run_id,
+            CommitThreadRunUpdate::Start {
+                source_key: "validate:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        let valid_digest = "a".repeat(64);
+        let canonical = crate::ThreadEffectDescriptor {
+            effect_id: "effect-validate".into(),
+            tool_call_id: "call-validate".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path":"a.txt"}),
+            attempt: 1,
+        };
+        let canonical_json = serde_json::to_string(&canonical).unwrap();
+        let thread_rev = running.revision;
+        let run_rev = running.runs[0].run_revision;
+
+        // PrepareEffect: invalid source key (control character).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "bad\nsource".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                13,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid effect id (empty).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some(String::new()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:empty-id".into(),
+                        effect_id: String::new(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                14,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid digest (not 64 hex chars).
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-digest".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: "short".into(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                15,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid descriptor JSON.
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-descriptor".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "not json".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "{}".into(),
+                    },
+                },
+                &lease,
+                16,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // PrepareEffect: invalid checkpoint JSON.
+        assert!(matches!(
+            store.commit_thread_run_update(
+                &ThreadCommitRequest {
+                    thread_id,
+                    run_id,
+                    expected_thread_revision: thread_rev,
+                    expected_run_revision: run_rev,
+                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: Some("effect-validate".into()),
+                    update: CommitThreadRunUpdate::PrepareEffect {
+                        source_key: "validate:bad-checkpoint".into(),
+                        effect_id: "effect-validate".into(),
+                        operation_digest: valid_digest.clone(),
+                        descriptor_json: "{}".into(),
+                        canonical_descriptor_json: canonical_json.clone(),
+                        policy: ThreadEffectPolicy::Allow,
+                        description: "read".into(),
+                        checkpoint_json: "not json".into(),
+                    },
+                },
+                &lease,
+                17,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // StartEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: Some(eid.into()),
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::StartEffect {
+                            source_key: "validate:start-effect".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    18,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // ObserveEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::ObserveEffect {
+                            source_key: "validate:observe".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            success: true,
+                            result: "ok".into(),
+                            payload: None,
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    19,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // UnknownEffect: invalid effect id, digest, checkpoint.
+        for (eid, digest, cp) in [
+            ("", valid_digest.as_str(), "{}"),
+            ("effect-validate", "short", "{}"),
+            ("effect-validate", valid_digest.as_str(), "not json"),
+        ] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::UnknownEffect {
+                            source_key: "validate:unknown".into(),
+                            effect_id: eid.into(),
+                            operation_digest: digest.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    20,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+        // ReconcileUnknownEffect: invalid effect id, checkpoint.
+        for (eid, cp) in [("", "{}"), ("effect-validate", "not json")] {
+            assert!(matches!(
+                store.commit_thread_run_update(
+                    &ThreadCommitRequest {
+                        thread_id,
+                        run_id,
+                        expected_thread_revision: thread_rev,
+                        expected_run_revision: run_rev,
+                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: Some(eid.into()),
+                        update: CommitThreadRunUpdate::ReconcileUnknownEffect {
+                            source_key: "validate:reconcile".into(),
+                            effect_id: eid.into(),
+                            checkpoint_json: cp.into(),
+                        },
+                    },
+                    &lease,
+                    21,
+                ),
+                Err(StorageError::InvalidData(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_functions_reject_thread_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let (run_id, _event_id) = ids();
+        let thread_lease = store.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        let digest = "a".repeat(64);
+        // cancel_waiting with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &thread_lease, 2, false),
+            Err(StorageError::LeaseLost)
+        ));
+        // append_event with a thread lease → LeaseLost.
+        let state = RunState::queued(run_id);
+        let event = RuntimeEvent::StateChanged {
+            status: RunStatus::Queued,
+        };
+        assert!(matches!(
+            store.append_event(
+                &state,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                2,
+                &thread_lease,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // replace_pending_effect with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.replace_pending_effect(
+                "old-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "{}",
+                &digest,
+                &thread_lease,
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // create_prepared_permission with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.create_prepared_permission(
+                "effect",
+                run_id,
+                0,
+                0,
+                1,
+                "{}",
+                &digest,
+                &thread_lease,
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+        // consume_permission_and_start with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.consume_permission_and_start("effect", run_id, 0, &thread_lease, &digest, 2),
+            Err(StorageError::LeaseLost)
+        ));
+        // reconcile_unknown_and_abort with a thread lease → LeaseLost.
+        assert!(matches!(
+            store.reconcile_unknown_and_abort(run_id, "effect", 0, &thread_lease, 2),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn cancel_waiting_rejects_stale_revision_and_non_waiting_states() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Wrong expected revision → StaleRevision.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 99, &lease, 3, false),
+            Err(StorageError::StaleRevision { .. })
+        ));
+        // Non-waiting run (queued) → InvalidData.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &lease, 3, false),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Denied on a non-WaitingPermission run → InvalidData.
+        assert!(matches!(
+            store.cancel_waiting(run_id, 0, &lease, 3, true),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn append_event_rejects_unknown_run_and_stale_revision() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        let state = RunState::queued(run_id);
+        let event = RuntimeEvent::StateChanged {
+            status: RunStatus::Queued,
+        };
+        // Non-existent run → RunNotFound.
+        assert!(matches!(
+            store.append_event(
+                &state,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                2,
+                &lease,
+            ),
+            Err(StorageError::RunNotFound(_))
+        ));
+        // Create the run, then use a stale revision.
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        let mut next = state.clone();
+        next.revision = 5; // does not match expected_revision + 1
+        assert!(matches!(
+            store.append_event(
+                &next,
+                0,
+                EventId::from_uuid(id_source.next_uuid_v7()),
+                &event,
+                3,
+                &lease,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn switch_thread_binding_v2_rejects_invalid_binding_and_unknown_thread() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let (thread_id, _run_id, queued) =
+            create_linked_fixture(&store, &id_source, "binding switch", 11);
+        let lease = store.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
+        // Invalid binding (empty provider_name) → InvalidData.
+        let mut bad_binding = thread_binding();
+        bad_binding.provider_name = String::new();
+        assert!(matches!(
+            store.switch_thread_binding_v2(thread_id, queued.revision, &bad_binding, &lease, 12),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Unknown thread → ThreadNotFound.
+        let unknown = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let unknown_lease = store.acquire_thread_lease(unknown, 10, 10_000).unwrap();
+        assert!(matches!(
+            store.switch_thread_binding_v2(
+                unknown,
+                queued.revision,
+                &thread_binding(),
+                &unknown_lease,
+                12,
+            ),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+        // Stale revision → StaleThreadRevision.
+        assert!(matches!(
+            store.switch_thread_binding_v2(
+                thread_id,
+                queued.revision + 1,
+                &thread_binding(),
+                &lease,
+                12,
+            ),
+            Err(StorageError::StaleThreadRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn create_prepared_permission_rejects_invalid_descriptor_json() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Invalid descriptor JSON → InvalidData.
+        assert!(matches!(
+            store.create_prepared_permission(
+                "effect",
+                run_id,
+                0,
+                0,
+                1,
+                "not json",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn replace_pending_effect_rejects_invalid_json_and_missing_effect() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Invalid descriptor JSON → InvalidData.
+        assert!(matches!(
+            store.replace_pending_effect(
+                "old-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "not json",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // No existing pending permission → LeaseLost (validity check fails).
+        assert!(matches!(
+            store.replace_pending_effect(
+                "missing-effect",
+                "new-effect",
+                run_id,
+                0,
+                1,
+                "{}",
+                &"a".repeat(64),
+                &lease,
+                3,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn consume_permission_and_start_rejects_missing_permission() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Non-existent permission → InvalidData.
+        assert!(matches!(
+            store.consume_permission_and_start(
+                "missing-effect",
+                run_id,
+                0,
+                &lease,
+                &"a".repeat(64),
+                3,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn release_lease_rejects_stale_token() {
+        let store = Storage::memory().unwrap();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        let stale = Lease {
+            scope: lease.scope.clone(),
+            owner: lease.owner.clone(),
+            fencing_token: lease.fencing_token + 1,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.release_lease(&stale),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn complete_verified_rejects_thread_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let (run_id, _) = ids();
+        let thread_lease = store.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        let manifest = std::collections::BTreeMap::new();
+        assert!(matches!(
+            store.complete_verified(
+                run_id,
+                0,
+                &thread_lease,
+                "summary".into(),
+                &manifest,
+                "digest",
+                2,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn import_legacy_database_rejects_invalid_workspace_root_and_fingerprint() {
+        let store = Storage::memory().unwrap();
+        let (dir, path) = db();
+        // Create a minimal legacy database file.
+        std::fs::write(&path, "not a database").unwrap();
+        // Invalid workspace root (control character) → InvalidData.
+        assert!(matches!(
+            store.import_legacy_database(&path, "/source/path", "fingerprint", "bad\nroot", 1,),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Invalid fingerprint (control character) → InvalidData.
+        assert!(matches!(
+            store.import_legacy_database(
+                &path,
+                "/source/path",
+                "bad\nfingerprint",
+                "/workspace",
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        drop(dir);
+    }
+
+    #[test]
+    fn lookup_create_replay_rejects_invalid_workspace_root_and_returns_none_for_missing() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let command_id = latte_core::ThreadCommandId::from_uuid(id_source.next_uuid_v7());
+        let binding = thread_binding();
+        // Invalid workspace root → InvalidData.
+        assert!(matches!(
+            store.lookup_create_replay(
+                &command_id,
+                thread_id,
+                "bad\nroot",
+                "prompt",
+                &binding,
+                None,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // No existing command → Ok(None).
+        assert!(
+            store
+                .lookup_create_replay(
+                    &command_id,
+                    thread_id,
+                    "/workspace",
+                    "prompt",
+                    &binding,
+                    None,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_unknown_and_abort_rejects_stale_revision() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Wrong expected revision → StaleRevision.
+        assert!(matches!(
+            store.reconcile_unknown_and_abort(run_id, "effect", 99, &lease, 3),
+            Err(StorageError::StaleRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn interrupt_after_lease_loss_rejects_still_authoritative_lease() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // Lease is still valid → InvalidData.
+        assert!(matches!(
+            store.interrupt_after_lease_loss(run_id, &lease, 0, 3),
+            Err(StorageError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn apply_transition_rejects_stale_lease_token() {
+        let store = Storage::memory().unwrap();
+        let (run_id, _) = ids();
+        let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
+        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        // A lease with a higher fencing token → LeaseLost.
+        let stale = Lease {
+            scope: lease.scope.clone(),
+            owner: lease.owner.clone(),
+            fencing_token: lease.fencing_token + 1,
+            expires_at_ms: lease.expires_at_ms,
+        };
+        assert!(matches!(
+            store.apply_transition(run_id, 0, Transition::Start, 3, &stale,),
+            Err(StorageError::LeaseLost)
+        ));
+    }
+
+    #[test]
+    fn create_thread_v2_rejects_invalid_binding_workspace_and_duplicate() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let baseline = std::collections::BTreeMap::new();
+        let thread_id = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let run_id = RunId::from_uuid(id_source.next_uuid_v7());
+        // Invalid binding (empty provider_name) → InvalidData.
+        let mut bad_binding = thread_binding();
+        bad_binding.provider_name = String::new();
+        assert!(matches!(
+            store.create_thread_v2(
+                thread_id,
+                run_id,
+                &bad_binding,
+                "/workspace",
+                "prompt",
+                &baseline,
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Invalid workspace root (control character) → InvalidData.
+        assert!(matches!(
+            store.create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "bad\nroot",
+                "prompt",
+                &baseline,
+                1,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+        // Create the thread, then duplicate → replays the existing snapshot.
+        store
+            .create_thread_v2(
+                thread_id,
+                run_id,
+                &thread_binding(),
+                "/workspace",
+                "prompt",
+                &baseline,
+                1,
+            )
+            .unwrap();
+        let run_id2 = RunId::from_uuid(id_source.next_uuid_v7());
+        let duplicate = store
+            .create_thread_v2(
+                thread_id,
+                run_id2,
+                &thread_binding(),
+                "/workspace",
+                "prompt",
+                &baseline,
+                2,
+            )
+            .unwrap();
+        assert_eq!(duplicate.thread_id, thread_id);
+    }
+
+    #[test]
+    fn create_thread_follow_up_v2_rejects_unknown_thread_and_wrong_lease_scope() {
+        let store = Storage::memory().unwrap();
+        let id_source = SystemIdSource::default();
+        let baseline = std::collections::BTreeMap::new();
+        let (thread_id, _run_id, queued) =
+            create_linked_fixture(&store, &id_source, "follow-up errors", 11);
+        // Unknown thread → ThreadNotFound.
+        let unknown = latte_core::ThreadId::from_uuid(id_source.next_uuid_v7());
+        let follow_up = RunId::from_uuid(id_source.next_uuid_v7());
+        assert!(matches!(
+            store.create_thread_follow_up_v2(
+                unknown,
+                follow_up,
+                queued.revision,
+                "next",
+                &baseline,
+                12,
+            ),
+            Err(StorageError::ThreadNotFound(_))
+        ));
+        // Wrong lease scope (runtime lease instead of thread lease) → LeaseLost.
+        let runtime_lease = store.acquire_lease("owner", 10, 10_000).unwrap();
+        assert!(matches!(
+            store.create_started_thread_follow_up_v2(
+                None,
+                thread_id,
+                follow_up,
+                queued.revision,
+                "next",
+                &baseline,
+                &runtime_lease,
+                12,
+            ),
+            Err(StorageError::LeaseLost)
+        ));
     }
 }

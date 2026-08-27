@@ -171,6 +171,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn truncation_backs_off_to_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "root").unwrap();
+        fs::create_dir_all(dir.path().join("folder")).unwrap();
+        fs::write(dir.path().join("folder/AGENTS.md"), "éé").unwrap();
+        // Section sizes: root = 23 bytes, folder = 30 bytes. A cap of 50
+        // leaves 27 bytes for the folder section, which lands on the
+        // continuation byte of the first `é`, forcing the char-boundary
+        // back-off.
+        let bundle = build(dir.path(), Some(Path::new("folder")), 50).unwrap();
+        assert!(bundle.truncated);
+        assert!(bundle.text.is_char_boundary(bundle.text.len()));
+        assert!(bundle.text.ends_with("folder/AGENTS.md ---\n"));
+    }
+
+    #[test]
+    fn invalid_utf8_manifest_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), &[0xFF, 0xFE, 0xFD][..]).unwrap();
+        assert!(build(dir.path(), None, 1024).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_external_symlink_ancestors_and_agents_files() {
