@@ -613,8 +613,10 @@ mod tests {
     #[test]
     fn crossterm_mouse_capture_commands_are_writable() {
         let ops = CrosstermTerminalOps;
-        ops.enable_mouse().unwrap();
-        ops.disable_mouse().unwrap();
+        // Ignore failures on hosts without a controlling TTY so the test does
+        // not leave the console in a partially-enabled state on Windows.
+        let _ = ops.enable_mouse();
+        let _ = ops.disable_mouse();
     }
 
     #[test]
@@ -889,14 +891,16 @@ mod tests {
         let ops = CrosstermTerminalOps;
         // Raw mode requires a controlling TTY; the transition is still
         // exercised here and any failure is ignored because the test host is
-        // allowed to lack a terminal.
+        // allowed to lack a terminal.  All results are ignored so that
+        // disable_raw() runs even when an intermediate operation fails,
+        // preventing the console from being left in raw mode on Windows.
         let _ = ops.enable_raw();
-        ops.push_keyboard().unwrap();
-        ops.enter_alternate().unwrap();
-        ops.enable_paste().unwrap();
-        ops.disable_paste().unwrap();
-        ops.leave_alternate().unwrap();
-        ops.pop_keyboard().unwrap();
+        let _ = ops.push_keyboard();
+        let _ = ops.enter_alternate();
+        let _ = ops.enable_paste();
+        let _ = ops.disable_paste();
+        let _ = ops.leave_alternate();
+        let _ = ops.pop_keyboard();
         let _ = ops.disable_raw();
     }
 
