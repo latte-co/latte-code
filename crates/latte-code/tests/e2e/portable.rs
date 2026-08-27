@@ -6804,6 +6804,7 @@ fn final_binary_cli_run_with_process_tool_completes() {
     provider.assert_consumed();
 }
 
+#[cfg(unix)]
 #[test]
 fn final_binary_cli_run_with_safe_grep_process_completes() {
     // /usr/bin/grep -q <pattern> <relative-file> is an Allow-class process:
@@ -6840,6 +6841,7 @@ fn final_binary_cli_run_with_safe_grep_process_completes() {
     provider.assert_consumed();
 }
 
+#[cfg(unix)]
 #[test]
 fn final_binary_cli_run_with_denied_shell_process_fails() {
     // A shell command matching the deny list (e.g. `rm -rf /`) must be
