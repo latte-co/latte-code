@@ -811,7 +811,7 @@ impl EngineHandle {
         if self.process_supervision_supported {
             tools.push(ToolDescriptor {
                 name: "process".into(),
-                description: "Engine-owned supervised process operation".into(),
+                description: crate::tools::tool_description("process").into(),
                 input_schema: crate::tools::tool_schema("process"),
                 version: 1,
                 effect: "process".into(),
