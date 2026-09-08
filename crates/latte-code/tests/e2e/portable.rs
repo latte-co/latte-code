@@ -294,6 +294,127 @@ fn final_binary_uses_inline_provider_secret_without_environment_inheritance() {
     );
 }
 
+/// The tool schemas and the system prompt are the only channel telling a model
+/// that a mutation's `precondition` is the digest `read_file` returned. A live
+/// model that cannot see the link omits it and every edit is rejected, so the
+/// final binary must actually put both on the wire.
+#[test]
+fn final_binary_sends_tool_contracts_and_the_workflow_prompt_to_the_provider() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::json(
+        200,
+        &serde_json::json!({
+            "choices": [{"message": {"content": "read only, nothing to change"},
+                         "finish_reason": "stop"}]
+        }),
+    )]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        ".latte/latte-code.db",
+        "",
+    );
+    let output = scenario.output(&["--json", "run", "describe this repository"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-contract-secret");
+    });
+    assert!(output.status.success(), "{output:?}");
+
+    let requests = provider.requests();
+    let body = &requests[0].body;
+    let system = body["messages"][0]["content"]
+        .as_str()
+        .expect("a system message leads the request");
+    assert_eq!(body["messages"][0]["role"], "system");
+    for needle in ["read_file", "sha256", "precondition", "verification"] {
+        assert!(
+            system.contains(needle),
+            "the workflow prompt lost `{needle}`: {system}"
+        );
+    }
+
+    let tools = body["tools"].as_array().expect("tools are advertised");
+    let edit = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "edit_file")
+        .expect("edit_file is advertised");
+    let description = edit["function"]["description"].as_str().unwrap();
+    assert!(
+        description.contains("read_file") && description.contains("precondition"),
+        "edit_file must carry its digest contract: {description}"
+    );
+    assert!(
+        description.contains("exactly once"),
+        "edit_file must state the unique-match rule: {description}"
+    );
+    let read = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "read_file")
+        .expect("read_file is advertised");
+    assert!(
+        read["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("sha256"),
+        "read_file must name the digest it returns"
+    );
+}
+
+/// A `length` finish means the model hit its output cap mid-answer. The partial
+/// text must reach the user, but the turn must not be reported as completed.
+#[test]
+fn final_binary_reports_a_length_truncated_answer_as_unfinished() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::json(
+        200,
+        &serde_json::json!({
+            "choices": [{"message": {"content": "the answer starts here and then"},
+                         "finish_reason": "length"}]
+        }),
+    )]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        ".latte/latte-code.db",
+        "",
+    );
+    let output = scenario.output(&["--json", "run", "write something long"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-truncation-secret");
+    });
+
+    // Not a success: a cut-off answer is an unfinished turn.
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json(&output)["status"], "failed");
+    assert_eq!(
+        json(&output)["data"]["session"]["runs"][0]["status"],
+        "failed"
+    );
+    // Retryable, so the session still accepts a follow-up that continues it.
+    assert_eq!(json(&output)["data"]["session"]["lifecycle"], "ready");
+    provider.assert_consumed();
+
+    let id = session_id(&output);
+    let shown = scenario.output(&["--json", "show", &id], |_| {});
+    assert!(shown.status.success());
+    let entries = json(&shown)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .expect("transcript entries")
+        .clone();
+    let assistant = entries
+        .iter()
+        .find(|entry| entry["kind"] == "assistant")
+        .expect("the partial answer survives for the user to read");
+    assert_eq!(assistant["text"], "the answer starts here and then");
+    assert_eq!(assistant["payload"]["truncated"], "length");
+    assert!(
+        entries.iter().any(|entry| entry["kind"] == "failure"
+            && entry["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("output limit")),
+        "the user must be told why the answer stops: {entries:?}"
+    );
+}
+
 #[test]
 fn final_binary_persists_terminal_provider_failure_without_retrying() {
     let scenario = Scenario::new();
@@ -336,6 +457,304 @@ fn final_binary_persists_terminal_provider_failure_without_retrying() {
             .unwrap()
             .iter()
             .any(|entry| entry["text"].as_str().unwrap_or("").contains("http 400"))
+    );
+}
+
+/// Some Providers reject a request that carries no conversation header. The
+/// binary must send the configured header, expand the placeholder, and present
+/// the *same* value on a follow-up turn of the same Session — a value that
+/// changed per turn would defeat the grouping the header exists for.
+#[test]
+fn final_binary_sends_the_configured_session_header_and_keeps_it_stable_across_turns() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first answer"),
+        ProviderReply::completion("second answer"),
+    ]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        ".latte/latte-code.db",
+        r#",headers:{"x-session-id":"${session_id}","x-tenant":"acme"}"#,
+    );
+
+    let first = scenario.output(&["--json", "run", "first turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-header-secret");
+    });
+    assert!(first.status.success(), "{first:?}");
+    let session = session_id(&first);
+
+    let second = scenario.output(&["--json", "resume", &session, "second turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-header-secret");
+    });
+    assert!(
+        second.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "each turn issues one provider request");
+    let first_reference = requests[0]
+        .headers
+        .get("x-session-id")
+        .expect("the configured session header reached the wire");
+    assert_eq!(
+        requests[1].headers.get("x-session-id"),
+        Some(first_reference),
+        "both turns of one session must present the same reference"
+    );
+    assert!(
+        !first_reference.is_empty() && first_reference != "${session_id}",
+        "the placeholder must be expanded, not sent literally: {first_reference}"
+    );
+    assert_ne!(
+        first_reference, &session,
+        "the Session id itself must not be handed to the Provider"
+    );
+    for request in &requests {
+        assert_eq!(
+            request.headers.get("x-tenant").map(String::as_str),
+            Some("acme"),
+            "a literal header is sent unchanged"
+        );
+    }
+}
+
+/// A follow-up turn replays the earlier assistant answer. Serializing that
+/// answer with `tool_calls: []` is rejected by Providers that treat an empty
+/// array as invalid, which would break every Session whose history contains a
+/// plain text reply — so the key must be absent, not empty.
+#[test]
+fn final_binary_omits_tool_calls_when_replaying_a_plain_assistant_answer() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first answer"),
+        ProviderReply::completion("second answer"),
+    ]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        ".latte/latte-code.db",
+        "",
+    );
+
+    let first = scenario.output(&["--json", "run", "first turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-replay-secret");
+    });
+    assert!(first.status.success(), "{first:?}");
+    let session = session_id(&first);
+    let second = scenario.output(&["--json", "resume", &session, "second turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-replay-secret");
+    });
+    assert!(
+        second.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    let requests = provider.requests();
+    let messages = requests[1].body["messages"]
+        .as_array()
+        .expect("the follow-up replays the conversation");
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("the earlier answer is replayed");
+    assert_eq!(assistant["content"], "first answer");
+    assert!(
+        assistant.get("tool_calls").is_none(),
+        "a plain answer must not replay an empty tool_calls array: {assistant}"
+    );
+}
+
+/// The configured verification run is an engine-initiated effect, recorded as
+/// a durable tool result under an id the engine minted. Replaying it as a
+/// `tool` message would place one in front of no matching `tool_calls`, which
+/// the Chat Completions grammar forbids — and since history is rebuilt from
+/// the transcript every turn, that would break *every* later turn of the
+/// Session, not just one.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-1",
+            "write_file",
+            &serde_json::json!({
+                "path": "note.txt",
+                "content": "hello\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("wrote the file"),
+        ProviderReply::completion("second answer"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(&workspace_id, "write it", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached WaitingPermission");
+    let (allow_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "allow": true,
+            "expected_thread_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(allow_status, 200);
+
+    // Settle, approving any further gate (the verification run asks too),
+    // then take a follow-up turn: it replays the whole transcript.
+    let mut settled = false;
+    for _ in 0..400 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status != 200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        match body["snapshot"]["lifecycle"].as_str() {
+            Some("ready" | "failed") => {
+                settled = true;
+                break;
+            }
+            Some("waiting_permission") => {
+                let pending = &body["snapshot"]["pending"];
+                let (allow_status, _) = server.request(
+                    "POST",
+                    &format!(
+                        "/v1/sessions/{session_id}/permissions/{}",
+                        pending["request_id"].as_str().unwrap()
+                    ),
+                    Some(&server.token),
+                    Some(&serde_json::json!({
+                        "allow": true,
+                        "expected_thread_revision": body["snapshot"]["revision"],
+                        "expected_run_revision": pending["expected_run_revision"],
+                    })),
+                    &[],
+                );
+                assert_eq!(allow_status, 200);
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    assert!(settled, "session never settled after the verified turn");
+    let resume = scenario.output(
+        &[
+            "--json",
+            "resume",
+            &session_id,
+            "what did you change?",
+            "--server",
+            &format!("http://127.0.0.1:{}", server.port),
+            "--token",
+            &server.token,
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "portable-verification-secret");
+        },
+    );
+    assert!(
+        resume.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resume.stdout)
+    );
+
+    let requests = provider.requests();
+    let messages = requests
+        .last()
+        .expect("the follow-up reached the provider")
+        .body["messages"]
+        .as_array()
+        .expect("the follow-up replays the conversation")
+        .clone();
+
+    // Every replayed `tool` message must answer a call some earlier assistant
+    // message declared.
+    let declared: Vec<String> = messages
+        .iter()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .filter_map(|call| call["id"].as_str().map(str::to_owned))
+        .collect();
+    for message in &messages {
+        if message["role"] == "tool" {
+            let id = message["tool_call_id"].as_str().unwrap_or_default();
+            assert!(
+                declared.iter().any(|declared| declared == id),
+                "replayed an orphan tool result {id}: {messages:#?}"
+            );
+        }
+    }
+    assert!(
+        !messages.iter().any(|message| message["tool_call_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("verification-"))),
+        "the verification effect must stay out of provider history: {messages:#?}"
+    );
+    // The model-issued call is still replayed with its result.
+    assert!(
+        declared.iter().any(|id| id == "write-1"),
+        "the assistant's own call must survive the rebuild: {messages:#?}"
     );
 }
 
@@ -6961,12 +7380,14 @@ fn final_binary_cli_run_with_provider_error_fails() {
     provider.assert_consumed();
 }
 
-/// Provider responses with non-standard finish reasons (`length`,
-/// `content_filter`, unknown) must still complete the session, covering the
-/// `finish_reason` mapping branches in the provider.
+/// Provider responses with non-terminal finish reasons (`content_filter`,
+/// unknown) still complete the session, covering the `finish_reason` mapping
+/// branches in the provider. `length` is deliberately excluded: it means the
+/// model stopped mid-answer, and
+/// `final_binary_reports_a_length_truncated_answer_as_unfinished` covers it.
 #[test]
 fn final_binary_cli_run_with_variant_finish_reasons_completes() {
-    for reason in ["length", "content_filter", "custom_reason"] {
+    for reason in ["content_filter", "custom_reason"] {
         let scenario = Scenario::new();
         let reply = ProviderReply::json(
             200,

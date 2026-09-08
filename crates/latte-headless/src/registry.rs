@@ -1,6 +1,6 @@
 use crate::provider::{
     Message, OpenAiProvider, Provider, ProviderCapabilities, ProviderContext, ProviderError,
-    ProviderFuture, ProviderRequest,
+    ProviderFuture, ProviderRequest, RESERVED_HEADERS, SESSION_ID_PLACEHOLDER,
 };
 use latte_core::ThreadProviderBindingV2;
 use latte_engine::ToolDescriptor;
@@ -51,9 +51,59 @@ pub enum ProviderDefinition {
         compatibility_input_request: bool,
         #[serde(default)]
         streaming: bool,
+        /// Extra request headers this Provider requires beyond the Chat
+        /// Completions protocol. `${session_id}` in a value expands to an
+        /// opaque per-Session identifier; other `${...}` names are rejected at
+        /// load time. Reserved headers cannot be set here.
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
     },
+}
+
+/// Validates one provider's configured headers before any request is built.
+/// Failing at load time keeps a typo from silently dropping the header a
+/// Provider requires — some reject the whole request without it.
+fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), RegistryError> {
+    for (name, value) in headers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(RegistryError::Invalid(format!(
+                "header name {name:?} must be non-empty and use only ASCII letters, digits, `-`, or `_`"
+            )));
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(RegistryError::Invalid(format!(
+                "header {name:?} is derived by the provider and cannot be configured"
+            )));
+        }
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(RegistryError::Invalid(format!(
+                "header {name:?} value must not contain control characters"
+            )));
+        }
+        let mut rest = value.as_str();
+        while let Some(start) = rest.find("${") {
+            let end = rest[start..].find('}').map(|offset| start + offset + 1);
+            let Some(end) = end else {
+                return Err(RegistryError::Invalid(format!(
+                    "header {name:?} has an unterminated placeholder"
+                )));
+            };
+            let placeholder = &rest[start..end];
+            if placeholder != SESSION_ID_PLACEHOLDER {
+                return Err(RegistryError::Invalid(format!(
+                    "header {name:?} uses unknown placeholder {placeholder}; only {SESSION_ID_PLACEHOLDER} is supported"
+                )));
+            }
+            rest = &rest[end..];
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -485,6 +535,7 @@ impl ProviderRegistry {
                 max_tokens,
                 compatibility_input_request,
                 streaming,
+                headers,
                 ..
             } => {
                 let model_options = definition.model_options(selected_model).ok_or_else(|| {
@@ -512,6 +563,7 @@ impl ProviderRegistry {
                     )
                 });
                 let binding = Self::binding_for_model(name, definition, selected_model, tools)?;
+                validate_headers(headers)?;
                 let provider = OpenAiProvider::new(
                     endpoint,
                     selected_model,
@@ -525,7 +577,8 @@ impl ProviderRegistry {
                 )
                 .with_reasoning_effort(model_options.reasoning_effort)
                 .with_compatibility_input_request(*compatibility_input_request)
-                .with_streaming(*streaming);
+                .with_streaming(*streaming)
+                .with_headers(headers.clone());
                 let reverse = binding
                     .aliases
                     .iter()
@@ -1055,6 +1108,7 @@ mod tests {
             max_tokens: None,
             compatibility_input_request: false,
             streaming: false,
+            headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
         };
         let forward = ProviderRegistry::binding_for_model(
@@ -1207,6 +1261,7 @@ mod tests {
             events: None,
         };
         let tool_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![tool("read_file")],
         };
@@ -1215,6 +1270,7 @@ mod tests {
             Err(ProviderError::Malformed(message)) if message.contains("declaration")
         ));
         let assistant_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Assistant {
                 content: None,
                 tool_calls: vec![crate::provider::ToolCall {
@@ -1230,6 +1286,7 @@ mod tests {
             Err(ProviderError::Malformed(message)) if message.contains("historical tool call")
         ));
         let tool_result_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Tool {
                 tool_call_id: "call".into(),
                 name: Some("read_file".into()),
@@ -1256,6 +1313,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![],
                     },
@@ -1294,6 +1352,7 @@ mod tests {
         let outcome = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![Message::Assistant {
                         content: None,
                         tool_calls: vec![crate::provider::ToolCall {
@@ -1424,6 +1483,7 @@ mod tests {
             max_tokens: None,
             compatibility_input_request: false,
             streaming: false,
+            headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
         };
         assert_eq!(definition.model_name("m"), Some("Display"));
@@ -1447,6 +1507,77 @@ mod tests {
         )
         .unwrap();
         assert!(registry.resolve_model("main", "m", &[]).is_err());
+    }
+
+    #[test]
+    fn configured_headers_are_accepted_and_reach_the_resolved_provider() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-session-id':'${session_id}','x-tenant':'acme'}}}}",
+        )
+        .unwrap();
+        assert!(registry.resolve_model("main", "m", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_header_typo_is_rejected_at_load_rather_than_silently_dropped() {
+        // A Provider that requires the header rejects the whole request without
+        // it. Failing here names the offending header; failing at request time
+        // would surface as an opaque 400 from the Provider.
+        for (headers, expected) in [
+            (r"{'x-session':'${sesion_id}'}", "unknown placeholder"),
+            (r"{'x-session':'${session_id'}", "unterminated placeholder"),
+            (r"{'x session':'v'}", "must be non-empty"),
+            (r"{'':'v'}", "must be non-empty"),
+            (r"{'authorization':'Bearer x'}", "cannot be configured"),
+            (r"{'Content-Type':'text/plain'}", "cannot be configured"),
+        ] {
+            let registry = ProviderRegistry::parse_jsonc(&format!(
+                r"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{headers}}}}}}}"
+            ))
+            .unwrap();
+            let Err(error) = registry.resolve_model("main", "m", &[]) else {
+                panic!("headers {headers} must be rejected");
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "{headers} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_value_carrying_a_control_character_is_rejected() {
+        let registry = ProviderRegistry::parse_jsonc(
+            "{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-a':'a\\nb'}}}}",
+        )
+        .unwrap();
+        let Err(error) = registry.resolve_model("main", "m", &[]) else {
+            panic!("a control character in a header value must be rejected");
+        };
+        assert!(error.to_string().contains("control characters"), "{error}");
+    }
+
+    #[test]
+    fn headers_take_part_in_the_configuration_fingerprint() {
+        // Two deployments that differ only by a required header are not the
+        // same configuration: a binding pinned under one must not be reused
+        // under the other.
+        let without = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k'}}}",
+        )
+        .unwrap()
+        .resolve_model("main", "m", &[])
+        .unwrap();
+        let with = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-session-id':'${session_id}'}}}}",
+        )
+        .unwrap()
+        .resolve_model("main", "m", &[])
+        .unwrap();
+        assert_ne!(
+            without.binding.config_fingerprint,
+            with.binding.config_fingerprint
+        );
     }
 
     #[test]
@@ -1476,6 +1607,7 @@ mod tests {
             .unwrap();
         // A Tool message whose name is not in the forward alias map.
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Tool {
                 tool_call_id: "t1".into(),
                 name: Some("unknown".into()),
@@ -1505,6 +1637,7 @@ mod tests {
             .resolve_model("main", "m", &[tool("read_file")])
             .unwrap();
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![],
         };
@@ -1531,6 +1664,7 @@ mod tests {
             .resolve_model("main", "m", &[tool("read_file")])
             .unwrap();
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![],
         };

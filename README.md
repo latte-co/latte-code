@@ -51,6 +51,20 @@ The TUI creates v2 threads. A completed child is immutable; a follow-up creates 
 
 OpenAI Chat Completions can use bounded SSE when `streaming` is true. Only actual deltas are rendered; a valid inline JSON response renders only its final answer. A zero-body unsupported streaming response may make one non-streaming retry; any body byte, malformed SSE, or cancellation does not fall back. Responses API and other provider protocols are not implemented. Provider-issued v2 tool calls are executed only by the engine through fenced durable `Prepare -> Started -> Observe` transitions. A restart or lost authority after `Started` records `Unknown` and requires explicit reconciliation; neither the TUI nor provider has direct effect authority.
 
+An OpenAI Chat provider may declare `headers` for gateways that require request headers beyond the protocol itself. Each value is sent verbatim except for `${session_id}`, which expands to an opaque per-Session reference — derived from the Session, stable for all of its turns, and not the Session id itself, so a Provider can group a conversation without receiving an internal identifier. Any other `${...}` name, a malformed header name, a control character in a value, and the provider-derived `authorization`, `content-type`, `host`, and `content-length` headers are rejected when the model is resolved rather than at request time. Configured headers participate in the Session binding fingerprint.
+
+```jsonc
+providers: {
+  gateway: {
+    type: 'openai-chat',
+    models: ['some-model'],
+    endpoint: 'https://gateway.example/v1/chat/completions',
+    api_key: { source: 'env', name: 'OPENAI_API_KEY' },
+    headers: { 'x-session-id': '${session_id}' },
+  },
+}
+```
+
 ## Safety and recovery
 
 - `latte-engine` is the sole authority for filesystem and process effects.

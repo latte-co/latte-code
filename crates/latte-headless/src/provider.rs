@@ -81,6 +81,34 @@ pub type ProviderOutcome = ProviderResponse;
 pub struct ProviderRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDescriptor>,
+    /// Opaque per-Session identifier for Providers that route or group by
+    /// conversation. It is derived from the Session id rather than being it:
+    /// a Provider is an external party and receives no internal identifier.
+    /// Stable for the whole Session, so follow-up turns keep the same value.
+    pub session_ref: String,
+}
+
+/// Headers the provider derives itself. Configuration cannot set them: doing so
+/// would let a config file replace resolved credentials or the wire format.
+pub(crate) const RESERVED_HEADERS: [&str; 4] =
+    ["authorization", "content-type", "host", "content-length"];
+
+/// The only placeholder a configured header value may use.
+pub(crate) const SESSION_ID_PLACEHOLDER: &str = "${session_id}";
+
+/// Derives the value a Provider sees for one Session.
+///
+/// The internal `ThreadId` is never sent as-is: a Provider is an external party
+/// and correlating our identifiers across Providers is not something the user
+/// asked for. Hashing keeps the value stable for the whole Session — the point
+/// of the header — while making it meaningless outside this process.
+#[must_use]
+pub fn session_ref_for(thread_id: latte_core::ThreadId) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(thread_id.as_uuid().as_bytes());
+    // 128 bits: collision-free at any session count a workspace will reach, and
+    // short enough that Providers with header length limits accept it.
+    format!("{digest:x}")[..32].to_owned()
 }
 
 pub trait ProviderEventSink: Send + Sync {
@@ -217,6 +245,7 @@ pub struct OpenAiProvider {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     streaming: bool,
+    headers: std::collections::BTreeMap<String, String>,
 }
 impl OpenAiProvider {
     pub fn new(
@@ -241,7 +270,21 @@ impl OpenAiProvider {
             max_tokens: None,
             reasoning_effort: None,
             streaming: false,
+            headers: std::collections::BTreeMap::new(),
         })
+    }
+    /// Sets extra request headers this Provider requires beyond the protocol.
+    /// `${session_id}` in a value expands per request. The caller must have
+    /// validated names and placeholders; reserved headers are dropped here as
+    /// a second line of defence so a bypassed caller cannot replace the
+    /// resolved credential or the wire format.
+    #[must_use]
+    pub fn with_headers(mut self, headers: std::collections::BTreeMap<String, String>) -> Self {
+        self.headers = headers
+            .into_iter()
+            .filter(|(name, _)| !RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+            .collect();
+        self
     }
     #[must_use]
     pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
@@ -304,6 +347,11 @@ enum WireRequestMessage<'a> {
     },
     Assistant {
         content: Option<&'a str>,
+        /// Omitted when the assistant turn made no calls. An empty array is not
+        /// the same as absence on the wire: some Providers reject `tool_calls:
+        /// []`, which would fail every follow-up turn of a Session whose
+        /// history contains a plain text answer.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<WireRequestCall<'a>>,
     },
     Tool {
@@ -470,11 +518,13 @@ impl Provider for OpenAiProvider {
                 }
                 let sent = tokio::time::timeout(
                     remaining,
-                    this.client
-                        .post(&this.endpoint)
-                        .bearer_auth(&this.api_key)
-                        .json(&body)
-                        .send(),
+                    apply_headers(
+                        this.client.post(&this.endpoint).bearer_auth(&this.api_key),
+                        &this.headers,
+                        &request.session_ref,
+                    )
+                    .json(&body)
+                    .send(),
                 )
                 .await;
                 let response = match sent {
@@ -530,7 +580,13 @@ impl Provider for OpenAiProvider {
                             .as_object_mut()
                             .expect("request serializes to object")
                             .remove("stream");
-                        return complete_inline_once(&this, inline_body, &context).await;
+                        return complete_inline_once(
+                            &this,
+                            inline_body,
+                            &request.session_ref,
+                            &context,
+                        )
+                        .await;
                     }
                 }
                 return Err(ProviderError::Http {
@@ -564,6 +620,32 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// Applies the provider's configured headers to one outgoing request,
+/// substituting the placeholder with this Session's reference.
+///
+/// Reserved headers were already dropped at construction, so this cannot
+/// overwrite the credential or the wire format. A value that does not survive
+/// `HeaderValue` parsing is skipped rather than failing the turn: the header is
+/// an addition for the Provider's benefit, and losing the whole conversation
+/// over one malformed one would be worse than sending the request without it.
+fn apply_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &std::collections::BTreeMap<String, String>,
+    session_ref: &str,
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        let expanded = value.replace(SESSION_ID_PLACEHOLDER, session_ref);
+        let Ok(name) = reqwest::header::HeaderName::try_from(name) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::try_from(expanded) else {
+            continue;
+        };
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
 fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
     // Rendering observers are intentionally outside the provider critical
     // path. A slow terminal reducer cannot hold the network response open.
@@ -576,6 +658,7 @@ fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
 async fn complete_inline_once(
     provider: &OpenAiProvider,
     body: Value,
+    session_ref: &str,
     context: &ProviderContext,
 ) -> Result<ProviderResponse, ProviderError> {
     if context.cancellation.is_cancelled() {
@@ -590,12 +673,16 @@ async fn complete_inline_once(
     }
     let response = tokio::time::timeout(
         remaining,
-        provider
-            .client
-            .post(&provider.endpoint)
-            .bearer_auth(&provider.api_key)
-            .json(&body)
-            .send(),
+        apply_headers(
+            provider
+                .client
+                .post(&provider.endpoint)
+                .bearer_auth(&provider.api_key),
+            &provider.headers,
+            session_ref,
+        )
+        .json(&body)
+        .send(),
     )
     .await
     .map_err(|_| ProviderError::Timeout)?
@@ -999,6 +1086,7 @@ fn digest_schema() -> Value {
 mod tests {
     use super::*;
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::TcpListener,
         sync::mpsc,
@@ -1080,6 +1168,42 @@ mod tests {
         (format!("http://{address}"), rx)
     }
 
+    /// Captures the raw request head so a test can assert on wire headers
+    /// rather than on the builder that produced them.
+    fn header_capturing_server(
+        responses: Vec<(&str, &str)>,
+    ) -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<_> = responses
+            .into_iter()
+            .map(|(status, body)| (status.to_owned(), body.to_owned()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 16 * 1024];
+                let count = socket.read(&mut buffer).unwrap();
+                let head = String::from_utf8_lossy(&buffer[..count]);
+                let head = head.split("\r\n\r\n").next().unwrap_or_default();
+                tx.send(
+                    head.lines()
+                        .skip(1)
+                        .map(|line| line.trim().to_ascii_lowercase())
+                        .collect(),
+                )
+                .unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), rx)
+    }
+
     fn sse_server(chunks: Vec<Vec<u8>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1107,6 +1231,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1136,6 +1261,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1177,6 +1303,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1226,6 +1353,7 @@ mod tests {
         let output = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1257,6 +1385,7 @@ mod tests {
             let response = provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![],
                     },
@@ -1283,6 +1412,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1308,6 +1438,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1338,6 +1469,7 @@ mod tests {
         let result = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1365,6 +1497,7 @@ mod tests {
         let result = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1397,6 +1530,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1438,6 +1572,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages,
                     tools: tools.into(),
                 },
@@ -1479,6 +1614,7 @@ mod tests {
             .with_reasoning_effort(Some("high".into()))
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1496,6 +1632,7 @@ mod tests {
             .unwrap()
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1515,6 +1652,7 @@ mod tests {
             duplicate
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1530,6 +1668,7 @@ mod tests {
             malformed
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1549,6 +1688,7 @@ mod tests {
             error
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![]
                     },
@@ -1567,6 +1707,7 @@ mod tests {
         assert!(matches!(
             slow.complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![]
                 },
@@ -1638,6 +1779,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn local_provider_boundaries_fail_closed_before_network_and_preserve_wire_roles() {
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![],
         };
@@ -1681,7 +1823,13 @@ mod tests {
             Err(ProviderError::Cancelled)
         ));
         assert!(matches!(
-            complete_inline_once(&provider, serde_json::json!({}), &cancelled_context).await,
+            complete_inline_once(
+                &provider,
+                serde_json::json!({}),
+                "session-ref",
+                &cancelled_context
+            )
+            .await,
             Err(ProviderError::Cancelled)
         ));
         assert!(matches!(
@@ -1699,7 +1847,13 @@ mod tests {
             Err(ProviderError::Timeout)
         ));
         assert!(matches!(
-            complete_inline_once(&provider, serde_json::json!({}), &expired_context).await,
+            complete_inline_once(
+                &provider,
+                serde_json::json!({}),
+                "session-ref",
+                &expired_context
+            )
+            .await,
             Err(ProviderError::Timeout)
         ));
         assert!(matches!(
@@ -1740,6 +1894,40 @@ mod tests {
                 role
             );
         }
+
+        // A plain assistant answer must not carry `tool_calls: []`. Providers
+        // that reject an empty array would fail every follow-up turn of a
+        // Session whose history contains one — absence and emptiness are not
+        // interchangeable here.
+        let plain = serde_json::to_value(
+            wire_message(&Message::Assistant {
+                content: Some("just an answer".into()),
+                tool_calls: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            plain.get("tool_calls").is_none(),
+            "an assistant turn with no calls must omit the key: {plain}"
+        );
+        let calling = serde_json::to_value(
+            wire_message(&Message::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            calling["tool_calls"].as_array().map(Vec::len),
+            Some(1),
+            "a real call is still serialized: {calling}"
+        );
 
         let missing: Wire = serde_json::from_value(serde_json::json!({"choices":[]})).unwrap();
         assert!(matches!(
@@ -1876,6 +2064,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1904,6 +2093,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1956,6 +2146,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -1977,6 +2168,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2003,6 +2195,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2024,6 +2217,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2043,6 +2237,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2090,6 +2285,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2113,6 +2309,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2133,6 +2330,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2155,6 +2353,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2178,6 +2377,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2203,6 +2403,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2228,6 +2429,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2253,6 +2455,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2272,6 +2475,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2298,6 +2502,7 @@ mod tests {
         let response = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2326,6 +2531,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2351,6 +2557,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2376,6 +2583,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2408,6 +2616,7 @@ mod tests {
         let err = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![],
                     tools: vec![],
                 },
@@ -2418,6 +2627,198 @@ mod tests {
         assert!(
             matches!(err, ProviderError::Malformed(ref m) if m.contains("arguments exceed limit")),
             "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_headers_reach_the_wire_with_the_session_reference_expanded() {
+        let (endpoint, heads) = header_capturing_server(vec![(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        )]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_headers(BTreeMap::from([
+                ("x-session-id".into(), "${session_id}".into()),
+                ("x-tenant".into(), "acme".into()),
+            ]));
+        provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "abc123".into(),
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let head = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            head.contains(&"x-session-id: abc123".to_owned()),
+            "{head:?}"
+        );
+        assert!(head.contains(&"x-tenant: acme".to_owned()), "{head:?}");
+    }
+
+    #[tokio::test]
+    async fn configured_headers_cannot_replace_the_credential_or_the_wire_format() {
+        let (endpoint, heads) = header_capturing_server(vec![(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        )]);
+        // Construction is the last line of defence: config validation already
+        // rejects these, but a Provider built in code must not be able to send
+        // a credential the resolver did not produce.
+        let provider = OpenAiProvider::new(endpoint, "m", "real-key", Duration::from_secs(1))
+            .unwrap()
+            .with_headers(BTreeMap::from([
+                ("Authorization".into(), "Bearer stolen".into()),
+                ("Content-Type".into(), "text/plain".into()),
+            ]));
+        provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "abc123".into(),
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let head = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            head.contains(&"authorization: bearer real-key".to_owned()),
+            "{head:?}"
+        );
+        assert!(
+            head.contains(&"content-type: application/json".to_owned()),
+            "{head:?}"
+        );
+        assert!(!head.iter().any(|line| line.contains("stolen")), "{head:?}");
+    }
+
+    #[tokio::test]
+    async fn the_inline_fallback_carries_the_same_headers_as_the_stream_attempt() {
+        // The fallback builds a second request from scratch. A Provider that
+        // rejects the stream *because* of a missing header would otherwise be
+        // retried without it and fail again for the same reason.
+        let (endpoint, heads) = header_capturing_server(vec![
+            ("400 Bad Request", ""),
+            (
+                "200 OK",
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+        ]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_streaming(true)
+            .with_headers(BTreeMap::from([(
+                "x-session-id".into(),
+                "${session_id}".into(),
+            )]));
+        provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "abc123".into(),
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let streamed = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fallback = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            streamed.contains(&"x-session-id: abc123".to_owned()),
+            "{streamed:?}"
+        );
+        assert!(
+            fallback.contains(&"x-session-id: abc123".to_owned()),
+            "{fallback:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_configured_headers_sends_none() {
+        let (endpoint, heads) = header_capturing_server(vec![(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        )]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1)).unwrap();
+        provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "abc123".into(),
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let head = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !head.iter().any(|line| line.contains("abc123")),
+            "an unconfigured provider must not leak the session reference: {head:?}"
+        );
+    }
+
+    #[test]
+    fn the_session_reference_is_stable_per_session_and_hides_the_thread_id() {
+        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let other = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let reference = session_ref_for(thread_id);
+        assert_eq!(
+            reference,
+            session_ref_for(thread_id),
+            "every turn of one session must present the same reference"
+        );
+        assert_ne!(reference, session_ref_for(other));
+        assert_eq!(reference.len(), 32);
+        assert!(reference.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            !reference.contains(&thread_id.to_string()),
+            "the internal identifier must not survive into the header"
+        );
+        // A hyphen-free hex string also survives every Provider's header parser.
+        assert!(reqwest::header::HeaderValue::try_from(reference).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_header_value_that_cannot_be_sent_is_skipped_rather_than_failing_the_turn() {
+        let (endpoint, heads) = header_capturing_server(vec![(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+        )]);
+        let provider = OpenAiProvider::new(endpoint, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .with_headers(BTreeMap::from([
+                // Validation rejects this at load time; a value assembled in
+                // code could still reach here, and losing the conversation
+                // would be worse than sending the request without the header.
+                ("x-broken".into(), "line\nbreak".into()),
+                ("x-fine".into(), "kept".into()),
+            ]));
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "abc123".into(),
+                    messages: vec![],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.message.as_deref(), Some("ok"));
+        let head = heads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(head.contains(&"x-fine: kept".to_owned()), "{head:?}");
+        assert!(
+            !head.iter().any(|line| line.starts_with("x-broken")),
+            "{head:?}"
         );
     }
 }

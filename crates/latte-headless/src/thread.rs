@@ -37,6 +37,22 @@ use uuid::Uuid;
 const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
 const THREAD_MAILBOX_CAPACITY: usize = 8;
 
+/// Whether some assistant message in this segment declared `tool_call_id`.
+///
+/// The Chat Completions grammar admits a `tool` message only as the answer to
+/// a call the assistant made. Effects the engine starts on its own — the
+/// configured verification run — are durable tool results too, but carry an id
+/// we minted rather than one the model emitted, so they are transcript content
+/// and not provider history.
+fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
+    segment.iter().any(|message| match message {
+        Message::Assistant { tool_calls, .. } => {
+            tool_calls.iter().any(|call| call.id == tool_call_id)
+        }
+        _ => false,
+    })
+}
+
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
     let calls = segment
         .iter()
@@ -1033,13 +1049,9 @@ impl ThreadRuntimeService {
     ) -> Result<Vec<Message>, ThreadRuntimeError> {
         let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
             .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
-        let system = format!(
-            "You are Latte Code. Work only in the supplied repository context.{}",
-            context.text
-        );
         self.enforce_budget(vec![
             Message::System {
-                content: redact_thread_text(&system),
+                content: redact_thread_text(&system_prompt(&context.text)),
             },
             Message::User {
                 content: redact_thread_text(prompt),
@@ -1056,10 +1068,7 @@ impl ThreadRuntimeService {
         let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
             .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
         let system = Message::System {
-            content: redact_thread_text(&format!(
-                "You are Latte Code. Work only in the supplied repository context.{}",
-                context.text
-            )),
+            content: redact_thread_text(&system_prompt(&context.text)),
         };
         let mut segments: Vec<Vec<Message>> = Vec::new();
         for entry in &snapshot.transcript.entries {
@@ -1092,6 +1101,14 @@ impl ThreadRuntimeService {
                                 .get("provider_content")
                                 .and_then(serde_json::Value::as_str),
                         )
+                        // A `tool` message is only legal as the answer to a
+                        // call the assistant actually made. Engine-initiated
+                        // effects — verification above all — are recorded as
+                        // tool results with an id we minted, which the model
+                        // never declared; replaying one makes every later turn
+                        // of the Session a protocol violation the Provider
+                        // rejects outright.
+                        && declared_tool_call(segment, tool_call_id)
                     {
                         segment.push(Message::Tool {
                             tool_call_id: tool_call_id.into(),
@@ -1625,6 +1642,10 @@ impl ThreadRuntimeService {
                     // capability: every returned call still crosses the
                     // engine-owned prepare/start/observe lifecycle below.
                     tools: self.engine.tool_descriptors(),
+                    // Derived, not the Session id itself: stable for every turn
+                    // of this Session so a Provider can group them, opaque
+                    // enough that it learns no internal identifier.
+                    session_ref: crate::provider::session_ref_for(thread_id),
                 },
                 ProviderContext {
                     deadline: Instant::now() + Duration::from_mins(1),
@@ -1730,6 +1751,10 @@ impl ThreadRuntimeService {
                     .await
             }
             Ok(response) => {
+                let truncated = matches!(
+                    response.finish_reason,
+                    Some(crate::provider::FinishReason::Length)
+                );
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
                     return self.fail(
@@ -1750,10 +1775,26 @@ impl ThreadRuntimeService {
                         source_key: format!("{run_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
-                        payload: None,
+                        payload: truncated.then(|| serde_json::json!({"truncated":"length"})),
                     },
                     &lease,
                 )?;
+                // A `length` finish means the model stopped at its output cap
+                // mid-answer. Persist what arrived, then fail retryably: the
+                // partial text is not a completed turn, and treating it as one
+                // would record an unfinished answer as success. Retryable keeps
+                // the session usable so a follow-up can continue the work.
+                if truncated {
+                    return self.fail_retryable(
+                        thread_id,
+                        run_id,
+                        appended.revision,
+                        run_revision,
+                        "provider stopped at its output limit before completing the response"
+                            .into(),
+                        &lease,
+                    );
+                }
                 let changed = self.engine.thread_run_changed_files(run_id)?;
                 if !changed.is_empty() {
                     if self.verification.is_none() {
@@ -2048,6 +2089,41 @@ impl ProviderEventSink for ProviderProgress {
     }
 }
 
+/// Builds the system message for one provider request.
+///
+/// The tool schemas state each argument's shape, and `tool_description` states
+/// each tool's own contract. Neither can express how the tools compose, so the
+/// read-before-mutate rule and the completion bar live here. Without the first
+/// rule a model omits `precondition` and every mutation is rejected as stale.
+fn system_prompt(repository_context: &str) -> String {
+    format!(
+        "You are Latte Code, a coding agent making scoped changes to the repository \
+         described below. Work only within it: paths outside the workspace are rejected, \
+         and you cannot reach the network.\n\
+         \n\
+         Read before you write. To change an existing file, first call `read_file` on it \
+         and pass the `sha256` it returns as `precondition` to `edit_file` or \
+         `write_file`. A mutation without the digest of the version you actually read is \
+         rejected, and this holds again for every later edit to the same file: re-read to \
+         get the new digest. Prefer `edit_file`, whose `before` must match the file \
+         verbatim and occur exactly once; reach for `write_file` only to create a file or \
+         to rewrite one whole.\n\
+         \n\
+         Understand before you change. Locate the relevant code with `search` and \
+         `list_directory`, and read enough of it that your edit follows what is already \
+         there. `read_project_manifest` shows the language and dependencies. Do not \
+         invent APIs, dependencies, or file paths you have not observed.\n\
+         \n\
+         Finish what you start. After editing, check your own work with `git_diff`. When \
+         a verification command is configured it must pass before the task is complete; a \
+         failing, missing, or unrun verification means the work is unfinished. Report \
+         plainly what you changed and what you verified. If a tool call is rejected, read \
+         the error and correct the call rather than repeating it unchanged. If the task \
+         is ambiguous or you lack the means to finish it, say so instead of guessing.\n\
+         {repository_context}"
+    )
+}
+
 fn wire_bytes(messages: &[Message]) -> Result<usize, ThreadRuntimeError> {
     serde_json::to_vec(messages)
         .map(|bytes| bytes.len())
@@ -2194,6 +2270,46 @@ mod tests {
     use super::*;
     use crate::provider::{FakeProvider, InputRequest, ProviderResponse};
     use latte_engine::EngineBuilder;
+
+    /// The read-before-mutate rule spans two tools, so no single tool
+    /// description can carry it. Losing it here makes a real model omit
+    /// `precondition` and every mutation is rejected as stale.
+    #[test]
+    fn system_prompt_states_the_read_before_mutate_rule() {
+        let prompt = system_prompt("");
+        for needle in [
+            "read_file",
+            "sha256",
+            "precondition",
+            "edit_file",
+            "write_file",
+        ] {
+            assert!(prompt.contains(needle), "system prompt lost `{needle}`");
+        }
+        assert!(
+            prompt.contains("re-read"),
+            "a second edit to the same file needs the fresh digest"
+        );
+    }
+
+    /// Verification is a completion bar, not a suggestion; the engine rejects
+    /// completion without it, so the model must know before it claims success.
+    #[test]
+    fn system_prompt_states_the_completion_bar() {
+        let prompt = system_prompt("");
+        assert!(prompt.contains("verification"));
+        assert!(prompt.contains("unfinished"));
+    }
+
+    /// Repository context is appended verbatim: the caller already bounded and
+    /// redacted it, and a prompt that dropped it would strand the model.
+    #[test]
+    fn system_prompt_appends_repository_context_verbatim() {
+        let context = "\n--- AGENTS.md ---\nproject specific rules\n";
+        let prompt = system_prompt(context);
+        assert!(prompt.ends_with(context));
+        assert!(system_prompt("").len() < prompt.len());
+    }
 
     struct DelayedProvider {
         responses: Mutex<std::collections::VecDeque<(Duration, ProviderResponse)>>,
@@ -2702,6 +2818,95 @@ mod tests {
             })
         });
         ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
+    }
+
+    /// A `length` finish is a mid-answer stop at the model's output cap. The
+    /// partial text must survive for the user to read, but the turn must not
+    /// be recorded as completed, or an unfinished answer counts as success.
+    #[tokio::test]
+    async fn length_finish_persists_the_partial_answer_and_fails_retryably() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut cut = response(Some("half of an ans"), vec![]);
+        cut.finish_reason = Some(crate::provider::FinishReason::Length);
+        let service = scripted_service(root.path(), engine, vec![cut]);
+        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let snapshot = service
+            .start(thread_id, "write something long".into(), binding(), None)
+            .await
+            .unwrap();
+
+        // Retryable, not terminal: the session still accepts a follow-up that
+        // continues the work.
+        assert_eq!(snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert!(snapshot.lifecycle.accepts_follow_up());
+        let latest = snapshot.runs.last().expect("one run");
+        assert_eq!(latest.status, latte_core::ThreadRunStatus::Failed);
+
+        let assistant = snapshot
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.kind == TranscriptKind::Assistant)
+            .expect("the partial answer is persisted");
+        assert_eq!(assistant.text, "half of an ans");
+        assert_eq!(
+            assistant.payload.as_ref().and_then(|p| p.get("truncated")),
+            Some(&serde_json::json!("length")),
+            "the card must say why it stopped"
+        );
+        assert!(
+            snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::Failure
+                    && entry.text.contains("output limit")),
+            "the user must see the reason, not a silently short answer"
+        );
+    }
+
+    /// Every other finish reason completes normally; only `length` is a stop.
+    #[tokio::test]
+    async fn non_length_finish_reasons_complete_the_turn() {
+        for reason in [
+            None,
+            Some(crate::provider::FinishReason::Stop),
+            Some(crate::provider::FinishReason::Other("eos".into())),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let engine = EngineBuilder::new()
+                .workspace_root(root.path())
+                .build()
+                .unwrap();
+            let mut done = response(Some("a complete answer"), vec![]);
+            done.finish_reason = reason.clone();
+            let service = scripted_service(root.path(), engine, vec![done]);
+            let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+            let snapshot = service
+                .start(thread_id, "ask".into(), binding(), None)
+                .await
+                .unwrap();
+            let latest = snapshot.runs.last().expect("one run");
+            assert_eq!(
+                latest.status,
+                latte_core::ThreadRunStatus::Completed,
+                "finish_reason {reason:?} must not block completion"
+            );
+            let assistant = snapshot
+                .transcript
+                .entries
+                .iter()
+                .find(|entry| entry.kind == TranscriptKind::Assistant)
+                .expect("assistant card");
+            assert!(
+                assistant.payload.is_none(),
+                "an untruncated answer carries no truncation marker"
+            );
+        }
     }
 
     fn delayed_service(
@@ -4126,8 +4331,8 @@ mod tests {
                 .unwrap(),
             root.path(),
             ThreadHistoryPolicy {
-                max_request_bytes: 512,
-                max_input_bytes: 512,
+                max_request_bytes: 4096,
+                max_input_bytes: 4096,
                 reserved_output_bytes: 1,
                 context_cap_bytes: 1,
             },
@@ -5424,6 +5629,35 @@ mod tests {
     }
 
     #[test]
+    fn declared_tool_call_admits_only_ids_the_assistant_emitted() {
+        use crate::provider::{Message, ToolCall};
+        let segment = vec![
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                }],
+            },
+            Message::Tool {
+                tool_call_id: "call-1".into(),
+                name: Some("read_file".into()),
+                content: "contents".into(),
+            },
+        ];
+        assert!(declared_tool_call(&segment, "call-1"));
+        // The verification run is a durable tool result whose id the engine
+        // minted. Replaying it would put a `tool` message in front of no
+        // matching call, which the Provider rejects for the whole Session.
+        assert!(!declared_tool_call(
+            &segment,
+            "verification-01a0800c-42f4-7b82-ae01-bf81b981852c"
+        ));
+        assert!(!declared_tool_call(&[], "call-1"));
+    }
+
+    #[test]
     fn append_denied_tool_results_handles_empty_segment() {
         let mut segment: Vec<Message> = vec![];
         append_denied_tool_results(&mut segment);
@@ -6116,9 +6350,11 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
+        // The budget must clear the system prompt and still reject the
+        // oversized input value below; it is not a minimum-size probe.
         let policy = ThreadHistoryPolicy {
-            max_request_bytes: 256,
-            max_input_bytes: 256,
+            max_request_bytes: 4096,
+            max_input_bytes: 4096,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
         };
