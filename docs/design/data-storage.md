@@ -426,10 +426,10 @@ Fingerprint，拒绝外部 Workspace Row 与 ID 冲突，保持源文件不变�
 恢复控制状态并把导入对话生成为 JSONL。TUI Discovery 与 Search 仅限当前
 Workspace；从孤立 JSONL 重建 Catalog 尚未实现。
 
-UT 覆盖全局 Home 解析、迁移至 Schema 11、Worktree-Aware Catalog Identity、
+UT 覆盖全局 Home 解析、迁移至当前 Schema（12）、Worktree-Aware Catalog Identity、
 Scoped Authority、JSONL 尾行修复与读取权威、幂等 Legacy Import，以及持久、可重试
 的 Provider Failure。最终二进制 E2E 覆盖全局 State/JSONL 创建、旧库源文件不变的
-导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Turn。
+导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Run。
 
 ## 16. 交付阶段
 

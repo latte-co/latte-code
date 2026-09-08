@@ -13,7 +13,8 @@ Latte Code 区分 durable domain event 与 transient progress。前者由 engine
 
 durable event 至少含 `event_id`、`thread_id`、sequence、关联 Run、时间、typed redacted payload 与 source key。Run/Effect/Permission/Transcript 更新、revision 递增和 event append 必须原子提交；重复 source key 只产生一次状态变化和一次可见 event。
 
-transient progress 可携带 Provider delta、`InputQueued`、waiting state 与 local reconnect hint，但不得有 raw credential、private descriptor 或未完成 assistant content。event buffer 有界；slow consumer、reconnect 或 sequence gap 时 adapter 丢弃 transient state 并重读权威 snapshot/page。
+transient progress 可携带 Provider delta、`InputQueued`（提案，见
+[asynchronous-turn-runner.md](asynchronous-turn-runner.md)）、waiting state 与 local reconnect hint，但不得有 raw credential、private descriptor 或未完成 assistant content。event buffer 有界；slow consumer、reconnect 或 sequence gap 时 adapter 丢弃 transient state 并重读权威 snapshot/page。
 
 ## 3. 回放与审计
 

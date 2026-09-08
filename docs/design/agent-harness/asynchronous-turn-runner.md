@@ -21,13 +21,17 @@ round 和 JSONL 顺序始终串行。这演进 v2 `ThreadRuntimeService` 的进�
 
 ## 2. 责任与输入
 
-`latte-headless` 拥有 `TurnSupervisor`：构造 Provider history、驱动 stream、协调
+`latte-headless` 拥有 `ThreadRuntimeService`：构造 Provider history、驱动 stream、协调
 tool continuation 并消费 mailbox。它没有直接 filesystem、process、SQLite 写入或
 approval 消费能力；这些继续经 `latte-engine` 的受限句柄完成。`latte-engine` 仍是
 lease、Run revision、Effect、Permission 与 durable projection 的权威；`latte-tui`
 只维护 composer/queued 展示并提交 typed command。
 
+下面两个 enum 是提案形状，`crates/` 中尚无对应类型；已实现的用户 Prompt Mailbox
+只搬运纯文本，控制路径由 `ThreadRuntimeService` 的既有方法承担。
+
 ```rust
+// 提案，未实现。
 enum RuntimeInput {
     UserPrompt { input_id: InputId, text: String },
     TrustedReminder {
@@ -39,6 +43,7 @@ enum RuntimeInput {
     },
 }
 
+// 提案，未实现。
 enum ControlInput {
     Cancel,
     PermissionDecision { request_id: RequestId, decision: Decision },
@@ -69,7 +74,9 @@ prompt 不会改变 descriptor、approval、revision 或执行顺序，而会保
 ## 4. 生命周期、容量与恢复
 
 mailbox、partial delta、stream handle、timer 与 cancellation token 都是进程内状态。
-接受 entry 时 TUI 可显示 `InputQueued` progress，但不写 JSONL、SQLite 或 telemetry。
+接受 entry 时 TUI 可显示 `InputQueued` progress（提案；`ThreadTransientProgress`
+当前只有 `ProviderAttempt`、`AssistantDelta`、`ToolProgress` 三个变体），但不写
+JSONL、SQLite 或 telemetry。
 Runner 在安全注入点消费 Entry 时，会先按会话存储的物化点追加精确输入并创建
 Child Run/Control State，再构造或调用 Provider，完整 Outcome 随后追加。Provider
 启动失败会向这个已接受的 Conversation Record 追加有界、已脱敏的 Failure；满队列、
@@ -81,9 +88,9 @@ Child Run/Control State，再构造或调用 Provider，完整 Outcome 随后追
 `Started` effect 交由 engine 记录 `Unknown` 并 reconciliation。未物化 mailbox 在
 进程崩溃时可丢失，这是不持久化 Provider attempt/Draft 的有意取舍。
 
-`ThreadSnapshot` 保持 durable lifecycle 权威。`ThreadTransientProgress` 可显示
-`queued`、`consumed`、`expired`，但事件缺口或重连后 TUI 必须丢弃这些瞬态条目并重新
-读取 snapshot。
+`ThreadSnapshot` 保持 durable lifecycle 权威。`ThreadTransientProgress` 未来可显示
+`queued`、`consumed`、`expired`（提案；当前三个变体均不表达 mailbox 状态），但事件
+缺口或重连后 TUI 必须丢弃这些瞬态条目并重新读取 snapshot。
 
 ## 5. 验收
 

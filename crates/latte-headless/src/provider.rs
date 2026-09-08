@@ -75,7 +75,6 @@ pub struct ProviderResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<Value>,
 }
-pub type ProviderOutcome = ProviderResponse;
 
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
@@ -185,7 +184,7 @@ pub enum ProviderError {
 }
 
 pub type ProviderFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ProviderOutcome, ProviderError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>;
 pub trait Provider: Send + Sync + 'static {
     fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_>;
     fn capabilities(&self) -> ProviderCapabilities {

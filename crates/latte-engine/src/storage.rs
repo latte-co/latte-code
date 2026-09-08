@@ -278,6 +278,9 @@ pub enum ThreadLeaseLossRecovery {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectStatus {
+    /// Written only by `declare_effect`, which is `#[cfg(test)]`: the production
+    /// paths insert `prepared` or `started` directly. Kept so the parser accepts
+    /// rows an older binary may have left behind, not as a live lifecycle stage.
     Declared,
     Prepared,
     Started,

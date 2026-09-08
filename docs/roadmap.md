@@ -77,7 +77,8 @@ Windows 已支持任意外部进程执行。
 - [x] 工作区发现、路径约束、工作区内工具执行与 Git/文件 manifest 读取。
 - [x] 用户级全局 SQLite 中的 v1 Run 状态与 Thread v2 控制状态；Session Transcript
   Content 只以每 Session JSONL 为权威。
-- [x] v1 `run`、`resume`、`show`、`list` CLI 兼容路径；既有 v1 Run 不被回填成 Thread。
+- [x] `run`、`resume`、`show`、`list` 已切到 v2 Session 契约；v1 run-id CLI 契约移除，
+  `--allow`/`--deny` 是硬错误。既有 v1 Run 状态保留在库中，不被回填成 Thread。
 - [x] Thread v2 的不可变 follow-up child、分页投影和有界 history 预算校验。
 - [x] 用户级全局 `LATTE_CODE_HOME`、可识别 Git Worktree 的稳定
   Project/Workspace Identity、全局 Catalog 注册与 Session 分区 Lease。

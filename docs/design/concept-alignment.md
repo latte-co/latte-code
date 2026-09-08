@@ -168,7 +168,9 @@ roadmap:80 是过期条目。
 
 ## 5. 分批方案
 
-### 批次 0：文档与死代码（无行为变更，可立即做）
+### 批次 0：文档与死代码（无行为变更）
+
+状态：**已完成**，除 v1 `sessions` 死表外全部落地。
 
 不触碰任何类型名与协议字段，只消除虚假信息。
 
@@ -176,10 +178,10 @@ roadmap:80 是过期条目。
 | --- | --- | --- |
 | `TurnSupervisor` 虚构类型 | 改为 `ThreadRuntimeService`，并区分「已实现」与「提案」词汇 | `asynchronous-turn-runner.md:24`，全库零 Rust 定义 |
 | 同文档其余虚构类型 | `RuntimeInput` / `ControlInput` / `TrustedReminder` / `ReminderSource` / `InputId` 标注为提案 | 同上，全部零命中 |
-| `InputQueued` progress | 标注未实现；实际只有 3 个变体 | `asynchronous-turn-runner.md:72, 84` vs `thread.rs:395-409` |
-| `data-storage.md` 自相矛盾 | 术语表 `:38` 定义 Run，`:432` 却写 Turn，统一 | 同文件 |
+| `InputQueued` progress | 标注未实现；实际只有 3 个变体 | `asynchronous-turn-runner.md:72, 84` + `event-projection-and-replay.md:16` vs `thread.rs:395-409` |
+| `data-storage.md` 自相矛盾 | 术语表 `:38` 定义 Run，`:432` 却写 Turn，统一到 Run（批次 2 再整体改名）；顺带修正过期的 Schema 11 断言 | 同文件；`SCHEMA_VERSION = 12` |
 | roadmap:80 过期条目 | 与 README:50 对齐 | 见 4.3 |
-| v1 `sessions` 死表 | drop（迁移），为批次 1 腾出名字 | `storage.rs:369` |
+| ~~v1 `sessions` 死表~~ | **推迟到批次 1**：drop 需要 schema 迁移，而批次 1 本就要写一个 | `storage.rs:369`、`:847` |
 | `EffectStatus::Declared` | 标注为测试专用状态，生产路径从 `Prepared` 起步 | `storage.rs:3752-3753` 带 `#[cfg(test)]` |
 | `ProviderOutcome` 冗余别名 | 移除 `type ProviderOutcome = ProviderResponse;` | `provider.rs:78` |
 
@@ -209,13 +211,17 @@ roadmap:80 是过期条目。
 - 请求体 `thread_id` → `session_id`（与响应体统一）
 - SSE 事件名 `thread_changed` → `session_changed`
 - CLI `--json` 内层 `thread_id` → `session_id`
-- SQL 表 `threads_v2` → `sessions_v2`，`conversation_outbox` 更名需单独评估
-  （它同时是 transcript 存储与 JSONL 出箱，见 6.2）
+- 先 drop 掉 v1 死表 `sessions`（`storage.rs:369` 建表、`:847` 在 legacy import
+  表清单里；全库无 INSERT/SELECT/UPDATE，无外键引用），腾出这个名字，
+  再把 `threads_v2` → `sessions`。批次 0 已确认它是死表但推迟了 drop：
+  两件事共用同一次 schema 迁移（当前 `SCHEMA_VERSION = 12`）。
+- `conversation_outbox` 更名需单独评估（它同时是 transcript 存储与 JSONL 出箱，
+  见 6.2）
 
-**协议决策点**：v1 端点承诺过稳定性
-（`versioned-rpc-contract.md` §2.1）。字段改名属 breaking change，按该文档
-§2.2 应走 v2。但当前处于早期阶段，#16 已有先例（list 分页、422→400）在 v1 内
-直接 breaking。需明确选择。
+**协议决策点（已定）**：v1 端点承诺过稳定性
+（`versioned-rpc-contract.md` §2.1），字段改名属 breaking change，按该文档
+§2.2 本应走 v2。但当前处于早期阶段，#16 已有先例（list 分页、422→400）在 v1 内
+直接 breaking。**决定：v1 内直接破坏性改名，不加兼容层。**
 
 ### 批次 2：Turn 改名（与 v1 退役绑定）
 
