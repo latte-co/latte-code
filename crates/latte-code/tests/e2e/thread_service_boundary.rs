@@ -186,6 +186,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
             max_input_bytes: 2,
             reserved_output_bytes: 1,
             context_cap_bytes: 1,
+            ..ThreadHistoryPolicy::default()
         },
         factory([completion("unreachable")]),
     );

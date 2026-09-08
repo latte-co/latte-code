@@ -72,6 +72,7 @@ providers: {
 - Effect state is persisted before execution. Ambiguous interruption becomes `Unknown` and requires explicit reconciliation; it is never silently retried.
 - File writes use handle-relative replacement on supported platforms and fail before starting on unsupported platforms.
 - Process execution is argv-first, drains bounded output, and terminates Unix process groups on timeout or cancellation. Process supervision fails closed on non-Unix targets; CI still runs Windows check, Clippy, UT, Contract, portable final-binary E2E, and release build gates without claiming Windows process execution support.
+- A turn takes at most `thread.max_tool_rounds` tool rounds (default 48) and allows each provider request `thread.provider_timeout_ms` (default 60000). The agent loop is a recursion the model drives, so the round budget is what stops a model that keeps calling tools without converging. Exhausting it ends the turn as a retryable failure naming the limit: the work so far stays durable and the Session remains usable. The budget spans the whole turn, so a permission approval resumes the count rather than refilling it.
 - TUI Enter sends a nonblank composer or pending-input value, while Shift+Enter inserts a newline. Permission and reconciliation prompts consume both keys without approving or acknowledging anything; those protected actions require their explicit chords.
 
 ## Configuration library

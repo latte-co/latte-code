@@ -60,6 +60,8 @@ pub struct ThreadConfig {
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
     pub context_cap_bytes: usize,
+    pub max_tool_rounds: u32,
+    pub provider_timeout_ms: u64,
 }
 impl Default for ThreadConfig {
     fn default() -> Self {
@@ -69,6 +71,8 @@ impl Default for ThreadConfig {
             max_input_bytes: defaults.max_input_bytes,
             reserved_output_bytes: defaults.reserved_output_bytes,
             context_cap_bytes: defaults.context_cap_bytes,
+            max_tool_rounds: defaults.max_tool_rounds,
+            provider_timeout_ms: defaults.provider_timeout_ms,
         }
     }
 }
@@ -137,6 +141,8 @@ impl AppConfig {
             max_input_bytes: config.thread.max_input_bytes,
             reserved_output_bytes: config.thread.reserved_output_bytes,
             context_cap_bytes: config.thread.context_cap_bytes,
+            max_tool_rounds: config.thread.max_tool_rounds,
+            provider_timeout_ms: config.thread.provider_timeout_ms,
         }
         .validate()
         .map_err(|error| format!("invalid thread configuration: {error}"))?;
@@ -169,6 +175,8 @@ impl AppConfig {
             max_input_bytes: self.thread.max_input_bytes,
             reserved_output_bytes: self.thread.reserved_output_bytes,
             context_cap_bytes: self.thread.context_cap_bytes,
+            max_tool_rounds: self.thread.max_tool_rounds,
+            provider_timeout_ms: self.thread.provider_timeout_ms,
         }
     }
 }

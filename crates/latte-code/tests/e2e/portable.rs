@@ -758,6 +758,187 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
     );
 }
 
+/// The agent loop is a recursion the model controls: it decides whether to
+/// call another tool. Without a bound, a model that never converges is only
+/// stopped once its history overflows the byte budget — after an unbounded
+/// amount of wall time and spend. The turn must end on the configured round
+/// budget instead, and end retryably so the Session survives.
+#[test]
+fn final_binary_stops_a_turn_that_never_stops_calling_tools() {
+    let scenario = Scenario::new();
+    // More replies than the budget allows: if the limit did not hold, the run
+    // would keep consuming them.
+    // Distinct call ids per round: reusing one would collide on the engine's
+    // effect id and interrupt the run before the budget is reached.
+    let ids: Vec<String> = (0..8).map(|i| format!("loop-call-{i}")).collect();
+    let provider = ScriptedProvider::start(ids.iter().map(|id| {
+        ProviderReply::tool_call(id, "list_directory", &serde_json::json!({"path": "."}))
+    }));
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+        ".latte/latte-code.db",
+        "",
+    );
+    // Narrow the budget so the test is fast; the mechanism is the same at the
+    // default of 48.
+    let config = scenario.root().join(".latte/latte-code.jsonc");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace("verification:", "thread:{max_tool_rounds:3},verification:"),
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "run", "go in circles"], |command| {
+        command.env("TEST_OPENAI_KEY", "portable-round-secret");
+    });
+    assert!(
+        !output.status.success(),
+        "a turn stopped by the round budget is not a success: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let body = json(&output);
+    assert_eq!(body["data"]["session"]["runs"][0]["status"], "failed");
+    // Retryable: the Session stays usable and a follow-up can continue.
+    assert_eq!(body["data"]["session"]["lifecycle"], "ready");
+
+    let failure = body["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "failure")
+        .filter_map(|entry| entry["text"].as_str())
+        .next_back()
+        .expect("the stopped turn reports why");
+    assert!(
+        failure.contains("tool rounds") && failure.contains("max_tool_rounds"),
+        "the failure must name the limit and how to raise it: {failure}"
+    );
+
+    // The budget bounds provider calls: 3 rounds, not all 8 scripted replies.
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "the loop must stop at the configured round budget"
+    );
+}
+
+/// A permission approval re-enters the loop from a snapshot rather than from
+/// the in-memory counter. If the budget were recomputed from zero there, a
+/// model could take unlimited rounds simply by asking for one gated tool per
+/// round — each approval silently refilling the budget.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
+    let scenario = Scenario::new();
+    // Round 1 is gated (write_file asks); rounds 2+ are not. With a budget of
+    // 2, the run must stop after the second round even though the approval
+    // took it through the recovery path.
+    // Two ungated rounds first, then the gate. The approval therefore resumes
+    // at round 2 — a recovery that recomputed from zero would grant three more
+    // rounds instead of stopping.
+    let mut replies = vec![
+        ProviderReply::tool_call(
+            "plain-0",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        ProviderReply::tool_call(
+            "plain-1",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        ProviderReply::tool_call(
+            "gated-2",
+            "write_file",
+            &serde_json::json!({"path":"a.txt","content":"x\n","create_intent":true}),
+        ),
+    ];
+    for i in 3..9 {
+        replies.push(ProviderReply::tool_call(
+            &format!("plain-{i}"),
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ));
+    }
+    let provider = ScriptedProvider::start(replies);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},thread:{{max_tool_rounds:3}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(&workspace_id, "loop", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Approve every gate, then let the run settle.
+    let mut settled = None;
+    for _ in 0..400 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status != 200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        match body["snapshot"]["lifecycle"].as_str() {
+            Some("ready" | "failed") => {
+                settled = Some(body);
+                break;
+            }
+            Some("waiting_permission") => {
+                let pending = &body["snapshot"]["pending"];
+                server.request(
+                    "POST",
+                    &format!(
+                        "/v1/sessions/{session_id}/permissions/{}",
+                        pending["request_id"].as_str().unwrap()
+                    ),
+                    Some(&server.token),
+                    Some(&serde_json::json!({
+                        "allow": true,
+                        "expected_thread_revision": body["snapshot"]["revision"],
+                        "expected_run_revision": pending["expected_run_revision"],
+                    })),
+                    &[],
+                );
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let settled = settled.expect("session never settled");
+    assert_eq!(settled["snapshot"]["runs"][0]["status"], "failed");
+
+    // Two rounds total, spanning the approval — not two *after* it.
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "an approval must not refill the round budget"
+    );
+}
+
 /// A supervised `latte-code serve` child bound to an ephemeral port. Dropping
 /// it terminates the process group so no server survives the test.
 struct ServeChild {

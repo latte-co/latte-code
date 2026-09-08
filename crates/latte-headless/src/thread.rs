@@ -53,6 +53,24 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
+/// Tool rounds already present in a rebuilt history.
+///
+/// The round budget has to survive a restart or a permission approval, both of
+/// which re-enter the loop from a snapshot rather than from the in-memory
+/// counter. Counting the assistant messages that carry calls recovers the
+/// position; without it, every approval would silently reset the budget.
+fn tool_rounds_in(messages: &[Message]) -> u32 {
+    u32::try_from(
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
     let calls = segment
         .iter()
@@ -85,6 +103,16 @@ pub struct ThreadHistoryPolicy {
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
     pub context_cap_bytes: usize,
+    /// Tool rounds one turn may take before it is stopped.
+    ///
+    /// The agent loop is a recursion with no natural fixed point: the model
+    /// decides whether to call another tool. Without a bound, a model that
+    /// keeps calling tools without converging only stops once its history
+    /// overflows the byte budget — after an unbounded amount of wall time and
+    /// spend. This makes that limit explicit and reportable.
+    pub max_tool_rounds: u32,
+    /// Wall-clock budget for one provider request.
+    pub provider_timeout_ms: u64,
 }
 
 impl Default for ThreadHistoryPolicy {
@@ -94,6 +122,10 @@ impl Default for ThreadHistoryPolicy {
             max_input_bytes: 384 * 1024,
             reserved_output_bytes: 128 * 1024,
             context_cap_bytes: 64 * 1024,
+            // Generous enough for a real read-edit-verify task, small enough
+            // that a non-converging loop is caught in minutes, not hours.
+            max_tool_rounds: 48,
+            provider_timeout_ms: 60_000,
         }
     }
 }
@@ -107,6 +139,12 @@ impl ThreadHistoryPolicy {
             || self.context_cap_bytes == 0
         {
             return Err("max_request_bytes/context cap must be nonzero and reserved output must be smaller than input budget".into());
+        }
+        if self.max_tool_rounds == 0 {
+            return Err("max_tool_rounds must be at least 1".into());
+        }
+        if self.provider_timeout_ms == 0 {
+            return Err("provider_timeout_ms must be nonzero".into());
         }
         Ok(())
     }
@@ -925,6 +963,9 @@ impl ThreadRuntimeService {
             )
         })?;
         let messages = self.history_from_snapshot(&after_effect)?;
+        // Re-entering after an approval or a restart: recover how many rounds
+        // this turn already took so the budget is not reset by the detour.
+        let round = tool_rounds_in(&messages).saturating_sub(1);
         self.continue_provider_tool_round(
             after_effect,
             messages,
@@ -933,6 +974,7 @@ impl ThreadRuntimeService {
             round_sequence,
             provider.provider,
             lease,
+            round,
         )
         .await
     }
@@ -1341,6 +1383,7 @@ impl ThreadRuntimeService {
         response: crate::provider::ProviderResponse,
         provider: Arc<dyn Provider>,
         lease: ThreadLeaseGuard,
+        round: u32,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let thread_id = snapshot.thread_id;
         let run_id = snapshot
@@ -1403,6 +1446,7 @@ impl ThreadRuntimeService {
             round_sequence,
             provider,
             lease,
+            round,
         )
         .await
     }
@@ -1420,6 +1464,7 @@ impl ThreadRuntimeService {
         round_sequence: u64,
         provider: Arc<dyn Provider>,
         lease: ThreadLeaseGuard,
+        round: u32,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let run_id = current
             .active_run_id
@@ -1473,7 +1518,14 @@ impl ThreadRuntimeService {
                 content: result,
             });
         }
-        Box::pin(self.run_provider_turn(current, messages, provider, lease)).await
+        Box::pin(self.run_provider_round(
+            current,
+            messages,
+            provider,
+            lease,
+            round.saturating_add(1),
+        ))
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1611,13 +1663,29 @@ impl ThreadRuntimeService {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn run_provider_turn(
         &self,
         snapshot: ThreadSnapshot,
         messages: Vec<Message>,
         provider: Arc<dyn Provider>,
         lease: ThreadLeaseGuard,
+    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        self.run_provider_round(snapshot, messages, provider, lease, 0)
+            .await
+    }
+
+    /// One provider round of a turn. `round` counts the tool rounds already
+    /// taken, so the recursive continuation below is bounded: a model that
+    /// keeps calling tools without converging is stopped by policy rather
+    /// than by eventually overflowing the history budget.
+    #[allow(clippy::too_many_lines)]
+    async fn run_provider_round(
+        &self,
+        snapshot: ThreadSnapshot,
+        messages: Vec<Message>,
+        provider: Arc<dyn Provider>,
+        lease: ThreadLeaseGuard,
+        round: u32,
     ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
         let thread_id = snapshot.thread_id;
         let run_id = snapshot
@@ -1629,6 +1697,22 @@ impl ThreadRuntimeService {
             .find(|run| run.run_id == run_id)
             .ok_or(ThreadRuntimeError::InvalidState)?
             .run_revision;
+        if round >= self.policy.max_tool_rounds {
+            // Retryable: the work so far is durable and a follow-up turn can
+            // continue from it. The turn is stopped, not the Session.
+            return self.fail_retryable(
+                thread_id,
+                run_id,
+                snapshot.revision,
+                run_revision,
+                format!(
+                    "turn stopped after {} tool rounds without completing; \
+                     raise thread.max_tool_rounds or narrow the task",
+                    self.policy.max_tool_rounds
+                ),
+                &lease,
+            );
+        }
         let cancellation = CancellationToken::new();
         self.active
             .lock()
@@ -1648,7 +1732,8 @@ impl ThreadRuntimeService {
                     session_ref: crate::provider::session_ref_for(thread_id),
                 },
                 ProviderContext {
-                    deadline: Instant::now() + Duration::from_mins(1),
+                    deadline: Instant::now()
+                        + Duration::from_millis(self.policy.provider_timeout_ms),
                     cancellation: cancellation.clone(),
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
@@ -1747,8 +1832,10 @@ impl ThreadRuntimeService {
                 )
             }
             Ok(response) if !response.tool_calls.is_empty() => {
-                self.handle_provider_tool_round(snapshot, messages, response, provider, lease)
-                    .await
+                self.handle_provider_tool_round(
+                    snapshot, messages, response, provider, lease, round,
+                )
+                .await
             }
             Ok(response) => {
                 let truncated = matches!(
@@ -4236,6 +4323,7 @@ mod tests {
                 max_input_bytes: 10,
                 reserved_output_bytes: 10,
                 context_cap_bytes: 1,
+                ..ThreadHistoryPolicy::default()
             }
             .validate()
             .is_err()
@@ -4335,6 +4423,7 @@ mod tests {
                 max_input_bytes: 4096,
                 reserved_output_bytes: 1,
                 context_cap_bytes: 1,
+                ..ThreadHistoryPolicy::default()
             },
             Arc::new(|_| Err("not used".into())),
         );
@@ -5629,6 +5718,70 @@ mod tests {
     }
 
     #[test]
+    fn tool_rounds_in_counts_only_assistant_messages_that_called_something() {
+        use crate::provider::{Message, ToolCall};
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            input: serde_json::json!({}),
+        };
+        let history = vec![
+            Message::System {
+                content: "prompt".into(),
+            },
+            Message::User {
+                content: "do it".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![call("c1")],
+            },
+            Message::Tool {
+                tool_call_id: "c1".into(),
+                name: None,
+                content: "r".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![call("c2")],
+            },
+            Message::Tool {
+                tool_call_id: "c2".into(),
+                name: None,
+                content: "r".into(),
+            },
+            // A plain answer is not a tool round.
+            Message::Assistant {
+                content: Some("done".into()),
+                tool_calls: vec![],
+            },
+        ];
+        assert_eq!(tool_rounds_in(&history), 2);
+        assert_eq!(tool_rounds_in(&[]), 0);
+    }
+
+    #[test]
+    fn policy_rejects_a_zero_round_budget_and_a_zero_timeout() {
+        assert!(
+            ThreadHistoryPolicy {
+                max_tool_rounds: 0,
+                ..ThreadHistoryPolicy::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ThreadHistoryPolicy {
+                provider_timeout_ms: 0,
+                ..ThreadHistoryPolicy::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(ThreadHistoryPolicy::default().validate().is_ok());
+    }
+
+    #[test]
     fn declared_tool_call_admits_only_ids_the_assistant_emitted() {
         use crate::provider::{Message, ToolCall};
         let segment = vec![
@@ -6002,6 +6155,7 @@ mod tests {
             max_input_bytes: 100,
             reserved_output_bytes: 100,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
@@ -6035,6 +6189,7 @@ mod tests {
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
@@ -6080,6 +6235,7 @@ mod tests {
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
@@ -6149,6 +6305,7 @@ mod tests {
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
@@ -6186,6 +6343,7 @@ mod tests {
             max_input_bytes: 100,
             reserved_output_bytes: 100,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
         let factory: ThreadProviderFactory = Arc::new(move |_| {
@@ -6357,6 +6515,7 @@ mod tests {
             max_input_bytes: 4096,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
+            ..ThreadHistoryPolicy::default()
         };
         let (service, thread_id) = waiting_input_service(root.path(), engine, policy);
         let waiting = service
