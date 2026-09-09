@@ -305,7 +305,7 @@ fn final_tui_startup_configuration_and_storage_failures_return_stable_exit_codes
             providers:{main:{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",
                 api_key:{source:"env",name:"TEST_OPENAI_KEY"}}},
             database:{path:".latte/state.db"},
-            thread:{max_request_bytes:1,max_input_bytes:1,reserved_output_bytes:1,context_cap_bytes:0}
+            session:{max_request_bytes:1,max_input_bytes:1,reserved_output_bytes:1,context_cap_bytes:0}
         }"#,
     )
     .unwrap();

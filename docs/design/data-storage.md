@@ -33,8 +33,7 @@ fsync 到 JSONL 的已接受记录，同步成功后立即删除。当前 Worksp
 
 - **Project** 表示逻辑仓库身份，多个 Git Worktree 可以共享一个 Project。
 - **Workspace** 表示一个物理 Checkout 或非 Git 工作目录。
-- **Session** 表示一个用户可见的 Conversation。迁移期间它与现有
-  `ThreadId` 一一对应，不引入第二套身份。
+- **Session** 表示一个用户可见的 Conversation，由 `SessionId` 标识。
 - **Run** 表示一次用户提交及其 Provider/Tool Continuation Loop。
 - **Effect** 表示可能改变或观察外部状态、由 `latte-engine` 掌握权限的操作。
 - **Draft** 表示尚未通过本地校验并到达持久提交点、只存在于内存的新 Session 或
@@ -160,13 +159,13 @@ SQLite 继续作为以下数据的权威来源：
 
 ```text
 runtime_lease
-  scope（主键：runtime 或 thread:<session-id>）
+  scope（主键：runtime 或 session:<session-id>）
   owner
   fencing_token
   expires_at_ms
 ```
 
-Legacy Headless Run 共用 `runtime` Scope；不同 Thread v2 Session 使用不同 Scope，
+Legacy Headless Run 共用 `runtime` Scope；不同 v2 Session 使用不同 Scope，
 因此可以并发运行。一个 Session 最多只有一个有效 Engine Owner 和一个 JSONL
 Writer。Lease 过期后重新获取必须推进全局单调的 Fencing Token。旧 Owner 不能
 开始或观察 Effect，并且失去 Ownership 后必须关闭 Session Writer。
@@ -379,13 +378,13 @@ Session Row；迁移会在 Schema 事务内补齐 Workspace 与 Title。若外�
 调用方 Workspace。
 
 迁移 10 把 Singleton Runtime Lease 改为带 Scope 的 Lease Row。Legacy Headless
-Run 继续使用 `runtime` Scope；Thread v2 则为每个 Session 使用独立的
-`thread:<session-id>` Scope。每次获取都会使用独立的 Coordinator Owner，因此同一
+Run 继续使用 `runtime` Scope；v2 Session 则为各自 使用独立的
+`session:<session-id>` Scope。每次获取都会使用独立的 Coordinator Owner，因此同一
 Session 的第二个 Coordinator 会被拒绝，而不同 Session 仍可并发；Runtime 在一次
 操作返回时释放 Lease，持久化的 Input/Permission 等待会进入无 Writer 的安全静止，
 而不是被误判为 Orphan Run。Fencing Token 仍保持全局单调，因此 Session 并发不会
 削弱重启恢复语义。
-Thread Lease 被释放时如果 Child 仍 Active，表示 Coordinator 非正常退出：同一释放
+Session Lease 被释放时如果 Child 仍 Active，表示 Coordinator 非正常退出：同一释放
 事务会先中断 Child；如果已有 `Started` Effect，则把它们标记为 `Unknown` 并要求
 Reconciliation，然后才删除 Lease。因此 TUI 不需要等进程重启，就能离开无 Lease
 的虚假 `Running` Projection。
@@ -410,7 +409,7 @@ Snapshot 证明精确 Input Card 未提交，才恢复输入值。Terminal Sessi
 恢复该 Draft。
 
 Model Selection 是 Session Binding Transition，而不是 Editor Preference。只有
-不存在 Active Child 的 `Ready` Session 可以在精确 `thread:<session-id>` Lease
+不存在 Active Child 的 `Ready` Session 可以在精确 `session:<session-id>` Lease
 与 Expected Revision 下切换。该事务替换完整的非密钥 Provider Binding、追加一条
 有界 System Card，并发出 `BindingChanged`。TUI 在刷新的 Snapshot 包含所选
 Provider 与 Model 前阻止竞争的 Follow-up。这个 Transition 不解析 Provider

@@ -10,7 +10,7 @@ Session metadata 与需要事务/CAS 的运行 control state。二者都在用�
 home，而不在 workspace。workspace configuration 可以改变行为，但不能决定 history
 和数据库位置。
 
-这取代当前按 workspace `.latte/latte-code.db` 的实现方向。迁移期间 `ThreadId` 就是
+这取代当前按 workspace `.latte/latte-code.db` 的实现方向。迁移期间 `SessionId` 就是
 Session ID，不引入第二套 conversation identity。
 
 ## 2. 存储模型

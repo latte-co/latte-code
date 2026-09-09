@@ -150,17 +150,17 @@ impl ServerChild {
     }
 
     /// Creates a session through the crash-safe contract: a fresh client
-    /// `thread_id` + `command_id` in the body and a matching `Idempotency-Key`.
+    /// `session_id` + `command_id` in the body and a matching `Idempotency-Key`.
     pub(super) fn create_session(
         &self,
         workspace_id: &str,
         prompt: &str,
         binding: &serde_json::Value,
     ) -> String {
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let body = serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": prompt,
             "binding": binding,
@@ -183,7 +183,7 @@ impl ServerChild {
     }
 
     /// Polls until the session parks at `WaitingPermission`, returning the
-    /// (thread revision, request id, run revision) needed for the decision.
+    /// (session revision, request id, run revision) needed for the decision.
     pub(super) fn wait_for_permission(&self, session_id: &str) -> (u64, String, u64) {
         for _ in 0..200 {
             let snapshot = self.snapshot(session_id);
@@ -218,7 +218,7 @@ impl ServerChild {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(&serde_json::json!({
                 "allow": allow,
-                "expected_thread_revision": revision,
+                "expected_session_revision": revision,
                 "expected_run_revision": run_revision,
             })),
             &[],
@@ -280,7 +280,7 @@ pub(super) fn server_binding(scenario: &Scenario) -> serde_json::Value {
         .expect("engine builds for binding");
     let tools = engine.tool_descriptors();
     let binding = registry
-        .thread_binding_for_default(&tools)
+        .session_binding_for_default(&tools)
         .expect("default binding resolves");
     serde_json::to_value(binding).expect("binding serializes")
 }
@@ -382,7 +382,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|session| session["thread_id"] == session_id)
+            .any(|session| session["session_id"] == session_id)
     );
     assert!(!scenario.root().join("state/nested/custom.db").exists());
     assert!(scenario.database_path().exists());
@@ -421,7 +421,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     );
     // The denied run is terminal and its pending permission is consumed; the
     // session returns to `ready` for a follow-up but the failed child cannot
-    // be resumed (v2 thread-linked runs carry no runtime checkpoint).
+    // be resumed (v2 session-linked runs carry no runtime checkpoint).
     assert!(denied_terminal["pending"].is_null());
     denied_provider.assert_consumed();
     drop(denied_server);

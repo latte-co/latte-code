@@ -2,9 +2,9 @@ use super::support::Scenario;
 use latte_core::{
     CommandEnvelope, CommandId, CompletionPolicy, Evidence, FailureCode, Handoff, HeadlessOutcome,
     IdSource, PendingInput, PendingPermission, Retryability, RunFailure, RunId, RunState,
-    RunStatus, RuntimeCommand, SystemIdSource, ThreadCommand, ThreadCommandEnvelope,
-    ThreadCommandId, ThreadLifecycle, Transition, TransitionError, VerificationStatus,
-    redact_thread_text, redact_thread_value, valid_openai_chat_input_request_id,
+    RunStatus, RuntimeCommand, SessionCommand, SessionCommandEnvelope, SessionCommandId,
+    SessionLifecycle, SystemIdSource, Transition, TransitionError, VerificationStatus,
+    redact_session_text, redact_session_value, valid_openai_chat_input_request_id,
     valid_openai_chat_opaque_id, valid_openai_chat_tool_call_id,
 };
 use latte_headless::{context, registry::ProviderRegistry};
@@ -35,19 +35,19 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     let envelope = CommandEnvelope::new(command_id, RuntimeCommand::List);
     assert_eq!(envelope.command_id.as_uuid(), command_id.as_uuid());
     assert_eq!(envelope.protocol_version, latte_core::PROTOCOL_VERSION);
-    let thread_command_id = ThreadCommandId::from_uuid(ids.next_uuid_v7());
-    let thread_envelope = ThreadCommandEnvelope::new(
-        thread_command_id,
-        ThreadCommand::Cancel {
-            thread_id: latte_core::ThreadId::from_uuid(ids.next_uuid_v7()),
-            expected_thread_revision: 1,
+    let session_command_id = SessionCommandId::from_uuid(ids.next_uuid_v7());
+    let session_envelope = SessionCommandEnvelope::new(
+        session_command_id,
+        SessionCommand::Cancel {
+            session_id: latte_core::SessionId::from_uuid(ids.next_uuid_v7()),
+            expected_session_revision: 1,
             expected_run_revision: 1,
         },
     );
-    assert_eq!(thread_envelope.command_id, thread_command_id);
+    assert_eq!(session_envelope.command_id, session_command_id);
     assert_eq!(
-        thread_envelope.protocol_version,
-        latte_core::THREAD_PROTOCOL_VERSION
+        session_envelope.protocol_version,
+        latte_core::SESSION_PROTOCOL_VERSION
     );
     for (status, code) in [
         (HeadlessOutcome::Success, 0),
@@ -59,8 +59,8 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     ] {
         assert_eq!(status.exit_code(), code);
     }
-    assert!(ThreadLifecycle::Ready.accepts_follow_up());
-    assert!(!ThreadLifecycle::Running.accepts_follow_up());
+    assert!(SessionLifecycle::Ready.accepts_follow_up());
+    assert!(!SessionLifecycle::Running.accepts_follow_up());
     for valid in ["opaque", "call_123", "req-1"] {
         assert!(valid_openai_chat_opaque_id(valid));
         assert!(valid_openai_chat_tool_call_id(valid));
@@ -70,10 +70,10 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     for invalid in ["", "has space", "line\nbreak", oversized.as_str()] {
         assert!(!valid_openai_chat_opaque_id(invalid));
     }
-    let redacted = redact_thread_text("ok\x1b[31m token=secret-value-12345678901234567890\x07");
+    let redacted = redact_session_text("ok\x1b[31m token=secret-value-12345678901234567890\x07");
     assert!(!redacted.contains("secret-value"));
     assert!(!redacted.contains('\x1b'));
-    let redacted_value = redact_thread_value(serde_json::json!({
+    let redacted_value = redact_session_value(serde_json::json!({
         "authorization": "Bearer secret",
         "nested": [{"api_key":"secret"}],
         "normal": "visible"
@@ -283,18 +283,18 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     assert!(registry.resolve_model("missing", "local-a", &[]).is_err());
     assert!(registry.resolve_model("primary", "missing", &[]).is_err());
     let bound = registry
-        .thread_binding_for_model("primary", "local-a", &[])
+        .session_binding_for_model("primary", "local-a", &[])
         .unwrap();
-    assert!(registry.resolve_thread_bound(&bound, &[]).is_ok());
+    assert!(registry.resolve_session_bound(&bound, &[]).is_ok());
     let mut changed = bound;
     changed.credential_generation += 1;
-    assert!(registry.resolve_thread_bound(&changed, &[]).is_err());
+    assert!(registry.resolve_session_bound(&changed, &[]).is_err());
 
     let mut missing_model_binding = resolved.binding.clone();
     missing_model_binding.model = "removed-model".into();
     assert!(registry.resolve_bound(&missing_model_binding, &[]).is_err());
 
-    let provider_with_derived_thread_scope = ProviderRegistry::parse_jsonc(
+    let provider_with_derived_session_scope = ProviderRegistry::parse_jsonc(
         r#"{
             version: 1,
             default_model: "primary/model-a",
@@ -309,8 +309,8 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         }"#,
     )
     .unwrap();
-    let derived = provider_with_derived_thread_scope
-        .thread_binding_for_default(&[])
+    let derived = provider_with_derived_session_scope
+        .session_binding_for_default(&[])
         .unwrap();
     assert_eq!(derived.credential_ref_id, "env:PATH");
     assert_eq!(derived.data_scope_id, "workspace");

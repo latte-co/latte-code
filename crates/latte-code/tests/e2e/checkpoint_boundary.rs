@@ -162,16 +162,16 @@ fn server_binding(scenario: &Scenario) -> serde_json::Value {
         .expect("engine builds for binding");
     let tools = engine.tool_descriptors();
     let binding = registry
-        .thread_binding_for_default(&tools)
+        .session_binding_for_default(&tools)
         .expect("default binding resolves");
     serde_json::to_value(binding).expect("binding serializes")
 }
 
 fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Value, String) {
-    let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-    let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
     let body = serde_json::json!({
-        "thread_id": thread_id,
+        "session_id": session_id,
         "command_id": command_id,
         "prompt": prompt,
         "binding": binding,
@@ -214,25 +214,25 @@ fn wait_for_lifecycle(
     );
 }
 
-/// Directly overwrites the canonical thread-effect descriptor via SQL.
+/// Directly overwrites the canonical session-effect descriptor via SQL.
 #[cfg(unix)]
 fn corrupt_canonical_descriptor(scenario: &Scenario, effect_id: &str, descriptor_json: &str) {
     use rusqlite::Connection;
     let conn = Connection::open(scenario.database_path()).unwrap();
     conn.execute(
-        "UPDATE thread_effect_canonical_v2 SET descriptor_json=?1 WHERE effect_id=?2",
+        "UPDATE session_effect_canonical SET descriptor_json=?1 WHERE effect_id=?2",
         rusqlite::params![descriptor_json, effect_id],
     )
     .unwrap();
 }
 
-/// Reads the canonical thread-effect descriptor ID for a run via SQL.
+/// Reads the canonical session-effect descriptor ID for a run via SQL.
 #[cfg(unix)]
 fn read_effect_id_for_run(scenario: &Scenario, run_id: &str) -> String {
     use rusqlite::Connection;
     let conn = Connection::open(scenario.database_path()).unwrap();
     conn.query_row(
-        "SELECT effect_id FROM thread_effect_canonical_v2 WHERE run_id=?1",
+        "SELECT effect_id FROM session_effect_canonical WHERE run_id=?1",
         [run_id],
         |r| r.get(0),
     )
@@ -241,8 +241,8 @@ fn read_effect_id_for_run(scenario: &Scenario, run_id: &str) -> String {
 
 /// v2 migration: the v1 test corrupted the full runtime checkpoint (messages,
 /// `tool_queue`, `pending`, etc.) and drove resume through CLI `resume --allow`.
-/// v2 stores a compact `thread_effect` checkpoint in `runtime_checkpoints` and
-/// a canonical descriptor in `thread_effect_canonical_v2`; the engine validates
+/// v2 stores a compact `session_effect` checkpoint in `runtime_checkpoints` and
+/// a canonical descriptor in `session_effect_canonical`; the engine validates
 /// the canonical descriptor during permission resolution.  This test starts a
 /// `ServeChild`, creates a session that parks at `waiting_permission`, corrupts
 /// the durable canonical descriptor through direct SQL, and then resolves the
@@ -289,7 +289,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
 
     let snapshot = wait_for_lifecycle(&server, &session_id, &["waiting_permission"]);
     let run_id_str = snapshot["active_run_id"].as_str().unwrap().to_string();
-    let thread_revision = snapshot["revision"].as_u64().unwrap();
+    let session_revision = snapshot["revision"].as_u64().unwrap();
     let request_id = snapshot["pending"]["request_id"]
         .as_str()
         .unwrap()
@@ -373,7 +373,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
             Some(&server.token),
             Some(&serde_json::json!({
                 "allow": true,
-                "expected_thread_revision": thread_revision,
+                "expected_session_revision": session_revision,
                 "expected_run_revision": run_revision
             })),
             &[],
@@ -413,7 +413,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
     let current_lifecycle = current_snapshot["lifecycle"].as_str().unwrap_or("");
     let current_revision = current_snapshot["revision"]
         .as_u64()
-        .unwrap_or(thread_revision);
+        .unwrap_or(session_revision);
     let current_run_revision = current_snapshot["runs"][0]["run_revision"]
         .as_u64()
         .unwrap_or(run_revision);
@@ -425,7 +425,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
             Some(&server.token),
             Some(&serde_json::json!({
                 "allow": false,
-                "expected_thread_revision": current_revision,
+                "expected_session_revision": current_revision,
                 "expected_run_revision": current_run_revision
             })),
             &[],

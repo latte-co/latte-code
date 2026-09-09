@@ -1,7 +1,7 @@
 {
   "version": 1,
   "default_model": "primary/model-id",
-  "thread": {
+  "session": {
     "max_request_bytes": 524288,
     "max_input_bytes": 393216,
     "reserved_output_bytes": 131072,

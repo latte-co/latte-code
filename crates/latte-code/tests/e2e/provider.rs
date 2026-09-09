@@ -359,7 +359,7 @@ fn legacy_headless_input_wait_is_visible_but_cannot_be_misresumed_as_permission(
     });
     assert_eq!(waiting.status.code(), Some(10));
     assert_eq!(json(&waiting)["status"], "waiting");
-    let session_id = json(&waiting)["data"]["session"]["thread_id"]
+    let session_id = json(&waiting)["data"]["session"]["session_id"]
         .as_str()
         .unwrap()
         .to_owned();

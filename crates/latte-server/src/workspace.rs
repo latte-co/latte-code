@@ -11,13 +11,13 @@ use tracing::info;
 use crate::http::ServerEvent;
 
 /// A fully constructed per-workspace runtime: a durable engine handle plus the
-/// thread runtime service bound to that workspace's own provider registry.
+/// session runtime service bound to that workspace's own provider registry.
 ///
 /// The binary owns configuration and storage-path resolution, so it builds
 /// these; the server only decides *when* to build one and caches the result.
 pub struct BuiltWorkspace {
     pub engine: latte_engine::EngineHandle,
-    pub runtime: latte_headless::thread::ThreadRuntimeService,
+    pub runtime: latte_headless::session::SessionRuntimeService,
     pub registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
 }
 
@@ -31,7 +31,7 @@ pub type WorkspaceRuntimeBuilder =
 /// Resolves the canonical workspace root that durably owns a session, from the
 /// global session catalog. Lets session reads survive a process restart
 /// instead of relying only on the in-memory index.
-pub type SessionLocator = Arc<dyn Fn(latte_core::ThreadId) -> Option<PathBuf> + Send + Sync>;
+pub type SessionLocator = Arc<dyn Fn(latte_core::SessionId) -> Option<PathBuf> + Send + Sync>;
 
 /// A workspace instance with its own runtime.
 pub struct WorkspaceInstance {
@@ -43,8 +43,8 @@ pub struct WorkspaceInstance {
     /// separate from `path` so session queries match the stored identity even
     /// when path spellings differ (e.g. `/var` vs `/private/var`).
     workspace_root: String,
-    /// The thread runtime service for this workspace.
-    pub runtime: Arc<latte_headless::thread::ThreadRuntimeService>,
+    /// The session runtime service for this workspace.
+    pub runtime: Arc<latte_headless::session::SessionRuntimeService>,
     /// Event sender for this workspace.
     pub event_tx: broadcast::Sender<ServerEvent>,
     /// Engine handle for event subscription.
@@ -58,13 +58,13 @@ impl WorkspaceInstance {
     pub fn new(
         id: String,
         path: PathBuf,
-        runtime: latte_headless::thread::ThreadRuntimeService,
+        runtime: latte_headless::session::SessionRuntimeService,
         event_tx: broadcast::Sender<ServerEvent>,
         engine: latte_engine::EngineHandle,
         registry: std::sync::Arc<latte_headless::registry::ProviderRegistry>,
     ) -> Self {
         // The engine canonicalizes the workspace root for its session catalog.
-        // Mirror that identity so `list_threads_v2_for_workspace` matches.
+        // Mirror that identity so `list_sessions_for_workspace` matches.
         let workspace_root = std::fs::canonicalize(&path)
             .unwrap_or_else(|_| path.clone())
             .to_string_lossy()
@@ -72,19 +72,21 @@ impl WorkspaceInstance {
 
         // Wire progress events to the workspace event channel.
         let progress_event_tx = event_tx.clone();
-        let progress_sink: std::sync::Arc<dyn latte_headless::thread::ThreadProgressSink> =
+        let progress_sink: std::sync::Arc<dyn latte_headless::session::SessionProgressSink> =
             std::sync::Arc::new(
-                move |thread_id: latte_core::ThreadId,
-                      progress: latte_core::ThreadTransientProgress| {
+                move |session_id: latte_core::SessionId,
+                      progress: latte_core::SessionTransientProgress| {
                     let run_id = match &progress {
-                        latte_core::ThreadTransientProgress::ProviderAttempt { run_id, .. }
-                        | latte_core::ThreadTransientProgress::AssistantDelta { run_id, .. }
-                        | latte_core::ThreadTransientProgress::ToolProgress { run_id, .. } => {
+                        latte_core::SessionTransientProgress::ProviderAttempt {
+                            run_id, ..
+                        }
+                        | latte_core::SessionTransientProgress::AssistantDelta { run_id, .. }
+                        | latte_core::SessionTransientProgress::ToolProgress { run_id, .. } => {
                             run_id.to_string()
                         }
                     };
                     let _ = progress_event_tx.send(ServerEvent::Progress {
-                        session_id: thread_id.to_string(),
+                        session_id: session_id.to_string(),
                         run_id,
                         progress: serde_json::to_value(&progress).unwrap_or_default(),
                     });
@@ -111,15 +113,15 @@ impl WorkspaceInstance {
     /// Loads the durable snapshot for one session owned by this workspace.
     ///
     /// # Errors
-    /// Returns a storage error when the thread does not exist or cannot be read.
+    /// Returns a storage error when the session does not exist or cannot be read.
     pub fn snapshot(
         &self,
-        thread_id: latte_core::ThreadId,
-    ) -> Result<latte_core::ThreadSnapshot, latte_engine::StorageError> {
+        session_id: latte_core::SessionId,
+    ) -> Result<latte_core::SessionSnapshot, latte_engine::StorageError> {
         // Use the tail (newest 500 entries) to match the TUI's
-        // `thread_snapshot_tail_v2` behavior: the TUI shows the latest
+        // `session_snapshot_tail_v2` behavior: the TUI shows the latest
         // transcript page, not the oldest.
-        self.engine.thread_snapshot_tail_v2(thread_id, 500)
+        self.engine.session_snapshot_tail_v2(session_id, 500)
     }
 
     /// Lists the durable sessions bound to this workspace, newest transcript
@@ -129,9 +131,9 @@ impl WorkspaceInstance {
     /// Returns a storage error when the session catalog cannot be read.
     pub fn list_sessions(
         &self,
-    ) -> Result<Vec<latte_core::ThreadSnapshot>, latte_engine::StorageError> {
+    ) -> Result<Vec<latte_core::SessionSnapshot>, latte_engine::StorageError> {
         self.engine
-            .list_threads_v2_for_workspace(&self.workspace_root)
+            .list_sessions_for_workspace(&self.workspace_root)
     }
 
     /// Searches this workspace's local session catalog by title/id.
@@ -142,8 +144,8 @@ impl WorkspaceInstance {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, latte_engine::StorageError> {
-        self.engine.search_thread_sessions_v2(query, limit)
+    ) -> Result<Vec<latte_core::SessionSummary>, latte_engine::StorageError> {
+        self.engine.search_sessions(query, limit)
     }
 
     /// Finds sessions whose title exactly matches `title` in this workspace.
@@ -157,13 +159,9 @@ impl WorkspaceInstance {
         &self,
         title: &str,
         limit: usize,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, latte_engine::StorageError> {
+    ) -> Result<Vec<latte_core::SessionSummary>, latte_engine::StorageError> {
         self.engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(
-                &self.workspace_root,
-                title,
-                limit,
-            )
+            .find_sessions_by_exact_title_for_workspace(&self.workspace_root, title, limit)
     }
 
     /// Lists one page of this workspace's durable sessions, newest transcript
@@ -177,9 +175,9 @@ impl WorkspaceInstance {
         &self,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<latte_core::ThreadSnapshot>, latte_engine::StorageError> {
+    ) -> Result<latte_core::Paged<latte_core::SessionSnapshot>, latte_engine::StorageError> {
         self.engine
-            .list_threads_v2_for_workspace_paged(&self.workspace_root, cursor, limit)
+            .list_sessions_for_workspace_paged(&self.workspace_root, cursor, limit)
     }
 
     /// Searches this workspace's local session catalog by title/id one page at
@@ -193,10 +191,8 @@ impl WorkspaceInstance {
         query: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, latte_engine::StorageError>
-    {
-        self.engine
-            .search_thread_sessions_v2_paged(query, cursor, limit)
+    ) -> Result<latte_core::Paged<latte_core::SessionSummary>, latte_engine::StorageError> {
+        self.engine.search_sessions_paged(query, cursor, limit)
     }
 
     /// Finds sessions whose title exactly matches `title` one page at a time.
@@ -209,10 +205,9 @@ impl WorkspaceInstance {
         title: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, latte_engine::StorageError>
-    {
+    ) -> Result<latte_core::Paged<latte_core::SessionSummary>, latte_engine::StorageError> {
         self.engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+            .find_sessions_by_exact_title_for_workspace_paged(
                 &self.workspace_root,
                 title,
                 cursor,
@@ -233,22 +228,22 @@ impl WorkspaceInstance {
         latte_headless::registry::RegistryError,
     > {
         self.registry
-            .thread_binding_catalog(&self.engine.tool_descriptors())
+            .session_binding_catalog(&self.engine.tool_descriptors())
     }
 
     /// Start bridging engine events to the workspace event channel.
     fn start_event_bridge(&self) {
-        let mut subscription = self.engine.subscribe_threads();
+        let mut subscription = self.engine.subscribe_sessions();
         let event_tx = self.event_tx.clone();
 
         tokio::spawn(async move {
             loop {
                 match subscription.recv().await {
                     Ok(event) => {
-                        // Forward all durable thread events as wake-up signals.
+                        // Forward all durable session events as wake-up signals.
                         // SSE is wake-up only; clients refetch snapshots.
-                        let server_event = ServerEvent::ThreadChanged {
-                            session_id: event.thread_id.to_string(),
+                        let server_event = ServerEvent::SessionChanged {
+                            session_id: event.session_id.to_string(),
                             revision: event.revision,
                         };
                         let _ = event_tx.send(server_event);
@@ -269,7 +264,7 @@ pub struct WorkspaceManager {
     instances: Arc<RwLock<HashMap<PathBuf, Arc<WorkspaceInstance>>>>,
     /// Session ID -> workspace path index. A best-effort in-memory cache; the
     /// durable `session_locator` is the source of truth across restarts.
-    session_index: Arc<RwLock<HashMap<latte_core::ThreadId, PathBuf>>>,
+    session_index: Arc<RwLock<HashMap<latte_core::SessionId, PathBuf>>>,
     /// Builds a durable per-workspace runtime on demand.
     builder: WorkspaceRuntimeBuilder,
     /// Resolves a session's owning workspace from the durable catalog.
@@ -393,7 +388,7 @@ impl WorkspaceManager {
     /// Register a session in the index (best-effort in-memory cache).
     pub async fn register_session(
         &self,
-        session_id: latte_core::ThreadId,
+        session_id: latte_core::SessionId,
         workspace_path: PathBuf,
     ) {
         let mut index = self.session_index.write().await;
@@ -405,7 +400,7 @@ impl WorkspaceManager {
     /// process restart; a durable hit repopulates the cache.
     pub async fn get_session_workspace(
         &self,
-        session_id: &latte_core::ThreadId,
+        session_id: &latte_core::SessionId,
     ) -> Option<PathBuf> {
         {
             let index = self.session_index.read().await;
@@ -439,9 +434,9 @@ mod tests {
                 .conversation_root(root.join(".latte/sessions"))
                 .build()
                 .map_err(|error| error.to_string())?;
-            let factory: latte_headless::thread::ThreadProviderFactory =
+            let factory: latte_headless::session::SessionProviderFactory =
                 Arc::new(|_| Err("no provider configured in test".to_string()));
-            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            let runtime = latte_headless::session::SessionRuntimeService::new(
                 engine.clone(),
                 root,
                 Default::default(),
@@ -518,14 +513,14 @@ mod tests {
     async fn session_index_registers_and_resolves() {
         let manager = manager();
         let dir = tempfile::tempdir().unwrap();
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
 
-        assert!(manager.get_session_workspace(&thread_id).await.is_none());
+        assert!(manager.get_session_workspace(&session_id).await.is_none());
         manager
-            .register_session(thread_id, dir.path().to_path_buf())
+            .register_session(session_id, dir.path().to_path_buf())
             .await;
         assert_eq!(
-            manager.get_session_workspace(&thread_id).await,
+            manager.get_session_workspace(&session_id).await,
             Some(dir.path().to_path_buf())
         );
     }
@@ -542,15 +537,15 @@ mod tests {
         let locator: SessionLocator = Arc::new(move |_| Some(locator_path.clone()));
         let manager = WorkspaceManager::new(builder, locator);
 
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         // Not in the in-memory index, but the durable locator resolves it.
         assert_eq!(
-            manager.get_session_workspace(&thread_id).await,
+            manager.get_session_workspace(&session_id).await,
             Some(resolved.clone())
         );
         // The durable hit is cached back into the index.
         assert_eq!(
-            manager.get_session_workspace(&thread_id).await,
+            manager.get_session_workspace(&session_id).await,
             Some(resolved)
         );
     }
@@ -558,8 +553,8 @@ mod tests {
     #[tokio::test]
     async fn session_workspace_none_when_locator_misses() {
         let manager = manager(); // locator always returns None
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-        assert!(manager.get_session_workspace(&thread_id).await.is_none());
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        assert!(manager.get_session_workspace(&session_id).await.is_none());
     }
 
     #[tokio::test]
@@ -576,14 +571,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let missing = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let missing = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         assert!(workspace.snapshot(missing).is_err());
 
         // The default manager's provider factory is a configured-error stub;
         // starting a turn exercises it and yields a retryable child failure
         // rather than a panic.
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-        let binding = latte_core::ThreadProviderBindingV2 {
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let binding = latte_core::SessionProviderBinding {
             version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
@@ -598,10 +593,10 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding, None)
+            .start(session_id, "hello".into(), binding, None)
             .await
             .expect("start persists a retryable failure without panicking");
-        assert_eq!(snapshot.thread_id, thread_id);
+        assert_eq!(snapshot.session_id, session_id);
     }
 
     #[tokio::test]
@@ -641,9 +636,9 @@ mod tests {
             .build()
             .unwrap();
         let (event_tx, _event_rx) = broadcast::channel(16);
-        let factory: latte_headless::thread::ThreadProviderFactory =
+        let factory: latte_headless::session::SessionProviderFactory =
             Arc::new(|_| Err("unused".to_string()));
-        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+        let runtime = latte_headless::session::SessionRuntimeService::new(
             engine.clone(),
             dir.path(),
             Default::default(),
@@ -681,9 +676,9 @@ mod tests {
             .build()
             .unwrap();
         let (event_tx, _) = broadcast::channel(16);
-        let factory: latte_headless::thread::ThreadProviderFactory =
+        let factory: latte_headless::session::SessionProviderFactory =
             Arc::new(|_| Err("unused".to_string()));
-        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+        let runtime = latte_headless::session::SessionRuntimeService::new(
             engine.clone(),
             dir.path(),
             Default::default(),
@@ -706,7 +701,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn event_bridge_resyncs_on_lagged_subscription() {
-        // Flooding the engine's thread_events channel (capacity 64) with
+        // Flooding the engine's session_events channel (capacity 64) with
         // synchronous commits before the bridge task is polled causes the
         // bridge receiver to lag; the bridge forwards a ResyncRequired event
         // (covers the Lagged arm).
@@ -720,16 +715,16 @@ mod tests {
             .build()
             .unwrap();
         let (event_tx, mut event_rx) = broadcast::channel(256);
-        let factory: latte_headless::thread::ThreadProviderFactory =
+        let factory: latte_headless::session::SessionProviderFactory =
             Arc::new(|_| Err("unused".to_string()));
-        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+        let runtime = latte_headless::session::SessionRuntimeService::new(
             engine.clone(),
             dir.path(),
             Default::default(),
             factory,
         );
         // Creating the instance starts the event bridge task. On a
-        // current-thread runtime the task is not polled until this test yields.
+        // current-session runtime the task is not polled until this test yields.
         let _instance = WorkspaceInstance::new(
             "ws_lag".into(),
             dir.path().to_path_buf(),
@@ -739,9 +734,9 @@ mod tests {
             std::sync::Arc::new(latte_headless::registry::ProviderRegistry::parse_jsonc(r#"{version:1,default_model:'p/m',providers:{p:{type:'openai-chat',models:['m'],base_url:'https://api.example/v1',api_key:{source:'env',name:'KEY'}}}}"#).unwrap()),
         );
 
-        // Produce more thread events than the channel capacity (64) without
+        // Produce more session events than the channel capacity (64) without
         // yielding, so the bridge receiver falls behind and lags.
-        let binding = latte_core::ThreadProviderBindingV2 {
+        let binding = latte_core::SessionProviderBinding {
             version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
@@ -756,13 +751,15 @@ mod tests {
         };
         let now = latte_core::wall_time_ms();
         for _ in 0..70 {
-            let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+            let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
             let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
-            let lease = engine.acquire_thread_lease(thread_id, now, 60_000).unwrap();
+            let lease = engine
+                .acquire_session_lease(session_id, now, 60_000)
+                .unwrap();
             engine
-                .create_started_thread_v2(
-                    &latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
-                    thread_id,
+                .create_started_session_v2(
+                    &latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
+                    session_id,
                     run_id,
                     binding.clone(),
                     "prompt",
@@ -806,9 +803,9 @@ mod tests {
                 .conversation_root(root.join(".latte/sessions"))
                 .build()
                 .map_err(|e| e.to_string())?;
-            let factory: latte_headless::thread::ThreadProviderFactory =
+            let factory: latte_headless::session::SessionProviderFactory =
                 Arc::new(|_| Err("no provider".to_string()));
-            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            let runtime = latte_headless::session::SessionRuntimeService::new(
                 engine.clone(),
                 root,
                 Default::default(),
@@ -856,9 +853,9 @@ mod tests {
         let manager = Arc::new(manager());
         let instance = manager.get_or_create(dir.path()).await.unwrap();
 
-        // Simulate a crash: a running thread whose lease is already expired
+        // Simulate a crash: a running session whose lease is already expired
         // against the wall clock (absolute expiry at epoch 1001ms).
-        let binding = latte_core::ThreadProviderBindingV2 {
+        let binding = latte_core::SessionProviderBinding {
             version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
@@ -871,17 +868,17 @@ mod tests {
             data_scope_id: "workspace".into(),
             credential_generation: 1,
         };
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
         let lease = instance
             .engine
-            .acquire_thread_lease(thread_id, 1, 1000)
+            .acquire_session_lease(session_id, 1, 1000)
             .unwrap();
         instance
             .engine
-            .create_started_thread_v2(
-                &latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
-                thread_id,
+            .create_started_session_v2(
+                &latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
+                session_id,
                 run_id,
                 binding,
                 "crashed mid-run",
@@ -896,14 +893,14 @@ mod tests {
         let handle =
             manager.start_recovery_sweeper(shutdown_rx, std::time::Duration::from_millis(20));
 
-        // Poll until the sweep recovers the expired lease (thread interrupted).
+        // Poll until the sweep recovers the expired lease (session interrupted).
         let mut recovered = false;
         for _ in 0..100 {
             let snapshot = instance
                 .engine
-                .thread_snapshot_v2(thread_id, None, 100)
+                .session_snapshot_v2(session_id, None, 100)
                 .unwrap();
-            if snapshot.lifecycle == latte_core::ThreadLifecycle::Interrupted {
+            if snapshot.lifecycle == latte_core::SessionLifecycle::Interrupted {
                 recovered = true;
                 break;
             }
@@ -922,7 +919,7 @@ mod tests {
     /// Builds a manager whose per-workspace runtimes use the given provider
     /// factory (each workspace still gets its own engine under a temp dir).
     fn manager_with_factory(
-        factory: latte_headless::thread::ThreadProviderFactory,
+        factory: latte_headless::session::SessionProviderFactory,
     ) -> WorkspaceManager {
         let builder: WorkspaceRuntimeBuilder = Arc::new(move |root: &Path| {
             let db = root.join(".latte/state.db");
@@ -933,7 +930,7 @@ mod tests {
                 .conversation_root(root.join(".latte/sessions"))
                 .build()
                 .map_err(|error| error.to_string())?;
-            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            let runtime = latte_headless::session::SessionRuntimeService::new(
                 engine.clone(),
                 root,
                 Default::default(),
@@ -1005,8 +1002,8 @@ mod tests {
             }
         }
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(ProgressProvider),
                     binding: ProviderBinding {
@@ -1029,8 +1026,8 @@ mod tests {
         // missed (broadcast channels only deliver to existing receivers).
         let mut events = workspace.event_tx.subscribe();
 
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-        let binding = latte_core::ThreadProviderBindingV2 {
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let binding = latte_core::SessionProviderBinding {
             version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
@@ -1045,10 +1042,10 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding, None)
+            .start(session_id, "hello".into(), binding, None)
             .await
             .expect("start completes with the progress provider");
-        assert_eq!(snapshot.thread_id, thread_id);
+        assert_eq!(snapshot.session_id, session_id);
 
         // The workspace progress closure must have forwarded both event kinds
         // as ServerEvent::Progress frames.

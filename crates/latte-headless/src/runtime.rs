@@ -1,7 +1,7 @@
-//! Verification plan shared by the v1 compatibility surface and the v2 thread
+//! Verification plan shared by the v1 compatibility surface and the v2 session
 //! runtime. The v1 `AgentRuntime` was removed when the CLI migrated to the
 //! embedded HTTP+SSE server; `VerificationPlan` is retained because the v2
-//! `ThreadRuntimeService` still consumes it.
+//! `SessionRuntimeService` still consumes it.
 
 /// Describes how a completed file change is verified before the run is
 /// declared successful.

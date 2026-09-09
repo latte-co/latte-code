@@ -1,15 +1,16 @@
 use super::support::{PtySession, Scenario, json, wait_until};
 use latte_core::{
-    FailureCode, Handoff, IdSource, PendingInput, Retryability, RunFailure, RunId, SystemIdSource,
-    ThreadCommandId, ThreadEvent, ThreadEventEnvelope, ThreadEventId, ThreadId, ThreadLifecycle,
-    ThreadPendingRequest, ThreadProviderBindingV2, ThreadRunStatus, ThreadSessionSummary,
-    ThreadTransientProgress, TranscriptEntry, TranscriptEntryId, TranscriptKind,
+    FailureCode, Handoff, IdSource, PendingInput, Retryability, RunFailure, RunId,
+    SessionCommandId, SessionEvent, SessionEventEnvelope, SessionEventId, SessionId,
+    SessionLifecycle, SessionPendingRequest, SessionProviderBinding, SessionRunStatus,
+    SessionSummary, SessionTransientProgress, SystemIdSource, TranscriptEntry, TranscriptEntryId,
+    TranscriptKind,
 };
 use latte_engine::{
-    CancellationToken, CommitThreadRunUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
-    ProcessTermination, StorageError, SubscriptionError, ThreadCommitRequest,
-    ThreadEffectDescriptor, ThreadEffectObservedValue, ThreadEffectPolicy, ThreadEffectRequest,
-    ThreadEffectStartRequest,
+    CancellationToken, CommitSessionRunUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
+    ProcessTermination, SessionCommitRequest, SessionEffectDescriptor, SessionEffectObservedValue,
+    SessionEffectPolicy, SessionEffectRequest, SessionEffectStartRequest, StorageError,
+    SubscriptionError,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -18,10 +19,10 @@ use ratatui::{Terminal, backend::TestBackend};
 
 use latte_tui::{
     ConnectionState,
-    thread::{
+    session::{
         ActiveConversation, PendingInputSubmission, PendingModelSwitch, PendingSubmission,
-        ThreadModelOption, ThreadPermissionMode, ThreadStartupPresentation, ThreadUiAction,
-        ThreadUiInput, ThreadUiModel, reduce,
+        SessionModelOption, SessionPermissionMode, SessionStartupPresentation, SessionUiAction,
+        SessionUiInput, SessionUiModel, reduce,
     },
 };
 
@@ -33,16 +34,16 @@ fn run_id() -> RunId {
     RunId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
-fn thread_id() -> ThreadId {
-    ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7())
+fn session_id() -> SessionId {
+    SessionId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
-fn command_id() -> ThreadCommandId {
-    ThreadCommandId::from_uuid(SystemIdSource::default().next_uuid_v7())
+fn command_id() -> SessionCommandId {
+    SessionCommandId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
-fn binding() -> ThreadProviderBindingV2 {
-    ThreadProviderBindingV2 {
+fn binding() -> SessionProviderBinding {
+    SessionProviderBinding {
         version: 1,
         provider_name: "v2-boundary".into(),
         provider_type: "openai-chat".into(),
@@ -66,7 +67,7 @@ fn build_engine(scenario: &Scenario) -> EngineHandle {
         .unwrap()
 }
 
-fn active_run(snapshot: &latte_core::ThreadSnapshot) -> (RunId, u64) {
+fn active_run(snapshot: &latte_core::SessionSnapshot) -> (RunId, u64) {
     let run_id = snapshot.active_run_id.unwrap();
     let revision = snapshot
         .runs
@@ -80,17 +81,17 @@ fn active_run(snapshot: &latte_core::ThreadSnapshot) -> (RunId, u64) {
 fn commit_with_command(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
-    command_id: ThreadCommandId,
-    update: CommitThreadRunUpdate,
+    snapshot: &latte_core::SessionSnapshot,
+    command_id: SessionCommandId,
+    update: CommitSessionRunUpdate,
     now: u64,
-) -> Result<latte_engine::ThreadCommitResponse, StorageError> {
+) -> Result<latte_engine::SessionCommitResponse, StorageError> {
     let (run_id, run_revision) = active_run(snapshot);
-    engine.commit_thread_run_update(
-        ThreadCommitRequest {
-            thread_id: snapshot.thread_id,
+    engine.commit_session_run_update(
+        SessionCommitRequest {
+            session_id: snapshot.session_id,
             run_id,
-            expected_thread_revision: snapshot.revision,
+            expected_session_revision: snapshot.revision,
             expected_run_revision: run_revision,
             command_id,
             request_id: None,
@@ -105,10 +106,10 @@ fn commit_with_command(
 fn commit(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
-    update: CommitThreadRunUpdate,
+    snapshot: &latte_core::SessionSnapshot,
+    update: CommitSessionRunUpdate,
     now: u64,
-) -> latte_core::ThreadSnapshot {
+) -> latte_core::SessionSnapshot {
     commit_with_command(engine, lease, snapshot, command_id(), update, now)
         .unwrap()
         .snapshot
@@ -117,33 +118,33 @@ fn commit(
 fn start(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
+    snapshot: &latte_core::SessionSnapshot,
     source: &str,
     now: u64,
-) -> latte_core::ThreadSnapshot {
+) -> latte_core::SessionSnapshot {
     commit(
         engine,
         lease,
         snapshot,
-        CommitThreadRunUpdate::Start {
+        CommitSessionRunUpdate::Start {
             source_key: source.into(),
         },
         now,
     )
 }
 
-fn create_started_effect_thread(
+fn create_started_effect_session(
     engine: &EngineHandle,
     prompt: &str,
     now: u64,
-) -> (latte_core::ThreadSnapshot, Lease, RunId) {
-    let thread_id = thread_id();
+) -> (latte_core::SessionSnapshot, Lease, RunId) {
+    let session_id = session_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let run_id = run_id();
     let snapshot = engine
-        .create_thread_v2(thread_id, run_id, binding(), prompt, now + 1)
+        .create_session_v2(session_id, run_id, binding(), prompt, now + 1)
         .unwrap();
     let snapshot = start(
         engine,
@@ -158,23 +159,23 @@ fn create_started_effect_thread(
 fn prepare_effect(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
+    snapshot: &latte_core::SessionSnapshot,
     effect_id: &str,
     name: &str,
     input: serde_json::Value,
     now: u64,
-) -> latte_engine::ThreadEffectPrepared {
+) -> latte_engine::SessionEffectPrepared {
     let (run_id, run_revision) = active_run(snapshot);
     engine
-        .prepare_thread_effect(
-            ThreadEffectRequest {
-                thread_id: snapshot.thread_id,
+        .prepare_session_effect(
+            SessionEffectRequest {
+                session_id: snapshot.session_id,
                 run_id,
-                expected_thread_revision: snapshot.revision,
+                expected_session_revision: snapshot.revision,
                 expected_run_revision: run_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:prepare"),
-                descriptor: ThreadEffectDescriptor {
+                descriptor: SessionEffectDescriptor {
                     effect_id: effect_id.into(),
                     tool_call_id: format!("call-{effect_id}"),
                     name: name.into(),
@@ -191,17 +192,17 @@ fn prepare_effect(
 fn start_effect(
     engine: &EngineHandle,
     lease: &Lease,
-    prepared: &latte_engine::ThreadEffectPrepared,
+    prepared: &latte_engine::SessionEffectPrepared,
     effect_id: &str,
     now: u64,
-) -> latte_engine::ThreadEffectStarted {
+) -> latte_engine::SessionEffectStarted {
     let (run_id, run_revision) = active_run(&prepared.snapshot);
     engine
-        .start_thread_effect(
-            ThreadEffectStartRequest {
-                thread_id: prepared.snapshot.thread_id,
+        .start_session_effect(
+            SessionEffectStartRequest {
+                session_id: prepared.snapshot.session_id,
                 run_id,
-                expected_thread_revision: prepared.snapshot.revision,
+                expected_session_revision: prepared.snapshot.revision,
                 expected_run_revision: run_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:start"),
@@ -222,14 +223,14 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let run_id = run_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let created = engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             run_id,
             binding(),
             "public reducer authoritative session",
@@ -241,7 +242,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         &engine,
         &lease,
         &started,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "reducer:complete".into(),
             handoff: Handoff {
                 summary: "public reducer session completed".into(),
@@ -253,17 +254,17 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     );
     engine.release_lease(&lease).unwrap();
 
-    let startup = ThreadStartupPresentation {
+    let startup = SessionStartupPresentation {
         default_provider: "v2-boundary".into(),
         default_model: "v2-boundary-model".into(),
         model_catalog: vec![
-            ThreadModelOption {
+            SessionModelOption {
                 provider_name: "v2-boundary".into(),
                 model: "v2-boundary-model".into(),
                 name: Some("Boundary default".into()),
                 is_default: true,
             },
-            ThreadModelOption {
+            SessionModelOption {
                 provider_name: "secondary".into(),
                 model: "secondary-model".into(),
                 name: None,
@@ -271,16 +272,16 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             },
         ],
         workspace_display: scenario.root().display().to_string(),
-        permission_mode: ThreadPermissionMode::Ask,
+        permission_mode: SessionPermissionMode::Ask,
     };
-    let mut model = ThreadUiModel::with_startup(startup);
+    let mut model = SessionUiModel::with_startup(startup);
 
     let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
     release.kind = KeyEventKind::Release;
-    assert!(reduce(&mut model, ThreadUiInput::Key(release)).is_empty());
+    assert!(reduce(&mut model, SessionUiInput::Key(release)).is_empty());
     assert_eq!(
         reduce(&mut model, key(KeyCode::F(10))),
-        vec![ThreadUiAction::Quit]
+        vec![SessionUiAction::Quit]
     );
     model.connection = ConnectionState::Disconnected;
     assert_eq!(
@@ -288,17 +289,17 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             &mut model,
             modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     model.connection = ConnectionState::Connected;
 
-    let mut no_models = ThreadUiModel::default();
+    let mut no_models = SessionUiModel::default();
     no_models.composer = "/model".into();
     assert!(reduce(&mut no_models, key(KeyCode::Enter)).is_empty());
     assert!(no_models.status.contains("Provider setup required"));
     assert!(no_models.status.contains("~/.latte/latte-code.jsonc"));
 
-    let mut validation_model = ThreadUiModel::with_startup(model.startup.clone().unwrap());
+    let mut validation_model = SessionUiModel::with_startup(model.startup.clone().unwrap());
     validation_model.composer = "/new unexpected".into();
     assert!(reduce(&mut validation_model, key(KeyCode::Enter)).is_empty());
     assert!(
@@ -309,14 +310,14 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     validation_model.composer.clear();
     assert!(reduce(&mut validation_model, key(KeyCode::Enter)).is_empty());
 
-    let mut paste_model = ThreadUiModel::default();
+    let mut paste_model = SessionUiModel::default();
     let oversized_paste = format!("\u{1b}[31mred\u{7}{}", "x".repeat(17_000));
-    assert!(reduce(&mut paste_model, ThreadUiInput::Paste(oversized_paste)).is_empty());
+    assert!(reduce(&mut paste_model, SessionUiInput::Paste(oversized_paste)).is_empty());
     assert!(!paste_model.composer.contains('\u{1b}'));
     assert!(!paste_model.composer.contains('\u{7}'));
     assert!(paste_model.composer.len() <= 16 * 1024);
 
-    let mut draft_model = ThreadUiModel::with_startup(model.startup.clone().unwrap());
+    let mut draft_model = SessionUiModel::with_startup(model.startup.clone().unwrap());
     draft_model.composer = "/model".into();
     assert!(reduce(&mut draft_model, key(KeyCode::Enter)).is_empty());
     assert!(reduce(&mut draft_model, key(KeyCode::Down)).is_empty());
@@ -329,29 +330,29 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     draft_model.composer = "start with the selected provider".into();
     assert!(matches!(
         reduce(&mut draft_model, key(KeyCode::F(5))).as_slice(),
-        [ThreadUiAction::StartWithModel { provider_name, model, .. }]
+        [SessionUiAction::StartWithModel { provider_name, model, .. }]
             if provider_name == "secondary" && model == "secondary-model"
     ));
-    assert_eq!(model.selected_thread(), None);
+    assert_eq!(model.selected_session(), None);
     assert!(model.authority_enabled());
-    assert!(reduce(&mut model, ThreadUiInput::Resize(1, 1)).is_empty());
+    assert!(reduce(&mut model, SessionUiInput::Resize(1, 1)).is_empty());
     assert_eq!(model.size, (1, 1));
-    assert!(reduce(&mut model, ThreadUiInput::Disconnected).is_empty());
+    assert!(reduce(&mut model, SessionUiInput::Disconnected).is_empty());
     assert_eq!(model.connection, ConnectionState::Disconnected);
     assert_eq!(
-        reduce(&mut model, ThreadUiInput::Lagged),
-        vec![ThreadUiAction::RefreshSnapshots]
+        reduce(&mut model, SessionUiInput::Lagged),
+        vec![SessionUiAction::RefreshSnapshots]
     );
     assert_eq!(model.connection, ConnectionState::SnapshotRequired);
-    assert!(reduce(&mut model, ThreadUiInput::Connected).is_empty());
+    assert!(reduce(&mut model, SessionUiInput::Connected).is_empty());
     assert_eq!(model.connection, ConnectionState::Connected);
 
-    let summary = ThreadSessionSummary {
-        thread_id,
+    let summary = SessionSummary {
+        session_id,
         title: "public reducer authoritative session".into(),
         workspace_root: scenario.root().display().to_string(),
-        parent_thread_id: None,
-        lifecycle: ThreadLifecycle::Ready,
+        parent_session_id: None,
+        lifecycle: SessionLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
         model: ready.binding.model.clone(),
         created_at_ms: now + 1,
@@ -360,7 +361,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalog(vec![summary.clone()])
+            SessionUiInput::SessionCatalog(vec![summary.clone()])
         )
         .is_empty()
     );
@@ -371,14 +372,14 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalog(vec![summary.clone()])
+            SessionUiInput::SessionCatalog(vec![summary.clone()])
         )
         .is_empty()
     );
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalogReady {
+            SessionUiInput::SessionCatalogReady {
                 sessions: Vec::new(),
                 query: None,
             }
@@ -389,17 +390,17 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert_eq!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalogReady {
+            SessionUiInput::SessionCatalogReady {
                 sessions: vec![summary.clone()],
                 query: Some(summary.title.clone()),
             }
         ),
-        vec![ThreadUiAction::OpenSession { thread_id }]
+        vec![SessionUiAction::OpenSession { session_id }]
     );
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalogReady {
+            SessionUiInput::SessionCatalogReady {
                 sessions: Vec::new(),
                 query: Some("missing-title".into()),
             }
@@ -408,11 +409,11 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     );
     assert!(model.status.contains("No exact session match"));
     let mut duplicate = summary.clone();
-    duplicate.thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    duplicate.session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionCatalogReady {
+            SessionUiInput::SessionCatalogReady {
                 sessions: vec![summary.clone(), duplicate],
                 query: Some(summary.title.clone()),
             }
@@ -424,35 +425,35 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::SessionOpened(Box::new(ready.clone()))
+            SessionUiInput::SessionOpened(Box::new(ready.clone()))
         )
         .is_empty()
     );
     assert_eq!(
         model.active_conversation,
-        Some(ActiveConversation::Session(thread_id))
+        Some(ActiveConversation::Session(session_id))
     );
-    assert_eq!(model.selected_thread(), Some(&ready));
+    assert_eq!(model.selected_session(), Some(&ready));
 
     for progress in [
-        ThreadTransientProgress::ProviderAttempt { run_id, number: 2 },
-        ThreadTransientProgress::AssistantDelta {
+        SessionTransientProgress::ProviderAttempt { run_id, number: 2 },
+        SessionTransientProgress::AssistantDelta {
             run_id,
             text: "streamed delta".into(),
         },
-        ThreadTransientProgress::ToolProgress {
+        SessionTransientProgress::ToolProgress {
             run_id,
             name: "read_file".into(),
             detail: "bounded detail".into(),
         },
     ] {
-        assert!(reduce(&mut model, ThreadUiInput::Progress(progress)).is_empty());
+        assert!(reduce(&mut model, SessionUiInput::Progress(progress)).is_empty());
     }
     assert_eq!(model.progress.len(), 3);
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::CommandError("typed command failed".into())
+            SessionUiInput::CommandError("typed command failed".into())
         )
         .is_empty()
     );
@@ -460,70 +461,70 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::CommandCompleted("typed command completed".into())
+            SessionUiInput::CommandCompleted("typed command completed".into())
         )
         .is_empty()
     );
 
-    let missing_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+    let missing_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         revision: 1,
         sequence: 1,
-        event: ThreadEvent::LifecycleChanged {
-            lifecycle: ThreadLifecycle::Running,
+        event: SessionEvent::LifecycleChanged {
+            lifecycle: SessionLifecycle::Running,
             run_id: Some(run_id),
         },
     };
     assert_eq!(
-        reduce(&mut model, ThreadUiInput::Event(missing_event)),
-        vec![ThreadUiAction::RefreshSnapshots]
+        reduce(&mut model, SessionUiInput::Event(missing_event)),
+        vec![SessionUiAction::RefreshSnapshots]
     );
-    let gap_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let gap_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision.saturating_add(2),
         sequence: ready.sequence.saturating_add(2),
-        event: ThreadEvent::LifecycleChanged {
-            lifecycle: ThreadLifecycle::Running,
+        event: SessionEvent::LifecycleChanged {
+            lifecycle: SessionLifecycle::Running,
             run_id: Some(run_id),
         },
     };
     assert_eq!(
-        reduce(&mut model, ThreadUiInput::Event(gap_event)),
-        vec![ThreadUiAction::RefreshSnapshots]
+        reduce(&mut model, SessionUiInput::Event(gap_event)),
+        vec![SessionUiAction::RefreshSnapshots]
     );
 
-    let mut event_model = ThreadUiModel::default();
+    let mut event_model = SessionUiModel::default();
     reduce(
         &mut event_model,
-        ThreadUiInput::Snapshot(vec![ready.clone()]),
+        SessionUiInput::Snapshot(vec![ready.clone()]),
     );
-    let lifecycle_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let lifecycle_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision + 1,
         sequence: ready.sequence + 1,
-        event: ThreadEvent::LifecycleChanged {
-            lifecycle: ThreadLifecycle::Interrupted,
+        event: SessionEvent::LifecycleChanged {
+            lifecycle: SessionLifecycle::Interrupted,
             run_id: Some(run_id),
         },
     };
-    assert!(reduce(&mut event_model, ThreadUiInput::Event(lifecycle_event)).is_empty());
+    assert!(reduce(&mut event_model, SessionUiInput::Event(lifecycle_event)).is_empty());
     assert_eq!(
         event_model.sessions[0].lifecycle,
-        ThreadLifecycle::Interrupted
+        SessionLifecycle::Interrupted
     );
-    let transcript_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let transcript_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision + 2,
         sequence: ready.sequence + 2,
-        event: ThreadEvent::TranscriptAppended {
+        event: SessionEvent::TranscriptAppended {
             entry: TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 sequence: ready.sequence + 2,
@@ -536,7 +537,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             },
         },
     };
-    assert!(reduce(&mut event_model, ThreadUiInput::Event(transcript_event)).is_empty());
+    assert!(reduce(&mut event_model, SessionUiInput::Event(transcript_event)).is_empty());
     assert!(
         event_model.sessions[0]
             .transcript
@@ -544,59 +545,59 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             .iter()
             .any(|entry| entry.text == "event appended card")
     );
-    let linked_run = latte_core::ThreadRunSummary {
+    let linked_run = latte_core::SessionRunSummary {
         run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         parent_run_id: Some(run_id),
         ordinal: 1,
-        status: ThreadRunStatus::Queued,
+        status: SessionRunStatus::Queued,
         run_revision: 0,
         completed_at_ms: None,
         failure_code: None,
     };
-    let run_linked_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let run_linked_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision + 3,
         sequence: ready.sequence + 3,
-        event: ThreadEvent::RunLinked {
+        event: SessionEvent::RunLinked {
             run: linked_run.clone(),
         },
     };
-    assert!(reduce(&mut event_model, ThreadUiInput::Event(run_linked_event)).is_empty());
+    assert!(reduce(&mut event_model, SessionUiInput::Event(run_linked_event)).is_empty());
     assert_eq!(
         event_model.sessions[0].latest_run_id,
         Some(linked_run.run_id)
     );
-    let binding_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let binding_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision + 4,
         sequence: ready.sequence + 4,
-        event: ThreadEvent::BindingChanged {
+        event: SessionEvent::BindingChanged {
             provider_name: "secondary".into(),
             model: "secondary-model".into(),
         },
     };
     assert_eq!(
-        reduce(&mut event_model, ThreadUiInput::Event(binding_event)),
-        vec![ThreadUiAction::RefreshSnapshots]
+        reduce(&mut event_model, SessionUiInput::Event(binding_event)),
+        vec![SessionUiAction::RefreshSnapshots]
     );
 
-    let mut feedback_model = ThreadUiModel::default();
+    let mut feedback_model = SessionUiModel::default();
     feedback_model.pending_submission = Some(PendingSubmission {
         submission_id: 7,
         prompt: "pending prompt".into(),
-        thread_id: None,
+        session_id: None,
         after_sequence: 0,
     });
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 6,
-                thread_id,
+                session_id,
             }
         )
         .is_empty()
@@ -604,9 +605,9 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 7,
-                thread_id,
+                session_id,
             }
         )
         .is_empty()
@@ -616,26 +617,26 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             .pending_submission
             .as_ref()
             .unwrap()
-            .thread_id,
-        Some(thread_id)
+            .session_id,
+        Some(session_id)
     );
     assert_eq!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::SubmissionError { submission_id: 7 }
+            SessionUiInput::SubmissionError { submission_id: 7 }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::SubmissionCompleted { submission_id: 7 }
+            SessionUiInput::SubmissionCompleted { submission_id: 7 }
         )
         .is_empty()
     );
     feedback_model.pending_input_submission = Some(PendingInputSubmission {
         submission_id: 8,
-        thread_id,
+        session_id,
         run_id,
         request_id: "pending-input".into(),
         value: "pending value".into(),
@@ -644,27 +645,27 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert_eq!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::InputSubmissionError { submission_id: 8 }
+            SessionUiInput::InputSubmissionError { submission_id: 8 }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::InputSubmissionCompleted { submission_id: 8 }
+            SessionUiInput::InputSubmissionCompleted { submission_id: 8 }
         )
         .is_empty()
     );
     feedback_model.pending_model_switch = Some(PendingModelSwitch {
         switch_id: 9,
-        thread_id,
+        session_id,
         provider_name: "secondary".into(),
         model: "secondary-model".into(),
     });
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::ModelSwitchError {
+            SessionUiInput::ModelSwitchError {
                 switch_id: 8,
                 error: "stale".into(),
             }
@@ -674,20 +675,20 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert_eq!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::ModelSwitchCompleted { switch_id: 9 }
+            SessionUiInput::ModelSwitchCompleted { switch_id: 9 }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     feedback_model.pending_model_switch = Some(PendingModelSwitch {
         switch_id: 10,
-        thread_id,
+        session_id,
         provider_name: "secondary".into(),
         model: "secondary-model".into(),
     });
     assert!(
         reduce(
             &mut feedback_model,
-            ThreadUiInput::ModelSwitchError {
+            SessionUiInput::ModelSwitchError {
                 switch_id: 10,
                 error: "authoritative rejection".into(),
             }
@@ -697,68 +698,68 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(feedback_model.pending_model_switch.is_none());
     assert!(feedback_model.status.contains("authoritative rejection"));
 
-    let mut queued_model = ThreadUiModel::default();
+    let mut queued_model = SessionUiModel::default();
     queued_model.sessions = vec![ready.clone()];
-    queued_model.active_conversation = Some(ActiveConversation::Session(thread_id));
+    queued_model.active_conversation = Some(ActiveConversation::Session(session_id));
     queued_model.pending_submission = Some(PendingSubmission {
         submission_id: 11,
         prompt: "queued public follow-up".into(),
-        thread_id: Some(thread_id),
+        session_id: Some(session_id),
         after_sequence: ready.sequence,
     });
     queued_model.queued_follow_up = Some("queued public follow-up".into());
-    queued_model.reconciliation_confirmation = Some((thread_id, "obsolete-effect".into()));
+    queued_model.reconciliation_confirmation = Some((session_id, "obsolete-effect".into()));
     assert_eq!(
         reduce(
             &mut queued_model,
-            ThreadUiInput::Snapshot(vec![ready.clone()])
+            SessionUiInput::Snapshot(vec![ready.clone()])
         ),
-        vec![ThreadUiAction::FollowUp {
+        vec![SessionUiAction::FollowUp {
             submission_id: 11,
-            thread_id,
-            expected_thread_revision: ready.revision,
+            session_id,
+            expected_session_revision: ready.revision,
             prompt: "queued public follow-up".into(),
         }]
     );
     assert!(queued_model.reconciliation_confirmation.is_none());
 
-    let mut coalesced = ThreadUiModel::default();
+    let mut coalesced = SessionUiModel::default();
     for input in [
-        ThreadTransientProgress::AssistantDelta {
+        SessionTransientProgress::AssistantDelta {
             run_id,
             text: "first".into(),
         },
-        ThreadTransientProgress::AssistantDelta {
+        SessionTransientProgress::AssistantDelta {
             run_id,
             text: " second".into(),
         },
-        ThreadTransientProgress::ToolProgress {
+        SessionTransientProgress::ToolProgress {
             run_id,
             name: "read_file".into(),
             detail: "old detail".into(),
         },
-        ThreadTransientProgress::ToolProgress {
+        SessionTransientProgress::ToolProgress {
             run_id,
             name: "read_file".into(),
             detail: "new detail".into(),
         },
     ] {
-        assert!(reduce(&mut coalesced, ThreadUiInput::Progress(input)).is_empty());
+        assert!(reduce(&mut coalesced, SessionUiInput::Progress(input)).is_empty());
     }
     assert_eq!(coalesced.progress.len(), 2);
 
-    let mut reconciliation_model = ThreadUiModel::default();
+    let mut reconciliation_model = SessionUiModel::default();
     reduce(
         &mut reconciliation_model,
-        ThreadUiInput::Snapshot(vec![ready.clone()]),
+        SessionUiInput::Snapshot(vec![ready.clone()]),
     );
-    let reconciliation_event = ThreadEventEnvelope {
-        protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-        event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        thread_id,
+    let reconciliation_event = SessionEventEnvelope {
+        protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+        event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        session_id,
         revision: ready.revision + 1,
         sequence: ready.sequence + 1,
-        event: ThreadEvent::ReconciliationRequired {
+        event: SessionEvent::ReconciliationRequired {
             run_id,
             effect_id: "event-unknown-effect".into(),
         },
@@ -766,31 +767,31 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert!(
         reduce(
             &mut reconciliation_model,
-            ThreadUiInput::Event(reconciliation_event)
+            SessionUiInput::Event(reconciliation_event)
         )
         .is_empty()
     );
     assert_eq!(
         reconciliation_model.sessions[0].lifecycle,
-        ThreadLifecycle::ReconciliationRequired
+        SessionLifecycle::ReconciliationRequired
     );
-    assert!(reduce(&mut feedback_model, ThreadUiInput::Tick).is_empty());
+    assert!(reduce(&mut feedback_model, SessionUiInput::Tick).is_empty());
 
     drop(engine);
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {thread_id}\r").as_bytes());
+    tui.write(format!("/resume {session_id}\r").as_bytes());
     assert!(tui.wait_for_output(b"public reducer session completed", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
 }
 
-fn key(code: KeyCode) -> ThreadUiInput {
-    ThreadUiInput::Key(KeyEvent::new(code, KeyModifiers::NONE))
+fn key(code: KeyCode) -> SessionUiInput {
+    SessionUiInput::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> ThreadUiInput {
-    ThreadUiInput::Key(KeyEvent::new(code, modifiers))
+fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> SessionUiInput {
+    SessionUiInput::Key(KeyEvent::new(code, modifiers))
 }
 
 #[test]
@@ -800,14 +801,14 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let run_id = run_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let created = engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             run_id,
             binding(),
             "render boundary session",
@@ -819,7 +820,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         &engine,
         &lease,
         &started,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "render:complete".into(),
             handoff: Handoff {
                 summary: "render boundary completed with a deliberately long summary".into(),
@@ -831,17 +832,17 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     );
     engine.release_lease(&lease).unwrap();
 
-    let startup = ThreadStartupPresentation {
+    let startup = SessionStartupPresentation {
         default_provider: "v2-boundary".into(),
         default_model: "v2-boundary-model".into(),
         model_catalog: vec![
-            ThreadModelOption {
+            SessionModelOption {
                 provider_name: "v2-boundary".into(),
                 model: "v2-boundary-model".into(),
                 name: Some("Boundary default".into()),
                 is_default: true,
             },
-            ThreadModelOption {
+            SessionModelOption {
                 provider_name: "secondary".into(),
                 model: "secondary-model".into(),
                 name: Some("Secondary friendly".into()),
@@ -849,9 +850,9 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             },
         ],
         workspace_display: scenario.root().display().to_string(),
-        permission_mode: ThreadPermissionMode::Ask,
+        permission_mode: SessionPermissionMode::Ask,
     };
-    let mut model = ThreadUiModel::with_startup(startup);
+    let mut model = SessionUiModel::with_startup(startup);
 
     model.composer = "/".into();
     assert!(reduce(&mut model, key(KeyCode::Up)).is_empty());
@@ -886,12 +887,12 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert!(reduce(&mut model, key(KeyCode::Up)).is_empty());
     assert!(reduce(&mut model, key(KeyCode::Esc)).is_empty());
 
-    let summary = ThreadSessionSummary {
-        thread_id,
+    let summary = SessionSummary {
+        session_id,
         title: "render boundary session".into(),
         workspace_root: scenario.root().display().to_string(),
-        parent_thread_id: None,
-        lifecycle: ThreadLifecycle::Ready,
+        parent_session_id: None,
+        lifecycle: SessionLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
         model: ready.binding.model.clone(),
         created_at_ms: now,
@@ -899,7 +900,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     };
     reduce(
         &mut model,
-        ThreadUiInput::SessionCatalogReady {
+        SessionUiInput::SessionCatalogReady {
             sessions: vec![summary],
             query: None,
         },
@@ -914,7 +915,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     }
     assert!(matches!(
         reduce(&mut model, key(KeyCode::Enter)).as_slice(),
-        [ThreadUiAction::OpenSession { thread_id: selected }] if *selected == thread_id
+        [SessionUiAction::OpenSession { session_id: selected }] if *selected == session_id
     ));
     model.session_picker = false;
 
@@ -1035,34 +1036,34 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         },
     ]);
     rich.sequence = next_sequence + 7;
-    model.active_conversation = Some(ActiveConversation::Session(thread_id));
-    reduce(&mut model, ThreadUiInput::Snapshot(vec![rich.clone()]));
+    model.active_conversation = Some(ActiveConversation::Session(session_id));
+    reduce(&mut model, SessionUiInput::Snapshot(vec![rich.clone()]));
 
-    let mut assigned_model = ThreadUiModel::with_startup(model.startup.clone().unwrap());
+    let mut assigned_model = SessionUiModel::with_startup(model.startup.clone().unwrap());
     assigned_model.composer = "assign this durable session".into();
     let assignment = reduce(&mut assigned_model, key(KeyCode::Enter));
     let assignment_id = match assignment.as_slice() {
-        [ThreadUiAction::Start { submission_id, .. }] => *submission_id,
+        [SessionUiAction::Start { submission_id, .. }] => *submission_id,
         actions => panic!("unexpected draft assignment actions: {actions:?}"),
     };
     reduce(
         &mut assigned_model,
-        ThreadUiInput::Snapshot(vec![rich.clone()]),
+        SessionUiInput::Snapshot(vec![rich.clone()]),
     );
     assert!(assigned_model.pending_submission.is_some());
     reduce(
         &mut assigned_model,
-        ThreadUiInput::SubmissionAssigned {
+        SessionUiInput::SubmissionAssigned {
             submission_id: assignment_id,
-            thread_id,
+            session_id,
         },
     );
     assert_eq!(
         assigned_model.active_conversation,
-        Some(ActiveConversation::Session(thread_id))
+        Some(ActiveConversation::Session(session_id))
     );
 
-    model.focus = latte_tui::thread::ThreadFocus::Navigation;
+    model.focus = latte_tui::session::SessionFocus::Navigation;
     for input in [
         key(KeyCode::Char('?')),
         key(KeyCode::Down),
@@ -1080,16 +1081,16 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     ] {
         assert!(reduce(&mut model, input).is_empty());
     }
-    model.focus = latte_tui::thread::ThreadFocus::Navigation;
+    model.focus = latte_tui::session::SessionFocus::Navigation;
     assert!(reduce(&mut model, key(KeyCode::Right)).is_empty());
     assert!(!model.expanded_actions.is_empty());
     let expanded_render_model = model.clone();
 
     let mut running = rich.clone();
-    running.lifecycle = ThreadLifecycle::Running;
+    running.lifecycle = SessionLifecycle::Running;
     running.active_run_id = Some(run_id);
-    running.runs.last_mut().unwrap().status = ThreadRunStatus::Running;
-    reduce(&mut model, ThreadUiInput::Snapshot(vec![running.clone()]));
+    running.runs.last_mut().unwrap().status = SessionRunStatus::Running;
+    reduce(&mut model, SessionUiInput::Snapshot(vec![running.clone()]));
 
     let mut active_keys = model.clone();
     assert!(matches!(
@@ -1098,7 +1099,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
         )
         .as_slice(),
-        [ThreadUiAction::Cancel { thread_id: selected }] if *selected == thread_id
+        [SessionUiAction::Cancel { session_id: selected }] if *selected == session_id
     ));
     assert!(
         reduce(
@@ -1107,7 +1108,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         )
         .is_empty()
     );
-    let mut idle_keys = ThreadUiModel::default();
+    let mut idle_keys = SessionUiModel::default();
     idle_keys.connection = ConnectionState::Connected;
     assert!(
         reduce(
@@ -1117,38 +1118,38 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         .is_empty()
     );
 
-    let mut busy_picker = ThreadUiModel::with_startup(model.startup.clone().unwrap());
-    busy_picker.active_conversation = Some(ActiveConversation::Session(thread_id));
+    let mut busy_picker = SessionUiModel::with_startup(model.startup.clone().unwrap());
+    busy_picker.active_conversation = Some(ActiveConversation::Session(session_id));
     reduce(
         &mut busy_picker,
-        ThreadUiInput::Snapshot(vec![rich.clone()]),
+        SessionUiInput::Snapshot(vec![rich.clone()]),
     );
     busy_picker.composer = "/model".into();
     assert!(reduce(&mut busy_picker, key(KeyCode::Enter)).is_empty());
     reduce(
         &mut busy_picker,
-        ThreadUiInput::Snapshot(vec![running.clone()]),
+        SessionUiInput::Snapshot(vec![running.clone()]),
     );
     assert!(reduce(&mut busy_picker, key(KeyCode::Enter)).is_empty());
     assert!(busy_picker.status.contains("disabled while work"));
 
-    model.focus = latte_tui::thread::ThreadFocus::Composer;
+    model.focus = latte_tui::session::SessionFocus::Composer;
     model.composer = "/new".into();
     assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
     assert!(model.status.contains("switching is disabled"));
     model.composer = "queue while running".into();
     assert!(matches!(
         reduce(&mut model, key(KeyCode::Enter)).as_slice(),
-        [ThreadUiAction::QueueFollowUp { prompt, .. }] if prompt == "queue while running"
+        [SessionUiAction::QueueFollowUp { prompt, .. }] if prompt == "queue while running"
     ));
     model.pending_submission = None;
     model.composer = "second queued prompt".into();
     assert!(matches!(
         reduce(&mut model, key(KeyCode::Enter)).as_slice(),
-        [ThreadUiAction::QueueFollowUp { prompt, .. }] if prompt == "second queued prompt"
+        [SessionUiAction::QueueFollowUp { prompt, .. }] if prompt == "second queued prompt"
     ));
 
-    reduce(&mut model, ThreadUiInput::Snapshot(vec![rich.clone()]));
+    reduce(&mut model, SessionUiInput::Snapshot(vec![rich.clone()]));
     model.queued_follow_up = None;
     model.pending_submission = None;
     model.composer = "/model".into();
@@ -1161,16 +1162,16 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let switch = reduce(&mut model, key(KeyCode::Enter));
     assert!(matches!(
         switch.as_slice(),
-        [ThreadUiAction::SwitchModel { provider_name, model, .. }]
+        [SessionUiAction::SwitchModel { provider_name, model, .. }]
             if provider_name == "secondary" && model == "secondary-model"
     ));
     let switch_id = model.pending_model_switch.as_ref().unwrap().switch_id;
     assert_eq!(
         reduce(
             &mut model,
-            ThreadUiInput::ModelSwitchCompleted { switch_id }
+            SessionUiInput::ModelSwitchCompleted { switch_id }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     model.composer = "blocked by switch".into();
     assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
@@ -1178,7 +1179,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::ModelSwitchError {
+            SessionUiInput::ModelSwitchError {
                 switch_id,
                 error: "provider rejected switch".into(),
             }
@@ -1189,53 +1190,53 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     model.pending_model_switch = None;
 
     let mut terminal = rich.clone();
-    terminal.lifecycle = ThreadLifecycle::Failed;
+    terminal.lifecycle = SessionLifecycle::Failed;
     terminal.active_run_id = None;
 
     let mut stranded_model = model.clone();
-    stranded_model.active_conversation = Some(ActiveConversation::Session(thread_id));
+    stranded_model.active_conversation = Some(ActiveConversation::Session(session_id));
     stranded_model.queued_follow_up = Some("stranded queued follow-up".into());
     stranded_model.pending_submission = Some(PendingSubmission {
         submission_id: 90,
         prompt: "stranded queued follow-up".into(),
-        thread_id: Some(thread_id),
+        session_id: Some(session_id),
         after_sequence: terminal.sequence,
     });
     reduce(
         &mut stranded_model,
-        ThreadUiInput::Snapshot(vec![terminal.clone()]),
+        SessionUiInput::Snapshot(vec![terminal.clone()]),
     );
     assert!(stranded_model.composer.contains("stranded queued"));
     assert!(stranded_model.status.contains("active child ended"));
 
-    reduce(&mut model, ThreadUiInput::Snapshot(vec![terminal.clone()]));
+    reduce(&mut model, SessionUiInput::Snapshot(vec![terminal.clone()]));
     model.composer = "cannot run terminal child".into();
     assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
     assert!(model.status.contains("no runnable child"));
     model.pending_submission = Some(PendingSubmission {
         submission_id: 91,
         prompt: "restore after pre-durable failure".into(),
-        thread_id: Some(thread_id),
+        session_id: Some(session_id),
         after_sequence: terminal.sequence,
     });
     assert_eq!(
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError { submission_id: 91 }
+            SessionUiInput::SubmissionError { submission_id: 91 }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
-    reduce(&mut model, ThreadUiInput::Snapshot(vec![terminal]));
+    reduce(&mut model, SessionUiInput::Snapshot(vec![terminal]));
     assert!(model.composer.contains("restore after"));
 
-    model.reconciliation_confirmation = Some((thread_id, "render-effect".into()));
+    model.reconciliation_confirmation = Some((session_id, "render-effect".into()));
     assert!(reduce(&mut model, key(KeyCode::Char('d'))).is_empty());
     assert!(model.reconciliation_confirmation.is_none());
     model.connection = ConnectionState::Disconnected;
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
+            SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
                 run_id,
                 text: "ignored while disconnected".into(),
             })
@@ -1247,18 +1248,18 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert!(
         reduce(
             &mut model,
-            ThreadUiInput::Paste("wide 界\tline\nnext".into())
+            SessionUiInput::Paste("wide 界\tline\nnext".into())
         )
         .is_empty()
     );
     model.pending_submission = Some(PendingSubmission {
         submission_id: 44,
         prompt: "pending".into(),
-        thread_id: Some(thread_id),
+        session_id: Some(session_id),
         after_sequence: ready.sequence,
     });
     let before = model.composer.clone();
-    reduce(&mut model, ThreadUiInput::Paste("blocked".into()));
+    reduce(&mut model, SessionUiInput::Paste("blocked".into()));
     assert_eq!(model.composer, format!("{before}blocked"));
     assert!(reduce(&mut model, key(KeyCode::Enter)).is_empty());
     assert!(model.pending_submission.is_some());
@@ -1268,10 +1269,10 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     render_models.push(expanded_render_model);
 
     let mut permission = rich.clone();
-    permission.lifecycle = ThreadLifecycle::WaitingPermission;
+    permission.lifecycle = SessionLifecycle::WaitingPermission;
     permission.active_run_id = Some(run_id);
-    permission.runs.last_mut().unwrap().status = ThreadRunStatus::WaitingPermission;
-    permission.pending = Some(ThreadPendingRequest::Permission {
+    permission.runs.last_mut().unwrap().status = SessionRunStatus::WaitingPermission;
+    permission.pending = Some(SessionPendingRequest::Permission {
         run_id,
         request_id: "render-effect".into(),
         description: "read the renderer before editing it".into(),
@@ -1280,13 +1281,13 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let mut permission_model = model.clone();
     reduce(
         &mut permission_model,
-        ThreadUiInput::Snapshot(vec![permission]),
+        SessionUiInput::Snapshot(vec![permission]),
     );
     assert!(reduce(&mut permission_model, key(KeyCode::Enter)).is_empty());
-    assert!(reduce(&mut permission_model, ThreadUiInput::FrameRendered).is_empty());
+    assert!(reduce(&mut permission_model, SessionUiInput::FrameRendered).is_empty());
     assert!(matches!(
         reduce(&mut permission_model, key(KeyCode::Char('d'))).as_slice(),
-        [ThreadUiAction::ResolvePermission { allow: false, .. }]
+        [SessionUiAction::ResolvePermission { allow: false, .. }]
     ));
     assert!(matches!(
         reduce(
@@ -1294,14 +1295,14 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         )
         .as_slice(),
-        [ThreadUiAction::ResolvePermission { allow: true, .. }]
+        [SessionUiAction::ResolvePermission { allow: true, .. }]
     ));
     render_models.push(permission_model);
 
     let mut waiting_input = running.clone();
-    waiting_input.lifecycle = ThreadLifecycle::WaitingInput;
-    waiting_input.runs.last_mut().unwrap().status = ThreadRunStatus::WaitingInput;
-    waiting_input.pending = Some(ThreadPendingRequest::Input {
+    waiting_input.lifecycle = SessionLifecycle::WaitingInput;
+    waiting_input.runs.last_mut().unwrap().status = SessionRunStatus::WaitingInput;
+    waiting_input.pending = Some(SessionPendingRequest::Input {
         run_id,
         request_id: "render-input".into(),
         prompt: "Which rendering tier should be verified?".into(),
@@ -1310,7 +1311,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let mut input_model = model.clone();
     reduce(
         &mut input_model,
-        ThreadUiInput::Snapshot(vec![waiting_input.clone()]),
+        SessionUiInput::Snapshot(vec![waiting_input.clone()]),
     );
     assert!(reduce(&mut input_model, key(KeyCode::Char('x'))).is_empty());
     assert!(
@@ -1325,7 +1326,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let input_actions = reduce(&mut input_model, key(KeyCode::Enter));
     assert!(matches!(
         input_actions.as_slice(),
-        [ThreadUiAction::ProvideInput { value, .. }] if value.contains("wide")
+        [SessionUiAction::ProvideInput { value, .. }] if value.contains("wide")
     ));
     assert!(reduce(&mut input_model, key(KeyCode::Char('z'))).is_empty());
     let input_submission_id = input_model
@@ -1336,7 +1337,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert!(
         reduce(
             &mut input_model,
-            ThreadUiInput::InputSubmissionCompleted {
+            SessionUiInput::InputSubmissionCompleted {
                 submission_id: input_submission_id,
             }
         )
@@ -1345,11 +1346,11 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     assert_eq!(
         reduce(
             &mut input_model,
-            ThreadUiInput::InputSubmissionError {
+            SessionUiInput::InputSubmissionError {
                 submission_id: input_submission_id,
             }
         ),
-        vec![ThreadUiAction::RefreshSnapshots]
+        vec![SessionUiAction::RefreshSnapshots]
     );
     let pending_input = input_model.pending_input_submission.clone().unwrap();
     let mut durable_input = waiting_input;
@@ -1359,20 +1360,20 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         sequence: durable_input.sequence,
         run_id: Some(run_id),
         kind: TranscriptKind::User,
-        text: latte_core::redact_thread_text(&pending_input.value),
+        text: latte_core::redact_session_text(&pending_input.value),
         payload: None,
         source_key: format!("{run_id}:input:{}:card", pending_input.request_id),
         created_at_ms: now + 12,
     });
     reduce(
         &mut input_model,
-        ThreadUiInput::Snapshot(vec![durable_input]),
+        SessionUiInput::Snapshot(vec![durable_input]),
     );
     assert!(input_model.pending_input_submission.is_none());
     render_models.push(input_model);
 
     let mut reconciliation = rich.clone();
-    reconciliation.lifecycle = ThreadLifecycle::ReconciliationRequired;
+    reconciliation.lifecycle = SessionLifecycle::ReconciliationRequired;
     reconciliation.active_run_id = None;
     reconciliation.transcript.entries.push(TranscriptEntry {
         entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
@@ -1391,9 +1392,9 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let mut reconciliation_model = model.clone();
     reduce(
         &mut reconciliation_model,
-        ThreadUiInput::Snapshot(vec![reconciliation]),
+        SessionUiInput::Snapshot(vec![reconciliation]),
     );
-    reconciliation_model.reconciliation_confirmation = Some((thread_id, "render-effect".into()));
+    reconciliation_model.reconciliation_confirmation = Some((session_id, "render-effect".into()));
     assert!(reduce(&mut reconciliation_model, key(KeyCode::Enter)).is_empty());
     assert!(matches!(
         reduce(
@@ -1401,22 +1402,22 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         )
         .as_slice(),
-        [ThreadUiAction::ReconcileUnknown { effect_id, .. }] if effect_id == "render-effect"
+        [SessionUiAction::ReconcileUnknown { effect_id, .. }] if effect_id == "render-effect"
     ));
     render_models.push(reconciliation_model);
 
     let mut running_model = model.clone();
-    reduce(&mut running_model, ThreadUiInput::Snapshot(vec![running]));
+    reduce(&mut running_model, SessionUiInput::Snapshot(vec![running]));
     reduce(
         &mut running_model,
-        ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
+        SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
             run_id,
             text: format!("streamed assistant detail{}", "x".repeat(70_000)),
         }),
     );
     reduce(
         &mut running_model,
-        ThreadUiInput::Progress(ThreadTransientProgress::ToolProgress {
+        SessionUiInput::Progress(SessionTransientProgress::ToolProgress {
             run_id,
             name: "read_file".into(),
             detail: "reading src/render.rs".into(),
@@ -1425,7 +1426,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     render_models.push(running_model);
 
     let startup = model.startup.clone().unwrap();
-    let mut idle_model = ThreadUiModel::with_startup(startup.clone());
+    let mut idle_model = SessionUiModel::with_startup(startup.clone());
     idle_model.composer = "wide 界\tcomposer\nsecond row".into();
     render_models.push(idle_model.clone());
 
@@ -1438,15 +1439,15 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     stale_draft.connection = ConnectionState::SnapshotRequired;
     render_models.push(stale_draft);
 
-    let mut slash_model = ThreadUiModel::with_startup(startup.clone());
+    let mut slash_model = SessionUiModel::with_startup(startup.clone());
     slash_model.composer = "/".into();
     render_models.push(slash_model);
 
-    let mut picker_model = ThreadUiModel::with_startup(startup);
-    picker_model.active_conversation = Some(ActiveConversation::Session(thread_id));
+    let mut picker_model = SessionUiModel::with_startup(startup);
+    picker_model.active_conversation = Some(ActiveConversation::Session(session_id));
     reduce(
         &mut picker_model,
-        ThreadUiInput::Snapshot(vec![rich.clone()]),
+        SessionUiInput::Snapshot(vec![rich.clone()]),
     );
     picker_model.composer = "/model".into();
     assert!(reduce(&mut picker_model, key(KeyCode::Enter)).is_empty());
@@ -1458,7 +1459,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|frame| latte_tui::thread::render(frame, &render_model))
+                .draw(|frame| latte_tui::session::render(frame, &render_model))
                 .unwrap();
         }
     }
@@ -1478,7 +1479,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|frame| latte_tui::thread::render(frame, &model))
+                .draw(|frame| latte_tui::session::render(frame, &model))
                 .unwrap();
             assert!(!terminal.backend().buffer().content().is_empty());
         }
@@ -1487,7 +1488,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {thread_id}\r").as_bytes());
+    tui.write(format!("/resume {session_id}\r").as_bytes());
     assert!(tui.wait_for_visible_text("render boundary completed", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
@@ -1495,7 +1496,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed() {
+fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
@@ -1510,26 +1511,26 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     assert_eq!(engine.tool_descriptors().len(), 3);
     assert!(format!("{engine:?}").contains("EngineHandle"));
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let run_id = run_id();
 
     assert!(matches!(
-        engine.create_thread_v2(thread_id, run_id, binding(), " \n ", now),
+        engine.create_session_v2(session_id, run_id, binding(), " \n ", now),
         Err(StorageError::InvalidData(message)) if message.contains("prompt must not be empty")
     ));
     let mut invalid_binding = binding();
     invalid_binding.provider_name.clear();
     assert!(matches!(
-        engine.create_thread_v2(thread_id, run_id, invalid_binding, "invalid binding", now),
+        engine.create_session_v2(session_id, run_id, invalid_binding, "invalid binding", now),
         Err(StorageError::InvalidData(message)) if message.contains("provider_name")
     ));
-    let foreign_thread = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let foreign_session = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let foreign_lease = engine
-        .acquire_thread_lease(foreign_thread, now, 60_000)
+        .acquire_session_lease(foreign_session, now, 60_000)
         .unwrap();
     assert!(matches!(
-        engine.create_started_thread_v2_snapshot(
-            thread_id,
+        engine.create_started_session_v2_snapshot(
+            session_id,
             run_id,
             binding(),
             "wrong scope",
@@ -1540,10 +1541,10 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         Err(StorageError::LeaseLost)
     ));
     engine.release_lease(&foreign_lease).unwrap();
-    let expired = engine.acquire_thread_lease(thread_id, now, 1).unwrap();
+    let expired = engine.acquire_session_lease(session_id, now, 1).unwrap();
     assert!(matches!(
-        engine.create_started_thread_v2_snapshot(
-            thread_id,
+        engine.create_started_session_v2_snapshot(
+            session_id,
             run_id,
             binding(),
             "expired authority",
@@ -1554,23 +1555,23 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         Err(StorageError::LeaseLost)
     ));
     let lease = engine
-        .acquire_thread_lease(thread_id, now + 2, 60_000)
+        .acquire_session_lease(session_id, now + 2, 60_000)
         .unwrap();
     let running = engine
-        .create_started_thread_v2_snapshot(
-            thread_id,
+        .create_started_session_v2_snapshot(
+            session_id,
             run_id,
             binding(),
-            "valid atomic thread",
+            "valid atomic session",
             &lease,
             now + 3,
             None,
         )
         .unwrap();
-    assert_eq!(running.lifecycle, ThreadLifecycle::Running);
+    assert_eq!(running.lifecycle, SessionLifecycle::Running);
     assert!(matches!(
-        engine.create_thread_follow_up_v2(
-            thread_id,
+        engine.create_session_follow_up_v2(
+            session_id,
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             running.revision,
             "",
@@ -1579,59 +1580,55 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         Err(StorageError::InvalidData(message)) if message.contains("follow-up must not be empty")
     ));
     assert!(matches!(
-        engine.create_thread_follow_up_v2(
-            thread_id,
+        engine.create_session_follow_up_v2(
+            session_id,
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             running.revision,
             "not ready",
             now + 4,
         ),
-        Err(StorageError::InvalidData(message)) if message.contains("ready thread")
+        Err(StorageError::InvalidData(message)) if message.contains("ready session")
     ));
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             running.revision,
             &binding(),
             &lease,
             now + 4,
         ),
-        Err(StorageError::InvalidData(message)) if message.contains("ready thread")
+        Err(StorageError::InvalidData(message)) if message.contains("ready session")
     ));
     assert!(
         engine
-            .list_thread_sessions_v2_for_workspace(scenario.root().to_str().unwrap(), 0)
+            .list_session_summaries_for_workspace(scenario.root().to_str().unwrap(), 0)
             .unwrap()
             .is_empty()
     );
     assert!(
         engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(
-                scenario.root().to_str().unwrap(),
-                "",
-                100,
-            )
+            .find_sessions_by_exact_title_for_workspace(scenario.root().to_str().unwrap(), "", 100,)
             .unwrap()
             .is_empty()
     );
     assert!(matches!(
-        engine.thread_snapshot_v2(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        engine.session_snapshot_v2(
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             None,
             10,
         ),
-        Err(StorageError::ThreadNotFound(_))
+        Err(StorageError::SessionNotFound(_))
     ));
     assert!(
         engine
-            .thread_session_v2(ThreadId::from_uuid(
+            .session_v2(SessionId::from_uuid(
                 SystemIdSource::default().next_uuid_v7()
             ))
             .unwrap()
             .is_none()
     );
     assert!(matches!(
-        engine.thread_run_changed_files(RunId::from_uuid(
+        engine.session_run_changed_files(RunId::from_uuid(
             SystemIdSource::default().next_uuid_v7()
         )),
         Err(StorageError::InvalidData(message)) if message.contains("baseline")
@@ -1641,7 +1638,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         &engine,
         &lease,
         &running,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "preconditions:complete".into(),
             handoff: Handoff {
                 summary: "precondition parent complete".into(),
@@ -1652,20 +1649,20 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         now + 5,
     );
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             ready.revision.saturating_add(1),
             &binding(),
             &lease,
             now + 6,
         ),
-        Err(StorageError::StaleThreadRevision { .. })
+        Err(StorageError::StaleSessionRevision { .. })
     ));
     let mut invalid_binding = binding();
     invalid_binding.model = "bad\nmodel".into();
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             ready.revision,
             &invalid_binding,
             &lease,
@@ -1674,15 +1671,15 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         Err(StorageError::InvalidData(message)) if message.contains("model")
     ));
     let wrong_lease = engine
-        .acquire_thread_lease(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        .acquire_session_lease(
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             now + 6,
             60_000,
         )
         .unwrap();
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             ready.revision,
             &binding(),
             &wrong_lease,
@@ -1695,34 +1692,34 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     alternate.provider_name = "alternate".into();
     alternate.model = "alternate-model".into();
     let switched = engine
-        .switch_thread_binding_v2(thread_id, ready.revision, &alternate, &lease, now + 7)
+        .switch_session_binding_v2(session_id, ready.revision, &alternate, &lease, now + 7)
         .unwrap();
     assert_eq!(switched.binding.model, "alternate-model");
 
     assert!(matches!(
-        engine.create_thread_follow_up_v2(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        engine.create_session_follow_up_v2(
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             0,
-            "missing thread",
+            "missing session",
             now + 8,
         ),
-        Err(StorageError::ThreadNotFound(_))
+        Err(StorageError::SessionNotFound(_))
     ));
     assert!(matches!(
-        engine.create_thread_follow_up_v2(
-            thread_id,
+        engine.create_session_follow_up_v2(
+            session_id,
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             switched.revision.saturating_add(1),
             "stale follow-up",
             now + 8,
         ),
-        Err(StorageError::StaleThreadRevision { .. })
+        Err(StorageError::StaleSessionRevision { .. })
     ));
     assert!(matches!(
-        engine.create_started_thread_follow_up_v2(
+        engine.create_started_session_follow_up_v2(
             None,
-            thread_id,
+            session_id,
             RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             switched.revision,
             "wrong scoped follow-up",
@@ -1733,9 +1730,9 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     ));
     let child_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let child = engine
-        .create_started_thread_follow_up_v2(
+        .create_started_session_follow_up_v2(
             None,
-            thread_id,
+            session_id,
             child_id,
             switched.revision,
             "valid atomic follow-up",
@@ -1751,7 +1748,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     assert_eq!(child.runs.len(), 2);
     assert_eq!(
         engine
-            .thread_snapshot_tail_v2(thread_id, usize::MAX)
+            .session_snapshot_tail_v2(session_id, usize::MAX)
             .unwrap()
             .runs
             .len(),
@@ -1775,7 +1772,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .unwrap();
     assert_eq!(
         jsonl_engine
-            .thread_snapshot_tail_v2(thread_id, 500)
+            .session_snapshot_tail_v2(session_id, 500)
             .unwrap()
             .runs
             .len(),
@@ -1896,7 +1893,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     for corruption in corruptions {
         std::fs::write(session_file, corruption).unwrap();
         assert!(matches!(
-            jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+            jsonl_engine.session_snapshot_tail_v2(session_id, 500),
             Err(StorageError::InvalidData(_))
         ));
         std::fs::write(session_file, &original).unwrap();
@@ -1906,10 +1903,10 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         rusqlite::Connection::open(scenario.database_path())
             .unwrap()
             .execute(
-                "INSERT INTO conversation_outbox(thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
                  VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
                 rusqlite::params![
-                    thread_id.to_string(),
+                    session_id.to_string(),
                     i64::try_from(entry.sequence).unwrap(),
                     entry.entry_id.to_string(),
                     entry.source_key,
@@ -1923,8 +1920,8 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         rusqlite::Connection::open(scenario.database_path())
             .unwrap()
             .execute(
-                "DELETE FROM conversation_outbox WHERE thread_id=?1",
-                [thread_id.to_string()],
+                "DELETE FROM conversation_outbox WHERE session_id=?1",
+                [session_id.to_string()],
             )
             .unwrap();
     };
@@ -1940,7 +1937,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     };
     insert_outbox(&conflicting);
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     clear_outbox();
@@ -1963,7 +1960,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     };
     insert_outbox(&earlier);
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     clear_outbox();
@@ -1988,7 +1985,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     };
     insert_outbox(&oversized_entry);
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     clear_outbox();
@@ -1998,7 +1995,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     oversized.set_len(64 * 1024 * 1024 + 1).unwrap();
     drop(oversized);
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     std::fs::write(session_file, &original).unwrap();
@@ -2008,7 +2005,7 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     std::fs::remove_file(session_file).unwrap();
     std::os::unix::fs::symlink(&symlink_target, session_file).unwrap();
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     std::fs::remove_file(session_file).unwrap();
@@ -2017,12 +2014,16 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
     std::fs::remove_file(session_file).unwrap();
     std::fs::create_dir(session_file).unwrap();
     assert!(matches!(
-        jsonl_engine.thread_snapshot_tail_v2(thread_id, 500),
+        jsonl_engine.session_snapshot_tail_v2(session_id, 500),
         Err(StorageError::InvalidData(_))
     ));
     std::fs::remove_dir(session_file).unwrap();
     std::fs::write(session_file, &original).unwrap();
-    assert!(jsonl_engine.thread_snapshot_tail_v2(thread_id, 500).is_ok());
+    assert!(
+        jsonl_engine
+            .session_snapshot_tail_v2(session_id, 500)
+            .is_ok()
+    );
 
     let foreign_workspace = tempfile::tempdir().unwrap();
     std::fs::create_dir(foreign_workspace.path().join(".git")).unwrap();
@@ -2033,11 +2034,11 @@ fn public_engine_thread_creation_catalog_and_binding_preconditions_fail_closed()
         .build()
         .unwrap();
     assert!(matches!(
-        foreign_engine.rename_thread_session_v2(thread_id, "foreign rename"),
+        foreign_engine.rename_session_v2(session_id, "foreign rename"),
         Err(StorageError::InvalidData(message)) if message.contains("current workspace")
     ));
     assert!(matches!(
-        foreign_engine.thread_snapshot_tail_v2(thread_id, 1),
+        foreign_engine.session_snapshot_tail_v2(session_id, 1),
         Err(StorageError::InvalidData(message)) if message.contains("foreign workspace")
     ));
 
@@ -2108,14 +2109,14 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let input_thread_id = thread_id();
+    let input_session_id = session_id();
     let lease = engine
-        .acquire_thread_lease(input_thread_id, now, 120_000)
+        .acquire_session_lease(input_session_id, now, 120_000)
         .unwrap();
     let input_run_id = run_id();
     let input = engine
-        .create_thread_v2(
-            input_thread_id,
+        .create_session_v2(
+            input_session_id,
             input_run_id,
             binding(),
             "boundary waiting input",
@@ -2127,7 +2128,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
         &engine,
         &lease,
         &input,
-        CommitThreadRunUpdate::RequestInput {
+        CommitSessionRunUpdate::RequestInput {
             source_key: "boundary:input:request".into(),
             request: PendingInput {
                 request_id: "boundary-input-request".into(),
@@ -2136,10 +2137,10 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
         },
         now + 3,
     );
-    assert_eq!(input.lifecycle, ThreadLifecycle::WaitingInput);
+    assert_eq!(input.lifecycle, SessionLifecycle::WaitingInput);
     let mut input_tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(input_tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    input_tui.write(format!("/resume {input_thread_id}\r").as_bytes());
+    input_tui.write(format!("/resume {input_session_id}\r").as_bytes());
     assert!(
         input_tui.wait_for_output(b"Input required", Duration::from_secs(5)),
         "waiting input projection was not rendered: {}",
@@ -2150,7 +2151,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     drop(engine);
     input_tui.write(CTRL_C);
     assert!(wait_until(Duration::from_secs(5), || {
-        let shown = scenario.output(&["--json", "show", &input_thread_id.to_string()], |_| {});
+        let shown = scenario.output(&["--json", "show", &input_session_id.to_string()], |_| {});
         shown.status.success()
             && json(&shown)["data"]["session"]["lifecycle"] == "failed"
             && json(&shown)["data"]["session"]["runs"]
@@ -2159,7 +2160,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     }));
     input_tui.write(F10);
     assert!(input_tui.finish(Duration::from_secs(5)).0.success());
-    let input_shown = scenario.output(&["--json", "show", &input_thread_id.to_string()], |_| {});
+    let input_shown = scenario.output(&["--json", "show", &input_session_id.to_string()], |_| {});
     assert!(input_shown.status.success());
     assert_eq!(
         json(&input_shown)["data"]["session"]["runs"][0]["failure_code"],
@@ -2179,14 +2180,14 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let permission_now = latte_core::wall_time_ms();
-    let permission_thread_id = thread_id();
+    let permission_session_id = session_id();
     let lease = engine
-        .acquire_thread_lease(permission_thread_id, permission_now, 120_000)
+        .acquire_session_lease(permission_session_id, permission_now, 120_000)
         .unwrap();
     let permission_run_id = run_id();
     let permission = engine
-        .create_thread_v2(
-            permission_thread_id,
+        .create_session_v2(
+            permission_session_id,
             permission_run_id,
             binding(),
             "boundary permission denial",
@@ -2213,15 +2214,15 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
         }),
         permission_now + 3,
     );
-    assert_eq!(prepared.policy, ThreadEffectPolicy::Ask);
+    assert_eq!(prepared.policy, SessionEffectPolicy::Ask);
     assert_eq!(
         prepared.snapshot.lifecycle,
-        ThreadLifecycle::WaitingPermission
+        SessionLifecycle::WaitingPermission
     );
     assert!(!scenario.root().join("must-not-exist.txt").exists());
     let mut permission_tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(permission_tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    permission_tui.write(format!("/resume {permission_thread_id}\r").as_bytes());
+    permission_tui.write(format!("/resume {permission_session_id}\r").as_bytes());
     assert!(permission_tui.wait_for_output(b"Permission required", Duration::from_secs(5)));
     assert!(permission_tui.wait_for_output(b"must-not-exist.txt", Duration::from_secs(5)));
     engine.release_lease(&lease).unwrap();
@@ -2229,7 +2230,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     permission_tui.write(b"d");
     assert!(wait_until(Duration::from_secs(5), || {
         let shown = scenario.output(
-            &["--json", "show", &permission_thread_id.to_string()],
+            &["--json", "show", &permission_session_id.to_string()],
             |_| {},
         );
         shown.status.success()
@@ -2246,7 +2247,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     assert!(permission_tui.finish(Duration::from_secs(5)).0.success());
 
     let shown = scenario.output(
-        &["--json", "show", &permission_thread_id.to_string()],
+        &["--json", "show", &permission_session_id.to_string()],
         |_| {},
     );
     assert!(shown.status.success());
@@ -2281,15 +2282,15 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let effect_thread_id = thread_id();
+    let effect_session_id = session_id();
     let effect_lease = engine
-        .acquire_thread_lease(effect_thread_id, now, 120_000)
+        .acquire_session_lease(effect_session_id, now, 120_000)
         .unwrap();
 
     let effect_run_id = run_id();
     let effect = engine
-        .create_thread_v2(
-            effect_thread_id,
+        .create_session_v2(
+            effect_session_id,
             effect_run_id,
             binding(),
             "boundary observed failure",
@@ -2312,7 +2313,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         serde_json::json!({"path":"boundary-read.txt"}),
         now + 3,
     );
-    assert_eq!(prepared.policy, ThreadEffectPolicy::Allow);
+    assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
     let started = start_effect(
         &engine,
         &effect_lease,
@@ -2321,11 +2322,11 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         now + 4,
     );
     let observed = engine
-        .observe_thread_effect(
+        .observe_session_effect(
             &started,
             "boundary:effect:observe-failed".into(),
             command_id(),
-            ThreadEffectObservedValue {
+            SessionEffectObservedValue {
                 result: r#"{"error":"certified boundary read failure"}"#.into(),
                 payload: Some(serde_json::json!({
                     "tool_call_id":"call-boundary-observed-failure",
@@ -2342,7 +2343,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &effect_lease,
         &observed.snapshot,
-        CommitThreadRunUpdate::Fail {
+        CommitSessionRunUpdate::Fail {
             source_key: "boundary:effect:terminal".into(),
             failure: RunFailure {
                 code: FailureCode::RuntimeFailed,
@@ -2352,16 +2353,16 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         },
         now + 6,
     );
-    assert_eq!(effect_failed.lifecycle, ThreadLifecycle::Failed);
+    assert_eq!(effect_failed.lifecycle, SessionLifecycle::Failed);
 
-    let tree_thread_id = thread_id();
+    let tree_session_id = session_id();
     let tree_lease = engine
-        .acquire_thread_lease(tree_thread_id, now + 7, 120_000)
+        .acquire_session_lease(tree_session_id, now + 7, 120_000)
         .unwrap();
     let parent_run_id = run_id();
     let parent = engine
-        .create_thread_v2(
-            tree_thread_id,
+        .create_session_v2(
+            tree_session_id,
             parent_run_id,
             binding(),
             "boundary immutable parent",
@@ -2379,7 +2380,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &tree_lease,
         &parent,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "boundary:parent:complete".into(),
             handoff: Handoff {
                 summary: "boundary parent completed".into(),
@@ -2389,12 +2390,12 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         },
         now + 9,
     );
-    assert_eq!(parent.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(parent.lifecycle, SessionLifecycle::Ready);
     let immutable_parent = parent.runs[0].clone();
     let interrupted_run_id = run_id();
     let child = engine
-        .create_thread_follow_up_v2(
-            tree_thread_id,
+        .create_session_follow_up_v2(
+            tree_session_id,
             interrupted_run_id,
             parent.revision,
             "boundary interrupted follow-up",
@@ -2412,24 +2413,24 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &tree_lease,
         &child,
-        CommitThreadRunUpdate::Interrupt {
+        CommitSessionRunUpdate::Interrupt {
             source_key: "boundary:child:interrupt".into(),
             reconciliation_effect_id: None,
         },
         now + 12,
     );
-    assert_eq!(child.lifecycle, ThreadLifecycle::Interrupted);
+    assert_eq!(child.lifecycle, SessionLifecycle::Interrupted);
     assert_eq!(child.runs[0], immutable_parent);
     assert_eq!(child.runs[1].parent_run_id, Some(parent_run_id));
 
-    let verification_thread_id = thread_id();
+    let verification_session_id = session_id();
     let verification_lease = engine
-        .acquire_thread_lease(verification_thread_id, now + 13, 120_000)
+        .acquire_session_lease(verification_session_id, now + 13, 120_000)
         .unwrap();
     let verification_run_id = run_id();
     let verification = engine
-        .create_thread_v2(
-            verification_thread_id,
+        .create_session_v2(
+            verification_session_id,
             verification_run_id,
             binding(),
             "boundary failed verification",
@@ -2445,7 +2446,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     );
     let (_, verification_revision) = active_run(&verification);
     engine
-        .record_thread_verification(
+        .record_session_verification(
             verification_run_id,
             verification_revision,
             "boundary-verification-failed",
@@ -2462,7 +2463,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         )
         .unwrap();
     let completion_error = engine
-        .complete_thread_verified(
+        .complete_session_verified(
             &verification,
             "must not complete".into(),
             "boundary-verification-failed".into(),
@@ -2480,7 +2481,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &verification_lease,
         &verification,
-        CommitThreadRunUpdate::Fail {
+        CommitSessionRunUpdate::Fail {
             source_key: "boundary:verification:terminal".into(),
             failure: RunFailure {
                 code: FailureCode::VerificationFailed,
@@ -2490,7 +2491,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         },
         now + 17,
     );
-    assert_eq!(verification_failed.lifecycle, ThreadLifecycle::Failed);
+    assert_eq!(verification_failed.lifecycle, SessionLifecycle::Failed);
     engine.release_lease(&effect_lease).unwrap();
     engine.release_lease(&tree_lease).unwrap();
     engine.release_lease(&verification_lease).unwrap();
@@ -2498,7 +2499,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {verification_thread_id}\r").as_bytes());
+    tui.write(format!("/resume {verification_session_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(
             b"boundary verification failed with exit 9",
@@ -2510,7 +2511,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
 
-    let effect_shown = scenario.output(&["--json", "show", &effect_thread_id.to_string()], |_| {});
+    let effect_shown = scenario.output(&["--json", "show", &effect_session_id.to_string()], |_| {});
     assert!(effect_shown.status.success());
     let effect_session = json(&effect_shown)["data"]["session"].clone();
     assert_eq!(effect_session["lifecycle"], "failed");
@@ -2524,7 +2525,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
                 && entry["text"] == "boundary observed effect failed")
     );
 
-    let tree_shown = scenario.output(&["--json", "show", &tree_thread_id.to_string()], |_| {});
+    let tree_shown = scenario.output(&["--json", "show", &tree_session_id.to_string()], |_| {});
     assert!(tree_shown.status.success());
     let tree_session = json(&tree_shown)["data"]["session"].clone();
     assert_eq!(tree_session["lifecycle"], "interrupted");
@@ -2544,7 +2545,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     );
 
     let verification_shown = scenario.output(
-        &["--json", "show", &verification_thread_id.to_string()],
+        &["--json", "show", &verification_session_id.to_string()],
         |_| {},
     );
     assert!(verification_shown.status.success());
@@ -2576,14 +2577,14 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let run_id = run_id();
     let initial = engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             run_id,
             binding(),
             "boundary command and lease fencing",
@@ -2592,15 +2593,15 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         .unwrap();
     let started = start(&engine, &lease, &initial, "boundary:fence:start", now + 2);
     let (_, started_run_revision) = active_run(&started);
-    let fixed_request = ThreadCommitRequest {
-        thread_id,
+    let fixed_request = SessionCommitRequest {
+        session_id,
         run_id,
-        expected_thread_revision: started.revision,
+        expected_session_revision: started.revision,
         expected_run_revision: started_run_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitThreadRunUpdate::AppendTranscript {
+        update: CommitSessionRunUpdate::AppendTranscript {
             source_key: "boundary:fence:history:00".into(),
             kind: TranscriptKind::System,
             text: "boundary history 00".into(),
@@ -2608,16 +2609,16 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     let first = engine
-        .commit_thread_run_update(fixed_request.clone(), &lease, now + 3)
+        .commit_session_run_update(fixed_request.clone(), &lease, now + 3)
         .unwrap();
     assert_eq!(first.snapshot.revision, started.revision + 1);
     assert_eq!(first.snapshot.sequence, started.sequence + 1);
 
     let replay = engine
-        .commit_thread_run_update(fixed_request.clone(), &lease, now + 4)
+        .commit_session_run_update(fixed_request.clone(), &lease, now + 4)
         .unwrap();
     assert_eq!(replay, first);
-    let after_replay = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_replay = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_replay.revision, first.snapshot.revision);
     assert_eq!(after_replay.sequence, first.snapshot.sequence);
     assert_eq!(
@@ -2631,7 +2632,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     );
 
     let mut conflicting_replay = fixed_request.clone();
-    let CommitThreadRunUpdate::AppendTranscript { text, payload, .. } =
+    let CommitSessionRunUpdate::AppendTranscript { text, payload, .. } =
         &mut conflicting_replay.update
     else {
         unreachable!()
@@ -2639,39 +2640,39 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     *text = "conflicting replay must not persist".into();
     *payload = Some(serde_json::json!({"ordinal":0,"stable":false}));
     assert!(matches!(
-        engine.commit_thread_run_update(conflicting_replay, &lease, now + 5),
-        Err(StorageError::ThreadCommandReplayMismatch)
+        engine.commit_session_run_update(conflicting_replay, &lease, now + 5),
+        Err(StorageError::SessionCommandReplayMismatch)
     ));
 
     let (_, current_run_revision) = active_run(&first.snapshot);
-    let stale_thread = ThreadCommitRequest {
-        thread_id,
+    let stale_session = SessionCommitRequest {
+        session_id,
         run_id,
-        expected_thread_revision: first.snapshot.revision - 1,
+        expected_session_revision: first.snapshot.revision - 1,
         expected_run_revision: current_run_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitThreadRunUpdate::AppendTranscript {
-            source_key: "boundary:fence:stale-thread".into(),
+        update: CommitSessionRunUpdate::AppendTranscript {
+            source_key: "boundary:fence:stale-session".into(),
             kind: TranscriptKind::System,
-            text: "stale thread revision must not persist".into(),
+            text: "stale session revision must not persist".into(),
             payload: None,
         },
     };
     assert!(matches!(
-        engine.commit_thread_run_update(stale_thread, &lease, now + 6),
-        Err(StorageError::StaleThreadRevision { .. })
+        engine.commit_session_run_update(stale_session, &lease, now + 6),
+        Err(StorageError::StaleSessionRevision { .. })
     ));
-    let stale_run = ThreadCommitRequest {
-        thread_id,
+    let stale_run = SessionCommitRequest {
+        session_id,
         run_id,
-        expected_thread_revision: first.snapshot.revision,
+        expected_session_revision: first.snapshot.revision,
         expected_run_revision: current_run_revision - 1,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitThreadRunUpdate::AppendTranscript {
+        update: CommitSessionRunUpdate::AppendTranscript {
             source_key: "boundary:fence:stale-run".into(),
             kind: TranscriptKind::System,
             text: "stale run revision must not persist".into(),
@@ -2679,15 +2680,15 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     assert!(matches!(
-        engine.commit_thread_run_update(stale_run, &lease, now + 7),
+        engine.commit_session_run_update(stale_run, &lease, now + 7),
         Err(StorageError::StaleRevision { .. })
     ));
-    let after_rejections = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_rejections = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_rejections.revision, first.snapshot.revision);
     assert_eq!(after_rejections.sequence, first.snapshot.sequence);
     assert!(!after_rejections.transcript.entries.iter().any(|entry| {
         entry.text == "conflicting replay must not persist"
-            || entry.text == "stale thread revision must not persist"
+            || entry.text == "stale session revision must not persist"
             || entry.text == "stale run revision must not persist"
     }));
 
@@ -2697,7 +2698,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
             &engine,
             &lease,
             &current,
-            CommitThreadRunUpdate::AppendTranscript {
+            CommitSessionRunUpdate::AppendTranscript {
                 source_key: format!("boundary:fence:history:{ordinal:02}"),
                 kind: TranscriptKind::System,
                 text: format!("boundary history {ordinal:02}"),
@@ -2710,14 +2711,14 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let authoritative_sequence = current.sequence;
     let (_, authoritative_run_revision) = active_run(&current);
 
-    let zero_limit = engine.thread_snapshot_v2(thread_id, None, 0).unwrap();
+    let zero_limit = engine.session_snapshot_v2(session_id, None, 0).unwrap();
     assert_eq!(zero_limit.transcript.entries.len(), 1);
     assert!(zero_limit.transcript.has_more);
     let mut after = None;
     let mut texts = Vec::new();
     let mut pages = 0;
     loop {
-        let page = engine.thread_snapshot_v2(thread_id, after, 3).unwrap();
+        let page = engine.session_snapshot_v2(session_id, after, 3).unwrap();
         pages += 1;
         texts.extend(
             page.transcript
@@ -2749,15 +2750,15 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         .unwrap();
     assert_ne!(independent_runtime.fencing_token(), lease.fencing_token());
     engine.release_lease(&independent_runtime).unwrap();
-    let expired_request = ThreadCommitRequest {
-        thread_id,
+    let expired_request = SessionCommitRequest {
+        session_id,
         run_id,
-        expected_thread_revision: authoritative_revision,
+        expected_session_revision: authoritative_revision,
         expected_run_revision: authoritative_run_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitThreadRunUpdate::AppendTranscript {
+        update: CommitSessionRunUpdate::AppendTranscript {
             source_key: "boundary:fence:expired-owner".into(),
             kind: TranscriptKind::System,
             text: "expired owner must not persist".into(),
@@ -2765,10 +2766,10 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     assert!(matches!(
-        engine.commit_thread_run_update(expired_request, &lease, now + 120_001),
+        engine.commit_session_run_update(expired_request, &lease, now + 120_001),
         Err(StorageError::LeaseLost)
     ));
-    let after_expiry = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_expiry = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_expiry.revision, authoritative_revision);
     assert_eq!(after_expiry.sequence, authoritative_sequence);
     assert!(
@@ -2779,7 +2780,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
             .any(|entry| entry.text == "expired owner must not persist")
     );
 
-    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &session_id.to_string()], |_| {});
     assert!(shown.status.success());
     let session = json(&shown)["data"]["session"].clone();
     assert_eq!(session["lifecycle"], "running");
@@ -2794,12 +2795,12 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         .unwrap()
         .clone();
     assert_eq!(listed_sessions.len(), 1);
-    assert_eq!(listed_sessions[0]["thread_id"], thread_id.to_string());
+    assert_eq!(listed_sessions[0]["session_id"], session_id.to_string());
     assert_eq!(listed_sessions[0]["lifecycle"], "running");
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {thread_id}\r").as_bytes());
+    tui.write(format!("/resume {session_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(b"boundary history 11", Duration::from_secs(5)),
         "final TUI omitted authoritative transcript tail: {}",
@@ -2823,14 +2824,14 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let run_id = run_id();
     let initial = engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             run_id,
             binding(),
             "boundary effect authority",
@@ -2854,7 +2855,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         serde_json::json!({"path":"effect-boundary.txt"}),
         now + 3,
     );
-    assert_eq!(prepared.policy, ThreadEffectPolicy::Allow);
+    assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
     assert_eq!(
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Prepared
@@ -2864,33 +2865,33 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     let (prepared_run_id, prepared_run_revision) = active_run(&prepared.snapshot);
     assert_eq!(prepared_run_id, run_id);
 
-    let start_request = ThreadEffectStartRequest {
-        thread_id,
+    let start_request = SessionEffectStartRequest {
+        session_id,
         run_id,
-        expected_thread_revision: prepared_revision,
+        expected_session_revision: prepared_revision,
         expected_run_revision: prepared_run_revision,
         command_id: command_id(),
         source_key: "boundary:effect-authority:start-exact".into(),
         effect_id: effect_id.into(),
     };
     let wrong_digest = engine
-        .start_thread_effect(start_request.clone(), "0".repeat(64), &lease, now + 4)
+        .start_session_effect(start_request.clone(), "0".repeat(64), &lease, now + 4)
         .unwrap_err();
     assert!(
         wrong_digest
             .to_string()
-            .contains("canonical thread effect digest mismatch")
+            .contains("canonical session effect digest mismatch")
     );
     assert_eq!(
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Prepared
     );
-    let after_wrong_digest = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_wrong_digest = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_wrong_digest.revision, prepared_revision);
     assert_eq!(after_wrong_digest.sequence, prepared_sequence);
 
-    let wrong_id = engine.start_thread_effect(
-        ThreadEffectStartRequest {
+    let wrong_id = engine.start_session_effect(
+        SessionEffectStartRequest {
             effect_id: "boundary-missing-effect".into(),
             command_id: command_id(),
             source_key: "boundary:effect-authority:wrong-id".into(),
@@ -2905,7 +2906,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Prepared
     );
-    let after_wrong_id = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_wrong_id = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_wrong_id.revision, prepared_revision);
     assert_eq!(after_wrong_id.sequence, prepared_sequence);
 
@@ -2914,8 +2915,8 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     let foreign = foreign_engine
         .acquire_lease("v2-effect-foreign", now + 6, 120_000)
         .unwrap();
-    let foreign_start = engine.start_thread_effect(
-        ThreadEffectStartRequest {
+    let foreign_start = engine.start_session_effect(
+        SessionEffectStartRequest {
             command_id: command_id(),
             source_key: "boundary:effect-authority:foreign-start".into(),
             ..start_request.clone()
@@ -2929,12 +2930,12 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Prepared
     );
-    let after_foreign_start = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_foreign_start = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_foreign_start.revision, prepared_revision);
     assert_eq!(after_foreign_start.sequence, prepared_sequence);
 
     let started = engine
-        .start_thread_effect(
+        .start_session_effect(
             start_request,
             prepared.operation_digest.clone(),
             &lease,
@@ -2947,7 +2948,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     );
     let started_revision = started.snapshot.revision;
     let started_sequence = started.snapshot.sequence;
-    let observed_value = ThreadEffectObservedValue {
+    let observed_value = SessionEffectObservedValue {
         result: r#"{"value":"must remain uncertified"}"#.into(),
         payload: Some(serde_json::json!({
             "tool_call_id":"call-boundary-authorized-read",
@@ -2957,7 +2958,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         success: true,
     };
     assert!(matches!(
-        engine.observe_thread_effect(
+        engine.observe_session_effect(
             &started,
             "boundary:effect-authority:foreign-observe".into(),
             command_id(),
@@ -2971,12 +2972,12 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Started
     );
-    let after_foreign_observe = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_foreign_observe = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_foreign_observe.revision, started_revision);
     assert_eq!(after_foreign_observe.sequence, started_sequence);
 
     assert!(matches!(
-        engine.observe_thread_effect(
+        engine.observe_session_effect(
             &started,
             "boundary:effect-authority:expired-observe".into(),
             command_id(),
@@ -2990,7 +2991,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Started
     );
-    let after_expired_observe = engine.thread_snapshot_v2(thread_id, None, 500).unwrap();
+    let after_expired_observe = engine.session_snapshot_v2(session_id, None, 500).unwrap();
     assert_eq!(after_expired_observe.revision, started_revision);
     assert_eq!(after_expired_observe.sequence, started_sequence);
     assert!(
@@ -3005,7 +3006,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
             })
     );
 
-    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &session_id.to_string()], |_| {});
     assert!(shown.status.success());
     assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "running");
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -3013,12 +3014,12 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     let listed_json = json(&listed);
     let listed_sessions = listed_json["data"]["sessions"].as_array().unwrap();
     assert_eq!(listed_sessions.len(), 1);
-    assert_eq!(listed_sessions[0]["thread_id"], thread_id.to_string());
+    assert_eq!(listed_sessions[0]["session_id"], session_id.to_string());
     assert_eq!(listed_sessions[0]["lifecycle"], "running");
 
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {thread_id}\r").as_bytes());
+    tui.write(format!("/resume {session_id}\r").as_bytes());
     assert!(
         tui.wait_for_output(b"effect-boundary.txt", Duration::from_secs(5)),
         "final TUI omitted the still-started authorized descriptor: {}",
@@ -3041,18 +3042,18 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let scenario = Scenario::new();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let parent_run_id = run_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let wrong_scope = engine
         .acquire_lease("v2-atomic-wrong-scope", now, 120_000)
         .unwrap();
 
     assert!(matches!(
-        engine.create_started_thread_v2_snapshot(
-            thread_id,
+        engine.create_started_session_v2_snapshot(
+            session_id,
             parent_run_id,
             binding(),
             "atomic boundary session",
@@ -3062,12 +3063,12 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         ),
         Err(StorageError::LeaseLost)
     ));
-    assert!(engine.thread_session_v2(thread_id).unwrap().is_none());
+    assert!(engine.session_v2(session_id).unwrap().is_none());
     assert!(engine.show(parent_run_id).is_err());
 
     let started = engine
-        .create_started_thread_v2_snapshot(
-            thread_id,
+        .create_started_session_v2_snapshot(
+            session_id,
             parent_run_id,
             binding(),
             "atomic boundary session",
@@ -3076,7 +3077,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             None,
         )
         .unwrap();
-    assert_eq!(started.lifecycle, ThreadLifecycle::Running);
+    assert_eq!(started.lifecycle, SessionLifecycle::Running);
     assert_eq!(active_run(&started), (parent_run_id, 1));
 
     let mut changed_binding = binding();
@@ -3085,8 +3086,8 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     changed_binding.config_fingerprint = "v2-boundary-next-config".into();
     assert!(
         engine
-            .switch_thread_binding_v2(
-                thread_id,
+            .switch_session_binding_v2(
+                session_id,
                 started.revision,
                 &changed_binding,
                 &lease,
@@ -3095,7 +3096,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             .is_err()
     );
     assert_eq!(
-        engine.thread_snapshot_v2(thread_id, None, 100).unwrap(),
+        engine.session_snapshot_v2(session_id, None, 100).unwrap(),
         started
     );
 
@@ -3103,7 +3104,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &engine,
         &lease,
         &started,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "boundary:atomic:complete".into(),
             handoff: Handoff {
                 summary: "atomic parent completed".into(),
@@ -3113,25 +3114,25 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         },
         now + 4,
     );
-    assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
     assert!(
         engine
-            .switch_thread_binding_v2(thread_id, completed.revision, &binding(), &lease, now + 5,)
+            .switch_session_binding_v2(session_id, completed.revision, &binding(), &lease, now + 5,)
             .is_err()
     );
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             completed.revision - 1,
             &changed_binding,
             &lease,
             now + 6,
         ),
-        Err(StorageError::StaleThreadRevision { .. })
+        Err(StorageError::StaleSessionRevision { .. })
     ));
     assert!(matches!(
-        engine.switch_thread_binding_v2(
-            thread_id,
+        engine.switch_session_binding_v2(
+            session_id,
             completed.revision,
             &changed_binding,
             &wrong_scope,
@@ -3140,15 +3141,15 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         Err(StorageError::LeaseLost)
     ));
     let switched = engine
-        .switch_thread_binding_v2(
-            thread_id,
+        .switch_session_binding_v2(
+            session_id,
             completed.revision,
             &changed_binding,
             &lease,
             now + 8,
         )
         .unwrap();
-    assert_eq!(switched.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(switched.lifecycle, SessionLifecycle::Ready);
     assert_eq!(switched.binding, changed_binding);
 
     let workspace = std::fs::canonicalize(scenario.root())
@@ -3157,57 +3158,51 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .into_owned();
     assert_eq!(
         engine
-            .list_thread_sessions_v2_for_workspace(&workspace, 10)
+            .list_session_summaries_for_workspace(&workspace, 10)
             .unwrap()
             .len(),
         1
     );
     assert!(
         engine
-            .list_thread_sessions_v2_for_workspace("/definitely/not/this/workspace", 10)
+            .list_session_summaries_for_workspace("/definitely/not/this/workspace", 10)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
         engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(
-                &workspace,
-                "atomic boundary session",
-                10,
-            )
+            .find_sessions_by_exact_title_for_workspace(&workspace, "atomic boundary session", 10,)
             .unwrap()
             .len(),
         1
     );
     assert!(
         engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(&workspace, "", 10)
+            .find_sessions_by_exact_title_for_workspace(&workspace, "", 10)
             .unwrap()
             .is_empty()
-    );
-    assert!(engine
-        .find_thread_sessions_v2_by_exact_title_for_workspace(
-            &workspace,
-            "atomic boundary",
-            10,
-        )
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        engine.list_threads_v2_for_workspace(&workspace).unwrap()[0].thread_id,
-        thread_id
     );
     assert!(
         engine
-            .list_threads_v2_for_workspace("/definitely/not/this/workspace")
+            .find_sessions_by_exact_title_for_workspace(&workspace, "atomic boundary", 10,)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        engine.thread_session_v2(thread_id).unwrap().unwrap().model,
+        engine.list_sessions_for_workspace(&workspace).unwrap()[0].session_id,
+        session_id
+    );
+    assert!(
+        engine
+            .list_sessions_for_workspace("/definitely/not/this/workspace")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        engine.session_v2(session_id).unwrap().unwrap().model,
         "v2-boundary-next-model"
     );
-    let tail = engine.thread_snapshot_tail_v2(thread_id, 2).unwrap();
+    let tail = engine.session_snapshot_tail_v2(session_id, 2).unwrap();
     assert_eq!(tail.transcript.entries.len(), 2);
     assert_eq!(
         tail.transcript.entries.last().unwrap().text,
@@ -3215,48 +3210,45 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     );
 
     assert!(matches!(
-        engine.rename_thread_session_v2(thread_id, "  "),
+        engine.rename_session_v2(session_id, "  "),
         Err(StorageError::InvalidData(message)) if message.contains("title")
     ));
     let renamed = engine
-        .rename_thread_session_v2(thread_id, "Renamed atomic boundary")
+        .rename_session_v2(session_id, "Renamed atomic boundary")
         .unwrap();
     assert_eq!(renamed.title, "Renamed atomic boundary");
     assert_eq!(
-        engine
-            .search_thread_sessions_v2("renamed atomic", 10)
-            .unwrap()[0]
-            .thread_id,
-        thread_id
+        engine.search_sessions("renamed atomic", 10).unwrap()[0].session_id,
+        session_id
     );
     assert_eq!(
         engine
-            .search_thread_sessions_v2(&thread_id.to_string()[..12], 10)
+            .search_sessions(&session_id.to_string()[..12], 10)
             .unwrap()[0]
-            .thread_id,
-        thread_id
+            .session_id,
+        session_id
     );
-    assert!(engine.search_thread_sessions_v2("", 0).unwrap().is_empty());
+    assert!(engine.search_sessions("", 0).unwrap().is_empty());
     assert!(
         engine
-            .search_thread_sessions_v2("definitely absent", 10)
+            .search_sessions("definitely absent", 10)
             .unwrap()
             .is_empty()
     );
 
-    let fork_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let fork_session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let fork = engine
-        .fork_thread_session_v2(
-            thread_id,
-            fork_thread_id,
+        .fork_session_v2(
+            session_id,
+            fork_session_id,
             Some("Forked atomic boundary"),
             now + 20,
         )
         .unwrap();
-    assert_eq!(fork.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(fork.lifecycle, SessionLifecycle::Ready);
     assert!(fork.runs.is_empty());
-    let fork_summary = engine.thread_session_v2(fork_thread_id).unwrap().unwrap();
-    assert_eq!(fork_summary.parent_thread_id, Some(thread_id));
+    let fork_summary = engine.session_v2(fork_session_id).unwrap().unwrap();
+    assert_eq!(fork_summary.parent_session_id, Some(session_id));
     assert_eq!(
         fork.transcript.entries.len(),
         switched.transcript.entries.len()
@@ -3274,52 +3266,42 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             })
     );
     assert_eq!(
-        engine
-            .search_thread_sessions_v2("forked atomic", 10)
-            .unwrap()[0]
-            .thread_id,
-        fork_thread_id
+        engine.search_sessions("forked atomic", 10).unwrap()[0].session_id,
+        fork_session_id
     );
     assert!(
         engine
-            .fork_thread_session_v2(thread_id, fork_thread_id, Some("duplicate"), now + 21,)
+            .fork_session_v2(session_id, fork_session_id, Some("duplicate"), now + 21,)
             .is_err()
     );
-    let default_fork_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let default_fork_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let default_fork = engine
-        .fork_thread_session_v2(thread_id, default_fork_id, None, now + 22)
+        .fork_session_v2(session_id, default_fork_id, None, now + 22)
         .unwrap();
     assert_eq!(
-        engine
-            .thread_session_v2(default_fork_id)
-            .unwrap()
-            .unwrap()
-            .title,
+        engine.session_v2(default_fork_id).unwrap().unwrap().title,
         "Renamed atomic boundary (fork)"
     );
     assert!(default_fork.runs.is_empty());
-    let missing_source = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let missing_source = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     assert!(matches!(
-        engine.rename_thread_session_v2(missing_source, "missing"),
-        Err(StorageError::ThreadNotFound(id)) if id == missing_source
+        engine.rename_session_v2(missing_source, "missing"),
+        Err(StorageError::SessionNotFound(id)) if id == missing_source
     ));
     let bounded_title = engine
-        .rename_thread_session_v2(thread_id, &"x".repeat(1_025))
+        .rename_session_v2(session_id, &"x".repeat(1_025))
         .unwrap();
     assert!(bounded_title.title.ends_with('…'));
     assert!(bounded_title.title.len() <= 123);
-    assert_eq!(
-        engine.search_thread_sessions_v2("   ", 10).unwrap().len(),
-        3
-    );
+    assert_eq!(engine.search_sessions("   ", 10).unwrap().len(), 3);
     assert!(matches!(
-        engine.fork_thread_session_v2(
+        engine.fork_session_v2(
             missing_source,
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             Some("missing"),
             now + 22,
         ),
-        Err(StorageError::ThreadNotFound(id)) if id == missing_source
+        Err(StorageError::SessionNotFound(id)) if id == missing_source
     ));
 
     let memory_root = tempfile::tempdir().unwrap();
@@ -3327,13 +3309,13 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .workspace_root(memory_root.path())
         .build()
         .unwrap();
-    let memory_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let memory_session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let memory_lease = memory_engine
-        .acquire_thread_lease(memory_thread_id, now + 26, 120_000)
+        .acquire_session_lease(memory_session_id, now + 26, 120_000)
         .unwrap();
     let memory_running = memory_engine
-        .create_started_thread_v2_snapshot(
-            memory_thread_id,
+        .create_started_session_v2_snapshot(
+            memory_session_id,
             run_id(),
             binding(),
             "memory-only session",
@@ -3346,7 +3328,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &memory_engine,
         &memory_lease,
         &memory_running,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "boundary:memory:complete".into(),
             handoff: Handoff {
                 summary: "memory session completed".into(),
@@ -3356,11 +3338,11 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         },
         now + 28,
     );
-    assert_eq!(memory_ready.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(memory_ready.lifecycle, SessionLifecycle::Ready);
     assert!(matches!(
-        memory_engine.fork_thread_session_v2(
-            memory_thread_id,
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        memory_engine.fork_session_v2(
+            memory_session_id,
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             None,
             now + 29,
         ),
@@ -3369,13 +3351,13 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     memory_engine.release_lease(&memory_lease).unwrap();
 
     let fork_lease = engine
-        .acquire_thread_lease(fork_thread_id, now + 23, 120_000)
+        .acquire_session_lease(fork_session_id, now + 23, 120_000)
         .unwrap();
     let fork_run_id = run_id();
     let fork_running = engine
-        .create_started_thread_follow_up_v2(
+        .create_started_session_follow_up_v2(
             None,
-            fork_thread_id,
+            fork_session_id,
             fork_run_id,
             fork.revision,
             "independent fork child",
@@ -3391,7 +3373,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &engine,
         &fork_lease,
         &fork_running,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "boundary:fork:complete".into(),
             handoff: Handoff {
                 summary: "fork child completed independently".into(),
@@ -3401,28 +3383,28 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         },
         now + 25,
     );
-    assert_eq!(fork_completed.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(fork_completed.lifecycle, SessionLifecycle::Ready);
     assert_eq!(fork_completed.runs.len(), 1);
     engine.release_lease(&fork_lease).unwrap();
 
     let follow_up_id = run_id();
     assert!(matches!(
-        engine.create_started_thread_follow_up_v2(
+        engine.create_started_session_follow_up_v2(
             None,
-            thread_id,
+            session_id,
             follow_up_id,
             switched.revision - 1,
             "atomic follow-up must not appear",
             &lease,
             now + 9,
         ),
-        Err(StorageError::StaleThreadRevision { .. })
+        Err(StorageError::StaleSessionRevision { .. })
     ));
     assert!(engine.show(follow_up_id).is_err());
     assert!(matches!(
-        engine.create_started_thread_follow_up_v2(
+        engine.create_started_session_follow_up_v2(
             None,
-            thread_id,
+            session_id,
             follow_up_id,
             switched.revision,
             "atomic follow-up must not appear",
@@ -3433,9 +3415,9 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     ));
     assert!(engine.show(follow_up_id).is_err());
     let follow_up = engine
-        .create_started_thread_follow_up_v2(
+        .create_started_session_follow_up_v2(
             None,
-            thread_id,
+            session_id,
             follow_up_id,
             switched.revision,
             "atomic follow-up accepted",
@@ -3447,14 +3429,14 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         latte_core::CreateOutcome::Created(snapshot)
         | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
     };
-    assert_eq!(follow_up.lifecycle, ThreadLifecycle::Running);
+    assert_eq!(follow_up.lifecycle, SessionLifecycle::Running);
     assert_eq!(active_run(&follow_up), (follow_up_id, 1));
     assert_eq!(follow_up.runs.len(), 2);
     engine.release_lease(&lease).unwrap();
     engine.release_lease(&wrong_scope).unwrap();
     drop(engine);
 
-    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &session_id.to_string()], |_| {});
     assert!(shown.status.success());
     let session = json(&shown)["data"]["session"].clone();
     assert_eq!(session["lifecycle"], "interrupted");
@@ -3492,17 +3474,17 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     .unwrap();
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
-    let thread_id = thread_id();
+    let session_id = session_id();
     let run_id = run_id();
     let lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let wrong_scope = engine
         .acquire_lease("v2-unknown-wrong-scope", now, 120_000)
         .unwrap();
     let running = engine
-        .create_started_thread_v2_snapshot(
-            thread_id,
+        .create_started_session_v2_snapshot(
+            session_id,
             run_id,
             binding(),
             "explicit unknown boundary",
@@ -3528,7 +3510,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         now + 3,
     );
     assert!(matches!(
-        engine.mark_thread_effect_unknown(
+        engine.mark_session_effect_unknown(
             &started,
             "boundary:unknown:wrong-scope".into(),
             command_id(),
@@ -3543,7 +3525,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     );
 
     let unknown = engine
-        .mark_thread_effect_unknown(
+        .mark_session_effect_unknown(
             &started,
             "boundary:unknown:mark".into(),
             command_id(),
@@ -3551,7 +3533,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
             now + 5,
         )
         .unwrap();
-    assert_eq!(unknown.lifecycle, ThreadLifecycle::ReconciliationRequired);
+    assert_eq!(unknown.lifecycle, SessionLifecycle::ReconciliationRequired);
     assert_eq!(
         engine.effect_status("explicit-unknown-effect").unwrap(),
         latte_engine::EffectStatus::Unknown
@@ -3563,8 +3545,8 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         .unwrap()
         .run_revision;
     assert!(matches!(
-        engine.reconcile_thread_effect_unknown(
-            thread_id,
+        engine.reconcile_session_effect_unknown(
+            session_id,
             run_id,
             unknown.revision,
             run_revision,
@@ -3577,8 +3559,8 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         Err(StorageError::LeaseLost)
     ));
     assert!(matches!(
-        engine.reconcile_thread_effect_unknown(
-            thread_id,
+        engine.reconcile_session_effect_unknown(
+            session_id,
             run_id,
             unknown.revision - 1,
             run_revision,
@@ -3588,11 +3570,11 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
             &lease,
             now + 7,
         ),
-        Err(StorageError::StaleThreadRevision { .. })
+        Err(StorageError::StaleSessionRevision { .. })
     ));
     let reconciled = engine
-        .reconcile_thread_effect_unknown(
-            thread_id,
+        .reconcile_session_effect_unknown(
+            session_id,
             run_id,
             unknown.revision,
             run_revision,
@@ -3603,7 +3585,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
             now + 8,
         )
         .unwrap();
-    assert_eq!(reconciled.lifecycle, ThreadLifecycle::Failed);
+    assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
     assert!(reconciled.pending.is_none());
     assert_eq!(
         engine.effect_status("explicit-unknown-effect").unwrap(),
@@ -3613,7 +3595,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     engine.release_lease(&wrong_scope).unwrap();
     drop(engine);
 
-    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &session_id.to_string()], |_| {});
     assert!(shown.status.success());
     let session = json(&shown)["data"]["session"].clone();
     assert_eq!(session["lifecycle"], "failed");
@@ -3643,36 +3625,36 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
     let mut legacy_events = engine.subscribe();
-    let mut thread_events = engine.subscribe_threads();
+    let mut session_events = engine.subscribe_sessions();
     assert_eq!(legacy_events.try_recv().unwrap(), None);
-    assert_eq!(thread_events.try_recv().unwrap(), None);
+    assert_eq!(session_events.try_recv().unwrap(), None);
 
-    let thread_id = thread_id();
-    let thread_run_id = run_id();
-    let thread_lease = engine
-        .acquire_thread_lease(thread_id, now, 120_000)
+    let session_id = session_id();
+    let session_run_id = run_id();
+    let session_lease = engine
+        .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
-    assert_eq!(thread_lease.scope(), format!("thread:{thread_id}"));
+    assert_eq!(session_lease.scope(), format!("session:{session_id}"));
     let mut snapshot = engine
-        .create_started_thread_v2_snapshot(
-            thread_id,
-            thread_run_id,
+        .create_started_session_v2_snapshot(
+            session_id,
+            session_run_id,
             binding(),
             "change feed snapshot fallback",
-            &thread_lease,
+            &session_lease,
             now + 1,
             None,
         )
         .unwrap();
-    let created_event = thread_events.try_recv().unwrap().unwrap();
-    assert_eq!(created_event.thread_id, thread_id);
+    let created_event = session_events.try_recv().unwrap().unwrap();
+    assert_eq!(created_event.session_id, session_id);
     assert_eq!(created_event.revision, snapshot.revision);
 
     snapshot = commit(
         &engine,
-        &thread_lease,
+        &session_lease,
         &snapshot,
-        CommitThreadRunUpdate::AppendTranscript {
+        CommitSessionRunUpdate::AppendTranscript {
             source_key: "boundary:feed:observed".into(),
             kind: TranscriptKind::System,
             text: "change feed observed event".into(),
@@ -3680,16 +3662,16 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         },
         now + 2,
     );
-    let observed_event = thread_events.recv().await.unwrap();
-    assert_eq!(observed_event.thread_id, thread_id);
+    let observed_event = session_events.recv().await.unwrap();
+    assert_eq!(observed_event.session_id, session_id);
     assert_eq!(observed_event.sequence, snapshot.sequence);
 
     for ordinal in 0_u64..70 {
         snapshot = commit(
             &engine,
-            &thread_lease,
+            &session_lease,
             &snapshot,
-            CommitThreadRunUpdate::AppendTranscript {
+            CommitSessionRunUpdate::AppendTranscript {
                 source_key: format!("boundary:feed:lag:{ordinal:02}"),
                 kind: TranscriptKind::System,
                 text: format!("change feed durable card {ordinal:02}"),
@@ -3699,10 +3681,10 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         );
     }
     assert!(matches!(
-        thread_events.try_recv(),
+        session_events.try_recv(),
         Err(SubscriptionError::Lagged(count)) if count >= 6
     ));
-    let authoritative_tail = engine.thread_snapshot_tail_v2(thread_id, 5).unwrap();
+    let authoritative_tail = engine.session_snapshot_tail_v2(session_id, 5).unwrap();
     assert_eq!(authoritative_tail.revision, snapshot.revision);
     assert_eq!(authoritative_tail.sequence, snapshot.sequence);
     assert_eq!(authoritative_tail.transcript.entries.len(), 5);
@@ -3761,8 +3743,8 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         Err(StorageError::RunNotFound(id)) if id == missing_run
     ));
     assert!(matches!(
-        engine.acquire_run_lease(thread_run_id, "linked-run-owner", now + 401, 120_000,),
-        Err(StorageError::LinkedRunRequiresThreadCommit)
+        engine.acquire_run_lease(session_run_id, "linked-run-owner", now + 401, 120_000,),
+        Err(StorageError::LinkedRunRequiresSessionCommit)
     ));
     let exact_run_lease = engine
         .acquire_run_lease(event_run_id, "exact-run-owner", now + 402, 120_000)
@@ -3779,15 +3761,15 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         Err(StorageError::EngineUnavailable)
     ));
     engine.release_lease(&renewed).unwrap();
-    engine.release_lease(&thread_lease).unwrap();
+    engine.release_lease(&session_lease).unwrap();
 
     let mut closed_legacy = engine.subscribe();
-    let mut closed_threads = engine.subscribe_threads();
+    let mut closed_sessions = engine.subscribe_sessions();
     drop(engine);
     assert_eq!(closed_legacy.try_recv(), Err(SubscriptionError::Closed));
-    assert_eq!(closed_threads.try_recv(), Err(SubscriptionError::Closed));
+    assert_eq!(closed_sessions.try_recv(), Err(SubscriptionError::Closed));
 
-    let shown = scenario.output(&["--json", "show", &thread_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &session_id.to_string()], |_| {});
     assert!(shown.status.success());
     assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "interrupted");
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -3835,9 +3817,9 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     let now = latte_core::wall_time_ms();
 
     let (validation, validation_lease, _) =
-        create_started_effect_thread(&engine, "effect descriptor validation", now);
+        create_started_effect_session(&engine, "effect descriptor validation", now);
     let (validation_run_id, validation_run_revision) = active_run(&validation);
-    let valid_descriptor = ThreadEffectDescriptor {
+    let valid_descriptor = SessionEffectDescriptor {
         effect_id: "validation-effect".into(),
         tool_call_id: "call-validation-effect".into(),
         name: "read_file".into(),
@@ -3845,34 +3827,34 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         attempt: 1,
     };
     let invalid_descriptors = [
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             effect_id: String::new(),
             ..valid_descriptor.clone()
         },
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             name: "read\nfile".into(),
             ..valid_descriptor.clone()
         },
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             tool_call_id: "invalid tool call id".into(),
             ..valid_descriptor.clone()
         },
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             attempt: 0,
             ..valid_descriptor.clone()
         },
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             input: serde_json::json!(["not", "an", "object"]),
             ..valid_descriptor.clone()
         },
     ];
     for (ordinal, descriptor) in invalid_descriptors.into_iter().enumerate() {
         let error = engine
-            .prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id: validation.thread_id,
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id: validation.session_id,
                     run_id: validation_run_id,
-                    expected_thread_revision: validation.revision,
+                    expected_session_revision: validation.revision,
                     expected_run_revision: validation_run_revision,
                     command_id: command_id(),
                     source_key: format!("validation:{ordinal}"),
@@ -3885,14 +3867,14 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         assert!(matches!(error, StorageError::InvalidData(_)));
     }
     for (ordinal, descriptor) in [
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             effect_id: "validation-denied-process".into(),
             tool_call_id: "call-validation-denied-process".into(),
             name: "process".into(),
             input: serde_json::json!({"shell":"rm -rf /","cwd":"."}),
             attempt: 1,
         },
-        ThreadEffectDescriptor {
+        SessionEffectDescriptor {
             effect_id: "validation-unknown-tool".into(),
             tool_call_id: "call-validation-unknown-tool".into(),
             name: "unknown_tool".into(),
@@ -3904,11 +3886,11 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     .enumerate()
     {
         let error = engine
-            .prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id: validation.thread_id,
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id: validation.session_id,
                     run_id: validation_run_id,
-                    expected_thread_revision: validation.revision,
+                    expected_session_revision: validation.revision,
                     expected_run_revision: validation_run_revision,
                     command_id: command_id(),
                     source_key: format!("policy-rejection:{ordinal}"),
@@ -3922,7 +3904,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     }
     assert_eq!(
         engine
-            .thread_snapshot_v2(validation.thread_id, None, 500)
+            .session_snapshot_v2(validation.session_id, None, 500)
             .unwrap(),
         validation
     );
@@ -3936,7 +3918,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         serde_json::json!({"path":"permission-summary.txt"}),
         now + 10,
     );
-    assert_eq!(prepared.policy, ThreadEffectPolicy::Allow);
+    assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
     let started = start_effect(
         &engine,
         &validation_lease,
@@ -3944,17 +3926,17 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         "summary-read",
         now + 11,
     );
-    let foreign_thread_id = thread_id();
+    let foreign_session_id = session_id();
     let foreign_lease = engine
-        .acquire_thread_lease(foreign_thread_id, now + 12, 120_000)
+        .acquire_session_lease(foreign_session_id, now + 12, 120_000)
         .unwrap();
     let wrong_scope = engine
-        .execute_started_thread_effect(&started, &foreign_lease, &CancellationToken::new())
+        .execute_started_session_effect(&started, &foreign_lease, &CancellationToken::new())
         .await
         .unwrap_err();
     assert!(matches!(
         wrong_scope,
-        latte_engine::ThreadEffectExecutionError::Uncertain(_)
+        latte_engine::SessionEffectExecutionError::Uncertain(_)
     ));
     engine.release_lease(&foreign_lease).unwrap();
     let cancelled = CancellationToken::new();
@@ -3962,24 +3944,24 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     assert!(cancelled.is_cancelled());
     cancelled.cancelled().await;
     let cancellation_error = engine
-        .execute_started_thread_effect(&started, &validation_lease, &cancelled)
+        .execute_started_session_effect(&started, &validation_lease, &cancelled)
         .await
         .unwrap_err();
     assert!(matches!(
         cancellation_error,
-        latte_engine::ThreadEffectExecutionError::Uncertain(message)
+        latte_engine::SessionEffectExecutionError::Uncertain(message)
             if message.contains("tool cancelled after Started")
     ));
 
     let (changed, changed_lease, _) =
-        create_started_effect_thread(&engine, "changed completion rejection", now + 14);
+        create_started_effect_session(&engine, "changed completion rejection", now + 14);
     std::fs::write(scenario.root().join("changed-after-start.txt"), "changed\n").unwrap();
     let changed_error = commit_with_command(
         &engine,
         &changed_lease,
         &changed,
         command_id(),
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "changed-completion:complete".into(),
             handoff: Handoff {
                 summary: "must not complete without verification".into(),
@@ -3998,11 +3980,11 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     engine.release_lease(&changed_lease).unwrap();
 
     let mut leases = vec![validation_lease];
-    let shell_process_thread_id;
+    let shell_process_session_id;
     {
         let mut next_now = now + 20;
         let mut prepare = |prompt: &str, effect_id: &str, name: &str, input: serde_json::Value| {
-            let (snapshot, lease, _) = create_started_effect_thread(&engine, prompt, next_now);
+            let (snapshot, lease, _) = create_started_effect_session(&engine, prompt, next_now);
             let prepared = prepare_effect(
                 &engine,
                 &lease,
@@ -4023,14 +4005,14 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             "list_directory",
             serde_json::json!({"path":"."}),
         );
-        assert_eq!(listed.policy, ThreadEffectPolicy::Allow);
+        assert_eq!(listed.policy, SessionEffectPolicy::Allow);
         let searched = prepare(
             "search permission summary",
             "summary-search",
             "search",
             serde_json::json!({"query":"permission summary"}),
         );
-        assert_eq!(searched.policy, ThreadEffectPolicy::Allow);
+        assert_eq!(searched.policy, SessionEffectPolicy::Allow);
 
         let created = prepare(
             "create permission summary",
@@ -4042,10 +4024,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
                 "create_intent":true
             }),
         );
-        assert_eq!(created.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(created.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             created.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description.contains("create or replace") && description.contains("11 bytes")
         ));
 
@@ -4060,10 +4042,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
                 "precondition":"0".repeat(64)
             }),
         );
-        assert_eq!(replaced.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(replaced.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             replaced.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description.contains("replace existing") && description.contains("11 bytes")
         ));
 
@@ -4078,10 +4060,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
                 "precondition":"0".repeat(64)
             }),
         );
-        assert_eq!(edited.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(edited.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             edited.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description.contains("6 bytes") && description.contains("11 bytes")
         ));
 
@@ -4091,7 +4073,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             "process",
             serde_json::json!({"argv":["/bin/pwd"],"cwd":"."}),
         );
-        assert_eq!(safe_process.policy, ThreadEffectPolicy::Allow);
+        assert_eq!(safe_process.policy, SessionEffectPolicy::Allow);
         let secret_process = prepare(
             "redacted process permission summary",
             "summary-secret-process",
@@ -4101,10 +4083,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
                 "cwd":"."
             }),
         );
-        assert_eq!(secret_process.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(secret_process.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             secret_process.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description.contains("TOKEN=[REDACTED]")
                     && description.contains("plain=value")
                     && !description.contains("must-not-persist")
@@ -4116,10 +4098,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             "process",
             serde_json::json!({"argv":["/bin/echo","x".repeat(1000)],"cwd":"."}),
         );
-        assert_eq!(long_process.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(long_process.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             long_process.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description.ends_with('…') && description.len() <= 363
         ));
 
@@ -4129,13 +4111,13 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             "process",
             serde_json::json!({"shell":"printf boundary","cwd":"."}),
         );
-        assert_eq!(shell_process.policy, ThreadEffectPolicy::Ask);
+        assert_eq!(shell_process.policy, SessionEffectPolicy::Ask);
         assert!(matches!(
             shell_process.snapshot.pending.as_ref(),
-            Some(ThreadPendingRequest::Permission { description, .. })
+            Some(SessionPendingRequest::Permission { description, .. })
                 if description == "Run shell command (cwd: .)"
         ));
-        shell_process_thread_id = shell_process.snapshot.thread_id;
+        shell_process_session_id = shell_process.snapshot.session_id;
     }
     for lease in &leases {
         engine.release_lease(lease).unwrap();
@@ -4150,7 +4132,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     );
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {shell_process_thread_id}\r").as_bytes());
+    tui.write(format!("/resume {shell_process_session_id}\r").as_bytes());
     assert!(tui.wait_for_output(b"Run shell command (cwd: .)", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());

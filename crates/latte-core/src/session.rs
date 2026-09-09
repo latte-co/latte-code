@@ -1,20 +1,20 @@
-//! Additive v2 conversation-thread protocol.
+//! Additive v2 conversation-session protocol.
 //!
 //! This module intentionally does not alter any v1 command, event, or run
 //! representation.  A decoder which only understands protocol v1 can keep
 //! reading its existing records byte-for-byte, while v2 consumers use the
 //! separate envelopes below.
 
-use crate::{RunId, ThreadCommandId, ThreadEventId, ThreadId, TranscriptEntryId};
+use crate::{RunId, SessionCommandId, SessionEventId, SessionId, TranscriptEntryId};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::LazyLock};
 
 /// Version of the additive conversation protocol.
-pub const THREAD_PROTOCOL_VERSION: u16 = 2;
-/// Maximum durable display text accepted by the thread protocol.
-pub const THREAD_TEXT_CAP_BYTES: usize = 64 * 1024;
+pub const SESSION_PROTOCOL_VERSION: u16 = 2;
+/// Maximum durable display text accepted by the session protocol.
+pub const SESSION_TEXT_CAP_BYTES: usize = 64 * 1024;
 /// Maximum number of bytes in an accepted `OpenAI` Chat-compatible tool-call ID.
 pub const OPENAI_CHAT_TOOL_CALL_ID_MAX_BYTES: usize = 256;
 
@@ -57,8 +57,8 @@ pub fn valid_openai_chat_input_request_id(id: &str) -> bool {
 /// Lifecycle of the conversation projection, distinct from its child run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ThreadLifecycle {
-    /// A thread may receive a follow-up. Its newest child either completed or
+pub enum SessionLifecycle {
+    /// A session may receive a follow-up. Its newest child either completed or
     /// failed with an explicitly retryable runtime error.
     Ready,
     /// The active child is talking to a provider or preparing work.
@@ -75,7 +75,7 @@ pub enum ThreadLifecycle {
     ReconciliationRequired,
 }
 
-impl ThreadLifecycle {
+impl SessionLifecycle {
     #[must_use]
     pub const fn accepts_follow_up(self) -> bool {
         matches!(self, Self::Ready)
@@ -84,7 +84,7 @@ impl ThreadLifecycle {
 
 /// Outcome of a session create operation.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CreateOutcome<T = ThreadSnapshot> {
+pub enum CreateOutcome<T = SessionSnapshot> {
     /// A new session was created.
     Created(T),
     /// The session already existed (idempotent replay).
@@ -99,7 +99,7 @@ pub enum CreateAcceptError {
     /// A durable command-id reuse with a different payload. Maps to 422
     /// Unprocessable Entity (idempotency mismatch).
     IdempotencyMismatch(String),
-    /// A non-replay create for an already-existing thread, or a revision
+    /// A non-replay create for an already-existing session, or a revision
     /// conflict. Maps to 409 Conflict.
     Conflict(String),
     /// Any other acceptance failure. Maps to 500.
@@ -110,7 +110,7 @@ pub enum CreateAcceptError {
 /// *values* are intentionally absent; only the stable non-secret reference
 /// and generation are durable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadProviderBindingV2 {
+pub struct SessionProviderBinding {
     pub version: u32,
     pub provider_name: String,
     pub provider_type: String,
@@ -124,7 +124,7 @@ pub struct ThreadProviderBindingV2 {
     pub credential_generation: u64,
 }
 
-impl ThreadProviderBindingV2 {
+impl SessionProviderBinding {
     /// Validates fields before any credential resolution or history egress.
     ///
     /// # Errors
@@ -164,22 +164,22 @@ impl ThreadProviderBindingV2 {
 
 /// A compact immutable child-run record shown in the session list.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadRunSummary {
+pub struct SessionRunSummary {
     pub run_id: RunId,
     pub parent_run_id: Option<RunId>,
     pub ordinal: u64,
-    pub status: ThreadRunStatus,
+    pub status: SessionRunStatus,
     pub run_revision: u64,
     pub completed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<crate::protocol::FailureCode>,
 }
 
-/// Thread-safe projection of a v1 child status. It deliberately has no
+/// Session-safe projection of a v1 child status. It deliberately has no
 /// transition API: `latte-engine` is the only writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ThreadRunStatus {
+pub enum SessionRunStatus {
     Queued,
     Running,
     Cancelling,
@@ -230,17 +230,17 @@ pub struct TranscriptPage {
 
 /// Authoritative read projection for a conversation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ThreadSnapshot {
-    pub thread_id: ThreadId,
+pub struct SessionSnapshot {
+    pub session_id: SessionId,
     pub revision: u64,
     pub sequence: u64,
-    pub lifecycle: ThreadLifecycle,
-    pub binding: ThreadProviderBindingV2,
+    pub lifecycle: SessionLifecycle,
+    pub binding: SessionProviderBinding,
     pub latest_run_id: Option<RunId>,
     pub active_run_id: Option<RunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending: Option<ThreadPendingRequest>,
-    pub runs: Vec<ThreadRunSummary>,
+    pub pending: Option<SessionPendingRequest>,
+    pub runs: Vec<SessionRunSummary>,
     pub transcript: TranscriptPage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
@@ -249,13 +249,13 @@ pub struct ThreadSnapshot {
 /// Bounded, transcript-free metadata used by Session catalog discovery.
 /// Provider credentials and executable effect data are intentionally absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadSessionSummary {
-    pub thread_id: ThreadId,
+pub struct SessionSummary {
+    pub session_id: SessionId,
     pub title: String,
     pub workspace_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_thread_id: Option<ThreadId>,
-    pub lifecycle: ThreadLifecycle,
+    pub parent_session_id: Option<SessionId>,
+    pub lifecycle: SessionLifecycle,
     pub provider_name: String,
     pub model: String,
     pub created_at_ms: u64,
@@ -272,11 +272,11 @@ pub struct Paged<T> {
     pub next_cursor: Option<String>,
 }
 
-/// The active request needed for explicit in-thread UI actions. Secret values
+/// The active request needed for explicit in-session UI actions. Secret values
 /// are never representable here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ThreadPendingRequest {
+pub enum SessionPendingRequest {
     Permission {
         run_id: RunId,
         request_id: String,
@@ -294,89 +294,89 @@ pub enum ThreadPendingRequest {
 /// A versioned v2 command. It is isolated from `RuntimeCommand` so v1 JSON
 /// and persisted envelopes remain exactly compatible.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadCommandEnvelope {
+pub struct SessionCommandEnvelope {
     pub protocol_version: u16,
-    pub command_id: ThreadCommandId,
-    pub command: ThreadCommand,
+    pub command_id: SessionCommandId,
+    pub command: SessionCommand,
 }
 
-impl ThreadCommandEnvelope {
+impl SessionCommandEnvelope {
     #[must_use]
-    pub const fn new(command_id: ThreadCommandId, command: ThreadCommand) -> Self {
+    pub const fn new(command_id: SessionCommandId, command: SessionCommand) -> Self {
         Self {
-            protocol_version: THREAD_PROTOCOL_VERSION,
+            protocol_version: SESSION_PROTOCOL_VERSION,
             command_id,
             command,
         }
     }
 }
 
-/// Commands accepted only by the thread composition boundary.
+/// Commands accepted only by the session composition boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ThreadCommand {
+pub enum SessionCommand {
     Start {
-        thread_id: ThreadId,
+        session_id: SessionId,
         prompt: String,
-        binding: ThreadProviderBindingV2,
+        binding: SessionProviderBinding,
         #[serde(default)]
         focus: Option<String>,
     },
     FollowUp {
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         prompt: String,
     },
     SwitchModel {
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
-        binding: ThreadProviderBindingV2,
+        session_id: SessionId,
+        expected_session_revision: u64,
+        binding: SessionProviderBinding,
     },
     Cancel {
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         expected_run_revision: u64,
     },
     ResolvePermission {
-        thread_id: ThreadId,
+        session_id: SessionId,
         request_id: String,
-        expected_thread_revision: u64,
+        expected_session_revision: u64,
         expected_run_revision: u64,
         allow: bool,
     },
     ProvideInput {
-        thread_id: ThreadId,
+        session_id: SessionId,
         request_id: String,
-        expected_thread_revision: u64,
+        expected_session_revision: u64,
         expected_run_revision: u64,
         value: String,
     },
 }
 
-/// A durable thread event, sequenced independently from v1 run events.
+/// A durable session event, sequenced independently from v1 run events.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEventEnvelope {
+pub struct SessionEventEnvelope {
     pub protocol_version: u16,
-    pub event_id: ThreadEventId,
-    pub thread_id: ThreadId,
+    pub event_id: SessionEventId,
+    pub session_id: SessionId,
     pub revision: u64,
     pub sequence: u64,
-    pub event: ThreadEvent,
+    pub event: SessionEvent,
 }
 
 /// Events are typed wake-ups. Snapshots remain authoritative after a gap.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ThreadEvent {
+pub enum SessionEvent {
     LifecycleChanged {
-        lifecycle: ThreadLifecycle,
+        lifecycle: SessionLifecycle,
         run_id: Option<RunId>,
     },
     TranscriptAppended {
         entry: TranscriptEntry,
     },
     RunLinked {
-        run: ThreadRunSummary,
+        run: SessionRunSummary,
     },
     BindingChanged {
         provider_name: String,
@@ -392,7 +392,7 @@ pub enum ThreadEvent {
 /// durable assistant message and must be cleared on snapshot/gap/reconnect.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
-pub enum ThreadTransientProgress {
+pub enum SessionTransientProgress {
     ProviderAttempt {
         run_id: RunId,
         number: u32,
@@ -410,8 +410,8 @@ pub enum ThreadTransientProgress {
 
 /// Sanitizes control/ANSI text and caps it at a valid UTF-8 boundary.
 #[must_use]
-pub fn redact_thread_text(value: &str) -> String {
-    let mut out = String::with_capacity(value.len().min(THREAD_TEXT_CAP_BYTES));
+pub fn redact_session_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(SESSION_TEXT_CAP_BYTES));
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
         // Drop the whole CSI sequence rather than rendering terminal controls.
@@ -429,7 +429,7 @@ pub fn redact_thread_text(value: &str) -> String {
         if ch.is_control() && ch != '\n' && ch != '\t' {
             continue;
         }
-        if out.len() + ch.len_utf8() > THREAD_TEXT_CAP_BYTES {
+        if out.len() + ch.len_utf8() > SESSION_TEXT_CAP_BYTES {
             out.push_str("…[truncated]");
             break;
         }
@@ -440,7 +440,7 @@ pub fn redact_thread_text(value: &str) -> String {
 
 /// Recursively sanitizes untrusted structured data before persistence/UI use.
 #[must_use]
-pub fn redact_thread_value(value: Value) -> Value {
+pub fn redact_session_value(value: Value) -> Value {
     match value {
         Value::Object(values) => Value::Object(
             values
@@ -458,18 +458,20 @@ pub fn redact_thread_value(value: Value) -> Value {
                     .iter()
                     .any(|needle| lower.contains(needle));
                     (
-                        redact_thread_text(&key),
+                        redact_session_text(&key),
                         if secret {
                             Value::String("[REDACTED]".into())
                         } else {
-                            redact_thread_value(value)
+                            redact_session_value(value)
                         },
                     )
                 })
                 .collect(),
         ),
-        Value::Array(values) => Value::Array(values.into_iter().map(redact_thread_value).collect()),
-        Value::String(value) => Value::String(redact_thread_text(&value)),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_session_value).collect())
+        }
+        Value::String(value) => Value::String(redact_session_text(&value)),
         other => other,
     }
 }
@@ -506,11 +508,11 @@ mod tests {
 
     #[test]
     fn redactor_never_keeps_controls_or_obvious_secrets() {
-        let text = redact_thread_text("ok\u{1b}[31m sk-this-should-not-survive-1234567890\u{7}");
+        let text = redact_session_text("ok\u{1b}[31m sk-this-should-not-survive-1234567890\u{7}");
         assert!(!text.contains('\u{1b}'));
         assert!(!text.contains("sk-this"));
         let value =
-            redact_thread_value(serde_json::json!({"api_key":"very-secret","ok":"\u{1b}[mtext"}));
+            redact_session_value(serde_json::json!({"api_key":"very-secret","ok":"\u{1b}[mtext"}));
         assert_eq!(value["api_key"], "[REDACTED]");
         assert_eq!(value["ok"], "text");
     }
@@ -526,22 +528,22 @@ mod tests {
             format!(r#"Bearer "{secret}""#),
         ];
         for sample in samples {
-            let redacted = redact_thread_text(&sample);
+            let redacted = redact_session_text(&sample);
             assert!(!redacted.contains(secret), "{redacted}");
             assert!(redacted.contains("[REDACTED]"), "{redacted}");
         }
 
         // The named-assignment path also covers opaque provider values that
         // do not have a recognizable `sk-` or bearer shape.
-        let named = redact_thread_text("GEMINI_API_KEY='short-provider-secret'");
+        let named = redact_session_text("GEMINI_API_KEY='short-provider-secret'");
         assert!(!named.contains("short-provider-secret"));
         assert!(named.contains("[REDACTED]"));
-        let bare = redact_thread_text("token=short-provider-secret api_key=other-secret");
+        let bare = redact_session_text("token=short-provider-secret api_key=other-secret");
         assert!(!bare.contains("short-provider-secret"));
         assert!(!bare.contains("other-secret"));
         assert_eq!(bare.matches("[REDACTED]").count(), 2);
 
-        let control = redact_thread_text(&format!("\u{1b}[31mOPENAI_API_KEY={secret}\u{7}"));
+        let control = redact_session_text(&format!("\u{1b}[31mOPENAI_API_KEY={secret}\u{7}"));
         assert!(!control.contains('\u{1b}'));
         assert!(!control.contains('\u{7}'));
         assert!(!control.contains(secret));
@@ -568,14 +570,14 @@ mod tests {
         // This is a protocol-ID boundary only. Tool input containing source
         // code remains valid and is handled by the normal redaction policy.
         assert_eq!(
-            redact_thread_text("const token=value;"),
+            redact_session_text("const token=value;"),
             "const token=[REDACTED];"
         );
     }
 
     #[test]
-    fn thread_protocol_rejects_invalid_binding_and_keeps_commands_versioned() {
-        let binding = ThreadProviderBindingV2 {
+    fn session_protocol_rejects_invalid_binding_and_keeps_commands_versioned() {
+        let binding = SessionProviderBinding {
             version: 1,
             provider_name: "provider".into(),
             provider_type: "openai-chat".into(),
@@ -597,30 +599,30 @@ mod tests {
         assert!(invalid.validate().is_err());
 
         let ids = SystemIdSource::default();
-        let command = ThreadCommandEnvelope::new(
-            ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-            ThreadCommand::Start {
-                thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+        let command = SessionCommandEnvelope::new(
+            SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            SessionCommand::Start {
+                session_id: SessionId::from_uuid(ids.next_uuid_v7()),
                 prompt: "hello".into(),
                 binding,
                 focus: None,
             },
         );
-        assert_eq!(command.protocol_version, THREAD_PROTOCOL_VERSION);
+        assert_eq!(command.protocol_version, SESSION_PROTOCOL_VERSION);
         let json = serde_json::to_value(&command).unwrap();
         assert_eq!(json["command"]["type"], "start");
         assert_eq!(
-            serde_json::from_value::<ThreadCommandEnvelope>(json).unwrap(),
+            serde_json::from_value::<SessionCommandEnvelope>(json).unwrap(),
             command
         );
-        assert!(ThreadLifecycle::Ready.accepts_follow_up());
+        assert!(SessionLifecycle::Ready.accepts_follow_up());
         for lifecycle in [
-            ThreadLifecycle::Running,
-            ThreadLifecycle::WaitingPermission,
-            ThreadLifecycle::WaitingInput,
-            ThreadLifecycle::Interrupted,
-            ThreadLifecycle::Failed,
-            ThreadLifecycle::ReconciliationRequired,
+            SessionLifecycle::Running,
+            SessionLifecycle::WaitingPermission,
+            SessionLifecycle::WaitingInput,
+            SessionLifecycle::Interrupted,
+            SessionLifecycle::Failed,
+            SessionLifecycle::ReconciliationRequired,
         ] {
             assert!(!lifecycle.accepts_follow_up());
         }
@@ -628,11 +630,11 @@ mod tests {
 
     #[test]
     fn recursive_redaction_caps_text_and_preserves_safe_structure() {
-        let long = "x".repeat(THREAD_TEXT_CAP_BYTES + 16);
-        let redacted = redact_thread_text(&long);
+        let long = "x".repeat(SESSION_TEXT_CAP_BYTES + 16);
+        let redacted = redact_session_text(&long);
         assert!(redacted.ends_with("…[truncated]"));
-        assert!(redacted.len() > THREAD_TEXT_CAP_BYTES);
-        let value = redact_thread_value(serde_json::json!({
+        assert!(redacted.len() > SESSION_TEXT_CAP_BYTES);
+        let value = redact_session_value(serde_json::json!({
             "nested": ["Bearer short", {"credential_id":"hidden", "safe":"ok"}],
             "authorization": "also hidden",
         }));

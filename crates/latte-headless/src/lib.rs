@@ -1,5 +1,5 @@
 //! Headless runtime: provider registry, conversation context, and the
-//! per-workspace thread runtime service shared by the TUI and the HTTP server.
+//! per-workspace session runtime service shared by the TUI and the HTTP server.
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -9,4 +9,4 @@ pub mod context;
 pub mod provider;
 pub mod registry;
 pub mod runtime;
-pub mod thread;
+pub mod session;

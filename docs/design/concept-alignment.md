@@ -13,7 +13,7 @@ CLI/TUI 用户可见文案。所有结论附 `file:line` 证据。
 同一个领域概念在代码、协议、界面、文档四层使用不同名称，且不存在任何翻译层说明。
 最集中的两处：
 
-- 「一次持久对话」有四个名字：`Thread`（类型）、`session`（HTTP 路径与 CLI）、
+- 「一次持久对话」有四个名字：`Session`（类型）、`session`（HTTP 路径与 CLI）、
   `conversation`（注释与 TUI 面板标题）、`Session`（引擎 API 注释与错误串）。
 - 「一次用户提交」有四个名字：`Run`（类型与 HTTP 字段）、`turn`（HTTP 注释、服务端
   日志、TUI 提示）、`child`（架构文档与 core 注释）、`linked run`（守卫函数名）。
@@ -42,7 +42,7 @@ Workspace                    工作区：一个文件系统根
   │                          （多个 Workspace 可归属同一 Project = 共享 git common dir）
   │
   └─ Session                 会话：一次持久对话，用户可见的顶层单位
-     │                       当前实现：Thread / ThreadId / threads_v2
+     │                       当前实现：Session / SessionId / threads_v2
      │                       上下文在此层累积、压缩、恢复
      │
      ├─ Transcript           记录：append-only 的卡片流，JSONL 为权威
@@ -64,7 +64,7 @@ Workspace                    工作区：一个文件系统根
 - **Session** 是用户在 `/sessions` 列表里看到的一行，有标题、工作区、创建时间。
   fork 产生新 Session 并记录 `parent_thread_id`（`crates/latte-core/src/thread.rs:257`）。
 - **Turn** 是一次「你说、它做完」。follow-up 产生新 Turn，同 Session。
-  `ThreadLifecycle` 名义挂在 Session 上，实际是 active Turn 状态的投影
+  `SessionLifecycle` 名义挂在 Session 上，实际是 active Turn 状态的投影
   （`thread.rs:57` 注释称「区别于 child run」，但 `:61-75` 七个变体逐条描述 child，
   注释自相矛盾）。
 - **Round** 是 Turn 内的一次 provider 往返所产生的 tool 调用批次。它是真实存在的
@@ -82,13 +82,13 @@ Workspace                    工作区：一个文件系统根
 | --- | --- | --- |
 | Workspace | 一个文件系统根，会话的归属边界 | `workspace_root: String` ✓ |
 | Project | 共享同一 git common dir 的 Workspace 分组 | `project_key`（仅存于 SQL，core 层缺席） |
-| Session | 一次持久对话 | *`Thread` / `ThreadId` / `threads_v2`* |
+| Session | 一次持久对话 | *`Session` / `SessionId` / `threads_v2`* |
 | Turn | Session 内一次用户提交及其完整循环 | *`Run` / `RunId` / `thread_runs_v2`* |
 | Round | Turn 内一次 assistant tool 调用批次 | *无类型* |
 | Call | Round 内单次工具调用 | `ToolCall`（provider 侧）✓ |
 | Effect | 一次特权操作的持久凭据与生命周期 | `effect_id: String`（无类型） |
 | Transcript | Session 的 append-only 卡片流 | `TranscriptPage` ✓ / *表名 `conversation_outbox`* |
-| Binding | Session 绑定的 provider + model + 指纹 | *`ProviderBinding` 与 `ThreadProviderBindingV2` 同名不同物* |
+| Binding | Session 绑定的 provider + model + 指纹 | *`ProviderBinding` 与 `SessionProviderBinding` 同名不同物* |
 | Lease | 执行权威的租约与 fencing token | `Lease` ✓ |
 | Verification | 变更后的验证及其证据 | *`Evidence` / `VerificationEvidence` / `VerificationRecord` 三类型同概念* |
 | Reconciliation | `Unknown` effect 的显式对账 | ✓ 全库一致，无需改动 |
@@ -115,7 +115,7 @@ Workspace                    工作区：一个文件系统根
 
 ### 4.1 Session 改名是干净的
 
-`Thread` 是纯 v2 概念，无 v1 同名类型。唯一障碍是一张 v1 遗留死表：
+`Session` 是纯 v2 概念，无 v1 同名类型。唯一障碍是一张 v1 遗留死表：
 
 ```sql
 -- crates/latte-engine/src/storage.rs:369
@@ -131,9 +131,9 @@ v2 的 run **就是** v1 的 run，不是相似概念：
 
 - SQL 外键：`thread_runs_v2.run_id TEXT PRIMARY KEY REFERENCES runs(run_id)`
   （`storage.rs:469`）
-- 类型复用：`ThreadRunSummary.run_id` 类型是 `RunId`，不存在 `ThreadRunId`
+- 类型复用：`SessionRunSummary.run_id` 类型是 `RunId`，不存在 `SessionRunId`
   （`thread.rs:168`）
-- 状态映射：`ThreadRunStatus` 是 `RunStatus` 的一对一无损映射
+- 状态映射：`SessionRunStatus` 是 `RunStatus` 的一对一无损映射
   （`storage.rs:4909-4920`）
 - revision 直读：`run_revision: state.revision`（`storage.rs:5004`）
 
@@ -176,7 +176,7 @@ roadmap:80 是过期条目。
 
 | 项 | 动作 | 证据 |
 | --- | --- | --- |
-| `TurnSupervisor` 虚构类型 | 改为 `ThreadRuntimeService`，并区分「已实现」与「提案」词汇 | `asynchronous-turn-runner.md:24`，全库零 Rust 定义 |
+| `TurnSupervisor` 虚构类型 | 改为 `SessionRuntimeService`，并区分「已实现」与「提案」词汇 | `asynchronous-turn-runner.md:24`，全库零 Rust 定义 |
 | 同文档其余虚构类型 | `RuntimeInput` / `ControlInput` / `TrustedReminder` / `ReminderSource` / `InputId` 标注为提案 | 同上，全部零命中 |
 | `InputQueued` progress | 标注未实现；实际只有 3 个变体 | `asynchronous-turn-runner.md:72, 84` + `event-projection-and-replay.md:16` vs `thread.rs:395-409` |
 | `data-storage.md` 自相矛盾 | 术语表 `:38` 定义 Run，`:432` 却写 Turn，统一到 Run（批次 2 再整体改名）；顺带修正过期的 Schema 11 断言 | 同文件；`SCHEMA_VERSION = 12` |
@@ -185,13 +185,14 @@ roadmap:80 是过期条目。
 | `EffectStatus::Declared` | 标注为测试专用状态，生产路径从 `Prepared` 起步 | `storage.rs:3752-3753` 带 `#[cfg(test)]` |
 | `ProviderOutcome` 冗余别名 | 移除 `type ProviderOutcome = ProviderResponse;` | `provider.rs:78` |
 
-### 批次 1：Session 改名（破坏性，需协议版本决策）
+### 批次 1：Session 改名（破坏性，已落地）
 
-`Thread* → Session*`，全部六个 crate + SQL 表 + HTTP 契约。
+状态：**已完成**。`Thread* → Session*` 贯穿全部六个 crate、SQL 表、HTTP/SSE 契约、
+CLI `--json` 字段、配置键 `thread` → `session` 与模块文件名（`thread.rs` → `session.rs`）。
 
-影响面统计（`crates/**/*.rs` 混合命名标识符）：
+影响面统计（改名前 `crates/**/*.rs` 混合命名标识符）：
 
-| 标识符 | 出现次数 |
+| 标识符（改名前） | 出现次数 |
 | --- | --- |
 | `thread_session_v2` | 58 |
 | `ThreadSessionSummary` | 50 |
@@ -204,21 +205,31 @@ roadmap:80 是过期条目。
 
 这些缝合词本身就是分裂的产物，改名后自然消失。典型如
 `Json<SessionListResponse<latte_core::ThreadSessionSummary>>`（`http.rs:620`）
-—— 一个类型表达式里 Session 与 Thread 各出现一次。
+—— 一个类型表达式里 Session 与 Session 各出现一次。
 
-同批必须修正的协议不一致：
+同批必须修正的协议不一致（均已落地）：
 
 - 请求体 `thread_id` → `session_id`（与响应体统一）
 - SSE 事件名 `thread_changed` → `session_changed`
 - CLI `--json` 内层 `thread_id` → `session_id`
-- 先 drop 掉 v1 死表 `sessions`（`storage.rs:369` 建表、`:847` 在 legacy import
-  表清单里；全库无 INSERT/SELECT/UPDATE，无外键引用），腾出这个名字，
-  再把 `threads_v2` → `sessions`。批次 0 已确认它是死表但推迟了 drop：
-  两件事共用同一次 schema 迁移（当前 `SCHEMA_VERSION = 12`）。
-- `conversation_outbox` 更名需单独评估（它同时是 transcript 存储与 JSONL 出箱，
-  见 6.2）
+- 配置键 `thread.*` → `session.*`（`max_tool_rounds` / `provider_timeout_ms` 等）
+- 先 drop 掉 v1 死表 `sessions`（迁移 1–12 中建表但全库无 INSERT/SELECT/UPDATE，
+  无外键引用），腾出这个名字，再把 v2 表改为无前缀名。**批次 0 已确认它是死表
+  但推迟了 drop，两件事共用同一次 schema 迁移（12 → 13）**。
+- schema 13 的最终 v2 表名：`threads_v2 → sessions`、`thread_runs_v2 → session_runs`、
+  `thread_active_runs_v2 → session_active_runs`、`thread_events_v2 → session_events`、
+  `thread_command_dedup_v2 → session_command_dedup`、
+  `thread_commit_sources_v2 → session_commit_sources`、
+  `thread_effect_canonical_v2 → session_effect_canonical`；列 `thread_id` / `parent_thread_id`
+  统一改为 `session_id` / `parent_session_id`。`_v2` 后缀一并去掉——`session_` 前缀
+  已与 v1 `runs` / `events` 命名区隔。
+- `conversation_outbox` 保留原名（它同时是 transcript 存储与 JSONL 出箱，见 6.2）；
+  仅其 `thread_id` 列改名为 `session_id`。
+- legacy import 改写为读旧名（attach 的 `legacy_import.threads_v2` 等历史表）写新名
+  （`main.sessions` 等）；版本门收紧为 `9..SCHEMA_VERSION`（不包含当前版本——当前
+  schema 的库没有可导入的旧表）。
 
-**协议决策点（已定）**：v1 端点承诺过稳定性
+**协议决策点（已定并执行）**：v1 端点承诺过稳定性
 （`versioned-rpc-contract.md` §2.1），字段改名属 breaking change，按该文档
 §2.2 本应走 v2。但当前处于早期阶段，#16 已有先例（list 分页、422→400）在 v1 内
 直接 breaking。**决定：v1 内直接破坏性改名，不加兼容层。**
@@ -245,13 +256,13 @@ roadmap:80 是过期条目。
    `thread-effect:{run_id}:{round_sequence}:{ordinal}:{tool_call_id}`
    （`headless/thread.rs:1416`）无解析器，与全库 `typed_id!` 惯例
    （`ids.rs:6-34`）不一致。
-3. **`ThreadEffectDescriptor` 与 `ThreadEffectPresentation` 字段完全同构**
+3. **`SessionEffectDescriptor` 与 `SessionEffectPresentation` 字段完全同构**
    （`lib.rs:289-295` vs `:334-340`），仅靠是否脱敏区分，名字上分不出哪个是
    可执行权威。建议改名体现信任级别，如 `EffectAuthority` / `EffectView`。
 4. **Project 在 core 层缺席** —— `ThreadSessionSummary` 只到 `workspace_root`
    （`thread.rs:255`），无 `project_key`，跨 worktree 归属只存在于 SQL 外键
    （`storage.rs:679`）。
-5. **`ThreadProviderBindingV2` 双版本号** —— 类型名后缀 `V2` 指 thread 协议版本，
+5. **`SessionProviderBinding` 双版本号** —— 类型名后缀 `V2` 指 thread 协议版本，
    字段 `version: u32` 指 binding 自身版本（`BINDING_VERSION = 1`,
    `registry.rs:17`）。读名字必然误解。
 
@@ -259,7 +270,7 @@ roadmap:80 是过期条目。
 
 三套状态枚举值域重叠但不相等，面向同一用户：
 
-| `ThreadLifecycle` | `ThreadRunStatus` | CLI `TerminalOutcome` | TUI |
+| `SessionLifecycle` | `SessionRunStatus` | CLI `TerminalOutcome` | TUI |
 | --- | --- | --- | --- |
 | `ready` | `completed` | `completed` | "Ready" / 卡片显示 "Completed" |
 | — | — | `denied` | 无对应显示 |
@@ -323,7 +334,7 @@ Round 身份依赖 `transcript_entry.sequence`，压缩若改变 sequence 或移
 
 | 概念 | 文档位置 | 代码状态 |
 | --- | --- | --- |
-| `TurnSupervisor` | `asynchronous-turn-runner.md:24` | 零命中，实际是 `ThreadRuntimeService` |
+| `TurnSupervisor` | `asynchronous-turn-runner.md:24` | 零命中，实际是 `SessionRuntimeService` |
 | `RuntimeInput` / `ControlInput` | 同文档 §2 | 零命中 |
 | `TrustedReminder` / `ReminderSource` / `InputId` | 同文档 §2 | 零命中 |
 | `InputQueued` / `consumed` / `expired` progress | 同文档 `:72, :84` | 零命中，实际只有 3 变体 |

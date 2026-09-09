@@ -97,14 +97,14 @@ pub(crate) const SESSION_ID_PLACEHOLDER: &str = "${session_id}";
 
 /// Derives the value a Provider sees for one Session.
 ///
-/// The internal `ThreadId` is never sent as-is: a Provider is an external party
+/// The internal `SessionId` is never sent as-is: a Provider is an external party
 /// and correlating our identifiers across Providers is not something the user
 /// asked for. Hashing keeps the value stable for the whole Session — the point
 /// of the header — while making it meaningless outside this process.
 #[must_use]
-pub fn session_ref_for(thread_id: latte_core::ThreadId) -> String {
+pub fn session_ref_for(session_id: latte_core::SessionId) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(thread_id.as_uuid().as_bytes());
+    let digest = Sha256::digest(session_id.as_uuid().as_bytes());
     // 128 bits: collision-free at any session count a workspace will reach, and
     // short enough that Providers with header length limits accept it.
     format!("{digest:x}")[..32].to_owned()
@@ -2766,20 +2766,20 @@ mod tests {
     }
 
     #[test]
-    fn the_session_reference_is_stable_per_session_and_hides_the_thread_id() {
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-        let other = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
-        let reference = session_ref_for(thread_id);
+    fn the_session_reference_is_stable_per_session_and_hides_the_session_id() {
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let other = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let reference = session_ref_for(session_id);
         assert_eq!(
             reference,
-            session_ref_for(thread_id),
+            session_ref_for(session_id),
             "every turn of one session must present the same reference"
         );
         assert_ne!(reference, session_ref_for(other));
         assert_eq!(reference.len(), 32);
         assert!(reference.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(
-            !reference.contains(&thread_id.to_string()),
+            !reference.contains(&session_id.to_string()),
             "the internal identifier must not survive into the header"
         );
         // A hyphen-free hex string also survives every Provider's header parser.

@@ -83,12 +83,12 @@ fn text_mode_run_show_and_list_preserve_the_user_visible_summary() {
 }
 
 #[test]
-fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_thread_budgets() {
+fn layered_configuration_rejects_non_objects_unknown_keys_and_invalid_session_budgets() {
     for (config, expected) in [
         ("[]", "top-level configuration must be an object"),
         ("{unknown_key:true}", "unknown field `unknown_key`"),
         (
-            "{thread:{max_input_bytes:5,reserved_output_bytes:5}}",
+            "{session:{max_input_bytes:5,reserved_output_bytes:5}}",
             "reserved output must be smaller than input budget",
         ),
     ] {

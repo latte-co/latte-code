@@ -1,6 +1,6 @@
 use crate::{
-    EngineHandle, Lease, ThreadEffectDescriptor, ThreadEffectExecutionError,
-    ThreadEffectObservedValue,
+    EngineHandle, Lease, SessionEffectDescriptor, SessionEffectExecutionError,
+    SessionEffectObservedValue,
 };
 use latte_core::RunId;
 use serde::{Deserialize, Serialize};
@@ -203,7 +203,7 @@ pub(crate) fn digest(i: &ProcessInvocation<'_>) -> String {
 /// They are converted to the borrowed legacy supervisor invocation only after
 /// the Started transaction has committed.
 #[derive(Clone, Debug)]
-pub(crate) struct ThreadProcessSpec {
+pub(crate) struct SessionProcessSpec {
     pub argv: Vec<String>,
     pub shell: Option<String>,
     pub cwd: String,
@@ -214,7 +214,7 @@ pub(crate) struct ThreadProcessSpec {
     pub stderr_cap: usize,
 }
 
-impl ThreadProcessSpec {
+impl SessionProcessSpec {
     pub(crate) fn from_input(input: &Value) -> Result<Self, ProcessError> {
         let object = input
             .as_object()
@@ -298,7 +298,7 @@ impl ThreadProcessSpec {
     pub(crate) fn invocation<'a>(
         &'a self,
         run_revision: u64,
-        descriptor: &'a ThreadEffectDescriptor,
+        descriptor: &'a SessionEffectDescriptor,
         lease: &'a Lease,
     ) -> ProcessInvocation<'a> {
         ProcessInvocation {
@@ -321,29 +321,29 @@ impl ThreadProcessSpec {
 }
 
 impl EngineHandle {
-    pub(crate) async fn execute_started_thread_process(
+    pub(crate) async fn execute_started_session_process(
         &self,
-        descriptor: &ThreadEffectDescriptor,
+        descriptor: &SessionEffectDescriptor,
         run_revision: u64,
         lease: &Lease,
         cancellation: &CancellationToken,
-    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+    ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         if !self.process_supervision_supported {
-            return Err(ThreadEffectExecutionError::Certified(
+            return Err(SessionEffectExecutionError::Certified(
                 ProcessError::Unsupported.to_string(),
             ));
         }
-        let spec = ThreadProcessSpec::from_input(&descriptor.input)
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+        let spec = SessionProcessSpec::from_input(&descriptor.input)
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
         let invocation = spec.invocation(run_revision, descriptor, lease);
         let cwd = self
             .tools
             .resolve_cwd(&spec.cwd)
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
         let _operation = std::sync::Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
-            .map_err(|_| ThreadEffectExecutionError::Uncertain("operation gate closed".into()))?;
+            .map_err(|_| SessionEffectExecutionError::Uncertain("operation gate closed".into()))?;
         match supervise(
             &invocation,
             &cwd,
@@ -353,20 +353,20 @@ impl EngineHandle {
         .await
         {
             Ok(output) if output.termination == ProcessTermination::Cancelled => {
-                Err(ThreadEffectExecutionError::Uncertain(
+                Err(SessionEffectExecutionError::Uncertain(
                     "process cancelled after its external outcome may have happened".into(),
                 ))
             }
-            Ok(output) => Ok(ThreadEffectObservedValue {
+            Ok(output) => Ok(SessionEffectObservedValue {
                 result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
-                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                payload: Some(latte_core::redact_session_value(serde_json::json!({
                     "tool_call_id":descriptor.tool_call_id,
                     "name":descriptor.name,
                     "output":output,
                 }))),
                 success: true,
             }),
-            Err(error) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
+            Err(error) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
         }
     }
 }
@@ -767,7 +767,7 @@ fn supervise_git(
         })
     })
     .join()
-    .map_err(|_| ProcessError::Supervision("git supervisor thread panicked".into()))?
+    .map_err(|_| ProcessError::Supervision("git supervisor session panicked".into()))?
 }
 
 #[cfg(unix)]
@@ -1195,8 +1195,8 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn thread_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
-        let defaults = ThreadProcessSpec::from_input(&serde_json::json!({
+    fn session_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
+        let defaults = SessionProcessSpec::from_input(&serde_json::json!({
             "argv": ["/bin/pwd"]
         }))
         .unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(defaults.stdout_cap, 64 * 1024);
         assert_eq!(defaults.stderr_cap, 64 * 1024);
 
-        let configured = ThreadProcessSpec::from_input(&serde_json::json!({
+        let configured = SessionProcessSpec::from_input(&serde_json::json!({
             "shell": "printf ok",
             "cwd": "subdir",
             "env": {"LANG": "C"},
@@ -1233,7 +1233,7 @@ mod tests {
             fencing_token: 7,
             expires_at_ms: 99,
         };
-        let descriptor = ThreadEffectDescriptor {
+        let descriptor = SessionEffectDescriptor {
             effect_id: "effect".into(),
             tool_call_id: "call_1".into(),
             name: "process".into(),
@@ -1297,7 +1297,7 @@ mod tests {
             ),
         ];
         for (input, expected) in invalid {
-            let error = ThreadProcessSpec::from_input(&input).unwrap_err();
+            let error = SessionProcessSpec::from_input(&input).unwrap_err();
             assert!(
                 matches!(error, ProcessError::Invalid(message) if message.contains(expected)),
                 "input {input} did not produce {expected}"
@@ -1423,8 +1423,8 @@ mod tests {
             );
         }
 
-        let descriptor = ThreadEffectDescriptor {
-            effect_id: "thread-process".into(),
+        let descriptor = SessionEffectDescriptor {
+            effect_id: "session-process".into(),
             tool_call_id: "call".into(),
             name: "process".into(),
             input: serde_json::json!({"argv":["/bin/echo","ok"]}),
@@ -1434,9 +1434,9 @@ mod tests {
         unsupported.process_supervision_supported = false;
         assert!(matches!(
             unsupported
-                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .execute_started_session_process(&descriptor, 0, &lease, &CancellationToken::new())
                 .await,
-            Err(ThreadEffectExecutionError::Certified(_))
+            Err(SessionEffectExecutionError::Certified(_))
         ));
         let gated = EngineBuilder::new()
             .workspace_root(dir.path())
@@ -1445,9 +1445,9 @@ mod tests {
         gated.operation_gate.close();
         assert!(matches!(
             gated
-                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .execute_started_session_process(&descriptor, 0, &lease, &CancellationToken::new())
                 .await,
-            Err(ThreadEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
+            Err(SessionEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
         ));
         assert!(
             storage(crate::StorageError::LeaseLost)

@@ -2,7 +2,7 @@ use crate::provider::{
     Message, OpenAiProvider, Provider, ProviderCapabilities, ProviderContext, ProviderError,
     ProviderFuture, ProviderRequest, RESERVED_HEADERS, SESSION_ID_PLACEHOLDER,
 };
-use latte_core::ThreadProviderBindingV2;
+use latte_core::SessionProviderBinding;
 use latte_engine::ToolDescriptor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -262,13 +262,13 @@ impl ProviderBinding {
 
     /// Builds the additive v2 binding without exposing any credential value.
     #[must_use]
-    pub fn with_thread_scope(
+    pub fn with_session_scope(
         &self,
         credential_ref_id: String,
         data_scope_id: String,
         credential_generation: u64,
-    ) -> ThreadProviderBindingV2 {
-        ThreadProviderBindingV2 {
+    ) -> SessionProviderBinding {
+        SessionProviderBinding {
             version: self.version,
             provider_name: self.provider_name.clone(),
             provider_type: self.provider_type.clone(),
@@ -319,7 +319,7 @@ pub struct BindingCatalogEntry {
     pub model: String,
     pub name: Option<String>,
     pub is_default: bool,
-    pub binding: ThreadProviderBindingV2,
+    pub binding: SessionProviderBinding,
 }
 
 #[derive(Clone, Debug)]
@@ -338,7 +338,7 @@ impl ProviderRegistry {
             // `latte_code::AppConfig`; they are not provider semantics. Keep
             // the provider schema strict after removing every documented
             // application-owned top-level section.
-            object.remove("thread");
+            object.remove("session");
         }
         let config: ProviderFile =
             serde_json::from_value(value).map_err(|e| RegistryError::Invalid(e.to_string()))?;
@@ -424,22 +424,22 @@ impl ProviderRegistry {
         Ok(resolved)
     }
 
-    /// Computes the complete Thread v2 binding for the single global default.
-    pub fn thread_binding_for_default(
+    /// Computes the complete Session v2 binding for the single global default.
+    pub fn session_binding_for_default(
         &self,
         tools: &[ToolDescriptor],
-    ) -> Result<ThreadProviderBindingV2, RegistryError> {
+    ) -> Result<SessionProviderBinding, RegistryError> {
         let (provider, model) = self.default_selection()?;
-        self.thread_binding_for_model(provider, model, tools)
+        self.session_binding_for_model(provider, model, tools)
     }
 
     /// Computes a complete v2 binding for one explicit catalog selection.
-    pub fn thread_binding_for_model(
+    pub fn session_binding_for_model(
         &self,
         name: &str,
         model: &str,
         tools: &[ToolDescriptor],
-    ) -> Result<ThreadProviderBindingV2, RegistryError> {
+    ) -> Result<SessionProviderBinding, RegistryError> {
         let definition = self
             .config
             .providers
@@ -449,7 +449,7 @@ impl ProviderRegistry {
         let binding = Self::binding_for_model(name, definition, model, tools)?;
         let ProviderDefinition::OpenaiChat { api_key, .. } = definition;
         let result =
-            binding.with_thread_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
+            binding.with_session_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
     }
@@ -458,7 +458,7 @@ impl ProviderRegistry {
     /// a model whose binding cannot be constructed is an error, not a silently
     /// dropped entry, so a broken configuration is visible to the client
     /// instead of producing a partial catalog.
-    pub fn thread_binding_catalog(
+    pub fn session_binding_catalog(
         &self,
         tools: &[ToolDescriptor],
     ) -> Result<Vec<BindingCatalogEntry>, RegistryError> {
@@ -466,7 +466,7 @@ impl ProviderRegistry {
             .into_iter()
             .map(|entry| {
                 let binding =
-                    self.thread_binding_for_model(&entry.provider_name, &entry.model, tools)?;
+                    self.session_binding_for_model(&entry.provider_name, &entry.model, tools)?;
                 Ok(BindingCatalogEntry {
                     provider_name: entry.provider_name,
                     model: entry.model,
@@ -479,9 +479,9 @@ impl ProviderRegistry {
     }
 
     /// Validates a persisted v2 binding before resolving the configured secret.
-    pub fn resolve_thread_bound(
+    pub fn resolve_session_bound(
         &self,
-        binding: &ThreadProviderBindingV2,
+        binding: &SessionProviderBinding,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
         let definition = self
@@ -500,7 +500,7 @@ impl ProviderRegistry {
             ));
         }
         let proposed =
-            self.thread_binding_for_model(&binding.provider_name, &binding.model, tools)?;
+            self.session_binding_for_model(&binding.provider_name, &binding.model, tools)?;
         if &proposed != binding {
             return Err(RegistryError::BindingMismatch(
                 "provider binding, aliases, credential reference/generation, or data scope changed"
@@ -959,7 +959,7 @@ mod tests {
         )
         .unwrap();
         assert!(inline.resolve_default(&[]).is_ok());
-        let inline_binding = inline.thread_binding_for_default(&[]).unwrap();
+        let inline_binding = inline.session_binding_for_default(&[]).unwrap();
         assert_eq!(inline_binding.credential_ref_id, "config:main/api_key");
         assert_eq!(inline_binding.data_scope_id, "workspace");
         assert_eq!(inline_binding.credential_generation, 1);
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_bindings_are_scoped_pinned_and_validated_before_secret_lookup() {
+    fn session_bindings_are_scoped_pinned_and_validated_before_secret_lookup() {
         let tools = vec![tool("read_file"), tool("search")];
         let registry = ProviderRegistry::parse_jsonc(
             r"{
@@ -1044,25 +1044,25 @@ mod tests {
             }",
         )
         .unwrap();
-        let binding = registry.thread_binding_for_default(&tools).unwrap();
+        let binding = registry.session_binding_for_default(&tools).unwrap();
         assert_eq!(binding.provider_name, "main");
         assert_eq!(binding.aliases["read_file"], "rf");
         assert_eq!(binding.credential_ref_id, "env:NEVER_LOOK_UP_THIS_KEY");
         assert_eq!(binding.data_scope_id, "workspace");
         assert_eq!(binding.credential_generation, 1);
         assert!(matches!(
-            registry.resolve_thread_bound(&binding, &tools),
+            registry.resolve_session_bound(&binding, &tools),
             Err(RegistryError::MissingSecret(name)) if name == "NEVER_LOOK_UP_THIS_KEY"
         ));
 
         let mut changed = binding.clone();
         changed.credential_generation += 1;
         assert!(matches!(
-            registry.resolve_thread_bound(&changed, &tools),
+            registry.resolve_session_bound(&changed, &tools),
             Err(RegistryError::BindingMismatch(_))
         ));
         assert!(matches!(
-            registry.thread_binding_for_model("unknown", "gpt-test", &tools),
+            registry.session_binding_for_model("unknown", "gpt-test", &tools),
             Err(RegistryError::Invalid(message)) if message.contains("unknown provider")
         ));
     }
@@ -1204,25 +1204,25 @@ mod tests {
         .unwrap();
         assert!(!semantic.to_string().contains("Alpha Default"));
         let selected = registry
-            .thread_binding_for_model("beta", "b-reasoning", &[])
+            .session_binding_for_model("beta", "b-reasoning", &[])
             .unwrap();
         assert_eq!(selected.provider_name, "beta");
         assert_eq!(selected.model, "b-reasoning");
-        assert!(registry.resolve_thread_bound(&selected, &[]).is_ok());
+        assert!(registry.resolve_session_bound(&selected, &[]).is_ok());
         assert!(matches!(
-            registry.thread_binding_for_model("beta", "missing", &[]),
+            registry.session_binding_for_model("beta", "missing", &[]),
             Err(RegistryError::Invalid(message)) if message.contains("unknown model")
         ));
         let mut missing_provider = selected.clone();
         missing_provider.provider_name = "missing".into();
         assert!(matches!(
-            registry.resolve_thread_bound(&missing_provider, &[]),
+            registry.resolve_session_bound(&missing_provider, &[]),
             Err(RegistryError::BindingMismatch(message)) if message.contains("provider")
         ));
         let mut missing_model = selected;
         missing_model.model = "missing".into();
         assert!(matches!(
-            registry.resolve_thread_bound(&missing_model, &[]),
+            registry.resolve_session_bound(&missing_model, &[]),
             Err(RegistryError::BindingMismatch(message)) if message.contains("model")
         ));
 
@@ -1383,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_binding_catalog_returns_every_configured_model() {
+    fn session_binding_catalog_returns_every_configured_model() {
         // The happy path: a well-formed config produces a complete catalog with
         // one entry per configured model, default flagged.
         let registry = ProviderRegistry::parse_jsonc(
@@ -1394,7 +1394,7 @@ mod tests {
         )
         .unwrap();
         let catalog = registry
-            .thread_binding_catalog(&[tool("read_file")])
+            .session_binding_catalog(&[tool("read_file")])
             .unwrap();
         assert_eq!(
             catalog
@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_binding_catalog_fails_closed_on_a_broken_model() {
+    fn session_binding_catalog_fails_closed_on_a_broken_model() {
         // A model whose binding cannot be constructed (here: an alias that
         // references a tool absent from the descriptor set) must surface as an
         // error, not be silently dropped from the catalog. A client that asked
@@ -1433,7 +1433,7 @@ mod tests {
         // ...but its binding cannot be built with these tools, so the catalog
         // fails closed instead of returning an empty (silently partial) list.
         assert!(matches!(
-            registry.thread_binding_catalog(&[tool("read_file")]),
+            registry.session_binding_catalog(&[tool("read_file")]),
             Err(RegistryError::Invalid(message)) if message.contains("unknown canonical tool")
         ));
     }
@@ -1445,13 +1445,13 @@ mod tests {
         let registry = ProviderRegistry::parse_jsonc(r"{version:1,providers:{}}").unwrap();
         assert!(registry.default_name().is_none());
         assert!(registry.resolve_default(&[]).is_err());
-        assert!(registry.thread_binding_for_default(&[]).is_err());
+        assert!(registry.session_binding_for_default(&[]).is_err());
     }
 
     #[test]
-    fn parse_jsonc_strips_owned_thread_section() {
+    fn parse_jsonc_strips_owned_session_section() {
         let registry = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_model:'main/m',thread:{max_request_bytes:4096},providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
+            r"{version:1,default_model:'main/m',session:{max_request_bytes:4096},providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
         )
         .unwrap();
         assert_eq!(registry.default_name(), Some("main"));

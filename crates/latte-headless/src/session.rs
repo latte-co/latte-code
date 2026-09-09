@@ -1,7 +1,7 @@
-//! Thread v2 composition for the transcript-first clients.
+//! Session v2 composition for the transcript-first clients.
 //!
 //! The service is deliberately a coordinator, not an effect authority: every
-//! durable change goes through `EngineHandle::commit_thread_run_update` and
+//! durable change goes through `EngineHandle::commit_session_run_update` and
 //! provider calls receive no direct repository capability.
 
 use crate::{
@@ -14,15 +14,15 @@ use crate::{
     runtime::VerificationPlan,
 };
 use latte_core::{
-    FailureCode, Retryability, RunFailure, RunId, ThreadCommandId, ThreadId, ThreadLifecycle,
-    ThreadProviderBindingV2, ThreadSnapshot, ThreadTransientProgress, TranscriptKind,
-    redact_thread_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
+    FailureCode, Retryability, RunFailure, RunId, SessionCommandId, SessionId, SessionLifecycle,
+    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptKind,
+    redact_session_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
 };
 use latte_engine::{
-    CancellationToken, CommitThreadRunUpdate, EngineHandle, Lease, StorageError,
-    ThreadCommitRequest, ThreadEffectDescriptor, ThreadEffectExecutionError,
-    ThreadEffectPresentation, ThreadEffectRequest, ThreadEffectStartRequest, ThreadEffectStarted,
-    ThreadLeaseLossRecovery,
+    CancellationToken, CommitSessionRunUpdate, EngineHandle, Lease, SessionCommitRequest,
+    SessionEffectDescriptor, SessionEffectExecutionError, SessionEffectPresentation,
+    SessionEffectRequest, SessionEffectStartRequest, SessionEffectStarted,
+    SessionLeaseLossRecovery, StorageError,
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -34,8 +34,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
-const THREAD_MAILBOX_CAPACITY: usize = 8;
+const SESSION_VERIFICATION_EFFECT_PREFIX: &str = "session-verification:";
+const SESSION_MAILBOX_CAPACITY: usize = 8;
 
 /// Whether some assistant message in this segment declared `tool_call_id`.
 ///
@@ -98,7 +98,7 @@ fn append_denied_tool_results(segment: &mut Vec<Message>) {
 
 /// Exact request-size policy for child history construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadHistoryPolicy {
+pub struct SessionHistoryPolicy {
     pub max_request_bytes: usize,
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
@@ -115,7 +115,7 @@ pub struct ThreadHistoryPolicy {
     pub provider_timeout_ms: u64,
 }
 
-impl Default for ThreadHistoryPolicy {
+impl Default for SessionHistoryPolicy {
     fn default() -> Self {
         Self {
             max_request_bytes: 512 * 1024,
@@ -130,7 +130,7 @@ impl Default for ThreadHistoryPolicy {
     }
 }
 
-impl ThreadHistoryPolicy {
+impl SessionHistoryPolicy {
     /// Validates the exact input/output budget without constructing a request.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_request_bytes == 0
@@ -148,8 +148,8 @@ impl ThreadHistoryPolicy {
         }
         Ok(())
     }
-    fn budget(&self) -> Result<usize, ThreadRuntimeError> {
-        self.validate().map_err(ThreadRuntimeError::History)?;
+    fn budget(&self) -> Result<usize, SessionRuntimeError> {
+        self.validate().map_err(SessionRuntimeError::History)?;
         Ok(self
             .max_request_bytes
             .min(self.max_input_bytes - self.reserved_output_bytes))
@@ -157,83 +157,83 @@ impl ThreadHistoryPolicy {
 }
 
 /// A secret-resolving provider constructor. Callers must validate the supplied
-/// binding first; the registry's `resolve_thread_bound` does exactly that.
-pub type ThreadProviderFactory =
-    Arc<dyn Fn(&ThreadProviderBindingV2) -> Result<ResolvedProvider, String> + Send + Sync>;
+/// binding first; the registry's `resolve_session_bound` does exactly that.
+pub type SessionProviderFactory =
+    Arc<dyn Fn(&SessionProviderBinding) -> Result<ResolvedProvider, String> + Send + Sync>;
 
 /// Non-durable provider progress bridge. It is intentionally separate from
 /// transcript persistence and is cleared by the TUI on a gap or reconnect.
-pub trait ThreadProgressSink: Send + Sync {
-    fn observe(&self, thread_id: ThreadId, progress: ThreadTransientProgress);
+pub trait SessionProgressSink: Send + Sync {
+    fn observe(&self, session_id: SessionId, progress: SessionTransientProgress);
 }
-impl<F: Fn(ThreadId, ThreadTransientProgress) + Send + Sync> ThreadProgressSink for F {
-    fn observe(&self, thread_id: ThreadId, progress: ThreadTransientProgress) {
-        self(thread_id, progress);
+impl<F: Fn(SessionId, SessionTransientProgress) + Send + Sync> SessionProgressSink for F {
+    fn observe(&self, session_id: SessionId, progress: SessionTransientProgress) {
+        self(session_id, progress);
     }
 }
 
 #[derive(Debug, Error)]
-pub enum ThreadRuntimeError {
-    #[error("thread storage: {0}")]
+pub enum SessionRuntimeError {
+    #[error("session storage: {0}")]
     Storage(#[from] StorageError),
-    #[error("thread provider configuration: {0}")]
+    #[error("session provider configuration: {0}")]
     ProviderConfiguration(String),
-    #[error("thread provider: {0}")]
+    #[error("session provider: {0}")]
     Provider(#[from] ProviderError),
-    #[error("thread history: {0}")]
+    #[error("session history: {0}")]
     History(String),
-    #[error("thread is not in the requested active state")]
+    #[error("session is not in the requested active state")]
     InvalidState,
-    #[error("thread input mailbox is full")]
+    #[error("session input mailbox is full")]
     MailboxFull,
-    #[error("thread effect: {0}")]
+    #[error("session effect: {0}")]
     Effect(String),
 }
 
 /// Transcript-first provider coordinator. The active cancellation map is
 /// process-local only; durable recovery remains in the engine.
 #[derive(Clone)]
-pub struct ThreadRuntimeService {
+pub struct SessionRuntimeService {
     engine: EngineHandle,
     root: PathBuf,
-    policy: ThreadHistoryPolicy,
-    provider: ThreadProviderFactory,
-    active: Arc<Mutex<HashMap<ThreadId, CancellationToken>>>,
-    mailboxes: Arc<Mutex<HashMap<ThreadId, VecDeque<String>>>>,
-    progress: Option<Arc<dyn ThreadProgressSink>>,
+    policy: SessionHistoryPolicy,
+    provider: SessionProviderFactory,
+    active: Arc<Mutex<HashMap<SessionId, CancellationToken>>>,
+    mailboxes: Arc<Mutex<HashMap<SessionId, VecDeque<String>>>>,
+    progress: Option<Arc<dyn SessionProgressSink>>,
     verification: Option<VerificationPlan>,
     lease_ttl_ms: u64,
 }
 
-struct ThreadLeaseGuard {
+struct SessionLeaseGuard {
     engine: EngineHandle,
     lease: Lease,
 }
 
-struct ThreadRunnerGuard {
-    thread_id: ThreadId,
-    mailboxes: Arc<Mutex<HashMap<ThreadId, VecDeque<String>>>>,
+struct SessionRunnerGuard {
+    session_id: SessionId,
+    mailboxes: Arc<Mutex<HashMap<SessionId, VecDeque<String>>>>,
     closed: bool,
 }
 
-impl ThreadRunnerGuard {
+impl SessionRunnerGuard {
     fn mark_closed(&mut self) {
         self.closed = true;
     }
 }
 
-impl Drop for ThreadRunnerGuard {
+impl Drop for SessionRunnerGuard {
     fn drop(&mut self) {
         if !self.closed {
             self.mailboxes
                 .lock()
                 .expect("mailbox mutex poisoned")
-                .remove(&self.thread_id);
+                .remove(&self.session_id);
         }
     }
 }
 
-impl std::ops::Deref for ThreadLeaseGuard {
+impl std::ops::Deref for SessionLeaseGuard {
     type Target = Lease;
 
     fn deref(&self) -> &Self::Target {
@@ -241,19 +241,19 @@ impl std::ops::Deref for ThreadLeaseGuard {
     }
 }
 
-impl Drop for ThreadLeaseGuard {
+impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
         let _ = self.engine.release_lease(&self.lease);
     }
 }
 
-impl ThreadRuntimeService {
+impl SessionRuntimeService {
     #[must_use]
     pub fn new(
         engine: EngineHandle,
         root: impl AsRef<Path>,
-        policy: ThreadHistoryPolicy,
-        provider: ThreadProviderFactory,
+        policy: SessionHistoryPolicy,
+        provider: SessionProviderFactory,
     ) -> Self {
         Self {
             engine,
@@ -270,7 +270,7 @@ impl ThreadRuntimeService {
 
     /// Connects typed transient provider progress to an interactive frontend.
     #[must_use]
-    pub fn with_progress_sink(mut self, sink: Arc<dyn ThreadProgressSink>) -> Self {
+    pub fn with_progress_sink(mut self, sink: Arc<dyn SessionProgressSink>) -> Self {
         self.progress = Some(sink);
         self
     }
@@ -298,14 +298,14 @@ impl ThreadRuntimeService {
     /// provider construction can resolve an environment key.
     pub async fn start(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         prompt: String,
-        binding: ThreadProviderBindingV2,
+        binding: SessionProviderBinding,
         focus: Option<&Path>,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let runner = self.begin_runner(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let runner = self.begin_runner(session_id)?;
         let snapshot = match self
-            .start_one(None, thread_id, prompt, binding, focus, None)
+            .start_one(None, session_id, prompt, binding, focus, None)
             .await?
         {
             latte_core::CreateOutcome::Created(snapshot)
@@ -323,16 +323,16 @@ impl ThreadRuntimeService {
     /// crash-safe idempotent replay).
     pub async fn start_accepted(
         &self,
-        thread_id: ThreadId,
-        command_id: ThreadCommandId,
+        session_id: SessionId,
+        command_id: SessionCommandId,
         prompt: String,
-        binding: ThreadProviderBindingV2,
+        binding: SessionProviderBinding,
         focus: Option<&Path>,
         accept: oneshot::Sender<
-            Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
-        let runner = match self.begin_runner(thread_id) {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        let runner = match self.begin_runner(session_id) {
             Ok(runner) => runner,
             Err(error) => {
                 let _ = accept.send(Err(latte_core::CreateAcceptError::Failed(
@@ -344,7 +344,7 @@ impl ThreadRuntimeService {
         let outcome = self
             .start_one(
                 Some(command_id),
-                thread_id,
+                session_id,
                 prompt,
                 binding,
                 focus,
@@ -372,39 +372,39 @@ impl ThreadRuntimeService {
     /// a fresh create; `Err` is a command-identity conflict or storage error.
     fn durable_replay(
         &self,
-        command_id: &ThreadCommandId,
-        thread_id: ThreadId,
+        command_id: &SessionCommandId,
+        session_id: SessionId,
         prompt: &str,
-        binding: &ThreadProviderBindingV2,
+        binding: &SessionProviderBinding,
         focus: Option<&Path>,
-    ) -> Result<Option<ThreadSnapshot>, ThreadRuntimeError> {
+    ) -> Result<Option<SessionSnapshot>, SessionRuntimeError> {
         self.engine
             .lookup_create_replay(
                 command_id,
-                thread_id,
+                session_id,
                 prompt,
                 binding,
                 focus.and_then(|focus| focus.to_str()),
             )
-            .map_err(ThreadRuntimeError::from)
+            .map_err(SessionRuntimeError::from)
     }
 
     async fn start_one(
         &self,
-        command_id: Option<ThreadCommandId>,
-        thread_id: ThreadId,
+        command_id: Option<SessionCommandId>,
+        session_id: SessionId,
         prompt: String,
-        binding: ThreadProviderBindingV2,
+        binding: SessionProviderBinding,
         focus: Option<&Path>,
         accept: Option<
             oneshot::Sender<
-                Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+                Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
             >,
         >,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
         if let Err(error) = binding
             .validate()
-            .map_err(ThreadRuntimeError::ProviderConfiguration)
+            .map_err(SessionRuntimeError::ProviderConfiguration)
         {
             signal_accept(
                 accept,
@@ -426,7 +426,7 @@ impl ThreadRuntimeService {
         // acquiring the lease. A retry after a crash hits the record and
         // replays without blocking on the dead owner's still-unexpired lease.
         if let Some(command_id) = &command_id {
-            match self.durable_replay(command_id, thread_id, &prompt, &binding, focus) {
+            match self.durable_replay(command_id, session_id, &prompt, &binding, focus) {
                 Ok(Some(snapshot)) => {
                     signal_accept(
                         accept,
@@ -443,7 +443,7 @@ impl ThreadRuntimeService {
         }
         let run_id = new_run_id();
         let now = now_ms();
-        let lease = match self.acquire(thread_id) {
+        let lease = match self.acquire(session_id) {
             Ok(lease) => lease,
             Err(error) => {
                 signal_accept(
@@ -457,10 +457,10 @@ impl ThreadRuntimeService {
         // fresh one so the durable dedup record is still written (it will
         // never replay, but the create contract is uniform).
         let create_command_id =
-            command_id.unwrap_or_else(|| ThreadCommandId::from_uuid(Uuid::now_v7()));
-        let started = match self.engine.create_started_thread_v2(
+            command_id.unwrap_or_else(|| SessionCommandId::from_uuid(Uuid::now_v7()));
+        let started = match self.engine.create_started_session_v2(
             &create_command_id,
-            thread_id,
+            session_id,
             run_id,
             binding,
             &prompt,
@@ -480,7 +480,7 @@ impl ThreadRuntimeService {
                 return Ok(latte_core::CreateOutcome::Replayed(snapshot));
             }
             Err(error) => {
-                let error = ThreadRuntimeError::from(error);
+                let error = SessionRuntimeError::from(error);
                 signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
@@ -497,7 +497,7 @@ impl ThreadRuntimeService {
         let Ok(provider) = (self.provider)(&started.binding) else {
             return self
                 .fail_retryable(
-                    thread_id,
+                    session_id,
                     run_id,
                     started.revision,
                     active_run_revision(&started)?,
@@ -515,19 +515,19 @@ impl ThreadRuntimeService {
     /// completed parent remains untouched in both v1 and v2 tables.
     pub async fn follow_up(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         prompt: String,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let runner = self.begin_runner(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let runner = self.begin_runner(session_id)?;
         // The legacy in-process path mints a fresh command id so the durable
         // dedup record is still written (it will never replay, but the
         // follow-up contract is uniform).
-        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
         let snapshot = match self
             .follow_up_one(
-                thread_id,
-                expected_thread_revision,
+                session_id,
+                expected_session_revision,
                 prompt,
                 Some(command_id),
                 None,
@@ -547,15 +547,15 @@ impl ThreadRuntimeService {
     /// crash-safe idempotent replay).
     pub async fn follow_up_accepted(
         &self,
-        thread_id: ThreadId,
-        command_id: ThreadCommandId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        expected_session_revision: u64,
         prompt: String,
         accept: oneshot::Sender<
-            Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
-        let runner = match self.begin_runner(thread_id) {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        let runner = match self.begin_runner(session_id) {
             Ok(runner) => runner,
             Err(error) => {
                 let _ = accept.send(Err(classify_create_error(&error)));
@@ -564,8 +564,8 @@ impl ThreadRuntimeService {
         };
         let outcome = self
             .follow_up_one(
-                thread_id,
-                expected_thread_revision,
+                session_id,
+                expected_session_revision,
                 prompt,
                 Some(command_id),
                 Some(accept),
@@ -589,17 +589,17 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn follow_up_one(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         prompt: String,
-        command_id: Option<ThreadCommandId>,
+        command_id: Option<SessionCommandId>,
         accept: Option<
             oneshot::Sender<
-                Result<latte_core::CreateOutcome<ThreadSnapshot>, latte_core::CreateAcceptError>,
+                Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
             >,
         >,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, ThreadRuntimeError> {
-        let snapshot = match self.load_full(thread_id) {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        let snapshot = match self.load_full(session_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 signal_accept(accept, Err(classify_create_error(&error)));
@@ -614,8 +614,8 @@ impl ThreadRuntimeService {
         if let Some(command_id) = &command_id {
             match self.engine.lookup_follow_up_replay(
                 command_id,
-                thread_id,
-                expected_thread_revision,
+                session_id,
+                expected_session_revision,
                 &prompt,
             ) {
                 Ok(Some(snapshot)) => {
@@ -627,21 +627,21 @@ impl ThreadRuntimeService {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let error = ThreadRuntimeError::from(error);
+                    let error = SessionRuntimeError::from(error);
                     signal_accept(accept, Err(classify_create_error(&error)));
                     return Err(error);
                 }
             }
         }
-        if snapshot.revision != expected_thread_revision || !snapshot.lifecycle.accepts_follow_up()
+        if snapshot.revision != expected_session_revision || !snapshot.lifecycle.accepts_follow_up()
         {
             signal_accept(
                 accept,
                 Err(latte_core::CreateAcceptError::Conflict(
-                    ThreadRuntimeError::InvalidState.to_string(),
+                    SessionRuntimeError::InvalidState.to_string(),
                 )),
             );
-            return Err(ThreadRuntimeError::InvalidState);
+            return Err(SessionRuntimeError::InvalidState);
         }
         let messages = match self.history_with_prompt(&snapshot, &prompt) {
             Ok(messages) => messages,
@@ -651,25 +651,25 @@ impl ThreadRuntimeService {
             }
         };
         let run_id = new_run_id();
-        let lease = match self.acquire(thread_id) {
+        let lease = match self.acquire(session_id) {
             Ok(lease) => lease,
             Err(error) => {
                 signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
         };
-        let started = match self.engine.create_started_thread_follow_up_v2(
+        let started = match self.engine.create_started_session_follow_up_v2(
             command_id.as_ref(),
-            thread_id,
+            session_id,
             run_id,
-            expected_thread_revision,
+            expected_session_revision,
             &prompt,
             &lease,
             now_ms(),
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let error = ThreadRuntimeError::from(error);
+                let error = SessionRuntimeError::from(error);
                 signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
@@ -695,7 +695,7 @@ impl ThreadRuntimeService {
         let Ok(provider) = (self.provider)(&started.binding) else {
             return self
                 .fail_retryable(
-                    thread_id,
+                    session_id,
                     run_id,
                     started.revision,
                     active_run_revision(&started)?,
@@ -716,29 +716,32 @@ impl ThreadRuntimeService {
     /// transcript history.
     pub fn queue_follow_up(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         prompt: String,
-    ) -> Result<usize, ThreadRuntimeError> {
+    ) -> Result<usize, SessionRuntimeError> {
         let _ = self.initial_messages(&prompt, None)?;
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
         let mailbox = mailboxes
-            .get_mut(&thread_id)
-            .ok_or(ThreadRuntimeError::InvalidState)?;
-        if mailbox.len() >= THREAD_MAILBOX_CAPACITY {
-            return Err(ThreadRuntimeError::MailboxFull);
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        if mailbox.len() >= SESSION_MAILBOX_CAPACITY {
+            return Err(SessionRuntimeError::MailboxFull);
         }
         mailbox.push_back(prompt);
         Ok(mailbox.len())
     }
 
-    fn begin_runner(&self, thread_id: ThreadId) -> Result<ThreadRunnerGuard, ThreadRuntimeError> {
+    fn begin_runner(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionRunnerGuard, SessionRuntimeError> {
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
-        if mailboxes.contains_key(&thread_id) {
-            return Err(ThreadRuntimeError::InvalidState);
+        if mailboxes.contains_key(&session_id) {
+            return Err(SessionRuntimeError::InvalidState);
         }
-        mailboxes.insert(thread_id, VecDeque::new());
-        Ok(ThreadRunnerGuard {
-            thread_id,
+        mailboxes.insert(session_id, VecDeque::new());
+        Ok(SessionRunnerGuard {
+            session_id,
             mailboxes: Arc::clone(&self.mailboxes),
             closed: false,
         })
@@ -746,22 +749,22 @@ impl ThreadRuntimeService {
 
     async fn drain_mailbox(
         &self,
-        mut snapshot: ThreadSnapshot,
-        mut runner: ThreadRunnerGuard,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        mut snapshot: SessionSnapshot,
+        mut runner: SessionRunnerGuard,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         loop {
             let prompt = {
                 let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
                 let mailbox = mailboxes
-                    .get_mut(&snapshot.thread_id)
-                    .ok_or(ThreadRuntimeError::InvalidState)?;
+                    .get_mut(&snapshot.session_id)
+                    .ok_or(SessionRuntimeError::InvalidState)?;
                 let prompt = snapshot
                     .lifecycle
                     .accepts_follow_up()
                     .then(|| mailbox.pop_front())
                     .flatten();
                 if prompt.is_none() {
-                    mailboxes.remove(&snapshot.thread_id);
+                    mailboxes.remove(&snapshot.session_id);
                     runner.mark_closed();
                 }
                 prompt
@@ -771,10 +774,10 @@ impl ThreadRuntimeService {
             };
             // Queued mailbox turns are process-local by design; mint a fresh
             // command id so the durable dedup record is still written.
-            let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+            let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
             snapshot = match self
                 .follow_up_one(
-                    snapshot.thread_id,
+                    snapshot.session_id,
                     snapshot.revision,
                     prompt,
                     Some(command_id),
@@ -792,28 +795,28 @@ impl ThreadRuntimeService {
     /// Credential resolution remains deferred until the next accepted prompt.
     pub fn switch_model(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
-        binding: &ThreadProviderBindingV2,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        session_id: SessionId,
+        expected_session_revision: u64,
+        binding: &SessionProviderBinding,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         binding
             .validate()
-            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
-        let snapshot = self.load_full(thread_id)?;
-        if snapshot.revision != expected_thread_revision
+            .map_err(SessionRuntimeError::ProviderConfiguration)?;
+        let snapshot = self.load_full(session_id)?;
+        if snapshot.revision != expected_session_revision
             || !snapshot.lifecycle.accepts_follow_up()
             || snapshot.active_run_id.is_some()
         {
-            return Err(ThreadRuntimeError::InvalidState);
+            return Err(SessionRuntimeError::InvalidState);
         }
         if snapshot.binding == *binding {
             return Ok(snapshot);
         }
-        let lease = self.acquire(thread_id)?;
+        let lease = self.acquire(session_id)?;
         self.engine
-            .switch_thread_binding_v2(
-                thread_id,
-                expected_thread_revision,
+            .switch_session_binding_v2(
+                session_id,
+                expected_session_revision,
                 binding,
                 &lease,
                 now_ms(),
@@ -824,37 +827,37 @@ impl ThreadRuntimeService {
     /// Provides a non-secret request value and continues the same child.
     pub async fn provide_input(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         expected_run_revision: u64,
         request_id: String,
         value: String,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let snapshot = self.load_full(session_id)?;
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run = snapshot
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
-            .ok_or(ThreadRuntimeError::InvalidState)?;
-        if snapshot.lifecycle != ThreadLifecycle::WaitingInput
-            || snapshot.revision != expected_thread_revision
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        if snapshot.lifecycle != SessionLifecycle::WaitingInput
+            || snapshot.revision != expected_session_revision
             || run.run_revision != expected_run_revision
         {
-            return Err(ThreadRuntimeError::InvalidState);
+            return Err(SessionRuntimeError::InvalidState);
         }
         let messages = self.history_with_prompt(&snapshot, &value)?;
         let provider = (self.provider)(&snapshot.binding)
-            .map_err(ThreadRuntimeError::ProviderConfiguration)?;
-        let lease = self.acquire(thread_id)?;
+            .map_err(SessionRuntimeError::ProviderConfiguration)?;
+        let lease = self.acquire(session_id)?;
         let running = self.commit(
-            thread_id,
+            session_id,
             run_id,
             snapshot.revision,
             run.run_revision,
-            CommitThreadRunUpdate::ProvideInput {
+            CommitSessionRunUpdate::ProvideInput {
                 source_key: format!("{run_id}:input:{request_id}"),
                 request_id,
                 value,
@@ -871,30 +874,30 @@ impl ThreadRuntimeService {
     /// without executing it.
     pub async fn resolve_permission(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         expected_run_revision: u64,
         request_id: String,
         allow: bool,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let snapshot = self.load_full(session_id)?;
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run_revision = active_run_revision(&snapshot)?;
-        if snapshot.lifecycle != ThreadLifecycle::WaitingPermission
-            || snapshot.revision != expected_thread_revision
+        if snapshot.lifecycle != SessionLifecycle::WaitingPermission
+            || snapshot.revision != expected_session_revision
             || run_revision != expected_run_revision
             || snapshot.pending.as_ref().and_then(|pending| match pending {
-                latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
+                latte_core::SessionPendingRequest::Permission { request_id, .. } => {
                     Some(request_id.as_str())
                 }
-                latte_core::ThreadPendingRequest::Input { .. } => None,
+                latte_core::SessionPendingRequest::Input { .. } => None,
             }) != Some(request_id.as_str())
         {
-            return Err(ThreadRuntimeError::InvalidState);
+            return Err(SessionRuntimeError::InvalidState);
         }
-        let verification = request_id.starts_with(THREAD_VERIFICATION_EFFECT_PREFIX);
+        let verification = request_id.starts_with(SESSION_VERIFICATION_EFFECT_PREFIX);
         // Validate the immutable Provider binding before approval can start an
         // external effect. A configuration/model mismatch is not authority to
         // consume permission or execute the tool; the Session remains at the
@@ -902,14 +905,14 @@ impl ThreadRuntimeService {
         let provider = if allow && !verification {
             Some(
                 (self.provider)(&snapshot.binding)
-                    .map_err(ThreadRuntimeError::ProviderConfiguration)?,
+                    .map_err(SessionRuntimeError::ProviderConfiguration)?,
             )
         } else {
             None
         };
-        let lease = self.acquire(thread_id)?;
-        let resolved = self.engine.resolve_thread_effect_permission(
-            thread_id,
+        let lease = self.acquire(session_id)?;
+        let resolved = self.engine.resolve_session_effect_permission(
+            session_id,
             run_id,
             snapshot.revision,
             run_revision,
@@ -919,7 +922,7 @@ impl ThreadRuntimeService {
                 if allow { "allow" } else { "deny" }
             ),
             allow,
-            ThreadCommandId::from_uuid(Uuid::now_v7()),
+            SessionCommandId::from_uuid(Uuid::now_v7()),
             &lease,
             now_ms(),
         )?;
@@ -930,13 +933,13 @@ impl ThreadRuntimeService {
         // provider tool round.  Do not reconstruct a new provider turn after
         // this one approved call: OpenAI-compatible history requires a tool
         // result for every call in the original assistant message, in order.
-        let started = self.engine.start_thread_effect(
-            thread_effect_start_request(
+        let started = self.engine.start_session_effect(
+            session_effect_start_request(
                 &resolved,
                 request_id.clone(),
                 format!("{run_id}:effect:{request_id}:start"),
             )?,
-            self.engine.thread_effect_digest(&request_id)?,
+            self.engine.session_effect_digest(&request_id)?,
             &lease,
             now_ms(),
         )?;
@@ -948,17 +951,17 @@ impl ThreadRuntimeService {
             .then(|| tool_round_for_call(&resolved, &presentation.tool_call_id))
             .transpose()?;
         let after_effect = self.execute_and_observe_effect(started, &lease).await?;
-        if after_effect.lifecycle != ThreadLifecycle::Running {
+        if after_effect.lifecycle != SessionLifecycle::Running {
             return Ok(after_effect);
         }
         if verification {
             return self.finish_verification(&after_effect, &presentation, &lease);
         }
         let (round_sequence, calls, ordinal) = continuation.ok_or_else(|| {
-            ThreadRuntimeError::Effect("provider tool continuation is missing".into())
+            SessionRuntimeError::Effect("provider tool continuation is missing".into())
         })?;
         let provider = provider.ok_or_else(|| {
-            ThreadRuntimeError::ProviderConfiguration(
+            SessionRuntimeError::ProviderConfiguration(
                 "provider was not resolved before effect approval".into(),
             )
         })?;
@@ -982,36 +985,36 @@ impl ThreadRuntimeService {
     /// Explicitly resolves an Unknown v2 effect through the v2 commit path.
     pub fn reconcile_unknown_effect(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         effect_id: &str,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let snapshot = self.load_full(session_id)?;
         let run_id = snapshot
             .latest_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
-        if snapshot.lifecycle != ThreadLifecycle::ReconciliationRequired {
-            return Err(ThreadRuntimeError::InvalidState);
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        if snapshot.lifecycle != SessionLifecycle::ReconciliationRequired {
+            return Err(SessionRuntimeError::InvalidState);
         }
         let run_revision = snapshot
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
             .map(|run| run.run_revision)
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         // A reconcile acquires a lease and immediately commits under it with no
         // heartbeat renewal, so it uses the management TTL (floored well above a
         // sub-second turn TTL) to avoid a spurious `LeaseLost` if the acquire →
         // in-transaction recheck window stalls under load.
-        let lease = self.acquire_with_ttl(thread_id, self.management_ttl())?;
+        let lease = self.acquire_with_ttl(session_id, self.management_ttl())?;
         self.engine
-            .reconcile_thread_effect_unknown(
-                thread_id,
+            .reconcile_session_effect_unknown(
+                session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
                 effect_id.to_owned(),
                 format!("{run_id}:effect:{effect_id}:reconcile"),
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 &lease,
                 now_ms(),
             )
@@ -1020,12 +1023,12 @@ impl ThreadRuntimeService {
 
     /// Cancellation is explicit. No composer input has a run ID before start,
     /// so canceling it is necessarily local and never reaches this method.
-    pub fn cancel(&self, thread_id: ThreadId) {
+    pub fn cancel(&self, session_id: SessionId) {
         if let Some(token) = self
             .active
             .lock()
             .expect("active mutex poisoned")
-            .get(&thread_id)
+            .get(&session_id)
         {
             token.cancel();
         }
@@ -1035,48 +1038,48 @@ impl ThreadRuntimeService {
     /// is signalled first and commits its own interruption without a partial
     /// assistant card; a waiting request is terminally cancelled immediately.
     ///
-    /// The caller's `expected_thread_revision`/`expected_run_revision` are
+    /// The caller's `expected_session_revision`/`expected_run_revision` are
     /// validated against the authoritative snapshot before any interruption, so
     /// a stale client cannot cancel a newer run.
     pub fn cancel_durable(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         expected_run_revision: u64,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let snapshot = self.load_full(thread_id)?;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let snapshot = self.load_full(session_id)?;
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run_revision = snapshot
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
-            .ok_or(ThreadRuntimeError::InvalidState)?
+            .ok_or(SessionRuntimeError::InvalidState)?
             .run_revision;
         // Fence the caller's expectation against the authoritative snapshot
         // before signalling or committing any cancellation.
-        if snapshot.revision != expected_thread_revision || run_revision != expected_run_revision {
-            return Err(ThreadRuntimeError::InvalidState);
+        if snapshot.revision != expected_session_revision || run_revision != expected_run_revision {
+            return Err(SessionRuntimeError::InvalidState);
         }
         // Hold the active-map lock across the fence recheck and signal so no
         // concurrent state advance can slip between validation and
         // cancellation.
         {
             let active = self.active.lock().expect("active mutex poisoned");
-            if let Some(token) = active.get(&thread_id) {
+            if let Some(token) = active.get(&session_id) {
                 token.cancel();
                 drop(active);
-                return self.load_full(thread_id);
+                return self.load_full(session_id);
             }
         }
-        let lease = self.acquire(thread_id)?;
+        let lease = self.acquire(session_id)?;
         self.commit(
-            thread_id,
+            session_id,
             run_id,
             snapshot.revision,
             run_revision,
-            CommitThreadRunUpdate::Interrupt {
+            CommitSessionRunUpdate::Interrupt {
                 source_key: format!("{run_id}:cancel"),
                 reconciliation_effect_id: None,
             },
@@ -1088,29 +1091,29 @@ impl ThreadRuntimeService {
         &self,
         prompt: &str,
         focus: Option<&Path>,
-    ) -> Result<Vec<Message>, ThreadRuntimeError> {
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
         let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
-            .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
+            .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
         self.enforce_budget(vec![
             Message::System {
-                content: redact_thread_text(&system_prompt(&context.text)),
+                content: redact_session_text(&system_prompt(&context.text)),
             },
             Message::User {
-                content: redact_thread_text(prompt),
+                content: redact_session_text(prompt),
             },
         ])
     }
 
     fn history_with_prompt(
         &self,
-        snapshot: &ThreadSnapshot,
+        snapshot: &SessionSnapshot,
         prompt: &str,
-    ) -> Result<Vec<Message>, ThreadRuntimeError> {
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
         let focus = snapshot.focus.as_deref().map(Path::new);
         let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
-            .map_err(|error| ThreadRuntimeError::History(error.to_string()))?;
+            .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
         let system = Message::System {
-            content: redact_thread_text(&system_prompt(&context.text)),
+            content: redact_session_text(&system_prompt(&context.text)),
         };
         let mut segments: Vec<Vec<Message>> = Vec::new();
         for entry in &snapshot.transcript.entries {
@@ -1191,7 +1194,7 @@ impl ThreadRuntimeService {
             }
         }
         segments.push(vec![Message::User {
-            content: redact_thread_text(prompt),
+            content: redact_session_text(prompt),
         }]);
         let budget = self.policy.budget()?;
         let mut selected = Vec::new();
@@ -1202,7 +1205,7 @@ impl ThreadRuntimeService {
             candidate.extend(selected.iter().cloned());
             if wire_bytes(&candidate)? > budget {
                 if selected.is_empty() {
-                    return Err(ThreadRuntimeError::History(
+                    return Err(SessionRuntimeError::History(
                         "newest complete user segment exceeds the exact request budget".into(),
                     ));
                 }
@@ -1217,10 +1220,10 @@ impl ThreadRuntimeService {
         self.enforce_budget(messages)
     }
 
-    fn enforce_budget(&self, messages: Vec<Message>) -> Result<Vec<Message>, ThreadRuntimeError> {
+    fn enforce_budget(&self, messages: Vec<Message>) -> Result<Vec<Message>, SessionRuntimeError> {
         let bytes = wire_bytes(&messages)?;
         if bytes > self.policy.budget()? {
-            return Err(ThreadRuntimeError::History(format!(
+            return Err(SessionRuntimeError::History(format!(
                 "request is {bytes} bytes and exceeds the exact budget"
             )));
         }
@@ -1229,8 +1232,8 @@ impl ThreadRuntimeService {
 
     fn history_from_snapshot(
         &self,
-        snapshot: &ThreadSnapshot,
-    ) -> Result<Vec<Message>, ThreadRuntimeError> {
+        snapshot: &SessionSnapshot,
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
         let mut messages = self.history_with_prompt(snapshot, "")?;
         if matches!(messages.last(), Some(Message::User { content }) if content.is_empty()) {
             let _ = messages.pop();
@@ -1240,24 +1243,24 @@ impl ThreadRuntimeService {
 
     fn verification_descriptor(
         &self,
-        snapshot: &ThreadSnapshot,
+        snapshot: &SessionSnapshot,
         summary: &str,
-    ) -> Result<ThreadEffectDescriptor, ThreadRuntimeError> {
+    ) -> Result<SessionEffectDescriptor, SessionRuntimeError> {
         let plan = self.verification.as_ref().ok_or_else(|| {
-            ThreadRuntimeError::Effect(
+            SessionRuntimeError::Effect(
                 "workspace changed but no configured verification plan is available".into(),
             )
         })?;
         if plan.argv.is_empty() {
-            return Err(ThreadRuntimeError::Effect(
+            return Err(SessionRuntimeError::Effect(
                 "configured verification argv is empty".into(),
             ));
         }
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
-        Ok(ThreadEffectDescriptor {
-            effect_id: format!("{THREAD_VERIFICATION_EFFECT_PREFIX}{run_id}"),
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        Ok(SessionEffectDescriptor {
+            effect_id: format!("{SESSION_VERIFICATION_EFFECT_PREFIX}{run_id}"),
             tool_call_id: format!("verification-{run_id}"),
             name: "process".into(),
             input: serde_json::json!({
@@ -1271,7 +1274,7 @@ impl ThreadRuntimeService {
                 // The summary is non-secret transcript content. Keeping it
                 // with the durable verification descriptor lets an Ask
                 // approval resume after restart without trusting RAM.
-                "completion_summary": redact_thread_text(summary),
+                "completion_summary": redact_session_text(summary),
             }),
             attempt: 1,
         })
@@ -1280,16 +1283,16 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn begin_verification(
         &self,
-        snapshot: ThreadSnapshot,
+        snapshot: SessionSnapshot,
         summary: String,
-        lease: ThreadLeaseGuard,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        lease: SessionLeaseGuard,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let descriptor = self.verification_descriptor(&snapshot, &summary)?;
-        let prepared = self.engine.prepare_thread_effect(
-            thread_effect_request(
+        let prepared = self.engine.prepare_session_effect(
+            session_effect_request(
                 &snapshot,
                 descriptor.clone(),
                 format!("{run_id}:verification:prepare"),
@@ -1297,11 +1300,11 @@ impl ThreadRuntimeService {
             &lease,
             now_ms(),
         )?;
-        if prepared.policy == latte_engine::ThreadEffectPolicy::Ask {
+        if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
             return Ok(prepared.snapshot);
         }
-        let started = self.engine.start_thread_effect(
-            thread_effect_start_request(
+        let started = self.engine.start_session_effect(
+            session_effect_start_request(
                 &prepared.snapshot,
                 descriptor.effect_id.clone(),
                 format!("{run_id}:verification:start"),
@@ -1312,7 +1315,7 @@ impl ThreadRuntimeService {
         )?;
         let presentation = started.presentation.clone();
         let observed = self.execute_and_observe_effect(started, &lease).await?;
-        if observed.lifecycle != ThreadLifecycle::Running {
+        if observed.lifecycle != SessionLifecycle::Running {
             return Ok(observed);
         }
         self.finish_verification(&observed, &presentation, &lease)
@@ -1320,25 +1323,25 @@ impl ThreadRuntimeService {
 
     fn finish_verification(
         &self,
-        snapshot: &ThreadSnapshot,
-        descriptor: &ThreadEffectPresentation,
+        snapshot: &SessionSnapshot,
+        descriptor: &SessionEffectPresentation,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run_revision = active_run_revision(snapshot)?;
         let raw_output =
             effect_provider_result(snapshot, &descriptor.tool_call_id).ok_or_else(|| {
-                ThreadRuntimeError::Effect("verification observation is missing".into())
+                SessionRuntimeError::Effect("verification observation is missing".into())
             })?;
         let output: latte_engine::ProcessOutput =
             serde_json::from_str(&raw_output).map_err(|_| {
-                ThreadRuntimeError::Effect(
+                SessionRuntimeError::Effect(
                     "verification observation is not a process result".into(),
                 )
             })?;
-        self.engine.record_thread_verification(
+        self.engine.record_session_verification(
             run_id,
             run_revision,
             &descriptor.effect_id,
@@ -1348,7 +1351,7 @@ impl ThreadRuntimeService {
         )?;
         if !output.command_succeeded() {
             return self.fail(
-                snapshot.thread_id,
+                snapshot.session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
@@ -1361,11 +1364,11 @@ impl ThreadRuntimeService {
             .get("completion_summary")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                ThreadRuntimeError::Effect("verification completion summary is missing".into())
+                SessionRuntimeError::Effect("verification completion summary is missing".into())
             })?
             .to_owned();
         self.engine
-            .complete_thread_verified(
+            .complete_session_verified(
                 snapshot,
                 summary,
                 descriptor.effect_id.clone(),
@@ -1378,17 +1381,17 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn handle_provider_tool_round(
         &self,
-        snapshot: ThreadSnapshot,
+        snapshot: SessionSnapshot,
         mut messages: Vec<Message>,
         response: crate::provider::ProviderResponse,
         provider: Arc<dyn Provider>,
-        lease: ThreadLeaseGuard,
+        lease: SessionLeaseGuard,
         round: u32,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let thread_id = snapshot.thread_id;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let session_id = snapshot.session_id;
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run_revision = active_run_revision(&snapshot)?;
         let known_tools = self
             .engine
@@ -1404,7 +1407,7 @@ impl ThreadRuntimeService {
                 || !call.input.is_object()
         }) {
             return self.fail(
-                thread_id,
+                session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
@@ -1416,11 +1419,11 @@ impl ThreadRuntimeService {
         let first_tool_call_id = response.tool_calls[0].id.clone();
         let tool_calls = response.tool_calls;
         let current = self.commit(
-            thread_id,
+            session_id,
             run_id,
             snapshot.revision,
             run_revision,
-            CommitThreadRunUpdate::AppendTranscript {
+            CommitSessionRunUpdate::AppendTranscript {
                 source_key: format!("{run_id}:assistant-tool-round:{first_tool_call_id}"),
                 kind: TranscriptKind::Assistant,
                 text: assistant_text.clone(),
@@ -1453,29 +1456,29 @@ impl ThreadRuntimeService {
 
     /// Continues one persisted assistant tool round. `start_ordinal` is
     /// durable through the `ToolResult` cards already in history; callers only
-    /// use this helper after loading the authoritative thread snapshot.
+    /// use this helper after loading the authoritative session snapshot.
     #[allow(clippy::too_many_arguments)]
     async fn continue_provider_tool_round(
         &self,
-        mut current: ThreadSnapshot,
+        mut current: SessionSnapshot,
         mut messages: Vec<Message>,
         calls: Vec<crate::provider::ToolCall>,
         start_ordinal: usize,
         round_sequence: u64,
         provider: Arc<dyn Provider>,
-        lease: ThreadLeaseGuard,
+        lease: SessionLeaseGuard,
         round: u32,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let run_id = current
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         for (ordinal, call) in calls.into_iter().enumerate().skip(start_ordinal) {
-            let descriptor = ThreadEffectDescriptor {
+            let descriptor = SessionEffectDescriptor {
                 // Provider IDs only need to be unique within one response.
                 // Include the durable assistant sequence to prevent a later
                 // response reusing an ID from colliding with this effect.
                 effect_id: format!(
-                    "thread-effect:{run_id}:{round_sequence}:{ordinal}:{}",
+                    "session-effect:{run_id}:{round_sequence}:{ordinal}:{}",
                     call.id
                 ),
                 tool_call_id: call.id.clone(),
@@ -1483,8 +1486,8 @@ impl ThreadRuntimeService {
                 input: call.input.clone(),
                 attempt: 1,
             };
-            let prepared = self.engine.prepare_thread_effect(
-                thread_effect_request(
+            let prepared = self.engine.prepare_session_effect(
+                session_effect_request(
                     &current,
                     descriptor.clone(),
                     format!("{run_id}:effect:{}:{ordinal}:prepare", call.id),
@@ -1493,11 +1496,11 @@ impl ThreadRuntimeService {
                 now_ms(),
             )?;
             current = prepared.snapshot;
-            if prepared.policy == latte_engine::ThreadEffectPolicy::Ask {
+            if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
                 return Ok(current);
             }
-            let started = self.engine.start_thread_effect(
-                thread_effect_start_request(
+            let started = self.engine.start_session_effect(
+                session_effect_start_request(
                     &current,
                     descriptor.effect_id,
                     format!("{run_id}:effect:{}:{ordinal}:start", call.id),
@@ -1507,11 +1510,12 @@ impl ThreadRuntimeService {
                 now_ms(),
             )?;
             current = self.execute_and_observe_effect(started, &lease).await?;
-            if current.lifecycle != ThreadLifecycle::Running {
+            if current.lifecycle != SessionLifecycle::Running {
                 return Ok(current);
             }
-            let result = effect_provider_result(&current, &call.id)
-                .ok_or_else(|| ThreadRuntimeError::Effect("missing observed tool result".into()))?;
+            let result = effect_provider_result(&current, &call.id).ok_or_else(|| {
+                SessionRuntimeError::Effect("missing observed tool result".into())
+            })?;
             messages.push(Message::Tool {
                 tool_call_id: call.id,
                 name: Some(call.name),
@@ -1531,18 +1535,18 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn execute_and_observe_effect(
         &self,
-        started: ThreadEffectStarted,
+        started: SessionEffectStarted,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let thread_id = started.snapshot.thread_id;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let session_id = started.snapshot.session_id;
         let cancellation = CancellationToken::new();
         self.active
             .lock()
             .expect("active mutex poisoned")
-            .insert(thread_id, cancellation.clone());
+            .insert(session_id, cancellation.clone());
         let execution = self
             .engine
-            .execute_started_thread_effect(&started, lease, &cancellation);
+            .execute_started_session_effect(&started, lease, &cancellation);
         tokio::pin!(execution);
         let heartbeat = tokio::time::sleep(self.heartbeat_interval());
         tokio::pin!(heartbeat);
@@ -1553,7 +1557,7 @@ impl ThreadRuntimeService {
                     if self.engine.renew_lease(lease, now_ms(), self.authority_ttl()).is_err() {
                         cancellation.cancel();
                         let _ = execution.await;
-                        self.active.lock().expect("active mutex poisoned").remove(&thread_id);
+                        self.active.lock().expect("active mutex poisoned").remove(&session_id);
                         return Err(self.recover_lease_loss(&started.snapshot, lease, "started effect"));
                     }
                     heartbeat
@@ -1562,7 +1566,7 @@ impl ThreadRuntimeService {
                 }
                 () = cancellation.cancelled() => {
                     let _ = execution.await;
-                    self.active.lock().expect("active mutex poisoned").remove(&thread_id);
+                    self.active.lock().expect("active mutex poisoned").remove(&session_id);
                     return self.mark_cancelled_started_effect_unknown(&started, lease);
                 }
             }
@@ -1571,7 +1575,7 @@ impl ThreadRuntimeService {
         self.active
             .lock()
             .expect("active mutex poisoned")
-            .remove(&thread_id);
+            .remove(&session_id);
         if cancelled {
             return self.mark_cancelled_started_effect_unknown(&started, lease);
         }
@@ -1598,17 +1602,17 @@ impl ThreadRuntimeService {
                 }
                 value.payload = Some(payload);
                 self.engine
-                    .observe_thread_effect(
+                    .observe_session_effect(
                         &started,
                         format!(
                             "{}:effect:{}:observe",
                             started
                                 .snapshot
                                 .active_run_id
-                                .ok_or(ThreadRuntimeError::InvalidState)?,
+                                .ok_or(SessionRuntimeError::InvalidState)?,
                             started.presentation.effect_id
                         ),
-                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
                         value,
                         lease,
                         now_ms(),
@@ -1616,20 +1620,20 @@ impl ThreadRuntimeService {
                     .map(|observed| observed.snapshot)
                     .map_err(Into::into)
             }
-            Err(ThreadEffectExecutionError::Certified(error)) => self
+            Err(SessionEffectExecutionError::Certified(error)) => self
                 .engine
-                .observe_thread_effect(
+                .observe_session_effect(
                     &started,
                     format!(
                         "{}:effect:{}:observe-failed",
                         started
                             .snapshot
                             .active_run_id
-                            .ok_or(ThreadRuntimeError::InvalidState)?,
+                            .ok_or(SessionRuntimeError::InvalidState)?,
                         started.presentation.effect_id
                     ),
-                    ThreadCommandId::from_uuid(Uuid::now_v7()),
-                    latte_engine::ThreadEffectObservedValue {
+                    SessionCommandId::from_uuid(Uuid::now_v7()),
+                    latte_engine::SessionEffectObservedValue {
                         result: serde_json::json!({"error":error}).to_string(),
                         payload: Some(serde_json::json!({
                             "tool_call_id":started.presentation.tool_call_id,
@@ -1643,19 +1647,19 @@ impl ThreadRuntimeService {
                 )
                 .map(|observed| observed.snapshot)
                 .map_err(Into::into),
-            Err(ThreadEffectExecutionError::Uncertain(_error)) => self
+            Err(SessionEffectExecutionError::Uncertain(_error)) => self
                 .engine
-                .mark_thread_effect_unknown(
+                .mark_session_effect_unknown(
                     &started,
                     format!(
                         "{}:effect:{}:unknown",
                         started
                             .snapshot
                             .active_run_id
-                            .ok_or(ThreadRuntimeError::InvalidState)?,
+                            .ok_or(SessionRuntimeError::InvalidState)?,
                         started.presentation.effect_id
                     ),
-                    ThreadCommandId::from_uuid(Uuid::now_v7()),
+                    SessionCommandId::from_uuid(Uuid::now_v7()),
                     lease,
                     now_ms(),
                 )
@@ -1665,11 +1669,11 @@ impl ThreadRuntimeService {
 
     async fn run_provider_turn(
         &self,
-        snapshot: ThreadSnapshot,
+        snapshot: SessionSnapshot,
         messages: Vec<Message>,
         provider: Arc<dyn Provider>,
-        lease: ThreadLeaseGuard,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+        lease: SessionLeaseGuard,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.run_provider_round(snapshot, messages, provider, lease, 0)
             .await
     }
@@ -1681,33 +1685,33 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn run_provider_round(
         &self,
-        snapshot: ThreadSnapshot,
+        snapshot: SessionSnapshot,
         messages: Vec<Message>,
         provider: Arc<dyn Provider>,
-        lease: ThreadLeaseGuard,
+        lease: SessionLeaseGuard,
         round: u32,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let thread_id = snapshot.thread_id;
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let session_id = snapshot.session_id;
         let run_id = snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?;
+            .ok_or(SessionRuntimeError::InvalidState)?;
         let run_revision = snapshot
             .runs
             .iter()
             .find(|run| run.run_id == run_id)
-            .ok_or(ThreadRuntimeError::InvalidState)?
+            .ok_or(SessionRuntimeError::InvalidState)?
             .run_revision;
         if round >= self.policy.max_tool_rounds {
             // Retryable: the work so far is durable and a follow-up turn can
             // continue from it. The turn is stopped, not the Session.
             return self.fail_retryable(
-                thread_id,
+                session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
                 format!(
                     "turn stopped after {} tool rounds without completing; \
-                     raise thread.max_tool_rounds or narrow the task",
+                     raise session.max_tool_rounds or narrow the task",
                     self.policy.max_tool_rounds
                 ),
                 &lease,
@@ -1717,7 +1721,7 @@ impl ThreadRuntimeService {
         self.active
             .lock()
             .expect("active mutex poisoned")
-            .insert(thread_id, cancellation.clone());
+            .insert(session_id, cancellation.clone());
         let output = {
             let output = provider.complete(
                 ProviderRequest {
@@ -1729,7 +1733,7 @@ impl ThreadRuntimeService {
                     // Derived, not the Session id itself: stable for every turn
                     // of this Session so a Provider can group them, opaque
                     // enough that it learns no internal identifier.
-                    session_ref: crate::provider::session_ref_for(thread_id),
+                    session_ref: crate::provider::session_ref_for(session_id),
                 },
                 ProviderContext {
                     deadline: Instant::now()
@@ -1737,7 +1741,7 @@ impl ThreadRuntimeService {
                     cancellation: cancellation.clone(),
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
-                            thread_id,
+                            session_id,
                             run_id,
                             sink: Arc::clone(sink),
                         }) as Arc<dyn ProviderEventSink>
@@ -1754,7 +1758,7 @@ impl ThreadRuntimeService {
                         if self.engine.renew_lease(&lease, now_ms(), self.authority_ttl()).is_err() {
                             cancellation.cancel();
                             let _ = output.await;
-                            self.active.lock().expect("active mutex poisoned").remove(&thread_id);
+                            self.active.lock().expect("active mutex poisoned").remove(&session_id);
                             return Err(self.recover_lease_loss(&snapshot, &lease, "provider call"));
                         }
                         heartbeat
@@ -1774,21 +1778,21 @@ impl ThreadRuntimeService {
         self.active
             .lock()
             .expect("active mutex poisoned")
-            .remove(&thread_id);
+            .remove(&session_id);
         match output {
             Err(ProviderError::Cancelled) => self.commit(
-                thread_id,
+                session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
-                CommitThreadRunUpdate::Interrupt {
+                CommitSessionRunUpdate::Interrupt {
                     source_key: format!("{run_id}:provider-cancel"),
                     reconciliation_effect_id: None,
                 },
                 &lease,
             ),
             Err(error) => self.fail_retryable(
-                thread_id,
+                session_id,
                 run_id,
                 snapshot.revision,
                 run_revision,
@@ -1808,7 +1812,7 @@ impl ThreadRuntimeService {
                     || input.prompt.trim().is_empty()
                 {
                     return self.fail(
-                        thread_id,
+                        session_id,
                         run_id,
                         snapshot.revision,
                         run_revision,
@@ -1817,11 +1821,11 @@ impl ThreadRuntimeService {
                     );
                 }
                 self.commit(
-                    thread_id,
+                    session_id,
                     run_id,
                     snapshot.revision,
                     run_revision,
-                    CommitThreadRunUpdate::RequestInput {
+                    CommitSessionRunUpdate::RequestInput {
                         source_key: format!("{run_id}:input-request:{}", input.id),
                         request: latte_core::PendingInput {
                             request_id: input.id,
@@ -1845,7 +1849,7 @@ impl ThreadRuntimeService {
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
                     return self.fail(
-                        thread_id,
+                        session_id,
                         run_id,
                         snapshot.revision,
                         run_revision,
@@ -1854,11 +1858,11 @@ impl ThreadRuntimeService {
                     );
                 };
                 let appended = self.commit(
-                    thread_id,
+                    session_id,
                     run_id,
                     snapshot.revision,
                     run_revision,
-                    CommitThreadRunUpdate::AppendTranscript {
+                    CommitSessionRunUpdate::AppendTranscript {
                         source_key: format!("{run_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
@@ -1873,7 +1877,7 @@ impl ThreadRuntimeService {
                 // the session usable so a follow-up can continue the work.
                 if truncated {
                     return self.fail_retryable(
-                        thread_id,
+                        session_id,
                         run_id,
                         appended.revision,
                         run_revision,
@@ -1882,11 +1886,11 @@ impl ThreadRuntimeService {
                         &lease,
                     );
                 }
-                let changed = self.engine.thread_run_changed_files(run_id)?;
+                let changed = self.engine.session_run_changed_files(run_id)?;
                 if !changed.is_empty() {
                     if self.verification.is_none() {
                         return self.fail(
-                            thread_id,
+                            session_id,
                             run_id,
                             appended.revision,
                             run_revision,
@@ -1898,11 +1902,11 @@ impl ThreadRuntimeService {
                     return self.begin_verification(appended, message, lease).await;
                 }
                 self.commit(
-                    thread_id,
+                    session_id,
                     run_id,
                     appended.revision,
                     run_revision,
-                    CommitThreadRunUpdate::Complete {
+                    CommitSessionRunUpdate::Complete {
                         source_key: format!("{run_id}:complete"),
                         handoff: latte_core::Handoff {
                             summary: message,
@@ -1919,17 +1923,17 @@ impl ThreadRuntimeService {
     #[allow(clippy::needless_pass_by_value)]
     fn fail(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         run_id: RunId,
-        thread_revision: u64,
+        session_revision: u64,
         run_revision: u64,
         message: String,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.fail_with_retryability(
-            thread_id,
+            session_id,
             run_id,
-            thread_revision,
+            session_revision,
             run_revision,
             &message,
             Retryability::Terminal,
@@ -1940,17 +1944,17 @@ impl ThreadRuntimeService {
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn fail_retryable(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         run_id: RunId,
-        thread_revision: u64,
+        session_revision: u64,
         run_revision: u64,
         message: String,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.fail_with_retryability(
-            thread_id,
+            session_id,
             run_id,
-            thread_revision,
+            session_revision,
             run_revision,
             &message,
             Retryability::Retryable,
@@ -1961,24 +1965,24 @@ impl ThreadRuntimeService {
     #[allow(clippy::too_many_arguments)]
     fn fail_with_retryability(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         run_id: RunId,
-        thread_revision: u64,
+        session_revision: u64,
         run_revision: u64,
         message: &str,
         retryability: Retryability,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.commit(
-            thread_id,
+            session_id,
             run_id,
-            thread_revision,
+            session_revision,
             run_revision,
-            CommitThreadRunUpdate::Fail {
+            CommitSessionRunUpdate::Fail {
                 source_key: format!("{run_id}:failure"),
                 failure: RunFailure {
                     code: FailureCode::RuntimeFailed,
-                    message: redact_thread_text(message),
+                    message: redact_session_text(message),
                     retryability,
                 },
             },
@@ -1988,20 +1992,20 @@ impl ThreadRuntimeService {
 
     fn commit(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         run_id: RunId,
-        expected_thread_revision: u64,
+        expected_session_revision: u64,
         expected_run_revision: u64,
-        update: CommitThreadRunUpdate,
+        update: CommitSessionRunUpdate,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
         self.engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
+            .commit_session_run_update(
+                SessionCommitRequest {
+                    session_id,
                     run_id,
-                    expected_thread_revision,
+                    expected_session_revision,
                     expected_run_revision,
                     command_id,
                     request_id: None,
@@ -2015,18 +2019,18 @@ impl ThreadRuntimeService {
             .map_err(Into::into)
     }
 
-    fn acquire(&self, thread_id: ThreadId) -> Result<ThreadLeaseGuard, ThreadRuntimeError> {
-        self.acquire_with_ttl(thread_id, self.authority_ttl())
+    fn acquire(&self, session_id: SessionId) -> Result<SessionLeaseGuard, SessionRuntimeError> {
+        self.acquire_with_ttl(session_id, self.authority_ttl())
     }
 
     fn acquire_with_ttl(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         ttl_ms: u64,
-    ) -> Result<ThreadLeaseGuard, ThreadRuntimeError> {
+    ) -> Result<SessionLeaseGuard, SessionRuntimeError> {
         self.engine
-            .acquire_thread_lease(thread_id, now_ms(), ttl_ms)
-            .map(|lease| ThreadLeaseGuard {
+            .acquire_session_lease(session_id, now_ms(), ttl_ms)
+            .map(|lease| SessionLeaseGuard {
                 engine: self.engine.clone(),
                 lease,
             })
@@ -2035,12 +2039,12 @@ impl ThreadRuntimeService {
 
     fn recover_lease_loss(
         &self,
-        snapshot: &ThreadSnapshot,
+        snapshot: &SessionSnapshot,
         lease: &Lease,
         phase: &str,
-    ) -> ThreadRuntimeError {
+    ) -> SessionRuntimeError {
         let Some(run_id) = snapshot.active_run_id else {
-            return ThreadRuntimeError::Effect(format!(
+            return SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; active linked run is unavailable"
             ));
         };
@@ -2050,27 +2054,27 @@ impl ThreadRuntimeService {
             .find(|run| run.run_id == run_id)
             .map(|run| run.run_revision)
         else {
-            return ThreadRuntimeError::Effect(format!(
+            return SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; active linked run revision is unavailable"
             ));
         };
-        match self.engine.recover_thread_after_lease_loss(
-            snapshot.thread_id,
+        match self.engine.recover_session_after_lease_loss(
+            snapshot.session_id,
             run_id,
             lease,
             revision,
             now_ms(),
         ) {
-            Ok(ThreadLeaseLossRecovery::Recovered(_)) => ThreadRuntimeError::Effect(format!(
+            Ok(SessionLeaseLossRecovery::Recovered(_)) => SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; linked run requires reconciliation"
             )),
-            Ok(ThreadLeaseLossRecovery::FencedNoop) => ThreadRuntimeError::Effect(format!(
+            Ok(SessionLeaseLossRecovery::FencedNoop) => SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; newer owner fenced stale recovery"
             )),
-            Ok(ThreadLeaseLossRecovery::AlreadyTerminal(_)) => ThreadRuntimeError::Effect(format!(
-                "lease heartbeat lost during {phase}; linked run already terminal"
-            )),
-            Err(error) => ThreadRuntimeError::Effect(format!(
+            Ok(SessionLeaseLossRecovery::AlreadyTerminal(_)) => SessionRuntimeError::Effect(
+                format!("lease heartbeat lost during {phase}; linked run already terminal"),
+            ),
+            Err(error) => SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; recovery failed: {error}"
             )),
         }
@@ -2078,21 +2082,21 @@ impl ThreadRuntimeService {
 
     fn mark_cancelled_started_effect_unknown(
         &self,
-        started: &ThreadEffectStarted,
+        started: &SessionEffectStarted,
         lease: &Lease,
-    ) -> Result<ThreadSnapshot, ThreadRuntimeError> {
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.engine
-            .mark_thread_effect_unknown(
+            .mark_session_effect_unknown(
                 started,
                 format!(
                     "{}:effect:{}:cancelled-after-start",
                     started
                         .snapshot
                         .active_run_id
-                        .ok_or(ThreadRuntimeError::InvalidState)?,
+                        .ok_or(SessionRuntimeError::InvalidState)?,
                     started.presentation.effect_id
                 ),
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 lease,
                 now_ms(),
             )
@@ -2125,11 +2129,11 @@ impl ThreadRuntimeService {
         Duration::from_millis((self.lease_ttl_ms / 3).max(1))
     }
 
-    fn load_full(&self, thread_id: ThreadId) -> Result<ThreadSnapshot, ThreadRuntimeError> {
-        let mut snapshot = self.engine.thread_snapshot_v2(thread_id, None, 500)?;
+    fn load_full(&self, session_id: SessionId) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let mut snapshot = self.engine.session_snapshot_v2(session_id, None, 500)?;
         while snapshot.transcript.has_more {
             let after = snapshot.transcript.next_after;
-            let next = self.engine.thread_snapshot_v2(thread_id, after, 500)?;
+            let next = self.engine.session_snapshot_v2(session_id, after, 500)?;
             if next.transcript.entries.is_empty() {
                 break;
             }
@@ -2147,17 +2151,17 @@ fn provider_configuration_failure_message() -> String {
 }
 
 struct ProviderProgress {
-    thread_id: ThreadId,
+    session_id: SessionId,
     run_id: RunId,
-    sink: Arc<dyn ThreadProgressSink>,
+    sink: Arc<dyn SessionProgressSink>,
 }
 impl ProviderEventSink for ProviderProgress {
     fn observe(&self, event: ProviderEvent) {
         match event {
             ProviderEvent::Attempt { number } => {
                 self.sink.observe(
-                    self.thread_id,
-                    ThreadTransientProgress::ProviderAttempt {
+                    self.session_id,
+                    SessionTransientProgress::ProviderAttempt {
                         run_id: self.run_id,
                         number,
                     },
@@ -2165,10 +2169,10 @@ impl ProviderEventSink for ProviderProgress {
             }
             ProviderEvent::AssistantDelta { text } => {
                 self.sink.observe(
-                    self.thread_id,
-                    ThreadTransientProgress::AssistantDelta {
+                    self.session_id,
+                    SessionTransientProgress::AssistantDelta {
                         run_id: self.run_id,
-                        text: redact_thread_text(&text),
+                        text: redact_session_text(&text),
                     },
                 );
             }
@@ -2211,10 +2215,10 @@ fn system_prompt(repository_context: &str) -> String {
     )
 }
 
-fn wire_bytes(messages: &[Message]) -> Result<usize, ThreadRuntimeError> {
+fn wire_bytes(messages: &[Message]) -> Result<usize, SessionRuntimeError> {
     serde_json::to_vec(messages)
         .map(|bytes| bytes.len())
-        .map_err(|error| ThreadRuntimeError::History(error.to_string()))
+        .map_err(|error| SessionRuntimeError::History(error.to_string()))
 }
 
 fn new_run_id() -> RunId {
@@ -2231,64 +2235,64 @@ fn signal_accept<T, E>(accept: Option<oneshot::Sender<Result<T, E>>>, result: Re
 
 /// Classifies a create/follow-up acceptance error for the HTTP layer: a
 /// durable command-id reuse with a different payload is a 422 idempotency
-/// mismatch; a non-replay create for an existing thread, or a stale revision
+/// mismatch; a non-replay create for an existing session, or a stale revision
 /// / invalid state, is a 409 conflict; everything else is a 500.
-fn classify_create_error(error: &ThreadRuntimeError) -> latte_core::CreateAcceptError {
+fn classify_create_error(error: &SessionRuntimeError) -> latte_core::CreateAcceptError {
     match error {
-        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch) => {
+        SessionRuntimeError::Storage(latte_engine::StorageError::SessionCommandReplayMismatch) => {
             latte_core::CreateAcceptError::IdempotencyMismatch(error.to_string())
         }
-        ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(_))
-        | ThreadRuntimeError::InvalidState => {
+        SessionRuntimeError::Storage(latte_engine::StorageError::SessionAlreadyExists(_))
+        | SessionRuntimeError::InvalidState => {
             latte_core::CreateAcceptError::Conflict(error.to_string())
         }
         _ => latte_core::CreateAcceptError::Failed(error.to_string()),
     }
 }
 
-fn active_run_revision(snapshot: &ThreadSnapshot) -> Result<u64, ThreadRuntimeError> {
+fn active_run_revision(snapshot: &SessionSnapshot) -> Result<u64, SessionRuntimeError> {
     let run_id = snapshot
         .active_run_id
-        .ok_or(ThreadRuntimeError::InvalidState)?;
+        .ok_or(SessionRuntimeError::InvalidState)?;
     snapshot
         .runs
         .iter()
         .find(|run| run.run_id == run_id)
         .map(|run| run.run_revision)
-        .ok_or(ThreadRuntimeError::InvalidState)
+        .ok_or(SessionRuntimeError::InvalidState)
 }
 
-fn thread_effect_request(
-    snapshot: &ThreadSnapshot,
-    descriptor: ThreadEffectDescriptor,
+fn session_effect_request(
+    snapshot: &SessionSnapshot,
+    descriptor: SessionEffectDescriptor,
     source_key: String,
-) -> Result<ThreadEffectRequest, ThreadRuntimeError> {
-    Ok(ThreadEffectRequest {
-        thread_id: snapshot.thread_id,
+) -> Result<SessionEffectRequest, SessionRuntimeError> {
+    Ok(SessionEffectRequest {
+        session_id: snapshot.session_id,
         run_id: snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?,
-        expected_thread_revision: snapshot.revision,
+            .ok_or(SessionRuntimeError::InvalidState)?,
+        expected_session_revision: snapshot.revision,
         expected_run_revision: active_run_revision(snapshot)?,
-        command_id: ThreadCommandId::from_uuid(Uuid::now_v7()),
+        command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
         descriptor,
     })
 }
 
-fn thread_effect_start_request(
-    snapshot: &ThreadSnapshot,
+fn session_effect_start_request(
+    snapshot: &SessionSnapshot,
     effect_id: String,
     source_key: String,
-) -> Result<ThreadEffectStartRequest, ThreadRuntimeError> {
-    Ok(ThreadEffectStartRequest {
-        thread_id: snapshot.thread_id,
+) -> Result<SessionEffectStartRequest, SessionRuntimeError> {
+    Ok(SessionEffectStartRequest {
+        session_id: snapshot.session_id,
         run_id: snapshot
             .active_run_id
-            .ok_or(ThreadRuntimeError::InvalidState)?,
-        expected_thread_revision: snapshot.revision,
+            .ok_or(SessionRuntimeError::InvalidState)?,
+        expected_session_revision: snapshot.revision,
         expected_run_revision: active_run_revision(snapshot)?,
-        command_id: ThreadCommandId::from_uuid(Uuid::now_v7()),
+        command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
         effect_id,
     })
@@ -2300,9 +2304,9 @@ fn thread_effect_start_request(
 /// summary. Keeping them in the transcript gives a restarted coordinator the
 /// same ordered queue it had before the permission pause.
 fn tool_round_for_call(
-    snapshot: &ThreadSnapshot,
+    snapshot: &SessionSnapshot,
     tool_call_id: &str,
-) -> Result<(u64, Vec<crate::provider::ToolCall>, usize), ThreadRuntimeError> {
+) -> Result<(u64, Vec<crate::provider::ToolCall>, usize), SessionRuntimeError> {
     snapshot
         .transcript
         .entries
@@ -2324,13 +2328,13 @@ fn tool_round_for_call(
                 .map(|ordinal| (entry.sequence, calls, ordinal))
         })
         .ok_or_else(|| {
-            ThreadRuntimeError::Effect(
+            SessionRuntimeError::Effect(
                 "prepared tool call has no durable provider round continuation".into(),
             )
         })
 }
 
-fn effect_provider_result(snapshot: &ThreadSnapshot, tool_call_id: &str) -> Option<String> {
+fn effect_provider_result(snapshot: &SessionSnapshot, tool_call_id: &str) -> Option<String> {
     for entry in snapshot.transcript.entries.iter().rev() {
         if entry.kind != TranscriptKind::ToolResult {
             continue;
@@ -2460,7 +2464,7 @@ mod tests {
         }
     }
 
-    fn test_run_revision(snapshot: &ThreadSnapshot) -> u64 {
+    fn test_run_revision(snapshot: &SessionSnapshot) -> u64 {
         snapshot
             .active_run_id
             .and_then(|run_id| {
@@ -2473,8 +2477,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn binding() -> ThreadProviderBindingV2 {
-        ThreadProviderBindingV2 {
+    fn binding() -> SessionProviderBinding {
+        SessionProviderBinding {
             version: 1,
             provider_name: "p".into(),
             provider_type: "test".into(),
@@ -2509,48 +2513,52 @@ mod tests {
             .unwrap();
         let provider = Arc::new(DelayedProvider::scripted(
             std::iter::once((Duration::from_millis(100), simple_response("answer-0"))).chain(
-                (1..=THREAD_MAILBOX_CAPACITY)
+                (1..=SESSION_MAILBOX_CAPACITY)
                     .map(|index| (Duration::ZERO, simple_response(&format!("answer-{index}")))),
             ),
         ));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let task_service = service.clone();
         let task = tokio::spawn(async move {
             task_service
-                .start(thread_id, "prompt-0".into(), binding(), None)
+                .start(session_id, "prompt-0".into(), binding(), None)
                 .await
         });
         tokio::task::yield_now().await;
 
-        for index in 1..=THREAD_MAILBOX_CAPACITY {
+        for index in 1..=SESSION_MAILBOX_CAPACITY {
             assert_eq!(
                 service
-                    .queue_follow_up(thread_id, format!("prompt-{index}"))
+                    .queue_follow_up(session_id, format!("prompt-{index}"))
                     .unwrap(),
                 index
             );
         }
         assert!(matches!(
-            service.queue_follow_up(thread_id, "overflow".into()),
-            Err(ThreadRuntimeError::MailboxFull)
+            service.queue_follow_up(session_id, "overflow".into()),
+            Err(SessionRuntimeError::MailboxFull)
         ));
         assert!(matches!(
             service
-                .follow_up(thread_id, 0, "parallel runner".into())
+                .follow_up(session_id, 0, "parallel runner".into())
                 .await,
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
 
         let completed = task.await.unwrap().unwrap();
-        assert_eq!(completed.runs.len(), THREAD_MAILBOX_CAPACITY + 1);
+        assert_eq!(completed.runs.len(), SESSION_MAILBOX_CAPACITY + 1);
         let users = completed
             .transcript
             .entries
@@ -2560,13 +2568,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             users,
-            (0..=THREAD_MAILBOX_CAPACITY)
+            (0..=SESSION_MAILBOX_CAPACITY)
                 .map(|index| format!("prompt-{index}"))
                 .collect::<Vec<_>>()
         );
         assert!(matches!(
-            service.queue_follow_up(thread_id, "too late".into()),
-            Err(ThreadRuntimeError::InvalidState)
+            service.queue_follow_up(session_id, "too late".into()),
+            Err(SessionRuntimeError::InvalidState)
         ));
     }
 
@@ -2583,18 +2591,22 @@ mod tests {
             (Duration::ZERO, simple_response("three")),
             (Duration::ZERO, simple_response("four")),
         ]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
         let first = service.clone();
         let second = service.clone();
-        let left_id = ThreadId::from_uuid(Uuid::now_v7());
-        let right_id = ThreadId::from_uuid(Uuid::now_v7());
+        let left_id = SessionId::from_uuid(Uuid::now_v7());
+        let right_id = SessionId::from_uuid(Uuid::now_v7());
         let left =
             tokio::spawn(async move { first.start(left_id, "left".into(), binding(), None).await });
         let right = tokio::spawn(async move {
@@ -2634,11 +2646,11 @@ mod tests {
             engine,
             [(Duration::from_millis(300), simple_response("done"))],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let first = service.clone();
         let running = tokio::spawn(async move {
             first
-                .start(thread_id, "slow turn".into(), binding(), None)
+                .start(session_id, "slow turn".into(), binding(), None)
                 .await
         });
         // Let the first turn enter the provider call so its runner is active.
@@ -2649,8 +2661,8 @@ mod tests {
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
             .start_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "second start".into(),
                 binding(),
                 None,
@@ -2658,7 +2670,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
         accept_rx
             .await
             .expect("accept channel must be signalled")
@@ -2668,15 +2680,15 @@ mod tests {
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let err = service
             .follow_up_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 0,
                 "second follow-up".into(),
                 accept_tx,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
         accept_rx
             .await
             .expect("accept channel must be signalled")
@@ -2684,7 +2696,7 @@ mod tests {
 
         // The original turn completes successfully.
         let completed = running.await.unwrap().unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
     }
 
     #[tokio::test]
@@ -2694,25 +2706,25 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let factory: ThreadProviderFactory =
+        let factory: SessionProviderFactory =
             Arc::new(|_| Err("missing environment variable PROVIDER_SECRET_NAME".into()));
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine.clone(),
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             factory,
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
 
         let failed = service
-            .start(thread_id, "durable prompt".into(), binding(), None)
+            .start(session_id, "durable prompt".into(), binding(), None)
             .await
             .unwrap();
 
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
         assert!(failed.active_run_id.is_none());
         assert_eq!(failed.runs.len(), 1);
-        assert_eq!(failed.runs[0].status, latte_core::ThreadRunStatus::Failed);
+        assert_eq!(failed.runs[0].status, latte_core::SessionRunStatus::Failed);
         let expected_failure = provider_configuration_failure_message();
         assert_eq!(
             failed
@@ -2734,7 +2746,7 @@ mod tests {
                 retryability: Retryability::Retryable,
             })
         );
-        assert_eq!(engine.list_threads_v2().unwrap(), [failed]);
+        assert_eq!(engine.list_sessions().unwrap(), [failed]);
     }
 
     #[tokio::test]
@@ -2764,7 +2776,7 @@ mod tests {
                 provider_state: None,
             },
         ]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 Err("secret reference PROVIDER_SECRET_NAME is unavailable".into())
             } else {
@@ -2774,30 +2786,30 @@ mod tests {
                 })
             }
         });
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine.clone(),
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             factory,
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let complete = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
 
         let failed = service
-            .follow_up(thread_id, complete.revision, "durable follow-up".into())
+            .follow_up(session_id, complete.revision, "durable follow-up".into())
             .await
             .unwrap();
 
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
         assert_eq!(failed.runs.len(), 2);
         assert_eq!(
             failed.runs[0].status,
-            latte_core::ThreadRunStatus::Completed
+            latte_core::SessionRunStatus::Completed
         );
-        assert_eq!(failed.runs[1].status, latte_core::ThreadRunStatus::Failed);
+        assert_eq!(failed.runs[1].status, latte_core::SessionRunStatus::Failed);
         assert!(failed.transcript.entries.iter().any(|entry| {
             entry.kind == TranscriptKind::User && entry.text == "durable follow-up"
         }));
@@ -2807,14 +2819,14 @@ mod tests {
         }));
 
         let retried = service
-            .follow_up(thread_id, failed.revision, "retry after config fix".into())
+            .follow_up(session_id, failed.revision, "retry after config fix".into())
             .await
             .unwrap();
-        assert_eq!(retried.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(retried.lifecycle, SessionLifecycle::Ready);
         assert_eq!(retried.runs.len(), 3);
         assert_eq!(
             retried.runs[2].status,
-            latte_core::ThreadRunStatus::Completed
+            latte_core::SessionRunStatus::Completed
         );
         assert!(retried.transcript.entries.iter().any(|entry| {
             entry.kind == TranscriptKind::User && entry.text == "retry after config fix"
@@ -2831,7 +2843,7 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let factory: ThreadProviderFactory = Arc::new(|_| {
+        let factory: SessionProviderFactory = Arc::new(|_| {
             Ok(ResolvedProvider {
                 provider: Arc::new(FakeProvider::scripted([
                     ProviderResponse {
@@ -2854,23 +2866,23 @@ mod tests {
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine.clone(),
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             factory,
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let complete = service
-            .start(thread_id, "one".into(), binding(), None)
+            .start(session_id, "one".into(), binding(), None)
             .await
             .unwrap();
         let parent = complete.latest_run_id.unwrap();
         let child = service
-            .follow_up(thread_id, complete.revision, "two".into())
+            .follow_up(session_id, complete.revision, "two".into())
             .await
             .unwrap();
-        assert_eq!(child.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(child.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             engine.show(parent).unwrap().status,
             latte_core::RunStatus::Completed
@@ -2896,15 +2908,15 @@ mod tests {
         root: &std::path::Path,
         engine: EngineHandle,
         responses: Vec<ProviderResponse>,
-    ) -> ThreadRuntimeService {
+    ) -> SessionRuntimeService {
         let provider = Arc::new(FakeProvider::scripted(responses));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
+        SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
     }
 
     /// A `length` finish is a mid-answer stop at the model's output cap. The
@@ -2920,18 +2932,18 @@ mod tests {
         let mut cut = response(Some("half of an ans"), vec![]);
         cut.finish_reason = Some(crate::provider::FinishReason::Length);
         let service = scripted_service(root.path(), engine, vec![cut]);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let snapshot = service
-            .start(thread_id, "write something long".into(), binding(), None)
+            .start(session_id, "write something long".into(), binding(), None)
             .await
             .unwrap();
 
         // Retryable, not terminal: the session still accepts a follow-up that
         // continues the work.
-        assert_eq!(snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
         assert!(snapshot.lifecycle.accepts_follow_up());
         let latest = snapshot.runs.last().expect("one run");
-        assert_eq!(latest.status, latte_core::ThreadRunStatus::Failed);
+        assert_eq!(latest.status, latte_core::SessionRunStatus::Failed);
 
         let assistant = snapshot
             .transcript
@@ -2972,15 +2984,15 @@ mod tests {
             let mut done = response(Some("a complete answer"), vec![]);
             done.finish_reason = reason.clone();
             let service = scripted_service(root.path(), engine, vec![done]);
-            let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+            let session_id = SessionId::from_uuid(Uuid::now_v7());
             let snapshot = service
-                .start(thread_id, "ask".into(), binding(), None)
+                .start(session_id, "ask".into(), binding(), None)
                 .await
                 .unwrap();
             let latest = snapshot.runs.last().expect("one run");
             assert_eq!(
                 latest.status,
-                latte_core::ThreadRunStatus::Completed,
+                latte_core::SessionRunStatus::Completed,
                 "finish_reason {reason:?} must not block completion"
             );
             let assistant = snapshot
@@ -3000,29 +3012,29 @@ mod tests {
         root: &std::path::Path,
         engine: EngineHandle,
         responses: impl IntoIterator<Item = (Duration, ProviderResponse)>,
-    ) -> ThreadRuntimeService {
+    ) -> SessionRuntimeService {
         let provider = Arc::new(DelayedProvider::scripted(responses));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
+        SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
     }
 
     fn recording_service(
         root: &std::path::Path,
         engine: EngineHandle,
         provider: Arc<RecordingProvider>,
-    ) -> ThreadRuntimeService {
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+    ) -> SessionRuntimeService {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        ThreadRuntimeService::new(engine, root, ThreadHistoryPolicy::default(), factory)
+        SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
     }
 
     #[tokio::test]
@@ -3037,35 +3049,35 @@ mod tests {
             engine,
             vec![response(Some("complete"), vec![])],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "initial".into(), binding(), None)
+            .start(session_id, "initial".into(), binding(), None)
             .await
             .unwrap();
 
         assert_eq!(
             service
-                .switch_model(thread_id, ready.revision, &ready.binding)
+                .switch_model(session_id, ready.revision, &ready.binding)
                 .unwrap(),
             ready
         );
         let mut invalid = binding();
         invalid.provider_name.clear();
         assert!(matches!(
-            service.switch_model(thread_id, ready.revision, &invalid),
-            Err(ThreadRuntimeError::ProviderConfiguration(_))
+            service.switch_model(session_id, ready.revision, &invalid),
+            Err(SessionRuntimeError::ProviderConfiguration(_))
         ));
         let mut next = binding();
         next.provider_name = "other".into();
         next.model = "reasoning".into();
         next.config_fingerprint = "other-config".into();
         assert!(matches!(
-            service.switch_model(thread_id, ready.revision + 1, &next),
-            Err(ThreadRuntimeError::InvalidState)
+            service.switch_model(session_id, ready.revision + 1, &next),
+            Err(SessionRuntimeError::InvalidState)
         ));
 
         let switched = service
-            .switch_model(thread_id, ready.revision, &next)
+            .switch_model(session_id, ready.revision, &next)
             .unwrap();
         assert_eq!(switched.binding, next);
         assert!(switched.transcript.entries.iter().any(|entry| {
@@ -3151,14 +3163,14 @@ mod tests {
         );
         let snapshot = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "read it".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
         assert!(
             snapshot
                 .transcript
@@ -3210,21 +3222,21 @@ mod tests {
         );
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "run a failed process".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let terminal = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3232,7 +3244,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(terminal.lifecycle, ThreadLifecycle::ReconciliationRequired);
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
         let effect_id = terminal
             .transcript
             .entries
@@ -3259,10 +3271,10 @@ mod tests {
         );
         assert_eq!(
             service
-                .reconcile_unknown_effect(terminal.thread_id, effect_id)
+                .reconcile_unknown_effect(terminal.session_id, effect_id)
                 .unwrap()
                 .lifecycle,
-            ThreadLifecycle::Failed
+            SessionLifecycle::Failed
         );
     }
 
@@ -3333,21 +3345,21 @@ mod tests {
         .with_verification(passing_verification());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "create it".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let done = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3355,7 +3367,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(done.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(done.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
             "const token=value;\n"
@@ -3363,7 +3375,7 @@ mod tests {
         assert!(
             done.runs
                 .iter()
-                .any(|run| run.status == latte_core::ThreadRunStatus::Completed)
+                .any(|run| run.status == latte_core::SessionRunStatus::Completed)
         );
         let run_id = done.latest_run_id.unwrap();
         let handoff = engine.show(run_id).unwrap().handoff.unwrap();
@@ -3380,7 +3392,7 @@ mod tests {
             .find(|entry| entry.kind == TranscriptKind::Completion)
             .and_then(|entry| entry.payload.as_ref())
             .and_then(|payload| payload.get("handoff"))
-            .expect("completed thread snapshot projects the redacted handoff");
+            .expect("completed session snapshot projects the redacted handoff");
         assert_eq!(
             projected_handoff["files_changed"],
             serde_json::json!(["created.txt"])
@@ -3393,7 +3405,7 @@ mod tests {
     async fn v2_private_descriptor_executes_approved_code_without_transcript_or_history_secret_egress()
      {
         let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("thread.db");
+        let database = root.path().join("session.db");
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&database)
@@ -3415,24 +3427,24 @@ mod tests {
             .with_verification(passing_verification());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "write and inspect source".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let waiting_json = serde_json::to_string(&waiting).unwrap();
         assert!(!waiting_json.contains("live-secret-value"));
         assert!(!waiting_json.contains("token=value"));
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let completed = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id.clone(),
@@ -3440,7 +3452,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             std::fs::read_to_string(root.path().join("generated.rs")).unwrap(),
             source
@@ -3476,7 +3488,7 @@ mod tests {
             ("effects", "descriptor_json"),
             ("conversation_outbox", "entry_json"),
             ("runtime_checkpoints", "payload_json"),
-            ("thread_command_dedup_v2", "result_json"),
+            ("session_command_dedup", "result_json"),
         ] {
             let (table, column) = table_and_column;
             let query = format!("SELECT COALESCE(group_concat({column}, '\\n'), '') FROM {table}");
@@ -3486,7 +3498,7 @@ mod tests {
         }
         let canonical: String = connection
             .query_row(
-                "SELECT descriptor_json FROM thread_effect_canonical_v2 WHERE effect_id=?1",
+                "SELECT descriptor_json FROM session_effect_canonical WHERE effect_id=?1",
                 [effect_id],
                 |row| row.get(0),
             )
@@ -3548,23 +3560,23 @@ mod tests {
             .with_verification(passing_verification());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         assert!(request_id.contains("call_ask-write"));
         assert!(!request_id.contains("[REDACTED]"));
         let completed = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3572,7 +3584,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
             "created"
@@ -3611,21 +3623,21 @@ mod tests {
             .with_verification(passing_verification());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let completed = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3633,7 +3645,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
             "created"
@@ -3663,7 +3675,7 @@ mod tests {
         let service = recording_service(root.path(), engine, provider.clone());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
                 None,
@@ -3671,12 +3683,12 @@ mod tests {
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let denied = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3684,20 +3696,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(denied.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(denied.lifecycle, SessionLifecycle::Ready);
         assert!(denied.active_run_id.is_none());
         assert!(denied.pending.is_none());
         assert!(!root.path().join("new.txt").exists());
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
         let continued = service
             .follow_up(
-                denied.thread_id,
+                denied.session_id,
                 denied.revision,
                 "continue without those tools".into(),
             )
             .await
             .unwrap();
-        assert_eq!(continued.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(continued.lifecycle, SessionLifecycle::Ready);
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(tool_result_ids(&requests[1]), ["ask-write", "allowed-read"]);
@@ -3707,7 +3719,7 @@ mod tests {
     #[tokio::test]
     async fn v2_tool_round_resume_after_restart_uses_durable_assistant_queue() {
         let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("thread.db");
+        let database = root.path().join("session.db");
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&database)
@@ -3727,7 +3739,7 @@ mod tests {
             .with_verification(passing_verification());
         let waiting = first
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "perform the round".into(),
                 binding(),
                 None,
@@ -3735,8 +3747,8 @@ mod tests {
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         assert!(request_id.contains("call_ask-write"));
         assert!(!request_id.contains("[REDACTED]"));
@@ -3744,7 +3756,7 @@ mod tests {
         let resumed = recording_service(root.path(), engine, provider.clone())
             .with_verification(passing_verification())
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3752,7 +3764,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resumed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(resumed.lifecycle, SessionLifecycle::Ready);
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
@@ -3782,7 +3794,7 @@ mod tests {
         );
         let complete = read_only
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "read".into(),
                 binding(),
                 None,
@@ -3817,7 +3829,7 @@ mod tests {
         );
         let waiting = mutated
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
                 None,
@@ -3825,12 +3837,12 @@ mod tests {
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = mutated
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3838,7 +3850,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
         assert!(
             engine
                 .show(failed.latest_run_id.unwrap())
@@ -3870,7 +3882,7 @@ mod tests {
         .with_verification(failing_verification());
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
                 None,
@@ -3878,12 +3890,12 @@ mod tests {
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let failed = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -3891,7 +3903,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
         let run = engine.show(failed.latest_run_id.unwrap()).unwrap();
         assert_eq!(run.status, latte_core::RunStatus::Failed);
         assert!(run.handoff.is_none());
@@ -3931,7 +3943,7 @@ mod tests {
         .with_verification(verification);
         let waiting_tool = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "write".into(),
                 binding(),
                 None,
@@ -3939,12 +3951,12 @@ mod tests {
             .await
             .unwrap();
         let tool_request = match waiting_tool.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let waiting_verification = service
             .resolve_permission(
-                waiting_tool.thread_id,
+                waiting_tool.session_id,
                 waiting_tool.revision,
                 test_run_revision(&waiting_tool),
                 tool_request,
@@ -3954,17 +3966,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             waiting_verification.lifecycle,
-            ThreadLifecycle::WaitingPermission
+            SessionLifecycle::WaitingPermission
         );
         let verification_request = match waiting_verification.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => {
                 panic!("expected verification permission")
             }
         };
         let complete = service
             .resolve_permission(
-                waiting_verification.thread_id,
+                waiting_verification.session_id,
                 waiting_verification.revision,
                 test_run_revision(&waiting_verification),
                 verification_request,
@@ -3972,7 +3984,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(complete.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(complete.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             engine
                 .show(complete.latest_run_id.unwrap())
@@ -4013,17 +4025,17 @@ mod tests {
         );
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "choose a language".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingInput);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
         let completed = service
             .provide_input(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 "language".into(),
@@ -4031,7 +4043,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
         assert!(
             completed
                 .transcript
@@ -4042,21 +4054,21 @@ mod tests {
         assert!(matches!(
             service
                 .provide_input(
-                    waiting.thread_id,
+                    waiting.session_id,
                     waiting.revision,
                     test_run_revision(&waiting),
                     "language".into(),
                     "again".into()
                 )
                 .await,
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert_eq!(
             engine
-                .thread_snapshot_v2(completed.thread_id, None, 100)
+                .session_snapshot_v2(completed.session_id, None, 100)
                 .unwrap()
                 .lifecycle,
-            ThreadLifecycle::Ready
+            SessionLifecycle::Ready
         );
     }
 
@@ -4095,14 +4107,14 @@ mod tests {
             let service = scripted_service(root.path(), engine, vec![outcome]);
             let failed = service
                 .start(
-                    ThreadId::from_uuid(Uuid::now_v7()),
+                    SessionId::from_uuid(Uuid::now_v7()),
                     "must fail closed".into(),
                     binding(),
                     None,
                 )
                 .await
                 .unwrap();
-            assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
+            assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
             assert!(failed.active_run_id.is_none());
             assert!(
                 !failed
@@ -4116,8 +4128,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_, _| {}));
-        let failed = service.start(ThreadId::from_uuid(Uuid::now_v7()), "provider error".into(), binding(), None).await.unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(ThreadId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding, None).await, Err(ThreadRuntimeError::ProviderConfiguration(_)))); let missing = ThreadId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
+        let failed = service.start(SessionId::from_uuid(Uuid::now_v7()), "provider error".into(), binding(), None).await.unwrap();
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(SessionId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding, None).await, Err(SessionRuntimeError::ProviderConfiguration(_)))); let missing = SessionId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -4126,16 +4138,16 @@ mod tests {
             engine,
             [(Duration::from_mins(1), response(Some("unused"), vec![]))],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
-        let cancel = async { wait_until(|| service.active.lock().unwrap().contains_key(&thread_id), "provider registration").await; service.cancel(thread_id); };
-        let (cancelled, ()) = tokio::join!(service.start(thread_id, "cancel provider".into(), binding(), None), cancel);
-        assert_eq!(cancelled.unwrap().lifecycle, ThreadLifecycle::Interrupted);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let cancel = async { wait_until(|| service.active.lock().unwrap().contains_key(&session_id), "provider registration").await; service.cancel(session_id); };
+        let (cancelled, ()) = tokio::join!(service.start(session_id, "cancel provider".into(), binding(), None), cancel);
+        assert_eq!(cancelled.unwrap().lifecycle, SessionLifecycle::Interrupted);
     }
 
     #[tokio::test]
     async fn v2_rejects_secret_shaped_provider_tool_id_before_any_durable_tool_state() {
         let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("thread.db");
+        let database = root.path().join("session.db");
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&database)
@@ -4161,14 +4173,14 @@ mod tests {
 
         let failed = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "reject unsafe provider identity".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
         assert!(failed.active_run_id.is_none());
         assert!(!root.path().join("must-not-exist.txt").exists());
         assert!(failed.pending.is_none());
@@ -4194,12 +4206,12 @@ mod tests {
         for (table, column) in [
             ("effects", "effect_id"),
             ("effects", "descriptor_json"),
-            ("thread_effect_canonical_v2", "descriptor_json"),
+            ("session_effect_canonical", "descriptor_json"),
             ("pending_permissions", "effect_id"),
             ("conversation_outbox", "entry_json"),
-            ("thread_events_v2", "event_json"),
+            ("session_events", "event_json"),
             ("runtime_checkpoints", "payload_json"),
-            ("thread_command_dedup_v2", "result_json"),
+            ("session_command_dedup", "result_json"),
         ] {
             let query = format!("SELECT COALESCE(group_concat({column}, '\\n'), '') FROM {table}");
             let durable: String = connection.query_row(&query, [], |row| row.get(0)).unwrap();
@@ -4214,7 +4226,7 @@ mod tests {
     #[tokio::test]
     async fn v2_rejects_secret_shaped_input_id_before_any_durable_request_state() {
         let root = tempfile::tempdir().unwrap();
-        let database = root.path().join("thread.db");
+        let database = root.path().join("session.db");
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&database)
@@ -4240,14 +4252,14 @@ mod tests {
 
         let failed = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "reject unsafe input identity".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
         assert!(failed.pending.is_none());
         let failure = failed
             .transcript
@@ -4268,7 +4280,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         let input_request_sources: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM thread_commit_sources_v2 WHERE source_key LIKE '%:input-request:%'",
+                "SELECT COUNT(*) FROM session_commit_sources WHERE source_key LIKE '%:input-request:%'",
                 [],
                 |row| row.get(0),
             )
@@ -4290,12 +4302,12 @@ mod tests {
         );
         for (table, column) in [
             ("conversation_outbox", "entry_json"),
-            ("thread_events_v2", "event_json"),
-            ("thread_command_dedup_v2", "digest"),
-            ("thread_command_dedup_v2", "result_json"),
-            ("thread_commit_sources_v2", "source_key"),
-            ("thread_commit_sources_v2", "digest"),
-            ("thread_commit_sources_v2", "result_json"),
+            ("session_events", "event_json"),
+            ("session_command_dedup", "digest"),
+            ("session_command_dedup", "result_json"),
+            ("session_commit_sources", "source_key"),
+            ("session_commit_sources", "digest"),
+            ("session_commit_sources", "result_json"),
         ] {
             let query = format!("SELECT COALESCE(group_concat({column}, '\\n'), '') FROM {table}");
             let durable: String = connection.query_row(&query, [], |row| row.get(0)).unwrap();
@@ -4310,33 +4322,33 @@ mod tests {
     #[test]
     fn history_policy_progress_and_request_helpers_are_bounded_and_typed() {
         assert!(
-            ThreadHistoryPolicy {
+            SessionHistoryPolicy {
                 max_request_bytes: 0,
-                ..ThreadHistoryPolicy::default()
+                ..SessionHistoryPolicy::default()
             }
             .validate()
             .is_err()
         );
         assert!(
-            ThreadHistoryPolicy {
+            SessionHistoryPolicy {
                 max_request_bytes: 10,
                 max_input_bytes: 10,
                 reserved_output_bytes: 10,
                 context_cap_bytes: 1,
-                ..ThreadHistoryPolicy::default()
+                ..SessionHistoryPolicy::default()
             }
             .validate()
             .is_err()
         );
 
         let received = Arc::new(Mutex::new(Vec::new()));
-        let sink: Arc<dyn ThreadProgressSink> = {
+        let sink: Arc<dyn SessionProgressSink> = {
             let received = Arc::clone(&received);
-            Arc::new(move |_thread_id, progress| received.lock().unwrap().push(progress))
+            Arc::new(move |_session_id, progress| received.lock().unwrap().push(progress))
         };
         let run_id = RunId::from_uuid(Uuid::now_v7());
         let progress = ProviderProgress {
-            thread_id: ThreadId::from_uuid(Uuid::now_v7()),
+            session_id: SessionId::from_uuid(Uuid::now_v7()),
             run_id,
             sink,
         };
@@ -4347,15 +4359,15 @@ mod tests {
         assert!(matches!(
             received.lock().unwrap().as_slice(),
             [
-                ThreadTransientProgress::ProviderAttempt { run_id: observed, number: 2 },
-                ThreadTransientProgress::AssistantDelta { text, .. },
+                SessionTransientProgress::ProviderAttempt { run_id: observed, number: 2 },
+                SessionTransientProgress::AssistantDelta { text, .. },
             ] if *observed == run_id && !text.contains("sk-hidden")
         ));
         assert_eq!(
-            ThreadRuntimeService::new(
+            SessionRuntimeService::new(
                 EngineBuilder::new().build().unwrap(),
                 std::env::current_dir().unwrap(),
-                ThreadHistoryPolicy::default(),
+                SessionHistoryPolicy::default(),
                 Arc::new(|_| Err("not used".into())),
             )
             .with_lease_ttl_ms(1)
@@ -4390,7 +4402,7 @@ mod tests {
         );
         let completed = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "read for history".into(),
                 binding(),
                 None,
@@ -4412,18 +4424,18 @@ mod tests {
             Some(Message::User { content }) if content.is_empty()
         ));
 
-        let constrained = ThreadRuntimeService::new(
+        let constrained = SessionRuntimeService::new(
             EngineBuilder::new()
                 .workspace_root(root.path())
                 .build()
                 .unwrap(),
             root.path(),
-            ThreadHistoryPolicy {
+            SessionHistoryPolicy {
                 max_request_bytes: 4096,
                 max_input_bytes: 4096,
                 reserved_output_bytes: 1,
                 context_cap_bytes: 1,
-                ..ThreadHistoryPolicy::default()
+                ..SessionHistoryPolicy::default()
             },
             Arc::new(|_| Err("not used".into())),
         );
@@ -4470,7 +4482,7 @@ mod tests {
         );
         let completed = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "inspect provider settings".into(),
                 binding(),
                 None,
@@ -4478,7 +4490,7 @@ mod tests {
             .await
             .unwrap();
         let durable = engine
-            .thread_snapshot_v2(completed.thread_id, None, 100)
+            .session_snapshot_v2(completed.session_id, None, 100)
             .unwrap();
         let transcript = serde_json::to_string(&durable.transcript).unwrap();
         assert!(!transcript.contains(secret));
@@ -4516,7 +4528,7 @@ mod tests {
             );
             let waiting = service
                 .start(
-                    ThreadId::from_uuid(Uuid::now_v7()),
+                    SessionId::from_uuid(Uuid::now_v7()),
                     "create it".into(),
                     binding(),
                     None,
@@ -4526,18 +4538,20 @@ mod tests {
             let terminal = if cancel {
                 let run_revision = active_run_revision(&waiting).unwrap();
                 service
-                    .cancel_durable(waiting.thread_id, waiting.revision, run_revision)
+                    .cancel_durable(waiting.session_id, waiting.revision, run_revision)
                     .unwrap()
             } else {
                 let request_id = match waiting.pending.as_ref().unwrap() {
-                    latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
+                    latte_core::SessionPendingRequest::Permission { request_id, .. } => {
                         request_id.clone()
                     }
-                    latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+                    latte_core::SessionPendingRequest::Input { .. } => {
+                        panic!("expected permission")
+                    }
                 };
                 service
                     .resolve_permission(
-                        waiting.thread_id,
+                        waiting.session_id,
                         waiting.revision,
                         test_run_revision(&waiting),
                         request_id,
@@ -4549,9 +4563,9 @@ mod tests {
             assert_eq!(
                 terminal.lifecycle,
                 if cancel {
-                    ThreadLifecycle::Failed
+                    SessionLifecycle::Failed
                 } else {
-                    ThreadLifecycle::Ready
+                    SessionLifecycle::Ready
                 }
             );
             assert!(!root.path().join("created.txt").exists());
@@ -4584,14 +4598,14 @@ mod tests {
         );
         let snapshot = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "show cwd".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(snapshot.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
         assert!(
             snapshot
                 .transcript
@@ -4614,28 +4628,28 @@ mod tests {
             [(Duration::from_millis(900), response(Some("done"), vec![]))],
         )
         .with_lease_ttl_ms(300);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .start(thread_id, "wait".into(), binding(), None)
+                .start(session_id, "wait".into(), binding(), None)
                 .await
         });
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
-            engine.acquire_thread_lease(thread_id, now_ms(), 60),
+            engine.acquire_session_lease(session_id, now_ms(), 60),
             Err(StorageError::EngineUnavailable)
         ));
         let parallel = engine
-            .acquire_thread_lease(ThreadId::from_uuid(Uuid::now_v7()), now_ms(), 60)
+            .acquire_session_lease(SessionId::from_uuid(Uuid::now_v7()), now_ms(), 60)
             .unwrap();
         engine.release_lease(&parallel).unwrap();
         assert_eq!(
             run.await.unwrap().unwrap().lifecycle,
-            ThreadLifecycle::Ready
+            SessionLifecycle::Ready
         );
         let resumed = engine
-            .acquire_thread_lease(thread_id, now_ms(), 60)
+            .acquire_session_lease(session_id, now_ms(), 60)
             .unwrap();
         engine.release_lease(&resumed).unwrap();
     }
@@ -4647,7 +4661,7 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let factory: ThreadProviderFactory = Arc::new(|_| {
+        let factory: SessionProviderFactory = Arc::new(|_| {
             Ok(ResolvedProvider {
                 provider: Arc::new(DelayedProvider::scripted([(
                     Duration::from_millis(200),
@@ -4656,20 +4670,24 @@ mod tests {
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
         let first = service.clone();
         let second = service.clone();
-        let first_thread = ThreadId::from_uuid(Uuid::now_v7());
-        let second_thread = ThreadId::from_uuid(Uuid::now_v7());
+        let first_session = SessionId::from_uuid(Uuid::now_v7());
+        let second_session = SessionId::from_uuid(Uuid::now_v7());
 
         let (first, second) = tokio::join!(
-            first.start(first_thread, "first".into(), binding(), None),
-            second.start(second_thread, "second".into(), binding(), None),
+            first.start(first_session, "first".into(), binding(), None),
+            second.start(second_session, "second".into(), binding(), None),
         );
 
-        assert_eq!(first.unwrap().lifecycle, ThreadLifecycle::Ready);
-        assert_eq!(second.unwrap().lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(first.unwrap().lifecycle, SessionLifecycle::Ready);
+        assert_eq!(second.unwrap().lifecycle, SessionLifecycle::Ready);
     }
 
     #[tokio::test]
@@ -4690,27 +4708,27 @@ mod tests {
             )],
         )
         .with_lease_ttl_ms(300);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
-                .start(thread_id, "wait for fencing".into(), binding(), None)
+                .start(session_id, "wait for fencing".into(), binding(), None)
                 .await
         });
 
         wait_until(
             || {
                 engine
-                    .thread_snapshot_v2(thread_id, None, 100)
+                    .session_snapshot_v2(session_id, None, 100)
                     .is_ok_and(|snapshot| {
-                        snapshot.lifecycle == ThreadLifecycle::Running
+                        snapshot.lifecycle == SessionLifecycle::Running
                             && snapshot.active_run_id.is_some()
                     })
             },
             "provider turn to become active",
         )
         .await;
-        let active = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
+        let active = engine.session_snapshot_v2(session_id, None, 100).unwrap();
         let run_id = active.active_run_id.unwrap();
         force_lease_renewal_failure(&database);
 
@@ -4721,8 +4739,8 @@ mod tests {
                 .contains("lease heartbeat lost during provider call"),
             "unexpected provider lease-loss error: {error}"
         );
-        let terminal = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
-        assert_eq!(terminal.lifecycle, ThreadLifecycle::Interrupted);
+        let terminal = engine.session_snapshot_v2(session_id, None, 100).unwrap();
+        assert_eq!(terminal.lifecycle, SessionLifecycle::Interrupted);
         assert!(terminal.active_run_id.is_none());
         assert_eq!(
             engine.show(run_id).unwrap().status,
@@ -4784,21 +4802,21 @@ mod tests {
         // boundary comfortably above instrumented CI startup time, then wait
         // past it so the heartbeat—not scheduler speed—proves renewal.
         .with_lease_ttl_ms(300);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let waiting = service
-            .start(thread_id, "sleep".into(), binding(), None)
+            .start(session_id, "sleep".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
                 .resolve_permission(
-                    thread_id,
+                    session_id,
                     waiting.revision,
                     test_run_revision(&waiting),
                     request_id,
@@ -4807,7 +4825,7 @@ mod tests {
                 .await
         });
         let effect_id = loop {
-            if let Ok(snapshot) = engine.thread_snapshot_v2(thread_id, None, 100)
+            if let Ok(snapshot) = engine.session_snapshot_v2(session_id, None, 100)
                 && let Some(effect_id) = snapshot.transcript.entries.iter().find_map(|entry| {
                     entry
                         .payload
@@ -4825,12 +4843,12 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(450)).await;
         let parallel = engine
-            .acquire_thread_lease(ThreadId::from_uuid(Uuid::now_v7()), now_ms(), 60)
+            .acquire_session_lease(SessionId::from_uuid(Uuid::now_v7()), now_ms(), 60)
             .unwrap();
         engine.release_lease(&parallel).unwrap();
-        service.cancel(thread_id);
+        service.cancel(session_id);
         let terminal = run.await.unwrap().unwrap();
-        assert_eq!(terminal.lifecycle, ThreadLifecycle::ReconciliationRequired);
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
         assert!(terminal.active_run_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
@@ -4885,20 +4903,20 @@ mod tests {
         // a sub-100 ms TTL only makes pre-permission setup scheduler-sensitive
         // under coverage instrumentation and is not part of this test's claim.
         .with_lease_ttl_ms(1000);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let waiting = service
-            .start(thread_id, "sleep until fenced".into(), binding(), None)
+            .start(session_id, "sleep until fenced".into(), binding(), None)
             .await
             .unwrap();
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let runner = service.clone();
         let run = tokio::spawn(async move {
             runner
                 .resolve_permission(
-                    thread_id,
+                    session_id,
                     waiting.revision,
                     test_run_revision(&waiting),
                     request_id,
@@ -4907,7 +4925,7 @@ mod tests {
                 .await
         });
         let effect_id = loop {
-            let snapshot = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
+            let snapshot = engine.session_snapshot_v2(session_id, None, 100).unwrap();
             if let Some(effect_id) = snapshot.transcript.entries.iter().find_map(|entry| {
                 entry
                     .payload
@@ -4923,7 +4941,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        let before_loss = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
+        let before_loss = engine.session_snapshot_v2(session_id, None, 100).unwrap();
         let linked_run_id = before_loss.active_run_id.unwrap();
         force_lease_renewal_failure(&database);
 
@@ -4933,8 +4951,11 @@ mod tests {
                 .to_string()
                 .contains("lease heartbeat lost during started effect")
         );
-        let recovered = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
-        assert_eq!(recovered.lifecycle, ThreadLifecycle::ReconciliationRequired);
+        let recovered = engine.session_snapshot_v2(session_id, None, 100).unwrap();
+        assert_eq!(
+            recovered.lifecycle,
+            SessionLifecycle::ReconciliationRequired
+        );
         assert!(recovered.active_run_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
@@ -4953,9 +4974,9 @@ mod tests {
             "a started process must not produce an observed result after lease loss"
         );
         let reconciled = service
-            .reconcile_unknown_effect(thread_id, &effect_id)
+            .reconcile_unknown_effect(session_id, &effect_id)
             .unwrap();
-        assert_eq!(reconciled.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
         assert!(reconciled.active_run_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
@@ -4978,25 +4999,25 @@ mod tests {
             .build()
             .unwrap();
         std::fs::write(root.path().join("note.txt"), "recovery fixture").unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         engine
-            .create_thread_v2(thread_id, run_id, binding(), "recover", 1)
+            .create_session_v2(session_id, run_id, binding(), "recover", 1)
             .unwrap();
         let lease = engine
-            .acquire_thread_lease(thread_id, now_ms(), 10_000)
+            .acquire_session_lease(session_id, now_ms(), 10_000)
             .unwrap();
         let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
+            .commit_session_run_update(
+                SessionCommitRequest {
+                    session_id,
                     run_id,
-                    expected_thread_revision: 0,
+                    expected_session_revision: 0,
                     expected_run_revision: 0,
-                    command_id: ThreadCommandId::from_uuid(Uuid::now_v7()),
+                    command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionRunUpdate::Start {
                         source_key: format!("{run_id}:start"),
                     },
                 },
@@ -5005,24 +5026,24 @@ mod tests {
             )
             .unwrap()
             .snapshot;
-        let descriptor = ThreadEffectDescriptor {
-            effect_id: format!("thread-effect:{run_id}:recover"),
+        let descriptor = SessionEffectDescriptor {
+            effect_id: format!("session-effect:{run_id}:recover"),
             tool_call_id: "recover".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"note.txt"}),
             attempt: 1,
         };
         let prepared = engine
-            .prepare_thread_effect(
-                thread_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
+            .prepare_session_effect(
+                session_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
                     .unwrap(),
                 &lease,
                 now_ms(),
             )
             .unwrap();
         let started = engine
-            .start_thread_effect(
-                thread_effect_start_request(
+            .start_session_effect(
+                session_effect_start_request(
                     &prepared.snapshot,
                     descriptor.effect_id.clone(),
                     format!("{run_id}:start-effect"),
@@ -5053,8 +5074,11 @@ mod tests {
             .database_path(&db)
             .build()
             .unwrap();
-        let recovered = reopened.thread_snapshot_v2(thread_id, None, 100).unwrap();
-        assert_eq!(recovered.lifecycle, ThreadLifecycle::ReconciliationRequired);
+        let recovered = reopened.session_snapshot_v2(session_id, None, 100).unwrap();
+        assert_eq!(
+            recovered.lifecycle,
+            SessionLifecycle::ReconciliationRequired
+        );
         assert!(recovered.active_run_id.is_none());
         assert_eq!(
             reopened.effect_status(&descriptor.effect_id).unwrap(),
@@ -5079,9 +5103,9 @@ mod tests {
         }));
         let service = scripted_service(root.path(), reopened.clone(), vec![]);
         let reconciled = service
-            .reconcile_unknown_effect(thread_id, &descriptor.effect_id)
+            .reconcile_unknown_effect(session_id, &descriptor.effect_id)
             .unwrap();
-        assert_eq!(reconciled.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
         assert!(reconciled.active_run_id.is_none());
         assert_eq!(
             reopened.show(run_id).unwrap().status,
@@ -5102,25 +5126,25 @@ mod tests {
             .database_path(&db)
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         engine
-            .create_thread_v2(thread_id, run_id, binding(), "prepare", 1)
+            .create_session_v2(session_id, run_id, binding(), "prepare", 1)
             .unwrap();
         let lease = engine
-            .acquire_thread_lease(thread_id, now_ms(), 500)
+            .acquire_session_lease(session_id, now_ms(), 500)
             .unwrap();
         let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
+            .commit_session_run_update(
+                SessionCommitRequest {
+                    session_id,
                     run_id,
-                    expected_thread_revision: 0,
+                    expected_session_revision: 0,
                     expected_run_revision: 0,
-                    command_id: ThreadCommandId::from_uuid(Uuid::now_v7()),
+                    command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionRunUpdate::Start {
                         source_key: format!("{run_id}:start"),
                     },
                 },
@@ -5129,8 +5153,8 @@ mod tests {
             )
             .unwrap()
             .snapshot;
-        let descriptor = ThreadEffectDescriptor {
-            effect_id: format!("thread-effect:{run_id}:prepared"),
+        let descriptor = SessionEffectDescriptor {
+            effect_id: format!("session-effect:{run_id}:prepared"),
             tool_call_id: "prepared".into(),
             name: "write_file".into(),
             input: serde_json::json!({
@@ -5141,8 +5165,8 @@ mod tests {
             attempt: 1,
         };
         let prepared = engine
-            .prepare_thread_effect(
-                thread_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
+            .prepare_session_effect(
+                session_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
                     .unwrap(),
                 &lease,
                 now_ms(),
@@ -5150,7 +5174,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             prepared.snapshot.lifecycle,
-            ThreadLifecycle::WaitingPermission
+            SessionLifecycle::WaitingPermission
         );
         drop(engine);
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -5159,8 +5183,8 @@ mod tests {
             .database_path(&db)
             .build()
             .unwrap();
-        let recovered = reopened.thread_snapshot_v2(thread_id, None, 100).unwrap();
-        assert_eq!(recovered.lifecycle, ThreadLifecycle::Interrupted);
+        let recovered = reopened.session_snapshot_v2(session_id, None, 100).unwrap();
+        assert_eq!(recovered.lifecycle, SessionLifecycle::Interrupted);
         assert!(recovered.active_run_id.is_none());
         assert_eq!(
             reopened.effect_status(&descriptor.effect_id).unwrap(),
@@ -5180,57 +5204,57 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine.clone(),
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             Arc::new(|_| Err("provider must not be constructed".into())),
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let running = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
 
         assert!(matches!(
             service
-                .follow_up(thread_id, running.revision, "too early".into())
+                .follow_up(session_id, running.revision, "too early".into())
                 .await,
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert!(matches!(
             service
                 .provide_input(
-                    thread_id,
+                    session_id,
                     running.revision,
                     test_run_revision(&running),
                     "missing".into(),
                     "value".into()
                 )
                 .await,
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert!(matches!(
             service
                 .resolve_permission(
-                    thread_id,
+                    session_id,
                     running.revision,
                     test_run_revision(&running),
                     "missing".into(),
                     true
                 )
                 .await,
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert!(matches!(
-            service.reconcile_unknown_effect(thread_id, "missing"),
-            Err(ThreadRuntimeError::InvalidState)
+            service.reconcile_unknown_effect(session_id, "missing"),
+            Err(SessionRuntimeError::InvalidState)
         ));
 
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let sink: Arc<dyn ThreadProgressSink> = {
+        let sink: Arc<dyn SessionProgressSink> = {
             let observed = Arc::clone(&observed);
-            Arc::new(move |_thread_id, progress| observed.lock().unwrap().push(progress))
+            Arc::new(move |_session_id, progress| observed.lock().unwrap().push(progress))
         };
         let service = service.with_progress_sink(sink);
         let token = CancellationToken::new();
@@ -5238,17 +5262,17 @@ mod tests {
             .active
             .lock()
             .unwrap()
-            .insert(thread_id, token.clone());
-        service.cancel(thread_id);
+            .insert(session_id, token.clone());
+        service.cancel(session_id);
         assert!(token.is_cancelled());
-        let live = service.load_full(thread_id).unwrap();
+        let live = service.load_full(session_id).unwrap();
         let live_run_revision = active_run_revision(&live).unwrap();
         assert_eq!(
             service
-                .cancel_durable(thread_id, live.revision, live_run_revision)
+                .cancel_durable(session_id, live.revision, live_run_revision)
                 .unwrap()
-                .thread_id,
-            thread_id,
+                .session_id,
+            session_id,
             "registered in-flight work is cancelled transiently without forging a durable terminal"
         );
     }
@@ -5257,27 +5281,27 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[rustfmt::skip]
     fn verification_and_transcript_helpers_fail_closed_on_missing_authority() {
-        use latte_core::{ThreadRunStatus, ThreadRunSummary, TranscriptEntry, TranscriptEntryId};
+        use latte_core::{SessionRunStatus, SessionRunSummary, TranscriptEntry, TranscriptEntryId};
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
-        let base = ThreadRuntimeService::new(
+        let base = SessionRuntimeService::new(
             engine,
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             Arc::new(|_| Err("not used".into())),
         );
         assert!(matches!(
             base.verification_descriptor(&snapshot, "done"),
-            Err(ThreadRuntimeError::Effect(message)) if message.contains("no configured verification")
+            Err(SessionRuntimeError::Effect(message)) if message.contains("no configured verification")
         ));
         let empty = base.clone().with_verification(VerificationPlan {
             argv: vec![],
@@ -5289,7 +5313,7 @@ mod tests {
         });
         assert!(matches!(
             empty.verification_descriptor(&snapshot, "done"),
-            Err(ThreadRuntimeError::Effect(message)) if message.contains("argv is empty")
+            Err(SessionRuntimeError::Effect(message)) if message.contains("argv is empty")
         ));
         let verified = base.with_verification(VerificationPlan {
             argv: vec!["/bin/true".into()],
@@ -5308,39 +5332,39 @@ mod tests {
         snapshot.active_run_id = None;
         assert!(matches!(
             active_run_revision(&snapshot),
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert!(
-            thread_effect_request(&snapshot, descriptor.clone(), "missing-run".into()).is_err()
+            session_effect_request(&snapshot, descriptor.clone(), "missing-run".into()).is_err()
         );
         assert!(
-            thread_effect_start_request(
+            session_effect_start_request(
                 &snapshot,
                 descriptor.effect_id.clone(),
                 "missing-run".into()
             )
             .is_err()
         );
-        let live = verified.acquire(thread_id).unwrap();
+        let live = verified.acquire(session_id).unwrap();
         assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("active linked run is unavailable"));
 
         snapshot.active_run_id = Some(run_id);
-        snapshot.runs = vec![ThreadRunSummary {
+        snapshot.runs = vec![SessionRunSummary {
             run_id: new_run_id(),
             parent_run_id: None,
             ordinal: 0,
-            status: ThreadRunStatus::Running,
+            status: SessionRunStatus::Running,
             run_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         }];
         assert!(matches!(
             active_run_revision(&snapshot),
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("linked run revision is unavailable"));
         snapshot.runs[0].run_id = run_id;
-        let presentation = ThreadEffectPresentation { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
+        let presentation = SessionEffectPresentation { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
         assert!(verified.finish_verification(&snapshot, &presentation, &live).unwrap_err().to_string().contains("observation is missing"));
 
         let call = crate::provider::ToolCall {
@@ -5402,11 +5426,11 @@ mod tests {
         );
         assert_eq!(effect_provider_result(&snapshot, "missing"), None);
 
-        let mut running = verified.commit(thread_id, run_id, 0, 0, CommitThreadRunUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
+        let mut running = verified.commit(session_id, run_id, 0, 0, CommitSessionRunUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
         assert!(verified.recover_lease_loss(&running, &live, "test").to_string().contains("recovery failed"));
         let takeover = verified
             .engine
-            .acquire_thread_lease(thread_id, live.expires_at_ms(), 60_000)
+            .acquire_session_lease(session_id, live.expires_at_ms(), 60_000)
             .unwrap();
         let mut mismatched = running.clone();
         mismatched.runs[0].run_revision += 1;
@@ -5416,12 +5440,12 @@ mod tests {
                 .to_string()
                 .contains("newer owner fenced")
         );
-        let live = ThreadLeaseGuard {
+        let live = SessionLeaseGuard {
             engine: verified.engine.clone(),
             lease: takeover,
         };
-        for index in 0..501 { running = verified.commit(thread_id, run_id, running.revision, 1, CommitThreadRunUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
-        assert_eq!(verified.load_full(thread_id).unwrap().transcript.entries.len(), 502);
+        for index in 0..501 { running = verified.commit(session_id, run_id, running.revision, 1, CommitSessionRunUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
+        assert_eq!(verified.load_full(session_id).unwrap().transcript.entries.len(), 502);
         let mut observed = running.clone();
         observed.transcript = snapshot.transcript.clone();
         let mut presentation = presentation;
@@ -5436,7 +5460,7 @@ mod tests {
         observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
         presentation.effect_id = "failed-verification".into();
         presentation.input = descriptor.input;
-        assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, SessionLifecycle::Failed);
         verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
     }
 
@@ -5452,7 +5476,7 @@ mod tests {
             engine,
             vec![response(Some("done"), Vec::new())],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let (tx, rx) = oneshot::channel();
         // Drive the future on a task so it makes progress while we await the
         // acceptance signal (the future is otherwise lazy).
@@ -5461,8 +5485,8 @@ mod tests {
             tokio::spawn(async move {
                 service
                     .start_accepted(
-                        thread_id,
-                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        session_id,
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
                         "hello".into(),
                         binding(),
                         None,
@@ -5476,12 +5500,12 @@ mod tests {
         let accepted_snapshot = match accepted {
             latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
         };
-        assert_eq!(accepted_snapshot.thread_id, thread_id);
+        assert_eq!(accepted_snapshot.session_id, session_id);
         let finished = handle.await.unwrap().unwrap();
         let finished_snapshot = match finished {
             latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
         };
-        assert_eq!(finished_snapshot.thread_id, thread_id);
+        assert_eq!(finished_snapshot.session_id, session_id);
     }
 
     #[tokio::test]
@@ -5501,8 +5525,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let result = service
             .start_accepted(
-                ThreadId::from_uuid(Uuid::now_v7()),
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "x".into(),
                 invalid,
                 None,
@@ -5513,7 +5537,7 @@ mod tests {
         assert!(rx.await.unwrap().is_err());
         assert!(matches!(
             result,
-            Err(ThreadRuntimeError::ProviderConfiguration(_))
+            Err(SessionRuntimeError::ProviderConfiguration(_))
         ));
     }
 
@@ -5532,12 +5556,12 @@ mod tests {
                 response(Some("second"), Vec::new()),
             ],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
 
         let (tx, rx) = oneshot::channel();
         let handle = {
@@ -5545,8 +5569,8 @@ mod tests {
             tokio::spawn(async move {
                 service
                     .follow_up_accepted(
-                        thread_id,
-                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        session_id,
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
                         ready.revision,
                         "second".into(),
                         tx,
@@ -5559,22 +5583,22 @@ mod tests {
             latte_core::CreateOutcome::Created(snapshot)
             | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
         };
-        assert_eq!(accepted.thread_id, thread_id);
+        assert_eq!(accepted.session_id, session_id);
         assert!(handle.await.unwrap().is_ok());
 
         // A stale follow-up signals rejection and errors (call errors directly).
         let (tx, rx) = oneshot::channel();
         let stale = service
             .follow_up_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 999,
                 "stale".into(),
                 tx,
             )
             .await;
         assert!(rx.await.unwrap().is_err());
-        assert!(matches!(stale, Err(ThreadRuntimeError::InvalidState)));
+        assert!(matches!(stale, Err(SessionRuntimeError::InvalidState)));
     }
 
     #[tokio::test]
@@ -5596,14 +5620,14 @@ mod tests {
                 response(Some("third"), Vec::new()),
             ],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
 
-        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
 
         // First follow-up → Created.
         let (tx, rx) = oneshot::channel();
@@ -5611,7 +5635,7 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+                    .follow_up_accepted(session_id, command_id, ready.revision, "second".into(), tx)
                     .await
             })
         };
@@ -5624,8 +5648,8 @@ mod tests {
 
         // Wait for the follow-up turn to complete.
         let ready2 = loop {
-            let snap = service.load_full(thread_id).unwrap();
-            if snap.lifecycle == ThreadLifecycle::Ready {
+            let snap = service.load_full(session_id).unwrap();
+            if snap.lifecycle == SessionLifecycle::Ready {
                 break snap;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5633,14 +5657,14 @@ mod tests {
 
         // Replay with the same command_id + payload → Replayed (no new turn).
         let replay = service
-            .follow_up(thread_id, ready2.revision, "second".into())
+            .follow_up(session_id, ready2.revision, "second".into())
             .await;
         // follow_up mints a fresh command_id, so this is a new follow-up, not
         // a replay. To test the durable replay, use follow_up_accepted with
         // the same command_id.
         let (tx, rx) = oneshot::channel();
         let replayed = service
-            .follow_up_accepted(thread_id, command_id, ready.revision, "second".into(), tx)
+            .follow_up_accepted(session_id, command_id, ready.revision, "second".into(), tx)
             .await
             .unwrap();
         match replayed {
@@ -5658,7 +5682,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mismatch = service
             .follow_up_accepted(
-                thread_id,
+                session_id,
                 command_id,
                 ready.revision,
                 "DIFFERENT".into(),
@@ -5667,8 +5691,8 @@ mod tests {
             .await;
         assert!(matches!(
             mismatch,
-            Err(ThreadRuntimeError::Storage(
-                latte_engine::StorageError::ThreadCommandReplayMismatch
+            Err(SessionRuntimeError::Storage(
+                latte_engine::StorageError::SessionCommandReplayMismatch
             ))
         ));
         let _ = rx.await;
@@ -5763,22 +5787,22 @@ mod tests {
     #[test]
     fn policy_rejects_a_zero_round_budget_and_a_zero_timeout() {
         assert!(
-            ThreadHistoryPolicy {
+            SessionHistoryPolicy {
                 max_tool_rounds: 0,
-                ..ThreadHistoryPolicy::default()
+                ..SessionHistoryPolicy::default()
             }
             .validate()
             .is_err()
         );
         assert!(
-            ThreadHistoryPolicy {
+            SessionHistoryPolicy {
                 provider_timeout_ms: 0,
-                ..ThreadHistoryPolicy::default()
+                ..SessionHistoryPolicy::default()
             }
             .validate()
             .is_err()
         );
-        assert!(ThreadHistoryPolicy::default().validate().is_ok());
+        assert!(SessionHistoryPolicy::default().validate().is_ok());
     }
 
     #[test]
@@ -5853,14 +5877,14 @@ mod tests {
     #[test]
     fn classify_create_error_maps_conflict_and_failed() {
         let mismatch =
-            ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadCommandReplayMismatch);
+            SessionRuntimeError::Storage(latte_engine::StorageError::SessionCommandReplayMismatch);
         assert!(matches!(
             classify_create_error(&mismatch),
             latte_core::CreateAcceptError::IdempotencyMismatch(_)
         ));
         let conflict =
-            ThreadRuntimeError::Storage(latte_engine::StorageError::ThreadAlreadyExists(
-                latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()),
+            SessionRuntimeError::Storage(latte_engine::StorageError::SessionAlreadyExists(
+                latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()),
             ));
         assert!(matches!(
             classify_create_error(&conflict),
@@ -5868,12 +5892,12 @@ mod tests {
         ));
         // InvalidState (stale revision / not accepting follow-up) is a
         // client-side conflict, not a server failure.
-        let invalid_state = ThreadRuntimeError::InvalidState;
+        let invalid_state = SessionRuntimeError::InvalidState;
         assert!(matches!(
             classify_create_error(&invalid_state),
             latte_core::CreateAcceptError::Conflict(_)
         ));
-        let failed = ThreadRuntimeError::MailboxFull;
+        let failed = SessionRuntimeError::MailboxFull;
         assert!(matches!(
             classify_create_error(&failed),
             latte_core::CreateAcceptError::Failed(_)
@@ -5883,15 +5907,15 @@ mod tests {
     #[test]
     fn active_run_revision_finds_active_run() {
         use latte_core::{
-            IdSource, SystemIdSource, ThreadRunStatus, ThreadRunSummary, TranscriptPage,
+            IdSource, SessionRunStatus, SessionRunSummary, SystemIdSource, TranscriptPage,
         };
         let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let snapshot = ThreadSnapshot {
-            thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        let snapshot = SessionSnapshot {
+            session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             revision: 1,
             sequence: 1,
-            lifecycle: ThreadLifecycle::Running,
-            binding: ThreadProviderBindingV2 {
+            lifecycle: SessionLifecycle::Running,
+            binding: SessionProviderBinding {
                 version: 2,
                 provider_name: String::new(),
                 provider_type: String::new(),
@@ -5907,11 +5931,11 @@ mod tests {
             latest_run_id: None,
             active_run_id: Some(run_id),
             pending: None,
-            runs: vec![ThreadRunSummary {
+            runs: vec![SessionRunSummary {
                 run_id,
                 parent_run_id: None,
                 ordinal: 0,
-                status: ThreadRunStatus::Running,
+                status: SessionRunStatus::Running,
                 run_revision: 7,
                 completed_at_ms: None,
                 failure_code: None,
@@ -5943,8 +5967,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let err = service
             .start_accepted(
-                ThreadId::from_uuid(Uuid::now_v7()),
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "prompt".into(),
                 binding(),
                 Some(Path::new("../outside")),
@@ -5952,7 +5976,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
         let accepted = rx.await.unwrap().unwrap_err();
         assert!(
             matches!(accepted, latte_core::CreateAcceptError::Failed(_)),
@@ -5961,7 +5985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_accepted_on_existing_thread_with_fresh_command_conflicts() {
+    async fn start_accepted_on_existing_session_with_fresh_command_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -5975,17 +5999,17 @@ mod tests {
                 response(Some("unused"), vec![]),
             ],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
         let (tx, rx) = oneshot::channel();
         let err = service
             .start_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "second".into(),
                 binding(),
                 None,
@@ -5993,7 +6017,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
         let accepted = rx.await.unwrap().unwrap_err();
         assert!(
             matches!(accepted, latte_core::CreateAcceptError::Conflict(_)),
@@ -6016,15 +6040,15 @@ mod tests {
                 response(Some("must not be called"), vec![]),
             ],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
-        let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
         // First create with this command id.
         let (tx, rx) = oneshot::channel();
         let handle = {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
+                    .start_accepted(session_id, command_id, "hello".into(), binding(), None, tx)
                     .await
             })
         };
@@ -6037,14 +6061,14 @@ mod tests {
         // acquiring a lease or calling the provider.
         let (tx, rx) = oneshot::channel();
         let replayed = service
-            .start_accepted(thread_id, command_id, "hello".into(), binding(), None, tx)
+            .start_accepted(session_id, command_id, "hello".into(), binding(), None, tx)
             .await
             .unwrap();
         let replayed_snapshot = match replayed {
             latte_core::CreateOutcome::Replayed(s) => s,
             latte_core::CreateOutcome::Created(_) => panic!("expected replay, got Created"),
         };
-        assert_eq!(replayed_snapshot.thread_id, thread_id);
+        assert_eq!(replayed_snapshot.session_id, session_id);
         let accepted = rx.await.unwrap().unwrap();
         assert!(matches!(accepted, latte_core::CreateOutcome::Replayed(_)));
     }
@@ -6064,21 +6088,21 @@ mod tests {
                 response(Some("unused"), vec![]),
             ],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
         // Hold the lease so the next create's acquire fails.
         let _held = engine
-            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let (tx, rx) = oneshot::channel();
         let err = service
             .start_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "second".into(),
                 binding(),
                 None,
@@ -6086,7 +6110,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
         let accepted = rx.await.unwrap().unwrap_err();
         assert!(
             matches!(accepted, latte_core::CreateAcceptError::Failed(_)),
@@ -6106,21 +6130,21 @@ mod tests {
             engine,
             [(Duration::from_millis(300), simple_response("done"))],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let first = service.clone();
         let running = tokio::spawn(async move {
             first
-                .start(thread_id, "slow turn".into(), binding(), None)
+                .start(session_id, "slow turn".into(), binding(), None)
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let err = service
-            .start(thread_id, "concurrent".into(), binding(), None)
+            .start(session_id, "concurrent".into(), binding(), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
         let completed = running.await.unwrap().unwrap();
-        assert_eq!(completed.lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
     }
 
     #[tokio::test]
@@ -6133,14 +6157,14 @@ mod tests {
         let service = scripted_service(&root.path().join("missing"), engine, vec![]);
         let err = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "hi".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6150,31 +6174,31 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let policy = ThreadHistoryPolicy {
+        let policy = SessionHistoryPolicy {
             max_request_bytes: 1024,
             max_input_bytes: 100,
             reserved_output_bytes: 100,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
         let err = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "hi".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6184,31 +6208,31 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let policy = ThreadHistoryPolicy {
+        let policy = SessionHistoryPolicy {
             max_request_bytes: 64,
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
         let err = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "x".repeat(10_000),
                 binding(),
                 None,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     // -- follow_up error paths ----------------------------------------------
@@ -6225,31 +6249,31 @@ mod tests {
             engine.clone(),
             vec![response(Some("first"), vec![])],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        let tiny_policy = ThreadHistoryPolicy {
+        let tiny_policy = SessionHistoryPolicy {
             max_request_bytes: 64,
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let tiny = ThreadRuntimeService::new(engine, root.path(), tiny_policy, factory);
+        let tiny = SessionRuntimeService::new(engine, root.path(), tiny_policy, factory);
         let err = tiny
-            .follow_up(thread_id, ready.revision, "x".repeat(10_000))
+            .follow_up(session_id, ready.revision, "x".repeat(10_000))
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6264,33 +6288,33 @@ mod tests {
             engine.clone(),
             vec![response(Some("first"), vec![])],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
         let _held = engine
-            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let (tx, rx) = oneshot::channel();
         let err = service
             .follow_up_accepted(
-                thread_id,
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                session_id,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 ready.revision,
                 "second".into(),
                 tx,
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
         let accepted = rx.await.unwrap().unwrap_err();
         let message = match accepted {
             latte_core::CreateAcceptError::Conflict(message)
             | latte_core::CreateAcceptError::IdempotencyMismatch(message)
             | latte_core::CreateAcceptError::Failed(message) => message,
         };
-        assert!(message.contains("thread storage"));
+        assert!(message.contains("session storage"));
     }
 
     #[tokio::test]
@@ -6300,25 +6324,25 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let policy = ThreadHistoryPolicy {
+        let policy = SessionHistoryPolicy {
             max_request_bytes: 64,
             max_input_bytes: 64,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = ThreadRuntimeService::new(engine, root.path(), policy, factory);
+        let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
         let err = service
-            .queue_follow_up(ThreadId::from_uuid(Uuid::now_v7()), "x".repeat(10_000))
+            .queue_follow_up(SessionId::from_uuid(Uuid::now_v7()), "x".repeat(10_000))
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6333,37 +6357,37 @@ mod tests {
             engine.clone(),
             vec![response(Some("first"), vec![])],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
-        let invalid_policy = ThreadHistoryPolicy {
+        let invalid_policy = SessionHistoryPolicy {
             max_request_bytes: 1024,
             max_input_bytes: 100,
             reserved_output_bytes: 100,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let broken = ThreadRuntimeService::new(engine, root.path(), invalid_policy, factory);
+        let broken = SessionRuntimeService::new(engine, root.path(), invalid_policy, factory);
         let err = broken
-            .follow_up(thread_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.revision, "second".into())
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     // -- switch_model / resolve_permission / cancel_durable -----------------
 
     #[tokio::test]
-    async fn switch_model_unknown_thread_fails() {
+    async fn switch_model_unknown_session_fails() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -6371,9 +6395,9 @@ mod tests {
             .unwrap();
         let service = scripted_service(root.path(), engine, vec![]);
         let err = service
-            .switch_model(ThreadId::from_uuid(Uuid::now_v7()), 0, &binding())
+            .switch_model(SessionId::from_uuid(Uuid::now_v7()), 0, &binding())
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6388,9 +6412,9 @@ mod tests {
             engine.clone(),
             vec![response(Some("first"), vec![])],
         );
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
-            .start(thread_id, "first".into(), binding(), None)
+            .start(session_id, "first".into(), binding(), None)
             .await
             .unwrap();
         let mut next = binding();
@@ -6398,12 +6422,12 @@ mod tests {
         next.model = "reasoning".into();
         next.config_fingerprint = "other-config".into();
         let _held = engine
-            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
-            .switch_model(thread_id, ready.revision, &next)
+            .switch_model(session_id, ready.revision, &next)
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6416,7 +6440,7 @@ mod tests {
         let service = scripted_service(root.path(), engine, vec![response(Some("first"), vec![])]);
         let ready = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "first".into(),
                 binding(),
                 None,
@@ -6424,10 +6448,10 @@ mod tests {
             .await
             .unwrap();
         let err = service
-            .resolve_permission(ready.thread_id, ready.revision, 0, "any".into(), true)
+            .resolve_permission(ready.session_id, ready.revision, 0, "any".into(), true)
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
     }
 
     #[tokio::test]
@@ -6438,15 +6462,19 @@ mod tests {
             .build()
             .unwrap();
         let service = scripted_service(root.path(), engine.clone(), vec![]);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let running = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
         let err = service
-            .cancel_durable(thread_id, running.revision + 1, test_run_revision(&running))
+            .cancel_durable(
+                session_id,
+                running.revision + 1,
+                test_run_revision(&running),
+            )
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
     }
 
     #[tokio::test]
@@ -6457,18 +6485,18 @@ mod tests {
             .build()
             .unwrap();
         let service = scripted_service(root.path(), engine.clone(), vec![]);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let running = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
         let _held = engine
-            .acquire_thread_lease(thread_id, now_ms(), 60_000)
+            .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
-            .cancel_durable(thread_id, running.revision, test_run_revision(&running))
+            .cancel_durable(session_id, running.revision, test_run_revision(&running))
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
 
     // -- input request / permission flows -----------------------------------
@@ -6476,8 +6504,8 @@ mod tests {
     fn waiting_input_service(
         root: &std::path::Path,
         engine: EngineHandle,
-        policy: ThreadHistoryPolicy,
-    ) -> (ThreadRuntimeService, ThreadId) {
+        policy: SessionHistoryPolicy,
+    ) -> (SessionRuntimeService, SessionId) {
         let provider = Arc::new(FakeProvider::scripted([ProviderResponse {
             message: None,
             tool_calls: vec![],
@@ -6490,15 +6518,15 @@ mod tests {
             finish_reason: None,
             provider_state: None,
         }]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = ThreadRuntimeService::new(engine, root, policy, factory);
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
-        (service, thread_id)
+        let service = SessionRuntimeService::new(engine, root, policy, factory);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        (service, session_id)
     }
 
     #[tokio::test]
@@ -6510,22 +6538,22 @@ mod tests {
             .unwrap();
         // The budget must clear the system prompt and still reject the
         // oversized input value below; it is not a minimum-size probe.
-        let policy = ThreadHistoryPolicy {
+        let policy = SessionHistoryPolicy {
             max_request_bytes: 4096,
             max_input_bytes: 4096,
             reserved_output_bytes: 0,
             context_cap_bytes: 64,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         };
-        let (service, thread_id) = waiting_input_service(root.path(), engine, policy);
+        let (service, session_id) = waiting_input_service(root.path(), engine, policy);
         let waiting = service
-            .start(thread_id, "hi".into(), binding(), None)
+            .start(session_id, "hi".into(), binding(), None)
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingInput);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
         let err = service
             .provide_input(
-                thread_id,
+                session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 "lang".into(),
@@ -6533,7 +6561,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::History(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -6557,7 +6585,7 @@ mod tests {
             finish_reason: None,
             provider_state: None,
         }]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 Err("secret reference unavailable".into())
             } else {
@@ -6567,21 +6595,25 @@ mod tests {
                 })
             }
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "hi".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingInput);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
         let err = service
             .provide_input(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 "lang".into(),
@@ -6590,7 +6622,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ThreadRuntimeError::ProviderConfiguration(_)),
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
             "{err:?}"
         );
     }
@@ -6616,7 +6648,7 @@ mod tests {
                 }),
             }],
         )]));
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             if factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 Err("secret reference unavailable".into())
             } else {
@@ -6626,25 +6658,29 @@ mod tests {
                 })
             }
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory);
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "create it".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let err = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -6653,7 +6689,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ThreadRuntimeError::ProviderConfiguration(_)),
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
             "{err:?}"
         );
     }
@@ -6683,24 +6719,24 @@ mod tests {
         );
         let waiting = service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "create it".into(),
                 binding(),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
         let request_id = match waiting.pending.as_ref().unwrap() {
-            latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
         let _held = engine
-            .acquire_thread_lease(waiting.thread_id, now_ms(), 60_000)
+            .acquire_session_lease(waiting.session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
             .resolve_permission(
-                waiting.thread_id,
+                waiting.session_id,
                 waiting.revision,
                 test_run_revision(&waiting),
                 request_id,
@@ -6708,7 +6744,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::Storage(_)), "{err:?}");
+        assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
 
     // -- focus / progress / helper coverage ---------------------------------
@@ -6731,8 +6767,8 @@ mod tests {
             tokio::spawn(async move {
                 service
                     .start_accepted(
-                        ThreadId::from_uuid(Uuid::now_v7()),
-                        ThreadCommandId::from_uuid(Uuid::now_v7()),
+                        SessionId::from_uuid(Uuid::now_v7()),
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
                         "hi".into(),
                         binding(),
                         Some(focus),
@@ -6770,23 +6806,27 @@ mod tests {
             .build()
             .unwrap();
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let sink: Arc<dyn ThreadProgressSink> = {
+        let sink: Arc<dyn SessionProgressSink> = {
             let observed = Arc::clone(&observed);
-            Arc::new(move |_thread_id, progress| observed.lock().unwrap().push(progress))
+            Arc::new(move |_session_id, progress| observed.lock().unwrap().push(progress))
         };
         let provider = Arc::new(EventProvider);
-        let factory: ThreadProviderFactory = Arc::new(move |_| {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service =
-            ThreadRuntimeService::new(engine, root.path(), ThreadHistoryPolicy::default(), factory)
-                .with_progress_sink(sink);
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        )
+        .with_progress_sink(sink);
         service
             .start(
-                ThreadId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
                 "hi".into(),
                 binding(),
                 None,
@@ -6796,7 +6836,7 @@ mod tests {
         let events = observed.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
-            ThreadTransientProgress::ProviderAttempt { number: 1, .. }
+            SessionTransientProgress::ProviderAttempt { number: 1, .. }
         )));
     }
 
@@ -6807,15 +6847,15 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine,
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             Arc::new(|_| Err("unused".into())),
         )
         .with_verification(VerificationPlan {
@@ -6829,7 +6869,7 @@ mod tests {
         snapshot.active_run_id = None;
         assert!(matches!(
             service.verification_descriptor(&snapshot, "done"),
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
     }
 
@@ -6840,47 +6880,47 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
         snapshot.active_run_id = None;
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine,
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             Arc::new(|_| Err("unused".into())),
         );
-        let lease = service.acquire(thread_id).unwrap();
+        let lease = service.acquire(session_id).unwrap();
         let err = service
             .begin_verification(snapshot, "summary".into(), lease)
             .await
             .unwrap_err();
-        assert!(matches!(err, ThreadRuntimeError::InvalidState));
+        assert!(matches!(err, SessionRuntimeError::InvalidState));
     }
 
     #[test]
     fn finish_verification_without_active_run_fails() {
-        use latte_engine::ThreadEffectPresentation;
+        use latte_engine::SessionEffectPresentation;
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
-        let service = ThreadRuntimeService::new(
+        let service = SessionRuntimeService::new(
             engine,
             root.path(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             Arc::new(|_| Err("unused".into())),
         );
-        let lease = service.acquire(thread_id).unwrap();
-        let presentation = ThreadEffectPresentation {
+        let lease = service.acquire(session_id).unwrap();
+        let presentation = SessionEffectPresentation {
             effect_id: "e".into(),
             tool_call_id: "t".into(),
             name: "process".into(),
@@ -6891,14 +6931,14 @@ mod tests {
         snapshot.active_run_id = None;
         assert!(matches!(
             service.finish_verification(&snapshot, &presentation, &lease),
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
         // Active run id but missing from runs → InvalidState at run_revision.
         snapshot.active_run_id = Some(run_id);
         snapshot.runs = vec![];
         assert!(matches!(
             service.finish_verification(&snapshot, &presentation, &lease),
-            Err(ThreadRuntimeError::InvalidState)
+            Err(SessionRuntimeError::InvalidState)
         ));
     }
 
@@ -6910,10 +6950,10 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
         let call = crate::provider::ToolCall {
             id: "call-1".into(),
@@ -6954,25 +6994,25 @@ mod tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let thread_id = ThreadId::from_uuid(Uuid::now_v7());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
         let run_id = new_run_id();
         let mut snapshot = engine
-            .create_thread_v2(thread_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, run_id, binding(), "initial", 1)
             .unwrap();
         // Active run id set but the run is absent from the summary list.
         snapshot.active_run_id = Some(run_id);
         snapshot.runs = vec![];
-        let descriptor = ThreadEffectDescriptor {
+        let descriptor = SessionEffectDescriptor {
             effect_id: "e".into(),
             tool_call_id: "t".into(),
             name: "read_file".into(),
             input: serde_json::json!({}),
             attempt: 1,
         };
-        assert!(thread_effect_request(&snapshot, descriptor.clone(), "k".into()).is_err());
-        assert!(thread_effect_start_request(&snapshot, "e".into(), "k".into()).is_err());
+        assert!(session_effect_request(&snapshot, descriptor.clone(), "k".into()).is_err());
+        assert!(session_effect_start_request(&snapshot, "e".into(), "k".into()).is_err());
         // A snapshot without any active run also fails.
         snapshot.active_run_id = None;
-        assert!(thread_effect_request(&snapshot, descriptor, "k".into()).is_err());
+        assert!(session_effect_request(&snapshot, descriptor, "k".into()).is_err());
     }
 }

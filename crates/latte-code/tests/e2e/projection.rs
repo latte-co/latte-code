@@ -1,12 +1,12 @@
 use super::support::{ProviderReply, PtySession, Scenario, ScriptedProvider, wait_until};
 use latte_core::{
     Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, RunFailure,
-    SystemIdSource, ThreadCommandId, ThreadId, ThreadProviderBindingV2, TranscriptKind,
+    SessionCommandId, SessionId, SessionProviderBinding, SystemIdSource, TranscriptKind,
     VerificationStatus,
 };
 use latte_engine::{
-    CommitThreadRunUpdate, EngineHandle, Lease, ThreadCommitRequest, ThreadEffectDescriptor,
-    ThreadEffectPolicy,
+    CommitSessionRunUpdate, EngineHandle, Lease, SessionCommitRequest, SessionEffectDescriptor,
+    SessionEffectPolicy,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -14,8 +14,8 @@ const TUI_READY: &[u8] = b"\x1b[>3u";
 const F10: &[u8] = b"\x1b[21~";
 const CTRL_P: &[u8] = b"\x1b[112;5u";
 
-fn binding() -> ThreadProviderBindingV2 {
-    ThreadProviderBindingV2 {
+fn binding() -> SessionProviderBinding {
+    SessionProviderBinding {
         version: 1,
         provider_name: "fixture".into(),
         provider_type: "openai-chat".into(),
@@ -30,7 +30,7 @@ fn binding() -> ThreadProviderBindingV2 {
     }
 }
 
-fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::ThreadSnapshot) {
+fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::SessionSnapshot) {
     std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -38,13 +38,13 @@ fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::Thre
         .build()
         .unwrap();
     let ids = SystemIdSource::default();
-    let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+    let session_id = SessionId::from_uuid(ids.next_uuid_v7());
     let lease = engine
-        .acquire_thread_lease(thread_id, 1_000, 60_000)
+        .acquire_session_lease(session_id, 1_000, 60_000)
         .unwrap();
     let snapshot = engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             latte_core::RunId::from_uuid(ids.next_uuid_v7()),
             binding(),
             "fixture prompt",
@@ -57,10 +57,10 @@ fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::Thre
 fn commit(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
-    update: CommitThreadRunUpdate,
+    snapshot: &latte_core::SessionSnapshot,
+    update: CommitSessionRunUpdate,
     now_ms: u64,
-) -> latte_core::ThreadSnapshot {
+) -> latte_core::SessionSnapshot {
     let run_id = snapshot.latest_run_id.unwrap();
     let run_revision = snapshot
         .runs
@@ -69,13 +69,13 @@ fn commit(
         .unwrap()
         .run_revision;
     engine
-        .commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: snapshot.thread_id,
+        .commit_session_run_update(
+            SessionCommitRequest {
+                session_id: snapshot.session_id,
                 run_id,
-                expected_thread_revision: snapshot.revision,
+                expected_session_revision: snapshot.revision,
                 expected_run_revision: run_revision,
-                command_id: ThreadCommandId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                command_id: SessionCommandId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
                 update,
@@ -90,13 +90,13 @@ fn commit(
 fn start(
     engine: &EngineHandle,
     lease: &Lease,
-    snapshot: &latte_core::ThreadSnapshot,
-) -> latte_core::ThreadSnapshot {
+    snapshot: &latte_core::SessionSnapshot,
+) -> latte_core::SessionSnapshot {
     commit(
         engine,
         lease,
         snapshot,
-        CommitThreadRunUpdate::Start {
+        CommitSessionRunUpdate::Start {
             source_key: "fixture:start".into(),
         },
         1_002,
@@ -110,7 +110,7 @@ fn finish_fixture(engine: EngineHandle, lease: &Lease) {
 
 fn render_fixture(
     scenario: &Scenario,
-    thread_id: ThreadId,
+    session_id: SessionId,
     expected: &[u8],
     rows: u16,
     columns: u16,
@@ -118,7 +118,7 @@ fn render_fixture(
     scenario.write_config("http://127.0.0.1:9", r#"["/bin/pwd"]"#);
     let mut pty = PtySession::spawn_with_size(scenario.command(&["tui"]), rows, columns);
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    pty.write(format!("/resume {thread_id}\r").as_bytes());
+    pty.write(format!("/resume {session_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(expected, Duration::from_secs(5)),
         "fixture was not rendered: {}",
@@ -182,7 +182,7 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
             &engine,
             &lease,
             &snapshot,
-            CommitThreadRunUpdate::AppendTranscript {
+            CommitSessionRunUpdate::AppendTranscript {
                 source_key: format!("fixture:card:{index}"),
                 kind,
                 text: text.into(),
@@ -195,7 +195,7 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
         &engine,
         &lease,
         &snapshot,
-        CommitThreadRunUpdate::Complete {
+        CommitSessionRunUpdate::Complete {
             source_key: "fixture:complete".into(),
             handoff: Handoff {
                 summary: "rich completion summary".into(),
@@ -221,16 +221,16 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
         },
         1_030,
     );
-    assert_eq!(snapshot.lifecycle, latte_core::ThreadLifecycle::Ready);
+    assert_eq!(snapshot.lifecycle, latte_core::SessionLifecycle::Ready);
     assert_eq!(
         snapshot.runs[0].status,
-        latte_core::ThreadRunStatus::Completed
+        latte_core::SessionRunStatus::Completed
     );
     finish_fixture(engine, &lease);
 
     let mut pty = render_fixture(
         &scenario,
-        snapshot.thread_id,
+        snapshot.session_id,
         b"rich completion summary",
         40,
         120,
@@ -271,7 +271,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitThreadRunUpdate::Fail {
+                    CommitSessionRunUpdate::Fail {
                         source_key: "fixture:failed".into(),
                         failure: RunFailure {
                             code: FailureCode::RuntimeFailed,
@@ -288,7 +288,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitThreadRunUpdate::Interrupt {
+                    CommitSessionRunUpdate::Interrupt {
                         source_key: "fixture:interrupted".into(),
                         reconciliation_effect_id: None,
                     },
@@ -297,7 +297,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                 b"Interrupted"
             }
             "reconciliation" => {
-                let descriptor = ThreadEffectDescriptor {
+                let descriptor = SessionEffectDescriptor {
                     effect_id: "matrix-effect".into(),
                     tool_call_id: "matrix-call".into(),
                     name: "read_file".into(),
@@ -310,13 +310,13 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitThreadRunUpdate::PrepareEffect {
+                    CommitSessionRunUpdate::PrepareEffect {
                         source_key: "fixture:prepare".into(),
                         effect_id: descriptor.effect_id.clone(),
                         operation_digest: digest.clone(),
                         descriptor_json: descriptor_json.clone(),
                         canonical_descriptor_json: descriptor_json,
-                        policy: ThreadEffectPolicy::Allow,
+                        policy: SessionEffectPolicy::Allow,
                         description: "read matrix.txt".into(),
                         checkpoint_json: r#"{"phase":"prepared"}"#.into(),
                     },
@@ -326,7 +326,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitThreadRunUpdate::StartEffect {
+                    CommitSessionRunUpdate::StartEffect {
                         source_key: "fixture:start-effect".into(),
                         effect_id: descriptor.effect_id,
                         operation_digest: digest,
@@ -338,7 +338,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitThreadRunUpdate::Interrupt {
+                    CommitSessionRunUpdate::Interrupt {
                         source_key: "fixture:unknown".into(),
                         reconciliation_effect_id: None,
                     },
@@ -351,7 +351,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
         assert_eq!(snapshot.lifecycle_label_for_test(), state);
         finish_fixture(engine, &lease);
 
-        let mut pty = render_fixture(&scenario, snapshot.thread_id, expected, 28, 82);
+        let mut pty = render_fixture(&scenario, snapshot.session_id, expected, 28, 82);
         if matches!(state, "failed" | "interrupted") {
             let output_start = pty.output().len();
             pty.write(b"/new\r");
@@ -410,10 +410,10 @@ fn constrained_idle_view_and_retry_progress_render_in_real_ptys() {
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].transcript.entries.iter().any(|entry| {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == TranscriptKind::Assistant
                         && entry.text == "retry matrix completed"
                 })
@@ -468,7 +468,7 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
                 &engine,
                 &lease,
                 &snapshot,
-                CommitThreadRunUpdate::AppendTranscript {
+                CommitSessionRunUpdate::AppendTranscript {
                     source_key: format!("fixture:permission:{name}:descriptor"),
                     kind: TranscriptKind::ToolCall,
                     text: format!("inspect {expected_operation}"),
@@ -486,7 +486,7 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
             &engine,
             &lease,
             &snapshot,
-            CommitThreadRunUpdate::RequestPermission {
+            CommitSessionRunUpdate::RequestPermission {
                 source_key: format!("fixture:permission:{}:request", name.unwrap_or("generic")),
                 request: PendingPermission {
                     request_id,
@@ -498,13 +498,13 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
         );
         assert_eq!(
             snapshot.lifecycle,
-            latte_core::ThreadLifecycle::WaitingPermission
+            latte_core::SessionLifecycle::WaitingPermission
         );
         finish_fixture(engine, &lease);
 
         let mut pty = render_fixture(
             &scenario,
-            snapshot.thread_id,
+            snapshot.session_id,
             b"Permission required",
             26,
             88,
@@ -530,16 +530,16 @@ trait LifecycleLabelForTest {
     fn lifecycle_label_for_test(&self) -> &'static str;
 }
 
-impl LifecycleLabelForTest for latte_core::ThreadSnapshot {
+impl LifecycleLabelForTest for latte_core::SessionSnapshot {
     fn lifecycle_label_for_test(&self) -> &'static str {
         match self.lifecycle {
-            latte_core::ThreadLifecycle::Ready => "ready",
-            latte_core::ThreadLifecycle::Running => "running",
-            latte_core::ThreadLifecycle::WaitingPermission => "permission",
-            latte_core::ThreadLifecycle::WaitingInput => "input",
-            latte_core::ThreadLifecycle::Interrupted => "interrupted",
-            latte_core::ThreadLifecycle::Failed => "failed",
-            latte_core::ThreadLifecycle::ReconciliationRequired => "reconciliation",
+            latte_core::SessionLifecycle::Ready => "ready",
+            latte_core::SessionLifecycle::Running => "running",
+            latte_core::SessionLifecycle::WaitingPermission => "permission",
+            latte_core::SessionLifecycle::WaitingInput => "input",
+            latte_core::SessionLifecycle::Interrupted => "interrupted",
+            latte_core::SessionLifecycle::Failed => "failed",
+            latte_core::SessionLifecycle::ReconciliationRequired => "reconciliation",
         }
     }
 }

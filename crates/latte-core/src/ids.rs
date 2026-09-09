@@ -36,11 +36,11 @@ macro_rules! typed_id {
 typed_id!(RunId);
 typed_id!(CommandId);
 typed_id!(EventId);
-// Thread identifiers deliberately do not reuse the v1 run identifiers.  A
-// thread is a durable conversation which can contain several immutable runs.
-typed_id!(ThreadId);
-typed_id!(ThreadCommandId);
-typed_id!(ThreadEventId);
+// Session identifiers deliberately do not reuse the v1 run identifiers.  A
+// session is a durable conversation which can contain several immutable runs.
+typed_id!(SessionId);
+typed_id!(SessionCommandId);
+typed_id!(SessionEventId);
 typed_id!(TranscriptEntryId);
 
 /// Supplies wall-clock Unix milliseconds.
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn typed_id_as_uuid_round_trips() {
         let uuid = Uuid::now_v7();
-        let id = ThreadId::from_uuid(uuid);
+        let id = SessionId::from_uuid(uuid);
         assert_eq!(id.as_uuid(), uuid);
         assert_eq!(id.to_string(), uuid.to_string());
     }

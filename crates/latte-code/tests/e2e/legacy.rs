@@ -1,5 +1,5 @@
 use super::support::{PtySession, Scenario, json};
-use latte_core::{IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2};
+use latte_core::{IdSource, RunId, SessionId, SessionProviderBinding, SystemIdSource};
 use rusqlite::Connection;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
@@ -111,7 +111,7 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     // v2 session commands open the database through an embedded server. The
     // first open migrates the v1 schema to v12; the server's recovery sweeper
     // then marks the orphaned v1 running run as interrupted. A v1 run is not a
-    // v2 session, so it is never surfaced as a thread: `list` returns an empty
+    // v2 session, so it is never surfaced as a session: `list` returns an empty
     // session catalogue and `show <run_id>` fails closed with not_found. Each
     // `list` invocation is a fresh final binary, so the retry loop also proves
     // the migration/recovery is stable across restarts.
@@ -167,19 +167,19 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     );
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        12
+        13
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        12
+        13
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
-            "SELECT COUNT(*) FROM thread_effect_canonical_v2;"
+            "SELECT COUNT(*) FROM session_effect_canonical;"
         ),
         0
     );
@@ -190,7 +190,7 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
 // workflow, asserting that resuming a versionless checkpoint fails closed with
 // the `legacy/versionless` error. That resume path lived in the v1
 // `AgentRuntime` and is unreachable from the v2 session-command contract
-// (`resume <session-id> <prompt>` is a thread follow-up, not a checkpoint
+// (`resume <session-id> <prompt>` is a session follow-up, not a checkpoint
 // resume; a v1 run id is not a session and fails closed as `not_found`). The
 // v7 -> v12 schema migration it also exercised is covered by the v1 -> v12
 // recovery test above and by the engine storage migration tests.
@@ -212,7 +212,7 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "internal");
     assert_eq!(
         json(&output)["error"]["message"],
-        "server setup: database schema version 99 is newer than supported version 12"
+        "server setup: database schema version 99 is newer than supported version 13"
     );
 }
 
@@ -223,7 +223,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
     scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
     let legacy_path = scenario.root().join(".latte/latte-code.db");
     std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-    let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -231,10 +231,10 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
         .build()
         .unwrap();
     engine
-        .create_thread_v2(
-            thread_id,
+        .create_session_v2(
+            session_id,
             run_id,
-            ThreadProviderBindingV2 {
+            SessionProviderBinding {
                 version: 1,
                 provider_name: "main".into(),
                 provider_type: "openai-chat".into(),
@@ -255,24 +255,28 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
 
     // Reconstruct the historical v9 authority schema. This is deliberately a
     // compatibility fixture: current state was first created through the
-    // public Engine, and acceptance still comes from a fresh final TUI.
+    // public Engine, and acceptance still comes from a fresh final TUI. The
+    // database is built at schema 13, so first undo migration 13's object
+    // renames (back to the v9-era `threads_v2` / `thread_id` shape), then drop
+    // the v10/v11 infrastructure the v9 schema predates.
     sqlite_execute(
         &legacy_path,
-        r"
-        PRAGMA foreign_keys=OFF;
-        DROP TABLE legacy_imports;
-        DROP TABLE workspaces;
-        DROP TABLE projects;
-        DROP TABLE runtime_lease;
-        DROP TABLE runtime_lease_epoch;
-        CREATE TABLE runtime_lease(
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,
-          fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
-        );
-        DELETE FROM schema_migrations WHERE version IN (10,11,12);
-        PRAGMA user_version=9;
-        PRAGMA foreign_keys=ON;
-        ",
+        &format!(
+            "{} \
+             DROP TABLE legacy_imports; \
+             DROP TABLE workspaces; \
+             DROP TABLE projects; \
+             DROP TABLE runtime_lease; \
+             DROP TABLE runtime_lease_epoch; \
+             CREATE TABLE runtime_lease( \
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, \
+               fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL \
+             ); \
+             DELETE FROM schema_migrations WHERE version IN (10,11,12); \
+             PRAGMA user_version=9; \
+             PRAGMA foreign_keys=ON;",
+            super::support::REVERSE_SCHEMA_13_SQL
+        ),
     );
 
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));
@@ -281,7 +285,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
         "imported v9 TUI did not render: {}",
         String::from_utf8_lossy(&pty.output())
     );
-    pty.write(format!("/resume {thread_id}\r").as_bytes());
+    pty.write(format!("/resume {session_id}\r").as_bytes());
     assert!(
         pty.wait_for_output(
             b"restore the legacy session catalog title",
@@ -294,15 +298,15 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
     assert!(pty.finish(Duration::from_secs(5)).0.success());
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        12
+        13
     );
     assert_eq!(sqlite_integer(&legacy_path, "PRAGMA user_version;"), 9);
     assert_eq!(
         Connection::open(scenario.database_path())
             .unwrap()
             .query_row(
-                "SELECT title FROM threads_v2 WHERE thread_id=?1",
-                [thread_id.to_string()],
+                "SELECT title FROM sessions WHERE session_id=?1",
+                [session_id.to_string()],
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),

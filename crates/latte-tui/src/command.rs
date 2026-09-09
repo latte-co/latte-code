@@ -1,7 +1,7 @@
 //! Closed built-in command catalog shared by slash input and the command palette.
 //!
 //! The catalog contains identifiers and metadata only. Execution remains in
-//! the TUI reducer or is emitted as a typed [`crate::thread::ThreadUiAction`].
+//! the TUI reducer or is emitted as a typed [`crate::session::SessionUiAction`].
 
 /// Stable identifiers for the first built-in command slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

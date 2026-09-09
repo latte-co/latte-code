@@ -53,7 +53,7 @@ Prompt Template 只允许文本展开；解析期间不能执行 Shell、读取�
 - 任意 Shell Command、可执行 Plugin 或 Command Handler Script。
 - Workspace 自定义命令覆盖内建命令。
 - MCP Prompt Command 或模型可调用 Skill。
-- 绕过 `ThreadRuntimeService` 或 Engine Effect 的第二套 Runtime API。
+- 绕过 `SessionRuntimeService` 或 Engine Effect 的第二套 Runtime API。
 - 在 `latte-code --json run` 中解析斜杠命令；Headless Automation 继续使用显式
   CLI Subcommand，并把 Prompt String 当作字面文本。
 
@@ -92,7 +92,7 @@ pub enum CommandAvailability {
 | Kind | 结果 | Provider 可见 | 持久化 |
 | --- | --- | --- | --- |
 | `LocalUi` | 纯 Reducer State Change，例如打开 Help 或进入 Navigation | 否 | 否 |
-| `TypedAction` | 由 Composition Root 处理的既有或新增 `ThreadUiAction` | 默认否；只有正常 Domain Operation 本身产生 Conversation Content 时才可见 | 只保存目标 Service 权威拥有的 Domain State |
+| `TypedAction` | 由 Composition Root 处理的既有或新增 `SessionUiAction` | 默认否；只有正常 Domain Operation 本身产生 Conversation Content 时才可见 | 只保存目标 Service 权威拥有的 Domain State |
 | `PromptTemplate` | 展开为有界文本，通过普通 Start/Follow-up 路径提交 | 是 | 精确展开后的 User Content 与有界 Invocation Metadata |
 
 Catalog 只包含 Metadata 与 Identifier，不包含任意 Callback。Built-in Command
@@ -183,8 +183,8 @@ composer text
 ```
 
 `LocalUi` Command 调用纯 Reducer Transition。`TypedAction` Command 发出显式
-`ThreadUiAction` Variant。`latte-code` Composition Root 把该 Variant 映射为
-具体 `ThreadRuntimeService` Method 或本地 Terminal Action。`latte-engine` 永远
+`SessionUiAction` Variant。`latte-code` Composition Root 把该 Variant 映射为
+具体 `SessionRuntimeService` Method 或本地 Terminal Action。`latte-engine` 永远
 不会接收 Command Name String，也不提供通用 `execute_slash_command` Method。
 
 未来的 `PromptTemplate` Command 向 `latte-headless` 发出有界 Prompt Command
@@ -195,7 +195,7 @@ Recovery Path。
 因此：
 
 - `/refresh` 只能发出 `RefreshSnapshots`。
-- `/cancel` 只能发出现有 Typed `Cancel { thread_id }` Action。
+- `/cancel` 只能发出现有 Typed `Cancel { session_id }` Action。
 - `/help` 不能创建 Session 或调用 Provider。
 - Prompt Command 可以影响模型，但后续所有 Tool 仍必须经过 Engine Prepare、
   Permission、Fencing 与 Observation。
@@ -289,7 +289,7 @@ Conversation Target，例如：
 ```rust
 pub enum ActiveConversation {
     NewSessionDraft,
-    Session(ThreadId),
+    Session(SessionId),
 }
 ```
 
@@ -321,7 +321,7 @@ Active Run。
 | `/help` | – | `LocalUi` | 打开现有 Help Overlay。 |
 | `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
 | `/refresh` | – | `TypedAction` | 发出 `RefreshSnapshots`。 |
-| `/cancel` | – | `TypedAction` | 对可取消 Active Run 发出 `Cancel { thread_id }`。 |
+| `/cancel` | – | `TypedAction` | 对可取消 Active Run 发出 `Cancel { session_id }`。 |
 | `/quit` | `/exit`、`/q` | `TypedAction` | 发出 `Quit`。 |
 
 后续 Built-in 可以增加 `/status`、`/fork`、`/rename`、`/compact`、
@@ -340,7 +340,7 @@ Built-in `PromptTemplate` Command。
 latte-tui/src/command.rs
   built-in identifiers, descriptors, parser, catalog matching, availability
 
-latte-tui/src/thread.rs
+latte-tui/src/session.rs
   popup state, ActiveConversation, Session picker, reducer integration,
   rendering, typed action emission
 
@@ -351,7 +351,7 @@ latte-headless/src/command.rs         (future PromptTemplate phase)
   trusted discovery, validation, pure bounded template expansion
 
 latte-code/src/lib.rs
-  composition-root mapping from explicit ThreadUiAction variants to services,
+  composition-root mapping from explicit SessionUiAction variants to services,
   typed global Session catalog/open adapter
 ```
 
@@ -364,7 +364,7 @@ Engine API 与 Typed Service Method 中。
 - Command 在 Popup Selection 与 Enter 之间变为 Disabled 时，第二次 Availability
   Check 会在本地拒绝执行。
 - Local UI Command 失败不能关闭无关 Overlay，也不能改变 Durable State。
-- Typed Action 失败使用现有 Secret-safe `ThreadUiFeedback` Channel，并在需要时
+- Typed Action 失败使用现有 Secret-safe `SessionUiFeedback` Channel，并在需要时
  重新加载 Authoritative Snapshot。
 - PromptTemplate Load 或 Expansion 失败会恢复 Invocation，并且不调用 Provider。
 - PromptTemplate 一旦转化为普通 Submitted Prompt，恢复就完全遵守普通
@@ -473,7 +473,7 @@ Skill、可执行 Plugin、显式 Cross-workspace Rebinding 与 Slash `/cancel` 
 Reducer Test 覆盖 Popup Filter、键盘选择、Dismiss、Blocking、Local、Typed 与
 普通 Prompt Path、Alias、精确 Argument、禁用的切换和 Draft 保留。最终二进制
 PTY E2E 覆盖 Popup Rendering、方向键 Navigation、Prefix Filter、Session 创建、
-`/resume <thread-id>`、`/new`、Provider/Model 切换、下一次 Wire Request 使用所选
+`/resume <session-id>`、`/new`、Provider/Model 切换、下一次 Wire Request 使用所选
 Model，以及纯本地路径不会触发额外 Provider Request。
 
 ## 16. 交付阶段

@@ -203,8 +203,8 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             "model mock options are invalid",
         ),
         (
-            r"{thread:{max_input_bytes:32,reserved_output_bytes:32}}",
-            "invalid thread configuration",
+            r"{session:{max_input_bytes:32,reserved_output_bytes:32}}",
+            "invalid session configuration",
         ),
         (r"{unexpected:true}", "invalid merged configuration"),
     ];

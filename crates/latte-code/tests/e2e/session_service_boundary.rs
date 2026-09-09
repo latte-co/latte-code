@@ -1,11 +1,11 @@
 use super::support::{PtySession, Scenario};
-use latte_core::{IdSource, SystemIdSource, ThreadId, ThreadLifecycle, ThreadProviderBindingV2};
+use latte_core::{IdSource, SessionId, SessionLifecycle, SessionProviderBinding, SystemIdSource};
 use latte_headless::{
     provider::{FakeProvider, InputRequest, ProviderResponse, ProviderUsage, ToolCall},
     registry::{ProviderBinding, ResolvedProvider},
     runtime::VerificationPlan,
-    thread::{
-        ThreadHistoryPolicy, ThreadProviderFactory, ThreadRuntimeError, ThreadRuntimeService,
+    session::{
+        SessionHistoryPolicy, SessionProviderFactory, SessionRuntimeError, SessionRuntimeService,
     },
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -13,8 +13,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 const TUI_READY: &[u8] = b"\x1b[>3u";
 const F10: &[u8] = b"\x1b[21~";
 
-fn binding(provider: &str, model: &str) -> ThreadProviderBindingV2 {
-    ThreadProviderBindingV2 {
+fn binding(provider: &str, model: &str) -> SessionProviderBinding {
+    SessionProviderBinding {
         version: 1,
         provider_name: provider.into(),
         provider_type: "openai-chat".into(),
@@ -40,7 +40,7 @@ fn completion(text: &str) -> ProviderResponse {
     }
 }
 
-fn factory(responses: impl IntoIterator<Item = ProviderResponse>) -> ThreadProviderFactory {
+fn factory(responses: impl IntoIterator<Item = ProviderResponse>) -> SessionProviderFactory {
     let provider = Arc::new(FakeProvider::scripted(responses));
     Arc::new(move |selected| {
         Ok(ResolvedProvider {
@@ -62,7 +62,7 @@ fn factory(responses: impl IntoIterator<Item = ProviderResponse>) -> ThreadProvi
 #[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visible() {
+async fn public_session_service_state_and_configuration_matrix_is_final_cli_visible() {
     let scenario = Scenario::new();
     scenario.write_config("http://127.0.0.1:1", r#"["/bin/pwd"]"#);
     std::fs::create_dir_all(scenario.database_path().parent().unwrap()).unwrap();
@@ -71,10 +71,10 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let service = ThreadRuntimeService::new(
+    let service = SessionRuntimeService::new(
         engine.clone(),
         scenario.root(),
-        ThreadHistoryPolicy::default(),
+        SessionHistoryPolicy::default(),
         factory([
             completion("first public child completed"),
             completion("follow-up public child completed"),
@@ -91,20 +91,20 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     })
     .with_lease_ttl_ms(120_000);
 
-    let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let ready = service
         .start(
-            thread_id,
-            "exercise public thread service states".into(),
+            session_id,
+            "exercise public session service states".into(),
             binding("primary", "model-a"),
             None,
         )
         .await
         .unwrap();
-    assert_eq!(ready.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
     assert_eq!(
         service
-            .switch_model(thread_id, ready.revision, &ready.binding)
+            .switch_model(session_id, ready.revision, &ready.binding)
             .unwrap()
             .revision,
         ready.revision
@@ -113,63 +113,69 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     let mut invalid = ready.binding.clone();
     invalid.provider_name.clear();
     assert!(matches!(
-        service.switch_model(thread_id, ready.revision, &invalid),
-        Err(ThreadRuntimeError::ProviderConfiguration(_))
+        service.switch_model(session_id, ready.revision, &invalid),
+        Err(SessionRuntimeError::ProviderConfiguration(_))
     ));
     let secondary = binding("secondary", "model-b");
     assert!(matches!(
-        service.switch_model(thread_id, ready.revision + 1, &secondary),
-        Err(ThreadRuntimeError::InvalidState)
+        service.switch_model(session_id, ready.revision + 1, &secondary),
+        Err(SessionRuntimeError::InvalidState)
     ));
     let switched = service
-        .switch_model(thread_id, ready.revision, &secondary)
+        .switch_model(session_id, ready.revision, &secondary)
         .unwrap();
     assert_eq!(switched.binding, secondary);
     assert!(matches!(
         service
-            .follow_up(thread_id, ready.revision, "stale follow-up".into())
+            .follow_up(session_id, ready.revision, "stale follow-up".into())
             .await,
-        Err(ThreadRuntimeError::InvalidState)
+        Err(SessionRuntimeError::InvalidState)
     ));
     let followed = service
         .follow_up(
-            thread_id,
+            session_id,
             switched.revision,
             "accepted follow-up through switched model".into(),
         )
         .await
         .unwrap();
-    assert_eq!(followed.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(followed.lifecycle, SessionLifecycle::Ready);
     assert_eq!(followed.runs.len(), 2);
 
     assert!(matches!(
         service
             .provide_input(
-                thread_id,
+                session_id,
                 followed.revision,
                 0,
                 "not-waiting".into(),
                 "value".into(),
             )
             .await,
-        Err(ThreadRuntimeError::InvalidState)
+        Err(SessionRuntimeError::InvalidState)
     ));
     assert!(matches!(
         service
-            .resolve_permission(thread_id, followed.revision, 0, "not-waiting".into(), false,)
+            .resolve_permission(
+                session_id,
+                followed.revision,
+                0,
+                "not-waiting".into(),
+                false,
+            )
             .await,
-        Err(ThreadRuntimeError::InvalidState)
+        Err(SessionRuntimeError::InvalidState)
     ));
     assert!(matches!(
-        service.reconcile_unknown_effect(thread_id, "not-unknown"),
-        Err(ThreadRuntimeError::InvalidState)
+        service.reconcile_unknown_effect(session_id, "not-unknown"),
+        Err(SessionRuntimeError::InvalidState)
     ));
-    service.cancel(thread_id);
+    service.cancel(session_id);
     assert!(matches!(
-        service.cancel_durable(thread_id, followed.revision, 0),
-        Err(ThreadRuntimeError::InvalidState)
+        service.cancel_durable(session_id, followed.revision, 0),
+        Err(SessionRuntimeError::InvalidState)
     ));
-    let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let missing = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     assert!(
         service
             .follow_up(missing, 0, "missing".into())
@@ -178,57 +184,57 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     );
     assert!(service.cancel_durable(missing, 0, 0).is_err());
 
-    let constrained = ThreadRuntimeService::new(
+    let constrained = SessionRuntimeService::new(
         engine.clone(),
         scenario.root(),
-        ThreadHistoryPolicy {
+        SessionHistoryPolicy {
             max_request_bytes: 1,
             max_input_bytes: 2,
             reserved_output_bytes: 1,
             context_cap_bytes: 1,
-            ..ThreadHistoryPolicy::default()
+            ..SessionHistoryPolicy::default()
         },
         factory([completion("unreachable")]),
     );
     assert!(matches!(
         constrained
             .start(
-                ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 "too large".into(),
                 binding("primary", "model-a"),
                 None,
             )
             .await,
-        Err(ThreadRuntimeError::History(_))
+        Err(SessionRuntimeError::History(_))
     ));
 
-    let unavailable: ThreadProviderFactory =
+    let unavailable: SessionProviderFactory =
         Arc::new(|_| Err("configured provider unavailable".into()));
-    let unavailable_service = ThreadRuntimeService::new(
+    let unavailable_service = SessionRuntimeService::new(
         engine.clone(),
         scenario.root(),
-        ThreadHistoryPolicy::default(),
+        SessionHistoryPolicy::default(),
         unavailable,
     );
     let failed = unavailable_service
         .start(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "durable provider configuration failure".into(),
             binding("primary", "model-a"),
             None,
         )
         .await
         .unwrap();
-    assert_eq!(failed.lifecycle, ThreadLifecycle::Ready);
+    assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
     assert!(failed.transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Failure
             && entry.text.contains("selected model could not be started")
     }));
 
-    let no_verification = ThreadRuntimeService::new(
+    let no_verification = SessionRuntimeService::new(
         engine.clone(),
         scenario.root(),
-        ThreadHistoryPolicy::default(),
+        SessionHistoryPolicy::default(),
         factory([
             ProviderResponse {
                 message: None,
@@ -251,17 +257,17 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     );
     let waiting = no_verification
         .start(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "workspace change without verification".into(),
             binding("primary", "model-a"),
             None,
         )
         .await
         .unwrap();
-    assert_eq!(waiting.lifecycle, ThreadLifecycle::WaitingPermission);
+    assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
     let request_id = match waiting.pending.as_ref().unwrap() {
-        latte_core::ThreadPendingRequest::Permission { request_id, .. } => request_id.clone(),
-        latte_core::ThreadPendingRequest::Input { .. } => panic!("expected permission"),
+        latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+        latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
     };
     let run_revision = waiting
         .active_run_id
@@ -275,7 +281,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         .unwrap_or(0);
     let failed_verification = no_verification
         .resolve_permission(
-            waiting.thread_id,
+            waiting.session_id,
             waiting.revision,
             run_revision,
             request_id,
@@ -283,7 +289,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         )
         .await
         .unwrap();
-    assert_eq!(failed_verification.lifecycle, ThreadLifecycle::Failed);
+    assert_eq!(failed_verification.lifecycle, SessionLifecycle::Failed);
     assert!(scenario.root().join("service-write.txt").exists());
 
     let invalid_outcomes = [
@@ -321,29 +327,29 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         },
     ];
     for (index, outcome) in invalid_outcomes.into_iter().enumerate() {
-        let invalid_service = ThreadRuntimeService::new(
+        let invalid_service = SessionRuntimeService::new(
             engine.clone(),
             scenario.root(),
-            ThreadHistoryPolicy::default(),
+            SessionHistoryPolicy::default(),
             factory([outcome]),
         );
         let invalid = invalid_service
             .start(
-                ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 format!("invalid provider outcome {index}"),
                 binding("primary", "model-a"),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(invalid.lifecycle, ThreadLifecycle::Failed);
+        assert_eq!(invalid.lifecycle, SessionLifecycle::Failed);
     }
 
     std::fs::create_dir(scenario.root().join("unreadable-as-file")).unwrap();
-    let uncertain_tool = ThreadRuntimeService::new(
+    let uncertain_tool = SessionRuntimeService::new(
         engine.clone(),
         scenario.root(),
-        ThreadHistoryPolicy::default(),
+        SessionHistoryPolicy::default(),
         factory([ProviderResponse {
             message: None,
             tool_calls: vec![ToolCall {
@@ -359,7 +365,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     );
     let reconciliation = uncertain_tool
         .start(
-            ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             "uncertain filesystem result requires reconciliation".into(),
             binding("primary", "model-a"),
             None,
@@ -368,7 +374,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
         .unwrap();
     assert_eq!(
         reconciliation.lifecycle,
-        ThreadLifecycle::ReconciliationRequired
+        SessionLifecycle::ReconciliationRequired
     );
     assert!(reconciliation.transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Failure
@@ -382,7 +388,7 @@ async fn public_thread_service_state_and_configuration_matrix_is_final_cli_visib
     drop(engine);
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    tui.write(format!("/resume {}\r", reconciliation.thread_id).as_bytes());
+    tui.write(format!("/resume {}\r", reconciliation.session_id).as_bytes());
     assert!(tui.wait_for_output(b"Reconciliation required", Duration::from_secs(5)));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());

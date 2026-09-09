@@ -75,11 +75,11 @@ Windows 已支持任意外部进程执行。
 ## 工作区、Session 与历史
 
 - [x] 工作区发现、路径约束、工作区内工具执行与 Git/文件 manifest 读取。
-- [x] 用户级全局 SQLite 中的 v1 Run 状态与 Thread v2 控制状态；Session Transcript
+- [x] 用户级全局 SQLite 中的 v1 Run 状态与 v2 Session 控制状态；Session Transcript
   Content 只以每 Session JSONL 为权威。
 - [x] `run`、`resume`、`show`、`list` 已切到 v2 Session 契约；v1 run-id CLI 契约移除，
-  `--allow`/`--deny` 是硬错误。既有 v1 Run 状态保留在库中，不被回填成 Thread。
-- [x] Thread v2 的不可变 follow-up child、分页投影和有界 history 预算校验。
+  `--allow`/`--deny` 是硬错误。既有 v1 Run 状态保留在库中，不被回填成 Session。
+- [x] v2 Session 的不可变 follow-up child、分页投影和有界 history 预算校验。
 - [x] 用户级全局 `LATTE_CODE_HOME`、可识别 Git Worktree 的稳定
   Project/Workspace Identity、全局 Catalog 注册与 Session 分区 Lease。
 - [x] TUI Catalog 中当前 Workspace 的 Session 发现与有界搜索。
@@ -100,7 +100,7 @@ Windows 已支持任意外部进程执行。
 - [x] 有界仓库上下文收集，包括受路径约束的 `AGENTS.md` 内容。
 - [x] 模型工具调用、非密钥 input request、验证命令、handoff/evidence 的运行路径。
 - [x] Provider 工具调用 ID、history 语法和请求字节预算的 fail-closed 校验。
-- [x] Thread v2 snapshot、事件订阅和瞬态流式进度的基础协议。
+- [x] v2 Session snapshot、事件订阅和瞬态流式进度的基础协议。
 - [x] 已验证的 TUI 基础 loop：首条 Prompt 经选定 Provider、工具/权限、持久化和
   transcript 展示完整走通。
 - [x] 每 Session 一个进程内 Runner、有界 FIFO 用户输入 Mailbox 与跨 Session 并行。
@@ -174,7 +174,7 @@ Windows 已支持任意外部进程执行。
 
 ## 事件、回放与可观测性
 
-- [x] Engine 事务性事件、Thread event stream、snapshot reload 与有界 transient progress。
+- [x] Engine 事务性事件、Session event stream、snapshot reload 与有界 transient progress。
 - [x] 持久化的 Run/Effect/permission/checkpoint/verification 控制信息。
 - [ ] 以 JSONL Conversation 为权威的离线回放；回放不调用 Provider 或执行 Effect。
 - [ ] 可查询的 Session/Run/Effect 时间线、结构化诊断与脱敏审计导出。

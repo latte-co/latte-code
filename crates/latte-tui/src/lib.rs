@@ -1,7 +1,7 @@
 //! Ratatui terminal lifecycle support for Latte Code's transcript UI.
 //!
 //! The crate exposes one conversation-first presentation surface in
-//! [`thread`].  Terminal state is kept here so the reducer remains pure and
+//! [`session`].  Terminal state is kept here so the reducer remains pure and
 //! every interactive entrypoint gets the same transactional cleanup contract.
 #![allow(clippy::missing_errors_doc)]
 
@@ -21,7 +21,7 @@ use crossterm::{
 use thiserror::Error;
 
 pub mod command;
-pub mod thread;
+pub mod session;
 
 /// Connectivity is presentation state, never runtime truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1056,7 +1056,7 @@ mod tests {
             }
         }));
         let guard = TerminalGuard::enter_with_hook_and_ops(|_| {}, &ops).unwrap();
-        // Panic on a worker thread so the process-wide TERMINAL_LOCK held by
+        // Panic on a worker session so the process-wide TERMINAL_LOCK held by
         // the guard is never poisoned; the installed hook still runs.
         let _ = std::thread::spawn(|| panic!("trigger scoped panic hook")).join();
         drop(guard);

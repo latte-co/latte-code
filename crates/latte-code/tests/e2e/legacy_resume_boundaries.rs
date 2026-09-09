@@ -11,7 +11,7 @@
 //! The v1 `resume <run-id> --allow|--deny` command is gone: permission
 //! decisions now go through the HTTP API
 //! (`POST /v1/sessions/{id}/permissions/{req_id}`) or the TUI, and `resume
-//! <session-id> <prompt>` is a thread follow-up, not a permission decision.
+//! <session-id> <prompt>` is a session follow-up, not a permission decision.
 //! The v1 lease-token permission reissue and resume-from-checkpoint paths
 //! lived in the v1 `AgentRuntime` and are unreachable from the v2 contract.
 //!

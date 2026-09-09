@@ -13,6 +13,34 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Reverses migration 13 on a fully-migrated database, restoring the pre-13 v2
+/// layout (`threads_v2` / `thread_id` and friends). Legacy-import and upgrade
+/// fixtures feed a database in this historical shape to the current binary so
+/// the real migration path is exercised. Mirrors the forward migration:
+/// columns back first, then tables. Runs with `legacy_alter_table=OFF` and
+/// foreign keys disabled so the object renames cascade and succeed.
+pub const REVERSE_SCHEMA_13_SQL: &str = r"
+    PRAGMA foreign_keys=OFF;
+    PRAGMA legacy_alter_table=OFF;
+    DROP INDEX IF EXISTS sessions_workspace_activity;
+    DROP INDEX IF EXISTS sessions_parent;
+    ALTER TABLE sessions RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE sessions RENAME COLUMN parent_session_id TO parent_thread_id;
+    ALTER TABLE session_runs RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE session_active_runs RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE session_events RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE session_commit_sources RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE conversation_outbox RENAME COLUMN session_id TO thread_id;
+    ALTER TABLE session_effect_canonical RENAME TO thread_effect_canonical_v2;
+    ALTER TABLE session_commit_sources RENAME TO thread_commit_sources_v2;
+    ALTER TABLE session_command_dedup RENAME TO thread_command_dedup_v2;
+    ALTER TABLE session_events RENAME TO thread_events_v2;
+    ALTER TABLE session_active_runs RENAME TO thread_active_runs_v2;
+    ALTER TABLE session_runs RENAME TO thread_runs_v2;
+    ALTER TABLE sessions RENAME TO threads_v2;
+    DELETE FROM schema_migrations WHERE version=13;
+";
+
 pub struct Scenario {
     root: tempfile::TempDir,
     home: tempfile::TempDir,
