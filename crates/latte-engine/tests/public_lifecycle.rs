@@ -1,13 +1,13 @@
 use latte_core::{
-    CommandId, EventId, IdSource, RunId, RunStatus, RuntimeEvent, SystemIdSource, Transition,
+    CommandId, EventId, IdSource, RuntimeEvent, SystemIdSource, Transition, TurnId, TurnStatus,
 };
 use latte_engine::{EffectStatus, EngineBuilder, StorageError, ToolError, ToolInvocation};
 use serde_json::json;
 
-fn ids() -> (RunId, EventId) {
+fn ids() -> (TurnId, EventId) {
     let source = SystemIdSource::default();
     (
-        RunId::from_uuid(source.next_uuid_v7()),
+        TurnId::from_uuid(source.next_uuid_v7()),
         EventId::from_uuid(source.next_uuid_v7()),
     )
 }
@@ -15,10 +15,10 @@ fn ids() -> (RunId, EventId) {
 #[test]
 fn typed_ids_expose_their_underlying_uuid_without_string_roundtrips() {
     let source = SystemIdSource::default();
-    let run = RunId::from_uuid(source.next_uuid_v7());
+    let run = TurnId::from_uuid(source.next_uuid_v7());
     let command = CommandId::from_uuid(source.next_uuid_v7());
     let event = EventId::from_uuid(source.next_uuid_v7());
-    assert_eq!(RunId::from_uuid(run.as_uuid()), run);
+    assert_eq!(TurnId::from_uuid(run.as_uuid()), run);
     assert_eq!(CommandId::from_uuid(command.as_uuid()), command);
     assert_eq!(EventId::from_uuid(event.as_uuid()), event);
 }
@@ -31,14 +31,14 @@ fn expired_pending_tool_permission_is_reissued_to_a_fresh_fenced_lease() {
         .workspace_root(dir.path())
         .build()
         .unwrap();
-    let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-    engine.create_run(run_id, 1).unwrap();
+    let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    engine.create_turn(turn_id, 1).unwrap();
     let old_lease = engine.acquire_lease("old-owner", 2, 5).unwrap();
     let read_input = json!({"path":"a.txt"});
     let read = ToolInvocation {
         name: "read_file",
         input: &read_input,
-        run_revision: 0,
+        turn_revision: 0,
         effect_id: "read-reissue",
         attempt: 1,
         precondition: None,
@@ -49,7 +49,7 @@ fn expired_pending_tool_permission_is_reissued_to_a_fresh_fenced_lease() {
         lease_token: old_lease.fencing_token(),
     };
     let hash = engine
-        .execute_tool(run_id, &old_lease, 3, &read)
+        .execute_tool(turn_id, &old_lease, 3, &read)
         .unwrap()
         .value["sha256"]
         .as_str()
@@ -59,7 +59,7 @@ fn expired_pending_tool_permission_is_reissued_to_a_fresh_fenced_lease() {
     let old_write = ToolInvocation {
         name: "write_file",
         input: &write_input,
-        run_revision: 0,
+        turn_revision: 0,
         effect_id: "old-write",
         attempt: 1,
         precondition: Some(&hash),
@@ -70,7 +70,7 @@ fn expired_pending_tool_permission_is_reissued_to_a_fresh_fenced_lease() {
         lease_token: old_lease.fencing_token(),
     };
     assert!(matches!(
-        engine.execute_tool(run_id, &old_lease, 4, &old_write),
+        engine.execute_tool(turn_id, &old_lease, 4, &old_write),
         Err(ToolError::PermissionRequired { .. })
     ));
 
@@ -83,13 +83,13 @@ fn expired_pending_tool_permission_is_reissued_to_a_fresh_fenced_lease() {
         ..old_write
     };
     let digest = engine
-        .reissue_tool_permission("old-write", run_id, &fresh, 9, &fresh_write)
+        .reissue_tool_permission("old-write", turn_id, &fresh, 9, &fresh_write)
         .unwrap();
     assert!(!digest.is_empty());
     // The fresh binding is still fail-closed until all exact resume inputs match.
     assert!(
         !engine
-            .permission_matches("fresh-write", run_id, 0, &fresh, "wrong-digest", 10)
+            .permission_matches("fresh-write", turn_id, 0, &fresh, "wrong-digest", 10)
             .unwrap()
     );
     assert_eq!(
@@ -141,36 +141,36 @@ async fn public_storage_effect_event_and_subscription_lifecycle() {
         second_manifest[important_key]
     );
 
-    let (run_id, _event_id) = ids();
-    let queued = engine.create_run(run_id, 1).unwrap();
-    assert_eq!(engine.show(run_id).unwrap(), queued);
+    let (turn_id, _event_id) = ids();
+    let queued = engine.create_turn(turn_id, 1).unwrap();
+    assert_eq!(engine.show(turn_id).unwrap(), queued);
     assert_eq!(engine.list().unwrap(), vec![queued.clone()]);
     let lease = engine.acquire_lease("integration", 2, 100).unwrap();
     let renewed = engine.renew_lease(&lease, 3, 100).unwrap();
     let mut subscription = engine.subscribe();
     assert!(subscription.try_recv().unwrap().is_none());
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, 4, &renewed)
+        .apply_transition(turn_id, 0, Transition::Start, 4, &renewed)
         .unwrap();
     let received = subscription.recv().await.unwrap();
-    assert_eq!(received.run_id, run_id);
+    assert_eq!(received.turn_id, turn_id);
     assert_eq!(received.revision, 1);
     assert_eq!(
         received.event,
         RuntimeEvent::StateChanged {
-            status: RunStatus::Running
+            status: TurnStatus::Running
         }
     );
     assert!(matches!(
-        engine.apply_transition(run_id, 0, Transition::Start, 5, &renewed),
+        engine.apply_transition(turn_id, 0, Transition::Start, 5, &renewed),
         Err(StorageError::StaleRevision { .. })
     ));
 
     engine
-        .persist_runtime_checkpoint(run_id, running.revision, &renewed, r#"{"step":1}"#, 12)
+        .persist_runtime_checkpoint(turn_id, running.revision, &renewed, r#"{"step":1}"#, 12)
         .unwrap();
     assert_eq!(
-        engine.runtime_checkpoint(run_id).unwrap().as_deref(),
+        engine.runtime_checkpoint(turn_id).unwrap().as_deref(),
         Some(r#"{"step":1}"#)
     );
     engine.release_lease(&renewed).unwrap();

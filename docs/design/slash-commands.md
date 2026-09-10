@@ -46,7 +46,7 @@ Prompt Template 只允许文本展开；解析期间不能执行 Shell、读取�
 - 支持确定性的匹配、参数、Alias、Disabled Reason 和未来可信 Prompt Command
   Source。
 - Command Validation Error 与 Popup State 保持瞬态；Prompt 一旦被接受，Provider
-  启动失败使用正常的持久 Run Failure 语义展示。
+  启动失败使用正常的持久 Turn Failure 语义展示。
 
 第一阶段不做：
 
@@ -206,9 +206,9 @@ Recovery Path。
 每个 Descriptor 显式声明 Concurrency Policy：
 
 - `Always`：安全的本地查看或 Terminal Action。
-- `SessionRequired`：要求选中 Session，但不一定要求 Run Idle。
+- `SessionRequired`：要求选中 Session，但不一定要求 Turn Idle。
 - `IdleOnly`：修改 Session Configuration 或 Lifecycle，要求 `Ready`。
-- `RunningOnly`：只对 Active Run 有意义，例如 `/cancel`。
+- `RunningOnly`：只对 Active Turn 有意义，例如 `/cancel`。
 - `PromptLike`：使用普通 Composer Text 相同的当前 Submission 与单条 Follow-up
   Queue Contract。
 
@@ -225,7 +225,7 @@ Local 与 Typed Action Command 不会进入 Provider Follow-up Queue。Prompt Co
 
 - Popup Filter、Selection、Validation Error、Disabled Reason 和 Local Command
   Output 都是内存中的 Presentation State。
-- `LocalUi` Invocation 不创建 Session、Run、SQLite 或 JSONL Record。
+- `LocalUi` Invocation 不创建 Session、Turn、SQLite 或 JSONL Record。
 - `TypedAction` Command 只持久化它调用的权威 Domain Transition；字面
   `/command` 文本不是 Conversation Message。
 - `PromptTemplate` Command 持久化精确展开、Provider 可见的 User Message；有界
@@ -280,8 +280,8 @@ Trust Check。它们不会获得新的 Execution Kind。
 
 | Command | Alias | Kind | Availability | Mapping |
 | --- | --- | --- | --- | --- |
-| `/new` | – | `LocalUi` | 不存在 Active Run 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，在第一条 Prompt 被接受前不创建 Durable Session。 |
-| `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Run 或 Blocking Request | 无参数时加载并打开当前 Workspace 的 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
+| `/new` | – | `LocalUi` | 不存在 Active Turn 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，在第一条 Prompt 被接受前不创建 Durable Session。 |
+| `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Turn 或 Blocking Request | 无参数时加载并打开当前 Workspace 的 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
 
 `/new` 不会修改当前 Session。TUI 需要显式的 Active
 Conversation Target，例如：
@@ -310,7 +310,7 @@ Conversation 与 SQLite Control Projection，不调用 Provider，也不增加 C
 Entry。如果原 Workspace 不可用，则按照既有数据存储 Rebinding Contract，要求
 用户显式选择有效 Workspace。
 
-Background Session Ownership 完成设计前，Active Run 或 Permission、Input、
+Background Session Ownership 完成设计前，Active Turn 或 Permission、Input、
 Reconciliation Request 拥有交互时，这两个命令都保持 Disabled，绝不隐式 Detach
 Active Run。
 

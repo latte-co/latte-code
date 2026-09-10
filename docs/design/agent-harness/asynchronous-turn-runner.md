@@ -15,7 +15,7 @@ Runtime 现在保证每 Session 一个进程内 Runner、八条 FIFO 用户 Prom
 mailbox，由 runner 在安全边界消费。
 
 异步不表示同一 Session 并发发起多个 Provider Request，也不表示修改已发出的 HTTP
-stream。不同 Session 可以并发；单 Session 的 Provider context、Run revision、tool
+stream。不同 Session 可以并发；单 Session 的 Provider context、Turn revision、tool
 round 和 JSONL 顺序始终串行。这演进 v2 `SessionRuntimeService` 的进程内 active map
 及 TUI 的单条 follow-up 槽位，不改变 v1 协议。
 
@@ -24,7 +24,7 @@ round 和 JSONL 顺序始终串行。这演进 v2 `SessionRuntimeService` 的进
 `latte-headless` 拥有 `SessionRuntimeService`：构造 Provider history、驱动 stream、协调
 tool continuation 并消费 mailbox。它没有直接 filesystem、process、SQLite 写入或
 approval 消费能力；这些继续经 `latte-engine` 的受限句柄完成。`latte-engine` 仍是
-lease、Run revision、Effect、Permission 与 durable projection 的权威；`latte-tui`
+lease、Turn revision、Effect、Permission 与 durable projection 的权威；`latte-tui`
 只维护 composer/queued 展示并提交 typed command。
 
 下面两个 enum 是提案形状，`crates/` 中尚无对应类型；已实现的用户 Prompt Mailbox

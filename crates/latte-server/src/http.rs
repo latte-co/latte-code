@@ -157,7 +157,7 @@ pub enum ServerEvent {
     },
     Progress {
         session_id: String,
-        run_id: String,
+        turn_id: String,
         progress: serde_json::Value,
     },
     ResyncRequired,
@@ -311,7 +311,7 @@ pub struct SwitchModelRequest {
 #[derive(Debug, Deserialize)]
 pub struct CancelRequest {
     pub expected_session_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,7 +323,7 @@ pub struct QueueFollowUpRequest {
 pub struct ResolvePermissionRequest {
     pub allow: bool,
     pub expected_session_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,7 +331,7 @@ pub struct ProvideInputRequest {
     pub request_id: String,
     pub value: String,
     pub expected_session_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -810,7 +810,7 @@ async fn switch_model(
 
 /// Cancels an active session. Both revision fences are validated atomically
 /// inside the engine authority operation (not a TOCTOU precheck here), so a
-/// stale client cannot cancel a newer run; a mismatch returns 409 with the
+/// stale client cannot cancel a newer turn; a mismatch returns 409 with the
 /// current revision.
 async fn cancel_session(
     State(state): State<Arc<ServerState>>,
@@ -823,7 +823,7 @@ async fn cancel_session(
     match workspace.runtime.cancel_durable(
         session_id,
         req.expected_session_revision,
-        req.expected_run_revision,
+        req.expected_turn_revision,
     ) {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
@@ -863,7 +863,7 @@ async fn queue_follow_up(
     }
 }
 
-/// Resolves a permission request. Both session and run revision fences are
+/// Resolves a permission request. Both session and turn revision fences are
 /// validated before the authority-changing operation proceeds.
 async fn resolve_permission(
     State(state): State<Arc<ServerState>>,
@@ -873,14 +873,14 @@ async fn resolve_permission(
     let session_id = parse_session_id(&id)?;
     let workspace = lookup_workspace(&state, session_id).await?;
 
-    // The run revision fence is now validated atomically inside the runtime
+    // The turn revision fence is now validated atomically inside the runtime
     // method alongside the session revision fence.
     match workspace
         .runtime
         .resolve_permission(
             session_id,
             req.expected_session_revision,
-            req.expected_run_revision,
+            req.expected_turn_revision,
             request_id,
             req.allow,
         )
@@ -894,7 +894,7 @@ async fn resolve_permission(
     }
 }
 
-/// Provides a requested non-secret input value. Both session and run revision
+/// Provides a requested non-secret input value. Both session and turn revision
 /// fences are validated before the authority-changing operation proceeds.
 async fn provide_input(
     State(state): State<Arc<ServerState>>,
@@ -904,14 +904,14 @@ async fn provide_input(
     let session_id = parse_session_id(&id)?;
     let workspace = lookup_workspace(&state, session_id).await?;
 
-    // The run revision fence is now validated atomically inside the runtime
+    // The turn revision fence is now validated atomically inside the runtime
     // method alongside the session revision fence.
     match workspace
         .runtime
         .provide_input(
             session_id,
             req.expected_session_revision,
-            req.expected_run_revision,
+            req.expected_turn_revision,
             req.request_id,
             req.value,
         )
@@ -1525,10 +1525,10 @@ mod tests {
                     .as_str()
                     .expect("pending permission request id")
                     .to_string();
-                let run_revision = pending["expected_run_revision"]
+                let turn_revision = pending["expected_turn_revision"]
                     .as_u64()
                     .expect("pending expected run revision");
-                return (session_id, revision, request_id, run_revision);
+                return (session_id, revision, request_id, turn_revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1606,8 +1606,8 @@ mod tests {
                 let revision = body["snapshot"]["revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"].as_str().unwrap().to_string();
-                let run_revision = pending["expected_run_revision"].as_u64().unwrap();
-                return (session_id, revision, request_id, run_revision);
+                let turn_revision = pending["expected_turn_revision"].as_u64().unwrap();
+                return (session_id, revision, request_id, turn_revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1619,7 +1619,7 @@ mod tests {
         let state = input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, _revision, request_id, run_revision) =
+        let (session_id, _revision, request_id, turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -1630,7 +1630,7 @@ mod tests {
                 "request_id": request_id,
                 "value": "the answer",
                 "expected_session_revision": 999,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -2213,7 +2213,7 @@ mod tests {
                         .body(axum::body::Body::from(
                             serde_json::json!({
                                 "expected_session_revision": 999,
-                                "expected_run_revision": 999
+                                "expected_turn_revision": 999
                             })
                             .to_string(),
                         ))
@@ -2251,7 +2251,7 @@ mod tests {
                     .body(axum::body::Body::from(
                         serde_json::json!({
                             "expected_session_revision": 0,
-                            "expected_run_revision": 0
+                            "expected_turn_revision": 0
                         })
                         .to_string(),
                     ))
@@ -2523,7 +2523,7 @@ mod tests {
                 serde_json::json!({
                     "allow": true,
                     "expected_session_revision": 0,
-                    "expected_run_revision": 0
+                    "expected_turn_revision": 0
                 }),
             ),
             (
@@ -2533,7 +2533,7 @@ mod tests {
                     "request_id": "req-1",
                     "value": "v",
                     "expected_session_revision": 0,
-                    "expected_run_revision": 0
+                    "expected_turn_revision": 0
                 }),
             ),
             (
@@ -2729,7 +2729,7 @@ mod tests {
         });
         let _ = workspace.event_tx.send(ServerEvent::Progress {
             session_id: "abc".into(),
-            run_id: "run-1".into(),
+            turn_id: "run-1".into(),
             progress: serde_json::json!({ "step": 1 }),
         });
         let _ = workspace.event_tx.send(ServerEvent::ResyncRequired);
@@ -2959,7 +2959,7 @@ mod tests {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         // Denial consumes the prepared permission without running the tool, so
@@ -2971,7 +2971,7 @@ mod tests {
             Some(serde_json::json!({
                 "allow": false,
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -2988,7 +2988,7 @@ mod tests {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, _revision, request_id, run_revision) =
+        let (session_id, _revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -2998,7 +2998,7 @@ mod tests {
             Some(serde_json::json!({
                 "allow": true,
                 "expected_session_revision": 999,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3014,7 +3014,7 @@ mod tests {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, _request_id, run_revision) =
+        let (session_id, revision, _request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, _) = call(
@@ -3025,7 +3025,7 @@ mod tests {
                 "request_id": "whatever",
                 "value": "v",
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3033,13 +3033,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_permission_stale_run_revision_conflicts() {
-        // A stale expected_run_revision is rejected with 409 even when the
+    async fn resolve_permission_stale_turn_revision_conflicts() {
+        // A stale expected_turn_revision is rejected with 409 even when the
         // session revision is correct.
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, _run_revision) =
+        let (session_id, revision, request_id, _turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3049,7 +3049,7 @@ mod tests {
             Some(serde_json::json!({
                 "allow": true,
                 "expected_session_revision": revision,
-                "expected_run_revision": 999
+                "expected_turn_revision": 999
             })),
         )
         .await;
@@ -3058,12 +3058,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provide_input_stale_run_revision_conflicts() {
-        // A stale expected_run_revision on provide_input is rejected with 409.
+    async fn provide_input_stale_turn_revision_conflicts() {
+        // A stale expected_turn_revision on provide_input is rejected with 409.
         let state = input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, _run_revision) =
+        let (session_id, revision, request_id, _turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3074,7 +3074,7 @@ mod tests {
                 "request_id": request_id,
                 "value": "the answer",
                 "expected_session_revision": revision,
-                "expected_run_revision": 999
+                "expected_turn_revision": 999
             })),
         )
         .await;
@@ -3790,7 +3790,7 @@ mod tests {
         let state = shared_input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3801,7 +3801,7 @@ mod tests {
                 "request_id": request_id,
                 "value": "the answer",
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3825,29 +3825,29 @@ mod tests {
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
 
-        // Wait until the session has an active run, then read the authoritative
+        // Wait until the session has an active turn, then read the authoritative
         // session and run revisions for a correct-fence cancel.
-        let (revision, run_revision) = 'wait: {
+        let (revision, turn_revision) = 'wait: {
             for _ in 0..200 {
                 let (status, body) =
                     call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
                 if status == StatusCode::OK {
                     let snapshot = &body["snapshot"];
-                    if let Some(active_run_id) = snapshot["active_run_id"].as_str() {
+                    if let Some(active_turn_id) = snapshot["active_turn_id"].as_str() {
                         let revision = snapshot["revision"].as_u64().unwrap();
-                        let run_revision = snapshot["runs"]
+                        let turn_revision = snapshot["turns"]
                             .as_array()
                             .unwrap()
                             .iter()
-                            .find(|run| run["run_id"].as_str() == Some(active_run_id))
-                            .and_then(|run| run["run_revision"].as_u64())
+                            .find(|run| run["turn_id"].as_str() == Some(active_turn_id))
+                            .and_then(|run| run["turn_revision"].as_u64())
                             .unwrap();
-                        break 'wait (revision, run_revision);
+                        break 'wait (revision, turn_revision);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            panic!("session never started an active run");
+            panic!("session never started an active turn");
         };
 
         let (status, body) = call(
@@ -3856,7 +3856,7 @@ mod tests {
             &format!("/v1/sessions/{session_id}/cancel"),
             Some(serde_json::json!({
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3927,7 +3927,7 @@ mod tests {
         let state = process_reconciliation_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         // Grant permission; the launch fails and the session enters
@@ -3939,7 +3939,7 @@ mod tests {
             Some(serde_json::json!({
                 "allow": true,
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -4525,7 +4525,7 @@ mod tests {
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/cancel",
-                serde_json::json!({ "expected_session_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",
@@ -4535,12 +4535,12 @@ mod tests {
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/permissions/req-1",
-                serde_json::json!({ "allow": true, "expected_session_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "allow": true, "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/input",
-                serde_json::json!({ "request_id": "req-1", "value": "v", "expected_session_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "request_id": "req-1", "value": "v", "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",

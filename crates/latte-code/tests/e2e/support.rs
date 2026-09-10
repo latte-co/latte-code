@@ -13,15 +13,37 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Reverses migration 13 on a fully-migrated database, restoring the pre-13 v2
-/// layout (`threads_v2` / `thread_id` and friends). Legacy-import and upgrade
-/// fixtures feed a database in this historical shape to the current binary so
-/// the real migration path is exercised. Mirrors the forward migration:
-/// columns back first, then tables. Runs with `legacy_alter_table=OFF` and
-/// foreign keys disabled so the object renames cascade and succeed.
-pub const REVERSE_SCHEMA_13_SQL: &str = r"
+/// Rewrites a current-schema database to the pre-concept-alignment v12 layout
+/// (historical v2 table/column names). This undoes schema 15 (turn→run), 14
+/// (drops `tool_round_count`), and 13 (session→thread). Columns back first,
+/// then tables. Runs with `legacy_alter_table=OFF` and foreign keys disabled so
+/// the object renames cascade and succeed.
+pub const REVERSE_TO_SCHEMA_12_SQL: &str = r"
     PRAGMA foreign_keys=OFF;
     PRAGMA legacy_alter_table=OFF;
+    -- Undo schema 15 (turn→run) first.
+    ALTER TABLE sessions RENAME COLUMN latest_turn_id TO latest_run_id;
+    ALTER TABLE session_effect_canonical RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE conversation_outbox RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE session_active_turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE session_turns RENAME COLUMN parent_turn_id TO parent_run_id;
+    ALTER TABLE session_turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE pending_permissions RENAME COLUMN turn_revision TO run_revision;
+    ALTER TABLE pending_permissions RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE runtime_checkpoints RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_read_model RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_baselines RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE evidence RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE effects RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE events RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_read_model RENAME TO run_read_model;
+    ALTER TABLE turn_baselines RENAME TO run_baselines;
+    ALTER TABLE turns RENAME TO runs;
+    ALTER TABLE session_active_turns RENAME TO session_active_runs;
+    ALTER TABLE session_turns RENAME TO session_runs;
+    -- Undo schema 14 and 13.
+    ALTER TABLE session_runs DROP COLUMN tool_round_count;
     DROP INDEX IF EXISTS sessions_workspace_activity;
     DROP INDEX IF EXISTS sessions_parent;
     ALTER TABLE sessions RENAME COLUMN session_id TO thread_id;
@@ -38,7 +60,7 @@ pub const REVERSE_SCHEMA_13_SQL: &str = r"
     ALTER TABLE session_active_runs RENAME TO thread_active_runs_v2;
     ALTER TABLE session_runs RENAME TO thread_runs_v2;
     ALTER TABLE sessions RENAME TO threads_v2;
-    DELETE FROM schema_migrations WHERE version=13;
+    DELETE FROM schema_migrations WHERE version IN (13,14,15);
 ";
 
 pub struct Scenario {

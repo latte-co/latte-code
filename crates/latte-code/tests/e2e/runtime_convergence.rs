@@ -175,7 +175,7 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
         .unwrap()
         .to_owned();
     assert_eq!(
-        json(&first)["data"]["session"]["runs"][0]["status"],
+        json(&first)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     assert!(provider.wait_for_calls(6, Duration::from_secs(5)));
@@ -270,7 +270,7 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
     let shown = invoke(&scenario, &["--json", "show", &session_id]);
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     assert_eq!(
@@ -334,7 +334,7 @@ fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_
     );
     assert_eq!(json(&output)["status"], "failed");
     let session = &json(&output)["data"]["session"];
-    assert_eq!(session["runs"][0]["status"], "failed");
+    assert_eq!(session["turns"][0]["status"], "failed");
     // The provider error is recorded durably in the transcript failure card.
     assert!(
         session["transcript"]["entries"]
@@ -359,7 +359,7 @@ fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_
     let shown = invoke(&scenario, &["--json", "show", &session_id]);
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert_eq!(provider.requests().len(), 17);

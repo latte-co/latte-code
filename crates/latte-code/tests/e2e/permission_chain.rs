@@ -288,7 +288,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
         .as_str()
         .unwrap()
         .to_string();
-    let run_revision = snapshot["pending"]["expected_run_revision"]
+    let turn_revision = snapshot["pending"]["expected_turn_revision"]
         .as_u64()
         .unwrap();
     assert_eq!(provider.requests().len(), 1);
@@ -301,7 +301,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -311,7 +311,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
     // and the provider completes the turn.
     let snapshot = wait_for_lifecycle(&server, &session_id, &["ready"]);
     assert_eq!(
-        snapshot["runs"][0]["status"].as_str(),
+        snapshot["turns"][0]["status"].as_str(),
         Some("completed"),
         "run should complete after process permission allowed: {snapshot:?}"
     );

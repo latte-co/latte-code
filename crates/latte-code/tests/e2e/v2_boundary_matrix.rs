@@ -1,13 +1,12 @@
 use super::support::{PtySession, Scenario, json, wait_until};
 use latte_core::{
-    FailureCode, Handoff, IdSource, PendingInput, Retryability, RunFailure, RunId,
-    SessionCommandId, SessionEvent, SessionEventEnvelope, SessionEventId, SessionId,
-    SessionLifecycle, SessionPendingRequest, SessionProviderBinding, SessionRunStatus,
-    SessionSummary, SessionTransientProgress, SystemIdSource, TranscriptEntry, TranscriptEntryId,
-    TranscriptKind,
+    FailureCode, Handoff, IdSource, PendingInput, Retryability, SessionCommandId, SessionEvent,
+    SessionEventEnvelope, SessionEventId, SessionId, SessionLifecycle, SessionPendingRequest,
+    SessionProviderBinding, SessionSummary, SessionTransientProgress, SessionTurnStatus,
+    SystemIdSource, TranscriptEntry, TranscriptEntryId, TranscriptKind, TurnFailure, TurnId,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionRunUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
+    CancellationToken, CommitSessionTurnUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
     ProcessTermination, SessionCommitRequest, SessionEffectDescriptor, SessionEffectObservedValue,
     SessionEffectPolicy, SessionEffectRequest, SessionEffectStartRequest, StorageError,
     SubscriptionError,
@@ -30,8 +29,8 @@ const TUI_READY: &[u8] = b"\x1b[>3u";
 const F10: &[u8] = b"\x1b[21~";
 const CTRL_C: &[u8] = b"\x1b[99;5u";
 
-fn run_id() -> RunId {
-    RunId::from_uuid(SystemIdSource::default().next_uuid_v7())
+fn turn_id() -> TurnId {
+    TurnId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
 fn session_id() -> SessionId {
@@ -67,15 +66,15 @@ fn build_engine(scenario: &Scenario) -> EngineHandle {
         .unwrap()
 }
 
-fn active_run(snapshot: &latte_core::SessionSnapshot) -> (RunId, u64) {
-    let run_id = snapshot.active_run_id.unwrap();
+fn active_turn(snapshot: &latte_core::SessionSnapshot) -> (TurnId, u64) {
+    let turn_id = snapshot.active_turn_id.unwrap();
     let revision = snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
-    (run_id, revision)
+        .turn_revision;
+    (turn_id, revision)
 }
 
 fn commit_with_command(
@@ -83,16 +82,16 @@ fn commit_with_command(
     lease: &Lease,
     snapshot: &latte_core::SessionSnapshot,
     command_id: SessionCommandId,
-    update: CommitSessionRunUpdate,
+    update: CommitSessionTurnUpdate,
     now: u64,
 ) -> Result<latte_engine::SessionCommitResponse, StorageError> {
-    let (run_id, run_revision) = active_run(snapshot);
-    engine.commit_session_run_update(
+    let (turn_id, turn_revision) = active_turn(snapshot);
+    engine.commit_session_turn_update(
         SessionCommitRequest {
             session_id: snapshot.session_id,
-            run_id,
+            turn_id,
             expected_session_revision: snapshot.revision,
-            expected_run_revision: run_revision,
+            expected_turn_revision: turn_revision,
             command_id,
             request_id: None,
             effect_id: None,
@@ -107,7 +106,7 @@ fn commit(
     engine: &EngineHandle,
     lease: &Lease,
     snapshot: &latte_core::SessionSnapshot,
-    update: CommitSessionRunUpdate,
+    update: CommitSessionTurnUpdate,
     now: u64,
 ) -> latte_core::SessionSnapshot {
     commit_with_command(engine, lease, snapshot, command_id(), update, now)
@@ -126,7 +125,7 @@ fn start(
         engine,
         lease,
         snapshot,
-        CommitSessionRunUpdate::Start {
+        CommitSessionTurnUpdate::Start {
             source_key: source.into(),
         },
         now,
@@ -137,23 +136,23 @@ fn create_started_effect_session(
     engine: &EngineHandle,
     prompt: &str,
     now: u64,
-) -> (latte_core::SessionSnapshot, Lease, RunId) {
+) -> (latte_core::SessionSnapshot, Lease, TurnId) {
     let session_id = session_id();
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let snapshot = engine
-        .create_session_v2(session_id, run_id, binding(), prompt, now + 1)
+        .create_session_v2(session_id, turn_id, binding(), prompt, now + 1)
         .unwrap();
     let snapshot = start(
         engine,
         &lease,
         &snapshot,
-        &format!("permission-summary:{run_id}:start"),
+        &format!("permission-summary:{turn_id}:start"),
         now + 2,
     );
-    (snapshot, lease, run_id)
+    (snapshot, lease, turn_id)
 }
 
 fn prepare_effect(
@@ -165,14 +164,14 @@ fn prepare_effect(
     input: serde_json::Value,
     now: u64,
 ) -> latte_engine::SessionEffectPrepared {
-    let (run_id, run_revision) = active_run(snapshot);
+    let (turn_id, turn_revision) = active_turn(snapshot);
     engine
         .prepare_session_effect(
             SessionEffectRequest {
                 session_id: snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:prepare"),
                 descriptor: SessionEffectDescriptor {
@@ -196,14 +195,14 @@ fn start_effect(
     effect_id: &str,
     now: u64,
 ) -> latte_engine::SessionEffectStarted {
-    let (run_id, run_revision) = active_run(&prepared.snapshot);
+    let (turn_id, turn_revision) = active_turn(&prepared.snapshot);
     engine
         .start_session_effect(
             SessionEffectStartRequest {
                 session_id: prepared.snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: prepared.snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:start"),
                 effect_id: effect_id.into(),
@@ -224,14 +223,14 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let created = engine
         .create_session_v2(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "public reducer authoritative session",
             now + 1,
@@ -242,7 +241,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         &engine,
         &lease,
         &started,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "reducer:complete".into(),
             handoff: Handoff {
                 summary: "public reducer session completed".into(),
@@ -436,13 +435,13 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     assert_eq!(model.selected_session(), Some(&ready));
 
     for progress in [
-        SessionTransientProgress::ProviderAttempt { run_id, number: 2 },
+        SessionTransientProgress::ProviderAttempt { turn_id, number: 2 },
         SessionTransientProgress::AssistantDelta {
-            run_id,
+            turn_id,
             text: "streamed delta".into(),
         },
         SessionTransientProgress::ToolProgress {
-            run_id,
+            turn_id,
             name: "read_file".into(),
             detail: "bounded detail".into(),
         },
@@ -474,7 +473,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         sequence: 1,
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Running,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
         },
     };
     assert_eq!(
@@ -489,7 +488,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         sequence: ready.sequence.saturating_add(2),
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Running,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
         },
     };
     assert_eq!(
@@ -510,7 +509,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         sequence: ready.sequence + 1,
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Interrupted,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
         },
     };
     assert!(reduce(&mut event_model, SessionUiInput::Event(lifecycle_event)).is_empty());
@@ -528,7 +527,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             entry: TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 sequence: ready.sequence + 2,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::System,
                 text: "event appended card".into(),
                 payload: None,
@@ -545,12 +544,12 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
             .iter()
             .any(|entry| entry.text == "event appended card")
     );
-    let linked_run = latte_core::SessionRunSummary {
-        run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        parent_run_id: Some(run_id),
+    let linked_turn = latte_core::SessionTurnSummary {
+        turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        parent_turn_id: Some(turn_id),
         ordinal: 1,
-        status: SessionRunStatus::Queued,
-        run_revision: 0,
+        status: SessionTurnStatus::Queued,
+        turn_revision: 0,
         completed_at_ms: None,
         failure_code: None,
     };
@@ -560,14 +559,14 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         session_id,
         revision: ready.revision + 3,
         sequence: ready.sequence + 3,
-        event: SessionEvent::RunLinked {
-            run: linked_run.clone(),
+        event: SessionEvent::TurnLinked {
+            turn: linked_turn.clone(),
         },
     };
     assert!(reduce(&mut event_model, SessionUiInput::Event(run_linked_event)).is_empty());
     assert_eq!(
-        event_model.sessions[0].latest_run_id,
-        Some(linked_run.run_id)
+        event_model.sessions[0].latest_turn_id,
+        Some(linked_turn.turn_id)
     );
     let binding_event = SessionEventEnvelope {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
@@ -637,7 +636,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     feedback_model.pending_input_submission = Some(PendingInputSubmission {
         submission_id: 8,
         session_id,
-        run_id,
+        turn_id,
         request_id: "pending-input".into(),
         value: "pending value".into(),
         after_sequence: 0,
@@ -726,20 +725,20 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     let mut coalesced = SessionUiModel::default();
     for input in [
         SessionTransientProgress::AssistantDelta {
-            run_id,
+            turn_id,
             text: "first".into(),
         },
         SessionTransientProgress::AssistantDelta {
-            run_id,
+            turn_id,
             text: " second".into(),
         },
         SessionTransientProgress::ToolProgress {
-            run_id,
+            turn_id,
             name: "read_file".into(),
             detail: "old detail".into(),
         },
         SessionTransientProgress::ToolProgress {
-            run_id,
+            turn_id,
             name: "read_file".into(),
             detail: "new detail".into(),
         },
@@ -760,7 +759,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         revision: ready.revision + 1,
         sequence: ready.sequence + 1,
         event: SessionEvent::ReconciliationRequired {
-            run_id,
+            turn_id,
             effect_id: "event-unknown-effect".into(),
         },
     };
@@ -802,14 +801,14 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
     let created = engine
         .create_session_v2(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "render boundary session",
             now + 1,
@@ -820,7 +819,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         &engine,
         &lease,
         &started,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "render:complete".into(),
             handoff: Handoff {
                 summary: "render boundary completed with a deliberately long summary".into(),
@@ -925,7 +924,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::System,
             text: "system render annotation".into(),
             payload: None,
@@ -935,7 +934,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 1,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::ToolCall,
             text: "Read src/render.rs".into(),
             payload: Some(serde_json::json!({
@@ -957,7 +956,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 2,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::ToolResult,
             text: "render tool result with enough detail to wrap across narrow viewports".into(),
             payload: Some(serde_json::json!({
@@ -970,7 +969,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 3,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::Failure,
             text: "rendered failure card".into(),
             payload: Some(serde_json::json!({"code":"runtime_failed"})),
@@ -978,12 +977,12 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             created_at_ms: now + 7,
         },
     ]);
-    let orphan_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let orphan_turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
     rich.transcript.entries.extend([
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 4,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::ToolResult,
             text: "unpaired successful tool result".into(),
             payload: Some(serde_json::json!({
@@ -997,7 +996,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 5,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::System,
             text: "orphan started status".into(),
             payload: Some(serde_json::json!({
@@ -1010,7 +1009,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 6,
-            run_id: Some(orphan_run_id),
+            turn_id: Some(orphan_turn_id),
             kind: TranscriptKind::ToolCall,
             text: "x".repeat(500),
             payload: Some(serde_json::json!({
@@ -1027,7 +1026,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: next_sequence + 7,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::System,
             text: format!("{}{}", "bounded".repeat(400), '\u{7}'),
             payload: None,
@@ -1088,8 +1087,8 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut running = rich.clone();
     running.lifecycle = SessionLifecycle::Running;
-    running.active_run_id = Some(run_id);
-    running.runs.last_mut().unwrap().status = SessionRunStatus::Running;
+    running.active_turn_id = Some(turn_id);
+    running.turns.last_mut().unwrap().status = SessionTurnStatus::Running;
     reduce(&mut model, SessionUiInput::Snapshot(vec![running.clone()]));
 
     let mut active_keys = model.clone();
@@ -1191,7 +1190,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut terminal = rich.clone();
     terminal.lifecycle = SessionLifecycle::Failed;
-    terminal.active_run_id = None;
+    terminal.active_turn_id = None;
 
     let mut stranded_model = model.clone();
     stranded_model.active_conversation = Some(ActiveConversation::Session(session_id));
@@ -1237,7 +1236,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         reduce(
             &mut model,
             SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "ignored while disconnected".into(),
             })
         )
@@ -1270,13 +1269,13 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut permission = rich.clone();
     permission.lifecycle = SessionLifecycle::WaitingPermission;
-    permission.active_run_id = Some(run_id);
-    permission.runs.last_mut().unwrap().status = SessionRunStatus::WaitingPermission;
+    permission.active_turn_id = Some(turn_id);
+    permission.turns.last_mut().unwrap().status = SessionTurnStatus::WaitingPermission;
     permission.pending = Some(SessionPendingRequest::Permission {
-        run_id,
+        turn_id,
         request_id: "render-effect".into(),
         description: "read the renderer before editing it".into(),
-        expected_run_revision: permission.runs.last().unwrap().run_revision,
+        expected_turn_revision: permission.turns.last().unwrap().turn_revision,
     });
     let mut permission_model = model.clone();
     reduce(
@@ -1301,12 +1300,12 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut waiting_input = running.clone();
     waiting_input.lifecycle = SessionLifecycle::WaitingInput;
-    waiting_input.runs.last_mut().unwrap().status = SessionRunStatus::WaitingInput;
+    waiting_input.turns.last_mut().unwrap().status = SessionTurnStatus::WaitingInput;
     waiting_input.pending = Some(SessionPendingRequest::Input {
-        run_id,
+        turn_id,
         request_id: "render-input".into(),
         prompt: "Which rendering tier should be verified?".into(),
-        expected_run_revision: waiting_input.runs.last().unwrap().run_revision,
+        expected_turn_revision: waiting_input.turns.last().unwrap().turn_revision,
     });
     let mut input_model = model.clone();
     reduce(
@@ -1358,11 +1357,11 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     durable_input.transcript.entries.push(TranscriptEntry {
         entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         sequence: durable_input.sequence,
-        run_id: Some(run_id),
+        turn_id: Some(turn_id),
         kind: TranscriptKind::User,
         text: latte_core::redact_session_text(&pending_input.value),
         payload: None,
-        source_key: format!("{run_id}:input:{}:card", pending_input.request_id),
+        source_key: format!("{turn_id}:input:{}:card", pending_input.request_id),
         created_at_ms: now + 12,
     });
     reduce(
@@ -1374,11 +1373,11 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
 
     let mut reconciliation = rich.clone();
     reconciliation.lifecycle = SessionLifecycle::ReconciliationRequired;
-    reconciliation.active_run_id = None;
+    reconciliation.active_turn_id = None;
     reconciliation.transcript.entries.push(TranscriptEntry {
         entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         sequence: reconciliation.sequence + 1,
-        run_id: Some(run_id),
+        turn_id: Some(turn_id),
         kind: TranscriptKind::Failure,
         text: "process result requires reconciliation".into(),
         payload: Some(serde_json::json!({
@@ -1411,14 +1410,14 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     reduce(
         &mut running_model,
         SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
-            run_id,
+            turn_id,
             text: format!("streamed assistant detail{}", "x".repeat(70_000)),
         }),
     );
     reduce(
         &mut running_model,
         SessionUiInput::Progress(SessionTransientProgress::ToolProgress {
-            run_id,
+            turn_id,
             name: "read_file".into(),
             detail: "reading src/render.rs".into(),
         }),
@@ -1512,16 +1511,16 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(format!("{engine:?}").contains("EngineHandle"));
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
-    let run_id = run_id();
+    let turn_id = turn_id();
 
     assert!(matches!(
-        engine.create_session_v2(session_id, run_id, binding(), " \n ", now),
+        engine.create_session_v2(session_id, turn_id, binding(), " \n ", now),
         Err(StorageError::InvalidData(message)) if message.contains("prompt must not be empty")
     ));
     let mut invalid_binding = binding();
     invalid_binding.provider_name.clear();
     assert!(matches!(
-        engine.create_session_v2(session_id, run_id, invalid_binding, "invalid binding", now),
+        engine.create_session_v2(session_id, turn_id, invalid_binding, "invalid binding", now),
         Err(StorageError::InvalidData(message)) if message.contains("provider_name")
     ));
     let foreign_session = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -1531,7 +1530,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_started_session_v2_snapshot(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "wrong scope",
             &foreign_lease,
@@ -1545,7 +1544,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_started_session_v2_snapshot(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "expired authority",
             &expired,
@@ -1560,7 +1559,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     let running = engine
         .create_started_session_v2_snapshot(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "valid atomic session",
             &lease,
@@ -1572,7 +1571,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_session_follow_up_v2(
             session_id,
-            RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             running.revision,
             "",
             now + 4,
@@ -1582,7 +1581,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_session_follow_up_v2(
             session_id,
-            RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             running.revision,
             "not ready",
             now + 4,
@@ -1628,7 +1627,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
             .is_none()
     );
     assert!(matches!(
-        engine.session_run_changed_files(RunId::from_uuid(
+        engine.session_turn_changed_files(TurnId::from_uuid(
             SystemIdSource::default().next_uuid_v7()
         )),
         Err(StorageError::InvalidData(message)) if message.contains("baseline")
@@ -1638,7 +1637,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         &engine,
         &lease,
         &running,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "preconditions:complete".into(),
             handoff: Handoff {
                 summary: "precondition parent complete".into(),
@@ -1699,7 +1698,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_session_follow_up_v2(
             SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             0,
             "missing session",
             now + 8,
@@ -1709,7 +1708,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.create_session_follow_up_v2(
             session_id,
-            RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             switched.revision.saturating_add(1),
             "stale follow-up",
             now + 8,
@@ -1720,7 +1719,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         engine.create_started_session_follow_up_v2(
             None,
             session_id,
-            RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             switched.revision,
             "wrong scoped follow-up",
             &foreign_lease,
@@ -1728,7 +1727,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         ),
         Err(StorageError::LeaseLost)
     ));
-    let child_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let child_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let child = engine
         .create_started_session_follow_up_v2(
             None,
@@ -1744,13 +1743,13 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         latte_core::CreateOutcome::Created(snapshot)
         | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
     };
-    assert_eq!(child.active_run_id, Some(child_id));
-    assert_eq!(child.runs.len(), 2);
+    assert_eq!(child.active_turn_id, Some(child_id));
+    assert_eq!(child.turns.len(), 2);
     assert_eq!(
         engine
             .session_snapshot_tail_v2(session_id, usize::MAX)
             .unwrap()
-            .runs
+            .turns
             .len(),
         2
     );
@@ -1762,7 +1761,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     let listed_json = json(&listed);
     let sessions = listed_json["data"]["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(sessions[0]["turns"].as_array().unwrap().len(), 2);
 
     let jsonl_engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
@@ -1774,7 +1773,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         jsonl_engine
             .session_snapshot_tail_v2(session_id, 500)
             .unwrap()
-            .runs
+            .turns
             .len(),
         2
     );
@@ -1836,7 +1835,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         },
         {
             let mut value = entry.clone();
-            value["run_id"] = serde_json::json!(7);
+            value["turn_id"] = serde_json::json!(7);
             format!(
                 "{}\n{}\n",
                 serde_json::to_string(&header).unwrap(),
@@ -1903,7 +1902,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         rusqlite::Connection::open(scenario.database_path())
             .unwrap()
             .execute(
-                "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
                  VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
                 rusqlite::params![
                     session_id.to_string(),
@@ -1928,7 +1927,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     let conflicting = TranscriptEntry {
         entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         sequence: entry["seq"].as_u64().unwrap(),
-        run_id: None,
+        turn_id: None,
         kind: TranscriptKind::User,
         text: "conflicting entry identity".into(),
         payload: None,
@@ -1976,7 +1975,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     let oversized_entry = TranscriptEntry {
         entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         sequence: last_sequence + 1,
-        run_id: None,
+        turn_id: None,
         kind: TranscriptKind::User,
         text: "x".repeat(2 * 1024 * 1024 + 1),
         payload: None,
@@ -2113,11 +2112,11 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     let lease = engine
         .acquire_session_lease(input_session_id, now, 120_000)
         .unwrap();
-    let input_run_id = run_id();
+    let input_turn_id = turn_id();
     let input = engine
         .create_session_v2(
             input_session_id,
-            input_run_id,
+            input_turn_id,
             binding(),
             "boundary waiting input",
             now + 1,
@@ -2128,7 +2127,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
         &engine,
         &lease,
         &input,
-        CommitSessionRunUpdate::RequestInput {
+        CommitSessionTurnUpdate::RequestInput {
             source_key: "boundary:input:request".into(),
             request: PendingInput {
                 request_id: "boundary-input-request".into(),
@@ -2154,7 +2153,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
         let shown = scenario.output(&["--json", "show", &input_session_id.to_string()], |_| {});
         shown.status.success()
             && json(&shown)["data"]["session"]["lifecycle"] == "failed"
-            && json(&shown)["data"]["session"]["runs"]
+            && json(&shown)["data"]["session"]["turns"]
                 .as_array()
                 .is_some_and(|runs| runs.iter().any(|run| run["failure_code"] == "cancelled"))
     }));
@@ -2163,7 +2162,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     let input_shown = scenario.output(&["--json", "show", &input_session_id.to_string()], |_| {});
     assert!(input_shown.status.success());
     assert_eq!(
-        json(&input_shown)["data"]["session"]["runs"][0]["failure_code"],
+        json(&input_shown)["data"]["session"]["turns"][0]["failure_code"],
         "cancelled"
     );
     let input_listed = scenario.output(&["--json", "list"], |_| {});
@@ -2184,11 +2183,11 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     let lease = engine
         .acquire_session_lease(permission_session_id, permission_now, 120_000)
         .unwrap();
-    let permission_run_id = run_id();
+    let permission_turn_id = turn_id();
     let permission = engine
         .create_session_v2(
             permission_session_id,
-            permission_run_id,
+            permission_turn_id,
             binding(),
             "boundary permission denial",
             permission_now + 1,
@@ -2234,7 +2233,7 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
             |_| {},
         );
         shown.status.success()
-            && json(&shown)["data"]["session"]["runs"]
+            && json(&shown)["data"]["session"]["turns"]
                 .as_array()
                 .is_some_and(|runs| {
                     runs.iter().any(|run| {
@@ -2254,11 +2253,11 @@ fn final_tui_cancels_waiting_input_and_denies_prepared_permission_without_execut
     // Denial terminalizes the child run but returns the conversation to Ready.
     assert_eq!(json(&shown)["data"]["session"]["lifecycle"], "ready");
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["failure_code"],
+        json(&shown)["data"]["session"]["turns"][0]["failure_code"],
         "permission_denied"
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -2287,11 +2286,11 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         .acquire_session_lease(effect_session_id, now, 120_000)
         .unwrap();
 
-    let effect_run_id = run_id();
+    let effect_turn_id = turn_id();
     let effect = engine
         .create_session_v2(
             effect_session_id,
-            effect_run_id,
+            effect_turn_id,
             binding(),
             "boundary observed failure",
             now + 1,
@@ -2343,9 +2342,9 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &effect_lease,
         &observed.snapshot,
-        CommitSessionRunUpdate::Fail {
+        CommitSessionTurnUpdate::Fail {
             source_key: "boundary:effect:terminal".into(),
-            failure: RunFailure {
+            failure: TurnFailure {
                 code: FailureCode::RuntimeFailed,
                 message: "boundary observed effect failed".into(),
                 retryability: Retryability::Terminal,
@@ -2359,11 +2358,11 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     let tree_lease = engine
         .acquire_session_lease(tree_session_id, now + 7, 120_000)
         .unwrap();
-    let parent_run_id = run_id();
+    let parent_turn_id = turn_id();
     let parent = engine
         .create_session_v2(
             tree_session_id,
-            parent_run_id,
+            parent_turn_id,
             binding(),
             "boundary immutable parent",
             now + 7,
@@ -2380,7 +2379,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &tree_lease,
         &parent,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "boundary:parent:complete".into(),
             handoff: Handoff {
                 summary: "boundary parent completed".into(),
@@ -2391,12 +2390,12 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         now + 9,
     );
     assert_eq!(parent.lifecycle, SessionLifecycle::Ready);
-    let immutable_parent = parent.runs[0].clone();
-    let interrupted_run_id = run_id();
+    let immutable_parent = parent.turns[0].clone();
+    let interrupted_turn_id = turn_id();
     let child = engine
         .create_session_follow_up_v2(
             tree_session_id,
-            interrupted_run_id,
+            interrupted_turn_id,
             parent.revision,
             "boundary interrupted follow-up",
             now + 10,
@@ -2413,25 +2412,25 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &tree_lease,
         &child,
-        CommitSessionRunUpdate::Interrupt {
+        CommitSessionTurnUpdate::Interrupt {
             source_key: "boundary:child:interrupt".into(),
             reconciliation_effect_id: None,
         },
         now + 12,
     );
     assert_eq!(child.lifecycle, SessionLifecycle::Interrupted);
-    assert_eq!(child.runs[0], immutable_parent);
-    assert_eq!(child.runs[1].parent_run_id, Some(parent_run_id));
+    assert_eq!(child.turns[0], immutable_parent);
+    assert_eq!(child.turns[1].parent_turn_id, Some(parent_turn_id));
 
     let verification_session_id = session_id();
     let verification_lease = engine
         .acquire_session_lease(verification_session_id, now + 13, 120_000)
         .unwrap();
-    let verification_run_id = run_id();
+    let verification_turn_id = turn_id();
     let verification = engine
         .create_session_v2(
             verification_session_id,
-            verification_run_id,
+            verification_turn_id,
             binding(),
             "boundary failed verification",
             now + 13,
@@ -2444,10 +2443,10 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         "boundary:verification:start",
         now + 14,
     );
-    let (_, verification_revision) = active_run(&verification);
+    let (_, verification_revision) = active_turn(&verification);
     engine
         .record_session_verification(
-            verification_run_id,
+            verification_turn_id,
             verification_revision,
             "boundary-verification-failed",
             &ProcessOutput {
@@ -2481,9 +2480,9 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         &engine,
         &verification_lease,
         &verification,
-        CommitSessionRunUpdate::Fail {
+        CommitSessionTurnUpdate::Fail {
             source_key: "boundary:verification:terminal".into(),
-            failure: RunFailure {
+            failure: TurnFailure {
                 code: FailureCode::VerificationFailed,
                 message: "boundary verification failed with exit 9".into(),
                 retryability: Retryability::Terminal,
@@ -2515,7 +2514,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert!(effect_shown.status.success());
     let effect_session = json(&effect_shown)["data"]["session"].clone();
     assert_eq!(effect_session["lifecycle"], "failed");
-    assert_eq!(effect_session["runs"][0]["status"], "failed");
+    assert_eq!(effect_session["turns"][0]["status"], "failed");
     assert!(
         effect_session["transcript"]["entries"]
             .as_array()
@@ -2529,12 +2528,12 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert!(tree_shown.status.success());
     let tree_session = json(&tree_shown)["data"]["session"].clone();
     assert_eq!(tree_session["lifecycle"], "interrupted");
-    let tree_runs = tree_session["runs"].as_array().unwrap();
-    assert_eq!(tree_runs.len(), 2);
-    assert_eq!(tree_runs[0]["run_id"], parent_run_id.to_string());
-    assert_eq!(tree_runs[0]["status"], "completed");
-    assert_eq!(tree_runs[1]["run_id"], interrupted_run_id.to_string());
-    assert_eq!(tree_runs[1]["status"], "interrupted");
+    let tree_turns = tree_session["turns"].as_array().unwrap();
+    assert_eq!(tree_turns.len(), 2);
+    assert_eq!(tree_turns[0]["turn_id"], parent_turn_id.to_string());
+    assert_eq!(tree_turns[0]["status"], "completed");
+    assert_eq!(tree_turns[1]["turn_id"], interrupted_turn_id.to_string());
+    assert_eq!(tree_turns[1]["status"], "interrupted");
     assert!(
         tree_session["transcript"]["entries"]
             .as_array()
@@ -2551,7 +2550,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
     assert!(verification_shown.status.success());
     let verification_session = json(&verification_shown)["data"]["session"].clone();
     assert_eq!(verification_session["lifecycle"], "failed");
-    assert_eq!(verification_session["runs"][0]["status"], "failed");
+    assert_eq!(verification_session["turns"][0]["status"], "failed");
     assert!(
         verification_session["transcript"]["entries"]
             .as_array()
@@ -2581,27 +2580,27 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let initial = engine
         .create_session_v2(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "boundary command and lease fencing",
             now + 1,
         )
         .unwrap();
     let started = start(&engine, &lease, &initial, "boundary:fence:start", now + 2);
-    let (_, started_run_revision) = active_run(&started);
+    let (_, started_turn_revision) = active_turn(&started);
     let fixed_request = SessionCommitRequest {
         session_id,
-        run_id,
+        turn_id,
         expected_session_revision: started.revision,
-        expected_run_revision: started_run_revision,
+        expected_turn_revision: started_turn_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitSessionRunUpdate::AppendTranscript {
+        update: CommitSessionTurnUpdate::AppendTranscript {
             source_key: "boundary:fence:history:00".into(),
             kind: TranscriptKind::System,
             text: "boundary history 00".into(),
@@ -2609,13 +2608,13 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     let first = engine
-        .commit_session_run_update(fixed_request.clone(), &lease, now + 3)
+        .commit_session_turn_update(fixed_request.clone(), &lease, now + 3)
         .unwrap();
     assert_eq!(first.snapshot.revision, started.revision + 1);
     assert_eq!(first.snapshot.sequence, started.sequence + 1);
 
     let replay = engine
-        .commit_session_run_update(fixed_request.clone(), &lease, now + 4)
+        .commit_session_turn_update(fixed_request.clone(), &lease, now + 4)
         .unwrap();
     assert_eq!(replay, first);
     let after_replay = engine.session_snapshot_v2(session_id, None, 500).unwrap();
@@ -2632,7 +2631,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     );
 
     let mut conflicting_replay = fixed_request.clone();
-    let CommitSessionRunUpdate::AppendTranscript { text, payload, .. } =
+    let CommitSessionTurnUpdate::AppendTranscript { text, payload, .. } =
         &mut conflicting_replay.update
     else {
         unreachable!()
@@ -2640,20 +2639,20 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     *text = "conflicting replay must not persist".into();
     *payload = Some(serde_json::json!({"ordinal":0,"stable":false}));
     assert!(matches!(
-        engine.commit_session_run_update(conflicting_replay, &lease, now + 5),
+        engine.commit_session_turn_update(conflicting_replay, &lease, now + 5),
         Err(StorageError::SessionCommandReplayMismatch)
     ));
 
-    let (_, current_run_revision) = active_run(&first.snapshot);
+    let (_, current_turn_revision) = active_turn(&first.snapshot);
     let stale_session = SessionCommitRequest {
         session_id,
-        run_id,
+        turn_id,
         expected_session_revision: first.snapshot.revision - 1,
-        expected_run_revision: current_run_revision,
+        expected_turn_revision: current_turn_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitSessionRunUpdate::AppendTranscript {
+        update: CommitSessionTurnUpdate::AppendTranscript {
             source_key: "boundary:fence:stale-session".into(),
             kind: TranscriptKind::System,
             text: "stale session revision must not persist".into(),
@@ -2661,18 +2660,18 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     assert!(matches!(
-        engine.commit_session_run_update(stale_session, &lease, now + 6),
+        engine.commit_session_turn_update(stale_session, &lease, now + 6),
         Err(StorageError::StaleSessionRevision { .. })
     ));
     let stale_run = SessionCommitRequest {
         session_id,
-        run_id,
+        turn_id,
         expected_session_revision: first.snapshot.revision,
-        expected_run_revision: current_run_revision - 1,
+        expected_turn_revision: current_turn_revision - 1,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitSessionRunUpdate::AppendTranscript {
+        update: CommitSessionTurnUpdate::AppendTranscript {
             source_key: "boundary:fence:stale-run".into(),
             kind: TranscriptKind::System,
             text: "stale run revision must not persist".into(),
@@ -2680,7 +2679,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     assert!(matches!(
-        engine.commit_session_run_update(stale_run, &lease, now + 7),
+        engine.commit_session_turn_update(stale_run, &lease, now + 7),
         Err(StorageError::StaleRevision { .. })
     ));
     let after_rejections = engine.session_snapshot_v2(session_id, None, 500).unwrap();
@@ -2698,7 +2697,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
             &engine,
             &lease,
             &current,
-            CommitSessionRunUpdate::AppendTranscript {
+            CommitSessionTurnUpdate::AppendTranscript {
                 source_key: format!("boundary:fence:history:{ordinal:02}"),
                 kind: TranscriptKind::System,
                 text: format!("boundary history {ordinal:02}"),
@@ -2709,7 +2708,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     }
     let authoritative_revision = current.revision;
     let authoritative_sequence = current.sequence;
-    let (_, authoritative_run_revision) = active_run(&current);
+    let (_, authoritative_turn_revision) = active_turn(&current);
 
     let zero_limit = engine.session_snapshot_v2(session_id, None, 0).unwrap();
     assert_eq!(zero_limit.transcript.entries.len(), 1);
@@ -2752,13 +2751,13 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     engine.release_lease(&independent_runtime).unwrap();
     let expired_request = SessionCommitRequest {
         session_id,
-        run_id,
+        turn_id,
         expected_session_revision: authoritative_revision,
-        expected_run_revision: authoritative_run_revision,
+        expected_turn_revision: authoritative_turn_revision,
         command_id: command_id(),
         request_id: None,
         effect_id: None,
-        update: CommitSessionRunUpdate::AppendTranscript {
+        update: CommitSessionTurnUpdate::AppendTranscript {
             source_key: "boundary:fence:expired-owner".into(),
             kind: TranscriptKind::System,
             text: "expired owner must not persist".into(),
@@ -2766,7 +2765,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         },
     };
     assert!(matches!(
-        engine.commit_session_run_update(expired_request, &lease, now + 120_001),
+        engine.commit_session_turn_update(expired_request, &lease, now + 120_001),
         Err(StorageError::LeaseLost)
     ));
     let after_expiry = engine.session_snapshot_v2(session_id, None, 500).unwrap();
@@ -2785,8 +2784,8 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let session = json(&shown)["data"]["session"].clone();
     assert_eq!(session["lifecycle"], "running");
     assert_eq!(
-        session["runs"][0]["run_revision"],
-        authoritative_run_revision
+        session["turns"][0]["turn_revision"],
+        authoritative_turn_revision
     );
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
@@ -2828,11 +2827,11 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let initial = engine
         .create_session_v2(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "boundary effect authority",
             now + 1,
@@ -2862,14 +2861,14 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
     );
     let prepared_revision = prepared.snapshot.revision;
     let prepared_sequence = prepared.snapshot.sequence;
-    let (prepared_run_id, prepared_run_revision) = active_run(&prepared.snapshot);
-    assert_eq!(prepared_run_id, run_id);
+    let (prepared_turn_id, prepared_turn_revision) = active_turn(&prepared.snapshot);
+    assert_eq!(prepared_turn_id, turn_id);
 
     let start_request = SessionEffectStartRequest {
         session_id,
-        run_id,
+        turn_id,
         expected_session_revision: prepared_revision,
-        expected_run_revision: prepared_run_revision,
+        expected_turn_revision: prepared_turn_revision,
         command_id: command_id(),
         source_key: "boundary:effect-authority:start-exact".into(),
         effect_id: effect_id.into(),
@@ -3043,7 +3042,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
-    let parent_run_id = run_id();
+    let parent_turn_id = turn_id();
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
@@ -3054,7 +3053,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(matches!(
         engine.create_started_session_v2_snapshot(
             session_id,
-            parent_run_id,
+            parent_turn_id,
             binding(),
             "atomic boundary session",
             &wrong_scope,
@@ -3064,12 +3063,12 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         Err(StorageError::LeaseLost)
     ));
     assert!(engine.session_v2(session_id).unwrap().is_none());
-    assert!(engine.show(parent_run_id).is_err());
+    assert!(engine.show(parent_turn_id).is_err());
 
     let started = engine
         .create_started_session_v2_snapshot(
             session_id,
-            parent_run_id,
+            parent_turn_id,
             binding(),
             "atomic boundary session",
             &lease,
@@ -3078,7 +3077,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         )
         .unwrap();
     assert_eq!(started.lifecycle, SessionLifecycle::Running);
-    assert_eq!(active_run(&started), (parent_run_id, 1));
+    assert_eq!(active_turn(&started), (parent_turn_id, 1));
 
     let mut changed_binding = binding();
     changed_binding.provider_name = "v2-boundary-next".into();
@@ -3104,7 +3103,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &engine,
         &lease,
         &started,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "boundary:atomic:complete".into(),
             handoff: Handoff {
                 summary: "atomic parent completed".into(),
@@ -3246,7 +3245,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         )
         .unwrap();
     assert_eq!(fork.lifecycle, SessionLifecycle::Ready);
-    assert!(fork.runs.is_empty());
+    assert!(fork.turns.is_empty());
     let fork_summary = engine.session_v2(fork_session_id).unwrap().unwrap();
     assert_eq!(fork_summary.parent_session_id, Some(session_id));
     assert_eq!(
@@ -3262,7 +3261,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
                 forked.kind == source.kind
                     && forked.text == source.text
                     && forked.payload == source.payload
-                    && forked.run_id.is_none()
+                    && forked.turn_id.is_none()
             })
     );
     assert_eq!(
@@ -3282,7 +3281,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         engine.session_v2(default_fork_id).unwrap().unwrap().title,
         "Renamed atomic boundary (fork)"
     );
-    assert!(default_fork.runs.is_empty());
+    assert!(default_fork.turns.is_empty());
     let missing_source = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     assert!(matches!(
         engine.rename_session_v2(missing_source, "missing"),
@@ -3316,7 +3315,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let memory_running = memory_engine
         .create_started_session_v2_snapshot(
             memory_session_id,
-            run_id(),
+            turn_id(),
             binding(),
             "memory-only session",
             &memory_lease,
@@ -3328,7 +3327,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &memory_engine,
         &memory_lease,
         &memory_running,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "boundary:memory:complete".into(),
             handoff: Handoff {
                 summary: "memory session completed".into(),
@@ -3353,12 +3352,12 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let fork_lease = engine
         .acquire_session_lease(fork_session_id, now + 23, 120_000)
         .unwrap();
-    let fork_run_id = run_id();
+    let fork_turn_id = turn_id();
     let fork_running = engine
         .create_started_session_follow_up_v2(
             None,
             fork_session_id,
-            fork_run_id,
+            fork_turn_id,
             fork.revision,
             "independent fork child",
             &fork_lease,
@@ -3373,7 +3372,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         &engine,
         &fork_lease,
         &fork_running,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "boundary:fork:complete".into(),
             handoff: Handoff {
                 summary: "fork child completed independently".into(),
@@ -3384,10 +3383,10 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         now + 25,
     );
     assert_eq!(fork_completed.lifecycle, SessionLifecycle::Ready);
-    assert_eq!(fork_completed.runs.len(), 1);
+    assert_eq!(fork_completed.turns.len(), 1);
     engine.release_lease(&fork_lease).unwrap();
 
-    let follow_up_id = run_id();
+    let follow_up_id = turn_id();
     assert!(matches!(
         engine.create_started_session_follow_up_v2(
             None,
@@ -3430,8 +3429,8 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
     };
     assert_eq!(follow_up.lifecycle, SessionLifecycle::Running);
-    assert_eq!(active_run(&follow_up), (follow_up_id, 1));
-    assert_eq!(follow_up.runs.len(), 2);
+    assert_eq!(active_turn(&follow_up), (follow_up_id, 1));
+    assert_eq!(follow_up.turns.len(), 2);
     engine.release_lease(&lease).unwrap();
     engine.release_lease(&wrong_scope).unwrap();
     drop(engine);
@@ -3440,11 +3439,11 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(shown.status.success());
     let session = json(&shown)["data"]["session"].clone();
     assert_eq!(session["lifecycle"], "interrupted");
-    let runs = session["runs"].as_array().unwrap();
+    let runs = session["turns"].as_array().unwrap();
     assert_eq!(runs.len(), 2);
-    assert_eq!(runs[0]["run_id"], parent_run_id.to_string());
+    assert_eq!(runs[0]["turn_id"], parent_turn_id.to_string());
     assert_eq!(runs[0]["status"], "completed");
-    assert_eq!(runs[1]["run_id"], follow_up_id.to_string());
+    assert_eq!(runs[1]["turn_id"], follow_up_id.to_string());
     assert_eq!(runs[1]["status"], "interrupted");
     assert!(
         session["transcript"]["entries"]
@@ -3475,7 +3474,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     let engine = build_engine(&scenario);
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
@@ -3485,7 +3484,7 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     let running = engine
         .create_started_session_v2_snapshot(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "explicit unknown boundary",
             &lease,
@@ -3538,18 +3537,18 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         engine.effect_status("explicit-unknown-effect").unwrap(),
         latte_engine::EffectStatus::Unknown
     );
-    let run_revision = unknown
-        .runs
+    let turn_revision = unknown
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
     assert!(matches!(
         engine.reconcile_session_effect_unknown(
             session_id,
-            run_id,
+            turn_id,
             unknown.revision,
-            run_revision,
+            turn_revision,
             "explicit-unknown-effect".into(),
             "boundary:unknown:wrong-scope-reconcile".into(),
             command_id(),
@@ -3561,9 +3560,9 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     assert!(matches!(
         engine.reconcile_session_effect_unknown(
             session_id,
-            run_id,
+            turn_id,
             unknown.revision - 1,
-            run_revision,
+            turn_revision,
             "explicit-unknown-effect".into(),
             "boundary:unknown:stale-reconcile".into(),
             command_id(),
@@ -3575,9 +3574,9 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
     let reconciled = engine
         .reconcile_session_effect_unknown(
             session_id,
-            run_id,
+            turn_id,
             unknown.revision,
-            run_revision,
+            turn_revision,
             "explicit-unknown-effect".into(),
             "boundary:unknown:reconcile".into(),
             command_id(),
@@ -3630,7 +3629,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
     assert_eq!(session_events.try_recv().unwrap(), None);
 
     let session_id = session_id();
-    let session_run_id = run_id();
+    let session_turn_id = turn_id();
     let session_lease = engine
         .acquire_session_lease(session_id, now, 120_000)
         .unwrap();
@@ -3638,7 +3637,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
     let mut snapshot = engine
         .create_started_session_v2_snapshot(
             session_id,
-            session_run_id,
+            session_turn_id,
             binding(),
             "change feed snapshot fallback",
             &session_lease,
@@ -3654,7 +3653,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         &engine,
         &session_lease,
         &snapshot,
-        CommitSessionRunUpdate::AppendTranscript {
+        CommitSessionTurnUpdate::AppendTranscript {
             source_key: "boundary:feed:observed".into(),
             kind: TranscriptKind::System,
             text: "change feed observed event".into(),
@@ -3671,7 +3670,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
             &engine,
             &session_lease,
             &snapshot,
-            CommitSessionRunUpdate::AppendTranscript {
+            CommitSessionTurnUpdate::AppendTranscript {
                 source_key: format!("boundary:feed:lag:{ordinal:02}"),
                 kind: TranscriptKind::System,
                 text: format!("change feed durable card {ordinal:02}"),
@@ -3695,8 +3694,8 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
 
     let mut legacy_ids = Vec::new();
     for ordinal in 0_u64..40 {
-        let id = run_id();
-        engine.create_run(id, now + 100 + ordinal).unwrap();
+        let id = turn_id();
+        engine.create_turn(id, now + 100 + ordinal).unwrap();
         legacy_ids.push(id);
     }
     let legacy_lease = engine
@@ -3721,11 +3720,11 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
 
     let mut next_legacy_event = engine.subscribe();
     assert_eq!(next_legacy_event.try_recv().unwrap(), None);
-    let event_run_id = run_id();
-    engine.create_run(event_run_id, now + 300).unwrap();
+    let event_turn_id = turn_id();
+    engine.create_turn(event_turn_id, now + 300).unwrap();
     engine
         .apply_transition(
-            event_run_id,
+            event_turn_id,
             0,
             latte_core::Transition::Start,
             now + 301,
@@ -3733,24 +3732,24 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         )
         .unwrap();
     let event = next_legacy_event.recv().await.unwrap();
-    assert_eq!(event.run_id, event_run_id);
+    assert_eq!(event.turn_id, event_turn_id);
     assert_eq!(event.revision, 1);
 
     engine.release_lease(&legacy_lease).unwrap();
-    let missing_run = run_id();
+    let missing_turn = turn_id();
     assert!(matches!(
-        engine.acquire_run_lease(missing_run, "missing-run-owner", now + 400, 120_000),
-        Err(StorageError::RunNotFound(id)) if id == missing_run
+        engine.acquire_turn_lease(missing_turn, "missing-run-owner", now + 400, 120_000),
+        Err(StorageError::TurnNotFound(id)) if id == missing_turn
     ));
     assert!(matches!(
-        engine.acquire_run_lease(session_run_id, "linked-run-owner", now + 401, 120_000,),
-        Err(StorageError::LinkedRunRequiresSessionCommit)
+        engine.acquire_turn_lease(session_turn_id, "linked-run-owner", now + 401, 120_000,),
+        Err(StorageError::LinkedTurnRequiresSessionCommit)
     ));
     let exact_run_lease = engine
-        .acquire_run_lease(event_run_id, "exact-run-owner", now + 402, 120_000)
+        .acquire_turn_lease(event_turn_id, "exact-run-owner", now + 402, 120_000)
         .unwrap();
     let same_epoch = engine
-        .acquire_run_lease(event_run_id, "exact-run-owner", now + 403, 120_000)
+        .acquire_turn_lease(event_turn_id, "exact-run-owner", now + 403, 120_000)
         .unwrap();
     assert_eq!(same_epoch.fencing_token(), exact_run_lease.fencing_token());
     let renewed = engine.renew_lease(&same_epoch, now + 404, 240_000).unwrap();
@@ -3818,7 +3817,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
 
     let (validation, validation_lease, _) =
         create_started_effect_session(&engine, "effect descriptor validation", now);
-    let (validation_run_id, validation_run_revision) = active_run(&validation);
+    let (validation_turn_id, validation_turn_revision) = active_turn(&validation);
     let valid_descriptor = SessionEffectDescriptor {
         effect_id: "validation-effect".into(),
         tool_call_id: "call-validation-effect".into(),
@@ -3853,9 +3852,9 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             .prepare_session_effect(
                 SessionEffectRequest {
                     session_id: validation.session_id,
-                    run_id: validation_run_id,
+                    turn_id: validation_turn_id,
                     expected_session_revision: validation.revision,
-                    expected_run_revision: validation_run_revision,
+                    expected_turn_revision: validation_turn_revision,
                     command_id: command_id(),
                     source_key: format!("validation:{ordinal}"),
                     descriptor,
@@ -3889,9 +3888,9 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             .prepare_session_effect(
                 SessionEffectRequest {
                     session_id: validation.session_id,
-                    run_id: validation_run_id,
+                    turn_id: validation_turn_id,
                     expected_session_revision: validation.revision,
-                    expected_run_revision: validation_run_revision,
+                    expected_turn_revision: validation_turn_revision,
                     command_id: command_id(),
                     source_key: format!("policy-rejection:{ordinal}"),
                     descriptor,
@@ -3961,7 +3960,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         &changed_lease,
         &changed,
         command_id(),
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "changed-completion:complete".into(),
             handoff: Handoff {
                 summary: "must not complete without verification".into(),

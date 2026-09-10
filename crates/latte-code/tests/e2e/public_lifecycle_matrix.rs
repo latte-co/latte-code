@@ -1,10 +1,10 @@
 use super::support::{PtySession, Scenario, json, wait_until};
 use latte_core::{
-    FailureCode, IdSource, Retryability, RunFailure, RunId, SessionCommandId, SessionId,
-    SessionProviderBinding, SystemIdSource,
+    FailureCode, IdSource, Retryability, SessionCommandId, SessionId, SessionProviderBinding,
+    SystemIdSource, TurnFailure, TurnId,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionRunUpdate, EngineHandle, Lease, ProcessOutput,
+    CancellationToken, CommitSessionTurnUpdate, EngineHandle, Lease, ProcessOutput,
     ProcessTermination, SessionCommitRequest, SessionEffectDescriptor, SessionEffectObservedValue,
     SessionEffectPolicy, SessionEffectRequest, SessionEffectStartRequest, SessionLeaseLossRecovery,
     StorageError,
@@ -16,8 +16,8 @@ const F10: &[u8] = b"\x1b[21~";
 const CTRL_A: &[u8] = b"\x1b[97;5u";
 const CTRL_R: &[u8] = b"\x1b[114;5u";
 
-fn run_id() -> RunId {
-    RunId::from_uuid(SystemIdSource::default().next_uuid_v7())
+fn turn_id() -> TurnId {
+    TurnId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
 fn session_id() -> SessionId {
@@ -53,32 +53,32 @@ fn build_engine(scenario: &Scenario) -> EngineHandle {
         .unwrap()
 }
 
-fn active_run(snapshot: &latte_core::SessionSnapshot) -> (RunId, u64) {
-    let run_id = snapshot.active_run_id.unwrap();
+fn active_turn(snapshot: &latte_core::SessionSnapshot) -> (TurnId, u64) {
+    let turn_id = snapshot.active_turn_id.unwrap();
     let revision = snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
-    (run_id, revision)
+        .turn_revision;
+    (turn_id, revision)
 }
 
 fn commit_session(
     engine: &EngineHandle,
     lease: &Lease,
     snapshot: &latte_core::SessionSnapshot,
-    update: CommitSessionRunUpdate,
+    update: CommitSessionTurnUpdate,
     now: u64,
 ) -> latte_core::SessionSnapshot {
-    let (run_id, run_revision) = active_run(snapshot);
+    let (turn_id, turn_revision) = active_turn(snapshot);
     engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 request_id: None,
                 effect_id: None,
@@ -102,7 +102,7 @@ fn start_session(
         engine,
         lease,
         snapshot,
-        CommitSessionRunUpdate::Start {
+        CommitSessionTurnUpdate::Start {
             source_key: source.into(),
         },
         now,
@@ -117,14 +117,14 @@ fn prepare_read(
     path: &str,
     now: u64,
 ) -> latte_engine::SessionEffectPrepared {
-    let (run_id, run_revision) = active_run(snapshot);
+    let (turn_id, turn_revision) = active_turn(snapshot);
     let prepared = engine
         .prepare_session_effect(
             SessionEffectRequest {
                 session_id: snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("public:{effect_id}:prepare"),
                 descriptor: SessionEffectDescriptor {
@@ -150,14 +150,14 @@ fn start_effect(
     effect_id: &str,
     now: u64,
 ) -> latte_engine::SessionEffectStarted {
-    let (run_id, run_revision) = active_run(&prepared.snapshot);
+    let (turn_id, turn_revision) = active_turn(&prepared.snapshot);
     engine
         .start_session_effect(
             SessionEffectStartRequest {
                 session_id: prepared.snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: prepared.snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("public:{effect_id}:start"),
                 effect_id: effect_id.into(),
@@ -186,7 +186,7 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         .acquire_session_lease(success_session_id, now, 120_000)
         .unwrap();
 
-    let success_parent_id = run_id();
+    let success_parent_id = turn_id();
     let initial = engine
         .create_session_v2(
             success_session_id,
@@ -234,10 +234,10 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
             now + 5,
         )
         .unwrap();
-    let (parent_run_id, parent_revision) = active_run(&observed.snapshot);
+    let (parent_turn_id, parent_revision) = active_turn(&observed.snapshot);
     engine
         .record_session_verification(
-            parent_run_id,
+            parent_turn_id,
             parent_revision,
             "public-session-verification",
             &ProcessOutput {
@@ -266,7 +266,7 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         latte_core::SessionLifecycle::Ready
     );
 
-    let follow_up_id = run_id();
+    let follow_up_id = turn_id();
     let follow_up = engine
         .create_session_follow_up_v2(
             success_session_id,
@@ -287,9 +287,9 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         &engine,
         &success_lease,
         &follow_up,
-        CommitSessionRunUpdate::Fail {
+        CommitSessionTurnUpdate::Fail {
             source_key: "public:follow-up:fail".into(),
-            failure: RunFailure {
+            failure: TurnFailure {
                 code: FailureCode::RuntimeFailed,
                 message: "public follow-up terminal failure".into(),
                 retryability: Retryability::Terminal,
@@ -298,17 +298,17 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         now + 10,
     );
     assert_eq!(follow_up.lifecycle, latte_core::SessionLifecycle::Failed);
-    assert_eq!(follow_up.runs.len(), 2);
+    assert_eq!(follow_up.turns.len(), 2);
 
     let failed_session_id = session_id();
     let failed_lease = engine
         .acquire_session_lease(failed_session_id, now + 11, 120_000)
         .unwrap();
-    let failed_run_id = run_id();
+    let failed_turn_id = turn_id();
     let failed_initial = engine
         .create_session_v2(
             failed_session_id,
-            failed_run_id,
+            failed_turn_id,
             binding(),
             "public observed failure",
             now + 11,
@@ -358,9 +358,9 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         &engine,
         &failed_lease,
         &observed_failure.snapshot,
-        CommitSessionRunUpdate::Fail {
+        CommitSessionTurnUpdate::Fail {
             source_key: "public:failed:terminal".into(),
-            failure: RunFailure {
+            failure: TurnFailure {
                 code: FailureCode::RuntimeFailed,
                 message: "public certified effect failed".into(),
                 retryability: Retryability::Terminal,
@@ -381,12 +381,12 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
     assert!(success_shown.status.success());
     let success_session = json(&success_shown)["data"]["session"].clone();
     assert_eq!(success_session["lifecycle"], "failed");
-    let success_runs = success_session["runs"].as_array().unwrap();
-    assert_eq!(success_runs.len(), 2);
-    assert_eq!(success_runs[0]["run_id"], success_parent_id.to_string());
-    assert_eq!(success_runs[0]["status"], "completed");
-    assert_eq!(success_runs[1]["run_id"], follow_up_id.to_string());
-    assert_eq!(success_runs[1]["status"], "failed");
+    let success_turns = success_session["turns"].as_array().unwrap();
+    assert_eq!(success_turns.len(), 2);
+    assert_eq!(success_turns[0]["turn_id"], success_parent_id.to_string());
+    assert_eq!(success_turns[0]["status"], "completed");
+    assert_eq!(success_turns[1]["turn_id"], follow_up_id.to_string());
+    assert_eq!(success_turns[1]["status"], "failed");
     assert!(
         success_session["transcript"]["entries"]
             .as_array()
@@ -401,10 +401,10 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
     let failed_session = json(&failed_shown)["data"]["session"].clone();
     assert_eq!(failed_session["lifecycle"], "failed");
     assert_eq!(
-        failed_session["runs"][0]["run_id"],
-        failed_run_id.to_string()
+        failed_session["turns"][0]["turn_id"],
+        failed_turn_id.to_string()
     );
-    assert_eq!(failed_session["runs"][0]["status"], "failed");
+    assert_eq!(failed_session["turns"][0]["status"], "failed");
 
     let listed = scenario.output(&["--json", "list"], |_| {});
     assert!(listed.status.success());
@@ -435,11 +435,11 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     let now = latte_core::wall_time_ms();
     let session_id = session_id();
     let stale = engine.acquire_session_lease(session_id, now, 100).unwrap();
-    let run_id = run_id();
+    let turn_id = turn_id();
     let initial = engine
         .create_session_v2(
             session_id,
-            run_id,
+            turn_id,
             binding(),
             "public lease recovery",
             now + 1,
@@ -455,21 +455,21 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
         now + 3,
     );
     let started = start_effect(&engine, &stale, &prepared, "public-unknown-effect", now + 4);
-    let (_, started_revision) = active_run(&started.snapshot);
+    let (_, started_revision) = active_turn(&started.snapshot);
 
     let fresh = engine
         .acquire_session_lease(session_id, now + 200, 120_000)
         .unwrap();
-    let stale_commit = engine.commit_session_run_update(
+    let stale_commit = engine.commit_session_turn_update(
         SessionCommitRequest {
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision: started.snapshot.revision,
-            expected_run_revision: started_revision,
+            expected_turn_revision: started_revision,
             command_id: command_id(),
             request_id: None,
             effect_id: None,
-            update: CommitSessionRunUpdate::AppendTranscript {
+            update: CommitSessionTurnUpdate::AppendTranscript {
                 source_key: "public:stale:must-fail".into(),
                 kind: latte_core::TranscriptKind::System,
                 text: "stale owner must not commit".into(),
@@ -482,7 +482,7 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
     assert!(matches!(stale_commit, Err(StorageError::LeaseLost)));
 
     let recovered = engine
-        .recover_session_after_lease_loss(session_id, run_id, &stale, started_revision, now + 202)
+        .recover_session_after_lease_loss(session_id, turn_id, &stale, started_revision, now + 202)
         .unwrap();
     let recovered = match recovered {
         SessionLeaseLossRecovery::Recovered(response) => response.snapshot,

@@ -76,18 +76,20 @@ impl WorkspaceInstance {
             std::sync::Arc::new(
                 move |session_id: latte_core::SessionId,
                       progress: latte_core::SessionTransientProgress| {
-                    let run_id = match &progress {
+                    let turn_id = match &progress {
                         latte_core::SessionTransientProgress::ProviderAttempt {
-                            run_id, ..
+                            turn_id, ..
                         }
-                        | latte_core::SessionTransientProgress::AssistantDelta { run_id, .. }
-                        | latte_core::SessionTransientProgress::ToolProgress { run_id, .. } => {
-                            run_id.to_string()
+                        | latte_core::SessionTransientProgress::AssistantDelta {
+                            turn_id, ..
+                        }
+                        | latte_core::SessionTransientProgress::ToolProgress { turn_id, .. } => {
+                            turn_id.to_string()
                         }
                     };
                     let _ = progress_event_tx.send(ServerEvent::Progress {
                         session_id: session_id.to_string(),
-                        run_id,
+                        turn_id,
                         progress: serde_json::to_value(&progress).unwrap_or_default(),
                     });
                 },
@@ -752,7 +754,7 @@ mod tests {
         let now = latte_core::wall_time_ms();
         for _ in 0..70 {
             let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
-            let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+            let turn_id = latte_core::TurnId::from_uuid(uuid::Uuid::now_v7());
             let lease = engine
                 .acquire_session_lease(session_id, now, 60_000)
                 .unwrap();
@@ -760,7 +762,7 @@ mod tests {
                 .create_started_session_v2(
                     &latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
                     session_id,
-                    run_id,
+                    turn_id,
                     binding.clone(),
                     "prompt",
                     &lease,
@@ -869,7 +871,7 @@ mod tests {
             credential_generation: 1,
         };
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
-        let run_id = latte_core::RunId::from_uuid(uuid::Uuid::now_v7());
+        let turn_id = latte_core::TurnId::from_uuid(uuid::Uuid::now_v7());
         let lease = instance
             .engine
             .acquire_session_lease(session_id, 1, 1000)
@@ -879,7 +881,7 @@ mod tests {
             .create_started_session_v2(
                 &latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
                 session_id,
-                run_id,
+                turn_id,
                 binding,
                 "crashed mid-run",
                 &lease,

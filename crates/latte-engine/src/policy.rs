@@ -30,7 +30,7 @@ pub(crate) enum PolicyError {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct OperationBinding<'a> {
     pub descriptor_version: u32,
-    pub run_revision: u64,
+    pub turn_revision: u64,
     pub effect_id: &'a str,
     pub attempt: u64,
     pub tool: &'a str,

@@ -1,4 +1,4 @@
-use crate::{CommandId, EventId, PROTOCOL_VERSION, RunId};
+use crate::{CommandId, EventId, PROTOCOL_VERSION, TurnId};
 use serde::{Deserialize, Serialize};
 
 /// A versioned command message.
@@ -31,9 +31,9 @@ pub struct EventEnvelope {
     pub protocol_version: u16,
     /// Unique event identifier.
     pub event_id: EventId,
-    /// Related run.
-    pub run_id: RunId,
-    /// Monotonic run revision.
+    /// Related turn.
+    pub turn_id: TurnId,
+    /// Monotonic turn revision.
     pub revision: u64,
     /// Event payload.
     pub event: RuntimeEvent,
@@ -45,44 +45,45 @@ pub struct ReadModelEnvelope {
     /// Protocol version.
     pub protocol_version: u16,
     /// Snapshot payload.
-    pub run: RunState,
+    #[serde(alias = "run")]
+    pub turn: TurnState,
 }
 
 /// Commands accepted by the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeCommand {
-    /// Start a new run.
+    /// Start a new turn.
     Run { prompt: String },
-    /// Resume an interrupted or retryable failed run.
+    /// Resume an interrupted or retryable failed turn.
     Resume {
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
     },
-    /// Fetch one run.
-    Show { run_id: RunId },
-    /// List known runs.
+    /// Fetch one turn.
+    Show { turn_id: TurnId },
+    /// List known turns.
     List,
     /// Resolve a permission request.
     ResolvePermission {
-        run_id: RunId,
+        turn_id: TurnId,
         request_id: String,
         expected_revision: u64,
         decision: PermissionDecision,
     },
     /// Supply requested input.
     ProvideInput {
-        run_id: RunId,
+        turn_id: TurnId,
         request_id: String,
         expected_revision: u64,
         value: String,
     },
-    /// Cancel a run.
+    /// Cancel a turn.
     Cancel {
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
     },
-    /// Stop the engine without mutating a run.
+    /// Stop the engine without mutating a turn.
     Shutdown,
 }
 
@@ -91,7 +92,7 @@ pub enum RuntimeCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// The durable state changed.
-    StateChanged { status: RunStatus },
+    StateChanged { status: TurnStatus },
     /// A tool started.
     ToolStarted { name: String },
     /// A tool completed.
@@ -110,10 +111,10 @@ pub enum PermissionDecision {
     Deny,
 }
 
-/// Durable run status.
+/// Durable turn status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunStatus {
+pub enum TurnStatus {
     Queued,
     Running,
     WaitingPermission,
@@ -149,7 +150,7 @@ pub enum Retryability {
 
 /// Typed runtime failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunFailure {
+pub struct TurnFailure {
     pub code: FailureCode,
     pub message: String,
     pub retryability: Retryability,
@@ -174,7 +175,7 @@ pub enum VerificationStatus {
     NotRun,
 }
 
-/// Evidence attached to a run.
+/// Evidence attached to a turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub name: String,
@@ -190,7 +191,7 @@ pub struct Handoff {
     pub evidence: Vec<Evidence>,
 }
 
-use crate::RunState;
+use crate::TurnState;
 
 #[cfg(test)]
 mod tests {

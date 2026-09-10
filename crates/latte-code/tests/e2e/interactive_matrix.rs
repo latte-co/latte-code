@@ -73,7 +73,7 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_session() {
                 .as_array()
                 .is_some_and(|sessions| {
                     sessions.len() == 1
-                        && sessions[0]["runs"].as_array().is_some_and(|runs| {
+                        && sessions[0]["turns"].as_array().is_some_and(|runs| {
                             runs.iter()
                                 .filter(|run| run["status"] == "completed")
                                 .count()
@@ -231,7 +231,7 @@ fn edit_observed_failure_reaches_provider_then_verifies_without_mutation() {
             .unwrap()
             .iter()
             .any(|session| {
-                session["runs"]
+                session["turns"]
                     .as_array()
                     .is_some_and(|runs| runs.iter().any(|run| run["status"] == "completed"))
             })

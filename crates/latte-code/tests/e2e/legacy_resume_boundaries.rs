@@ -21,6 +21,6 @@
 //!   (allow -> the effect executes exactly once)
 //! - `final_binary_server_denies_a_permission_request_through_http`
 //!   (deny -> the effect never executes)
-//! - `final_binary_server_rejects_stale_run_revision_on_permission`
+//! - `final_binary_server_rejects_stale_turn_revision_on_permission`
 //!   (revision-fenced permission resolution, the v2 successor to the v1
 //!   lease-token reissue fencing)

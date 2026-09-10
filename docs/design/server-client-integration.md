@@ -242,7 +242,7 @@ Response: 200 { "snapshot": {...} }
 
 当前 `ServerEvent::Progress` 变体存在但未接线。需要在 `WorkspaceInstance::new` 中为 `SessionRuntimeService` 设置 `SessionProgressSink`。
 
-**标识维度修正**（P0-7）：`SessionTransientProgress` 的变体只携带 `run_id`，不携带 `session_id`。workspace SSE 混多 session，仅靠 run_id 无法可靠 demux。
+**标识维度修正**（P0-7，已落地）：`SessionTransientProgress` 的变体只携带 `turn_id`（schema 15 前为 `run_id`，serde alias 只读兼容），不携带 `session_id`。workspace SSE 混多 session，仅靠 turn_id 无法可靠 demux。
 
 修法：`SessionProgressSink` trait 签名改为：
 
@@ -258,8 +258,8 @@ pub trait SessionProgressSink: Send + Sync {
 
 ```rust
 Progress {
-    session_id: String,   // session_id
-    run_id: String,
+    session_id: String,
+    turn_id: String,
     progress: serde_json::Value,
 },
 ```
@@ -270,14 +270,14 @@ Progress {
 let sink: Arc<dyn SessionProgressSink> = {
     let event_tx = event_tx.clone();
     Arc::new(move |session_id: SessionId, progress: SessionTransientProgress| {
-        let run_id = match &progress {
-            SessionTransientProgress::ProviderAttempt { run_id, .. }
-            | SessionTransientProgress::AssistantDelta { run_id, .. }
-            | SessionTransientProgress::ToolProgress { run_id, .. } => run_id.to_string(),
+        let turn_id = match &progress {
+            SessionTransientProgress::ProviderAttempt { turn_id, .. }
+            | SessionTransientProgress::AssistantDelta { turn_id, .. }
+            | SessionTransientProgress::ToolProgress { turn_id, .. } => turn_id.to_string(),
         };
         let _ = event_tx.send(ServerEvent::Progress {
             session_id: session_id.to_string(),
-            run_id,
+            turn_id,
             progress: serde_json::to_value(&progress).unwrap_or_default(),
         });
     })
@@ -332,7 +332,7 @@ TUI Reducer（不变）
   └── Feedback/Progress
         ├── SSE 线程（专用 OS thread，reqwest::blocking）
         │     ├── SessionChanged → 置 projection Dirty 原子位
-        │     ├── Progress      → scoped accumulator（按 session_id+run_id+kind 分桶）
+        │     ├── Progress      → scoped accumulator（按 session_id+turn_id+kind 分桶）
         │     └── ResyncRequired → 置 projection Lagged 原子位
         └── Action worker（固定数量 OS 线程）
               └── SubmissionAssigned/Result/ModelSwitch/... → feedback channel
@@ -433,7 +433,7 @@ Action worker（固定数量 OS 线程，如 2 个）
 SSE 线程（std::thread::spawn，专用）
   └── reqwest::blocking GET /events（流式）
         ├── SessionChanged → 置 projection dirty 原子位
-        ├── Progress → scoped accumulator（按 session_id+run_id+kind 分桶）
+        ├── Progress → scoped accumulator（按 session_id+turn_id+kind 分桶）
         └── ResyncRequired → 置 projection lagged 原子位
 ```
 
@@ -444,7 +444,7 @@ SSE 线程（std::thread::spawn，专用）
 3. **Action worker 用固定 OS 线程 + `reqwest::blocking`**（不用 Tokio task + blocking client，会阻塞 async worker）。bounded queue + 固定 worker，per-session 串行化。
 4. **bounded queue 满时语义**：sink 仍返回 `Ok(())`，但立即发送与 action 对应的失败 feedback（如 `SubmissionResult(Err("action queue full"))`），不静默丢弃。
 5. **Projection 唤醒用 sticky 原子位**：`AtomicU8` 状态位（`Idle | Dirty | Lagged | Closed | Error`，5 态），SSE 线程 `fetch_max` 置位（保证 `LAGGED > DIRTY > IDLE` 优先级），重连成功用 `store(LAGGED)` 替换旧状态，TUI `poll()` 时 `swap` 取位并清零。
-6. **Progress 用 scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶，`AssistantDelta` 有界追加，`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux。不用全局 latest-slot（会丢 chunk + 串 session）。
+6. **Progress 用 scoped accumulator**：按 `(session_id, turn_id, kind/tool_name)` 分桶，`AssistantDelta` 有界追加，`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux。不用全局 latest-slot（会丢 chunk + 串 session）。
 7. **不用 `tokio::runtime::Runtime::new()` 在 TUI 侧**：client 侧纯 `reqwest::blocking` + `std::thread`，避免双 runtime 复杂性。
 
 ### 5.5 Binary 接线
@@ -679,7 +679,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 
 - in-process：`SessionProgressSink` → mpsc → TUI `progress_rx`。
 - HTTP：`SessionProgressSink`（带 session_id）→ `ServerEvent::Progress` → SSE → **scoped accumulator** → TUI `progress_rx`。
-- **Scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶。`AssistantDelta` 有界追加（reducer 按 run 追加 chunk），`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux，后台 session 的 progress 不显示。
+- **Scoped accumulator**：按 `(session_id, turn_id, kind/tool_name)` 分桶。`AssistantDelta` 有界追加（reducer 按 turn 追加 chunk），`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux，后台 session 的 progress 不显示。
 - progress 是瞬态，snapshot 刷新/断线/重连时清空（reducer 已有 `model.progress.clear()`）。
 
 ### 7.5 Sink 错误语义
@@ -769,7 +769,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 - [x] `PATCH /v1/sessions/{id}` 重命名端点（+SessionChanged 事件）
 - [x] `POST /v1/sessions/{id}/fork` 分叉端点（+SessionChanged 事件）
 - [x] `SessionProgressSink` trait 增加 `session_id` 参数；`ProviderProgress` 增加 `session_id` 字段
-- [x] `ServerEvent::Progress` 增加 `run_id` 字段
+- [x] `ServerEvent::Progress` 增加 `turn_id` 字段（落地时随 Run→Turn 改名，旧 `run_id` 经 serde alias 只读兼容）
 - [x] Progress 事件接线（`WorkspaceInstance::new` 中 `with_progress_sink`）
 - [x] SSE 桥接转发所有 durable SessionEvent（不只 LifecycleChanged）
 - [x] server builder 补 `.with_verification(config.plan())`
@@ -781,7 +781,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 - [x] `HttpProjectionClient` 实现（REST reads + mpsc `ProjectionEvent` 通道 poll：SessionChanged/Closed；原设计的 5 态 sticky 原子位在评审中简化为通道）
 - [x] Action dispatch 实现（闭包 over `ServerHandle`，非阻塞，6 种 feedback 全覆盖，绝不返回 Err，409 置 dirty 位，queue 满发失败 feedback；原设计的 `HttpActionSink` struct 在评审中简化为闭包）
 - [x] SSE 线程（专用 OS 线程，reqwest::blocking，demux：progress scoped accumulator / dirty 信号 / 带退避重连）
-- [x] Progress scoped accumulator（按 session_id+run_id+kind 分桶，AssistantDelta 有界追加，交付前按 active session demux）
+- [x] Progress scoped accumulator（按 session_id+turn_id+kind 分桶，AssistantDelta 有界追加，交付前按 active session demux）
 - [x] 执行模型：TUI loop 用 `spawn_blocking(...).await`，bounded action queue + 固定 OS 线程 worker，per-session 顺序
 - [x] `ClientWorkers` RAII owner（所有模式：cancel + join SSE/action workers）
 - [x] TUI 启动时内嵌 server（serve_with_shutdown + 独立 server shutdown token）+ HTTP client 接线

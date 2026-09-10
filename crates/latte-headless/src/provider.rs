@@ -97,10 +97,13 @@ pub(crate) const SESSION_ID_PLACEHOLDER: &str = "${session_id}";
 
 /// Derives the value a Provider sees for one Session.
 ///
-/// The internal `SessionId` is never sent as-is: a Provider is an external party
-/// and correlating our identifiers across Providers is not something the user
-/// asked for. Hashing keeps the value stable for the whole Session — the point
-/// of the header — while making it meaningless outside this process.
+/// The raw `SessionId` is never sent to a Provider. The ref is a deterministic,
+/// unkeyed SHA-256 prefix, so two claims it must NOT make: it is not
+/// uncorrelatable across Providers — every Provider receives the same stable
+/// value for one Session, which is deliberate so a Provider can group that
+/// Session's turns; and it is not unguessable by anyone who already knows the
+/// UUID. Its only privacy property is that the wire value reveals no internal
+/// identifier to a party that does not.
 #[must_use]
 pub fn session_ref_for(session_id: latte_core::SessionId) -> String {
     use sha2::{Digest, Sha256};

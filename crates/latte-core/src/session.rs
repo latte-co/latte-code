@@ -1,11 +1,11 @@
 //! Additive v2 conversation-session protocol.
 //!
-//! This module intentionally does not alter any v1 command, event, or run
+//! This module intentionally does not alter any v1 command, event, or turn
 //! representation.  A decoder which only understands protocol v1 can keep
 //! reading its existing records byte-for-byte, while v2 consumers use the
 //! separate envelopes below.
 
-use crate::{RunId, SessionCommandId, SessionEventId, SessionId, TranscriptEntryId};
+use crate::{SessionCommandId, SessionEventId, SessionId, TranscriptEntryId, TurnId};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,12 +54,14 @@ pub fn valid_openai_chat_input_request_id(id: &str) -> bool {
     valid_openai_chat_opaque_id(id)
 }
 
-/// Lifecycle of the conversation projection, distinct from its child run.
+/// Lifecycle of the conversation projection, distinct from its child turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLifecycle {
-    /// A session may receive a follow-up. Its newest child either completed or
-    /// failed with an explicitly retryable runtime error.
+    /// A session may receive a follow-up. Its newest child either completed,
+    /// failed with an explicitly retryable runtime error, or was denied a
+    /// requested permission. `Ready` answers "can the session continue", not
+    /// "did the last turn succeed": a denied turn leaves the session ready.
     Ready,
     /// The active child is talking to a provider or preparing work.
     Running,
@@ -162,14 +164,17 @@ impl SessionProviderBinding {
     }
 }
 
-/// A compact immutable child-run record shown in the session list.
+/// A compact immutable child-turn record shown in the session list.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionRunSummary {
-    pub run_id: RunId,
-    pub parent_run_id: Option<RunId>,
+pub struct SessionTurnSummary {
+    #[serde(alias = "run_id")]
+    pub turn_id: TurnId,
+    #[serde(alias = "parent_run_id")]
+    pub parent_turn_id: Option<TurnId>,
     pub ordinal: u64,
-    pub status: SessionRunStatus,
-    pub run_revision: u64,
+    pub status: SessionTurnStatus,
+    #[serde(alias = "run_revision")]
+    pub turn_revision: u64,
     pub completed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_code: Option<crate::protocol::FailureCode>,
@@ -179,7 +184,7 @@ pub struct SessionRunSummary {
 /// transition API: `latte-engine` is the only writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionRunStatus {
+pub enum SessionTurnStatus {
     Queued,
     Running,
     Cancelling,
@@ -211,7 +216,8 @@ pub enum TranscriptKind {
 pub struct TranscriptEntry {
     pub entry_id: TranscriptEntryId,
     pub sequence: u64,
-    pub run_id: Option<RunId>,
+    #[serde(default, alias = "run_id")]
+    pub turn_id: Option<TurnId>,
     pub kind: TranscriptKind,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,11 +246,16 @@ pub struct SessionSnapshot {
     pub sequence: u64,
     pub lifecycle: SessionLifecycle,
     pub binding: SessionProviderBinding,
-    pub latest_run_id: Option<RunId>,
-    pub active_run_id: Option<RunId>,
+    // Always serialized (null when absent): this is a hard key rename only,
+    // the wire shape must not change beyond the field name.
+    #[serde(alias = "latest_run_id")]
+    pub latest_turn_id: Option<TurnId>,
+    #[serde(alias = "active_run_id")]
+    pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<SessionPendingRequest>,
-    pub runs: Vec<SessionRunSummary>,
+    #[serde(alias = "runs")]
+    pub turns: Vec<SessionTurnSummary>,
     pub transcript: TranscriptPage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
@@ -287,16 +298,20 @@ pub struct Paged<T> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionPendingRequest {
     Permission {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         request_id: String,
         description: String,
-        expected_run_revision: u64,
+        #[serde(alias = "run_revision")]
+        expected_turn_revision: u64,
     },
     Input {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         request_id: String,
         prompt: String,
-        expected_run_revision: u64,
+        #[serde(alias = "run_revision")]
+        expected_turn_revision: u64,
     },
 }
 
@@ -344,20 +359,20 @@ pub enum SessionCommand {
     Cancel {
         session_id: SessionId,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
     },
     ResolvePermission {
         session_id: SessionId,
         request_id: String,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         allow: bool,
     },
     ProvideInput {
         session_id: SessionId,
         request_id: String,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         value: String,
     },
 }
@@ -380,20 +395,23 @@ pub struct SessionEventEnvelope {
 pub enum SessionEvent {
     LifecycleChanged {
         lifecycle: SessionLifecycle,
-        run_id: Option<RunId>,
+        #[serde(default, alias = "run_id")]
+        turn_id: Option<TurnId>,
     },
     TranscriptAppended {
         entry: TranscriptEntry,
     },
-    RunLinked {
-        run: SessionRunSummary,
+    TurnLinked {
+        #[serde(alias = "run")]
+        turn: SessionTurnSummary,
     },
     BindingChanged {
         provider_name: String,
         model: String,
     },
     ReconciliationRequired {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         effect_id: String,
     },
 }
@@ -404,15 +422,18 @@ pub enum SessionEvent {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SessionTransientProgress {
     ProviderAttempt {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         number: u32,
     },
     AssistantDelta {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         text: String,
     },
     ToolProgress {
-        run_id: RunId,
+        #[serde(alias = "run_id")]
+        turn_id: TurnId,
         name: String,
         detail: String,
     },

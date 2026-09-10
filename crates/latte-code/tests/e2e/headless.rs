@@ -240,7 +240,7 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
     assert_eq!(missing.status.code(), Some(1));
     assert_eq!(json(&missing)["status"], "failed");
     assert_eq!(
-        json(&missing)["data"]["session"]["runs"][0]["status"],
+        json(&missing)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
 
@@ -282,7 +282,7 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
     assert_eq!(transport.status.code(), Some(1));
     assert_eq!(json(&transport)["status"], "failed");
     assert_eq!(
-        json(&transport)["data"]["session"]["runs"][0]["status"],
+        json(&transport)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     let database = std::fs::read(scenario.database_path()).unwrap();
@@ -301,7 +301,7 @@ fn configuration_and_provider_failures_are_typed_and_do_not_leak_secrets() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(json(&output)["status"], "failed");
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
 }

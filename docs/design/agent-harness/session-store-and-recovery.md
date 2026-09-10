@@ -22,29 +22,29 @@ $LATTE_CODE_HOME/
     <canonical-workspace-key>/<session-id>.jsonl
 ```
 
-SQLite 至少保存 Project、Workspace、Session、Run、Effect、Permission、Lease、
+SQLite 至少保存 Project、Workspace、Session、Turn、Effect、Permission、Lease、
 Checkpoint、Evidence 和 deduplication key。它保存 title、最近活动时间、无密钥 binding
 fingerprint 与 JSONL 定位信息，但不复制 conversation transcript。
 
 JSONL 首行是最小自描述 header；后续只追加有稳定 `entry_id`、单调 `seq`、可选
-`run_id` 与有界内容的 `message`、完整 tool-call/tool-result、checkpoint 或 compaction。
+`turn_id`（schema 15 前为 `run_id`，旧文件只读回退）与有界内容的 `message`、完整 tool-call/tool-result、checkpoint 或 compaction。
 它不保存 credential、request header、raw Provider error、partial delta、cancellation
 token 或 engine-private effect descriptor。
 
 ## 3. 物化和恢复
 
 新 Session 与 follow-up 在本地校验阶段保持为内存 Draft。Prompt 一旦被接受，其
-Session/Run 与精确 User Content 会在解析 Credential、构造 Provider 或发起网络
+Session/Turn 与精确 User Content 会在解析 Credential、构造 Provider 或发起网络
 I/O 之前持久化。
 
 接受提交就是物化点：
 
 1. 插入不可发现的 `materializing` Session metadata；
 2. 追加并 sync JSONL header 与已消费输入；
-3. 创建 Child Run/Control State 并将 Session 标为可发现；
+3. 创建 Child Turn/Control State 并将 Session 标为可发现；
 4. 追加完整 Provider Outcome 或有界、已脱敏的 Failure Card。
 
-接受前的 Validation 或 Storage Failure 不创建 Session/Run Row 或 JSONL，并精确
+接受前的 Validation 或 Storage Failure 不创建 Session/Turn Row 或 JSONL，并精确
 恢复 Draft。接受后的 Configuration、Credential、Model、Authentication、
 Transport 或启动失败会保留 User Record，并追加已脱敏 Failure Record。Provider
 构造失败可重试；原始 Provider Error 与 Credential 绝不持久化。

@@ -8,8 +8,8 @@
 use crate::prepare_server;
 use futures::StreamExt;
 use latte_core::{
-    FailureCode, SessionCommandId, SessionId, SessionLifecycle, SessionRunStatus, SessionSnapshot,
-    SessionSummary, SessionTransientProgress, TranscriptKind,
+    FailureCode, SessionCommandId, SessionId, SessionLifecycle, SessionSnapshot, SessionSummary,
+    SessionTransientProgress, SessionTurnStatus, TranscriptKind,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -268,7 +268,7 @@ pub fn parse_session_id(value: &str) -> Result<SessionId, ClientError> {
 // Terminal classification (pure, mirrors design doc §6.4)
 // ---------------------------------------------------------------------------
 
-/// The terminal outcome of a session, derived from lifecycle + latest run.
+/// The terminal outcome of a session, derived from lifecycle + latest turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Completed,
@@ -316,12 +316,12 @@ pub fn classify(snapshot: &SessionSnapshot) -> Option<TerminalOutcome> {
         SessionLifecycle::Interrupted => Some(TerminalOutcome::Interrupted),
         SessionLifecycle::ReconciliationRequired => Some(TerminalOutcome::ReconciliationRequired),
         SessionLifecycle::Failed => Some(TerminalOutcome::Failed),
-        SessionLifecycle::Ready => match latest_run(snapshot) {
-            Some(run) if run.status == SessionRunStatus::Completed => {
+        SessionLifecycle::Ready => match latest_turn(snapshot) {
+            Some(turn) if turn.status == SessionTurnStatus::Completed => {
                 Some(TerminalOutcome::Completed)
             }
-            Some(run) if run.status == SessionRunStatus::Failed => {
-                if run.failure_code == Some(FailureCode::PermissionDenied) {
+            Some(turn) if turn.status == SessionTurnStatus::Failed => {
+                if turn.failure_code == Some(FailureCode::PermissionDenied) {
                     Some(TerminalOutcome::Denied)
                 } else {
                     Some(TerminalOutcome::Failed)
@@ -332,14 +332,14 @@ pub fn classify(snapshot: &SessionSnapshot) -> Option<TerminalOutcome> {
     }
 }
 
-/// The newest child run by ordinal.
-fn latest_run(snapshot: &SessionSnapshot) -> Option<&latte_core::SessionRunSummary> {
-    snapshot.runs.iter().max_by_key(|run| run.ordinal)
+/// The newest child turn by ordinal.
+fn latest_turn(snapshot: &SessionSnapshot) -> Option<&latte_core::SessionTurnSummary> {
+    snapshot.turns.iter().max_by_key(|turn| turn.ordinal)
 }
 
 /// The result of observing a session to completion.
 #[derive(Debug)]
-pub enum RunResult {
+pub enum TurnResult {
     /// The session reached a terminal state.
     Terminal {
         snapshot: SessionSnapshot,
@@ -349,7 +349,7 @@ pub enum RunResult {
     Cancelled { snapshot: Option<SessionSnapshot> },
 }
 
-impl RunResult {
+impl TurnResult {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
@@ -390,7 +390,7 @@ pub enum StreamEvent {
     /// Transient provider progress.
     Progress {
         session_id: String,
-        run_id: String,
+        turn_id: String,
         progress: Value,
     },
     /// The client fell behind or the server signalled a resync.
@@ -408,7 +408,7 @@ pub fn parse_sse_frame(event_type: Option<&str>, data: &str) -> Option<StreamEve
         }),
         Some("progress") => Some(StreamEvent::Progress {
             session_id: value.get("session_id")?.as_str()?.to_string(),
-            run_id: value.get("run_id")?.as_str()?.to_string(),
+            turn_id: value.get("turn_id")?.as_str()?.to_string(),
             progress: value.get("progress")?.clone(),
         }),
         Some("resync_required") => Some(StreamEvent::ResyncRequired),
@@ -524,7 +524,7 @@ fn last_message_text(snapshot: &SessionSnapshot) -> Option<String> {
 }
 
 #[must_use]
-pub fn run_envelope(result: &RunResult) -> Value {
+pub fn run_envelope(result: &TurnResult) -> Value {
     json!({
         "version": 2,
         "status": result.status(),
@@ -600,12 +600,12 @@ pub trait SessionServer {
         &mut self,
         workspace_id: &str,
     ) -> Result<Vec<SessionSnapshot>, ClientError>;
-    /// Requests cancellation of the active run.
+    /// Requests cancellation of the active turn.
     async fn cancel(
         &mut self,
         session_id: &SessionId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError>;
     /// Opens the workspace event stream; subsequent
     /// [`next_event`](Self::next_event) calls read from it.
@@ -627,15 +627,15 @@ pub async fn run_session(
     focus: Option<&Path>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     let workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
     let binding = tokio::select! {
         result = server.default_binding(&workspace_id) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
     let session_id = SessionId::from_uuid(Uuid::now_v7());
     let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
@@ -651,7 +651,7 @@ pub async fn run_session(
         () = &mut cancel => {
             // The session may have been created server-side even though the
             // response hasn't arrived; best-effort cancel to avoid leaving
-            // a background provider run.
+            // a background provider call.
             return Ok(cancel_session(server, &session_id).await);
         }
     };
@@ -666,11 +666,11 @@ pub async fn resume_session(
     prompt: &str,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     let _workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
     let session_id = parse_session_id(session_id)?;
     let snapshot = tokio::select! {
@@ -703,7 +703,7 @@ async fn observe_session(
     session_id: &SessionId,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     // Resync before subscribing: a fast turn may already be terminal.
     let pre_terminal = tokio::select! {
@@ -796,20 +796,20 @@ async fn observe_session(
 async fn check_terminal(
     server: &mut impl SessionServer,
     session_id: &SessionId,
-) -> Result<Option<RunResult>, ClientError> {
+) -> Result<Option<TurnResult>, ClientError> {
     let snapshot = server.snapshot(session_id).await?;
-    Ok(classify(&snapshot).map(|outcome| RunResult::Terminal { snapshot, outcome }))
+    Ok(classify(&snapshot).map(|outcome| TurnResult::Terminal { snapshot, outcome }))
 }
 
-async fn cancel_session(server: &mut impl SessionServer, session_id: &SessionId) -> RunResult {
+async fn cancel_session(server: &mut impl SessionServer, session_id: &SessionId) -> TurnResult {
     let snapshot = server.snapshot(session_id).await.ok();
     if let Some(snapshot) = &snapshot {
-        let run_revision = latest_run(snapshot).map_or(0, |run| run.run_revision);
+        let turn_revision = latest_turn(snapshot).map_or(0, |turn| turn.turn_revision);
         let _ = server
-            .cancel(session_id, snapshot.revision, run_revision)
+            .cancel(session_id, snapshot.revision, turn_revision)
             .await;
     }
-    RunResult::Cancelled { snapshot }
+    TurnResult::Cancelled { snapshot }
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,16 +1199,16 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Requests cancellation of the active run.
+    /// Requests cancellation of the active turn.
     pub async fn cancel(
         &self,
         session_id: &SessionId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError> {
         let body = json!({
             "expected_session_revision": session_revision,
-            "expected_run_revision": run_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
             .await?;
@@ -1292,7 +1292,7 @@ impl ServerHandle {
         &self,
         session_id: &SessionId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         request_id: &str,
         value: &str,
     ) -> Result<(), ClientError> {
@@ -1300,7 +1300,7 @@ impl ServerHandle {
             "request_id": request_id,
             "value": value,
             "expected_session_revision": session_revision,
-            "expected_run_revision": run_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/input"), body, None)
             .await?;
@@ -1312,14 +1312,14 @@ impl ServerHandle {
         &self,
         session_id: &SessionId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         request_id: &str,
         allow: bool,
     ) -> Result<(), ClientError> {
         let body = json!({
             "allow": allow,
             "expected_session_revision": session_revision,
-            "expected_run_revision": run_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -1620,11 +1620,11 @@ impl SessionServer for ServerClient {
         &mut self,
         session_id: &SessionId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError> {
         let body = json!({
             "expected_session_revision": session_revision,
-            "expected_run_revision": run_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
             .await?;
@@ -1693,8 +1693,8 @@ impl SessionServer for ServerClient {
 mod tests {
     use super::*;
     use latte_core::{
-        RunId, SessionProviderBinding, SessionRunSummary, TranscriptEntry, TranscriptEntryId,
-        TranscriptPage,
+        SessionProviderBinding, SessionTurnSummary, TranscriptEntry, TranscriptEntryId,
+        TranscriptPage, TurnId,
     };
     use std::sync::{Arc, Mutex};
 
@@ -1714,17 +1714,17 @@ mod tests {
         }
     }
 
-    fn snapshot(lifecycle: SessionLifecycle, runs: Vec<SessionRunSummary>) -> SessionSnapshot {
+    fn snapshot(lifecycle: SessionLifecycle, runs: Vec<SessionTurnSummary>) -> SessionSnapshot {
         SessionSnapshot {
             session_id: SessionId::from_uuid(Uuid::now_v7()),
             revision: 1,
             sequence: 0,
             lifecycle,
             binding: binding(),
-            latest_run_id: runs.last().map(|run| run.run_id),
-            active_run_id: None,
+            latest_turn_id: runs.last().map(|run| run.turn_id),
+            active_turn_id: None,
             pending: None,
-            runs,
+            turns: runs,
             transcript: TranscriptPage {
                 entries: Vec::new(),
                 next_after: None,
@@ -1734,16 +1734,16 @@ mod tests {
         }
     }
 
-    fn run_summary(
-        status: SessionRunStatus,
+    fn turn_summary(
+        status: SessionTurnStatus,
         failure_code: Option<FailureCode>,
-    ) -> SessionRunSummary {
-        SessionRunSummary {
-            run_id: RunId::from_uuid(Uuid::now_v7()),
-            parent_run_id: None,
+    ) -> SessionTurnSummary {
+        SessionTurnSummary {
+            turn_id: TurnId::from_uuid(Uuid::now_v7()),
+            parent_turn_id: None,
             ordinal: 1,
             status,
-            run_revision: 1,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code,
         }
@@ -1879,15 +1879,15 @@ mod tests {
         assert_eq!(
             classify(&snapshot(
                 SessionLifecycle::Ready,
-                vec![run_summary(SessionRunStatus::Completed, None)]
+                vec![turn_summary(SessionTurnStatus::Completed, None)]
             )),
             Some(TerminalOutcome::Completed)
         );
         assert_eq!(
             classify(&snapshot(
                 SessionLifecycle::Ready,
-                vec![run_summary(
-                    SessionRunStatus::Failed,
+                vec![turn_summary(
+                    SessionTurnStatus::Failed,
                     Some(FailureCode::PermissionDenied)
                 )]
             )),
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(
             classify(&snapshot(
                 SessionLifecycle::Ready,
-                vec![run_summary(SessionRunStatus::Failed, None)]
+                vec![turn_summary(SessionTurnStatus::Failed, None)]
             )),
             Some(TerminalOutcome::Failed)
         );
@@ -1926,9 +1926,9 @@ mod tests {
             Some(TerminalOutcome::Failed)
         );
         // The newest run by ordinal wins.
-        let mut older = run_summary(SessionRunStatus::Failed, None);
+        let mut older = turn_summary(SessionTurnStatus::Failed, None);
         older.ordinal = 1;
-        let mut newer = run_summary(SessionRunStatus::Completed, None);
+        let mut newer = turn_summary(SessionTurnStatus::Completed, None);
         newer.ordinal = 2;
         assert_eq!(
             classify(&snapshot(SessionLifecycle::Ready, vec![older, newer])),
@@ -1970,7 +1970,7 @@ mod tests {
         );
         let progress = parse_sse_frame(
             Some("progress"),
-            r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"hi"}}"#,
+            r#"{"session_id":"s","turn_id":"r","progress":{"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"hi"}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2012,15 +2012,15 @@ mod tests {
 
     #[test]
     fn progress_rendering_covers_every_variant() {
-        let run_id = "01900000-0000-7000-8000-000000000001";
-        let delta = serde_json::json!({"type":"assistant_delta","run_id":run_id,"text":"hello"});
+        let turn_id = "01900000-0000-7000-8000-000000000001";
+        let delta = serde_json::json!({"type":"assistant_delta","turn_id":turn_id,"text":"hello"});
         assert_eq!(render_progress(&delta), Some("hello".into()));
-        let tool = serde_json::json!({"type":"tool_progress","run_id":run_id,"name":"read","detail":"src/lib.rs"});
+        let tool = serde_json::json!({"type":"tool_progress","turn_id":turn_id,"name":"read","detail":"src/lib.rs"});
         assert_eq!(
             render_progress(&tool),
             Some("[tool] read: src/lib.rs\n".into())
         );
-        let attempt = serde_json::json!({"type":"provider_attempt","run_id":run_id,"number":1});
+        let attempt = serde_json::json!({"type":"provider_attempt","turn_id":turn_id,"number":1});
         assert_eq!(render_progress(&attempt), None);
         assert_eq!(render_progress(&serde_json::json!({"type":"bogus"})), None);
     }
@@ -2031,12 +2031,12 @@ mod tests {
     fn renders_session_text_and_rows() {
         let mut snapshot = snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         );
         snapshot.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "final answer".into(),
             payload: None,
@@ -2059,9 +2059,9 @@ mod tests {
     fn envelopes_use_version_2() {
         let snapshot = snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         );
-        let result = RunResult::Terminal {
+        let result = TurnResult::Terminal {
             snapshot: snapshot.clone(),
             outcome: TerminalOutcome::Completed,
         };
@@ -2069,12 +2069,12 @@ mod tests {
         assert_eq!(envelope["version"], 2);
         assert_eq!(envelope["status"], "completed");
         assert!(envelope["data"]["session"].is_object());
-        let cancelled = RunResult::Cancelled {
+        let cancelled = TurnResult::Cancelled {
             snapshot: Some(snapshot.clone()),
         };
         assert_eq!(run_envelope(&cancelled)["status"], "cancelled");
         assert!(
-            run_envelope(&RunResult::Cancelled { snapshot: None })["data"]["session"].is_null()
+            run_envelope(&TurnResult::Cancelled { snapshot: None })["data"]["session"].is_null()
         );
         assert_eq!(
             list_envelope(std::slice::from_ref(&snapshot))["data"]["sessions"][0]["session_id"],
@@ -2296,12 +2296,12 @@ mod tests {
             &mut self,
             _session_id: &SessionId,
             session_revision: u64,
-            run_revision: u64,
+            turn_revision: u64,
         ) -> Result<(), ClientError> {
             self.cancelled
                 .lock()
                 .unwrap()
-                .push((session_revision, run_revision));
+                .push((session_revision, turn_revision));
             Ok(())
         }
 
@@ -2366,12 +2366,12 @@ mod tests {
                     Some(created),
                     StreamEvent::Progress {
                         session_id,
-                        run_id,
+                        turn_id,
                         progress,
                     },
                 ) if session_id == "self" => StreamEvent::Progress {
                     session_id: created,
-                    run_id,
+                    turn_id,
                     progress,
                 },
                 (_, other) => other,
@@ -2382,8 +2382,8 @@ mod tests {
     fn assistant_progress(session_id: &str) -> StreamEvent {
         StreamEvent::Progress {
             session_id: session_id.into(),
-            run_id: "01900000-0000-7000-8000-000000000001".into(),
-            progress: json!({"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"chunk"}),
+            turn_id: "01900000-0000-7000-8000-000000000001".into(),
+            progress: json!({"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"chunk"}),
         }
     }
 
@@ -2402,7 +2402,7 @@ mod tests {
         });
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let mut printed = String::new();
         let result = run_session(
@@ -2429,14 +2429,14 @@ mod tests {
         for (lifecycle, runs, expected_code, expected_status) in [
             (
                 SessionLifecycle::Ready,
-                vec![run_summary(SessionRunStatus::Completed, None)],
+                vec![turn_summary(SessionTurnStatus::Completed, None)],
                 0,
                 "completed",
             ),
             (
                 SessionLifecycle::Ready,
-                vec![run_summary(
-                    SessionRunStatus::Failed,
+                vec![turn_summary(
+                    SessionTurnStatus::Failed,
                     Some(FailureCode::PermissionDenied),
                 )],
                 11,
@@ -2444,7 +2444,7 @@ mod tests {
             ),
             (
                 SessionLifecycle::Ready,
-                vec![run_summary(SessionRunStatus::Failed, None)],
+                vec![turn_summary(SessionTurnStatus::Failed, None)],
                 1,
                 "failed",
             ),
@@ -2580,7 +2580,7 @@ mod tests {
         });
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = run_session(
             &mut server,
@@ -2610,7 +2610,7 @@ mod tests {
         // Post-reconnect resync: terminal.
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = run_session(
             &mut server,
@@ -2669,7 +2669,7 @@ mod tests {
         server.push_event(StreamEvent::ResyncRequired);
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = resume_session(
             &mut server,
@@ -2702,7 +2702,7 @@ mod tests {
         server.push_event(StreamEvent::ResyncRequired);
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
-            vec![run_summary(SessionRunStatus::Completed, None)],
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = resume_session(
             &mut server,
@@ -2826,9 +2826,9 @@ mod tests {
                         "credential_ref_id": "env:K", "data_scope_id": "main/mock",
                         "credential_generation": 0
                     },
-                    "latest_run_id": null,
-                    "active_run_id": null,
-                    "runs": [],
+                    "latest_turn_id": null,
+                    "active_turn_id": null,
+                    "turns": [],
                     "transcript": { "entries": [], "next_after": null, "has_more": false }
                 } })),
             )
@@ -3952,21 +3952,21 @@ mod tests {
             ),
             None
         );
-        // progress missing session_id / run_id / progress.
+        // progress missing session_id / turn_id / progress.
         assert_eq!(parse_sse_frame(Some("progress"), "{}"), None);
         assert_eq!(
             parse_sse_frame(Some("progress"), r#"{"session_id":"s"}"#),
             None
         );
         assert_eq!(
-            parse_sse_frame(Some("progress"), r#"{"session_id":"s","run_id":"r"}"#),
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s","turn_id":"r"}"#),
             None
         );
         // progress fields present but wrong type.
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":123,"progress":{}}"#
+                r#"{"session_id":"s","turn_id":123,"progress":{}}"#
             ),
             None
         );
@@ -3974,11 +3974,11 @@ mod tests {
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":"r","progress":"not-an-object"}"#
+                r#"{"session_id":"s","turn_id":"r","progress":"not-an-object"}"#
             ),
             Some(StreamEvent::Progress {
                 session_id: "s".into(),
-                run_id: "r".into(),
+                turn_id: "r".into(),
                 progress: json!("not-an-object"),
             })
         );
@@ -3986,12 +3986,12 @@ mod tests {
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"r","text":"hi"}}"#
+                r#"{"session_id":"s","turn_id":"r","progress":{"type":"assistant_delta","turn_id":"r","text":"hi"}}"#
             ),
             Some(StreamEvent::Progress {
                 session_id: "s".into(),
-                run_id: "r".into(),
-                progress: json!({"type":"assistant_delta","run_id":"r","text":"hi"}),
+                turn_id: "r".into(),
+                progress: json!({"type":"assistant_delta","turn_id":"r","text":"hi"}),
             })
         );
         // resync_required ignores the payload shape.
@@ -4036,7 +4036,7 @@ mod tests {
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "working on it".into(),
             payload: None,
@@ -4052,7 +4052,7 @@ mod tests {
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "boom".into(),
             payload: None,
@@ -4067,7 +4067,7 @@ mod tests {
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "first".into(),
             payload: None,
@@ -4077,7 +4077,7 @@ mod tests {
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 1,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "second".into(),
             payload: None,

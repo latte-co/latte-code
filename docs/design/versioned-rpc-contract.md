@@ -182,7 +182,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 | event | data 字段 | 语义 | 丢失影响 |
 |---|---|---|---|
 | `session_changed` | `{session_id, revision}` | session 的持久状态变更 | 客户端下次 resync 时补齐 |
-| `progress` | `{session_id, run_id, progress}` | 瞬态流式进度 | 丢失只影响 UI 流畅度，不影响正确性 |
+| `progress` | `{session_id, turn_id, progress}` | 瞬态流式进度 | 丢失只影响 UI 流畅度，不影响正确性 |
 | `resync_required` | `{}` | 客户端必须全量 resync | 不适用（这就是 resync 信号） |
 
 **未知 event type**：客户端必须忽略（不报错、不断开）。这允许 v1 内新增 event type。

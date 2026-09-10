@@ -1,11 +1,11 @@
 use super::support::{ProviderReply, PtySession, Scenario, ScriptedProvider, wait_until};
 use latte_core::{
-    Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, RunFailure,
-    SessionCommandId, SessionId, SessionProviderBinding, SystemIdSource, TranscriptKind,
+    Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, SessionCommandId,
+    SessionId, SessionProviderBinding, SystemIdSource, TranscriptKind, TurnFailure,
     VerificationStatus,
 };
 use latte_engine::{
-    CommitSessionRunUpdate, EngineHandle, Lease, SessionCommitRequest, SessionEffectDescriptor,
+    CommitSessionTurnUpdate, EngineHandle, Lease, SessionCommitRequest, SessionEffectDescriptor,
     SessionEffectPolicy,
 };
 use std::{collections::BTreeMap, time::Duration};
@@ -45,7 +45,7 @@ fn fixture_engine(scenario: &Scenario) -> (EngineHandle, Lease, latte_core::Sess
     let snapshot = engine
         .create_session_v2(
             session_id,
-            latte_core::RunId::from_uuid(ids.next_uuid_v7()),
+            latte_core::TurnId::from_uuid(ids.next_uuid_v7()),
             binding(),
             "fixture prompt",
             1_001,
@@ -58,23 +58,23 @@ fn commit(
     engine: &EngineHandle,
     lease: &Lease,
     snapshot: &latte_core::SessionSnapshot,
-    update: CommitSessionRunUpdate,
+    update: CommitSessionTurnUpdate,
     now_ms: u64,
 ) -> latte_core::SessionSnapshot {
-    let run_id = snapshot.latest_run_id.unwrap();
-    let run_revision = snapshot
-        .runs
+    let turn_id = snapshot.latest_turn_id.unwrap();
+    let turn_revision = snapshot
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
     engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: SessionCommandId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
@@ -96,7 +96,7 @@ fn start(
         engine,
         lease,
         snapshot,
-        CommitSessionRunUpdate::Start {
+        CommitSessionTurnUpdate::Start {
             source_key: "fixture:start".into(),
         },
         1_002,
@@ -182,7 +182,7 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
             &engine,
             &lease,
             &snapshot,
-            CommitSessionRunUpdate::AppendTranscript {
+            CommitSessionTurnUpdate::AppendTranscript {
                 source_key: format!("fixture:card:{index}"),
                 kind,
                 text: text.into(),
@@ -195,7 +195,7 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
         &engine,
         &lease,
         &snapshot,
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key: "fixture:complete".into(),
             handoff: Handoff {
                 summary: "rich completion summary".into(),
@@ -223,8 +223,8 @@ fn rich_completed_projection_renders_tool_pair_failure_and_handoff_evidence() {
     );
     assert_eq!(snapshot.lifecycle, latte_core::SessionLifecycle::Ready);
     assert_eq!(
-        snapshot.runs[0].status,
-        latte_core::SessionRunStatus::Completed
+        snapshot.turns[0].status,
+        latte_core::SessionTurnStatus::Completed
     );
     finish_fixture(engine, &lease);
 
@@ -271,9 +271,9 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitSessionRunUpdate::Fail {
+                    CommitSessionTurnUpdate::Fail {
                         source_key: "fixture:failed".into(),
-                        failure: RunFailure {
+                        failure: TurnFailure {
                             code: FailureCode::RuntimeFailed,
                             message: "matrix terminal failure".into(),
                             retryability: Retryability::Terminal,
@@ -288,7 +288,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitSessionRunUpdate::Interrupt {
+                    CommitSessionTurnUpdate::Interrupt {
                         source_key: "fixture:interrupted".into(),
                         reconciliation_effect_id: None,
                     },
@@ -310,7 +310,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitSessionRunUpdate::PrepareEffect {
+                    CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "fixture:prepare".into(),
                         effect_id: descriptor.effect_id.clone(),
                         operation_digest: digest.clone(),
@@ -326,7 +326,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitSessionRunUpdate::StartEffect {
+                    CommitSessionTurnUpdate::StartEffect {
                         source_key: "fixture:start-effect".into(),
                         effect_id: descriptor.effect_id,
                         operation_digest: digest,
@@ -338,7 +338,7 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &engine,
                     &lease,
                     &snapshot,
-                    CommitSessionRunUpdate::Interrupt {
+                    CommitSessionTurnUpdate::Interrupt {
                         source_key: "fixture:unknown".into(),
                         reconciliation_effect_id: None,
                     },
@@ -468,7 +468,7 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
                 &engine,
                 &lease,
                 &snapshot,
-                CommitSessionRunUpdate::AppendTranscript {
+                CommitSessionTurnUpdate::AppendTranscript {
                     source_key: format!("fixture:permission:{name}:descriptor"),
                     kind: TranscriptKind::ToolCall,
                     text: format!("inspect {expected_operation}"),
@@ -486,7 +486,7 @@ fn permission_projection_matrix_renders_public_operation_and_target_variants() {
             &engine,
             &lease,
             &snapshot,
-            CommitSessionRunUpdate::RequestPermission {
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key: format!("fixture:permission:{}:request", name.unwrap_or("generic")),
                 request: PendingPermission {
                     request_id,

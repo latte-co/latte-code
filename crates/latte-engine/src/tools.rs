@@ -36,7 +36,7 @@ pub struct ToolOutput {
 pub struct ToolInvocation<'a> {
     pub name: &'a str,
     pub input: &'a Value,
-    pub run_revision: u64,
+    pub turn_revision: u64,
     pub effect_id: &'a str,
     pub attempt: u64,
     pub precondition: Option<&'a str>,
@@ -637,7 +637,7 @@ impl ToolRegistry {
         prepared.expected_hash = invocation.precondition.map(str::to_owned);
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
-            run_revision: invocation.run_revision,
+            turn_revision: invocation.turn_revision,
             effect_id: invocation.effect_id,
             attempt: invocation.attempt,
             tool: invocation.name,
@@ -670,7 +670,7 @@ impl ToolRegistry {
         )?;
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
-            run_revision: invocation.run_revision,
+            turn_revision: invocation.turn_revision,
             effect_id: invocation.effect_id,
             attempt: invocation.attempt,
             tool: invocation.name,
@@ -1015,7 +1015,7 @@ mod tests {
         ToolInvocation {
             name,
             input,
-            run_revision: 4,
+            turn_revision: 4,
             effect_id: "effect-1",
             attempt: 1,
             precondition: None,

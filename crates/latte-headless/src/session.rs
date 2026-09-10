@@ -1,7 +1,7 @@
 //! Session v2 composition for the transcript-first clients.
 //!
 //! The service is deliberately a coordinator, not an effect authority: every
-//! durable change goes through `EngineHandle::commit_session_run_update` and
+//! durable change goes through `EngineHandle::commit_session_turn_update` and
 //! provider calls receive no direct repository capability.
 
 use crate::{
@@ -14,13 +14,12 @@ use crate::{
     runtime::VerificationPlan,
 };
 use latte_core::{
-    FailureCode, Retryability, RunFailure, RunId, SessionCommandId, SessionId, SessionLifecycle,
-    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptEntry,
-    TranscriptKind, redact_session_text, valid_openai_chat_input_request_id,
-    wall_time_ms as now_ms,
+    FailureCode, Retryability, SessionCommandId, SessionId, SessionLifecycle,
+    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptKind, TurnFailure,
+    TurnId, redact_session_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionRunUpdate, EngineHandle, Lease, SessionCommitRequest,
+    CancellationToken, CommitSessionTurnUpdate, EngineHandle, Lease, SessionCommitRequest,
     SessionEffectDescriptor, SessionEffectExecutionError, SessionEffectPresentation,
     SessionEffectRequest, SessionEffectStartRequest, SessionEffectStarted,
     SessionLeaseLossRecovery, StorageError,
@@ -67,50 +66,6 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
-/// Tool rounds the *active run* has already taken, counted from the durable
-/// transcript rather than rebuilt provider messages.
-///
-/// The per-turn round budget has to survive a permission approval, an answered
-/// input request, and a restart — every path re-enters the loop from a snapshot
-/// rather than from the in-memory counter. Reconstructing the count from
-/// provider messages fails because an answered input request is itself
-/// persisted as a `User` transcript entry: "assistant calls after the last
-/// User message" then discards the rounds taken before that answer within the
-/// very same run, letting a model loop "call a tool → request input" to exceed
-/// the budget.
-///
-/// Counting persisted assistant tool-round cards (`Assistant` carrying a
-/// non-empty `tool_calls` payload) that belong to the active `run_id` is stable
-/// across all three resume paths: earlier turns have a different `run_id`, a
-/// resume re-reads the same durable records, and an input answer adds only a
-/// `User` entry, never a tool round.
-fn durable_tool_rounds_for_run(snapshot: &SessionSnapshot, run_id: RunId) -> u32 {
-    durable_tool_rounds_in(&snapshot.transcript.entries, run_id)
-}
-
-/// Counts the persisted assistant tool-round cards for one run.
-fn durable_tool_rounds_in(entries: &[TranscriptEntry], run_id: RunId) -> u32 {
-    u32::try_from(
-        entries
-            .iter()
-            .filter(|entry| entry.run_id == Some(run_id))
-            .filter(|entry| {
-                entry.kind == TranscriptKind::Assistant
-                    && entry
-                        .payload
-                        .as_ref()
-                        .and_then(|payload| {
-                            payload
-                                .get("tool_calls")
-                                .and_then(serde_json::Value::as_array)
-                        })
-                        .is_some_and(|calls| !calls.is_empty())
-            })
-            .count(),
-    )
-    .unwrap_or(u32::MAX)
-}
-
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
     let calls = segment
         .iter()
@@ -143,15 +98,24 @@ pub struct SessionHistoryPolicy {
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
     pub context_cap_bytes: usize,
-    /// Tool rounds one turn may take before it is stopped.
+    /// Optional hard bound on how many tool batches one turn may open.
     ///
     /// The agent loop is a recursion with no natural fixed point: the model
-    /// decides whether to call another tool. Without a bound, a model that
-    /// keeps calling tools without converging only stops once its history
-    /// overflows the byte budget — after an unbounded amount of wall time and
-    /// spend. This makes that limit explicit and reportable.
-    pub max_tool_rounds: u32,
-    /// Wall-clock budget for one provider request.
+    /// decides whether to call another tool. The default is deliberately
+    /// **unlimited** (`None`): a round count cannot by itself prove that a
+    /// model is failing to converge, and forcing a stop could interrupt a
+    /// legitimate long read-edit-verify task just before its final answer.
+    /// Operators who want a hard safety bound set an explicit positive limit;
+    /// the turn then ends retryably when a provider response tries to open a
+    /// further tool batch at or beyond the bound. A response that stops
+    /// calling tools is never blocked, so the turn can still consume its last
+    /// tool results and finish normally once the bound is reached. Single
+    /// request timeouts, cancellation, the I/O cap, and process cleanup
+    /// remain in force independently of this setting.
+    pub max_tool_rounds: Option<u32>,
+    /// Wall-clock budget for one provider request. The provider transport also
+    /// carries its own `timeout_ms` (per provider config, default 60s); the
+    /// request deadline is the minimum of the two.
     pub provider_timeout_ms: u64,
 }
 
@@ -162,9 +126,9 @@ impl Default for SessionHistoryPolicy {
             max_input_bytes: 384 * 1024,
             reserved_output_bytes: 128 * 1024,
             context_cap_bytes: 64 * 1024,
-            // Generous enough for a real read-edit-verify task, small enough
-            // that a non-converging loop is caught in minutes, not hours.
-            max_tool_rounds: 48,
+            // Unlimited by default. Wall-clock protection comes from the
+            // per-request provider timeout and cancellation instead.
+            max_tool_rounds: None,
             provider_timeout_ms: 60_000,
         }
     }
@@ -180,8 +144,8 @@ impl SessionHistoryPolicy {
         {
             return Err("max_request_bytes/context cap must be nonzero and reserved output must be smaller than input budget".into());
         }
-        if self.max_tool_rounds == 0 {
-            return Err("max_tool_rounds must be at least 1".into());
+        if self.max_tool_rounds.is_some_and(|max| max == 0) {
+            return Err("max_tool_rounds must be omitted (unlimited) or at least 1".into());
         }
         if self.provider_timeout_ms == 0 {
             return Err("provider_timeout_ms must be nonzero".into());
@@ -210,6 +174,30 @@ impl<F: Fn(SessionId, SessionTransientProgress) + Send + Sync> SessionProgressSi
     fn observe(&self, session_id: SessionId, progress: SessionTransientProgress) {
         self(session_id, progress);
     }
+}
+
+/// Result of executing the effects in one persisted assistant tool batch.
+enum ToolBatchOutcome {
+    /// Every call finished; the turn may issue its next provider request.
+    Completed {
+        snapshot: SessionSnapshot,
+        messages: Vec<Message>,
+    },
+    /// The turn parked at an Ask permission gate, failed, interrupted, or
+    /// otherwise left the running lifecycle. The snapshot is terminal for
+    /// this entry into the turn loop.
+    Parked(SessionSnapshot),
+}
+
+/// Control flow after one provider request inside the iterative turn loop.
+enum RoundFlow {
+    /// The tool batch finished and another provider request is allowed.
+    Continue {
+        snapshot: SessionSnapshot,
+        messages: Vec<Message>,
+    },
+    /// The turn completed, parked, failed, or was interrupted.
+    Done(SessionSnapshot),
 }
 
 #[derive(Debug, Error)]
@@ -481,7 +469,7 @@ impl SessionRuntimeService {
                 }
             }
         }
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let now = now_ms();
         let lease = match self.acquire(session_id) {
             Ok(lease) => lease,
@@ -501,7 +489,7 @@ impl SessionRuntimeService {
         let started = match self.engine.create_started_session_v2(
             &create_command_id,
             session_id,
-            run_id,
+            turn_id,
             binding,
             &prompt,
             &lease,
@@ -538,9 +526,9 @@ impl SessionRuntimeService {
             return self
                 .fail_retryable(
                     session_id,
-                    run_id,
+                    turn_id,
                     started.revision,
-                    active_run_revision(&started)?,
+                    active_turn_revision(&started)?,
                     provider_configuration_failure_message(),
                     &lease,
                 )
@@ -690,7 +678,7 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let lease = match self.acquire(session_id) {
             Ok(lease) => lease,
             Err(error) => {
@@ -701,7 +689,7 @@ impl SessionRuntimeService {
         let started = match self.engine.create_started_session_follow_up_v2(
             command_id.as_ref(),
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision,
             &prompt,
             &lease,
@@ -736,9 +724,9 @@ impl SessionRuntimeService {
             return self
                 .fail_retryable(
                     session_id,
-                    run_id,
+                    turn_id,
                     started.revision,
-                    active_run_revision(&started)?,
+                    active_turn_revision(&started)?,
                     provider_configuration_failure_message(),
                     &lease,
                 )
@@ -845,7 +833,7 @@ impl SessionRuntimeService {
         let snapshot = self.load_full(session_id)?;
         if snapshot.revision != expected_session_revision
             || !snapshot.lifecycle.accepts_follow_up()
-            || snapshot.active_run_id.is_some()
+            || snapshot.active_turn_id.is_some()
         {
             return Err(SessionRuntimeError::InvalidState);
         }
@@ -869,22 +857,22 @@ impl SessionRuntimeService {
         &self,
         session_id: SessionId,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         request_id: String,
         value: String,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let snapshot = self.load_full(session_id)?;
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let run = snapshot
-            .runs
+        let turn = snapshot
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
+            .find(|turn| turn.turn_id == turn_id)
             .ok_or(SessionRuntimeError::InvalidState)?;
         if snapshot.lifecycle != SessionLifecycle::WaitingInput
             || snapshot.revision != expected_session_revision
-            || run.run_revision != expected_run_revision
+            || turn.turn_revision != expected_turn_revision
         {
             return Err(SessionRuntimeError::InvalidState);
         }
@@ -894,11 +882,11 @@ impl SessionRuntimeService {
         let lease = self.acquire(session_id)?;
         let running = self.commit(
             session_id,
-            run_id,
+            turn_id,
             snapshot.revision,
-            run.run_revision,
-            CommitSessionRunUpdate::ProvideInput {
-                source_key: format!("{run_id}:input:{request_id}"),
+            turn.turn_revision,
+            CommitSessionTurnUpdate::ProvideInput {
+                source_key: format!("{turn_id}:input:{request_id}"),
                 request_id,
                 value,
             },
@@ -916,18 +904,18 @@ impl SessionRuntimeService {
         &self,
         session_id: SessionId,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         request_id: String,
         allow: bool,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let snapshot = self.load_full(session_id)?;
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let run_revision = active_run_revision(&snapshot)?;
+        let turn_revision = active_turn_revision(&snapshot)?;
         if snapshot.lifecycle != SessionLifecycle::WaitingPermission
             || snapshot.revision != expected_session_revision
-            || run_revision != expected_run_revision
+            || turn_revision != expected_turn_revision
             || snapshot.pending.as_ref().and_then(|pending| match pending {
                 latte_core::SessionPendingRequest::Permission { request_id, .. } => {
                     Some(request_id.as_str())
@@ -953,12 +941,12 @@ impl SessionRuntimeService {
         let lease = self.acquire(session_id)?;
         let resolved = self.engine.resolve_session_effect_permission(
             session_id,
-            run_id,
+            turn_id,
             snapshot.revision,
-            run_revision,
+            turn_revision,
             request_id.clone(),
             format!(
-                "{run_id}:permission:{request_id}:{}",
+                "{turn_id}:permission:{request_id}:{}",
                 if allow { "allow" } else { "deny" }
             ),
             allow,
@@ -977,7 +965,7 @@ impl SessionRuntimeService {
             session_effect_start_request(
                 &resolved,
                 request_id.clone(),
-                format!("{run_id}:effect:{request_id}:start"),
+                format!("{turn_id}:effect:{request_id}:start"),
             )?,
             self.engine.session_effect_digest(&request_id)?,
             &lease,
@@ -1006,22 +994,26 @@ impl SessionRuntimeService {
             )
         })?;
         let messages = self.history_from_snapshot(&after_effect)?;
-        // Re-entering after an approval or a restart: recover how many rounds
-        // this turn already took from the durable transcript so the budget is
-        // not reset by the detour. The current assistant round's card is
-        // already persisted at the gate, so subtract that one in-flight round.
-        let round = durable_tool_rounds_for_run(&after_effect, run_id).saturating_sub(1);
-        self.continue_provider_tool_round(
-            after_effect,
-            messages,
-            calls,
-            ordinal.saturating_add(1),
-            round_sequence,
-            provider.provider,
-            lease,
-            round,
-        )
-        .await
+        // Finish the remaining calls of this approved batch, then re-enter the
+        // iterative turn loop. The loop re-reads the persisted round counter
+        // itself, so approval/restart resumptions never reset the budget.
+        let outcome = self
+            .execute_tool_batch(
+                after_effect,
+                messages,
+                calls,
+                ordinal.saturating_add(1),
+                round_sequence,
+                &lease,
+            )
+            .await?;
+        match outcome {
+            ToolBatchOutcome::Parked(parked) => Ok(parked),
+            ToolBatchOutcome::Completed { snapshot, messages } => {
+                self.run_provider_turn(snapshot, messages, provider.provider, lease)
+                    .await
+            }
+        }
     }
 
     /// Explicitly resolves an Unknown v2 effect through the v2 commit path.
@@ -1031,17 +1023,17 @@ impl SessionRuntimeService {
         effect_id: &str,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let snapshot = self.load_full(session_id)?;
-        let run_id = snapshot
-            .latest_run_id
+        let turn_id = snapshot
+            .latest_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
         if snapshot.lifecycle != SessionLifecycle::ReconciliationRequired {
             return Err(SessionRuntimeError::InvalidState);
         }
-        let run_revision = snapshot
-            .runs
+        let turn_revision = snapshot
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
-            .map(|run| run.run_revision)
+            .find(|turn| turn.turn_id == turn_id)
+            .map(|turn| turn.turn_revision)
             .ok_or(SessionRuntimeError::InvalidState)?;
         // A reconcile acquires a lease and immediately commits under it with no
         // heartbeat renewal, so it uses the management TTL (floored well above a
@@ -1051,11 +1043,11 @@ impl SessionRuntimeService {
         self.engine
             .reconcile_session_effect_unknown(
                 session_id,
-                run_id,
+                turn_id,
                 snapshot.revision,
-                run_revision,
+                turn_revision,
                 effect_id.to_owned(),
-                format!("{run_id}:effect:{effect_id}:reconcile"),
+                format!("{turn_id}:effect:{effect_id}:reconcile"),
                 SessionCommandId::from_uuid(Uuid::now_v7()),
                 &lease,
                 now_ms(),
@@ -1063,7 +1055,7 @@ impl SessionRuntimeService {
             .map_err(Into::into)
     }
 
-    /// Cancellation is explicit. No composer input has a run ID before start,
+    /// Cancellation is explicit. No composer input has a turn ID before start,
     /// so canceling it is necessarily local and never reaches this method.
     pub fn cancel(&self, session_id: SessionId) {
         if let Some(token) = self
@@ -1080,28 +1072,29 @@ impl SessionRuntimeService {
     /// is signalled first and commits its own interruption without a partial
     /// assistant card; a waiting request is terminally cancelled immediately.
     ///
-    /// The caller's `expected_session_revision`/`expected_run_revision` are
+    /// The caller's `expected_session_revision`/`expected_turn_revision` are
     /// validated against the authoritative snapshot before any interruption, so
-    /// a stale client cannot cancel a newer run.
+    /// a stale client cannot cancel a newer turn.
     pub fn cancel_durable(
         &self,
         session_id: SessionId,
         expected_session_revision: u64,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let snapshot = self.load_full(session_id)?;
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let run_revision = snapshot
-            .runs
+        let turn_revision = snapshot
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
+            .find(|turn| turn.turn_id == turn_id)
             .ok_or(SessionRuntimeError::InvalidState)?
-            .run_revision;
+            .turn_revision;
         // Fence the caller's expectation against the authoritative snapshot
         // before signalling or committing any cancellation.
-        if snapshot.revision != expected_session_revision || run_revision != expected_run_revision {
+        if snapshot.revision != expected_session_revision || turn_revision != expected_turn_revision
+        {
             return Err(SessionRuntimeError::InvalidState);
         }
         // Hold the active-map lock across the fence recheck and signal so no
@@ -1118,11 +1111,11 @@ impl SessionRuntimeService {
         let lease = self.acquire(session_id)?;
         self.commit(
             session_id,
-            run_id,
+            turn_id,
             snapshot.revision,
-            run_revision,
-            CommitSessionRunUpdate::Interrupt {
-                source_key: format!("{run_id}:cancel"),
+            turn_revision,
+            CommitSessionTurnUpdate::Interrupt {
+                source_key: format!("{turn_id}:cancel"),
                 reconciliation_effect_id: None,
             },
             &lease,
@@ -1298,12 +1291,12 @@ impl SessionRuntimeService {
                 "configured verification argv is empty".into(),
             ));
         }
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
         Ok(SessionEffectDescriptor {
-            effect_id: format!("{SESSION_VERIFICATION_EFFECT_PREFIX}{run_id}"),
-            tool_call_id: format!("verification-{run_id}"),
+            effect_id: format!("{SESSION_VERIFICATION_EFFECT_PREFIX}{turn_id}"),
+            tool_call_id: format!("verification-{turn_id}"),
             name: "process".into(),
             input: serde_json::json!({
                 "argv": plan.argv,
@@ -1327,19 +1320,19 @@ impl SessionRuntimeService {
         &self,
         snapshot: SessionSnapshot,
         summary: String,
-        lease: SessionLeaseGuard,
+        lease: &SessionLeaseGuard,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
         let descriptor = self.verification_descriptor(&snapshot, &summary)?;
         let prepared = self.engine.prepare_session_effect(
             session_effect_request(
                 &snapshot,
                 descriptor.clone(),
-                format!("{run_id}:verification:prepare"),
+                format!("{turn_id}:verification:prepare"),
             )?,
-            &lease,
+            lease,
             now_ms(),
         )?;
         if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
@@ -1349,18 +1342,18 @@ impl SessionRuntimeService {
             session_effect_start_request(
                 &prepared.snapshot,
                 descriptor.effect_id.clone(),
-                format!("{run_id}:verification:start"),
+                format!("{turn_id}:verification:start"),
             )?,
             prepared.operation_digest,
-            &lease,
+            lease,
             now_ms(),
         )?;
         let presentation = started.presentation.clone();
-        let observed = self.execute_and_observe_effect(started, &lease).await?;
+        let observed = self.execute_and_observe_effect(started, lease).await?;
         if observed.lifecycle != SessionLifecycle::Running {
             return Ok(observed);
         }
-        self.finish_verification(&observed, &presentation, &lease)
+        self.finish_verification(&observed, &presentation, lease)
     }
 
     fn finish_verification(
@@ -1369,10 +1362,10 @@ impl SessionRuntimeService {
         descriptor: &SessionEffectPresentation,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let run_revision = active_run_revision(snapshot)?;
+        let turn_revision = active_turn_revision(snapshot)?;
         let raw_output =
             effect_provider_result(snapshot, &descriptor.tool_call_id).ok_or_else(|| {
                 SessionRuntimeError::Effect("verification observation is missing".into())
@@ -1384,8 +1377,8 @@ impl SessionRuntimeService {
                 )
             })?;
         self.engine.record_session_verification(
-            run_id,
-            run_revision,
+            turn_id,
+            turn_revision,
             &descriptor.effect_id,
             &output,
             lease,
@@ -1394,9 +1387,9 @@ impl SessionRuntimeService {
         if !output.command_succeeded() {
             return self.fail(
                 snapshot.session_id,
-                run_id,
+                turn_id,
                 snapshot.revision,
-                run_revision,
+                turn_revision,
                 "configured verification failed; evidence was recorded".into(),
                 lease,
             );
@@ -1420,21 +1413,21 @@ impl SessionRuntimeService {
             .map_err(Into::into)
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Persists the assistant tool-round card for a provider response and
+    /// executes the whole batch. Returns [`ToolBatchOutcome`] so the iterative
+    /// turn loop decides whether another provider request is allowed.
     async fn handle_provider_tool_round(
         &self,
         snapshot: SessionSnapshot,
         mut messages: Vec<Message>,
         response: crate::provider::ProviderResponse,
-        provider: Arc<dyn Provider>,
-        lease: SessionLeaseGuard,
-        round: u32,
-    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        lease: &SessionLeaseGuard,
+    ) -> Result<ToolBatchOutcome, SessionRuntimeError> {
         let session_id = snapshot.session_id;
-        let run_id = snapshot
-            .active_run_id
+        let turn_id = snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let run_revision = active_run_revision(&snapshot)?;
+        let turn_revision = active_turn_revision(&snapshot)?;
         let known_tools = self
             .engine
             .tool_descriptors()
@@ -1448,25 +1441,26 @@ impl SessionRuntimeService {
                 || !known_tools.contains(&call.name)
                 || !call.input.is_object()
         }) {
-            return self.fail(
+            let failed = self.fail(
                 session_id,
-                run_id,
+                turn_id,
                 snapshot.revision,
-                run_revision,
+                turn_revision,
                 "provider tool call ids must match [A-Za-z0-9_-]{1,256}, be unique, known, and object-shaped".into(),
-                &lease,
-            );
+                lease,
+            )?;
+            return Ok(ToolBatchOutcome::Parked(failed));
         }
         let assistant_text = response.message.clone().unwrap_or_default();
         let first_tool_call_id = response.tool_calls[0].id.clone();
         let tool_calls = response.tool_calls;
         let current = self.commit(
             session_id,
-            run_id,
+            turn_id,
             snapshot.revision,
-            run_revision,
-            CommitSessionRunUpdate::AppendTranscript {
-                source_key: format!("{run_id}:assistant-tool-round:{first_tool_call_id}"),
+            turn_revision,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:assistant-tool-round:{first_tool_call_id}"),
                 kind: TranscriptKind::Assistant,
                 text: assistant_text.clone(),
                 // This is intentionally more than display data: it is the
@@ -1476,43 +1470,35 @@ impl SessionRuntimeService {
                 // provider request can be made.
                 payload: Some(serde_json::json!({"tool_calls":tool_calls.clone()})),
             },
-            &lease,
+            lease,
         )?;
         messages.push(Message::Assistant {
             content: response.message,
             tool_calls: tool_calls.clone(),
         });
         let round_sequence = current.sequence;
-        self.continue_provider_tool_round(
-            current,
-            messages,
-            tool_calls,
-            0,
-            round_sequence,
-            provider,
-            lease,
-            round,
-        )
-        .await
+        self.execute_tool_batch(current, messages, tool_calls, 0, round_sequence, lease)
+            .await
     }
 
-    /// Continues one persisted assistant tool round. `start_ordinal` is
-    /// durable through the `ToolResult` cards already in history; callers only
-    /// use this helper after loading the authoritative session snapshot.
+    /// Executes the remaining calls of one persisted assistant tool batch.
+    /// Returns [`ToolBatchOutcome::Completed`] when every call finished and
+    /// the turn may issue its next provider request, or
+    /// [`ToolBatchOutcome::Parked`] when the turn is parked at a permission
+    /// gate or left the running lifecycle (failure, interruption, unknown
+    /// reconciliation).
     #[allow(clippy::too_many_arguments)]
-    async fn continue_provider_tool_round(
+    async fn execute_tool_batch(
         &self,
         mut current: SessionSnapshot,
         mut messages: Vec<Message>,
         calls: Vec<crate::provider::ToolCall>,
         start_ordinal: usize,
         round_sequence: u64,
-        provider: Arc<dyn Provider>,
-        lease: SessionLeaseGuard,
-        round: u32,
-    ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        let run_id = current
-            .active_run_id
+        lease: &SessionLeaseGuard,
+    ) -> Result<ToolBatchOutcome, SessionRuntimeError> {
+        let turn_id = current
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
         for (ordinal, call) in calls.into_iter().enumerate().skip(start_ordinal) {
             let descriptor = SessionEffectDescriptor {
@@ -1520,7 +1506,7 @@ impl SessionRuntimeService {
                 // Include the durable assistant sequence to prevent a later
                 // response reusing an ID from colliding with this effect.
                 effect_id: format!(
-                    "session-effect:{run_id}:{round_sequence}:{ordinal}:{}",
+                    "session-effect:{turn_id}:{round_sequence}:{ordinal}:{}",
                     call.id
                 ),
                 tool_call_id: call.id.clone(),
@@ -1532,28 +1518,28 @@ impl SessionRuntimeService {
                 session_effect_request(
                     &current,
                     descriptor.clone(),
-                    format!("{run_id}:effect:{}:{ordinal}:prepare", call.id),
+                    format!("{turn_id}:effect:{}:{ordinal}:prepare", call.id),
                 )?,
-                &lease,
+                lease,
                 now_ms(),
             )?;
             current = prepared.snapshot;
             if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
-                return Ok(current);
+                return Ok(ToolBatchOutcome::Parked(current));
             }
             let started = self.engine.start_session_effect(
                 session_effect_start_request(
                     &current,
                     descriptor.effect_id,
-                    format!("{run_id}:effect:{}:{ordinal}:start", call.id),
+                    format!("{turn_id}:effect:{}:{ordinal}:start", call.id),
                 )?,
                 prepared.operation_digest,
-                &lease,
+                lease,
                 now_ms(),
             )?;
-            current = self.execute_and_observe_effect(started, &lease).await?;
+            current = self.execute_and_observe_effect(started, lease).await?;
             if current.lifecycle != SessionLifecycle::Running {
-                return Ok(current);
+                return Ok(ToolBatchOutcome::Parked(current));
             }
             let result = effect_provider_result(&current, &call.id).ok_or_else(|| {
                 SessionRuntimeError::Effect("missing observed tool result".into())
@@ -1564,14 +1550,10 @@ impl SessionRuntimeService {
                 content: result,
             });
         }
-        Box::pin(self.run_provider_round(
-            current,
+        Ok(ToolBatchOutcome::Completed {
+            snapshot: current,
             messages,
-            provider,
-            lease,
-            round.saturating_add(1),
-        ))
-        .await
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1650,7 +1632,7 @@ impl SessionRuntimeService {
                             "{}:effect:{}:observe",
                             started
                                 .snapshot
-                                .active_run_id
+                                .active_turn_id
                                 .ok_or(SessionRuntimeError::InvalidState)?,
                             started.presentation.effect_id
                         ),
@@ -1670,7 +1652,7 @@ impl SessionRuntimeService {
                         "{}:effect:{}:observe-failed",
                         started
                             .snapshot
-                            .active_run_id
+                            .active_turn_id
                             .ok_or(SessionRuntimeError::InvalidState)?,
                         started.presentation.effect_id
                     ),
@@ -1697,7 +1679,7 @@ impl SessionRuntimeService {
                         "{}:effect:{}:unknown",
                         started
                             .snapshot
-                            .active_run_id
+                            .active_turn_id
                             .ok_or(SessionRuntimeError::InvalidState)?,
                         started.presentation.effect_id
                     ),
@@ -1709,64 +1691,85 @@ impl SessionRuntimeService {
         }
     }
 
-    async fn run_provider_turn(
-        &self,
-        snapshot: SessionSnapshot,
-        messages: Vec<Message>,
-        provider: Arc<dyn Provider>,
-        lease: SessionLeaseGuard,
-    ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        // Resume the per-turn budget from the durable record. A fresh start has
-        // zero persisted rounds; continuing after an answered input request
-        // carries the rounds that run already spent (the input answer itself
-        // only appends a `User` entry, never a tool round).
-        let run_id = snapshot
-            .active_run_id
-            .ok_or(SessionRuntimeError::InvalidState)?;
-        let round = durable_tool_rounds_for_run(&snapshot, run_id);
-        self.run_provider_round(snapshot, messages, provider, lease, round)
-            .await
+    /// Reads how many tool rounds one turn has already taken from the engine's
+    /// authoritative persisted counter. This must never be reconstructed from
+    /// the snapshot passed into a turn: commit responses carry only the
+    /// tail-500 transcript page, and once the conversation outbox drains into
+    /// the JSONL log the durable cards are gone from the database. Counting
+    /// either view undercounts long turns (a 47-round × 6-call probe showed 38
+    /// from the tail page) and silently refills the budget across an input
+    /// answer, an approval, or a restart. The counter increments in the same
+    /// transaction as each assistant tool-round card.
+    fn persisted_tool_rounds(&self, turn_id: TurnId) -> Result<u32, SessionRuntimeError> {
+        self.engine
+            .session_turn_tool_round_count(turn_id)
+            .map_err(Into::into)
     }
 
-    /// One provider round of a turn. `round` counts the tool rounds already
-    /// taken, so the recursive continuation below is bounded: a model that
-    /// keeps calling tools without converging is stopped by policy rather
-    /// than by eventually overflowing the history budget.
-    #[allow(clippy::too_many_lines)]
-    async fn run_provider_round(
+    async fn run_provider_turn(
         &self,
-        snapshot: SessionSnapshot,
-        messages: Vec<Message>,
+        mut snapshot: SessionSnapshot,
+        mut messages: Vec<Message>,
         provider: Arc<dyn Provider>,
         lease: SessionLeaseGuard,
-        round: u32,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        let session_id = snapshot.session_id;
-        let run_id = snapshot
-            .active_run_id
-            .ok_or(SessionRuntimeError::InvalidState)?;
-        let run_revision = snapshot
-            .runs
-            .iter()
-            .find(|run| run.run_id == run_id)
-            .ok_or(SessionRuntimeError::InvalidState)?
-            .run_revision;
-        if round >= self.policy.max_tool_rounds {
-            // Retryable: the work so far is durable and a follow-up turn can
-            // continue from it. The turn is stopped, not the Session.
-            return self.fail_retryable(
-                session_id,
-                run_id,
-                snapshot.revision,
-                run_revision,
-                format!(
-                    "turn stopped after {} tool rounds without completing; \
-                     raise session.max_tool_rounds or narrow the task",
-                    self.policy.max_tool_rounds
-                ),
-                &lease,
-            );
+        // The tool-batch loop is iterative on purpose: each iteration issues
+        // one provider request. A recursive tail grew the future stack by one
+        // frame per batch, so an unlimited turn on a long real task could
+        // overflow the worker thread (observed past ~40 batches in debug).
+        loop {
+            // The persisted counter is authoritative for the optional round
+            // bound: it counts every committed tool batch for this turn and
+            // survives input answers, approvals, restarts, the tail-500
+            // projection, and outbox draining.
+            let turn_id = snapshot
+                .active_turn_id
+                .ok_or(SessionRuntimeError::InvalidState)?;
+            let round = self.persisted_tool_rounds(turn_id)?;
+            match self
+                .run_provider_step(snapshot, &messages, provider.clone(), &lease, round)
+                .await?
+            {
+                RoundFlow::Done(done) => return Ok(done),
+                RoundFlow::Continue {
+                    snapshot: next,
+                    messages: next_messages,
+                } => {
+                    snapshot = next;
+                    messages = next_messages;
+                }
+            }
         }
+    }
+
+    /// Issues a single provider request and either finishes the turn
+    /// ([`RoundFlow::Done`]) or, after the response's tool batch fully
+    /// executed, prepares the next request ([`RoundFlow::Continue`]).
+    ///
+    /// The optional round bound is enforced *after* the model responds, not
+    /// before the request: at the bound the model must still be allowed to
+    /// read its last tool results and return a final answer; only an attempt
+    /// to open another tool batch stops the turn.
+    #[allow(clippy::too_many_lines)]
+    async fn run_provider_step(
+        &self,
+        snapshot: SessionSnapshot,
+        messages: &[Message],
+        provider: Arc<dyn Provider>,
+        lease: &SessionLeaseGuard,
+        round: u32,
+    ) -> Result<RoundFlow, SessionRuntimeError> {
+        let mut snapshot = snapshot;
+        let session_id = snapshot.session_id;
+        let turn_id = snapshot
+            .active_turn_id
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        let turn_revision = snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.turn_id == turn_id)
+            .ok_or(SessionRuntimeError::InvalidState)?
+            .turn_revision;
         let cancellation = CancellationToken::new();
         self.active
             .lock()
@@ -1775,7 +1778,7 @@ impl SessionRuntimeService {
         let output = {
             let output = provider.complete(
                 ProviderRequest {
-                    messages: messages.clone(),
+                    messages: messages.to_vec(),
                     // Declarations are data only. The provider receives no
                     // capability: every returned call still crosses the
                     // engine-owned prepare/start/observe lifecycle below.
@@ -1792,7 +1795,7 @@ impl SessionRuntimeService {
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
                             session_id,
-                            run_id,
+                            turn_id,
                             sink: Arc::clone(sink),
                         }) as Arc<dyn ProviderEventSink>
                     }),
@@ -1805,11 +1808,11 @@ impl SessionRuntimeService {
                 tokio::select! {
                     output = &mut output => break output,
                     () = &mut heartbeat => {
-                        if self.engine.renew_lease(&lease, now_ms(), self.authority_ttl()).is_err() {
+                        if self.engine.renew_lease(lease, now_ms(), self.authority_ttl()).is_err() {
                             cancellation.cancel();
                             let _ = output.await;
                             self.active.lock().expect("active mutex poisoned").remove(&session_id);
-                            return Err(self.recover_lease_loss(&snapshot, &lease, "provider call"));
+                            return Err(self.recover_lease_loss(&snapshot, lease, "provider call"));
                         }
                         heartbeat
                             .as_mut()
@@ -1817,7 +1820,7 @@ impl SessionRuntimeService {
                     }
                     () = cancellation.cancelled() => {
                         // Do not drop an in-flight provider future and race it
-                        // against a terminal write.  Providers receive the same
+                        // against a terminal write. Providers receive the same
                         // token and must finish cancellation before we record a
                         // v2 interruption.
                         break output.await;
@@ -1829,26 +1832,26 @@ impl SessionRuntimeService {
             .lock()
             .expect("active mutex poisoned")
             .remove(&session_id);
-        match output {
+        let finished = match output {
             Err(ProviderError::Cancelled) => self.commit(
                 session_id,
-                run_id,
+                turn_id,
                 snapshot.revision,
-                run_revision,
-                CommitSessionRunUpdate::Interrupt {
-                    source_key: format!("{run_id}:provider-cancel"),
+                turn_revision,
+                CommitSessionTurnUpdate::Interrupt {
+                    source_key: format!("{turn_id}:provider-cancel"),
                     reconciliation_effect_id: None,
                 },
-                &lease,
-            ),
+                lease,
+            )?,
             Err(error) => self.fail_retryable(
                 session_id,
-                run_id,
+                turn_id,
                 snapshot.revision,
-                run_revision,
+                turn_revision,
                 format!("provider: {error}"),
-                &lease,
-            ),
+                lease,
+            )?,
             Ok(response) if response.input_request.is_some() => {
                 let input = response.input_request.expect("checked is some");
                 // The provider controls this value, but it becomes part of a
@@ -1861,35 +1864,68 @@ impl SessionRuntimeService {
                     || !valid_openai_chat_input_request_id(&input.id)
                     || input.prompt.trim().is_empty()
                 {
-                    return self.fail(
+                    self.fail(
                         session_id,
-                        run_id,
+                        turn_id,
                         snapshot.revision,
-                        run_revision,
+                        turn_revision,
                         "provider requested unsupported secret or invalid input".into(),
-                        &lease,
-                    );
-                }
-                self.commit(
-                    session_id,
-                    run_id,
-                    snapshot.revision,
-                    run_revision,
-                    CommitSessionRunUpdate::RequestInput {
-                        source_key: format!("{run_id}:input-request:{}", input.id),
-                        request: latte_core::PendingInput {
-                            request_id: input.id,
-                            prompt: input.prompt,
+                        lease,
+                    )?
+                } else {
+                    self.commit(
+                        session_id,
+                        turn_id,
+                        snapshot.revision,
+                        turn_revision,
+                        CommitSessionTurnUpdate::RequestInput {
+                            source_key: format!("{turn_id}:input-request:{}", input.id),
+                            request: latte_core::PendingInput {
+                                request_id: input.id,
+                                prompt: input.prompt,
+                            },
                         },
-                    },
-                    &lease,
-                )
+                        lease,
+                    )?
+                }
             }
             Ok(response) if !response.tool_calls.is_empty() => {
-                self.handle_provider_tool_round(
-                    snapshot, messages, response, provider, lease, round,
-                )
-                .await
+                // Enforce the optional round bound here, at the decision to
+                // open another tool batch — never before the provider
+                // request. At the bound the model has already been allowed to
+                // read the last batch's results; only continuing to call
+                // tools is stopped, so a model that converges on its
+                // bound-reaching round finishes normally.
+                if self.policy.max_tool_rounds.is_some_and(|max| round >= max) {
+                    let stopped = self.fail_retryable(
+                        session_id,
+                        turn_id,
+                        snapshot.revision,
+                        turn_revision,
+                        format!(
+                            "turn stopped after {} tool rounds without completing;                              raise or remove session.max_tool_rounds, or narrow the task",
+                            self.policy.max_tool_rounds.expect("checked some")
+                        ),
+                        lease,
+                    )?;
+                    return Ok(RoundFlow::Done(stopped));
+                }
+                let next_messages = messages.to_vec();
+                match self
+                    .handle_provider_tool_round(snapshot, next_messages, response, lease)
+                    .await?
+                {
+                    ToolBatchOutcome::Completed {
+                        snapshot: next,
+                        messages: batch_messages,
+                    } => {
+                        return Ok(RoundFlow::Continue {
+                            snapshot: next,
+                            messages: batch_messages,
+                        });
+                    }
+                    ToolBatchOutcome::Parked(parked) => return Ok(RoundFlow::Done(parked)),
+                }
             }
             Ok(response) => {
                 let truncated = matches!(
@@ -1898,27 +1934,28 @@ impl SessionRuntimeService {
                 );
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
-                    return self.fail(
+                    let failed = self.fail(
                         session_id,
-                        run_id,
+                        turn_id,
                         snapshot.revision,
-                        run_revision,
+                        turn_revision,
                         "provider returned an empty assistant outcome".into(),
-                        &lease,
-                    );
+                        lease,
+                    )?;
+                    return Ok(RoundFlow::Done(failed));
                 };
                 let appended = self.commit(
                     session_id,
-                    run_id,
+                    turn_id,
                     snapshot.revision,
-                    run_revision,
-                    CommitSessionRunUpdate::AppendTranscript {
-                        source_key: format!("{run_id}:assistant-final"),
+                    turn_revision,
+                    CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
                         payload: truncated.then(|| serde_json::json!({"truncated":"length"})),
                     },
-                    &lease,
+                    lease,
                 )?;
                 // A `length` finish means the model stopped at its output cap
                 // mid-answer. Persist what arrived, then fail retryably: the
@@ -1926,65 +1963,70 @@ impl SessionRuntimeService {
                 // would record an unfinished answer as success. Retryable keeps
                 // the session usable so a follow-up can continue the work.
                 if truncated {
-                    return self.fail_retryable(
+                    let stopped = self.fail_retryable(
                         session_id,
-                        run_id,
+                        turn_id,
                         appended.revision,
-                        run_revision,
+                        turn_revision,
                         "provider stopped at its output limit before completing the response"
                             .into(),
-                        &lease,
-                    );
+                        lease,
+                    )?;
+                    return Ok(RoundFlow::Done(stopped));
                 }
-                let changed = self.engine.session_run_changed_files(run_id)?;
+                let changed = self.engine.session_turn_changed_files(turn_id)?;
                 if !changed.is_empty() {
                     if self.verification.is_none() {
-                        return self.fail(
+                        let failed = self.fail(
                             session_id,
-                            run_id,
+                            turn_id,
                             appended.revision,
-                            run_revision,
+                            turn_revision,
                             "workspace changed but no configured verification plan is available"
                                 .into(),
-                            &lease,
-                        );
+                            lease,
+                        )?;
+                        return Ok(RoundFlow::Done(failed));
                     }
-                    return self.begin_verification(appended, message, lease).await;
+                    let verified = self.begin_verification(appended, message, lease).await?;
+                    return Ok(RoundFlow::Done(verified));
                 }
-                self.commit(
+                snapshot = self.commit(
                     session_id,
-                    run_id,
+                    turn_id,
                     appended.revision,
-                    run_revision,
-                    CommitSessionRunUpdate::Complete {
-                        source_key: format!("{run_id}:complete"),
+                    turn_revision,
+                    CommitSessionTurnUpdate::Complete {
+                        source_key: format!("{turn_id}:complete"),
                         handoff: latte_core::Handoff {
                             summary: message,
                             files_changed: Vec::new(),
                             evidence: Vec::new(),
                         },
                     },
-                    &lease,
-                )
+                    lease,
+                )?;
+                return Ok(RoundFlow::Done(snapshot));
             }
-        }
+        };
+        Ok(RoundFlow::Done(finished))
     }
 
     #[allow(clippy::needless_pass_by_value)]
     fn fail(
         &self,
         session_id: SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         message: String,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.fail_with_retryability(
             session_id,
-            run_id,
+            turn_id,
             session_revision,
-            run_revision,
+            turn_revision,
             &message,
             Retryability::Terminal,
             lease,
@@ -1995,17 +2037,17 @@ impl SessionRuntimeService {
     fn fail_retryable(
         &self,
         session_id: SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         message: String,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.fail_with_retryability(
             session_id,
-            run_id,
+            turn_id,
             session_revision,
-            run_revision,
+            turn_revision,
             &message,
             Retryability::Retryable,
             lease,
@@ -2016,21 +2058,21 @@ impl SessionRuntimeService {
     fn fail_with_retryability(
         &self,
         session_id: SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         session_revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         message: &str,
         retryability: Retryability,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.commit(
             session_id,
-            run_id,
+            turn_id,
             session_revision,
-            run_revision,
-            CommitSessionRunUpdate::Fail {
-                source_key: format!("{run_id}:failure"),
-                failure: RunFailure {
+            turn_revision,
+            CommitSessionTurnUpdate::Fail {
+                source_key: format!("{turn_id}:failure"),
+                failure: TurnFailure {
                     code: FailureCode::RuntimeFailed,
                     message: redact_session_text(message),
                     retryability,
@@ -2043,20 +2085,20 @@ impl SessionRuntimeService {
     fn commit(
         &self,
         session_id: SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_session_revision: u64,
-        expected_run_revision: u64,
-        update: CommitSessionRunUpdate,
+        expected_turn_revision: u64,
+        update: CommitSessionTurnUpdate,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
         self.engine
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision,
-                    expected_run_revision,
+                    expected_turn_revision,
                     command_id,
                     request_id: None,
                     effect_id: None,
@@ -2093,36 +2135,36 @@ impl SessionRuntimeService {
         lease: &Lease,
         phase: &str,
     ) -> SessionRuntimeError {
-        let Some(run_id) = snapshot.active_run_id else {
+        let Some(turn_id) = snapshot.active_turn_id else {
             return SessionRuntimeError::Effect(format!(
-                "lease heartbeat lost during {phase}; active linked run is unavailable"
+                "lease heartbeat lost during {phase}; active linked turn is unavailable"
             ));
         };
         let Some(revision) = snapshot
-            .runs
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
-            .map(|run| run.run_revision)
+            .find(|turn| turn.turn_id == turn_id)
+            .map(|turn| turn.turn_revision)
         else {
             return SessionRuntimeError::Effect(format!(
-                "lease heartbeat lost during {phase}; active linked run revision is unavailable"
+                "lease heartbeat lost during {phase}; active linked turn revision is unavailable"
             ));
         };
         match self.engine.recover_session_after_lease_loss(
             snapshot.session_id,
-            run_id,
+            turn_id,
             lease,
             revision,
             now_ms(),
         ) {
             Ok(SessionLeaseLossRecovery::Recovered(_)) => SessionRuntimeError::Effect(format!(
-                "lease heartbeat lost during {phase}; linked run requires reconciliation"
+                "lease heartbeat lost during {phase}; linked turn requires reconciliation"
             )),
             Ok(SessionLeaseLossRecovery::FencedNoop) => SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; newer owner fenced stale recovery"
             )),
             Ok(SessionLeaseLossRecovery::AlreadyTerminal(_)) => SessionRuntimeError::Effect(
-                format!("lease heartbeat lost during {phase}; linked run already terminal"),
+                format!("lease heartbeat lost during {phase}; linked turn already terminal"),
             ),
             Err(error) => SessionRuntimeError::Effect(format!(
                 "lease heartbeat lost during {phase}; recovery failed: {error}"
@@ -2142,7 +2184,7 @@ impl SessionRuntimeService {
                     "{}:effect:{}:cancelled-after-start",
                     started
                         .snapshot
-                        .active_run_id
+                        .active_turn_id
                         .ok_or(SessionRuntimeError::InvalidState)?,
                     started.presentation.effect_id
                 ),
@@ -2202,7 +2244,7 @@ fn provider_configuration_failure_message() -> String {
 
 struct ProviderProgress {
     session_id: SessionId,
-    run_id: RunId,
+    turn_id: TurnId,
     sink: Arc<dyn SessionProgressSink>,
 }
 impl ProviderEventSink for ProviderProgress {
@@ -2212,7 +2254,7 @@ impl ProviderEventSink for ProviderProgress {
                 self.sink.observe(
                     self.session_id,
                     SessionTransientProgress::ProviderAttempt {
-                        run_id: self.run_id,
+                        turn_id: self.turn_id,
                         number,
                     },
                 );
@@ -2221,7 +2263,7 @@ impl ProviderEventSink for ProviderProgress {
                 self.sink.observe(
                     self.session_id,
                     SessionTransientProgress::AssistantDelta {
-                        run_id: self.run_id,
+                        turn_id: self.turn_id,
                         text: redact_session_text(&text),
                     },
                 );
@@ -2271,8 +2313,8 @@ fn wire_bytes(messages: &[Message]) -> Result<usize, SessionRuntimeError> {
         .map_err(|error| SessionRuntimeError::History(error.to_string()))
 }
 
-fn new_run_id() -> RunId {
-    RunId::from_uuid(Uuid::now_v7())
+fn new_turn_id() -> TurnId {
+    TurnId::from_uuid(Uuid::now_v7())
 }
 
 /// Sends a durable-acceptance signal if a receiver is present, ignoring a
@@ -2300,15 +2342,15 @@ fn classify_create_error(error: &SessionRuntimeError) -> latte_core::CreateAccep
     }
 }
 
-fn active_run_revision(snapshot: &SessionSnapshot) -> Result<u64, SessionRuntimeError> {
-    let run_id = snapshot
-        .active_run_id
+fn active_turn_revision(snapshot: &SessionSnapshot) -> Result<u64, SessionRuntimeError> {
+    let turn_id = snapshot
+        .active_turn_id
         .ok_or(SessionRuntimeError::InvalidState)?;
     snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
-        .map(|run| run.run_revision)
+        .find(|turn| turn.turn_id == turn_id)
+        .map(|turn| turn.turn_revision)
         .ok_or(SessionRuntimeError::InvalidState)
 }
 
@@ -2319,11 +2361,11 @@ fn session_effect_request(
 ) -> Result<SessionEffectRequest, SessionRuntimeError> {
     Ok(SessionEffectRequest {
         session_id: snapshot.session_id,
-        run_id: snapshot
-            .active_run_id
+        turn_id: snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?,
         expected_session_revision: snapshot.revision,
-        expected_run_revision: active_run_revision(snapshot)?,
+        expected_turn_revision: active_turn_revision(snapshot)?,
         command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
         descriptor,
@@ -2337,11 +2379,11 @@ fn session_effect_start_request(
 ) -> Result<SessionEffectStartRequest, SessionRuntimeError> {
     Ok(SessionEffectStartRequest {
         session_id: snapshot.session_id,
-        run_id: snapshot
-            .active_run_id
+        turn_id: snapshot
+            .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?,
         expected_session_revision: snapshot.revision,
-        expected_run_revision: active_run_revision(snapshot)?,
+        expected_turn_revision: active_turn_revision(snapshot)?,
         command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
         effect_id,
@@ -2514,15 +2556,15 @@ mod tests {
         }
     }
 
-    fn test_run_revision(snapshot: &SessionSnapshot) -> u64 {
+    fn test_turn_revision(snapshot: &SessionSnapshot) -> u64 {
         snapshot
-            .active_run_id
-            .and_then(|run_id| {
+            .active_turn_id
+            .and_then(|turn_id| {
                 snapshot
-                    .runs
+                    .turns
                     .iter()
-                    .find(|r| r.run_id == run_id)
-                    .map(|r| r.run_revision)
+                    .find(|r| r.turn_id == turn_id)
+                    .map(|r| r.turn_revision)
             })
             .unwrap_or(0)
     }
@@ -2608,7 +2650,7 @@ mod tests {
         ));
 
         let completed = task.await.unwrap().unwrap();
-        assert_eq!(completed.runs.len(), SESSION_MAILBOX_CAPACITY + 1);
+        assert_eq!(completed.turns.len(), SESSION_MAILBOX_CAPACITY + 1);
         let users = completed
             .transcript
             .entries
@@ -2772,9 +2814,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
-        assert!(failed.active_run_id.is_none());
-        assert_eq!(failed.runs.len(), 1);
-        assert_eq!(failed.runs[0].status, latte_core::SessionRunStatus::Failed);
+        assert!(failed.active_turn_id.is_none());
+        assert_eq!(failed.turns.len(), 1);
+        assert_eq!(
+            failed.turns[0].status,
+            latte_core::SessionTurnStatus::Failed
+        );
         let expected_failure = provider_configuration_failure_message();
         assert_eq!(
             failed
@@ -2789,8 +2834,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            engine.show(failed.runs[0].run_id).unwrap().failure,
-            Some(RunFailure {
+            engine.show(failed.turns[0].turn_id).unwrap().failure,
+            Some(TurnFailure {
                 code: FailureCode::RuntimeFailed,
                 message: expected_failure,
                 retryability: Retryability::Retryable,
@@ -2854,12 +2899,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
-        assert_eq!(failed.runs.len(), 2);
+        assert_eq!(failed.turns.len(), 2);
         assert_eq!(
-            failed.runs[0].status,
-            latte_core::SessionRunStatus::Completed
+            failed.turns[0].status,
+            latte_core::SessionTurnStatus::Completed
         );
-        assert_eq!(failed.runs[1].status, latte_core::SessionRunStatus::Failed);
+        assert_eq!(
+            failed.turns[1].status,
+            latte_core::SessionTurnStatus::Failed
+        );
         assert!(failed.transcript.entries.iter().any(|entry| {
             entry.kind == TranscriptKind::User && entry.text == "durable follow-up"
         }));
@@ -2873,10 +2921,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retried.lifecycle, SessionLifecycle::Ready);
-        assert_eq!(retried.runs.len(), 3);
+        assert_eq!(retried.turns.len(), 3);
         assert_eq!(
-            retried.runs[2].status,
-            latte_core::SessionRunStatus::Completed
+            retried.turns[2].status,
+            latte_core::SessionTurnStatus::Completed
         );
         assert!(retried.transcript.entries.iter().any(|entry| {
             entry.kind == TranscriptKind::User && entry.text == "retry after config fix"
@@ -2927,7 +2975,7 @@ mod tests {
             .start(session_id, "one".into(), binding(), None)
             .await
             .unwrap();
-        let parent = complete.latest_run_id.unwrap();
+        let parent = complete.latest_turn_id.unwrap();
         let child = service
             .follow_up(session_id, complete.revision, "two".into())
             .await
@@ -2935,9 +2983,9 @@ mod tests {
         assert_eq!(child.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             engine.show(parent).unwrap().status,
-            latte_core::RunStatus::Completed
+            latte_core::TurnStatus::Completed
         );
-        assert_eq!(child.runs.len(), 2);
+        assert_eq!(child.turns.len(), 2);
     }
 
     fn response(
@@ -2959,6 +3007,15 @@ mod tests {
         engine: EngineHandle,
         responses: Vec<ProviderResponse>,
     ) -> SessionRuntimeService {
+        scripted_service_with_policy(root, engine, responses, SessionHistoryPolicy::default())
+    }
+
+    fn scripted_service_with_policy(
+        root: &std::path::Path,
+        engine: EngineHandle,
+        responses: Vec<ProviderResponse>,
+        policy: SessionHistoryPolicy,
+    ) -> SessionRuntimeService {
         let provider = Arc::new(FakeProvider::scripted(responses));
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
@@ -2966,7 +3023,7 @@ mod tests {
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
+        SessionRuntimeService::new(engine, root, policy, factory)
     }
 
     /// A `length` finish is a mid-answer stop at the model's output cap. The
@@ -2992,8 +3049,8 @@ mod tests {
         // continues the work.
         assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
         assert!(snapshot.lifecycle.accepts_follow_up());
-        let latest = snapshot.runs.last().expect("one run");
-        assert_eq!(latest.status, latte_core::SessionRunStatus::Failed);
+        let latest = snapshot.turns.last().expect("one run");
+        assert_eq!(latest.status, latte_core::SessionTurnStatus::Failed);
 
         let assistant = snapshot
             .transcript
@@ -3039,10 +3096,10 @@ mod tests {
                 .start(session_id, "ask".into(), binding(), None)
                 .await
                 .unwrap();
-            let latest = snapshot.runs.last().expect("one run");
+            let latest = snapshot.turns.last().expect("one run");
             assert_eq!(
                 latest.status,
-                latte_core::SessionRunStatus::Completed,
+                latte_core::SessionTurnStatus::Completed,
                 "finish_reason {reason:?} must not block completion"
             );
             let assistant = snapshot
@@ -3288,7 +3345,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3411,7 +3468,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3423,12 +3480,12 @@ mod tests {
             "const token=value;\n"
         );
         assert!(
-            done.runs
+            done.turns
                 .iter()
-                .any(|run| run.status == latte_core::SessionRunStatus::Completed)
+                .any(|run| run.status == latte_core::SessionTurnStatus::Completed)
         );
-        let run_id = done.latest_run_id.unwrap();
-        let handoff = engine.show(run_id).unwrap().handoff.unwrap();
+        let turn_id = done.latest_turn_id.unwrap();
+        let handoff = engine.show(turn_id).unwrap().handoff.unwrap();
         assert_eq!(handoff.evidence.len(), 1);
         assert_eq!(
             handoff.evidence[0].status,
@@ -3496,7 +3553,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id.clone(),
                 true,
             )
@@ -3628,7 +3685,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3689,7 +3746,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3740,14 +3797,14 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 false,
             )
             .await
             .unwrap();
         assert_eq!(denied.lifecycle, SessionLifecycle::Ready);
-        assert!(denied.active_run_id.is_none());
+        assert!(denied.active_turn_id.is_none());
         assert!(denied.pending.is_none());
         assert!(!root.path().join("new.txt").exists());
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -3808,7 +3865,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3852,7 +3909,7 @@ mod tests {
             .await
             .unwrap();
         let handoff = engine
-            .show(complete.latest_run_id.unwrap())
+            .show(complete.latest_turn_id.unwrap())
             .unwrap()
             .handoff
             .unwrap();
@@ -3894,7 +3951,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -3903,7 +3960,7 @@ mod tests {
         assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
         assert!(
             engine
-                .show(failed.latest_run_id.unwrap())
+                .show(failed.latest_turn_id.unwrap())
                 .unwrap()
                 .handoff
                 .is_none()
@@ -3947,15 +4004,15 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
-        let run = engine.show(failed.latest_run_id.unwrap()).unwrap();
-        assert_eq!(run.status, latte_core::RunStatus::Failed);
+        let run = engine.show(failed.latest_turn_id.unwrap()).unwrap();
+        assert_eq!(run.status, latte_core::TurnStatus::Failed);
         assert!(run.handoff.is_none());
         assert!(
             failed
@@ -4008,7 +4065,7 @@ mod tests {
             .resolve_permission(
                 waiting_tool.session_id,
                 waiting_tool.revision,
-                test_run_revision(&waiting_tool),
+                test_turn_revision(&waiting_tool),
                 tool_request,
                 true,
             )
@@ -4028,7 +4085,7 @@ mod tests {
             .resolve_permission(
                 waiting_verification.session_id,
                 waiting_verification.revision,
-                test_run_revision(&waiting_verification),
+                test_turn_revision(&waiting_verification),
                 verification_request,
                 true,
             )
@@ -4037,7 +4094,7 @@ mod tests {
         assert_eq!(complete.lifecycle, SessionLifecycle::Ready);
         assert_eq!(
             engine
-                .show(complete.latest_run_id.unwrap())
+                .show(complete.latest_turn_id.unwrap())
                 .unwrap()
                 .handoff
                 .unwrap()
@@ -4087,7 +4144,7 @@ mod tests {
             .provide_input(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 "language".into(),
                 "Rust".into(),
             )
@@ -4106,7 +4163,7 @@ mod tests {
                 .provide_input(
                     waiting.session_id,
                     waiting.revision,
-                    test_run_revision(&waiting),
+                    test_turn_revision(&waiting),
                     "language".into(),
                     "again".into()
                 )
@@ -4165,7 +4222,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
-            assert!(failed.active_run_id.is_none());
+            assert!(failed.active_turn_id.is_none());
             assert!(
                 !failed
                     .transcript
@@ -4179,7 +4236,7 @@ mod tests {
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
         let service = recording_service(root.path(), engine, Arc::new(RecordingProvider::scripted([]))).with_progress_sink(Arc::new(|_, _| {}));
         let failed = service.start(SessionId::from_uuid(Uuid::now_v7()), "provider error".into(), binding(), None).await.unwrap();
-        assert_eq!(failed.lifecycle, SessionLifecycle::Ready); assert!(failed.active_run_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(SessionId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding, None).await, Err(SessionRuntimeError::ProviderConfiguration(_)))); let missing = SessionId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready); assert!(failed.active_turn_id.is_none()); assert!(failed.transcript.entries.iter().any(|entry| entry.kind == TranscriptKind::Failure)); let mut invalid_binding = binding(); invalid_binding.provider_name.clear(); assert!(matches!(service.start(SessionId::from_uuid(Uuid::now_v7()), "invalid binding".into(), invalid_binding, None).await, Err(SessionRuntimeError::ProviderConfiguration(_)))); let missing = SessionId::from_uuid(Uuid::now_v7()); assert!(service.follow_up(missing, 0, "missing".into()).await.is_err()); assert!(service.provide_input(missing, 0, 0, "missing".into(), "value".into()).await.is_err()); assert!(service.resolve_permission(missing, 0, 0, "missing".into(), false).await.is_err()); assert!(service.reconcile_unknown_effect(missing, "missing").is_err()); assert!(service.cancel_durable(missing, 0, 0).is_err());
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new().workspace_root(root.path()).build().unwrap();
@@ -4231,7 +4288,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
-        assert!(failed.active_run_id.is_none());
+        assert!(failed.active_turn_id.is_none());
         assert!(!root.path().join("must-not-exist.txt").exists());
         assert!(failed.pending.is_none());
         let failure = failed
@@ -4341,7 +4398,7 @@ mod tests {
         );
         let pending_inputs: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE json_extract(state_json, '$.pending_input') IS NOT NULL",
+                "SELECT COUNT(*) FROM turns WHERE json_extract(state_json, '$.pending_input') IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -4396,10 +4453,10 @@ mod tests {
             let received = Arc::clone(&received);
             Arc::new(move |_session_id, progress| received.lock().unwrap().push(progress))
         };
-        let run_id = RunId::from_uuid(Uuid::now_v7());
+        let turn_id = TurnId::from_uuid(Uuid::now_v7());
         let progress = ProviderProgress {
             session_id: SessionId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             sink,
         };
         progress.observe(ProviderEvent::Attempt { number: 2 });
@@ -4409,9 +4466,9 @@ mod tests {
         assert!(matches!(
             received.lock().unwrap().as_slice(),
             [
-                SessionTransientProgress::ProviderAttempt { run_id: observed, number: 2 },
+                SessionTransientProgress::ProviderAttempt { turn_id: observed, number: 2 },
                 SessionTransientProgress::AssistantDelta { text, .. },
-            ] if *observed == run_id && !text.contains("sk-hidden")
+            ] if *observed == turn_id && !text.contains("sk-hidden")
         ));
         assert_eq!(
             SessionRuntimeService::new(
@@ -4586,9 +4643,9 @@ mod tests {
                 .await
                 .unwrap();
             let terminal = if cancel {
-                let run_revision = active_run_revision(&waiting).unwrap();
+                let turn_revision = active_turn_revision(&waiting).unwrap();
                 service
-                    .cancel_durable(waiting.session_id, waiting.revision, run_revision)
+                    .cancel_durable(waiting.session_id, waiting.revision, turn_revision)
                     .unwrap()
             } else {
                 let request_id = match waiting.pending.as_ref().unwrap() {
@@ -4603,7 +4660,7 @@ mod tests {
                     .resolve_permission(
                         waiting.session_id,
                         waiting.revision,
-                        test_run_revision(&waiting),
+                        test_turn_revision(&waiting),
                         request_id,
                         false,
                     )
@@ -4619,7 +4676,7 @@ mod tests {
                 }
             );
             assert!(!root.path().join("created.txt").exists());
-            assert!(terminal.active_run_id.is_none());
+            assert!(terminal.active_turn_id.is_none());
         }
     }
 
@@ -4772,14 +4829,14 @@ mod tests {
                     .session_snapshot_v2(session_id, None, 100)
                     .is_ok_and(|snapshot| {
                         snapshot.lifecycle == SessionLifecycle::Running
-                            && snapshot.active_run_id.is_some()
+                            && snapshot.active_turn_id.is_some()
                     })
             },
             "provider turn to become active",
         )
         .await;
         let active = engine.session_snapshot_v2(session_id, None, 100).unwrap();
-        let run_id = active.active_run_id.unwrap();
+        let turn_id = active.active_turn_id.unwrap();
         force_lease_renewal_failure(&database);
 
         let error = run.await.unwrap().unwrap_err();
@@ -4791,10 +4848,10 @@ mod tests {
         );
         let terminal = engine.session_snapshot_v2(session_id, None, 100).unwrap();
         assert_eq!(terminal.lifecycle, SessionLifecycle::Interrupted);
-        assert!(terminal.active_run_id.is_none());
+        assert!(terminal.active_turn_id.is_none());
         assert_eq!(
-            engine.show(run_id).unwrap().status,
-            latte_core::RunStatus::Interrupted
+            engine.show(turn_id).unwrap().status,
+            latte_core::TurnStatus::Interrupted
         );
         assert!(
             !terminal
@@ -4868,7 +4925,7 @@ mod tests {
                 .resolve_permission(
                     session_id,
                     waiting.revision,
-                    test_run_revision(&waiting),
+                    test_turn_revision(&waiting),
                     request_id,
                     true,
                 )
@@ -4899,7 +4956,7 @@ mod tests {
         service.cancel(session_id);
         let terminal = run.await.unwrap().unwrap();
         assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
-        assert!(terminal.active_run_id.is_none());
+        assert!(terminal.active_turn_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
             latte_engine::EffectStatus::Unknown
@@ -4968,7 +5025,7 @@ mod tests {
                 .resolve_permission(
                     session_id,
                     waiting.revision,
-                    test_run_revision(&waiting),
+                    test_turn_revision(&waiting),
                     request_id,
                     true,
                 )
@@ -4992,7 +5049,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         let before_loss = engine.session_snapshot_v2(session_id, None, 100).unwrap();
-        let linked_run_id = before_loss.active_run_id.unwrap();
+        let linked_turn_id = before_loss.active_turn_id.unwrap();
         force_lease_renewal_failure(&database);
 
         let error = run.await.unwrap().unwrap_err();
@@ -5006,14 +5063,14 @@ mod tests {
             recovered.lifecycle,
             SessionLifecycle::ReconciliationRequired
         );
-        assert!(recovered.active_run_id.is_none());
+        assert!(recovered.active_turn_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
             latte_engine::EffectStatus::Unknown
         );
         assert_eq!(
-            engine.show(linked_run_id).unwrap().status,
-            latte_core::RunStatus::Interrupted
+            engine.show(linked_turn_id).unwrap().status,
+            latte_core::TurnStatus::Interrupted
         );
         assert!(
             !recovered
@@ -5027,14 +5084,14 @@ mod tests {
             .reconcile_unknown_effect(session_id, &effect_id)
             .unwrap();
         assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
-        assert!(reconciled.active_run_id.is_none());
+        assert!(reconciled.active_turn_id.is_none());
         assert_eq!(
             engine.effect_status(&effect_id).unwrap(),
             latte_engine::EffectStatus::ObservedFailed
         );
         assert_eq!(
-            engine.show(linked_run_id).unwrap().status,
-            latte_core::RunStatus::Failed
+            engine.show(linked_turn_id).unwrap().status,
+            latte_core::TurnStatus::Failed
         );
     }
 
@@ -5050,25 +5107,25 @@ mod tests {
             .unwrap();
         std::fs::write(root.path().join("note.txt"), "recovery fixture").unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         engine
-            .create_session_v2(session_id, run_id, binding(), "recover", 1)
+            .create_session_v2(session_id, turn_id, binding(), "recover", 1)
             .unwrap();
         let lease = engine
             .acquire_session_lease(session_id, now_ms(), 10_000)
             .unwrap();
         let running = engine
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: 0,
-                    expected_run_revision: 0,
+                    expected_turn_revision: 0,
                     command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitSessionRunUpdate::Start {
-                        source_key: format!("{run_id}:start"),
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: format!("{turn_id}:start"),
                     },
                 },
                 &lease,
@@ -5077,7 +5134,7 @@ mod tests {
             .unwrap()
             .snapshot;
         let descriptor = SessionEffectDescriptor {
-            effect_id: format!("session-effect:{run_id}:recover"),
+            effect_id: format!("session-effect:{turn_id}:recover"),
             tool_call_id: "recover".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"note.txt"}),
@@ -5085,7 +5142,7 @@ mod tests {
         };
         let prepared = engine
             .prepare_session_effect(
-                session_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
+                session_effect_request(&running, descriptor.clone(), format!("{turn_id}:prepare"))
                     .unwrap(),
                 &lease,
                 now_ms(),
@@ -5096,7 +5153,7 @@ mod tests {
                 session_effect_start_request(
                     &prepared.snapshot,
                     descriptor.effect_id.clone(),
-                    format!("{run_id}:start-effect"),
+                    format!("{turn_id}:start-effect"),
                 )
                 .unwrap(),
                 prepared.operation_digest,
@@ -5108,8 +5165,8 @@ mod tests {
             rusqlite::Connection::open(&db)
                 .unwrap()
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM runtime_checkpoints WHERE run_id=?1)",
-                    [run_id.to_string()],
+                    "SELECT EXISTS(SELECT 1 FROM runtime_checkpoints WHERE turn_id=?1)",
+                    [turn_id.to_string()],
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap()
@@ -5129,21 +5186,21 @@ mod tests {
             recovered.lifecycle,
             SessionLifecycle::ReconciliationRequired
         );
-        assert!(recovered.active_run_id.is_none());
+        assert!(recovered.active_turn_id.is_none());
         assert_eq!(
             reopened.effect_status(&descriptor.effect_id).unwrap(),
             latte_engine::EffectStatus::Unknown
         );
         assert_eq!(
-            reopened.show(run_id).unwrap().status,
-            latte_core::RunStatus::Interrupted
+            reopened.show(turn_id).unwrap().status,
+            latte_core::TurnStatus::Interrupted
         );
         assert!(
             rusqlite::Connection::open(&db)
                 .unwrap()
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM runtime_checkpoints WHERE run_id=?1)",
-                    [run_id.to_string()],
+                    "SELECT EXISTS(SELECT 1 FROM runtime_checkpoints WHERE turn_id=?1)",
+                    [turn_id.to_string()],
                     |row| row.get::<_, bool>(0),
                 )
                 .unwrap()
@@ -5156,10 +5213,10 @@ mod tests {
             .reconcile_unknown_effect(session_id, &descriptor.effect_id)
             .unwrap();
         assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
-        assert!(reconciled.active_run_id.is_none());
+        assert!(reconciled.active_turn_id.is_none());
         assert_eq!(
-            reopened.show(run_id).unwrap().status,
-            latte_core::RunStatus::Failed
+            reopened.show(turn_id).unwrap().status,
+            latte_core::TurnStatus::Failed
         );
         assert_eq!(
             reopened.effect_status(&descriptor.effect_id).unwrap(),
@@ -5177,25 +5234,25 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         engine
-            .create_session_v2(session_id, run_id, binding(), "prepare", 1)
+            .create_session_v2(session_id, turn_id, binding(), "prepare", 1)
             .unwrap();
         let lease = engine
             .acquire_session_lease(session_id, now_ms(), 500)
             .unwrap();
         let running = engine
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: 0,
-                    expected_run_revision: 0,
+                    expected_turn_revision: 0,
                     command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitSessionRunUpdate::Start {
-                        source_key: format!("{run_id}:start"),
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: format!("{turn_id}:start"),
                     },
                 },
                 &lease,
@@ -5204,7 +5261,7 @@ mod tests {
             .unwrap()
             .snapshot;
         let descriptor = SessionEffectDescriptor {
-            effect_id: format!("session-effect:{run_id}:prepared"),
+            effect_id: format!("session-effect:{turn_id}:prepared"),
             tool_call_id: "prepared".into(),
             name: "write_file".into(),
             input: serde_json::json!({
@@ -5216,7 +5273,7 @@ mod tests {
         };
         let prepared = engine
             .prepare_session_effect(
-                session_effect_request(&running, descriptor.clone(), format!("{run_id}:prepare"))
+                session_effect_request(&running, descriptor.clone(), format!("{turn_id}:prepare"))
                     .unwrap(),
                 &lease,
                 now_ms(),
@@ -5235,14 +5292,14 @@ mod tests {
             .unwrap();
         let recovered = reopened.session_snapshot_v2(session_id, None, 100).unwrap();
         assert_eq!(recovered.lifecycle, SessionLifecycle::Interrupted);
-        assert!(recovered.active_run_id.is_none());
+        assert!(recovered.active_turn_id.is_none());
         assert_eq!(
             reopened.effect_status(&descriptor.effect_id).unwrap(),
             latte_engine::EffectStatus::ObservedFailed
         );
         assert_eq!(
-            reopened.show(run_id).unwrap().status,
-            latte_core::RunStatus::Interrupted
+            reopened.show(turn_id).unwrap().status,
+            latte_core::TurnStatus::Interrupted
         );
         assert!(!root.path().join("must-not-exist.txt").exists());
     }
@@ -5261,9 +5318,9 @@ mod tests {
             Arc::new(|_| Err("provider must not be constructed".into())),
         );
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let running = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
 
         assert!(matches!(
@@ -5277,7 +5334,7 @@ mod tests {
                 .provide_input(
                     session_id,
                     running.revision,
-                    test_run_revision(&running),
+                    test_turn_revision(&running),
                     "missing".into(),
                     "value".into()
                 )
@@ -5289,7 +5346,7 @@ mod tests {
                 .resolve_permission(
                     session_id,
                     running.revision,
-                    test_run_revision(&running),
+                    test_turn_revision(&running),
                     "missing".into(),
                     true
                 )
@@ -5316,10 +5373,10 @@ mod tests {
         service.cancel(session_id);
         assert!(token.is_cancelled());
         let live = service.load_full(session_id).unwrap();
-        let live_run_revision = active_run_revision(&live).unwrap();
+        let live_turn_revision = active_turn_revision(&live).unwrap();
         assert_eq!(
             service
-                .cancel_durable(session_id, live.revision, live_run_revision)
+                .cancel_durable(session_id, live.revision, live_turn_revision)
                 .unwrap()
                 .session_id,
             session_id,
@@ -5331,7 +5388,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[rustfmt::skip]
     fn verification_and_transcript_helpers_fail_closed_on_missing_authority() {
-        use latte_core::{SessionRunStatus, SessionRunSummary, TranscriptEntry, TranscriptEntryId};
+        use latte_core::{SessionTurnStatus, SessionTurnSummary, TranscriptEntry, TranscriptEntryId};
 
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
@@ -5339,9 +5396,9 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let base = SessionRuntimeService::new(
             engine,
@@ -5379,9 +5436,9 @@ mod tests {
         assert_eq!(descriptor.name, "process");
         assert!(!descriptor.input.to_string().contains("api_key=secret"));
 
-        snapshot.active_run_id = None;
+        snapshot.active_turn_id = None;
         assert!(matches!(
-            active_run_revision(&snapshot),
+            active_turn_revision(&snapshot),
             Err(SessionRuntimeError::InvalidState)
         ));
         assert!(
@@ -5396,24 +5453,24 @@ mod tests {
             .is_err()
         );
         let live = verified.acquire(session_id).unwrap();
-        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("active linked run is unavailable"));
+        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("active linked turn is unavailable"));
 
-        snapshot.active_run_id = Some(run_id);
-        snapshot.runs = vec![SessionRunSummary {
-            run_id: new_run_id(),
-            parent_run_id: None,
+        snapshot.active_turn_id = Some(turn_id);
+        snapshot.turns = vec![SessionTurnSummary {
+            turn_id: new_turn_id(),
+            parent_turn_id: None,
             ordinal: 0,
-            status: SessionRunStatus::Running,
-            run_revision: 1,
+            status: SessionTurnStatus::Running,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         }];
         assert!(matches!(
-            active_run_revision(&snapshot),
+            active_turn_revision(&snapshot),
             Err(SessionRuntimeError::InvalidState)
         ));
-        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("linked run revision is unavailable"));
-        snapshot.runs[0].run_id = run_id;
+        assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("linked turn revision is unavailable"));
+        snapshot.turns[0].turn_id = turn_id;
         let presentation = SessionEffectPresentation { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
         assert!(verified.finish_verification(&snapshot, &presentation, &live).unwrap_err().to_string().contains("observation is missing"));
 
@@ -5426,7 +5483,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 2,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::Assistant,
                 text: "call".into(),
                 payload: Some(serde_json::json!({"tool_calls":[call.clone()]})),
@@ -5436,7 +5493,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 3,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::System,
                 text: "ignore".into(),
                 payload: None,
@@ -5446,7 +5503,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 4,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::ToolResult,
                 text: "missing payload".into(),
                 payload: None,
@@ -5456,7 +5513,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 5,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::ToolResult,
                 text: "result".into(),
                 payload: Some(serde_json::json!({
@@ -5476,14 +5533,14 @@ mod tests {
         );
         assert_eq!(effect_provider_result(&snapshot, "missing"), None);
 
-        let mut running = verified.commit(session_id, run_id, 0, 0, CommitSessionRunUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
+        let mut running = verified.commit(session_id, turn_id, 0, 0, CommitSessionTurnUpdate::Start { source_key: "helper:start".into() }, &live).unwrap();
         assert!(verified.recover_lease_loss(&running, &live, "test").to_string().contains("recovery failed"));
         let takeover = verified
             .engine
             .acquire_session_lease(session_id, live.expires_at_ms(), 60_000)
             .unwrap();
         let mut mismatched = running.clone();
-        mismatched.runs[0].run_revision += 1;
+        mismatched.turns[0].turn_revision += 1;
         assert!(
             verified
                 .recover_lease_loss(&mismatched, &live, "test")
@@ -5494,7 +5551,7 @@ mod tests {
             engine: verified.engine.clone(),
             lease: takeover,
         };
-        for index in 0..501 { running = verified.commit(session_id, run_id, running.revision, 1, CommitSessionRunUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
+        for index in 0..501 { running = verified.commit(session_id, turn_id, running.revision, 1, CommitSessionTurnUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
         assert_eq!(verified.load_full(session_id).unwrap().transcript.entries.len(), 502);
         let mut observed = running.clone();
         observed.transcript = snapshot.transcript.clone();
@@ -5792,81 +5849,10 @@ mod tests {
     }
 
     #[test]
-    fn durable_tool_rounds_are_per_run_and_survive_input_within_a_run() {
-        let run_one = RunId::from_uuid(Uuid::now_v7());
-        let run_two = RunId::from_uuid(Uuid::now_v7());
-        let tool_calls = serde_json::json!([{"id":"c","name":"read_file","input":{}}]);
-        let entry = |run: RunId,
-                     seq: u64,
-                     kind: TranscriptKind,
-                     payload: Option<serde_json::Value>| TranscriptEntry {
-            entry_id: latte_core::TranscriptEntryId::from_uuid(Uuid::now_v7()),
-            sequence: seq,
-            run_id: Some(run),
-            kind,
-            text: String::new(),
-            payload,
-            source_key: format!("{run}:{seq}"),
-            created_at_ms: seq,
-        };
-        // Turn one (run_one): two tool rounds.
-        let mut entries = vec![
-            entry(run_one, 1, TranscriptKind::User, None),
-            entry(
-                run_one,
-                2,
-                TranscriptKind::Assistant,
-                Some(serde_json::json!({"tool_calls": tool_calls})),
-            ),
-            entry(run_one, 3, TranscriptKind::ToolResult, None),
-            entry(
-                run_one,
-                4,
-                TranscriptKind::Assistant,
-                Some(serde_json::json!({"tool_calls": tool_calls})),
-            ),
-            entry(run_one, 5, TranscriptKind::ToolResult, None),
-            // A plain assistant answer carries no tool_calls: not a round.
-            entry(run_one, 6, TranscriptKind::Assistant, None),
-        ];
-        // Turn two (run_two): one tool round, then an input request and the
-        // model's answer as a persisted `User` entry, then another tool round.
-        entries.extend_from_slice(&[
-            entry(run_two, 7, TranscriptKind::User, None),
-            entry(
-                run_two,
-                8,
-                TranscriptKind::Assistant,
-                Some(serde_json::json!({"tool_calls": tool_calls})),
-            ),
-            entry(run_two, 9, TranscriptKind::ToolResult, None),
-            entry(run_two, 10, TranscriptKind::Input, None),
-            // The answered input request is persisted as a `User` card. It must
-            // NOT reset run_two's round count the way a "messages after the
-            // last User" heuristic would.
-            entry(run_two, 11, TranscriptKind::User, None),
-            entry(
-                run_two,
-                12,
-                TranscriptKind::Assistant,
-                Some(serde_json::json!({"tool_calls": tool_calls})),
-            ),
-            entry(run_two, 13, TranscriptKind::ToolResult, None),
-        ]);
-
-        // Prior turns never count against the active run.
-        assert_eq!(durable_tool_rounds_in(&entries, run_one), 2);
-        // The active run accumulates across the in-run input answer: both tool
-        // rounds are charged to run_two, not just the one after the User card.
-        assert_eq!(durable_tool_rounds_in(&entries, run_two), 2);
-        assert_eq!(durable_tool_rounds_in(&[], run_two), 0);
-    }
-
-    #[test]
-    fn policy_rejects_a_zero_round_budget_and_a_zero_timeout() {
+    fn policy_treats_missing_round_budget_as_unlimited_and_rejects_zero() {
         assert!(
             SessionHistoryPolicy {
-                max_tool_rounds: 0,
+                max_tool_rounds: Some(0),
                 ..SessionHistoryPolicy::default()
             }
             .validate()
@@ -5880,7 +5866,153 @@ mod tests {
             .validate()
             .is_err()
         );
+        // The default is unlimited and valid; an explicit positive bound is
+        // valid too.
+        assert!(SessionHistoryPolicy::default().max_tool_rounds.is_none());
         assert!(SessionHistoryPolicy::default().validate().is_ok());
+        assert!(
+            SessionHistoryPolicy {
+                max_tool_rounds: Some(1),
+                ..SessionHistoryPolicy::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    fn read_note_call(id: &str) -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": "note.txt"}),
+        }
+    }
+
+    /// The bound counts *opened tool batches*. Once the bound-reaching batch
+    /// has executed, the model must still be allowed to read its results and
+    /// return the final answer; the bound only blocks opening another batch.
+    /// A pre-request check (the old shape) refused this very completion with
+    /// `max_tool_rounds=1`.
+    #[tokio::test]
+    async fn round_bound_of_one_still_allows_the_final_completion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "hello").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service_with_policy(
+            root.path(),
+            engine,
+            vec![
+                response(Some("reading"), vec![read_note_call("only-round")]),
+                response(Some("final answer"), vec![]),
+            ],
+            SessionHistoryPolicy {
+                max_tool_rounds: Some(1),
+                ..SessionHistoryPolicy::default()
+            },
+        );
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "read and answer".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Completed,
+            "the final answer must complete even with a one-round bound: {snapshot:?}"
+        );
+    }
+
+    /// At a one-round bound, an attempt to open a second tool batch ends the
+    /// turn retryably without consuming further scripted responses.
+    #[tokio::test]
+    async fn round_bound_stops_only_another_tool_batch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "hello").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service_with_policy(
+            root.path(),
+            engine,
+            vec![
+                response(Some("one"), vec![read_note_call("round-1")]),
+                response(Some("two"), vec![read_note_call("round-2-blocked")]),
+                response(Some("must not be reached"), vec![]),
+            ],
+            SessionHistoryPolicy {
+                max_tool_rounds: Some(1),
+                ..SessionHistoryPolicy::default()
+            },
+        );
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "loop".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        let failure = snapshot
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::Failure)
+            .map(|entry| entry.text.as_str())
+            .next_back()
+            .unwrap_or("");
+        assert!(
+            failure.contains("tool rounds") && failure.contains("max_tool_rounds"),
+            "unexpected failure text: {failure}"
+        );
+    }
+
+    /// Regression guard for the removed default cap: with no explicit bound
+    /// the policy runs more than the old 48-round default to completion.
+    #[tokio::test]
+    async fn unlimited_default_runs_past_the_legacy_default_cap() {
+        // Also a stack-safety regression: the turn loop must be iterative so
+        // dozens of tool batches do not grow a recursive future stack.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "hello").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut responses: Vec<ProviderResponse> = (0..50)
+            .map(|i| response(Some("step"), vec![read_note_call(&format!("call-{i}"))]))
+            .collect();
+        responses.push(response(Some("finished"), vec![]));
+        let service = scripted_service(root.path(), engine, responses);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "very long task".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Completed,
+            "the default policy must not stop a 50-round converging turn: {snapshot:?}"
+        );
     }
 
     #[test]
@@ -5937,9 +6069,9 @@ mod tests {
     }
 
     #[test]
-    fn new_run_id_returns_unique_ids() {
-        let id1 = new_run_id();
-        let id2 = new_run_id();
+    fn new_turn_id_returns_unique_ids() {
+        let id1 = new_turn_id();
+        let id2 = new_turn_id();
         assert_ne!(id1, id2);
     }
 
@@ -5983,11 +6115,11 @@ mod tests {
     }
 
     #[test]
-    fn active_run_revision_finds_active_run() {
+    fn active_turn_revision_finds_active_run() {
         use latte_core::{
-            IdSource, SessionRunStatus, SessionRunSummary, SystemIdSource, TranscriptPage,
+            IdSource, SessionTurnStatus, SessionTurnSummary, SystemIdSource, TranscriptPage,
         };
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let snapshot = SessionSnapshot {
             session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             revision: 1,
@@ -6006,15 +6138,15 @@ mod tests {
                 data_scope_id: String::new(),
                 credential_generation: 0,
             },
-            latest_run_id: None,
-            active_run_id: Some(run_id),
+            latest_turn_id: None,
+            active_turn_id: Some(turn_id),
             pending: None,
-            runs: vec![SessionRunSummary {
-                run_id,
-                parent_run_id: None,
+            turns: vec![SessionTurnSummary {
+                turn_id,
+                parent_turn_id: None,
                 ordinal: 0,
-                status: SessionRunStatus::Running,
-                run_revision: 7,
+                status: SessionTurnStatus::Running,
+                turn_revision: 7,
                 completed_at_ms: None,
                 failure_code: None,
             }],
@@ -6025,11 +6157,11 @@ mod tests {
             },
             focus: None,
         };
-        assert_eq!(active_run_revision(&snapshot).unwrap(), 7);
+        assert_eq!(active_turn_revision(&snapshot).unwrap(), 7);
         // No active run → error.
         let mut no_active = snapshot.clone();
-        no_active.active_run_id = None;
-        assert!(active_run_revision(&no_active).is_err());
+        no_active.active_turn_id = None;
+        assert!(active_turn_revision(&no_active).is_err());
     }
 
     // -- start / start_accepted error paths --------------------------------
@@ -6541,15 +6673,15 @@ mod tests {
             .unwrap();
         let service = scripted_service(root.path(), engine.clone(), vec![]);
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let running = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let err = service
             .cancel_durable(
                 session_id,
                 running.revision + 1,
-                test_run_revision(&running),
+                test_turn_revision(&running),
             )
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::InvalidState));
@@ -6564,15 +6696,15 @@ mod tests {
             .unwrap();
         let service = scripted_service(root.path(), engine.clone(), vec![]);
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let running = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let _held = engine
             .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
-            .cancel_durable(session_id, running.revision, test_run_revision(&running))
+            .cancel_durable(session_id, running.revision, test_turn_revision(&running))
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
@@ -6633,7 +6765,7 @@ mod tests {
             .provide_input(
                 session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 "lang".into(),
                 "x".repeat(10_000),
             )
@@ -6693,7 +6825,7 @@ mod tests {
             .provide_input(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 "lang".into(),
                 "Rust".into(),
             )
@@ -6760,7 +6892,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -6816,7 +6948,7 @@ mod tests {
             .resolve_permission(
                 waiting.session_id,
                 waiting.revision,
-                test_run_revision(&waiting),
+                test_turn_revision(&waiting),
                 request_id,
                 true,
             )
@@ -6926,9 +7058,9 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let service = SessionRuntimeService::new(
             engine,
@@ -6944,7 +7076,7 @@ mod tests {
             stdout_cap: 1_024,
             stderr_cap: 1_024,
         });
-        snapshot.active_run_id = None;
+        snapshot.active_turn_id = None;
         assert!(matches!(
             service.verification_descriptor(&snapshot, "done"),
             Err(SessionRuntimeError::InvalidState)
@@ -6959,11 +7091,11 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
-        snapshot.active_run_id = None;
+        snapshot.active_turn_id = None;
         let service = SessionRuntimeService::new(
             engine,
             root.path(),
@@ -6972,7 +7104,7 @@ mod tests {
         );
         let lease = service.acquire(session_id).unwrap();
         let err = service
-            .begin_verification(snapshot, "summary".into(), lease)
+            .begin_verification(snapshot, "summary".into(), &lease)
             .await
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::InvalidState));
@@ -6987,9 +7119,9 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let service = SessionRuntimeService::new(
             engine,
@@ -7005,15 +7137,15 @@ mod tests {
             input: serde_json::json!({}),
             attempt: 1,
         };
-        // No active run → InvalidState at the active_run_id guard.
-        snapshot.active_run_id = None;
+        // No active run → InvalidState at the active_turn_id guard.
+        snapshot.active_turn_id = None;
         assert!(matches!(
             service.finish_verification(&snapshot, &presentation, &lease),
             Err(SessionRuntimeError::InvalidState)
         ));
-        // Active run id but missing from runs → InvalidState at run_revision.
-        snapshot.active_run_id = Some(run_id);
-        snapshot.runs = vec![];
+        // Active run id but missing from runs → InvalidState at turn_revision.
+        snapshot.active_turn_id = Some(turn_id);
+        snapshot.turns = vec![];
         assert!(matches!(
             service.finish_verification(&snapshot, &presentation, &lease),
             Err(SessionRuntimeError::InvalidState)
@@ -7029,9 +7161,9 @@ mod tests {
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         let call = crate::provider::ToolCall {
             id: "call-1".into(),
@@ -7042,7 +7174,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 1,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::Assistant,
                 text: "no calls here".into(),
                 payload: Some(serde_json::json!({})),
@@ -7052,7 +7184,7 @@ mod tests {
             TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: 2,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::Assistant,
                 text: "with calls".into(),
                 payload: Some(serde_json::json!({"tool_calls":[call.clone()]})),
@@ -7066,20 +7198,20 @@ mod tests {
     }
 
     #[test]
-    fn effect_request_helpers_reject_missing_run_revision() {
+    fn effect_request_helpers_reject_missing_turn_revision() {
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
             .unwrap();
         let session_id = SessionId::from_uuid(Uuid::now_v7());
-        let run_id = new_run_id();
+        let turn_id = new_turn_id();
         let mut snapshot = engine
-            .create_session_v2(session_id, run_id, binding(), "initial", 1)
+            .create_session_v2(session_id, turn_id, binding(), "initial", 1)
             .unwrap();
         // Active run id set but the run is absent from the summary list.
-        snapshot.active_run_id = Some(run_id);
-        snapshot.runs = vec![];
+        snapshot.active_turn_id = Some(turn_id);
+        snapshot.turns = vec![];
         let descriptor = SessionEffectDescriptor {
             effect_id: "e".into(),
             tool_call_id: "t".into(),
@@ -7090,7 +7222,7 @@ mod tests {
         assert!(session_effect_request(&snapshot, descriptor.clone(), "k".into()).is_err());
         assert!(session_effect_start_request(&snapshot, "e".into(), "k".into()).is_err());
         // A snapshot without any active run also fails.
-        snapshot.active_run_id = None;
+        snapshot.active_turn_id = None;
         assert!(session_effect_request(&snapshot, descriptor, "k".into()).is_err());
     }
 }

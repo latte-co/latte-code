@@ -7,10 +7,10 @@
 //! - `public_lease_loss_fencing_is_observed_as_interrupted_by_final_binary`
 //! - `public_unknown_effect_reconciliation_is_terminal_in_final_binary`
 //!
-//! They seeded v1 runs through the v1 engine API (`create_run`,
+//! They seeded v1 runs through the v1 engine API (`create_turn`,
 //! `apply_transition`, `interrupt_after_lease_loss`, `reconcile_unknown_and_abort`)
 //! and asserted their projection through the v1 CLI `list`/`show` shapes
-//! (`data.runs[]` / `data.run`).
+//! (`data.turns[]` / `data.run`).
 //!
 //! In v2 the run is a child of a session: `list`/`show` read `sessions` and
 //! return `data.sessions[]` / `data.session`. A v1 run is never inserted into
@@ -25,4 +25,4 @@
 //! projected through the final binary, including lease-loss recovery and
 //! unknown-effect reconciliation — is covered by `public_lifecycle_matrix.rs`,
 //! which seeds v2 sessions through `create_session_v2` +
-//! `commit_session_run_update` and drives the same `list`/`show` surface.
+//! `commit_session_turn_update` and drives the same `list`/`show` surface.

@@ -2,10 +2,10 @@
 use crate::VerificationEvidence;
 use latte_core::{
     CompletionPolicy, EventEnvelope, EventId, Evidence, FailureCode, Handoff, PROTOCOL_VERSION,
-    Paged, Retryability, RunFailure, RunId, RunState, RunStatus, RuntimeEvent, SessionEvent,
-    SessionEventEnvelope, SessionEventId, SessionLifecycle, SessionPendingRequest,
-    SessionProviderBinding, SessionRunStatus, SessionRunSummary, SessionSnapshot, SessionSummary,
-    TranscriptEntry, TranscriptEntryId, TranscriptKind, TranscriptPage, Transition,
+    Paged, Retryability, RuntimeEvent, SessionEvent, SessionEventEnvelope, SessionEventId,
+    SessionLifecycle, SessionPendingRequest, SessionProviderBinding, SessionSnapshot,
+    SessionSummary, SessionTurnStatus, SessionTurnSummary, TranscriptEntry, TranscriptEntryId,
+    TranscriptKind, TranscriptPage, Transition, TurnFailure, TurnId, TurnState, TurnStatus,
     VerificationStatus, redact_session_text, redact_session_value,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -13,7 +13,7 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 15;
 const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// session.  The bound prevents a single long-running conversation from
@@ -30,7 +30,7 @@ pub enum StorageError {
     #[error("database schema version {found} is newer than supported version {supported}")]
     NewerSchema { found: i64, supported: i64 },
     #[error("run {0} was not found")]
-    RunNotFound(RunId),
+    TurnNotFound(TurnId),
     #[error("stale run revision: expected {expected}, actual {actual}")]
     StaleRevision { expected: u64, actual: u64 },
     #[error("runtime lease is held by another owner")]
@@ -43,14 +43,14 @@ pub enum StorageError {
     SessionNotFound(latte_core::SessionId),
     #[error("session revision is stale: expected {expected}, actual {actual}")]
     StaleSessionRevision { expected: u64, actual: u64 },
-    #[error("linked session runs must use CommitSessionRunUpdate")]
-    LinkedRunRequiresSessionCommit,
+    #[error("linked session turns must use CommitSessionTurnUpdate")]
+    LinkedTurnRequiresSessionCommit,
     #[error("session command id was reused with different content")]
     SessionCommandReplayMismatch,
     #[error("session {0} already exists")]
     SessionAlreadyExists(latte_core::SessionId),
-    #[error("session does not have the requested active run")]
-    SessionActiveRunMismatch,
+    #[error("session does not have the requested active turn")]
+    SessionActiveTurnMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,11 +67,11 @@ pub struct StoredSessionEvent {
     pub envelope: SessionEventEnvelope,
 }
 
-/// Engine-only mutation variants for a linked v2 child run.  The legacy
-/// engine APIs reject these run IDs so every state/event/transcript write is
-/// kept in one fenced transaction.
+/// Engine-only mutation variants for a linked child turn. The direct engine
+/// APIs reject these turn IDs so every state/event/transcript write is kept
+/// in one fenced transaction.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CommitSessionRunUpdate {
+pub enum CommitSessionTurnUpdate {
     Start {
         source_key: String,
     },
@@ -174,7 +174,7 @@ pub enum CommitSessionRunUpdate {
     },
     Fail {
         source_key: String,
-        failure: RunFailure,
+        failure: TurnFailure,
     },
     Interrupt {
         source_key: String,
@@ -182,7 +182,7 @@ pub enum CommitSessionRunUpdate {
     },
 }
 
-impl CommitSessionRunUpdate {
+impl CommitSessionTurnUpdate {
     fn source_key(&self) -> &str {
         match self {
             Self::Start { source_key }
@@ -219,13 +219,13 @@ pub enum SessionEffectPolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionCommitRequest {
     pub session_id: latte_core::SessionId,
-    pub run_id: RunId,
+    pub turn_id: TurnId,
     pub expected_session_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_turn_revision: u64,
     pub command_id: latte_core::SessionCommandId,
     pub request_id: Option<String>,
     pub effect_id: Option<String>,
-    pub update: CommitSessionRunUpdate,
+    pub update: CommitSessionTurnUpdate,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -261,9 +261,9 @@ impl Lease {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseLossRecovery {
-    Interrupted(RunState),
+    Interrupted(TurnState),
     FencedNoop,
-    AlreadyTerminal(RunState),
+    AlreadyTerminal(TurnState),
 }
 
 /// Result of recovering a stale v2 linked child.  Unlike the legacy result,
@@ -290,7 +290,7 @@ pub enum EffectStatus {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct EffectAuthority {
-    run_id: RunId,
+    turn_id: TurnId,
     expected_revision: u64,
     lease: Lease,
     effect_id: String,
@@ -768,6 +768,81 @@ impl Storage {
                 "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(13,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=13;",
             )?;
             tx.commit()?;
+            version = 13;
+        }
+        if version == 13 {
+            // The per-turn tool-round budget used to be reconstructed from the
+            // tail-500 transcript snapshot, which undercounts turns longer than
+            // the projection bound (and counts nothing once the outbox is
+            // drained into the JSONL conversation log). Persist an authoritative
+            // per-turn counter incremented in the same transaction as each
+            // assistant tool-round card, and backfill it from whatever durable
+            // transcript rows remain.
+            let tx = connection.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE session_runs ADD COLUMN tool_round_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            tx.execute_batch(
+                r"
+                UPDATE session_runs
+                   SET tool_round_count = (
+                         SELECT COUNT(*) FROM conversation_outbox
+                          WHERE conversation_outbox.run_id = session_runs.run_id
+                            AND conversation_outbox.kind = 'assistant'
+                            AND json_array_length(
+                                  COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
+                                ) > 0
+                       );
+                ",
+            )?;
+            tx.execute_batch(
+                "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(14,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=14;",
+            )?;
+            tx.commit()?;
+            version = 14;
+        }
+        if version == 14 {
+            // Concept alignment: the durable "run" concept is named "turn" in
+            // the canonical hierarchy (Workspace → Session → Turn → Round →
+            // Call → Effect). This renames the physical v1 graph and the
+            // linked columns. UUID values, revisions, idempotency rows, and
+            // approval identities are untouched; historical serialized rows
+            // carry read-side serde aliases for their old `run_*` JSON keys.
+            // With legacy_alter_table off, table and column renames rewrite
+            // foreign-key references in sibling tables.
+            let tx = connection.unchecked_transaction()?;
+            tx.execute_batch("PRAGMA legacy_alter_table=OFF;")?;
+            tx.execute_batch(
+                r"
+                ALTER TABLE runs RENAME TO turns;
+                ALTER TABLE run_read_model RENAME TO turn_read_model;
+                ALTER TABLE run_baselines RENAME TO turn_baselines;
+                ALTER TABLE session_active_runs RENAME TO session_active_turns;
+                ALTER TABLE session_runs RENAME TO session_turns;
+                -- Renaming the parent key first cascades the referenced column
+                -- into every child table's foreign key; each local column is
+                -- then renamed below.
+                ALTER TABLE turns RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE events RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE effects RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE evidence RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE turn_read_model RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE turn_baselines RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE runtime_checkpoints RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE pending_permissions RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE pending_permissions RENAME COLUMN run_revision TO turn_revision;
+                ALTER TABLE session_turns RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE session_turns RENAME COLUMN parent_run_id TO parent_turn_id;
+                ALTER TABLE session_active_turns RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE conversation_outbox RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE session_effect_canonical RENAME COLUMN run_id TO turn_id;
+                ALTER TABLE sessions RENAME COLUMN latest_run_id TO latest_turn_id;
+                ",
+            )?;
+            tx.execute_batch(
+                "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(15,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=15;",
+            )?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -869,14 +944,13 @@ impl Storage {
         let import_result = (|| {
             let version: i64 =
                 conn.query_row("PRAGMA legacy_import.user_version", [], |row| row.get(0))?;
-            // Legacy import reads the historical v2 layout (e.g. `threads_v2`)
-            // and writes the current one. It only migrates databases older than
-            // the running schema; a file at `SCHEMA_VERSION` already carries the
-            // current table names and has nothing to import.
-            if !(9..SCHEMA_VERSION).contains(&version) {
+            // Legacy import copies the *historical* v2 layout (`threads_v2`)
+            // from another database file. Only v9..=12 ever had that layout;
+            // schema 13+ already uses session names and reaches this binary
+            // through ordinary open-time migrations, never through import.
+            if !(9..=12).contains(&version) {
                 return Err(StorageError::InvalidData(format!(
-                    "legacy database schema {version} cannot be imported; expected 9 through {}",
-                    SCHEMA_VERSION - 1
+                    "legacy database schema {version} cannot be imported; expected 9 through 12"
                 )));
             }
             let foreign_workspace: bool = conn.query_row(
@@ -891,7 +965,7 @@ impl Storage {
             }
             if previous.is_none() {
                 let collision: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM legacy_import.runs l JOIN main.runs m USING(run_id)) \
+                    "SELECT EXISTS(SELECT 1 FROM legacy_import.runs l JOIN main.turns m ON l.run_id = m.turn_id) \
                      OR EXISTS(SELECT 1 FROM legacy_import.threads_v2 l JOIN main.sessions m ON l.thread_id = m.session_id)",
                     [],
                     |row| row.get(0),
@@ -903,23 +977,88 @@ impl Storage {
                 }
             }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // v1 tables keep their names in schema 13; the dead v1 `sessions`
-            // table is gone (dropped by the migration) and is not copied.
-            for table in [
-                "runs",
-                "events",
-                "command_dedup",
-                "effects",
-                "effect_attempts",
-                "evidence",
-                "run_read_model",
-                "pending_permissions",
-                "runtime_checkpoints",
-                "run_baselines",
+            // The v1 graph keeps the same rows but schema 15 renamed the tables
+            // and their `run_id`/`run_revision` columns to `turn_*`. Copy with
+            // explicit column lists so a legacy v9-v12 source maps onto the
+            // current shape; identical-shape tables stay positional.
+            for (main_table, legacy_table, column_map) in [
+                (
+                    "turns",
+                    "runs",
+                    Some((
+                        "turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms",
+                        "run_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms",
+                    )),
+                ),
+                (
+                    "events",
+                    "events",
+                    Some((
+                        "turn_id,seq,event_id,revision,event_json,created_at_ms",
+                        "run_id,seq,event_id,revision,event_json,created_at_ms",
+                    )),
+                ),
+                ("command_dedup", "command_dedup", None),
+                (
+                    "effects",
+                    "effects",
+                    Some((
+                        "effect_id,turn_id,status,started_at_ms,observed_at_ms",
+                        "effect_id,run_id,status,started_at_ms,observed_at_ms",
+                    )),
+                ),
+                ("effect_attempts", "effect_attempts", None),
+                (
+                    "evidence",
+                    "evidence",
+                    Some((
+                        "id,turn_id,metadata_json,blob_ref",
+                        "id,run_id,metadata_json,blob_ref",
+                    )),
+                ),
+                (
+                    "turn_read_model",
+                    "run_read_model",
+                    Some((
+                        "turn_id,revision,last_seq,state_json",
+                        "run_id,revision,last_seq,state_json",
+                    )),
+                ),
+                (
+                    "pending_permissions",
+                    "pending_permissions",
+                    Some((
+                        "effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest,consumed_at_ms",
+                        "effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest,consumed_at_ms",
+                    )),
+                ),
+                (
+                    "runtime_checkpoints",
+                    "runtime_checkpoints",
+                    Some((
+                        "turn_id,payload_json,updated_at_ms",
+                        "run_id,payload_json,updated_at_ms",
+                    )),
+                ),
+                (
+                    "turn_baselines",
+                    "run_baselines",
+                    Some(("turn_id,manifest_json", "run_id,manifest_json")),
+                ),
             ] {
-                tx.execute_batch(&format!(
-                    "INSERT OR IGNORE INTO main.{table} SELECT * FROM legacy_import.{table};"
-                ))?;
+                match column_map {
+                    Some((main_columns, legacy_columns)) => {
+                        tx.execute_batch(&format!(
+                            "INSERT OR IGNORE INTO main.{main_table}({main_columns}) \
+                             SELECT {legacy_columns} FROM legacy_import.{legacy_table};"
+                        ))?;
+                    }
+                    None => {
+                        tx.execute_batch(&format!(
+                            "INSERT OR IGNORE INTO main.{main_table} SELECT * FROM legacy_import.{legacy_table};"
+                        ))?;
+                    }
+                }
             }
             // The legacy (schema <=12) session table is `threads_v2`; main is the
             // renamed `sessions`. It must be imported before the child tables that
@@ -950,15 +1089,22 @@ impl Storage {
             };
             let focus_expr = if has_focus { "focus" } else { "NULL" };
             tx.execute_batch(&format!(
-                "INSERT OR IGNORE INTO main.sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
+                "INSERT OR IGNORE INTO main.sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
                  SELECT thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,{parent_expr},{focus_expr} FROM legacy_import.threads_v2;"
             ))?;
-            // Legacy v2 child tables keep their old names in the attached schema;
-            // each maps positionally onto the renamed main table (the
-            // thread_id/session_id column is the same TEXT value in the same slot).
+            // Legacy v2 child tables map onto the renamed main tables. Rows are
+            // named explicitly: main `session_turns` gained the
+            // `tool_round_count` column in schema 14, so a positional
+            // `SELECT *` would not match. The counter is backfilled below once
+            // the legacy transcript rows are imported.
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO main.session_turns \
+                 (turn_id,session_id,parent_turn_id,ordinal,completed_at_ms,tool_round_count) \
+                 SELECT run_id,thread_id,parent_run_id,ordinal,completed_at_ms,0 \
+                 FROM legacy_import.thread_runs_v2;",
+            )?;
             for (legacy_name, main_name) in [
-                ("thread_runs_v2", "session_runs"),
-                ("thread_active_runs_v2", "session_active_runs"),
+                ("thread_active_runs_v2", "session_active_turns"),
                 ("thread_events_v2", "session_events"),
                 ("thread_command_dedup_v2", "session_command_dedup"),
                 ("thread_commit_sources_v2", "session_commit_sources"),
@@ -981,6 +1127,21 @@ impl Storage {
             tx.execute_batch(&format!(
                 "INSERT OR IGNORE INTO main.conversation_outbox SELECT * FROM legacy_import.{transcript_source};"
             ))?;
+            // Rebuild the imported turns' tool-round counters from their
+            // durable cards, mirroring the schema-14 migration backfill.
+            tx.execute_batch(
+                r"
+                UPDATE session_turns
+                   SET tool_round_count = (
+                         SELECT COUNT(*) FROM conversation_outbox
+                          WHERE conversation_outbox.turn_id = session_turns.turn_id
+                            AND conversation_outbox.kind = 'assistant'
+                            AND json_array_length(
+                                  COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
+                                ) > 0
+                       );
+                ",
+            )?;
             tx.execute(
                 "INSERT INTO legacy_imports(source_path,fingerprint,imported_at_ms) VALUES(?1,?2,?3) \
                  ON CONFLICT(source_path) DO UPDATE SET fingerprint=excluded.fingerprint,imported_at_ms=excluded.imported_at_ms",
@@ -1002,33 +1163,33 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub(crate) fn create_run(&self, state: &RunState, now_ms: u64) -> Result<(), StorageError> {
+    pub(crate) fn create_turn(&self, state: &TurnState, now_ms: u64) -> Result<(), StorageError> {
         self.create_run_with_baseline(state, now_ms, None)
     }
     pub(crate) fn create_run_with_baseline(
         &self,
-        state: &RunState,
+        state: &TurnState,
         now_ms: u64,
         baseline: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Result<(), StorageError> {
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let json = serde_json::to_string(state).map_err(invalid_json)?;
-        tx.execute("INSERT INTO runs(run_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,0,?5,?5)",
-            params![state.run_id.to_string(), json, status_name(state.status), to_i64(state.revision)?, to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO turns(turn_id,state_json,status,revision,last_seq,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,0,?5,?5)",
+            params![state.turn_id.to_string(), json, status_name(state.status), to_i64(state.revision)?, to_i64(now_ms)?])?;
         tx.execute(
-            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,?2,0,?3)",
+            "INSERT INTO turn_read_model(turn_id,revision,last_seq,state_json) VALUES(?1,?2,0,?3)",
             params![
-                state.run_id.to_string(),
+                state.turn_id.to_string(),
                 to_i64(state.revision)?,
                 serde_json::to_string(state).map_err(invalid_json)?
             ],
         )?;
         if let Some(baseline) = baseline {
             tx.execute(
-                "INSERT INTO run_baselines(run_id,manifest_json) VALUES(?1,?2)",
+                "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
                 params![
-                    state.run_id.to_string(),
+                    state.turn_id.to_string(),
                     serde_json::to_string(baseline).map_err(invalid_json)?
                 ],
             )?;
@@ -1037,22 +1198,22 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn load_run(&self, run_id: RunId) -> Result<RunState, StorageError> {
+    pub(crate) fn load_turn(&self, turn_id: TurnId) -> Result<TurnState, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let json: Option<String> = conn
             .query_row(
-                "SELECT state_json FROM run_read_model WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT state_json FROM turn_read_model WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |r| r.get(0),
             )
             .optional()?;
-        json.ok_or(StorageError::RunNotFound(run_id))
+        json.ok_or(StorageError::TurnNotFound(turn_id))
             .and_then(|v| serde_json::from_str(&v).map_err(invalid_json))
     }
 
-    pub(crate) fn list_runs(&self) -> Result<Vec<RunState>, StorageError> {
+    pub(crate) fn list_runs(&self) -> Result<Vec<TurnState>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let mut stmt = conn.prepare("SELECT state_json FROM run_read_model ORDER BY rowid")?;
+        let mut stmt = conn.prepare("SELECT state_json FROM turn_read_model ORDER BY rowid")?;
         let values = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1062,11 +1223,11 @@ impl Storage {
             .collect()
     }
 
-    pub(crate) fn is_session_linked_run(&self, run_id: RunId) -> Result<bool, StorageError> {
+    pub(crate) fn is_session_linked_turn(&self, turn_id: TurnId) -> Result<bool, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_runs WHERE run_id=?1)",
-            [run_id.to_string()],
+            "SELECT EXISTS(SELECT 1 FROM session_turns WHERE turn_id=?1)",
+            [turn_id.to_string()],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -1076,7 +1237,7 @@ impl Storage {
     pub(crate) fn create_session_v2(
         &self,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         binding: &SessionProviderBinding,
         workspace_root: &str,
         prompt: &str,
@@ -1086,7 +1247,7 @@ impl Storage {
         self.create_session_v2_inner(
             None,
             session_id,
-            run_id,
+            turn_id,
             binding,
             workspace_root,
             prompt,
@@ -1187,7 +1348,7 @@ impl Storage {
         &self,
         command_id: Option<&latte_core::SessionCommandId>,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         binding: &SessionProviderBinding,
         workspace_root: &str,
         prompt: &str,
@@ -1199,7 +1360,7 @@ impl Storage {
         let (outcome, session_event) = self.create_session_v2_inner(
             command_id,
             session_id,
-            run_id,
+            turn_id,
             binding,
             workspace_root,
             prompt,
@@ -1217,7 +1378,7 @@ impl Storage {
         &self,
         command_id: Option<&latte_core::SessionCommandId>,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         binding: &SessionProviderBinding,
         workspace_root: &str,
         prompt: &str,
@@ -1313,7 +1474,7 @@ impl Storage {
                 return Ok((latte_core::CreateOutcome::Replayed(snapshot), None));
             }
         }
-        let queued = RunState::queued(run_id);
+        let queued = TurnState::queued(turn_id);
         let state = if initial_lease.is_some() {
             queued
                 .transition(0, Transition::Start)
@@ -1321,44 +1482,44 @@ impl Storage {
         } else {
             queued
         };
-        let run_sequence = u64::from(initial_lease.is_some());
+        let turn_sequence = u64::from(initial_lease.is_some());
         let session_revision = u64::from(initial_lease.is_some());
         let session_sequence = if initial_lease.is_some() { 2 } else { 1 };
         let lease_token = initial_lease.map_or(0, |lease| lease.fencing_token);
         let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
         tx.execute(
-            "INSERT INTO runs(run_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-            params![run_id.to_string(), state_json, status_name(state.status), to_i64(state.revision)?, to_i64(run_sequence)?, to_i64(lease_token)?, to_i64(now_ms)?],
+            "INSERT INTO turns(turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![turn_id.to_string(), state_json, status_name(state.status), to_i64(state.revision)?, to_i64(turn_sequence)?, to_i64(lease_token)?, to_i64(now_ms)?],
         )?;
         tx.execute(
-            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO turn_read_model(turn_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
             params![
-                run_id.to_string(),
+                turn_id.to_string(),
                 to_i64(state.revision)?,
-                to_i64(run_sequence)?,
+                to_i64(turn_sequence)?,
                 serde_json::to_string(&state).map_err(invalid_json)?
             ],
         )?;
         tx.execute(
-            "INSERT INTO run_baselines(run_id,manifest_json) VALUES(?1,?2)",
+            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
             params![
-                run_id.to_string(),
+                turn_id.to_string(),
                 serde_json::to_string(baseline).map_err(invalid_json)?
             ],
         )?;
         tx.execute(
-            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8,?9)",
-            params![session_id.to_string(), to_i64(session_revision)?, to_i64(session_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, run_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8,?9)",
+            params![session_id.to_string(), to_i64(session_revision)?, to_i64(session_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, turn_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
         )?;
         tx.execute(
-            "INSERT INTO session_runs(run_id,session_id,parent_run_id,ordinal) VALUES(?1,?2,NULL,0)",
-            params![run_id.to_string(), session_id.to_string()],
+            "INSERT INTO session_turns(turn_id,session_id,parent_turn_id,ordinal) VALUES(?1,?2,NULL,0)",
+            params![turn_id.to_string(), session_id.to_string()],
         )?;
         tx.execute(
-            "INSERT INTO session_active_runs(session_id,run_id,lease_token) VALUES(?1,?2,?3)",
+            "INSERT INTO session_active_turns(session_id,turn_id,lease_token) VALUES(?1,?2,?3)",
             params![
                 session_id.to_string(),
-                run_id.to_string(),
+                turn_id.to_string(),
                 to_i64(lease_token)?
             ],
         )?;
@@ -1367,7 +1528,7 @@ impl Storage {
             // Transcript paging has an unsigned cursor, so reserve zero as
             // the initial cursor and put the first user card at one.
             sequence: 1,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: prompt,
             payload: None,
@@ -1375,22 +1536,22 @@ impl Storage {
             created_at_ms: now_ms,
         };
         tx.execute(
-            "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
-            params![session_id.to_string(), entry.entry_id.to_string(), run_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
+            "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
+            params![session_id.to_string(), entry.entry_id.to_string(), turn_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
         )?;
         let session_event = if initial_lease.is_some() {
-            let run_event = EventEnvelope {
+            let turn_event = EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 event_id: EventId::from_uuid(Uuid::now_v7()),
-                run_id,
+                turn_id,
                 revision: state.revision,
                 event: RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
             };
             tx.execute(
-                "INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
-                params![run_id.to_string(), run_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&run_event).map_err(invalid_json)?, to_i64(now_ms)?],
+                "INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
+                params![turn_id.to_string(), turn_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&turn_event).map_err(invalid_json)?, to_i64(now_ms)?],
             )?;
             let envelope = SessionEventEnvelope {
                 protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
@@ -1400,7 +1561,7 @@ impl Storage {
                 sequence: session_sequence,
                 event: SessionEvent::LifecycleChanged {
                     lifecycle: SessionLifecycle::Running,
-                    run_id: Some(run_id),
+                    turn_id: Some(turn_id),
                 },
             };
             tx.execute(
@@ -1434,7 +1595,7 @@ impl Storage {
     pub(crate) fn create_session_follow_up_v2(
         &self,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_session_revision: u64,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
@@ -1443,7 +1604,7 @@ impl Storage {
         self.create_session_follow_up_v2_inner(
             None,
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision,
             prompt,
             baseline,
@@ -1470,7 +1631,7 @@ impl Storage {
         &self,
         command_id: Option<&latte_core::SessionCommandId>,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_session_revision: u64,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
@@ -1486,7 +1647,7 @@ impl Storage {
         self.create_session_follow_up_v2_inner(
             command_id,
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision,
             prompt,
             baseline,
@@ -1500,7 +1661,7 @@ impl Storage {
         &self,
         command_id: Option<&latte_core::SessionCommandId>,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_session_revision: u64,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
@@ -1573,7 +1734,7 @@ impl Storage {
             Option<String>,
         ) = tx
             .query_row(
-                "SELECT revision,lifecycle,latest_run_id,parent_session_id FROM sessions WHERE session_id=?1",
+                "SELECT revision,lifecycle,latest_turn_id,parent_session_id FROM sessions WHERE session_id=?1",
                 [session_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -1588,7 +1749,7 @@ impl Storage {
         }
         if lifecycle != "ready"
             || tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_active_runs WHERE session_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM session_active_turns WHERE session_id=?1)",
                 [session_id.to_string()],
                 |row| row.get::<_, bool>(0),
             )?
@@ -1606,17 +1767,17 @@ impl Storage {
             .as_ref()
             .map(|parent| {
                 tx.query_row(
-                    "SELECT state_json FROM runs WHERE run_id=?1",
+                    "SELECT state_json FROM turns WHERE turn_id=?1",
                     [parent],
                     |row| row.get::<_, String>(0),
                 )
                 .map_err(StorageError::from)
-                .and_then(|state| serde_json::from_str::<RunState>(&state).map_err(invalid_json))
+                .and_then(|state| serde_json::from_str::<TurnState>(&state).map_err(invalid_json))
             })
             .transpose()?;
         if parent_state.as_ref().is_some_and(|parent| {
-            parent.status != RunStatus::Completed
-                && !(parent.status == RunStatus::Failed
+            parent.status != TurnStatus::Completed
+                && !(parent.status == TurnStatus::Failed
                     && parent.failure.as_ref().is_some_and(|failure| {
                         failure.retryability == Retryability::Retryable
                             || failure.code == FailureCode::PermissionDenied
@@ -1627,11 +1788,11 @@ impl Storage {
             ));
         }
         let ordinal: u64 = from_i64(tx.query_row(
-            "SELECT COALESCE(MAX(ordinal),-1)+1 FROM session_runs WHERE session_id=?1",
+            "SELECT COALESCE(MAX(ordinal),-1)+1 FROM session_turns WHERE session_id=?1",
             [session_id.to_string()],
             |row| row.get::<_, i64>(0),
         )?)?;
-        let queued = RunState::queued(run_id);
+        let queued = TurnState::queued(turn_id);
         let state = if initial_lease.is_some() {
             queued
                 .transition(0, Transition::Start)
@@ -1639,39 +1800,39 @@ impl Storage {
         } else {
             queued
         };
-        let run_sequence = u64::from(initial_lease.is_some());
+        let turn_sequence = u64::from(initial_lease.is_some());
         let lease_token = initial_lease.map_or(0, |lease| lease.fencing_token);
-        tx.execute("INSERT INTO runs(run_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![run_id.to_string(),serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(run_sequence)?,to_i64(lease_token)?,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO turns(turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![turn_id.to_string(),serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(turn_sequence)?,to_i64(lease_token)?,to_i64(now_ms)?])?;
         tx.execute(
-            "INSERT INTO run_read_model(run_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO turn_read_model(turn_id,revision,last_seq,state_json) VALUES(?1,?2,?3,?4)",
             params![
-                run_id.to_string(),
+                turn_id.to_string(),
                 to_i64(state.revision)?,
-                to_i64(run_sequence)?,
+                to_i64(turn_sequence)?,
                 serde_json::to_string(&state).map_err(invalid_json)?
             ],
         )?;
         tx.execute(
-            "INSERT INTO run_baselines(run_id,manifest_json) VALUES(?1,?2)",
+            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
             params![
-                run_id.to_string(),
+                turn_id.to_string(),
                 serde_json::to_string(baseline).map_err(invalid_json)?
             ],
         )?;
         tx.execute(
-            "INSERT INTO session_runs(run_id,session_id,parent_run_id,ordinal) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO session_turns(turn_id,session_id,parent_turn_id,ordinal) VALUES(?1,?2,?3,?4)",
             params![
-                run_id.to_string(),
+                turn_id.to_string(),
                 session_id.to_string(),
                 latest,
                 to_i64(ordinal)?
             ],
         )?;
         tx.execute(
-            "INSERT INTO session_active_runs(session_id,run_id,lease_token) VALUES(?1,?2,?3)",
+            "INSERT INTO session_active_turns(session_id,turn_id,lease_token) VALUES(?1,?2,?3)",
             params![
                 session_id.to_string(),
-                run_id.to_string(),
+                turn_id.to_string(),
                 to_i64(lease_token)?
             ],
         )?;
@@ -1688,20 +1849,20 @@ impl Storage {
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: seq,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: prompt,
             payload: None,
-            source_key: format!("follow-up:{run_id}:user"),
+            source_key: format!("follow-up:{turn_id}:user"),
             created_at_ms: now_ms,
         };
-        tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'user',?5,?6,?7)",params![session_id.to_string(),to_i64(seq)?,entry.entry_id.to_string(),run_id.to_string(),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        let summary = SessionRunSummary {
-            run_id,
-            parent_run_id: parent_state.map(|parent| parent.run_id),
+        tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'user',?5,?6,?7)",params![session_id.to_string(),to_i64(seq)?,entry.entry_id.to_string(),turn_id.to_string(),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        let summary = SessionTurnSummary {
+            turn_id,
+            parent_turn_id: parent_state.map(|parent| parent.turn_id),
             ordinal,
-            status: SessionRunStatus::Queued,
-            run_revision: 0,
+            status: SessionTurnStatus::Queued,
+            turn_revision: 0,
             completed_at_ms: None,
             failure_code: None,
         };
@@ -1711,23 +1872,23 @@ impl Storage {
             session_id,
             revision: next_revision,
             sequence: seq,
-            event: SessionEvent::RunLinked { run: summary },
+            event: SessionEvent::TurnLinked { turn: summary },
         };
         tx.execute("INSERT INTO session_events(session_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![session_id.to_string(),to_i64(seq)?,event.event_id.to_string(),to_i64(next_revision)?,serde_json::to_string(&event).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle='running',latest_run_id=?3,updated_at_ms=?4 WHERE session_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,run_id.to_string(),to_i64(now_ms)?,session_id.to_string()])?;
+        tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle='running',latest_turn_id=?3,updated_at_ms=?4 WHERE session_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,turn_id.to_string(),to_i64(now_ms)?,session_id.to_string()])?;
         let session_event = if initial_lease.is_some() {
-            let run_event = EventEnvelope {
+            let turn_event = EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 event_id: EventId::from_uuid(Uuid::now_v7()),
-                run_id,
+                turn_id,
                 revision: state.revision,
                 event: RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
             };
             tx.execute(
-                "INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
-                params![run_id.to_string(), run_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&run_event).map_err(invalid_json)?, to_i64(now_ms)?],
+                "INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,?3,?4,?5)",
+                params![turn_id.to_string(), turn_event.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&turn_event).map_err(invalid_json)?, to_i64(now_ms)?],
             )?;
             let started_revision = next_revision
                 .checked_add(1)
@@ -1743,7 +1904,7 @@ impl Storage {
                 sequence: started_sequence,
                 event: SessionEvent::LifecycleChanged {
                     lifecycle: SessionLifecycle::Running,
-                    run_id: Some(run_id),
+                    turn_id: Some(turn_id),
                 },
             };
             tx.execute(
@@ -1823,7 +1984,7 @@ impl Storage {
         }
         if lifecycle != "ready"
             || tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_active_runs WHERE session_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM session_active_turns WHERE session_id=?1)",
                 [session_id.to_string()],
                 |row| row.get::<_, bool>(0),
             )?
@@ -1848,7 +2009,7 @@ impl Storage {
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: next_sequence,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::System,
             text: format!(
                 "Model switched to {}/{}",
@@ -1862,7 +2023,7 @@ impl Storage {
             created_at_ms: now_ms,
         };
         tx.execute(
-            "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,NULL,'system',?4,?5,?6)",
+            "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,NULL,'system',?4,?5,?6)",
             params![session_id.to_string(), to_i64(next_sequence)?, entry.entry_id.to_string(), entry.source_key, serde_json::to_string(&entry).map_err(invalid_json)?, to_i64(now_ms)?],
         )?;
         let envelope = SessionEventEnvelope {
@@ -1913,6 +2074,20 @@ impl Storage {
     ) -> Result<SessionSnapshot, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         current_session_snapshot(&conn, session_id, limit)
+    }
+
+    /// Reads the authoritative persisted tool-round count for one run. Unlike a
+    /// tail transcript projection this never undercounts long runs and stays
+    /// correct after the conversation outbox is drained.
+    pub(crate) fn tool_round_count_for_turn(&self, turn_id: TurnId) -> Result<u32, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT tool_round_count FROM session_turns WHERE turn_id=?1",
+            [turn_id.to_string()],
+            |row| row.get(0),
+        )?;
+        u32::try_from(count)
+            .map_err(|_| StorageError::InvalidData("tool_round_count overflow".into()))
     }
 
     pub(crate) fn conversation_outbox_entries(
@@ -2477,7 +2652,7 @@ impl Storage {
         );
         let last_sequence = history.last().map_or(0, |entry| entry.sequence);
         tx.execute(
-            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
              VALUES(?1,0,?2,'ready',?3,NULL,?4,?4,?5,?6,?7,?8)",
             params![fork_session_id.to_string(),to_i64(last_sequence)?,binding_json,to_i64(now_ms)?,title,workspace_root,source_session_id.to_string(),focus],
         )?;
@@ -2491,10 +2666,10 @@ impl Storage {
             previous = source.sequence;
             let mut entry = source.clone();
             entry.entry_id = TranscriptEntryId::from_uuid(Uuid::now_v7());
-            entry.run_id = None;
+            entry.turn_id = None;
             entry.source_key = format!("fork:{source_session_id}:{}", source.sequence);
             tx.execute(
-                "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) \
+                "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
                  VALUES(?1,?2,?3,NULL,?4,?5,?6,?7)",
                 params![fork_session_id.to_string(),to_i64(entry.sequence)?,entry.entry_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(entry.created_at_ms)?],
             )?;
@@ -2508,14 +2683,14 @@ impl Storage {
     /// leaves durable storage except as this checked display list.
     pub(crate) fn session_changed_files(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         current_manifest: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<String>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let baseline_json: String = conn
             .query_row(
-                "SELECT manifest_json FROM run_baselines WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?
@@ -2557,7 +2732,7 @@ impl Storage {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn commit_session_run_update(
+    pub(crate) fn commit_session_turn_update(
         &self,
         request: &SessionCommitRequest,
         lease: &Lease,
@@ -2598,9 +2773,9 @@ impl Storage {
         if !lease_ok {
             return Err(StorageError::LeaseLost);
         }
-        let (session_revision, last_seq, lifecycle, latest_run): (i64, i64, String, Option<String>) = tx
+        let (session_revision, last_seq, lifecycle, latest_turn): (i64, i64, String, Option<String>) = tx
             .query_row(
-                "SELECT revision,last_seq,lifecycle,latest_run_id FROM sessions WHERE session_id=?1",
+                "SELECT revision,last_seq,lifecycle,latest_turn_id FROM sessions WHERE session_id=?1",
                 [request.session_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -2615,7 +2790,7 @@ impl Storage {
         }
         let active: Option<(String, i64)> = tx
             .query_row(
-                "SELECT run_id,lease_token FROM session_active_runs WHERE session_id=?1",
+                "SELECT turn_id,lease_token FROM session_active_turns WHERE session_id=?1",
                 [request.session_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2627,51 +2802,51 @@ impl Storage {
         let recovered_reconciliation = active.is_none()
             && matches!(
                 &request.update,
-                CommitSessionRunUpdate::ReconcileUnknownEffect { .. }
+                CommitSessionTurnUpdate::ReconcileUnknownEffect { .. }
             )
             && lifecycle == "reconciliation_required"
-            && latest_run.as_deref() == Some(request.run_id.to_string().as_str());
-        if let Some((active_run, active_token)) = active {
-            if active_run != request.run_id.to_string()
+            && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
+        if let Some((active_turn, active_token)) = active {
+            if active_turn != request.turn_id.to_string()
                 || from_i64(active_token)? > lease.fencing_token
             {
-                return Err(StorageError::SessionActiveRunMismatch);
+                return Err(StorageError::SessionActiveTurnMismatch);
             }
         } else if !recovered_reconciliation {
-            return Err(StorageError::SessionActiveRunMismatch);
+            return Err(StorageError::SessionActiveTurnMismatch);
         }
-        let (state_json, run_seq, run_token): (String, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-            [request.run_id.to_string()],
+        let (state_json, turn_seq, turn_token): (String, i64, i64) = tx.query_row(
+            "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+            [request.turn_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if from_i64(run_token)? > lease.fencing_token {
+        if from_i64(turn_token)? > lease.fencing_token {
             return Err(StorageError::LeaseLost);
         }
-        let current: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
-        if current.revision != request.expected_run_revision {
+        let current: TurnState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+        if current.revision != request.expected_turn_revision {
             return Err(StorageError::StaleRevision {
-                expected: request.expected_run_revision,
+                expected: request.expected_turn_revision,
                 actual: current.revision,
             });
         }
 
         let mut next = current.clone();
-        let mut run_changed = false;
+        let mut turn_changed = false;
         let mut next_lifecycle = lifecycle;
         let mut card: Option<(TranscriptKind, String, Option<serde_json::Value>, String)> = None;
         let mut terminal = false;
         let mut reconciliation_effect = None;
         let mut checkpoint: Option<String> = None;
         match &request.update {
-            CommitSessionRunUpdate::Start { .. } => {
+            CommitSessionTurnUpdate::Start { .. } => {
                 next = current
                     .transition(current.revision, Transition::Start)
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 next_lifecycle = "running".into();
             }
-            CommitSessionRunUpdate::AppendTranscript {
+            CommitSessionTurnUpdate::AppendTranscript {
                 source_key,
                 kind,
                 text,
@@ -2684,7 +2859,7 @@ impl Storage {
                     source_key.clone(),
                 ));
             }
-            CommitSessionRunUpdate::PrepareEffect {
+            CommitSessionTurnUpdate::PrepareEffect {
                 source_key,
                 effect_id,
                 operation_digest,
@@ -2700,7 +2875,7 @@ impl Storage {
                 serde_json::from_str::<crate::SessionEffectDescriptor>(canonical_descriptor_json)
                     .map_err(invalid_json)?;
                 serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
-                if current.status != RunStatus::Running {
+                if current.status != TurnStatus::Running {
                     return Err(StorageError::InvalidData(
                         "only a running linked child can prepare an effect".into(),
                     ));
@@ -2709,10 +2884,10 @@ impl Storage {
                     SessionEffectPolicy::Allow => r#"{"session_policy":"allow"}"#,
                     SessionEffectPolicy::Ask => r#"{"session_policy":"ask"}"#,
                 };
-                tx.execute("INSERT INTO effects(effect_id,run_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,1,?4,?5,?6,?3)",params![effect_id,request.run_id.to_string(),to_i64(now_ms)?,descriptor_json,operation_digest,pre_evidence])?;
+                tx.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,1,?4,?5,?6,?3)",params![effect_id,request.turn_id.to_string(),to_i64(now_ms)?,descriptor_json,operation_digest,pre_evidence])?;
                 tx.execute(
-                    "INSERT INTO session_effect_canonical(effect_id,run_id,descriptor_json) VALUES(?1,?2,?3)",
-                    params![effect_id, request.run_id.to_string(), canonical_descriptor_json],
+                    "INSERT INTO session_effect_canonical(effect_id,turn_id,descriptor_json) VALUES(?1,?2,?3)",
+                    params![effect_id, request.turn_id.to_string(), canonical_descriptor_json],
                 )?;
                 if *policy == SessionEffectPolicy::Ask {
                     let pending = latte_core::PendingPermission {
@@ -2723,13 +2898,13 @@ impl Storage {
                     next = current
                         .transition(current.revision, Transition::RequestPermission(pending))
                         .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-                    run_changed = true;
+                    turn_changed = true;
                     next_lifecycle = "waiting_permission".into();
                     let post_approval_revision = current
                         .revision
                         .checked_add(2)
                         .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-                    tx.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,request.run_id.to_string(),to_i64(post_approval_revision)?,lease.owner,to_i64(lease.fencing_token)?,operation_digest])?;
+                    tx.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,request.turn_id.to_string(),to_i64(post_approval_revision)?,lease.owner,to_i64(lease.fencing_token)?,operation_digest])?;
                 }
                 card = Some((
                     TranscriptKind::ToolCall,
@@ -2743,7 +2918,7 @@ impl Storage {
                 ));
                 checkpoint = Some(checkpoint_json.clone());
             }
-            CommitSessionRunUpdate::StartEffect {
+            CommitSessionTurnUpdate::StartEffect {
                 source_key,
                 effect_id,
                 operation_digest,
@@ -2752,7 +2927,7 @@ impl Storage {
                 validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
                 serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
-                if current.status != RunStatus::Running
+                if current.status != TurnStatus::Running
                     || current.pending_permission.is_some()
                     || current.pending_input.is_some()
                 {
@@ -2762,8 +2937,8 @@ impl Storage {
                 }
                 let prepared: Option<(String, String)> = tx
                     .query_row(
-                        "SELECT approval_digest,pre_evidence_json FROM effects WHERE effect_id=?1 AND run_id=?2 AND status='prepared'",
-                        params![effect_id, request.run_id.to_string()],
+                        "SELECT approval_digest,pre_evidence_json FROM effects WHERE effect_id=?1 AND turn_id=?2 AND status='prepared'",
+                        params![effect_id, request.turn_id.to_string()],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
@@ -2777,8 +2952,8 @@ impl Storage {
                 }
                 let pending: Option<(i64, String, i64, Option<i64>)> = tx
                     .query_row(
-                        "SELECT run_revision,lease_owner,lease_token,consumed_at_ms FROM pending_permissions WHERE effect_id=?1 AND run_id=?2",
-                        params![effect_id, request.run_id.to_string()],
+                        "SELECT turn_revision,lease_owner,lease_token,consumed_at_ms FROM pending_permissions WHERE effect_id=?1 AND turn_id=?2",
+                        params![effect_id, request.turn_id.to_string()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
@@ -2802,15 +2977,15 @@ impl Storage {
                     ));
                 }
                 let started = tx.execute(
-                    "UPDATE effects SET status='started',started_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared' AND approval_digest=?4",
-                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                    "UPDATE effects SET status='started',started_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared' AND approval_digest=?4",
+                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
                 )?;
                 if started != 1 {
                     return Err(StorageError::EffectFenced);
                 }
                 let bumped = tx.execute(
-                    "UPDATE runs SET effect_epoch=effect_epoch+1,lease_token=?1,updated_at_ms=?2 WHERE run_id=?3 AND revision=?4 AND lease_token<=?1",
-                    params![to_i64(lease.fencing_token)?,to_i64(now_ms)?,request.run_id.to_string(),to_i64(current.revision)?],
+                    "UPDATE turns SET effect_epoch=effect_epoch+1,lease_token=?1,updated_at_ms=?2 WHERE turn_id=?3 AND revision=?4 AND lease_token<=?1",
+                    params![to_i64(lease.fencing_token)?,to_i64(now_ms)?,request.turn_id.to_string(),to_i64(current.revision)?],
                 )?;
                 if bumped != 1 {
                     return Err(StorageError::LeaseLost);
@@ -2825,7 +3000,7 @@ impl Storage {
                 ));
                 checkpoint = Some(checkpoint_json.clone());
             }
-            CommitSessionRunUpdate::ObserveEffect {
+            CommitSessionTurnUpdate::ObserveEffect {
                 source_key,
                 effect_id,
                 operation_digest,
@@ -2837,14 +3012,14 @@ impl Storage {
                 validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
                 serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
-                if current.status != RunStatus::Running {
+                if current.status != TurnStatus::Running {
                     return Err(StorageError::InvalidData(
                         "effect observation requires a running linked child".into(),
                     ));
                 }
                 let changed = tx.execute(
-                    "UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND run_id=?5 AND status='started' AND approval_digest=?6",
-                    params![if *success { "observed_success" } else { "observed_failed" },serde_json::to_string(&redact_session_value(serde_json::json!({"result":result,"payload":payload.clone()}))).map_err(invalid_json)?,to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                    "UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND turn_id=?5 AND status='started' AND approval_digest=?6",
+                    params![if *success { "observed_success" } else { "observed_failed" },serde_json::to_string(&redact_session_value(serde_json::json!({"result":result,"payload":payload.clone()}))).map_err(invalid_json)?,to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::EffectFenced);
@@ -2857,7 +3032,7 @@ impl Storage {
                 ));
                 checkpoint = Some(checkpoint_json.clone());
             }
-            CommitSessionRunUpdate::UnknownEffect {
+            CommitSessionTurnUpdate::UnknownEffect {
                 source_key,
                 effect_id,
                 operation_digest,
@@ -2867,8 +3042,8 @@ impl Storage {
                 validate_session_digest(operation_digest)?;
                 serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
                 let changed = tx.execute(
-                    r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"uncertain"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started' AND approval_digest=?4"#,
-                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string(),operation_digest],
+                    r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"uncertain"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='started' AND approval_digest=?4"#,
+                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::EffectFenced);
@@ -2879,7 +3054,7 @@ impl Storage {
                 next = cancelling
                     .transition(cancelling.revision, Transition::Interrupt)
                     .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 reconciliation_effect = Some(redact_session_text(effect_id));
                 next_lifecycle = "reconciliation_required".into();
@@ -2893,7 +3068,7 @@ impl Storage {
                 ));
                 checkpoint = Some(checkpoint_json.clone());
             }
-            CommitSessionRunUpdate::ReconcileUnknownEffect {
+            CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key,
                 effect_id,
                 checkpoint_json,
@@ -2901,8 +3076,8 @@ impl Storage {
                 validate_session_effect_id(effect_id)?;
                 serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
                 let changed = tx.execute(
-                    r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"reconciliation":"acknowledged_failed"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='unknown'"#,
-                    params![to_i64(now_ms)?,effect_id,request.run_id.to_string()],
+                    r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"reconciliation":"acknowledged_failed"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='unknown'"#,
+                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string()],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::InvalidData(
@@ -2915,20 +3090,20 @@ impl Storage {
                     // explicit acknowledgement terminalizes that exact
                     // interrupted child without fabricating a legal v1
                     // transition that the state machine does not expose.
-                    if current.status != RunStatus::Interrupted {
+                    if current.status != TurnStatus::Interrupted {
                         return Err(StorageError::InvalidData(
                             "recovered reconciliation requires an interrupted child".into(),
                         ));
                     }
-                    next.status = RunStatus::Failed;
+                    next.status = TurnStatus::Failed;
                     next.revision = current
                         .revision
                         .checked_add(1)
                         .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-                    next.failure = Some(RunFailure {
+                    next.failure = Some(TurnFailure {
                         code: FailureCode::RuntimeFailed,
                         message: format!(
-                            "unknown effect {} acknowledged failed; run aborted",
+                            "unknown effect {} acknowledged failed; turn aborted",
                             redact_session_text(effect_id)
                         ),
                         retryability: Retryability::Terminal,
@@ -2939,10 +3114,10 @@ impl Storage {
                     next = current
                         .transition(
                             current.revision,
-                            Transition::Fail(RunFailure {
+                            Transition::Fail(TurnFailure {
                                 code: FailureCode::RuntimeFailed,
                                 message: format!(
-                                    "unknown effect {} acknowledged failed; run aborted",
+                                    "unknown effect {} acknowledged failed; turn aborted",
                                     redact_session_text(effect_id)
                                 ),
                                 retryability: Retryability::Terminal,
@@ -2950,12 +3125,12 @@ impl Storage {
                         )
                         .map_err(|error| StorageError::InvalidData(error.to_string()))?;
                 }
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 next_lifecycle = "failed".into();
                 card = Some((
                     TranscriptKind::Failure,
-                    "unknown effect acknowledged failed; run aborted".into(),
+                    "unknown effect acknowledged failed; turn aborted".into(),
                     Some(
                         serde_json::json!({"effect_id":redact_session_text(effect_id),"status":"reconciled"}),
                     ),
@@ -2963,7 +3138,7 @@ impl Storage {
                 ));
                 checkpoint = Some(checkpoint_json.clone());
             }
-            CommitSessionRunUpdate::RequestPermission {
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key,
                 request: pending,
             } => {
@@ -2973,7 +3148,7 @@ impl Storage {
                         Transition::RequestPermission(redact_permission(pending)),
                     )
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 next_lifecycle = "waiting_permission".into();
                 card = Some((
                     TranscriptKind::Permission,
@@ -2985,7 +3160,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::ResolvePermission {
+            CommitSessionTurnUpdate::ResolvePermission {
                 source_key,
                 request_id,
                 allow,
@@ -3000,7 +3175,7 @@ impl Storage {
                         },
                     )
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 terminal = !allow;
                 next_lifecycle = if *allow {
                     "running".into()
@@ -3019,13 +3194,13 @@ impl Storage {
                     // in this same permission-resolution transaction.
                     let pending: Option<(i64, String, i64, String, String)> = tx
                         .query_row(
-                            "SELECT p.run_revision,p.lease_owner,p.lease_token,\
+                            "SELECT p.turn_revision,p.lease_owner,p.lease_token,\
                                     p.approval_digest,e.approval_digest \
                              FROM pending_permissions p \
-                             JOIN effects e ON e.effect_id=p.effect_id AND e.run_id=p.run_id \
-                             WHERE p.effect_id=?1 AND p.run_id=?2 \
+                             JOIN effects e ON e.effect_id=p.effect_id AND e.turn_id=p.turn_id \
+                             WHERE p.effect_id=?1 AND p.turn_id=?2 \
                                AND p.consumed_at_ms IS NULL AND e.status='prepared'",
-                            params![request_id, request.run_id.to_string()],
+                            params![request_id, request.turn_id.to_string()],
                             |row| {
                                 Ok((
                                     row.get(0)?,
@@ -3057,26 +3232,26 @@ impl Storage {
                             validate_session_digest(digest)?;
                             let effect_changed = tx.execute(
                                 "UPDATE effects SET approval_digest=?1 \
-                                 WHERE effect_id=?2 AND run_id=?3 AND status='prepared' \
+                                 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared' \
                                    AND approval_digest=?4",
                                 params![
                                     digest,
                                     request_id,
-                                    request.run_id.to_string(),
+                                    request.turn_id.to_string(),
                                     effect_digest
                                 ],
                             )?;
                             let permission_changed = tx.execute(
                                 "UPDATE pending_permissions \
                                  SET lease_owner=?1,lease_token=?2,approval_digest=?3 \
-                                 WHERE effect_id=?4 AND run_id=?5 AND run_revision=?6 \
+                                 WHERE effect_id=?4 AND turn_id=?5 AND turn_revision=?6 \
                                    AND approval_digest=?7 AND consumed_at_ms IS NULL",
                                 params![
                                     lease.owner,
                                     to_i64(lease.fencing_token)?,
                                     digest,
                                     request_id,
-                                    request.run_id.to_string(),
+                                    request.turn_id.to_string(),
                                     to_i64(next.revision)?,
                                     pending_digest
                                 ],
@@ -3115,16 +3290,16 @@ impl Storage {
                     // records a terminal non-execution observation in the
                     // same transaction which removes the active child.
                     tx.execute(
-                        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND consumed_at_ms IS NULL",
-                        params![to_i64(now_ms)?, request_id, request.run_id.to_string()],
+                        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND consumed_at_ms IS NULL",
+                        params![to_i64(now_ms)?, request_id, request.turn_id.to_string()],
                     )?;
                     tx.execute(
-                        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"permission":"denied_before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared'"#,
-                        params![to_i64(now_ms)?, request_id, request.run_id.to_string()],
+                        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"permission":"denied_before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared'"#,
+                        params![to_i64(now_ms)?, request_id, request.turn_id.to_string()],
                     )?;
                 }
             }
-            CommitSessionRunUpdate::RequestInput {
+            CommitSessionTurnUpdate::RequestInput {
                 source_key,
                 request: pending,
             } => {
@@ -3134,7 +3309,7 @@ impl Storage {
                         Transition::RequestInput(redact_input(pending)),
                     )
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 next_lifecycle = "waiting_input".into();
                 card = Some((
                     TranscriptKind::Input,
@@ -3146,7 +3321,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::ProvideInput {
+            CommitSessionTurnUpdate::ProvideInput {
                 source_key,
                 request_id,
                 value,
@@ -3159,7 +3334,7 @@ impl Storage {
                         },
                     )
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 next_lifecycle = "running".into();
                 card = Some((
                     TranscriptKind::User,
@@ -3168,7 +3343,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::Complete {
+            CommitSessionTurnUpdate::Complete {
                 source_key,
                 handoff,
             } => {
@@ -3181,7 +3356,7 @@ impl Storage {
                         },
                     )
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 next_lifecycle = "ready".into();
                 card = Some((
@@ -3196,7 +3371,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::CompleteVerified {
+            CommitSessionTurnUpdate::CompleteVerified {
                 source_key,
                 summary,
                 verification_effect_id,
@@ -3204,14 +3379,14 @@ impl Storage {
                 files_changed,
             } => {
                 let effect_epoch = from_i64(tx.query_row(
-                    "SELECT effect_epoch FROM runs WHERE run_id=?1",
-                    [request.run_id.to_string()],
+                    "SELECT effect_epoch FROM turns WHERE turn_id=?1",
+                    [request.turn_id.to_string()],
                     |row| row.get::<_, i64>(0),
                 )?)?;
                 let metadata: Option<String> = tx
                     .query_row(
-                        "SELECT metadata_json FROM evidence WHERE run_id=?1 ORDER BY rowid DESC LIMIT 1",
-                        [request.run_id.to_string()],
+                        "SELECT metadata_json FROM evidence WHERE turn_id=?1 ORDER BY rowid DESC LIMIT 1",
+                        [request.turn_id.to_string()],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -3260,7 +3435,7 @@ impl Storage {
                         },
                     )
                     .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 next_lifecycle = "ready".into();
                 card = Some((
@@ -3275,7 +3450,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::Fail {
+            CommitSessionTurnUpdate::Fail {
                 source_key,
                 failure,
             } => {
@@ -3283,7 +3458,7 @@ impl Storage {
                 next = current
                     .transition(current.revision, Transition::Fail(redact_failure(failure)))
                     .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 // A terminal child record and a usable conversation are
                 // separate concerns. Provider/configuration failures are
@@ -3301,7 +3476,7 @@ impl Storage {
                     format!("{source_key}:card"),
                 ));
             }
-            CommitSessionRunUpdate::Interrupt {
+            CommitSessionTurnUpdate::Interrupt {
                 source_key,
                 reconciliation_effect_id,
             } => {
@@ -3310,7 +3485,7 @@ impl Storage {
                     .map(|value| redact_session_text(value));
                 if matches!(
                     current.status,
-                    RunStatus::WaitingPermission | RunStatus::WaitingInput
+                    TurnStatus::WaitingPermission | TurnStatus::WaitingInput
                 ) {
                     // Waiting requests have not started an external effect. The
                     // mandatory cancellation mapping is terminal Cancelled,
@@ -3319,10 +3494,10 @@ impl Storage {
                         .revision
                         .checked_add(1)
                         .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-                    next.status = RunStatus::Failed;
+                    next.status = TurnStatus::Failed;
                     next.pending_input = None;
                     next.pending_permission = None;
-                    next.failure = Some(RunFailure {
+                    next.failure = Some(TurnFailure {
                         code: FailureCode::Cancelled,
                         message: "run cancelled while waiting".into(),
                         retryability: Retryability::Terminal,
@@ -3331,12 +3506,12 @@ impl Storage {
                     next_lifecycle = "failed".into();
                     if let Some(permission) = current.pending_permission.as_ref() {
                         tx.execute(
-                            "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND consumed_at_ms IS NULL",
-                            params![to_i64(now_ms)?, permission.request_id, request.run_id.to_string()],
+                            "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND consumed_at_ms IS NULL",
+                            params![to_i64(now_ms)?, permission.request_id, request.turn_id.to_string()],
                         )?;
                         tx.execute(
-                            r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"cancelled":"before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared'"#,
-                            params![to_i64(now_ms)?, permission.request_id, request.run_id.to_string()],
+                            r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"cancelled":"before_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared'"#,
+                            params![to_i64(now_ms)?, permission.request_id, request.turn_id.to_string()],
                         )?;
                     }
                 } else {
@@ -3347,16 +3522,16 @@ impl Storage {
                     if reconciliation_effect.is_none() {
                         reconciliation_effect = tx
                             .query_row(
-                                "SELECT effect_id FROM effects WHERE run_id=?1 AND status='started' ORDER BY rowid DESC LIMIT 1",
-                                [request.run_id.to_string()],
+                                "SELECT effect_id FROM effects WHERE turn_id=?1 AND status='started' ORDER BY rowid DESC LIMIT 1",
+                                [request.turn_id.to_string()],
                                 |row| row.get::<_, String>(0),
                             )
                             .optional()?;
                     }
                     if let Some(effect_id) = reconciliation_effect.as_ref() {
                         tx.execute(
-                            r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"cancelled_after_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started'"#,
-                            params![to_i64(now_ms)?, effect_id, request.run_id.to_string()],
+                            r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"cancelled_after_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='started'"#,
+                            params![to_i64(now_ms)?, effect_id, request.turn_id.to_string()],
                         )?;
                     }
                     let cancelling = current
@@ -3371,14 +3546,14 @@ impl Storage {
                         "interrupted".into()
                     };
                 }
-                run_changed = true;
+                turn_changed = true;
                 terminal = true;
                 card = Some((
                     TranscriptKind::Failure,
                     if reconciliation_effect.is_some() {
                         "effect outcome unknown; reconciliation required".into()
                     } else {
-                        "run interrupted".into()
+                        "turn interrupted".into()
                     },
                     None,
                     format!("{source_key}:card"),
@@ -3391,16 +3566,23 @@ impl Storage {
         let next_sequence = from_i64(last_seq)?
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidData("session sequence overflow".into()))?;
-        if run_changed {
-            append_linked_run_transition(&tx, &current, &next, from_i64(run_seq)?, lease, now_ms)?;
+        if turn_changed {
+            append_linked_turn_transition(
+                &tx,
+                &current,
+                &next,
+                from_i64(turn_seq)?,
+                lease,
+                now_ms,
+            )?;
         } else {
             let changed = tx.execute(
-                "UPDATE runs SET lease_token=?1,updated_at_ms=?2 \
-                 WHERE run_id=?3 AND lease_token<=?1",
+                "UPDATE turns SET lease_token=?1,updated_at_ms=?2 \
+                 WHERE turn_id=?3 AND lease_token<=?1",
                 params![
                     to_i64(lease.fencing_token)?,
                     to_i64(now_ms)?,
-                    request.run_id.to_string()
+                    request.turn_id.to_string()
                 ],
             )?;
             if changed != 1 {
@@ -3409,57 +3591,75 @@ impl Storage {
         }
         if let Some(payload) = checkpoint {
             tx.execute(
-                "INSERT INTO runtime_checkpoints(run_id,payload_json,updated_at_ms) VALUES(?1,?2,?3) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",
-                params![request.run_id.to_string(), payload, to_i64(now_ms)?],
+                "INSERT INTO runtime_checkpoints(turn_id,payload_json,updated_at_ms) VALUES(?1,?2,?3) ON CONFLICT(turn_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",
+                params![request.turn_id.to_string(), payload, to_i64(now_ms)?],
             )?;
         }
         let transcript = if let Some((kind, text, payload, source_key)) = card {
+            // Maintain the authoritative per-turn tool-round counter in the same
+            // transaction as the card it describes. Reconstructing the count
+            // from a transcript projection undercounts once a turn passes the
+            // tail-500 bound or its outbox rows are drained into the JSONL
+            // conversation log. Source-key idempotency above guarantees the
+            // increment is not replayed.
+            let counts_as_tool_round = kind == TranscriptKind::Assistant
+                && payload
+                    .as_ref()
+                    .and_then(|value| value.get("tool_calls"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty());
             let entry = TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
                 sequence: next_sequence,
-                run_id: Some(request.run_id),
+                turn_id: Some(request.turn_id),
                 kind,
                 text,
                 payload,
                 source_key,
                 created_at_ms: now_ms,
             };
-            tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![request.session_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),request.run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+            tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![request.session_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),request.turn_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+            if counts_as_tool_round {
+                tx.execute(
+                    "UPDATE session_turns SET tool_round_count=tool_round_count+1 WHERE turn_id=?1",
+                    [request.turn_id.to_string()],
+                )?;
+            }
             Some(entry)
         } else {
             None
         };
         if terminal {
             tx.execute(
-                "UPDATE session_runs SET completed_at_ms=?1 WHERE run_id=?2",
-                params![to_i64(now_ms)?, request.run_id.to_string()],
+                "UPDATE session_turns SET completed_at_ms=?1 WHERE turn_id=?2",
+                params![to_i64(now_ms)?, request.turn_id.to_string()],
             )?;
             tx.execute(
-                "DELETE FROM session_active_runs WHERE session_id=?1 AND run_id=?2",
-                params![request.session_id.to_string(), request.run_id.to_string()],
+                "DELETE FROM session_active_turns WHERE session_id=?1 AND turn_id=?2",
+                params![request.session_id.to_string(), request.turn_id.to_string()],
             )?;
         } else {
             tx.execute(
-                "UPDATE session_active_runs SET lease_token=?1 WHERE session_id=?2 AND run_id=?3",
+                "UPDATE session_active_turns SET lease_token=?1 WHERE session_id=?2 AND turn_id=?3",
                 params![
                     to_i64(lease.fencing_token)?,
                     request.session_id.to_string(),
-                    request.run_id.to_string()
+                    request.turn_id.to_string()
                 ],
             )?;
         }
-        tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle=?3,latest_run_id=?4,updated_at_ms=?5 WHERE session_id=?6",params![to_i64(next_session_revision)?,to_i64(next_sequence)?,next_lifecycle,request.run_id.to_string(),to_i64(now_ms)?,request.session_id.to_string()])?;
+        tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle=?3,latest_turn_id=?4,updated_at_ms=?5 WHERE session_id=?6",params![to_i64(next_session_revision)?,to_i64(next_sequence)?,next_lifecycle,request.turn_id.to_string(),to_i64(now_ms)?,request.session_id.to_string()])?;
         let event = if let Some(entry) = transcript {
             SessionEvent::TranscriptAppended { entry }
         } else if let Some(effect_id) = reconciliation_effect {
             SessionEvent::ReconciliationRequired {
-                run_id: request.run_id,
+                turn_id: request.turn_id,
                 effect_id,
             }
         } else {
             SessionEvent::LifecycleChanged {
                 lifecycle: parse_lifecycle(&next_lifecycle)?,
-                run_id: Some(request.run_id),
+                turn_id: Some(request.turn_id),
             }
         };
         let envelope = SessionEventEnvelope {
@@ -3492,7 +3692,7 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn append_event(
         &self,
-        next: &RunState,
+        next: &TurnState,
         expected_revision: u64,
         event_id: EventId,
         event: &RuntimeEvent,
@@ -3512,12 +3712,12 @@ impl Storage {
         }
         let (actual, last_seq, token): (i64, i64, i64) = tx
             .query_row(
-                "SELECT revision,last_seq,lease_token FROM runs WHERE run_id=?1",
-                [next.run_id.to_string()],
+                "SELECT revision,last_seq,lease_token FROM turns WHERE turn_id=?1",
+                [next.turn_id.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
-            .ok_or(StorageError::RunNotFound(next.run_id))?;
+            .ok_or(StorageError::TurnNotFound(next.turn_id))?;
         let (actual, last_seq, token) = (from_i64(actual)?, from_i64(last_seq)?, from_i64(token)?);
         if actual != expected_revision {
             return Err(StorageError::StaleRevision {
@@ -3543,16 +3743,16 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id,
-            run_id: next.run_id,
+            turn_id: next.turn_id,
             revision: next.revision,
             event: event.clone(),
         };
         let state_json = serde_json::to_string(next).map_err(invalid_json)?;
         let event_json = serde_json::to_string(&envelope).map_err(invalid_json)?;
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![next.run_id.to_string(), to_i64(sequence)?, event_id.to_string(), to_i64(next.revision)?, event_json, to_i64(now_ms)?])?;
-        let changed = tx.execute("UPDATE runs SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE run_id=?7 AND revision=?8",
-            params![state_json, status_name(next.status), to_i64(next.revision)?, to_i64(sequence)?, to_i64(lease.fencing_token)?, to_i64(now_ms)?, next.run_id.to_string(), to_i64(expected_revision)?])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![next.turn_id.to_string(), to_i64(sequence)?, event_id.to_string(), to_i64(next.revision)?, event_json, to_i64(now_ms)?])?;
+        let changed = tx.execute("UPDATE turns SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE turn_id=?7 AND revision=?8",
+            params![state_json, status_name(next.status), to_i64(next.revision)?, to_i64(sequence)?, to_i64(lease.fencing_token)?, to_i64(now_ms)?, next.turn_id.to_string(), to_i64(expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
@@ -3560,12 +3760,12 @@ impl Storage {
             });
         }
         tx.execute(
-            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE turn_id=?4",
             params![
                 to_i64(next.revision)?,
                 to_i64(sequence)?,
                 serde_json::to_string(next).map_err(invalid_json)?,
-                next.run_id.to_string()
+                next.turn_id.to_string()
             ],
         )?;
         tx.commit()?;
@@ -3573,12 +3773,12 @@ impl Storage {
     }
     pub(crate) fn apply_transition(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         transition: Transition,
         now_ms: u64,
         lease: &Lease,
-    ) -> Result<(RunState, StoredEvent), StorageError> {
+    ) -> Result<(TurnState, StoredEvent), StorageError> {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3587,11 +3787,11 @@ impl Storage {
             return Err(StorageError::LeaseLost);
         }
         let (json, last_seq, token): (String, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+            "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let current: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
+        let current: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
         if current.revision != expected_revision {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
@@ -3617,20 +3817,20 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             revision: next.revision,
             event,
         };
         let state_json = serde_json::to_string(&next).map_err(invalid_json)?;
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![run_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(next.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE runs SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE run_id=?7 AND revision=?8",params![state_json,status_name(next.status),to_i64(next.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,run_id.to_string(),to_i64(expected_revision)?])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![turn_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(next.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE turns SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE turn_id=?7 AND revision=?8",params![state_json,status_name(next.status),to_i64(next.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,turn_id.to_string(),to_i64(expected_revision)?])?;
         tx.execute(
-            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE turn_id=?4",
             params![
                 to_i64(next.revision)?,
                 to_i64(sequence)?,
                 serde_json::to_string(&next).map_err(invalid_json)?,
-                run_id.to_string()
+                turn_id.to_string()
             ],
         )?;
         tx.commit()?;
@@ -3646,14 +3846,14 @@ impl Storage {
         self.acquire_scoped_lease("runtime", owner, None, now_ms, ttl_ms)
     }
 
-    pub(crate) fn acquire_run_lease(
+    pub(crate) fn acquire_turn_lease(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         owner: &str,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
-        self.acquire_scoped_lease("runtime", owner, Some(run_id), now_ms, ttl_ms)
+        self.acquire_scoped_lease("runtime", owner, Some(turn_id), now_ms, ttl_ms)
     }
 
     pub(crate) fn acquire_session_lease(
@@ -3671,7 +3871,7 @@ impl Storage {
         &self,
         scope: &str,
         owner: &str,
-        run_id: Option<RunId>,
+        turn_id: Option<TurnId>,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
@@ -3715,28 +3915,28 @@ impl Storage {
             .ok_or_else(|| StorageError::InvalidData("lease expiry overflow".into()))?;
         tx.execute("INSERT INTO runtime_lease(scope,owner,fencing_token,expires_at_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET owner=excluded.owner,fencing_token=excluded.fencing_token,expires_at_ms=excluded.expires_at_ms", params![scope,owner,to_i64(token)?,to_i64(expires)?])?;
         if scope == "runtime" {
-            if let Some(run_id) = run_id {
+            if let Some(turn_id) = turn_id {
                 let changed = tx.execute(
-                    "UPDATE runs SET lease_token=?1 WHERE run_id=?2 \
-                     AND NOT EXISTS(SELECT 1 FROM session_runs WHERE session_runs.run_id=runs.run_id)",
-                    params![to_i64(token)?, run_id.to_string()],
+                    "UPDATE turns SET lease_token=?1 WHERE turn_id=?2 \
+                     AND NOT EXISTS(SELECT 1 FROM session_turns WHERE session_turns.turn_id=turns.turn_id)",
+                    params![to_i64(token)?, turn_id.to_string()],
                 )?;
                 if changed != 1 {
                     let exists: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1)",
-                        [run_id.to_string()],
+                        "SELECT EXISTS(SELECT 1 FROM turns WHERE turn_id=?1)",
+                        [turn_id.to_string()],
                         |row| row.get(0),
                     )?;
                     return Err(if exists {
-                        StorageError::LinkedRunRequiresSessionCommit
+                        StorageError::LinkedTurnRequiresSessionCommit
                     } else {
-                        StorageError::RunNotFound(run_id)
+                        StorageError::TurnNotFound(turn_id)
                     });
                 }
             } else {
                 tx.execute(
-                    "UPDATE runs SET lease_token=?1 WHERE status='queued' \
-                     AND NOT EXISTS(SELECT 1 FROM session_runs WHERE session_runs.run_id=runs.run_id)",
+                    "UPDATE turns SET lease_token=?1 WHERE status='queued' \
+                     AND NOT EXISTS(SELECT 1 FROM session_turns WHERE session_turns.turn_id=turns.turn_id)",
                     [to_i64(token)?],
                 )?;
             }
@@ -3779,9 +3979,9 @@ impl Storage {
         let mut recovery = None;
         if let Some(session) = lease.scope.strip_prefix("session:") {
             let session_id = parse_session_id(session)?;
-            let active_run: Option<(String, i64)> = tx
+            let active_turn: Option<(String, i64)> = tx
                 .query_row(
-                    "SELECT run_id,lease_token FROM session_active_runs WHERE session_id=?1",
+                    "SELECT turn_id,lease_token FROM session_active_turns WHERE session_id=?1",
                     [session_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -3792,8 +3992,8 @@ impl Storage {
             // acquire a fresh global epoch immediately. Nonzero stale tokens
             // remain distinguishable for conservative startup recovery.
             let quiesced = tx.execute(
-                "UPDATE runs SET lease_token=0 \
-                 WHERE run_id=(SELECT run_id FROM session_active_runs \
+                "UPDATE turns SET lease_token=0 \
+                 WHERE turn_id=(SELECT turn_id FROM session_active_turns \
                                WHERE session_id=?1 AND lease_token=?2) \
                    AND lease_token=?2 \
                    AND status IN ('waiting_permission','waiting_input')",
@@ -3801,20 +4001,20 @@ impl Storage {
             )?;
             if quiesced == 1 {
                 let active_quiesced = tx.execute(
-                    "UPDATE session_active_runs SET lease_token=0 \
+                    "UPDATE session_active_turns SET lease_token=0 \
                      WHERE session_id=?1 AND lease_token=?2",
                     params![session_id.to_string(), to_i64(lease.fencing_token)?],
                 )?;
                 if active_quiesced != 1 {
                     return Err(StorageError::LeaseLost);
                 }
-            } else if let Some((run_id, active_token)) = active_run
+            } else if let Some((turn_id, active_token)) = active_turn
                 && from_i64(active_token)? == lease.fencing_token
             {
-                recovery = recover_linked_session_run(
+                recovery = recover_linked_session_turn(
                     &tx,
                     session_id,
-                    parse_run_id(&run_id)?,
+                    parse_turn_id(&turn_id)?,
                     lease.fencing_token,
                     None,
                     crate::wall_now_ms(),
@@ -3836,13 +4036,13 @@ impl Storage {
     pub(crate) fn start_effect(
         &self,
         id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         now_ms: u64,
     ) -> Result<(), StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.execute(
-            "INSERT INTO effects(effect_id,run_id,status,started_at_ms) VALUES(?1,?2,'started',?3)",
-            params![id, run_id.to_string(), to_i64(now_ms)?],
+            "INSERT INTO effects(effect_id,turn_id,status,started_at_ms) VALUES(?1,?2,'started',?3)",
+            params![id, turn_id.to_string(), to_i64(now_ms)?],
         )?;
         Ok(())
     }
@@ -3850,14 +4050,14 @@ impl Storage {
     pub(crate) fn declare_effect(
         &self,
         id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         attempt: u64,
         descriptor_json: &str,
         now_ms: u64,
     ) -> Result<(), StorageError> {
         serde_json::from_str::<serde_json::Value>(descriptor_json).map_err(invalid_json)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        conn.execute("INSERT INTO effects(effect_id,run_id,status,started_at_ms,attempt,descriptor_json) VALUES(?1,?2,'declared',?3,?4,?5)",params![id,run_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor_json])?;
+        conn.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json) VALUES(?1,?2,'declared',?3,?4,?5)",params![id,turn_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor_json])?;
         Ok(())
     }
     #[cfg(test)]
@@ -3908,7 +4108,7 @@ impl Storage {
         };
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND run_id=?5 AND status='started' AND attempt=?6 AND approval_digest=?7 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?9 AND fencing_token=?10 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?5 AND revision=?11 AND lease_token=?10)",params![status,post_evidence_json,to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
+        let changed=tx.execute("UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND turn_id=?5 AND status='started' AND attempt=?6 AND approval_digest=?7 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?9 AND fencing_token=?10 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM turns WHERE turn_id=?5 AND revision=?11 AND lease_token=?10)",params![status,post_evidence_json,to_i64(now_ms)?,authority.effect_id,authority.turn_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::EffectFenced);
         }
@@ -3923,7 +4123,7 @@ impl Storage {
         require_legacy_runtime_lease(&authority.lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE effects SET status='unknown',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='started' AND attempt=?4 AND approval_digest=?5 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?6 AND owner=?7 AND fencing_token=?8 AND expires_at_ms>?1) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?9 AND lease_token=?8)",params![to_i64(now_ms)?,authority.effect_id,authority.run_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
+        let changed=tx.execute("UPDATE effects SET status='unknown',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='started' AND attempt=?4 AND approval_digest=?5 AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?6 AND owner=?7 AND fencing_token=?8 AND expires_at_ms>?1) AND EXISTS(SELECT 1 FROM turns WHERE turn_id=?3 AND revision=?9 AND lease_token=?8)",params![to_i64(now_ms)?,authority.effect_id,authority.turn_id.to_string(),to_i64(authority.attempt)?,authority.digest,authority.lease.scope,authority.lease.owner,to_i64(authority.lease.fencing_token)?,to_i64(authority.expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::EffectFenced);
         }
@@ -3943,21 +4143,21 @@ impl Storage {
     pub(crate) fn persist_permission(
         &self,
         effect_id: &str,
-        run_id: RunId,
-        run_revision: u64,
+        turn_id: TurnId,
+        turn_revision: u64,
         lease: &Lease,
         digest: &str,
     ) -> Result<(), StorageError> {
         require_legacy_runtime_lease(lease)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        conn.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
+        conn.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,turn_id.to_string(),to_i64(turn_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
         Ok(())
     }
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) fn create_prepared_permission(
         &self,
         effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         bound_revision: u64,
         attempt: u64,
@@ -3970,20 +4170,20 @@ impl Storage {
         serde_json::from_str::<serde_json::Value>(descriptor).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4)",params![run_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?],|r|r.get(0))?;
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN turns r ON r.turn_id=?1 WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4)",params![turn_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?],|r|r.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
-        tx.execute("INSERT INTO effects(effect_id,run_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,?4,?5,?6,'{}',?3)",params![effect_id,run_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor,digest])?;
-        tx.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,run_id.to_string(),to_i64(bound_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
+        tx.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,?4,?5,?6,'{}',?3)",params![effect_id,turn_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor,digest])?;
+        tx.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,turn_id.to_string(),to_i64(bound_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
         tx.commit()?;
         Ok(())
     }
     pub(crate) fn consume_permission_and_start(
         &self,
         effect_id: &str,
-        run_id: RunId,
-        run_revision: u64,
+        turn_id: TurnId,
+        turn_revision: u64,
         lease: &Lease,
         digest: &str,
         now_ms: u64,
@@ -3991,7 +4191,7 @@ impl Storage {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND run_revision=?4 AND lease_owner=?5 AND lease_token=?6 AND approval_digest=?7 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM runs WHERE run_id=?3 AND revision=?4) AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?1)",params![to_i64(now_ms)?,effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest,lease.scope])?;
+        let changed=tx.execute("UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND turn_revision=?4 AND lease_owner=?5 AND lease_token=?6 AND approval_digest=?7 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM turns WHERE turn_id=?3 AND revision=?4) AND EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?8 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?1)",params![to_i64(now_ms)?,effect_id,turn_id.to_string(),to_i64(turn_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest,lease.scope])?;
         if changed != 1 {
             return Err(StorageError::InvalidData(
                 "permission is stale, mismatched, consumed, or lease-invalid".into(),
@@ -4004,8 +4204,8 @@ impl Storage {
             ));
         }
         let epoch_changed = tx.execute(
-            "UPDATE runs SET effect_epoch=effect_epoch+1 WHERE run_id=?1 AND revision=?2 AND lease_token=?3",
-            params![run_id.to_string(), to_i64(run_revision)?, to_i64(lease.fencing_token)?],
+            "UPDATE turns SET effect_epoch=effect_epoch+1 WHERE turn_id=?1 AND revision=?2 AND lease_token=?3",
+            params![turn_id.to_string(), to_i64(turn_revision)?, to_i64(lease.fencing_token)?],
         )?;
         if epoch_changed != 1 {
             return Err(StorageError::LeaseLost);
@@ -4017,8 +4217,8 @@ impl Storage {
         )?)?;
         tx.commit()?;
         Ok(EffectAuthority {
-            run_id,
-            expected_revision: run_revision,
+            turn_id,
+            expected_revision: turn_revision,
             lease: lease.clone(),
             effect_id: effect_id.into(),
             digest: digest.into(),
@@ -4030,8 +4230,8 @@ impl Storage {
         &self,
         old_effect_id: &str,
         new_effect_id: &str,
-        run_id: RunId,
-        run_revision: u64,
+        turn_id: TurnId,
+        turn_revision: u64,
         attempt: u64,
         descriptor_json: &str,
         digest: &str,
@@ -4042,27 +4242,27 @@ impl Storage {
         serde_json::from_str::<serde_json::Value>(descriptor_json).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expected_revision = run_revision.saturating_sub(2);
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN runs r ON r.run_id=?1 JOIN pending_permissions p ON p.run_id=r.run_id JOIN effects e ON e.effect_id=p.effect_id AND e.run_id=p.run_id WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4 AND p.effect_id=?7 AND p.consumed_at_ms IS NULL AND e.status='prepared' AND e.approval_digest=p.approval_digest AND (p.lease_owner<>?3 OR p.lease_token<>?4))",params![run_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?,old_effect_id],|r|r.get(0))?;
+        let expected_revision = turn_revision.saturating_sub(2);
+        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease l JOIN turns r ON r.turn_id=?1 JOIN pending_permissions p ON p.turn_id=r.turn_id JOIN effects e ON e.effect_id=p.effect_id AND e.turn_id=p.turn_id WHERE l.scope=?2 AND l.owner=?3 AND l.fencing_token=?4 AND l.expires_at_ms>?5 AND r.revision=?6 AND r.lease_token=?4 AND p.effect_id=?7 AND p.consumed_at_ms IS NULL AND e.status='prepared' AND e.approval_digest=p.approval_digest AND (p.lease_owner<>?3 OR p.lease_token<>?4))",params![turn_id.to_string(),lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?,to_i64(expected_revision)?,old_effect_id],|r|r.get(0))?;
         if !valid {
             return Err(StorageError::LeaseLost);
         }
-        let deleted = tx.execute("DELETE FROM pending_permissions WHERE effect_id=?1 AND run_id=?2 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM effects e WHERE e.effect_id=?1 AND e.run_id=?2 AND e.status='prepared' AND e.approval_digest=pending_permissions.approval_digest)", params![old_effect_id,run_id.to_string()])?;
-        let abandoned = tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json='{\"abandoned\":\"lease_changed\"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='prepared'",params![to_i64(now_ms)?,old_effect_id,run_id.to_string()])?;
+        let deleted = tx.execute("DELETE FROM pending_permissions WHERE effect_id=?1 AND turn_id=?2 AND consumed_at_ms IS NULL AND EXISTS(SELECT 1 FROM effects e WHERE e.effect_id=?1 AND e.turn_id=?2 AND e.status='prepared' AND e.approval_digest=pending_permissions.approval_digest)", params![old_effect_id,turn_id.to_string()])?;
+        let abandoned = tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json='{\"abandoned\":\"lease_changed\"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared'",params![to_i64(now_ms)?,old_effect_id,turn_id.to_string()])?;
         if deleted != 1 || abandoned != 1 {
             return Err(StorageError::InvalidData(
                 "old pending effect cannot be replaced".into(),
             ));
         }
-        tx.execute("INSERT INTO effects(effect_id,run_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,?4,?5,?6,'{}',?3)",params![new_effect_id,run_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor_json,digest])?;
-        tx.execute("INSERT INTO pending_permissions(effect_id,run_id,run_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![new_effect_id,run_id.to_string(),to_i64(run_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
+        tx.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,?4,?5,?6,'{}',?3)",params![new_effect_id,turn_id.to_string(),to_i64(now_ms)?,to_i64(attempt)?,descriptor_json,digest])?;
+        tx.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![new_effect_id,turn_id.to_string(),to_i64(turn_revision)?,lease.owner,to_i64(lease.fencing_token)?,digest])?;
         tx.commit()?;
         Ok(())
     }
     pub(crate) fn permission_matches(
         &self,
         effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         digest: &str,
@@ -4070,7 +4270,7 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         require_legacy_runtime_lease(lease)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_permissions p JOIN runs r ON r.run_id=p.run_id JOIN runtime_lease l ON l.scope=?4 AND l.owner=?5 WHERE p.effect_id=?1 AND p.run_id=?2 AND p.run_revision=?3 AND p.lease_owner=?5 AND p.lease_token=?6 AND p.approval_digest=?7 AND p.consumed_at_ms IS NULL AND r.revision+1=?3 AND l.fencing_token=?6 AND l.expires_at_ms>?8)",params![effect_id,run_id.to_string(),to_i64(expected_revision)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,digest,to_i64(now_ms)?],|r|r.get(0))?)
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pending_permissions p JOIN turns r ON r.turn_id=p.turn_id JOIN runtime_lease l ON l.scope=?4 AND l.owner=?5 WHERE p.effect_id=?1 AND p.turn_id=?2 AND p.turn_revision=?3 AND p.lease_owner=?5 AND p.lease_token=?6 AND p.approval_digest=?7 AND p.consumed_at_ms IS NULL AND r.revision+1=?3 AND l.fencing_token=?6 AND l.expires_at_ms>?8)",params![effect_id,turn_id.to_string(),to_i64(expected_revision)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,digest,to_i64(now_ms)?],|r|r.get(0))?)
     }
     pub(crate) fn effect_status(&self, id: &str) -> Result<EffectStatus, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
@@ -4105,26 +4305,26 @@ impl Storage {
     pub(crate) fn session_effect_canonical_descriptor(
         &self,
         effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
     ) -> Result<crate::SessionEffectDescriptor, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let json: String = conn.query_row(
-            "SELECT descriptor_json FROM session_effect_canonical WHERE effect_id=?1 AND run_id=?2",
-            params![effect_id, run_id.to_string()],
+            "SELECT descriptor_json FROM session_effect_canonical WHERE effect_id=?1 AND turn_id=?2",
+            params![effect_id, turn_id.to_string()],
             |row| row.get(0),
         )?;
         serde_json::from_str(&json).map_err(invalid_json)
     }
-    pub(crate) fn unknown_effects_for_run(
+    pub(crate) fn unknown_effects_for_turn(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
     ) -> Result<Vec<String>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT effect_id FROM effects WHERE run_id=?1 AND status='unknown' ORDER BY effect_id",
+            "SELECT effect_id FROM effects WHERE turn_id=?1 AND status='unknown' ORDER BY effect_id",
         )?;
         Ok(stmt
-            .query_map([run_id.to_string()], |row| row.get(0))?
+            .query_map([turn_id.to_string()], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -4135,9 +4335,9 @@ impl Storage {
     pub(crate) fn recover_session_after_lease_loss(
         &self,
         session_id: latte_core::SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         lost_lease: &Lease,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         now_ms: u64,
     ) -> Result<SessionLeaseLossRecovery, StorageError> {
         let expected_scope = session_lease_scope(session_id);
@@ -4161,30 +4361,30 @@ impl Storage {
         }
         let state_json: Option<String> = tx
             .query_row(
-                "SELECT state_json FROM runs WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT state_json FROM turns WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
         let Some(state_json) = state_json else {
-            return Err(StorageError::RunNotFound(run_id));
+            return Err(StorageError::TurnNotFound(turn_id));
         };
-        let state: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+        let state: TurnState = serde_json::from_str(&state_json).map_err(invalid_json)?;
         if matches!(
             state.status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+            TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
         ) {
             let snapshot =
                 current_session_snapshot(&tx, session_id, SESSION_PROJECTION_TRANSCRIPT_LIMIT)?;
             tx.commit()?;
             return Ok(SessionLeaseLossRecovery::AlreadyTerminal(snapshot));
         }
-        let response = recover_linked_session_run(
+        let response = recover_linked_session_turn(
             &tx,
             session_id,
-            run_id,
+            turn_id,
             lost_lease.fencing_token,
-            Some(expected_run_revision),
+            Some(expected_turn_revision),
             now_ms,
         )?;
         let Some(response) = response else {
@@ -4196,7 +4396,7 @@ impl Storage {
     }
     pub(crate) fn interrupt_after_lease_loss(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         lost_lease: &Lease,
         expected_revision: u64,
         now_ms: u64,
@@ -4210,19 +4410,20 @@ impl Storage {
                 "lease is still authoritative".into(),
             ));
         }
-        let (json, last_seq, run_token): (String, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+        let (json, last_seq, turn_token): (String, i64, i64) = tx.query_row(
+            "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let mut state: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
-        if from_i64(run_token)? != lost_lease.fencing_token || state.revision != expected_revision {
+        let mut state: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
+        if from_i64(turn_token)? != lost_lease.fencing_token || state.revision != expected_revision
+        {
             return Ok(LeaseLossRecovery::FencedNoop);
         }
-        if !matches!(state.status, RunStatus::Running | RunStatus::Cancelling) {
+        if !matches!(state.status, TurnStatus::Running | TurnStatus::Cancelling) {
             return Ok(LeaseLossRecovery::AlreadyTerminal(state));
         }
-        state.status = RunStatus::Interrupted;
+        state.status = TurnStatus::Interrupted;
         state.revision = state
             .revision
             .checked_add(1)
@@ -4233,27 +4434,27 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             revision: state.revision,
             event: RuntimeEvent::StateChanged {
-                status: RunStatus::Interrupted,
+                status: TurnStatus::Interrupted,
             },
         };
         let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![run_id.to_string(),to_i64(seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE runs SET state_json=?1,status='interrupted',revision=?2,last_seq=?3,updated_at_ms=?4 WHERE run_id=?5",params![state_json,to_i64(state.revision)?,to_i64(seq)?,to_i64(now_ms)?,run_id.to_string()])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![turn_id.to_string(),to_i64(seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE turns SET state_json=?1,status='interrupted',revision=?2,last_seq=?3,updated_at_ms=?4 WHERE turn_id=?5",params![state_json,to_i64(state.revision)?,to_i64(seq)?,to_i64(now_ms)?,turn_id.to_string()])?;
         tx.execute(
-            "UPDATE run_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE turn_id=?4",
             params![
                 serde_json::to_string(&state).map_err(invalid_json)?,
                 to_i64(state.revision)?,
                 to_i64(seq)?,
-                run_id.to_string()
+                turn_id.to_string()
             ],
         )?;
         tx.execute(
-            "UPDATE effects SET status='unknown' WHERE run_id=?1 AND status='started'",
-            [run_id.to_string()],
+            "UPDATE effects SET status='unknown' WHERE turn_id=?1 AND status='started'",
+            [turn_id.to_string()],
         )?;
         tx.commit()?;
         Ok(LeaseLossRecovery::Interrupted(state))
@@ -4261,12 +4462,12 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn reconcile_unknown_and_abort(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         effect_id: &str,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<RunState, StorageError> {
+    ) -> Result<TurnState, StorageError> {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4275,31 +4476,31 @@ impl Storage {
             return Err(StorageError::LeaseLost);
         }
         let (json, last_seq, token): (String, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+            "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let mut state: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
+        let mut state: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
         if state.revision != expected_revision || from_i64(token)? != lease.fencing_token {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
                 actual: state.revision,
             });
         }
-        let changed=tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json='{\"reconciliation\":\"acknowledged_failed\"}',observed_at_ms=?1 WHERE effect_id=?2 AND run_id=?3 AND status='unknown'",params![to_i64(now_ms)?,effect_id,run_id.to_string()])?;
+        let changed=tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json='{\"reconciliation\":\"acknowledged_failed\"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='unknown'",params![to_i64(now_ms)?,effect_id,turn_id.to_string()])?;
         if changed != 1 {
             return Err(StorageError::InvalidData(
                 "unknown effect does not belong to run".into(),
             ));
         }
-        state.status = RunStatus::Failed;
+        state.status = TurnStatus::Failed;
         state.revision = state
             .revision
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-        state.failure = Some(RunFailure {
+        state.failure = Some(TurnFailure {
             code: FailureCode::RuntimeFailed,
-            message: format!("unknown effect {effect_id} acknowledged failed; run aborted"),
+            message: format!("unknown effect {effect_id} acknowledged failed; turn aborted"),
             retryability: Retryability::Terminal,
         });
         state.pending_permission = None;
@@ -4310,22 +4511,22 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             revision: state.revision,
             event: RuntimeEvent::StateChanged {
-                status: RunStatus::Failed,
+                status: TurnStatus::Failed,
             },
         };
         let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![run_id.to_string(),to_i64(seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE runs SET state_json=?1,status='failed',revision=?2,last_seq=?3,updated_at_ms=?4 WHERE run_id=?5",params![state_json,to_i64(state.revision)?,to_i64(seq)?,to_i64(now_ms)?,run_id.to_string()])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![turn_id.to_string(),to_i64(seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE turns SET state_json=?1,status='failed',revision=?2,last_seq=?3,updated_at_ms=?4 WHERE turn_id=?5",params![state_json,to_i64(state.revision)?,to_i64(seq)?,to_i64(now_ms)?,turn_id.to_string()])?;
         tx.execute(
-            "UPDATE run_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE turn_id=?4",
             params![
                 serde_json::to_string(&state).map_err(invalid_json)?,
                 to_i64(state.revision)?,
                 to_i64(seq)?,
-                run_id.to_string()
+                turn_id.to_string()
             ],
         )?;
         tx.commit()?;
@@ -4334,7 +4535,7 @@ impl Storage {
 
     pub(crate) fn record_verification_evidence(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         evidence: &VerificationEvidence<'_>,
@@ -4347,8 +4548,8 @@ impl Storage {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let linked_session: Option<String> = tx
             .query_row(
-                "SELECT session_id FROM session_runs WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT session_id FROM session_turns WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4362,17 +4563,17 @@ impl Storage {
             );
         require_lease_scope(lease, &expected_scope)?;
         let changed = tx.execute(
-            "INSERT INTO evidence(id,run_id,metadata_json,blob_ref) \
+            "INSERT INTO evidence(id,turn_id,metadata_json,blob_ref) \
              SELECT ?1,?2,?3,?4 \
              WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?5 AND owner=?6 AND fencing_token=?7 AND expires_at_ms>?8) \
-             AND EXISTS(SELECT 1 FROM runs WHERE run_id=?2 AND revision=?9 AND effect_epoch=?10 AND lease_token=?7) \
-             AND ((?11 IS NULL AND NOT EXISTS(SELECT 1 FROM session_runs WHERE run_id=?2)) \
-                  OR EXISTS(SELECT 1 FROM session_runs tr \
-                            JOIN session_active_runs ar ON ar.session_id=tr.session_id AND ar.run_id=tr.run_id \
-                            WHERE tr.run_id=?2 AND tr.session_id=?11 AND ar.lease_token=?7))",
+             AND EXISTS(SELECT 1 FROM turns WHERE turn_id=?2 AND revision=?9 AND effect_epoch=?10 AND lease_token=?7) \
+             AND ((?11 IS NULL AND NOT EXISTS(SELECT 1 FROM session_turns WHERE turn_id=?2)) \
+                  OR EXISTS(SELECT 1 FROM session_turns tr \
+                            JOIN session_active_turns ar ON ar.session_id=tr.session_id AND ar.turn_id=tr.turn_id \
+                            WHERE tr.turn_id=?2 AND tr.session_id=?11 AND ar.lease_token=?7))",
             params![
                 evidence.id,
-                run_id.to_string(),
+                turn_id.to_string(),
                 evidence.metadata_json,
                 evidence.blob_ref,
                 expected_scope,
@@ -4390,11 +4591,11 @@ impl Storage {
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn effect_epoch(&self, run_id: RunId) -> Result<u64, StorageError> {
+    pub(crate) fn effect_epoch(&self, turn_id: TurnId) -> Result<u64, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let value: i64 = conn.query_row(
-            "SELECT effect_epoch FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+            "SELECT effect_epoch FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |row| row.get(0),
         )?;
         from_i64(value)
@@ -4402,14 +4603,14 @@ impl Storage {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) fn complete_verified(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         summary: String,
         current_manifest: &std::collections::BTreeMap<String, String>,
         manifest_digest: &str,
         now_ms: u64,
-    ) -> Result<(RunState, StoredEvent), StorageError> {
+    ) -> Result<(TurnState, StoredEvent), StorageError> {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4422,11 +4623,11 @@ impl Storage {
             return Err(StorageError::LeaseLost);
         }
         let (json, last_seq, token, epoch): (String, i64, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token,effect_epoch FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+            "SELECT state_json,last_seq,lease_token,effect_epoch FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let current: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
+        let current: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
         if current.revision != expected_revision {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
@@ -4439,8 +4640,8 @@ impl Storage {
         let epoch = from_i64(epoch)?;
         let raw: Option<String> = tx
             .query_row(
-                "SELECT metadata_json FROM evidence WHERE run_id=?1 ORDER BY rowid DESC LIMIT 1",
-                [run_id.to_string()],
+                "SELECT metadata_json FROM evidence WHERE turn_id=?1 ORDER BY rowid DESC LIMIT 1",
+                [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4462,8 +4663,8 @@ impl Storage {
         }
         let baseline_json: Option<String> = tx
             .query_row(
-                "SELECT manifest_json FROM run_baselines WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4528,13 +4729,13 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             revision: next.revision,
             event: RuntimeEvent::HandoffProduced { handoff },
         };
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![run_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(next.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![turn_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(next.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
         let state_json = serde_json::to_string(&next).map_err(invalid_json)?;
-        let changed = tx.execute("UPDATE runs SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE run_id=?7 AND revision=?8 AND effect_epoch=?9", params![state_json,status_name(next.status),to_i64(next.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,run_id.to_string(),to_i64(expected_revision)?,to_i64(epoch)?])?;
+        let changed = tx.execute("UPDATE turns SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE turn_id=?7 AND revision=?8 AND effect_epoch=?9", params![state_json,status_name(next.status),to_i64(next.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,turn_id.to_string(),to_i64(expected_revision)?,to_i64(epoch)?])?;
         if changed != 1 {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
@@ -4542,12 +4743,12 @@ impl Storage {
             });
         }
         tx.execute(
-            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE turn_id=?4",
             params![
                 to_i64(next.revision)?,
                 to_i64(sequence)?,
                 serde_json::to_string(&next).map_err(invalid_json)?,
-                run_id.to_string()
+                turn_id.to_string()
             ],
         )?;
         tx.commit()?;
@@ -4555,7 +4756,7 @@ impl Storage {
     }
     pub(crate) fn put_checkpoint(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         payload: &str,
@@ -4565,19 +4766,19 @@ impl Storage {
         serde_json::from_str::<serde_json::Value>(payload).map_err(invalid_json)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed=tx.execute("INSERT INTO runtime_checkpoints(run_id,payload_json,updated_at_ms) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?4 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND revision=?7 AND lease_token=?6) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",params![run_id.to_string(),payload,to_i64(now_ms)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(expected_revision)?])?;
+        let changed=tx.execute("INSERT INTO runtime_checkpoints(turn_id,payload_json,updated_at_ms) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?4 AND owner=?5 AND fencing_token=?6 AND expires_at_ms>?3) AND EXISTS(SELECT 1 FROM turns WHERE turn_id=?1 AND revision=?7 AND lease_token=?6) ON CONFLICT(turn_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",params![turn_id.to_string(),payload,to_i64(now_ms)?,lease.scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(expected_revision)?])?;
         if changed != 1 {
             return Err(StorageError::LeaseLost);
         }
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn checkpoint(&self, run_id: RunId) -> Result<Option<String>, StorageError> {
+    pub(crate) fn checkpoint(&self, turn_id: TurnId) -> Result<Option<String>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         Ok(conn
             .query_row(
-                "SELECT payload_json FROM runtime_checkpoints WHERE run_id=?1",
-                [run_id.to_string()],
+                "SELECT payload_json FROM runtime_checkpoints WHERE turn_id=?1",
+                [turn_id.to_string()],
                 |r| r.get(0),
             )
             .optional()?)
@@ -4585,12 +4786,12 @@ impl Storage {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn cancel_waiting(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
         denied: bool,
-    ) -> Result<(RunState, Option<StoredEvent>), StorageError> {
+    ) -> Result<(TurnState, Option<StoredEvent>), StorageError> {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4599,11 +4800,11 @@ impl Storage {
             return Err(StorageError::LeaseLost);
         }
         let (json, last_seq, token): (String, i64, i64) = tx.query_row(
-            "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-            [run_id.to_string()],
+            "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+            [turn_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let mut state: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
+        let mut state: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
         if state.revision != expected_revision {
             return Err(StorageError::StaleRevision {
                 expected: expected_revision,
@@ -4615,24 +4816,24 @@ impl Storage {
         }
         if matches!(
             state.status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+            TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
         ) {
             tx.commit()?;
             return Ok((state, None));
         }
-        if denied && state.status != RunStatus::WaitingPermission {
+        if denied && state.status != TurnStatus::WaitingPermission {
             return Err(StorageError::InvalidData(
-                "run is not waiting for permission".into(),
+                "turn is not waiting for permission".into(),
             ));
         }
         if !matches!(
             state.status,
-            RunStatus::WaitingPermission | RunStatus::WaitingInput
+            TurnStatus::WaitingPermission | TurnStatus::WaitingInput
         ) {
-            return Err(StorageError::InvalidData("run is not waiting".into()));
+            return Err(StorageError::InvalidData("turn is not waiting".into()));
         }
         if let Some(permission) = state.pending_permission.as_ref() {
-            let removed=tx.execute("DELETE FROM pending_permissions WHERE effect_id=?1 AND run_id=?2 AND approval_digest=?3 AND consumed_at_ms IS NULL",params![permission.request_id,run_id.to_string(),permission.operation_digest])?;
+            let removed=tx.execute("DELETE FROM pending_permissions WHERE effect_id=?1 AND turn_id=?2 AND approval_digest=?3 AND consumed_at_ms IS NULL",params![permission.request_id,turn_id.to_string(),permission.operation_digest])?;
             if removed != 1 {
                 return Err(StorageError::InvalidData(
                     "waiting permission binding is not prepared".into(),
@@ -4643,7 +4844,7 @@ impl Storage {
             } else {
                 "{\"cancelled\":true}"
             };
-            let marked=tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json=?1,observed_at_ms=?2 WHERE effect_id=?3 AND run_id=?4 AND status='prepared'",params![evidence,to_i64(now_ms)?,permission.request_id,run_id.to_string()])?;
+            let marked=tx.execute("UPDATE effects SET status='observed_failed',post_evidence_json=?1,observed_at_ms=?2 WHERE effect_id=?3 AND turn_id=?4 AND status='prepared'",params![evidence,to_i64(now_ms)?,permission.request_id,turn_id.to_string()])?;
             if marked != 1 {
                 return Err(StorageError::InvalidData(
                     "prepared effect cancellation failed".into(),
@@ -4654,10 +4855,10 @@ impl Storage {
             .revision
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-        state.status = RunStatus::Failed;
+        state.status = TurnStatus::Failed;
         state.pending_permission = None;
         state.pending_input = None;
-        state.failure = Some(RunFailure {
+        state.failure = Some(TurnFailure {
             code: if denied {
                 FailureCode::PermissionDenied
             } else {
@@ -4676,27 +4877,27 @@ impl Storage {
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id,
+            turn_id,
             revision: state.revision,
             event: RuntimeEvent::StateChanged {
-                status: RunStatus::Failed,
+                status: TurnStatus::Failed,
             },
         };
         let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![run_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE runs SET state_json=?1,status='failed',revision=?2,last_seq=?3,lease_token=?4,updated_at_ms=?5 WHERE run_id=?6 AND revision=?7",params![state_json,to_i64(state.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,run_id.to_string(),to_i64(expected_revision)?])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![turn_id.to_string(),to_i64(sequence)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE turns SET state_json=?1,status='failed',revision=?2,last_seq=?3,lease_token=?4,updated_at_ms=?5 WHERE turn_id=?6 AND revision=?7",params![state_json,to_i64(state.revision)?,to_i64(sequence)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,turn_id.to_string(),to_i64(expected_revision)?])?;
         tx.execute(
-            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE turn_id=?4",
             params![
                 to_i64(state.revision)?,
                 to_i64(sequence)?,
                 serde_json::to_string(&state).map_err(invalid_json)?,
-                run_id.to_string()
+                turn_id.to_string()
             ],
         )?;
         tx.execute(
-            "DELETE FROM runtime_checkpoints WHERE run_id=?1",
-            [run_id.to_string()],
+            "DELETE FROM runtime_checkpoints WHERE turn_id=?1",
+            [turn_id.to_string()],
         )?;
         tx.commit()?;
         Ok((state, Some(StoredEvent { sequence, envelope })))
@@ -4719,8 +4920,8 @@ impl Storage {
         let mut recovered = Vec::new();
         let linked_rows = {
             let mut stmt = tx.prepare(
-                "SELECT ar.session_id,ar.run_id,r.lease_token FROM session_active_runs ar \
-                 JOIN runs r ON r.run_id=ar.run_id \
+                "SELECT ar.session_id,ar.turn_id,r.lease_token FROM session_active_turns ar \
+                 JOIN turns r ON r.turn_id=ar.turn_id \
                  WHERE r.status IN ('queued','running','cancelling','waiting_permission','waiting_input') \
                  AND r.lease_token<>0 \
                  AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='session:'||ar.session_id AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
@@ -4736,19 +4937,24 @@ impl Storage {
         };
         for (session, run, token) in linked_rows {
             let session_id = parse_session_id(&session)?;
-            let run_id = uuid::Uuid::parse_str(&run)
-                .map(RunId::from_uuid)
+            let turn_id = uuid::Uuid::parse_str(&run)
+                .map(TurnId::from_uuid)
                 .map_err(|error| {
                     StorageError::InvalidData(format!("invalid stored run id: {error}"))
                 })?;
-            if let Some(response) =
-                recover_linked_session_run(&tx, session_id, run_id, from_i64(token)?, None, now_ms)?
-            {
+            if let Some(response) = recover_linked_session_turn(
+                &tx,
+                session_id,
+                turn_id,
+                from_i64(token)?,
+                None,
+                now_ms,
+            )? {
                 recovered.push(response);
             }
         }
         let mut stmt = tx.prepare(
-            "SELECT r.run_id,r.state_json,r.last_seq FROM runs r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM session_runs tr WHERE tr.run_id=r.run_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='runtime' AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
+            "SELECT r.turn_id,r.state_json,r.last_seq FROM turns r WHERE r.status IN ('running','cancelling') AND NOT EXISTS(SELECT 1 FROM session_turns tr WHERE tr.turn_id=r.turn_id) AND NOT EXISTS(SELECT 1 FROM runtime_lease l WHERE l.scope='runtime' AND l.fencing_token=r.lease_token AND l.expires_at_ms>?1)",
         )?;
         let rows = stmt
             .query_map([to_i64(now_ms)?], |r| {
@@ -4761,8 +4967,8 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for (id, json, last_seq) in rows {
-            let mut state: RunState = serde_json::from_str(&json).map_err(invalid_json)?;
-            state.status = RunStatus::Interrupted;
+            let mut state: TurnState = serde_json::from_str(&json).map_err(invalid_json)?;
+            state.status = TurnStatus::Interrupted;
             state.revision = state.revision.checked_add(1).ok_or_else(|| {
                 StorageError::InvalidData("revision overflow during recovery".into())
             })?;
@@ -4773,22 +4979,22 @@ impl Storage {
             let envelope = EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 event_id: EventId::from_uuid(Uuid::now_v7()),
-                run_id: state.run_id,
+                turn_id: state.turn_id,
                 revision: state.revision,
                 event: RuntimeEvent::StateChanged {
-                    status: RunStatus::Interrupted,
+                    status: TurnStatus::Interrupted,
                 },
             };
             tx.execute(
-                "INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![id, to_i64(sequence)?, envelope.event_id.to_string(), to_i64(state.revision)?, serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?],
             )?;
             tx.execute(
-                "UPDATE runs SET state_json=?1,status='interrupted',revision=?2,last_seq=?3 WHERE run_id=?4",
+                "UPDATE turns SET state_json=?1,status='interrupted',revision=?2,last_seq=?3 WHERE turn_id=?4",
                 params![json, to_i64(state.revision)?, to_i64(sequence)?, id],
             )?;
             tx.execute(
-                "UPDATE run_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE run_id=?4",
+                "UPDATE turn_read_model SET state_json=?1,revision=?2,last_seq=?3 WHERE turn_id=?4",
                 params![
                     serde_json::to_string(&state).map_err(invalid_json)?,
                     to_i64(state.revision)?,
@@ -4797,7 +5003,7 @@ impl Storage {
                 ],
             )?;
             tx.execute(
-                "UPDATE effects SET status='unknown' WHERE run_id=?1 AND status='started'",
+                "UPDATE effects SET status='unknown' WHERE turn_id=?1 AND status='started'",
                 [id],
             )?;
         }
@@ -4904,16 +5110,16 @@ fn session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(SessionSumm
     Ok((summary, updated, rowid))
 }
 
-fn status_name(status: RunStatus) -> &'static str {
+fn status_name(status: TurnStatus) -> &'static str {
     match status {
-        RunStatus::Queued => "queued",
-        RunStatus::Running => "running",
-        RunStatus::WaitingPermission => "waiting_permission",
-        RunStatus::WaitingInput => "waiting_input",
-        RunStatus::Cancelling => "cancelling",
-        RunStatus::Interrupted => "interrupted",
-        RunStatus::Failed => "failed",
-        RunStatus::Completed => "completed",
+        TurnStatus::Queued => "queued",
+        TurnStatus::Running => "running",
+        TurnStatus::WaitingPermission => "waiting_permission",
+        TurnStatus::WaitingInput => "waiting_input",
+        TurnStatus::Cancelling => "cancelling",
+        TurnStatus::Interrupted => "interrupted",
+        TurnStatus::Failed => "failed",
+        TurnStatus::Completed => "completed",
     }
 }
 
@@ -4923,9 +5129,9 @@ fn parse_session_id(value: &str) -> Result<latte_core::SessionId, StorageError> 
         .map_err(|error| StorageError::InvalidData(format!("invalid stored session id: {error}")))
 }
 
-fn parse_run_id(value: &str) -> Result<RunId, StorageError> {
+fn parse_turn_id(value: &str) -> Result<TurnId, StorageError> {
     uuid::Uuid::parse_str(value)
-        .map(RunId::from_uuid)
+        .map(TurnId::from_uuid)
         .map_err(|error| StorageError::InvalidData(format!("invalid stored run id: {error}")))
 }
 
@@ -4999,16 +5205,16 @@ fn parse_lifecycle(value: &str) -> Result<SessionLifecycle, StorageError> {
     }
 }
 
-fn session_run_status(status: RunStatus) -> SessionRunStatus {
+fn session_turn_status(status: TurnStatus) -> SessionTurnStatus {
     match status {
-        RunStatus::Queued => SessionRunStatus::Queued,
-        RunStatus::Running => SessionRunStatus::Running,
-        RunStatus::Cancelling => SessionRunStatus::Cancelling,
-        RunStatus::WaitingPermission => SessionRunStatus::WaitingPermission,
-        RunStatus::WaitingInput => SessionRunStatus::WaitingInput,
-        RunStatus::Interrupted => SessionRunStatus::Interrupted,
-        RunStatus::Failed => SessionRunStatus::Failed,
-        RunStatus::Completed => SessionRunStatus::Completed,
+        TurnStatus::Queued => SessionTurnStatus::Queued,
+        TurnStatus::Running => SessionTurnStatus::Running,
+        TurnStatus::Cancelling => SessionTurnStatus::Cancelling,
+        TurnStatus::WaitingPermission => SessionTurnStatus::WaitingPermission,
+        TurnStatus::WaitingInput => SessionTurnStatus::WaitingInput,
+        TurnStatus::Interrupted => SessionTurnStatus::Interrupted,
+        TurnStatus::Failed => SessionTurnStatus::Failed,
+        TurnStatus::Completed => SessionTurnStatus::Completed,
     }
 }
 
@@ -5035,33 +5241,33 @@ fn session_snapshot(
 ) -> Result<SessionSnapshot, StorageError> {
     let (revision, sequence, lifecycle, binding_json, latest, focus): (i64, i64, String, String, Option<String>, Option<String>) = connection
         .query_row(
-            "SELECT revision,last_seq,lifecycle,binding_json,latest_run_id,focus FROM sessions WHERE session_id=?1",
+            "SELECT revision,last_seq,lifecycle,binding_json,latest_turn_id,focus FROM sessions WHERE session_id=?1",
             [session_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()?
         .ok_or(StorageError::SessionNotFound(session_id))?;
     let binding = serde_json::from_str(&binding_json).map_err(invalid_json)?;
-    let latest_run_id = latest
+    let latest_turn_id = latest
         .as_deref()
-        .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+        .map(|value| uuid::Uuid::parse_str(value).map(TurnId::from_uuid))
         .transpose()
         .map_err(|error| StorageError::InvalidData(format!("invalid stored run id: {error}")))?;
-    let active_run_id: Option<String> = connection
+    let active_turn_id: Option<String> = connection
         .query_row(
-            "SELECT run_id FROM session_active_runs WHERE session_id=?1",
+            "SELECT turn_id FROM session_active_turns WHERE session_id=?1",
             [session_id.to_string()],
             |row| row.get(0),
         )
         .optional()?;
-    let active_run_id = active_run_id
+    let active_turn_id = active_turn_id
         .as_deref()
-        .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+        .map(|value| uuid::Uuid::parse_str(value).map(TurnId::from_uuid))
         .transpose()
-        .map_err(|error| StorageError::InvalidData(format!("invalid active run id: {error}")))?;
+        .map_err(|error| StorageError::InvalidData(format!("invalid active turn id: {error}")))?;
     let mut statement = connection.prepare(
-        "SELECT tr.run_id,tr.parent_run_id,tr.ordinal,tr.completed_at_ms,r.state_json
-         FROM session_runs tr JOIN runs r ON r.run_id=tr.run_id
+        "SELECT tr.turn_id,tr.parent_turn_id,tr.ordinal,tr.completed_at_ms,r.state_json
+         FROM session_turns tr JOIN turns r ON r.turn_id=tr.turn_id
          WHERE tr.session_id=?1 ORDER BY tr.ordinal ASC",
     )?;
     let runs = statement
@@ -5076,25 +5282,25 @@ fn session_snapshot(
         })?
         .map(|row| {
             let (run, parent, ordinal, completed, state_json) = row?;
-            let state: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
-            let run_id = uuid::Uuid::parse_str(&run)
-                .map(RunId::from_uuid)
+            let state: TurnState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+            let turn_id = uuid::Uuid::parse_str(&run)
+                .map(TurnId::from_uuid)
                 .map_err(|error| {
                     StorageError::InvalidData(format!("invalid stored run id: {error}"))
                 })?;
-            let parent_run_id = parent
+            let parent_turn_id = parent
                 .as_deref()
-                .map(|value| uuid::Uuid::parse_str(value).map(RunId::from_uuid))
+                .map(|value| uuid::Uuid::parse_str(value).map(TurnId::from_uuid))
                 .transpose()
                 .map_err(|error| {
                     StorageError::InvalidData(format!("invalid parent run id: {error}"))
                 })?;
-            Ok(SessionRunSummary {
-                run_id,
-                parent_run_id,
+            Ok(SessionTurnSummary {
+                turn_id,
+                parent_turn_id,
                 ordinal: from_i64(ordinal)?,
-                status: session_run_status(state.status),
-                run_revision: state.revision,
+                status: session_turn_status(state.status),
+                turn_revision: state.revision,
                 completed_at_ms: completed.map(from_i64).transpose()?,
                 failure_code: state.failure.map(|failure| failure.code),
             })
@@ -5115,13 +5321,13 @@ fn session_snapshot(
     let has_more = entries.len() > bounded_limit;
     entries.truncate(bounded_limit);
     let next_after = entries.last().map(|entry| entry.sequence);
-    let pending = active_run_id.and_then(|active| {
+    let pending = active_turn_id.and_then(|active| {
         runs.iter()
-            .find(|run| run.run_id == active)
+            .find(|run| run.turn_id == active)
             .and_then(|summary| {
                 let state_json: Option<String> = connection
                     .query_row(
-                        "SELECT state_json FROM runs WHERE run_id=?1",
+                        "SELECT state_json FROM turns WHERE turn_id=?1",
                         [active.to_string()],
                         |row| row.get(0),
                     )
@@ -5129,22 +5335,22 @@ fn session_snapshot(
                     .ok()
                     .flatten();
                 let state =
-                    state_json.and_then(|json| serde_json::from_str::<RunState>(&json).ok())?;
+                    state_json.and_then(|json| serde_json::from_str::<TurnState>(&json).ok())?;
                 if let Some(permission) = state.pending_permission {
                     Some(SessionPendingRequest::Permission {
-                        run_id: active,
+                        turn_id: active,
                         request_id: redact_session_text(&permission.request_id),
                         description: redact_session_text(&permission.description),
-                        expected_run_revision: summary.run_revision,
+                        expected_turn_revision: summary.turn_revision,
                     })
                 } else {
                     state
                         .pending_input
                         .map(|input| SessionPendingRequest::Input {
-                            run_id: active,
+                            turn_id: active,
                             request_id: redact_session_text(&input.request_id),
                             prompt: redact_session_text(&input.prompt),
-                            expected_run_revision: summary.run_revision,
+                            expected_turn_revision: summary.turn_revision,
                         })
                 }
             })
@@ -5155,10 +5361,10 @@ fn session_snapshot(
         sequence: from_i64(sequence)?,
         lifecycle: parse_lifecycle(&lifecycle)?,
         binding,
-        latest_run_id,
-        active_run_id,
+        latest_turn_id,
+        active_turn_id,
         pending,
-        runs,
+        turns: runs,
         transcript: TranscriptPage {
             entries,
             next_after,
@@ -5218,23 +5424,23 @@ fn session_transcript_tail(
     })
 }
 
-fn append_linked_run_transition(
+fn append_linked_turn_transition(
     tx: &rusqlite::Transaction<'_>,
-    current: &RunState,
-    next: &RunState,
-    run_last_seq: u64,
+    current: &TurnState,
+    next: &TurnState,
+    turn_last_seq: u64,
     lease: &Lease,
     now_ms: u64,
 ) -> Result<(), StorageError> {
     if next.revision <= current.revision {
         return Err(StorageError::InvalidData(
-            "linked run transition did not advance".into(),
+            "linked turn transition did not advance".into(),
         ));
     }
     // Cancellation is intentionally represented as the two v1 transitions so
     // a v1 reader never observes a revision jump without its cancelling event.
     let mut states = Vec::new();
-    if next.revision == current.revision + 2 && next.status == RunStatus::Interrupted {
+    if next.revision == current.revision + 2 && next.status == TurnStatus::Interrupted {
         states.push(
             current
                 .transition(current.revision, Transition::Cancel)
@@ -5242,7 +5448,7 @@ fn append_linked_run_transition(
         );
     }
     states.push(next.clone());
-    let mut last_seq = run_last_seq;
+    let mut last_seq = turn_last_seq;
     for state in states {
         last_seq = last_seq
             .checked_add(1)
@@ -5257,19 +5463,19 @@ fn append_linked_run_transition(
         let envelope = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             event_id: EventId::from_uuid(Uuid::now_v7()),
-            run_id: state.run_id,
+            turn_id: state.turn_id,
             revision: state.revision,
             event,
         };
-        tx.execute("INSERT INTO events(run_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![state.run_id.to_string(),to_i64(last_seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE runs SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE run_id=?7 AND revision<?3",params![serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(last_seq)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,state.run_id.to_string()])?;
+        tx.execute("INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![state.turn_id.to_string(),to_i64(last_seq)?,envelope.event_id.to_string(),to_i64(state.revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("UPDATE turns SET state_json=?1,status=?2,revision=?3,last_seq=?4,lease_token=?5,updated_at_ms=?6 WHERE turn_id=?7 AND revision<?3",params![serde_json::to_string(&state).map_err(invalid_json)?,status_name(state.status),to_i64(state.revision)?,to_i64(last_seq)?,to_i64(lease.fencing_token)?,to_i64(now_ms)?,state.turn_id.to_string()])?;
         tx.execute(
-            "UPDATE run_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE run_id=?4",
+            "UPDATE turn_read_model SET revision=?1,last_seq=?2,state_json=?3 WHERE turn_id=?4",
             params![
                 to_i64(state.revision)?,
                 to_i64(last_seq)?,
                 serde_json::to_string(&state).map_err(invalid_json)?,
-                state.run_id.to_string()
+                state.turn_id.to_string()
             ],
         )?;
     }
@@ -5281,40 +5487,40 @@ fn append_linked_run_transition(
 /// fencing token, not authority to mutate: it is used only to prove that this
 /// active row and run still belong to the caller/restart being recovered.
 #[allow(clippy::too_many_lines)]
-fn recover_linked_session_run(
+fn recover_linked_session_turn(
     tx: &rusqlite::Transaction<'_>,
     session_id: latte_core::SessionId,
-    run_id: RunId,
+    turn_id: TurnId,
     expected_lease_token: u64,
-    expected_run_revision: Option<u64>,
+    expected_turn_revision: Option<u64>,
     now_ms: u64,
 ) -> Result<Option<SessionCommitResponse>, StorageError> {
     let active: Option<(String, i64)> = tx
         .query_row(
-            "SELECT run_id,lease_token FROM session_active_runs WHERE session_id=?1",
+            "SELECT turn_id,lease_token FROM session_active_turns WHERE session_id=?1",
             [session_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some((active_run_id, active_token)) = active else {
+    let Some((active_turn_id, active_token)) = active else {
         return Ok(None);
     };
-    if active_run_id != run_id.to_string() || from_i64(active_token)? != expected_lease_token {
+    if active_turn_id != turn_id.to_string() || from_i64(active_token)? != expected_lease_token {
         return Ok(None);
     }
-    let (state_json, run_last_seq, run_token): (String, i64, i64) = tx.query_row(
-        "SELECT state_json,last_seq,lease_token FROM runs WHERE run_id=?1",
-        [run_id.to_string()],
+    let (state_json, turn_last_seq, turn_token): (String, i64, i64) = tx.query_row(
+        "SELECT state_json,last_seq,lease_token FROM turns WHERE turn_id=?1",
+        [turn_id.to_string()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if from_i64(run_token)? != expected_lease_token {
+    if from_i64(turn_token)? != expected_lease_token {
         return Ok(None);
     }
-    let current: RunState = serde_json::from_str(&state_json).map_err(invalid_json)?;
-    if expected_run_revision.is_some_and(|expected| expected != current.revision)
+    let current: TurnState = serde_json::from_str(&state_json).map_err(invalid_json)?;
+    if expected_turn_revision.is_some_and(|expected| expected != current.revision)
         || matches!(
             current.status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Interrupted
+            TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
         )
     {
         return Ok(None);
@@ -5330,18 +5536,18 @@ fn recover_linked_session_run(
 
     let started_effect_ids = {
         let mut statement = tx.prepare(
-            "SELECT effect_id FROM effects WHERE run_id=?1 AND status='started' ORDER BY rowid ASC",
+            "SELECT effect_id FROM effects WHERE turn_id=?1 AND status='started' ORDER BY rowid ASC",
         )?;
         statement
-            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
+            .query_map([turn_id.to_string()], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
     let prepared_effect_ids = {
         let mut statement = tx.prepare(
-            "SELECT effect_id FROM effects WHERE run_id=?1 AND status='prepared' ORDER BY rowid ASC",
+            "SELECT effect_id FROM effects WHERE turn_id=?1 AND status='prepared' ORDER BY rowid ASC",
         )?;
         statement
-            .query_map([run_id.to_string()], |row| row.get::<_, String>(0))?
+            .query_map([turn_id.to_string()], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
 
@@ -5350,23 +5556,23 @@ fn recover_linked_session_run(
     // the sole proof that an external outcome may exist, so every such effect
     // becomes Unknown before the active child is cleared.
     tx.execute(
-        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE run_id=?2 AND consumed_at_ms IS NULL",
-        params![to_i64(now_ms)?, run_id.to_string()],
+        "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE turn_id=?2 AND consumed_at_ms IS NULL",
+        params![to_i64(now_ms)?, turn_id.to_string()],
     )?;
     tx.execute(
-        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"recovery":"not_started"}',observed_at_ms=?1 WHERE run_id=?2 AND status='prepared'"#,
-        params![to_i64(now_ms)?, run_id.to_string()],
+        r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"recovery":"not_started"}',observed_at_ms=?1 WHERE turn_id=?2 AND status='prepared'"#,
+        params![to_i64(now_ms)?, turn_id.to_string()],
     )?;
     tx.execute(
-        r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"lease_lost_after_start"}',observed_at_ms=?1 WHERE run_id=?2 AND status='started'"#,
-        params![to_i64(now_ms)?, run_id.to_string()],
+        r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"lease_lost_after_start"}',observed_at_ms=?1 WHERE turn_id=?2 AND status='started'"#,
+        params![to_i64(now_ms)?, turn_id.to_string()],
     )?;
 
     // Keep the checkpoint intact: it is the only restart evidence we may
     // retain without asserting an effect outcome.  The v1 interruption is
     // deliberately one event/revision, matching the legacy recovery path.
     let mut interrupted = current.clone();
-    interrupted.status = RunStatus::Interrupted;
+    interrupted.status = TurnStatus::Interrupted;
     interrupted.revision = current
         .revision
         .checked_add(1)
@@ -5379,23 +5585,23 @@ fn recover_linked_session_run(
         fencing_token: expected_lease_token,
         expires_at_ms: 0,
     };
-    append_linked_run_transition(
+    append_linked_turn_transition(
         tx,
         &current,
         &interrupted,
-        from_i64(run_last_seq)?,
+        from_i64(turn_last_seq)?,
         &stale_fence,
         now_ms,
     )?;
     tx.execute(
-        "UPDATE session_runs SET completed_at_ms=?1 WHERE session_id=?2 AND run_id=?3",
-        params![to_i64(now_ms)?, session_id.to_string(), run_id.to_string()],
+        "UPDATE session_turns SET completed_at_ms=?1 WHERE session_id=?2 AND turn_id=?3",
+        params![to_i64(now_ms)?, session_id.to_string(), turn_id.to_string()],
     )?;
     tx.execute(
-        "DELETE FROM session_active_runs WHERE session_id=?1 AND run_id=?2 AND lease_token=?3",
+        "DELETE FROM session_active_turns WHERE session_id=?1 AND turn_id=?2 AND lease_token=?3",
         params![
             session_id.to_string(),
-            run_id.to_string(),
+            turn_id.to_string(),
             to_i64(expected_lease_token)?
         ],
     )?;
@@ -5421,14 +5627,14 @@ fn recover_linked_session_run(
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: next_sequence,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind,
             text: redact_session_text(&text),
             payload: payload.map(redact_session_value),
             source_key,
             created_at_ms: now_ms,
         };
-        tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![session_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),run_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
+        tx.execute("INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![session_id.to_string(),to_i64(next_sequence)?,entry.entry_id.to_string(),turn_id.to_string(),transcript_kind_name(entry.kind),entry.source_key,serde_json::to_string(&entry).map_err(invalid_json)?,to_i64(now_ms)?])?;
         let envelope = SessionEventEnvelope {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(Uuid::now_v7()),
@@ -5442,9 +5648,9 @@ fn recover_linked_session_run(
     };
     append_card(
         TranscriptKind::System,
-        "lease authority lost; linked run interrupted".into(),
+        "lease authority lost; linked turn interrupted".into(),
         Some(serde_json::json!({"recovery":"lease_lost"})),
-        format!("recovery:{run_id}:{}:interrupted", current.revision),
+        format!("recovery:{turn_id}:{}:interrupted", current.revision),
     )?;
     for (ordinal, effect_id) in started_effect_ids.iter().enumerate() {
         append_card(
@@ -5454,7 +5660,7 @@ fn recover_linked_session_run(
                 "effect_id": redact_session_text(effect_id),
                 "status":"unknown"
             })),
-            format!("recovery:{run_id}:{}:unknown:{ordinal}", current.revision),
+            format!("recovery:{turn_id}:{}:unknown:{ordinal}", current.revision),
         )?;
     }
     for (ordinal, effect_id) in prepared_effect_ids.iter().enumerate() {
@@ -5465,7 +5671,7 @@ fn recover_linked_session_run(
                 "effect_id": redact_session_text(effect_id),
                 "status":"not_started"
             })),
-            format!("recovery:{run_id}:{}:prepared:{ordinal}", current.revision),
+            format!("recovery:{turn_id}:{}:prepared:{ordinal}", current.revision),
         )?;
     }
     next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
@@ -5473,13 +5679,13 @@ fn recover_linked_session_run(
     })?;
     let final_event = if let Some(effect_id) = started_effect_ids.first() {
         SessionEvent::ReconciliationRequired {
-            run_id,
+            turn_id,
             effect_id: redact_session_text(effect_id),
         }
     } else {
         SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Interrupted,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
         }
     };
     let envelope = SessionEventEnvelope {
@@ -5492,12 +5698,12 @@ fn recover_linked_session_run(
     };
     tx.execute("INSERT INTO session_events(session_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![session_id.to_string(),to_i64(next_sequence)?,envelope.event_id.to_string(),to_i64(next_session_revision)?,serde_json::to_string(&envelope).map_err(invalid_json)?,to_i64(now_ms)?])?;
     tx.execute(
-        "UPDATE sessions SET revision=?1,last_seq=?2,lifecycle=?3,latest_run_id=?4,updated_at_ms=?5 WHERE session_id=?6",
+        "UPDATE sessions SET revision=?1,last_seq=?2,lifecycle=?3,latest_turn_id=?4,updated_at_ms=?5 WHERE session_id=?6",
         params![
             to_i64(next_session_revision)?,
             to_i64(next_sequence)?,
             lifecycle,
-            run_id.to_string(),
+            turn_id.to_string(),
             to_i64(now_ms)?,
             session_id.to_string()
         ],
@@ -5525,8 +5731,8 @@ fn redact_input(value: &latte_core::PendingInput) -> latte_core::PendingInput {
         prompt: redact_session_text(&value.prompt),
     }
 }
-fn redact_failure(value: &RunFailure) -> RunFailure {
-    RunFailure {
+fn redact_failure(value: &TurnFailure) -> TurnFailure {
+    TurnFailure {
         code: value.code,
         message: redact_session_text(&value.message),
         retryability: value.retryability,
@@ -5672,10 +5878,10 @@ pub fn legacy_follow_up_command_digest(
 fn session_command_digest(request: &SessionCommitRequest) -> Result<String, StorageError> {
     use sha2::{Digest, Sha256};
     let update = match &request.update {
-        CommitSessionRunUpdate::Start { source_key } => {
+        CommitSessionTurnUpdate::Start { source_key } => {
             serde_json::json!({"kind":"start","source_key":redact_session_text(source_key)})
         }
-        CommitSessionRunUpdate::AppendTranscript {
+        CommitSessionTurnUpdate::AppendTranscript {
             source_key,
             kind,
             text,
@@ -5683,7 +5889,7 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"append_transcript","source_key":redact_session_text(source_key),"card":format!("{kind:?}"),"text":redact_session_text(text),"payload":payload.clone().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::PrepareEffect {
+        CommitSessionTurnUpdate::PrepareEffect {
             source_key,
             effect_id,
             operation_digest,
@@ -5695,7 +5901,7 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"prepare_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"descriptor":serde_json::from_str::<serde_json::Value>(descriptor_json).ok().map(redact_session_value),"policy":match policy { SessionEffectPolicy::Allow=>"allow", SessionEffectPolicy::Ask=>"ask"},"description":redact_session_text(description),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::StartEffect {
+        CommitSessionTurnUpdate::StartEffect {
             source_key,
             effect_id,
             operation_digest,
@@ -5703,7 +5909,7 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"start_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::ObserveEffect {
+        CommitSessionTurnUpdate::ObserveEffect {
             source_key,
             effect_id,
             operation_digest,
@@ -5714,7 +5920,7 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"observe_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"success":success,"result":redact_session_text(result),"payload":payload.clone().map(redact_session_value),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::UnknownEffect {
+        CommitSessionTurnUpdate::UnknownEffect {
             source_key,
             effect_id,
             operation_digest,
@@ -5722,20 +5928,20 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::ReconcileUnknownEffect {
+        CommitSessionTurnUpdate::ReconcileUnknownEffect {
             source_key,
             effect_id,
             checkpoint_json,
         } => {
             serde_json::json!({"kind":"reconcile_unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
         }
-        CommitSessionRunUpdate::RequestPermission {
+        CommitSessionTurnUpdate::RequestPermission {
             source_key,
             request,
         } => {
             serde_json::json!({"kind":"request_permission","source_key":redact_session_text(source_key),"request":redact_permission(request)})
         }
-        CommitSessionRunUpdate::ResolvePermission {
+        CommitSessionTurnUpdate::ResolvePermission {
             source_key,
             request_id,
             allow,
@@ -5743,26 +5949,26 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"resolve_permission","source_key":redact_session_text(source_key),"request_id":redact_session_text(request_id),"allow":allow,"rebound_operation_digest":rebound_operation_digest})
         }
-        CommitSessionRunUpdate::RequestInput {
+        CommitSessionTurnUpdate::RequestInput {
             source_key,
             request,
         } => {
             serde_json::json!({"kind":"request_input","source_key":redact_session_text(source_key),"request":redact_input(request)})
         }
-        CommitSessionRunUpdate::ProvideInput {
+        CommitSessionTurnUpdate::ProvideInput {
             source_key,
             request_id,
             value,
         } => {
             serde_json::json!({"kind":"provide_input","source_key":redact_session_text(source_key),"request_id":redact_session_text(request_id),"value":redact_session_text(value)})
         }
-        CommitSessionRunUpdate::Complete {
+        CommitSessionTurnUpdate::Complete {
             source_key,
             handoff,
         } => {
             serde_json::json!({"kind":"complete","source_key":redact_session_text(source_key),"handoff":redact_handoff(handoff)})
         }
-        CommitSessionRunUpdate::CompleteVerified {
+        CommitSessionTurnUpdate::CompleteVerified {
             source_key,
             summary,
             verification_effect_id,
@@ -5771,13 +5977,13 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         } => {
             serde_json::json!({"kind":"complete_verified","source_key":redact_session_text(source_key),"summary":redact_session_text(summary),"verification_effect_id":redact_session_text(verification_effect_id),"verified_manifest_digest":redact_session_text(verified_manifest_digest),"files_changed":files_changed.iter().map(|path|redact_session_text(path)).collect::<Vec<_>>()})
         }
-        CommitSessionRunUpdate::Fail {
+        CommitSessionTurnUpdate::Fail {
             source_key,
             failure,
         } => {
             serde_json::json!({"kind":"fail","source_key":redact_session_text(source_key),"failure":redact_failure(failure)})
         }
-        CommitSessionRunUpdate::Interrupt {
+        CommitSessionTurnUpdate::Interrupt {
             source_key,
             reconciliation_effect_id,
         } => {
@@ -5785,8 +5991,8 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
         }
     };
     let canonical = serde_json::json!({
-        "session_id":request.session_id.to_string(), "command_id":request.command_id.to_string(), "run_id":request.run_id.to_string(),
-        "expected_session_revision":request.expected_session_revision, "expected_run_revision":request.expected_run_revision,
+        "session_id":request.session_id.to_string(), "command_id":request.command_id.to_string(), "turn_id":request.turn_id.to_string(),
+        "expected_session_revision":request.expected_session_revision, "expected_turn_revision":request.expected_turn_revision,
         "request_id":request.request_id.as_deref().map(redact_session_text), "effect_id":request.effect_id.as_deref().map(redact_session_text), "update":update
     });
     let bytes = serde_json::to_vec(&canonical).map_err(invalid_json)?;
@@ -5812,13 +6018,41 @@ fn validate_session_digest(value: &str) -> Result<(), StorageError> {
 }
 
 #[cfg(test)]
-/// Undoes migration 13 on a fully-migrated database so a test fixture can
+/// Undoes migrations 13-15 on a fully-migrated database so a test fixture can
 /// present a pre-13 layout (the historical v2 table names) to the legacy
-/// importer or to the upgrade path. Mirrors the forward migration: columns
-/// back first, then table names. Test-only.
+/// importer or to the upgrade path. Mirrors the forward migrations: schema 15
+/// (turn→run) first, then 14 (drop the counter), then 13 (session→thread);
+/// columns back before tables. Test-only.
+#[cfg(test)]
+const REVERSE_SCHEMA_15: &str = r"
+    PRAGMA legacy_alter_table=OFF;
+    ALTER TABLE sessions RENAME COLUMN latest_turn_id TO latest_run_id;
+    ALTER TABLE session_effect_canonical RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE conversation_outbox RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE session_active_turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE session_turns RENAME COLUMN parent_turn_id TO parent_run_id;
+    ALTER TABLE session_turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE pending_permissions RENAME COLUMN turn_revision TO run_revision;
+    ALTER TABLE pending_permissions RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE runtime_checkpoints RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_read_model RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_baselines RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE evidence RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE effects RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE events RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turns RENAME COLUMN turn_id TO run_id;
+    ALTER TABLE turn_read_model RENAME TO run_read_model;
+    ALTER TABLE turn_baselines RENAME TO run_baselines;
+    ALTER TABLE turns RENAME TO runs;
+    ALTER TABLE session_active_turns RENAME TO session_active_runs;
+    ALTER TABLE session_turns RENAME TO session_runs;
+    DELETE FROM schema_migrations WHERE version=15;
+";
+
 #[cfg(test)]
 const REVERSE_SCHEMA_13: &str = r"
     PRAGMA legacy_alter_table=OFF;
+    ALTER TABLE session_runs DROP COLUMN tool_round_count;
     DROP INDEX IF EXISTS sessions_workspace_activity;
     DROP INDEX IF EXISTS sessions_parent;
     CREATE INDEX IF NOT EXISTS thread_sessions_workspace_activity
@@ -5839,7 +6073,7 @@ const REVERSE_SCHEMA_13: &str = r"
     ALTER TABLE session_active_runs RENAME TO thread_active_runs_v2;
     ALTER TABLE session_runs RENAME TO thread_runs_v2;
     ALTER TABLE sessions RENAME TO threads_v2;
-    DELETE FROM schema_migrations WHERE version=13;
+    DELETE FROM schema_migrations WHERE version IN (13,14);
 ";
 
 /// Rewrites a fully-migrated on-disk database to the pre-13 layout so a test
@@ -5849,7 +6083,9 @@ const REVERSE_SCHEMA_13: &str = r"
 pub(crate) fn downgrade_database_to_v12_for_legacy_fixture(path: &Path) {
     let connection = Connection::open(path).expect("open legacy fixture database");
     connection
-        .execute_batch(&format!("{REVERSE_SCHEMA_13} PRAGMA user_version=12;"))
+        .execute_batch(&format!(
+            "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13} PRAGMA user_version=12;"
+        ))
         .expect("downgrade fixture database to the pre-13 v2 layout");
 }
 
@@ -5859,10 +6095,10 @@ mod tests {
     use latte_core::{IdSource, SystemIdSource, Transition};
     use tempfile::TempDir;
 
-    fn ids() -> (RunId, EventId) {
+    fn ids() -> (TurnId, EventId) {
         let source = SystemIdSource::default();
         (
-            RunId::from_uuid(source.next_uuid_v7()),
+            TurnId::from_uuid(source.next_uuid_v7()),
             EventId::from_uuid(source.next_uuid_v7()),
         )
     }
@@ -5951,7 +6187,7 @@ mod tests {
 
     #[test]
     fn legacy_import_is_idempotent_preserves_source_and_rejects_foreign_sessions() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let (source_dir, source_path) = db();
         let source = Storage::open(&source_path).unwrap();
@@ -5960,7 +6196,7 @@ mod tests {
         source
             .create_session_v2(
                 session_id,
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 &session_binding(),
                 source_dir.path().to_str().unwrap(),
                 "imported conversation",
@@ -5974,7 +6210,9 @@ mod tests {
         {
             let connection = Connection::open(&source_path).unwrap();
             connection
-                .execute_batch(&format!("{REVERSE_SCHEMA_13} PRAGMA user_version=12;"))
+                .execute_batch(&format!(
+                    "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13} PRAGMA user_version=12;"
+                ))
                 .unwrap();
         }
         let before = std::fs::read(&source_path).unwrap();
@@ -6032,7 +6270,7 @@ mod tests {
         // columns), then peel migrations 10-13 off: undo 13's renames, rebuild
         // `threads_v2` without the columns v10/v12 add, move the transcript to
         // the pre-v7 table name, and drop the v10/v11 workspace infrastructure.
-        use latte_core::{RunId, SessionId};
+        use latte_core::{SessionId, TurnId};
         let (source_dir, source_path) = db();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
@@ -6042,7 +6280,7 @@ mod tests {
             source
                 .create_session_v2(
                     session_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace,
                     "old conversation",
@@ -6054,7 +6292,9 @@ mod tests {
         {
             let conn = Connection::open(&source_path).unwrap();
             conn.execute_batch(
-                &format!("PRAGMA foreign_keys=OFF;\n{}", REVERSE_SCHEMA_13
+                &format!(
+                    "PRAGMA foreign_keys=OFF;\n{REVERSE_SCHEMA_15}{}",
+                    REVERSE_SCHEMA_13
                     .replace(
                         "    ALTER TABLE sessions RENAME TO threads_v2;\n",
                         // Recreate threads_v2 without parent_thread_id / focus.
@@ -6072,7 +6312,7 @@ mod tests {
                     )
                     // The pre-v7 transcript table takes conversation_outbox's place.
                     .replace(
-                        "DELETE FROM schema_migrations WHERE version=13;",
+                        "DELETE FROM schema_migrations WHERE version IN (13,14);",
                         "ALTER TABLE conversation_outbox RENAME TO thread_transcript_v2;\n    \
                          DROP TABLE legacy_imports;\n    DROP TABLE workspaces;\n    DROP TABLE projects;\n    \
                          DROP TABLE runtime_lease;\n    DROP TABLE runtime_lease_epoch;\n    \
@@ -6080,7 +6320,7 @@ mod tests {
                            singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL,\n      \
                            fencing_token INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL\n    \
                          );\n    \
-                         DELETE FROM schema_migrations WHERE version IN (10,11,12,13);\n    \
+                         DELETE FROM schema_migrations WHERE version IN (10,11,12,13,14);\n    \
                          PRAGMA user_version=9;",
                     ),
                 )
@@ -6131,7 +6371,7 @@ mod tests {
         source
             .create_session_v2(
                 session_id,
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 &session_binding(),
                 source_dir.path().to_str().unwrap(),
                 "source",
@@ -6158,7 +6398,9 @@ mod tests {
         {
             let connection = Connection::open(&source_path).unwrap();
             connection
-                .execute_batch(&format!("{REVERSE_SCHEMA_13} PRAGMA user_version=12;"))
+                .execute_batch(&format!(
+                    "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13} PRAGMA user_version=12;"
+                ))
                 .unwrap();
         }
 
@@ -6182,7 +6424,7 @@ mod tests {
         destination
             .create_session_v2(
                 session_id,
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 &session_binding(),
                 source_dir.path().to_str().unwrap(),
                 "collision",
@@ -6207,8 +6449,8 @@ mod tests {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let a = store.acquire_lease("a", 2, 100).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         store
@@ -6217,7 +6459,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 3,
                 &a,
@@ -6235,7 +6477,7 @@ mod tests {
                 1,
                 ids().1,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Interrupted,
+                    status: TurnStatus::Interrupted,
                 },
                 6,
                 &b,
@@ -6258,8 +6500,8 @@ mod tests {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let q = RunState::queued(run);
-        store.create_run(&q, 1).unwrap();
+        let q = TurnState::queued(run);
+        store.create_turn(&q, 1).unwrap();
         let a = store.acquire_lease("a", 2, 5).unwrap();
         let running = q.transition(0, Transition::Start).unwrap();
         store
@@ -6268,7 +6510,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 3,
                 &a,
@@ -6300,8 +6542,8 @@ mod tests {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let q = RunState::queued(run);
-        store.create_run(&q, 1).unwrap();
+        let q = TurnState::queued(run);
+        store.create_turn(&q, 1).unwrap();
         let lease = store.acquire_lease("owner", 2, 100).unwrap();
         let running = q.transition(0, Transition::Start).unwrap();
         store
@@ -6310,7 +6552,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 3,
                 &lease,
@@ -6368,8 +6610,8 @@ mod tests {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let q = RunState::queued(run);
-        store.create_run(&q, 1).unwrap();
+        let q = TurnState::queued(run);
+        store.create_turn(&q, 1).unwrap();
         let a = store.acquire_lease("a", 2, 10).unwrap();
         let running = q.transition(0, Transition::Start).unwrap();
         store
@@ -6378,7 +6620,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 3,
                 &a,
@@ -6401,7 +6643,10 @@ mod tests {
             Err(StorageError::EffectFenced)
         ));
         assert_eq!(store.effect_status("long").unwrap(), EffectStatus::Unknown);
-        assert_eq!(store.load_run(run).unwrap().status, RunStatus::Interrupted);
+        assert_eq!(
+            store.load_turn(run).unwrap().status,
+            TurnStatus::Interrupted
+        );
     }
     #[test]
     fn second_open_is_read_only_while_live_then_recovers_orphan_once() {
@@ -6409,8 +6654,8 @@ mod tests {
         let now = crate::wall_now_ms();
         let first = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let q = RunState::queued(run);
-        first.create_run(&q, now).unwrap();
+        let q = TurnState::queued(run);
+        first.create_turn(&q, now).unwrap();
         let lease = first.acquire_lease("live", now, 10_000).unwrap();
         let running = q.transition(0, Transition::Start).unwrap();
         first
@@ -6419,7 +6664,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 now,
                 &lease,
@@ -6433,21 +6678,21 @@ mod tests {
             .start_prepared_effect("live-effect", "d", now)
             .unwrap();
         let second = Storage::open(&path).unwrap();
-        assert_eq!(second.load_run(run).unwrap(), running);
+        assert_eq!(second.load_turn(run).unwrap(), running);
         assert_eq!(
             second.effect_status("live-effect").unwrap(),
             EffectStatus::Started
         );
         second.recover_at(lease.expires_at_ms() + 1).unwrap();
-        let recovered = second.load_run(run).unwrap();
-        assert_eq!(recovered.status, RunStatus::Interrupted);
+        let recovered = second.load_turn(run).unwrap();
+        assert_eq!(recovered.status, TurnStatus::Interrupted);
         assert_eq!(recovered.revision, 2);
         assert_eq!(
             second.effect_status("live-effect").unwrap(),
             EffectStatus::Unknown
         );
         second.recover_at(lease.expires_at_ms() + 2).unwrap();
-        assert_eq!(second.load_run(run).unwrap(), recovered);
+        assert_eq!(second.load_turn(run).unwrap(), recovered);
     }
 
     #[test]
@@ -6458,8 +6703,8 @@ mod tests {
         let (a, ea) = ids();
         let (b, eb) = ids();
         for (run, event) in [(a, ea), (b, eb)] {
-            let q = RunState::queued(run);
-            store.create_run(&q, 1).unwrap();
+            let q = TurnState::queued(run);
+            store.create_turn(&q, 1).unwrap();
             let r = q.transition(0, Transition::Start).unwrap();
             store
                 .append_event(
@@ -6467,7 +6712,7 @@ mod tests {
                     0,
                     event,
                     &RuntimeEvent::StateChanged {
-                        status: RunStatus::Running,
+                        status: TurnStatus::Running,
                     },
                     2,
                     &lease,
@@ -6485,8 +6730,8 @@ mod tests {
             store.effect_status("effect-a").unwrap(),
             EffectStatus::Unknown
         );
-        assert_eq!(store.load_run(a).unwrap().status, RunStatus::Running);
-        assert_eq!(store.load_run(b).unwrap().status, RunStatus::Running);
+        assert_eq!(store.load_turn(a).unwrap().status, TurnStatus::Running);
+        assert_eq!(store.load_turn(b).unwrap().status, TurnStatus::Running);
     }
 
     #[test]
@@ -6495,8 +6740,8 @@ mod tests {
         let store = Storage::open(&path).unwrap();
         let lease = store.acquire_lease("owner", 1, 100).unwrap();
         let (run, event) = ids();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         store
             .append_event(
@@ -6504,7 +6749,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 2,
                 &lease,
@@ -6515,13 +6760,13 @@ mod tests {
         let failed = store
             .reconcile_unknown_and_abort(run, "unknown", 1, &lease, 4)
             .unwrap();
-        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.status, TurnStatus::Failed);
         assert_eq!(failed.revision, 2);
         assert_eq!(
             store.effect_status("unknown").unwrap(),
             EffectStatus::ObservedFailed
         );
-        assert_eq!(store.load_run(run).unwrap(), failed);
+        assert_eq!(store.load_turn(run).unwrap(), failed);
     }
 
     #[test]
@@ -6529,8 +6774,8 @@ mod tests {
         let (_dir, path) = db();
         let store = Storage::open(&path).unwrap();
         let (run, event) = ids();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let lease = store.acquire_lease("lost", 1, 2).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         store
@@ -6539,7 +6784,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 2,
                 &lease,
@@ -6547,7 +6792,7 @@ mod tests {
             .unwrap();
         store.start_effect("started", run, 2).unwrap();
         assert!(
-            matches!(store.interrupt_after_lease_loss(run,&lease,1,4).unwrap(),LeaseLossRecovery::Interrupted(state) if state.status==RunStatus::Interrupted)
+            matches!(store.interrupt_after_lease_loss(run,&lease,1,4).unwrap(),LeaseLossRecovery::Interrupted(state) if state.status==TurnStatus::Interrupted)
         );
         assert_eq!(
             store.effect_status("started").unwrap(),
@@ -6565,8 +6810,8 @@ mod tests {
         let (run, event) = ids();
         let store = Storage::open(&path).unwrap();
         let lease = store.acquire_lease("owner", 1, 100).unwrap();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         assert_eq!(
             store
@@ -6575,7 +6820,7 @@ mod tests {
                     0,
                     event,
                     &RuntimeEvent::StateChanged {
-                        status: RunStatus::Running
+                        status: TurnStatus::Running
                     },
                     2,
                     &lease
@@ -6590,18 +6835,18 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running
+                    status: TurnStatus::Running
                 },
                 3,
                 &lease
             ),
             Err(StorageError::StaleRevision { .. })
         ));
-        assert_eq!(store.load_run(run).unwrap(), running);
+        assert_eq!(store.load_turn(run).unwrap(), running);
         drop(store);
         let reopened = Storage::open(&path).unwrap();
-        let recovered = reopened.load_run(run).unwrap();
-        assert_eq!(recovered.status, RunStatus::Interrupted);
+        let recovered = reopened.load_turn(run).unwrap();
+        assert_eq!(recovered.status, TurnStatus::Interrupted);
         assert_eq!(recovered.revision, 2);
         assert_eq!(reopened.list_runs().unwrap(), vec![recovered]);
     }
@@ -6623,8 +6868,8 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
         let (run, event) = ids();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         assert!(matches!(
             store.append_event(
@@ -6632,7 +6877,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 26,
                 &first
@@ -6645,7 +6890,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 26,
                 &second,
@@ -6693,15 +6938,15 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
 
-        let (_, linked_run, _) = create_linked_fixture(&store, &ids, "linked authority", 15);
+        let (_, linked_turn, _) = create_linked_fixture(&store, &ids, "linked authority", 15);
         assert!(matches!(
-            store.acquire_run_lease(linked_run, "legacy-linked", 16, 100),
-            Err(StorageError::LinkedRunRequiresSessionCommit)
+            store.acquire_turn_lease(linked_turn, "legacy-linked", 16, 100),
+            Err(StorageError::LinkedTurnRequiresSessionCommit)
         ));
-        let missing_run = RunId::from_uuid(ids.next_uuid_v7());
+        let missing_turn = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(matches!(
-            store.acquire_run_lease(missing_run, "legacy-missing", 17, 100),
-            Err(StorageError::RunNotFound(id)) if id == missing_run
+            store.acquire_turn_lease(missing_turn, "legacy-missing", 17, 100),
+            Err(StorageError::TurnNotFound(id)) if id == missing_turn
         ));
 
         store.release_lease(&takeover).unwrap();
@@ -6713,13 +6958,13 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_session_lease(session_id, 1, 100).unwrap();
         let started = match store
             .create_started_session_v2(
                 None,
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "accepted",
@@ -6739,7 +6984,7 @@ mod tests {
             .unwrap()
             .expect("running release must recover");
         assert_eq!(recovered.snapshot.lifecycle, SessionLifecycle::Interrupted);
-        assert!(recovered.snapshot.active_run_id.is_none());
+        assert!(recovered.snapshot.active_turn_id.is_none());
         assert_eq!(
             store.session_snapshot_v2(session_id, None, 100).unwrap(),
             recovered.snapshot
@@ -6750,15 +6995,16 @@ mod tests {
     fn ready_session_switches_binding_durably_under_exact_session_authority() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let (session_id, run_id, created) = create_linked_fixture(&store, &ids, "switch model", 10);
+        let (session_id, turn_id, created) =
+            create_linked_fixture(&store, &ids, "switch model", 10);
         let lease = store.acquire_session_lease(session_id, 11, 100).unwrap();
         let running = commit_linked(
             &store,
             &ids,
             &lease,
             &created,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "switch:start".into(),
             },
             12,
@@ -6769,10 +7015,10 @@ mod tests {
             &ids,
             &lease,
             &running,
-            run_id,
-            CommitSessionRunUpdate::Fail {
+            turn_id,
+            CommitSessionTurnUpdate::Fail {
                 source_key: "switch:retryable".into(),
-                failure: RunFailure {
+                failure: TurnFailure {
                     code: FailureCode::RuntimeFailed,
                     message: "retry with another model".into(),
                     retryability: Retryability::Retryable,
@@ -6824,12 +7070,12 @@ mod tests {
     fn session_snapshot_projects_failure_code_from_durable_run_state() {
         // The CLI exit-code contract needs to distinguish a permission-denied
         // run from any other terminal failure. failure_code must be projected
-        // from the durable RunState.failure.code, not hardcoded to None.
+        // from the durable TurnState.failure.code, not hardcoded to None.
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
 
         // A terminal permission-denied run projects PermissionDenied.
-        let (denied_session, denied_run, created) =
+        let (denied_session, denied_turn, created) =
             create_linked_fixture(&store, &ids, "denied run", 10);
         let lease = store
             .acquire_session_lease(denied_session, 11, 100)
@@ -6839,8 +7085,8 @@ mod tests {
             &ids,
             &lease,
             &created,
-            denied_run,
-            CommitSessionRunUpdate::Start {
+            denied_turn,
+            CommitSessionTurnUpdate::Start {
                 source_key: "denied:start".into(),
             },
             12,
@@ -6849,23 +7095,23 @@ mod tests {
         // A run still executing has no failure code yet.
         assert_eq!(
             running
-                .runs
+                .turns
                 .iter()
-                .find(|run| run.run_id == denied_run)
+                .find(|run| run.turn_id == denied_turn)
                 .unwrap()
                 .failure_code,
             None,
-            "an active run has no failure code"
+            "an active turn has no failure code"
         );
         let denied = commit_linked(
             &store,
             &ids,
             &lease,
             &running,
-            denied_run,
-            CommitSessionRunUpdate::Fail {
+            denied_turn,
+            CommitSessionTurnUpdate::Fail {
                 source_key: "denied:fail".into(),
-                failure: RunFailure {
+                failure: TurnFailure {
                     code: FailureCode::PermissionDenied,
                     message: "permission was denied".into(),
                     retryability: Retryability::Terminal,
@@ -6876,9 +7122,9 @@ mod tests {
         .snapshot;
         assert_eq!(
             denied
-                .runs
+                .turns
                 .iter()
-                .find(|run| run.run_id == denied_run)
+                .find(|run| run.turn_id == denied_turn)
                 .unwrap()
                 .failure_code,
             Some(FailureCode::PermissionDenied),
@@ -6890,9 +7136,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             reread
-                .runs
+                .turns
                 .iter()
-                .find(|run| run.run_id == denied_run)
+                .find(|run| run.turn_id == denied_turn)
                 .unwrap()
                 .failure_code,
             Some(FailureCode::PermissionDenied),
@@ -6900,7 +7146,7 @@ mod tests {
 
         // An ordinary terminal failure projects RuntimeFailed, so exit-code
         // logic can tell it apart from the permission-denied case.
-        let (failed_session, failed_run, created) =
+        let (failed_session, failed_turn, created) =
             create_linked_fixture(&store, &ids, "failed run", 20);
         let lease = store
             .acquire_session_lease(failed_session, 21, 100)
@@ -6910,8 +7156,8 @@ mod tests {
             &ids,
             &lease,
             &created,
-            failed_run,
-            CommitSessionRunUpdate::Start {
+            failed_turn,
+            CommitSessionTurnUpdate::Start {
                 source_key: "failed:start".into(),
             },
             22,
@@ -6922,10 +7168,10 @@ mod tests {
             &ids,
             &lease,
             &running,
-            failed_run,
-            CommitSessionRunUpdate::Fail {
+            failed_turn,
+            CommitSessionTurnUpdate::Fail {
                 source_key: "failed:fail".into(),
-                failure: RunFailure {
+                failure: TurnFailure {
                     code: FailureCode::RuntimeFailed,
                     message: "runtime blew up".into(),
                     retryability: Retryability::Terminal,
@@ -6936,9 +7182,9 @@ mod tests {
         .snapshot;
         assert_eq!(
             failed
-                .runs
+                .turns
                 .iter()
-                .find(|run| run.run_id == failed_run)
+                .find(|run| run.turn_id == failed_turn)
                 .unwrap()
                 .failure_code,
             Some(FailureCode::RuntimeFailed),
@@ -6950,37 +7196,39 @@ mod tests {
     fn runtime_and_session_lease_scopes_are_bidirectional_authority_boundaries() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let legacy_run = RunId::from_uuid(ids.next_uuid_v7());
-        store.create_run(&RunState::queued(legacy_run), 1).unwrap();
+        let legacy_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        store
+            .create_turn(&TurnState::queued(legacy_turn), 1)
+            .unwrap();
         let runtime_lease = store
-            .acquire_run_lease(legacy_run, "legacy", 2, 1_000)
+            .acquire_turn_lease(legacy_turn, "legacy", 2, 1_000)
             .unwrap();
 
-        let (session_id, linked_run, queued_session) =
+        let (session_id, linked_turn, queued_session) =
             create_linked_fixture(&store, &ids, "scoped", 3);
         let session_lease = store.acquire_session_lease(session_id, 4, 1_000).unwrap();
         assert!(session_lease.fencing_token > runtime_lease.fencing_token);
 
         assert!(matches!(
-            store.apply_transition(legacy_run, 0, Transition::Start, 5, &session_lease),
+            store.apply_transition(legacy_turn, 0, Transition::Start, 5, &session_lease),
             Err(StorageError::LeaseLost)
         ));
         assert_eq!(
-            store.load_run(legacy_run).unwrap().status,
-            RunStatus::Queued
+            store.load_turn(legacy_turn).unwrap().status,
+            TurnStatus::Queued
         );
 
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id: linked_run,
+                    turn_id: linked_turn,
                     expected_session_revision: queued_session.revision,
-                    expected_run_revision: 0,
+                    expected_turn_revision: 0,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitSessionRunUpdate::Start {
+                    update: CommitSessionTurnUpdate::Start {
                         source_key: "wrong-runtime-scope".into(),
                     },
                 },
@@ -6990,20 +7238,20 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
         assert_eq!(
-            store.load_run(linked_run).unwrap().status,
-            RunStatus::Queued
+            store.load_turn(linked_turn).unwrap().status,
+            TurnStatus::Queued
         );
 
         store
-            .apply_transition(legacy_run, 0, Transition::Start, 6, &runtime_lease)
+            .apply_transition(legacy_turn, 0, Transition::Start, 6, &runtime_lease)
             .unwrap();
         commit_linked(
             &store,
             &ids,
             &session_lease,
             &queued_session,
-            linked_run,
-            CommitSessionRunUpdate::Start {
+            linked_turn,
+            CommitSessionTurnUpdate::Start {
                 source_key: "correct-session-scope".into(),
             },
             6,
@@ -7015,7 +7263,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_session_lease(session_id, 10, 1_000).unwrap();
         store
             .connection
@@ -7032,7 +7280,7 @@ mod tests {
             .create_started_session_v2(
                 None,
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "accepted once",
@@ -7044,8 +7292,8 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("injected atomic start failure"));
         assert!(matches!(
-            store.load_run(run_id),
-            Err(StorageError::RunNotFound(id)) if id == run_id
+            store.load_turn(turn_id),
+            Err(StorageError::TurnNotFound(id)) if id == turn_id
         ));
         assert!(matches!(
             store.session_snapshot_v2(session_id, None, 10),
@@ -7070,8 +7318,8 @@ mod tests {
         let (run, event) = ids();
         let store = Storage::open(&path).unwrap();
         let lease = store.acquire_lease("owner", 1, 100).unwrap();
-        let queued = RunState::queued(run);
-        store.create_run(&queued, 1).unwrap();
+        let queued = TurnState::queued(run);
+        store.create_turn(&queued, 1).unwrap();
         let cancelling = queued.transition(0, Transition::Cancel).unwrap();
         store
             .append_event(
@@ -7079,7 +7327,7 @@ mod tests {
                 0,
                 event,
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Cancelling,
+                    status: TurnStatus::Cancelling,
                 },
                 2,
                 &lease,
@@ -7089,7 +7337,10 @@ mod tests {
         assert_eq!(store.effect_status("e").unwrap(), EffectStatus::Started);
         drop(store);
         let store = Storage::open(&path).unwrap();
-        assert_eq!(store.load_run(run).unwrap().status, RunStatus::Interrupted);
+        assert_eq!(
+            store.load_turn(run).unwrap().status,
+            TurnStatus::Interrupted
+        );
         assert_eq!(store.effect_status("e").unwrap(), EffectStatus::Unknown);
     }
 
@@ -7099,8 +7350,8 @@ mod tests {
         let (run, _) = ids();
         {
             let store = Storage::open(&path).unwrap();
-            let queued = RunState::queued(run);
-            store.create_run(&queued, 1).unwrap();
+            let queued = TurnState::queued(run);
+            store.create_turn(&queued, 1).unwrap();
             let lease = store.acquire_lease("owner", 1, 2).unwrap();
             let running = queued.transition(0, Transition::Start).unwrap();
             store
@@ -7109,7 +7360,7 @@ mod tests {
                     0,
                     ids().1,
                     &RuntimeEvent::StateChanged {
-                        status: RunStatus::Running,
+                        status: TurnStatus::Running,
                     },
                     2,
                     &lease,
@@ -7144,7 +7395,7 @@ mod tests {
     fn effect_success_and_failure_store_terminal_observations() {
         let store = Storage::memory().unwrap();
         let (run, _) = ids();
-        store.create_run(&RunState::queued(run), 1).unwrap();
+        store.create_turn(&TurnState::queued(run), 1).unwrap();
         let lease = store.acquire_lease("owner", 2, 100).unwrap();
         for (id, success, status) in [
             ("ok", true, EffectStatus::ObservedSuccess),
@@ -7154,7 +7405,7 @@ mod tests {
             store.prepare_effect(id, "d", "{}", 3).unwrap();
             store.start_prepared_effect(id, "d", 4).unwrap();
             let authority = EffectAuthority {
-                run_id: run,
+                turn_id: run,
                 expected_revision: 0,
                 lease: lease.clone(),
                 effect_id: id.into(),
@@ -7172,7 +7423,7 @@ mod tests {
     fn permission_consumption_rolls_back_when_started_transition_fails() {
         let store = Storage::memory().unwrap();
         let (run, _) = ids();
-        store.create_run(&RunState::queued(run), 1).unwrap();
+        store.create_turn(&TurnState::queued(run), 1).unwrap();
         let lease = store.acquire_lease("owner", 2, 100).unwrap();
         store.declare_effect("atomic", run, 1, "{}", 3).unwrap();
         store.prepare_effect("atomic", "digest", "{}", 3).unwrap();
@@ -7228,7 +7479,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(&format!(
-                "{REVERSE_SCHEMA_13}\
+                "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13}\
                  DROP TABLE thread_effect_canonical_v2; \
                  DROP TABLE legacy_imports; \
                  DROP TABLE workspaces; \
@@ -7304,12 +7555,12 @@ mod tests {
         let (_dir, path) = db();
         let ids = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let store = Storage::open(&path).unwrap();
         store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/old/workspace",
                 "legacy title",
@@ -7321,7 +7572,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(&format!(
-                "{REVERSE_SCHEMA_13}\
+                "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13}\
                  UPDATE threads_v2 SET title='',workspace_root=''; \
                  DROP TABLE legacy_imports; \
                  DROP TABLE workspaces; \
@@ -7388,7 +7639,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session = SessionId::from_uuid(ids.next_uuid_v7());
-        let first = RunId::from_uuid(ids.next_uuid_v7());
+        let first = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
             version: 1,
             provider_name: "p".into(),
@@ -7417,26 +7668,26 @@ mod tests {
         assert_eq!(initial.sequence, 1);
         assert_eq!(initial.transcript.entries[0].sequence, 1);
         assert!(!initial.transcript.entries[0].text.contains("sk-this"));
-        assert!(store.is_session_linked_run(first).unwrap());
+        assert!(store.is_session_linked_turn(first).unwrap());
         let lease = store.acquire_session_lease(session, 2, 100).unwrap();
         let start = SessionCommitRequest {
             session_id: session,
-            run_id: first,
+            turn_id: first,
             expected_session_revision: 0,
-            expected_run_revision: 0,
+            expected_turn_revision: 0,
             command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
             request_id: None,
             effect_id: None,
-            update: CommitSessionRunUpdate::Start {
+            update: CommitSessionTurnUpdate::Start {
                 source_key: "start".into(),
             },
         };
-        let started = store.commit_session_run_update(&start, &lease, 3).unwrap();
-        assert_eq!(started.snapshot.runs[0].run_revision, 1);
-        let replay = store.commit_session_run_update(&start, &lease, 4).unwrap();
+        let started = store.commit_session_turn_update(&start, &lease, 3).unwrap();
+        assert_eq!(started.snapshot.turns[0].turn_revision, 1);
+        let replay = store.commit_session_turn_update(&start, &lease, 4).unwrap();
         assert_eq!(replay, started);
         let changed = SessionCommitRequest {
-            update: CommitSessionRunUpdate::AppendTranscript {
+            update: CommitSessionTurnUpdate::AppendTranscript {
                 source_key: "other".into(),
                 kind: TranscriptKind::Assistant,
                 text: "different".into(),
@@ -7445,18 +7696,18 @@ mod tests {
             ..start.clone()
         };
         assert!(matches!(
-            store.commit_session_run_update(&changed, &lease, 5),
+            store.commit_session_turn_update(&changed, &lease, 5),
             Err(StorageError::SessionCommandReplayMismatch)
         ));
         let completed = SessionCommitRequest {
             session_id: session,
-            run_id: first,
+            turn_id: first,
             expected_session_revision: 1,
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
             command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
             request_id: None,
             effect_id: None,
-            update: CommitSessionRunUpdate::Complete {
+            update: CommitSessionTurnUpdate::Complete {
                 source_key: "complete".into(),
                 handoff: Handoff {
                     summary: "done".into(),
@@ -7466,12 +7717,12 @@ mod tests {
             },
         };
         let completed = store
-            .commit_session_run_update(&completed, &lease, 6)
+            .commit_session_turn_update(&completed, &lease, 6)
             .unwrap();
         assert_eq!(completed.snapshot.lifecycle, SessionLifecycle::Ready);
-        let parent = store.load_run(first).unwrap();
-        assert_eq!(parent.status, RunStatus::Completed);
-        let child = RunId::from_uuid(ids.next_uuid_v7());
+        let parent = store.load_turn(first).unwrap();
+        assert_eq!(parent.status, TurnStatus::Completed);
+        let child = TurnId::from_uuid(ids.next_uuid_v7());
         let followup = store
             .create_session_follow_up_v2(
                 session,
@@ -7482,9 +7733,9 @@ mod tests {
                 7,
             )
             .unwrap();
-        assert_eq!(followup.runs.len(), 2);
-        assert_eq!(followup.runs[1].parent_run_id, Some(first));
-        assert_eq!(store.load_run(first).unwrap(), parent);
+        assert_eq!(followup.turns.len(), 2);
+        assert_eq!(followup.turns[1].parent_turn_id, Some(first));
+        assert_eq!(store.load_turn(first).unwrap(), parent);
     }
 
     #[test]
@@ -7493,7 +7744,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
             version: 1,
             provider_name: "p".into(),
@@ -7510,7 +7761,7 @@ mod tests {
         let initial = store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &binding,
                 "/workspace",
                 "durable prompt",
@@ -7523,18 +7774,18 @@ mod tests {
 
         let lease = store.acquire_session_lease(session_id, 2, 100).unwrap();
         let failed = store
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: 0,
-                    expected_run_revision: 0,
+                    expected_turn_revision: 0,
                     command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitSessionRunUpdate::Fail {
+                    update: CommitSessionTurnUpdate::Fail {
                         source_key: "provider-configuration-failure".into(),
-                        failure: RunFailure {
+                        failure: TurnFailure {
                             code: FailureCode::RuntimeFailed,
                             message: "provider configuration failed".into(),
                             retryability: Retryability::Terminal,
@@ -7563,7 +7814,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
             version: 1,
             provider_name: "p".into(),
@@ -7580,7 +7831,7 @@ mod tests {
         store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &binding,
                 "/workspace",
                 "oldest prompt",
@@ -7596,7 +7847,7 @@ mod tests {
             let entry = TranscriptEntry {
                 entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
                 sequence,
-                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 kind: TranscriptKind::Assistant,
                 text: format!("card-{sequence}"),
                 payload: None,
@@ -7604,12 +7855,12 @@ mod tests {
                 created_at_ms: sequence,
             };
             conn.execute(
-                "INSERT INTO conversation_outbox(session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
+                "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
                 params![
                     session_id.to_string(),
                     to_i64(sequence).unwrap(),
                     entry.entry_id.to_string(),
-                    run_id.to_string(),
+                    turn_id.to_string(),
                     entry.source_key,
                     serde_json::to_string(&entry).unwrap(),
                     to_i64(sequence).unwrap(),
@@ -7645,16 +7896,16 @@ mod tests {
 
     #[test]
     fn session_catalog_reads_bounded_metadata_without_deserializing_transcripts() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace/catalog",
                 "First session title\nwith more context",
@@ -7701,7 +7952,7 @@ mod tests {
 
     #[test]
     fn workspace_scoped_session_projection_never_matches_an_identical_foreign_prompt() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
@@ -7714,7 +7965,7 @@ mod tests {
             store
                 .create_session_v2(
                     session_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace_root,
                     "identical prompt",
@@ -7743,7 +7994,7 @@ mod tests {
 
     #[test]
     fn session_cursor_pagination_pages_through_newest_first() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
@@ -7754,7 +8005,7 @@ mod tests {
             store
                 .create_session_v2(
                     session_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace,
                     &format!("session {index}"),
@@ -7797,7 +8048,7 @@ mod tests {
 
     #[test]
     fn session_cursor_pagination_excludes_foreign_workspace() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
@@ -7805,7 +8056,7 @@ mod tests {
             store
                 .create_session_v2(
                     SessionId::from_uuid(ids.next_uuid_v7()),
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace,
                     "identical prompt",
@@ -7867,7 +8118,7 @@ mod tests {
 
     #[test]
     fn search_and_exact_title_paged_filters_and_pages() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
@@ -7878,7 +8129,7 @@ mod tests {
             store
                 .create_session_v2(
                     session_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace,
                     &format!("matching session {index}"),
@@ -7892,7 +8143,7 @@ mod tests {
         store
             .create_session_v2(
                 SessionId::from_uuid(ids.next_uuid_v7()),
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 &session_binding(),
                 workspace,
                 "unrelated",
@@ -7903,7 +8154,7 @@ mod tests {
         store
             .create_session_v2(
                 SessionId::from_uuid(ids.next_uuid_v7()),
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 &session_binding(),
                 "/workspace/foreign",
                 "matching session 0",
@@ -7941,7 +8192,7 @@ mod tests {
 
     #[test]
     fn exact_title_paged_pages_through_multiple_matches() {
-        use latte_core::{RunId, SessionId, SystemIdSource};
+        use latte_core::{SessionId, SystemIdSource, TurnId};
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
@@ -7952,7 +8203,7 @@ mod tests {
             store
                 .create_session_v2(
                     session_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     &session_binding(),
                     workspace,
                     "shared title",
@@ -7999,37 +8250,37 @@ mod tests {
         ));
 
         for (status, stored, projected) in [
-            (RunStatus::Queued, "queued", SessionRunStatus::Queued),
-            (RunStatus::Running, "running", SessionRunStatus::Running),
+            (TurnStatus::Queued, "queued", SessionTurnStatus::Queued),
+            (TurnStatus::Running, "running", SessionTurnStatus::Running),
             (
-                RunStatus::WaitingPermission,
+                TurnStatus::WaitingPermission,
                 "waiting_permission",
-                SessionRunStatus::WaitingPermission,
+                SessionTurnStatus::WaitingPermission,
             ),
             (
-                RunStatus::WaitingInput,
+                TurnStatus::WaitingInput,
                 "waiting_input",
-                SessionRunStatus::WaitingInput,
+                SessionTurnStatus::WaitingInput,
             ),
             (
-                RunStatus::Cancelling,
+                TurnStatus::Cancelling,
                 "cancelling",
-                SessionRunStatus::Cancelling,
+                SessionTurnStatus::Cancelling,
             ),
             (
-                RunStatus::Interrupted,
+                TurnStatus::Interrupted,
                 "interrupted",
-                SessionRunStatus::Interrupted,
+                SessionTurnStatus::Interrupted,
             ),
-            (RunStatus::Failed, "failed", SessionRunStatus::Failed),
+            (TurnStatus::Failed, "failed", SessionTurnStatus::Failed),
             (
-                RunStatus::Completed,
+                TurnStatus::Completed,
                 "completed",
-                SessionRunStatus::Completed,
+                SessionTurnStatus::Completed,
             ),
         ] {
             assert_eq!(status_name(status), stored);
-            assert_eq!(session_run_status(status), projected);
+            assert_eq!(session_turn_status(status), projected);
         }
 
         for (stored, lifecycle) in [
@@ -8082,20 +8333,20 @@ mod tests {
         use latte_core::{PendingInput, PendingPermission, SessionCommandId, SessionId};
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let command_id = SessionCommandId::from_uuid(ids.next_uuid_v7());
         let source_key = "source".to_owned();
         let updates = vec![
-            CommitSessionRunUpdate::Start {
+            CommitSessionTurnUpdate::Start {
                 source_key: source_key.clone(),
             },
-            CommitSessionRunUpdate::AppendTranscript {
+            CommitSessionTurnUpdate::AppendTranscript {
                 source_key: source_key.clone(),
                 kind: TranscriptKind::Assistant,
                 text: "assistant text".into(),
                 payload: Some(serde_json::json!({"value":"payload"})),
             },
-            CommitSessionRunUpdate::PrepareEffect {
+            CommitSessionTurnUpdate::PrepareEffect {
                 source_key: source_key.clone(),
                 effect_id: "effect".into(),
                 operation_digest: "a".repeat(64),
@@ -8105,13 +8356,13 @@ mod tests {
                 description: "prepare".into(),
                 checkpoint_json: r#"{"phase":"prepared"}"#.into(),
             },
-            CommitSessionRunUpdate::StartEffect {
+            CommitSessionTurnUpdate::StartEffect {
                 source_key: source_key.clone(),
                 effect_id: "effect".into(),
                 operation_digest: "a".repeat(64),
                 checkpoint_json: r#"{"phase":"started"}"#.into(),
             },
-            CommitSessionRunUpdate::ObserveEffect {
+            CommitSessionTurnUpdate::ObserveEffect {
                 source_key: source_key.clone(),
                 effect_id: "effect".into(),
                 operation_digest: "a".repeat(64),
@@ -8120,18 +8371,18 @@ mod tests {
                 payload: Some(serde_json::json!({"result":"ok"})),
                 checkpoint_json: r#"{"phase":"observed"}"#.into(),
             },
-            CommitSessionRunUpdate::UnknownEffect {
+            CommitSessionTurnUpdate::UnknownEffect {
                 source_key: source_key.clone(),
                 effect_id: "effect".into(),
                 operation_digest: "a".repeat(64),
                 checkpoint_json: r#"{"phase":"unknown"}"#.into(),
             },
-            CommitSessionRunUpdate::ReconcileUnknownEffect {
+            CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key: source_key.clone(),
                 effect_id: "effect".into(),
                 checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
             },
-            CommitSessionRunUpdate::RequestPermission {
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key: source_key.clone(),
                 request: PendingPermission {
                     request_id: "permission".into(),
@@ -8139,25 +8390,25 @@ mod tests {
                     description: "allow write".into(),
                 },
             },
-            CommitSessionRunUpdate::ResolvePermission {
+            CommitSessionTurnUpdate::ResolvePermission {
                 source_key: source_key.clone(),
                 request_id: "permission".into(),
                 allow: true,
                 rebound_operation_digest: None,
             },
-            CommitSessionRunUpdate::RequestInput {
+            CommitSessionTurnUpdate::RequestInput {
                 source_key: source_key.clone(),
                 request: PendingInput {
                     request_id: "input".into(),
                     prompt: "value?".into(),
                 },
             },
-            CommitSessionRunUpdate::ProvideInput {
+            CommitSessionTurnUpdate::ProvideInput {
                 source_key: source_key.clone(),
                 request_id: "input".into(),
                 value: "answer".into(),
             },
-            CommitSessionRunUpdate::Complete {
+            CommitSessionTurnUpdate::Complete {
                 source_key: source_key.clone(),
                 handoff: Handoff {
                     summary: "done".into(),
@@ -8169,22 +8420,22 @@ mod tests {
                     }],
                 },
             },
-            CommitSessionRunUpdate::CompleteVerified {
+            CommitSessionTurnUpdate::CompleteVerified {
                 source_key: source_key.clone(),
                 summary: "verified".into(),
                 verification_effect_id: "verification".into(),
                 verified_manifest_digest: "c".repeat(64),
                 files_changed: vec!["a.txt".into()],
             },
-            CommitSessionRunUpdate::Fail {
+            CommitSessionTurnUpdate::Fail {
                 source_key: source_key.clone(),
-                failure: RunFailure {
+                failure: TurnFailure {
                     code: FailureCode::RuntimeFailed,
                     message: "failed".into(),
                     retryability: Retryability::Terminal,
                 },
             },
-            CommitSessionRunUpdate::Interrupt {
+            CommitSessionTurnUpdate::Interrupt {
                 source_key: source_key.clone(),
                 reconciliation_effect_id: Some("effect".into()),
             },
@@ -8195,9 +8446,9 @@ mod tests {
             assert_eq!(update.source_key(), source_key);
             let request = SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 2,
-                expected_run_revision: 3,
+                expected_turn_revision: 3,
                 command_id,
                 request_id: Some("request".into()),
                 effect_id: Some("effect".into()),
@@ -8211,11 +8462,11 @@ mod tests {
             );
         }
 
-        let CommitSessionRunUpdate::PrepareEffect { .. } = &updates[2] else {
+        let CommitSessionTurnUpdate::PrepareEffect { .. } = &updates[2] else {
             unreachable!()
         };
         let mut changed_private = updates[2].clone();
-        let CommitSessionRunUpdate::PrepareEffect {
+        let CommitSessionTurnUpdate::PrepareEffect {
             canonical_descriptor_json,
             ..
         } = &mut changed_private
@@ -8225,9 +8476,9 @@ mod tests {
         *canonical_descriptor_json = r#"{"api_key":"sk-a-different-private-secret"}"#.into();
         let request = |update| SessionCommitRequest {
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision: 2,
-            expected_run_revision: 3,
+            expected_turn_revision: 3,
             command_id,
             request_id: Some("request".into()),
             effect_id: Some("effect".into()),
@@ -8267,7 +8518,7 @@ mod tests {
             request_id: secret.into(),
             prompt: secret.into(),
         });
-        let failure = redact_failure(&RunFailure {
+        let failure = redact_failure(&TurnFailure {
             code: FailureCode::RuntimeFailed,
             message: secret.into(),
             retryability: Retryability::Retryable,
@@ -8307,13 +8558,13 @@ mod tests {
         ids: &SystemIdSource,
         prompt: &str,
         now_ms: u64,
-    ) -> (latte_core::SessionId, RunId, SessionSnapshot) {
+    ) -> (latte_core::SessionId, TurnId, SessionSnapshot) {
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 prompt,
@@ -8321,7 +8572,7 @@ mod tests {
                 now_ms,
             )
             .unwrap();
-        (session_id, run_id, snapshot)
+        (session_id, turn_id, snapshot)
     }
 
     fn commit_linked(
@@ -8329,23 +8580,23 @@ mod tests {
         ids: &SystemIdSource,
         lease: &Lease,
         snapshot: &SessionSnapshot,
-        run_id: RunId,
-        update: CommitSessionRunUpdate,
+        turn_id: TurnId,
+        update: CommitSessionTurnUpdate,
         now_ms: u64,
     ) -> SessionCommitResponse {
-        let run_revision = snapshot
-            .runs
+        let turn_revision = snapshot
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
+            .find(|run| run.turn_id == turn_id)
             .unwrap()
-            .run_revision;
+            .turn_revision;
         store
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id: snapshot.session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: snapshot.revision,
-                    expected_run_revision: run_revision,
+                    expected_turn_revision: turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
@@ -8363,7 +8614,7 @@ mod tests {
         let (dir, path) = db();
         let ids = SystemIdSource::default();
         let store = Storage::open(&path).unwrap();
-        let (session_id, run_id, queued) =
+        let (session_id, turn_id, queued) =
             create_linked_fixture(&store, &ids, "rebind permission", 10);
         let first = store.acquire_session_lease(session_id, 11, 100).unwrap();
         let running = commit_linked(
@@ -8371,8 +8622,8 @@ mod tests {
             &ids,
             &first,
             &queued,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "rebind:start".into(),
             },
             12,
@@ -8395,8 +8646,8 @@ mod tests {
             &ids,
             &first,
             &running,
-            run_id,
-            CommitSessionRunUpdate::PrepareEffect {
+            turn_id,
+            CommitSessionTurnUpdate::PrepareEffect {
                 source_key: "rebind:prepare".into(),
                 effect_id: descriptor.effect_id.clone(),
                 operation_digest: old_digest.clone(),
@@ -8416,7 +8667,7 @@ mod tests {
         let reopened = Storage::open(&path).unwrap();
         let preserved = reopened.session_snapshot_v2(session_id, None, 100).unwrap();
         assert_eq!(preserved.lifecycle, SessionLifecycle::WaitingPermission);
-        assert_eq!(preserved.active_run_id, Some(run_id));
+        assert_eq!(preserved.active_turn_id, Some(turn_id));
         let second = reopened.acquire_session_lease(session_id, 14, 100).unwrap();
         assert!(second.fencing_token > first.fencing_token);
 
@@ -8442,9 +8693,9 @@ mod tests {
         let identifier_error = engine
             .resolve_session_effect_permission(
                 session_id,
-                run_id,
+                turn_id,
                 preserved.revision,
-                preserved.runs[0].run_revision,
+                preserved.turns[0].turn_revision,
                 descriptor.effect_id.clone(),
                 "rebind:bad-identifier".into(),
                 true,
@@ -8473,7 +8724,7 @@ mod tests {
         let overflow = engine
             .resolve_session_effect_permission(
                 session_id,
-                run_id,
+                turn_id,
                 preserved.revision,
                 u64::MAX,
                 descriptor.effect_id.clone(),
@@ -8488,16 +8739,16 @@ mod tests {
         drop(engine);
 
         let resolve = |digest: Option<String>| {
-            reopened.commit_session_run_update(
+            reopened.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: preserved.revision,
-                    expected_run_revision: preserved.runs[0].run_revision,
+                    expected_turn_revision: preserved.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: Some(descriptor.effect_id.clone()),
                     effect_id: Some(descriptor.effect_id.clone()),
-                    update: CommitSessionRunUpdate::ResolvePermission {
+                    update: CommitSessionTurnUpdate::ResolvePermission {
                         source_key: "rebind:allow".into(),
                         request_id: descriptor.effect_id.clone(),
                         allow: true,
@@ -8580,8 +8831,8 @@ mod tests {
             &ids,
             &second,
             &allowed,
-            run_id,
-            CommitSessionRunUpdate::StartEffect {
+            turn_id,
+            CommitSessionTurnUpdate::StartEffect {
                 source_key: "rebind:started".into(),
                 effect_id: descriptor.effect_id.clone(),
                 operation_digest: rebound_digest,
@@ -8595,7 +8846,7 @@ mod tests {
             EffectStatus::Started
         );
 
-        let (generic_session, generic_run, generic_queued) =
+        let (generic_session, generic_turn, generic_queued) =
             create_linked_fixture(&reopened, &ids, "generic permission", 20);
         let generic_lease = reopened
             .acquire_session_lease(generic_session, 20, 100)
@@ -8605,8 +8856,8 @@ mod tests {
             &ids,
             &generic_lease,
             &generic_queued,
-            generic_run,
-            CommitSessionRunUpdate::Start {
+            generic_turn,
+            CommitSessionTurnUpdate::Start {
                 source_key: "generic:start".into(),
             },
             21,
@@ -8617,8 +8868,8 @@ mod tests {
             &ids,
             &generic_lease,
             &generic_running,
-            generic_run,
-            CommitSessionRunUpdate::RequestPermission {
+            generic_turn,
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key: "generic:request".into(),
                 request: latte_core::PendingPermission {
                     request_id: "generic-permission".into(),
@@ -8630,16 +8881,16 @@ mod tests {
         )
         .snapshot;
         let missing_capability = reopened
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id: generic_session,
-                    run_id: generic_run,
+                    turn_id: generic_turn,
                     expected_session_revision: generic_waiting.revision,
-                    expected_run_revision: generic_waiting.runs[0].run_revision,
+                    expected_turn_revision: generic_waiting.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: Some("generic-permission".into()),
                     effect_id: Some("generic-permission".into()),
-                    update: CommitSessionRunUpdate::ResolvePermission {
+                    update: CommitSessionTurnUpdate::ResolvePermission {
                         source_key: "generic:allow".into(),
                         request_id: "generic-permission".into(),
                         allow: true,
@@ -8665,7 +8916,8 @@ mod tests {
 
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let (session_id, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "initial", 11);
+        let (session_id, turn_id, mut snapshot) =
+            create_linked_fixture(&store, &ids, "initial", 11);
         let lease = store.acquire_session_lease(session_id, 10, 10_000).unwrap();
 
         snapshot = commit_linked(
@@ -8673,24 +8925,24 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "start".into(),
             },
             12,
         )
         .snapshot;
-        assert_eq!(snapshot.runs[0].status, SessionRunStatus::Running);
+        assert_eq!(snapshot.turns[0].status, SessionTurnStatus::Running);
 
         let append = SessionCommitRequest {
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision: snapshot.revision,
-            expected_run_revision: snapshot.runs[0].run_revision,
+            expected_turn_revision: snapshot.turns[0].turn_revision,
             command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
             request_id: None,
             effect_id: None,
-            update: CommitSessionRunUpdate::AppendTranscript {
+            update: CommitSessionTurnUpdate::AppendTranscript {
                 source_key: "assistant-card".into(),
                 kind: TranscriptKind::Assistant,
                 text: "safe card".into(),
@@ -8698,7 +8950,7 @@ mod tests {
             },
         };
         let appended = store
-            .commit_session_run_update(&append, &lease, 13)
+            .commit_session_turn_update(&append, &lease, 13)
             .unwrap();
         // The source ledger is the second durable idempotency key. Simulate a
         // lost command-index row and prove that the source record still
@@ -8715,7 +8967,7 @@ mod tests {
         let source_replay = append.clone();
         assert_eq!(
             store
-                .commit_session_run_update(&source_replay, &lease, 14)
+                .commit_session_turn_update(&source_replay, &lease, 14)
                 .unwrap(),
             appended,
             "the source ledger must replay the exact committed result"
@@ -8730,13 +8982,13 @@ mod tests {
                 [mismatched_source.command_id.to_string()],
             )
             .unwrap();
-        let CommitSessionRunUpdate::AppendTranscript { text, .. } = &mut mismatched_source.update
+        let CommitSessionTurnUpdate::AppendTranscript { text, .. } = &mut mismatched_source.update
         else {
             unreachable!()
         };
         *text = "different card".into();
         assert!(matches!(
-            store.commit_session_run_update(&mismatched_source, &lease, 15),
+            store.commit_session_turn_update(&mismatched_source, &lease, 15),
             Err(StorageError::SessionCommandReplayMismatch)
         ));
         snapshot = appended.snapshot;
@@ -8746,8 +8998,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::RequestInput {
+            turn_id,
+            CommitSessionTurnUpdate::RequestInput {
                 source_key: "request-input".into(),
                 request: PendingInput {
                     request_id: "input-1".into(),
@@ -8766,8 +9018,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::ProvideInput {
+            turn_id,
+            CommitSessionTurnUpdate::ProvideInput {
                 source_key: "provide-input".into(),
                 request_id: "input-1".into(),
                 value: "answer".into(),
@@ -8782,8 +9034,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::RequestPermission {
+            turn_id,
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key: "request-permission".into(),
                 request: PendingPermission {
                     request_id: "permission-1".into(),
@@ -8803,8 +9055,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::ResolvePermission {
+            turn_id,
+            CommitSessionTurnUpdate::ResolvePermission {
                 source_key: "allow-permission".into(),
                 request_id: "permission-1".into(),
                 allow: true,
@@ -8818,8 +9070,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::Complete {
+            turn_id,
+            CommitSessionTurnUpdate::Complete {
                 source_key: "complete".into(),
                 handoff: Handoff {
                     summary: "done".into(),
@@ -8830,9 +9082,9 @@ mod tests {
             20,
         );
         assert_eq!(completed.snapshot.lifecycle, SessionLifecycle::Ready);
-        assert_eq!(completed.snapshot.active_run_id, None);
+        assert_eq!(completed.snapshot.active_turn_id, None);
 
-        let (denied_session, denied_run, mut denied) =
+        let (denied_session, denied_turn, mut denied) =
             create_linked_fixture(&store, &ids, "deny", 21);
         let denied_lease = store
             .acquire_session_lease(denied_session, 21, 10_000)
@@ -8842,8 +9094,8 @@ mod tests {
             &ids,
             &denied_lease,
             &denied,
-            denied_run,
-            CommitSessionRunUpdate::Start {
+            denied_turn,
+            CommitSessionTurnUpdate::Start {
                 source_key: "deny:start".into(),
             },
             22,
@@ -8854,8 +9106,8 @@ mod tests {
             &ids,
             &denied_lease,
             &denied,
-            denied_run,
-            CommitSessionRunUpdate::RequestPermission {
+            denied_turn,
+            CommitSessionTurnUpdate::RequestPermission {
                 source_key: "deny:request".into(),
                 request: PendingPermission {
                     request_id: "permission-denied".into(),
@@ -8871,8 +9123,8 @@ mod tests {
             &ids,
             &denied_lease,
             &denied,
-            denied_run,
-            CommitSessionRunUpdate::ResolvePermission {
+            denied_turn,
+            CommitSessionTurnUpdate::ResolvePermission {
                 source_key: "deny:resolve".into(),
                 request_id: "permission-denied".into(),
                 allow: false,
@@ -8881,13 +9133,13 @@ mod tests {
             24,
         );
         assert_eq!(denied.snapshot.lifecycle, SessionLifecycle::Ready);
-        assert!(denied.snapshot.active_run_id.is_none());
+        assert!(denied.snapshot.active_turn_id.is_none());
         assert!(denied.snapshot.pending.is_none());
         assert_eq!(
-            store.load_run(denied_run).unwrap().status,
-            RunStatus::Failed
+            store.load_turn(denied_turn).unwrap().status,
+            TurnStatus::Failed
         );
-        let retry_run = RunId::from_uuid(ids.next_uuid_v7());
+        let retry_run = TurnId::from_uuid(ids.next_uuid_v7());
         let retry = store
             .create_session_follow_up_v2(
                 denied_session,
@@ -8899,7 +9151,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.lifecycle, SessionLifecycle::Running);
-        assert_eq!(retry.active_run_id, Some(retry_run));
+        assert_eq!(retry.active_turn_id, Some(retry_run));
     }
 
     #[test]
@@ -8907,7 +9159,8 @@ mod tests {
     fn linked_effect_started_interrupt_requires_exact_reconciliation() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let (session_id, run_id, mut snapshot) = create_linked_fixture(&store, &ids, "effect", 101);
+        let (session_id, turn_id, mut snapshot) =
+            create_linked_fixture(&store, &ids, "effect", 101);
         let lease = store
             .acquire_session_lease(session_id, 100, 10_000)
             .unwrap();
@@ -8916,8 +9169,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "effect:start-run".into(),
             },
             102,
@@ -8939,8 +9192,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::PrepareEffect {
+            turn_id,
+            CommitSessionTurnUpdate::PrepareEffect {
                 source_key: "effect:prepare".into(),
                 effect_id: effect_id.into(),
                 operation_digest: digest.clone(),
@@ -8959,7 +9212,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .session_effect_canonical_descriptor(effect_id, run_id)
+                .session_effect_canonical_descriptor(effect_id, turn_id)
                 .unwrap(),
             canonical_descriptor
         );
@@ -8968,8 +9221,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::StartEffect {
+            turn_id,
+            CommitSessionTurnUpdate::StartEffect {
                 source_key: "effect:start".into(),
                 effect_id: effect_id.into(),
                 operation_digest: digest,
@@ -8988,8 +9241,8 @@ mod tests {
             &ids,
             &lease,
             &snapshot,
-            run_id,
-            CommitSessionRunUpdate::Interrupt {
+            turn_id,
+            CommitSessionTurnUpdate::Interrupt {
                 source_key: "effect:interrupt".into(),
                 reconciliation_effect_id: None,
             },
@@ -9004,7 +9257,7 @@ mod tests {
             EffectStatus::Unknown
         );
         assert_eq!(
-            store.unknown_effects_for_run(run_id).unwrap(),
+            store.unknown_effects_for_turn(turn_id).unwrap(),
             vec![effect_id.to_owned()]
         );
         let reconciled = commit_linked(
@@ -9012,8 +9265,8 @@ mod tests {
             &ids,
             &lease,
             &interrupted.snapshot,
-            run_id,
-            CommitSessionRunUpdate::ReconcileUnknownEffect {
+            turn_id,
+            CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key: "effect:reconcile".into(),
                 effect_id: effect_id.into(),
                 checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
@@ -9025,13 +9278,13 @@ mod tests {
             store.effect_status(effect_id).unwrap(),
             EffectStatus::ObservedFailed
         );
-        assert!(store.unknown_effects_for_run(run_id).unwrap().is_empty());
+        assert!(store.unknown_effects_for_turn(turn_id).unwrap().is_empty());
 
         for (suffix, success, expected) in [
             ("success", true, EffectStatus::ObservedSuccess),
             ("failure", false, EffectStatus::ObservedFailed),
         ] {
-            let (observed_session, observed_run, mut observed) =
+            let (observed_session, observed_turn, mut observed) =
                 create_linked_fixture(&store, &ids, suffix, 110);
             let observed_lease = store
                 .acquire_session_lease(observed_session, 110, 10_000)
@@ -9041,8 +9294,8 @@ mod tests {
                 &ids,
                 &observed_lease,
                 &observed,
-                observed_run,
-                CommitSessionRunUpdate::Start {
+                observed_turn,
+                CommitSessionTurnUpdate::Start {
                     source_key: format!("{suffix}:start-run"),
                 },
                 111,
@@ -9067,8 +9320,8 @@ mod tests {
                 &ids,
                 &observed_lease,
                 &observed,
-                observed_run,
-                CommitSessionRunUpdate::PrepareEffect {
+                observed_turn,
+                CommitSessionTurnUpdate::PrepareEffect {
                     source_key: format!("{suffix}:prepare"),
                     effect_id: observed_effect.clone(),
                     operation_digest: observed_digest.clone(),
@@ -9086,8 +9339,8 @@ mod tests {
                 &ids,
                 &observed_lease,
                 &observed,
-                observed_run,
-                CommitSessionRunUpdate::StartEffect {
+                observed_turn,
+                CommitSessionTurnUpdate::StartEffect {
                     source_key: format!("{suffix}:start-effect"),
                     effect_id: observed_effect.clone(),
                     operation_digest: observed_digest.clone(),
@@ -9101,8 +9354,8 @@ mod tests {
                 &ids,
                 &observed_lease,
                 &observed,
-                observed_run,
-                CommitSessionRunUpdate::ObserveEffect {
+                observed_turn,
+                CommitSessionTurnUpdate::ObserveEffect {
                     source_key: format!("{suffix}:observe"),
                     effect_id: observed_effect.clone(),
                     operation_digest: observed_digest,
@@ -9130,7 +9383,7 @@ mod tests {
         let ids = SystemIdSource::default();
         let baseline = std::collections::BTreeMap::new();
         let empty_session = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let empty_run = RunId::from_uuid(ids.next_uuid_v7());
+        let empty_run = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(
             store
                 .create_session_v2(
@@ -9147,9 +9400,9 @@ mod tests {
                 .contains("prompt must not be empty")
         );
 
-        let (session_id, run_id, queued) = create_linked_fixture(&store, &ids, "initial", 11);
+        let (session_id, turn_id, queued) = create_linked_fixture(&store, &ids, "initial", 11);
         let lease = store.acquire_session_lease(session_id, 10, 10_000).unwrap();
-        let follow_up = RunId::from_uuid(ids.next_uuid_v7());
+        let follow_up = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(
             store
                 .create_session_follow_up_v2(
@@ -9190,15 +9443,15 @@ mod tests {
                 .contains("ready session")
         );
 
-        let start = |command_id, session_revision, run_revision, run_id| SessionCommitRequest {
+        let start = |command_id, session_revision, turn_revision, turn_id| SessionCommitRequest {
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision: session_revision,
-            expected_run_revision: run_revision,
+            expected_turn_revision: turn_revision,
             command_id,
             request_id: None,
             effect_id: None,
-            update: CommitSessionRunUpdate::Start {
+            update: CommitSessionTurnUpdate::Start {
                 source_key: format!("start:{command_id}"),
             },
         };
@@ -9209,12 +9462,12 @@ mod tests {
             expires_at_ms: lease.expires_at_ms,
         };
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     queued.revision,
                     0,
-                    run_id,
+                    turn_id,
                 ),
                 &fenced,
                 13,
@@ -9222,39 +9475,39 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     queued.revision + 1,
                     0,
-                    run_id,
+                    turn_id,
                 ),
                 &lease,
                 13,
             ),
             Err(StorageError::StaleSessionRevision { .. })
         ));
-        let other_run = RunId::from_uuid(ids.next_uuid_v7());
+        let other_turn = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     queued.revision,
                     0,
-                    other_run,
+                    other_turn,
                 ),
                 &lease,
                 13,
             ),
-            Err(StorageError::SessionActiveRunMismatch)
+            Err(StorageError::SessionActiveTurnMismatch)
         ));
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     queued.revision,
                     1,
-                    run_id,
+                    turn_id,
                 ),
                 &lease,
                 13,
@@ -9273,13 +9526,13 @@ mod tests {
                        command_id: latte_core::SessionCommandId,
                        source: &str| SessionCommitRequest {
             session_id,
-            run_id,
+            turn_id,
             expected_session_revision: snapshot.revision,
-            expected_run_revision: snapshot.runs[0].run_revision,
+            expected_turn_revision: snapshot.turns[0].turn_revision,
             command_id,
             request_id: None,
             effect_id: Some("effect-matrix".into()),
-            update: CommitSessionRunUpdate::PrepareEffect {
+            update: CommitSessionTurnUpdate::PrepareEffect {
                 source_key: source.into(),
                 effect_id: "effect-matrix".into(),
                 operation_digest: "a".repeat(64),
@@ -9292,7 +9545,7 @@ mod tests {
         };
         assert!(
             store
-                .commit_session_run_update(
+                .commit_session_turn_update(
                     &prepare(
                         &queued,
                         latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
@@ -9310,8 +9563,8 @@ mod tests {
             &ids,
             &lease,
             &queued,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "matrix:start".into(),
             },
             15,
@@ -9319,16 +9572,16 @@ mod tests {
         .snapshot;
         assert!(
             store
-                .commit_session_run_update(
+                .commit_session_turn_update(
                     &SessionCommitRequest {
                         session_id,
-                        run_id,
+                        turn_id,
                         expected_session_revision: running.revision,
-                        expected_run_revision: running.runs[0].run_revision,
+                        expected_turn_revision: running.turns[0].turn_revision,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
                         effect_id: Some("missing-effect".into()),
-                        update: CommitSessionRunUpdate::StartEffect {
+                        update: CommitSessionTurnUpdate::StartEffect {
                             source_key: "missing:start".into(),
                             effect_id: "missing-effect".into(),
                             operation_digest: "b".repeat(64),
@@ -9343,7 +9596,7 @@ mod tests {
                 .contains("not a prepared linked effect")
         );
         running = store
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &prepare(
                     &running,
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
@@ -9357,13 +9610,13 @@ mod tests {
         let start_effect =
             |snapshot: &SessionSnapshot, digest: String, source: &str| SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: snapshot.runs[0].run_revision,
+                expected_turn_revision: snapshot.turns[0].turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: Some("effect-matrix".into()),
                 effect_id: Some("effect-matrix".into()),
-                update: CommitSessionRunUpdate::StartEffect {
+                update: CommitSessionTurnUpdate::StartEffect {
                     source_key: source.into(),
                     effect_id: "effect-matrix".into(),
                     operation_digest: digest,
@@ -9372,7 +9625,7 @@ mod tests {
             };
         assert!(
             store
-                .commit_session_run_update(
+                .commit_session_turn_update(
                     &start_effect(&running, "b".repeat(64), "matrix:wrong-digest"),
                     &lease,
                     18,
@@ -9382,7 +9635,7 @@ mod tests {
                 .contains("digest mismatch")
         );
         running = store
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &start_effect(&running, "a".repeat(64), "matrix:start-effect"),
                 &lease,
                 19,
@@ -9392,13 +9645,13 @@ mod tests {
         let observe = |snapshot: &SessionSnapshot, effect: &str, digest: String, source: &str| {
             SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: snapshot.revision,
-                expected_run_revision: snapshot.runs[0].run_revision,
+                expected_turn_revision: snapshot.turns[0].turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: Some(effect.into()),
                 effect_id: Some(effect.into()),
-                update: CommitSessionRunUpdate::ObserveEffect {
+                update: CommitSessionTurnUpdate::ObserveEffect {
                     source_key: source.into(),
                     effect_id: effect.into(),
                     operation_digest: digest,
@@ -9410,7 +9663,7 @@ mod tests {
             }
         };
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &observe(
                     &running,
                     "effect-matrix",
@@ -9423,7 +9676,7 @@ mod tests {
             Err(StorageError::EffectFenced)
         ));
         let observed = store
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 &observe(&running, "effect-matrix", "a".repeat(64), "matrix:observe"),
                 &lease,
                 21,
@@ -9434,7 +9687,7 @@ mod tests {
             EffectStatus::ObservedSuccess
         );
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &observe(
                     &observed.snapshot,
                     "effect-matrix",
@@ -9461,13 +9714,13 @@ mod tests {
                 .iter()
                 .any(|s| s.session_id == session_id)
         );
-        let boundary = |snapshot: &SessionSnapshot, update: CommitSessionRunUpdate| store.commit_session_run_update(&SessionCommitRequest { session_id, run_id, expected_session_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_run(run_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = RunStatus::Failed; store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&failed_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionRunUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE runs SET state_json=?1 WHERE run_id=?2", params![serde_json::to_string(&running_state).unwrap(), run_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionRunUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitSessionRunUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitSessionRunUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, SessionLifecycle::Failed); let (ask_session, ask_run, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask_lease = store.acquire_session_lease(ask_session, 30, 10_000).unwrap(); let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitSessionRunUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::SessionEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
-        let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitSessionRunUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: SessionEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
-        let start_ask = |snapshot: &SessionSnapshot, source: &str| store.commit_session_run_update(&SessionCommitRequest { session_id: ask_session, run_id: ask_run, expected_session_revision: snapshot.revision, expected_run_revision: snapshot.runs[0].run_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitSessionRunUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &ask_lease, 33);
+        let boundary = |snapshot: &SessionSnapshot, update: CommitSessionTurnUpdate| store.commit_session_turn_update(&SessionCommitRequest { session_id, turn_id, expected_session_revision: snapshot.revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_turn(turn_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = TurnStatus::Failed; store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&failed_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&running_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitSessionTurnUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, SessionLifecycle::Failed); let (ask_session, ask_turn, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask_lease = store.acquire_session_lease(ask_session, 30, 10_000).unwrap(); let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::SessionEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
+        let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: SessionEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
+        let start_ask = |snapshot: &SessionSnapshot, source: &str| store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: snapshot.revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitSessionTurnUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &ask_lease, 33);
         assert!(start_ask(&ask, "ask:while-pending").unwrap_err().to_string().contains("without a pending request"));
-        let allowed = commit_linked(&store, &ids, &ask_lease, &ask, ask_run, CommitSessionRunUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true, rebound_operation_digest: None }, 34).snapshot;
-        store.connection.lock().unwrap().execute("UPDATE pending_permissions SET run_revision=999 WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:stale").unwrap_err().to_string().contains("stale, mismatched, or consumed"));
-        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM session_active_runs WHERE session_id=?1", [ask_session.to_string()]).unwrap(); conn.execute("UPDATE sessions SET lifecycle='reconciliation_required',latest_run_id=?1 WHERE session_id=?2", params![ask_run.to_string(), ask_session.to_string()]).unwrap(); } assert!(store.commit_session_run_update(&SessionCommitRequest { session_id: ask_session, run_id: ask_run, expected_session_revision: allowed.revision, expected_run_revision: allowed.runs[0].run_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitSessionRunUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &ask_lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
+        let allowed = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true, rebound_operation_digest: None }, 34).snapshot;
+        store.connection.lock().unwrap().execute("UPDATE pending_permissions SET turn_revision=999 WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:stale").unwrap_err().to_string().contains("stale, mismatched, or consumed"));
+        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM session_active_turns WHERE session_id=?1", [ask_session.to_string()]).unwrap(); conn.execute("UPDATE sessions SET lifecycle='reconciliation_required',latest_turn_id=?1 WHERE session_id=?2", params![ask_turn.to_string(), ask_session.to_string()]).unwrap(); } assert!(store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: allowed.revision, expected_turn_revision: allowed.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &ask_lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
     }
 
     #[test]
@@ -9477,14 +9730,14 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let valid_key = serde_json::to_string(&vec!["src", "lib.rs"]).unwrap();
         let baseline = std::collections::BTreeMap::from([(valid_key.clone(), "old".into())]);
-        let queued = RunState::queued(run_id);
+        let queued = TurnState::queued(turn_id);
         store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "inspect projection",
@@ -9492,26 +9745,26 @@ mod tests {
                 1,
             )
             .unwrap();
-        { let conn = store.connection.lock().unwrap(); conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); conn.execute("UPDATE sessions SET latest_run_id='bad' WHERE session_id=?1", [session_id.to_string()]).unwrap(); }
+        { let conn = store.connection.lock().unwrap(); conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); conn.execute("UPDATE sessions SET latest_turn_id='bad' WHERE session_id=?1", [session_id.to_string()]).unwrap(); }
         assert!(store.session_snapshot_v2(session_id, None, 10).unwrap_err().to_string().contains("invalid stored run id"));
-        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE sessions SET latest_run_id=?1 WHERE session_id=?2", params![run_id.to_string(), session_id.to_string()]).unwrap(); conn.execute("UPDATE session_active_runs SET run_id='bad' WHERE session_id=?1", [session_id.to_string()]).unwrap(); }
-        assert!(store.session_snapshot_v2(session_id, None, 10).unwrap_err().to_string().contains("invalid active run id"));
-        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE session_active_runs SET run_id=?1 WHERE session_id=?2", params![run_id.to_string(), session_id.to_string()]).unwrap(); conn.execute("UPDATE session_runs SET parent_run_id='bad' WHERE run_id=?1", [run_id.to_string()]).unwrap(); }
+        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE sessions SET latest_turn_id=?1 WHERE session_id=?2", params![turn_id.to_string(), session_id.to_string()]).unwrap(); conn.execute("UPDATE session_active_turns SET turn_id='bad' WHERE session_id=?1", [session_id.to_string()]).unwrap(); }
+        assert!(store.session_snapshot_v2(session_id, None, 10).unwrap_err().to_string().contains("invalid active turn id"));
+        { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE session_active_turns SET turn_id=?1 WHERE session_id=?2", params![turn_id.to_string(), session_id.to_string()]).unwrap(); conn.execute("UPDATE session_turns SET parent_turn_id='bad' WHERE turn_id=?1", [turn_id.to_string()]).unwrap(); }
         assert!(store.session_snapshot_v2(session_id, None, 10).unwrap_err().to_string().contains("invalid parent run id"));
-        store.connection.lock().unwrap().execute("UPDATE session_runs SET parent_run_id=NULL WHERE run_id=?1", [run_id.to_string()]).unwrap();
+        store.connection.lock().unwrap().execute("UPDATE session_turns SET parent_turn_id=NULL WHERE turn_id=?1", [turn_id.to_string()]).unwrap();
 
         assert!(
             store
-                .session_changed_files(run_id, &baseline)
+                .session_changed_files(turn_id, &baseline)
                 .unwrap()
                 .is_empty()
         );
         let current = std::collections::BTreeMap::from([(valid_key, "new".into())]);
         assert_eq!(
-            store.session_changed_files(run_id, &current).unwrap(),
+            store.session_changed_files(turn_id, &current).unwrap(),
             vec!["src/lib.rs"]
         );
-        let missing = RunId::from_uuid(ids.next_uuid_v7());
+        let missing = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(
             store
                 .session_changed_files(missing, &std::collections::BTreeMap::new())
@@ -9535,12 +9788,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .execute(
-                    "UPDATE run_baselines SET manifest_json=?1 WHERE run_id=?2",
-                    params![manifest, run_id.to_string()],
+                    "UPDATE turn_baselines SET manifest_json=?1 WHERE turn_id=?2",
+                    params![manifest, turn_id.to_string()],
                 )
                 .unwrap();
             assert!(matches!(
-                store.session_changed_files(run_id, &std::collections::BTreeMap::new()),
+                store.session_changed_files(turn_id, &std::collections::BTreeMap::new()),
                 Err(StorageError::InvalidData(_))
             ));
         }
@@ -9549,12 +9802,12 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE run_baselines SET manifest_json='{' WHERE run_id=?1",
-                [run_id.to_string()],
+                "UPDATE turn_baselines SET manifest_json='{' WHERE turn_id=?1",
+                [turn_id.to_string()],
             )
             .unwrap();
         assert!(matches!(
-            store.session_changed_files(run_id, &std::collections::BTreeMap::new()),
+            store.session_changed_files(turn_id, &std::collections::BTreeMap::new()),
             Err(StorageError::InvalidData(_))
         ));
 
@@ -9594,8 +9847,8 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "UPDATE runs SET state_json='{' WHERE run_id=?1",
-                [run_id.to_string()],
+                "UPDATE turns SET state_json='{' WHERE turn_id=?1",
+                [turn_id.to_string()],
             )
             .unwrap();
         }
@@ -9606,25 +9859,13 @@ mod tests {
         {
             let conn = store.connection.lock().unwrap();
             conn.execute(
-                "UPDATE runs SET state_json=?1 WHERE run_id=?2",
-                params![serde_json::to_string(&queued).unwrap(), run_id.to_string()],
+                "UPDATE turns SET state_json=?1 WHERE turn_id=?2",
+                params![serde_json::to_string(&queued).unwrap(), turn_id.to_string()],
             )
             .unwrap();
             conn.execute(
-                "UPDATE session_runs SET ordinal=-1 WHERE run_id=?1",
-                [run_id.to_string()],
-            )
-            .unwrap();
-        }
-        assert!(matches!(
-            store.session_snapshot_v2(session_id, None, 10),
-            Err(StorageError::InvalidData(_))
-        ));
-        {
-            let conn = store.connection.lock().unwrap();
-            conn.execute(
-                "UPDATE session_runs SET ordinal=0,completed_at_ms=-1 WHERE run_id=?1",
-                [run_id.to_string()],
+                "UPDATE session_turns SET ordinal=-1 WHERE turn_id=?1",
+                [turn_id.to_string()],
             )
             .unwrap();
         }
@@ -9635,8 +9876,20 @@ mod tests {
         {
             let conn = store.connection.lock().unwrap();
             conn.execute(
-                "UPDATE session_runs SET completed_at_ms=NULL WHERE run_id=?1",
-                [run_id.to_string()],
+                "UPDATE session_turns SET ordinal=0,completed_at_ms=-1 WHERE turn_id=?1",
+                [turn_id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.session_snapshot_v2(session_id, None, 10),
+            Err(StorageError::InvalidData(_))
+        ));
+        {
+            let conn = store.connection.lock().unwrap();
+            conn.execute(
+                "UPDATE session_turns SET completed_at_ms=NULL WHERE turn_id=?1",
+                [turn_id.to_string()],
             )
             .unwrap();
             conn.execute(
@@ -9653,12 +9906,12 @@ mod tests {
         {
             let conn = store.connection.lock().unwrap();
             conn.execute(
-                "DELETE FROM session_active_runs WHERE session_id=?1",
+                "DELETE FROM session_active_turns WHERE session_id=?1",
                 [session_id.to_string()],
             )
             .unwrap();
             conn.execute(
-                "UPDATE sessions SET lifecycle='ready',latest_run_id=NULL WHERE session_id=?1",
+                "UPDATE sessions SET lifecycle='ready',latest_turn_id=NULL WHERE session_id=?1",
                 [session_id.to_string()],
             )
             .unwrap();
@@ -9680,8 +9933,8 @@ mod tests {
         {
             let conn = store.connection.lock().unwrap();
             conn.execute(
-                "UPDATE sessions SET latest_run_id=?1 WHERE session_id=?2",
-                params![run_id.to_string(), session_id.to_string()],
+                "UPDATE sessions SET latest_turn_id=?1 WHERE session_id=?2",
+                params![turn_id.to_string(), session_id.to_string()],
             )
             .unwrap();
         }
@@ -9711,8 +9964,8 @@ mod tests {
         let baseline = std::collections::BTreeMap::from([(valid_key.clone(), "old".into())]);
 
         let start = |baseline: Option<&std::collections::BTreeMap<String, String>>, now_ms| {
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
-            let queued = RunState::queued(run_id);
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+            let queued = TurnState::queued(turn_id);
             store
                 .create_run_with_baseline(&queued, now_ms, baseline)
                 .unwrap();
@@ -9723,7 +9976,7 @@ mod tests {
                     0,
                     EventId::from_uuid(ids.next_uuid_v7()),
                     &RuntimeEvent::StateChanged {
-                        status: RunStatus::Running,
+                        status: TurnStatus::Running,
                     },
                     now_ms + 1,
                     &lease,
@@ -9731,7 +9984,7 @@ mod tests {
                 .unwrap();
             running
         };
-        let record = |run: RunId, id: &str, passed: bool, manifest_digest: &str, now_ms: u64| {
+        let record = |run: TurnId, id: &str, passed: bool, manifest_digest: &str, now_ms: u64| {
             let metadata = serde_json::to_string(&VerificationRecord {
                 revision: 1,
                 effect_epoch: 0,
@@ -9765,7 +10018,7 @@ mod tests {
         };
         assert!(matches!(
             store.complete_verified(
-                running.run_id,
+                running.turn_id,
                 running.revision,
                 &wrong_lease,
                 "summary".into(),
@@ -9777,7 +10030,7 @@ mod tests {
         ));
         assert!(matches!(
             store.complete_verified(
-                running.run_id,
+                running.turn_id,
                 99,
                 &lease,
                 "summary".into(),
@@ -9790,7 +10043,7 @@ mod tests {
         assert!(
             store
                 .complete_verified(
-                    running.run_id,
+                    running.turn_id,
                     1,
                     &lease,
                     "summary".into(),
@@ -9803,11 +10056,11 @@ mod tests {
                 .contains("missing current verification evidence")
         );
 
-        record(running.run_id, "failed", false, "manifest", 21);
+        record(running.turn_id, "failed", false, "manifest", 21);
         assert!(
             store
                 .complete_verified(
-                    running.run_id,
+                    running.turn_id,
                     1,
                     &lease,
                     "summary".into(),
@@ -9819,11 +10072,11 @@ mod tests {
                 .to_string()
                 .contains("verification failed")
         );
-        record(running.run_id, "stale-workspace", true, "before", 23);
+        record(running.turn_id, "stale-workspace", true, "before", 23);
         assert!(
             store
                 .complete_verified(
-                    running.run_id,
+                    running.turn_id,
                     1,
                     &lease,
                     "summary".into(),
@@ -9835,11 +10088,11 @@ mod tests {
                 .to_string()
                 .contains("workspace changed after verification")
         );
-        record(running.run_id, "passing", true, "manifest", 25);
+        record(running.turn_id, "passing", true, "manifest", 25);
         let current = std::collections::BTreeMap::from([(valid_key.clone(), "new".into())]);
         let (completed, event) = store
             .complete_verified(
-                running.run_id,
+                running.turn_id,
                 1,
                 &lease,
                 "verified summary".into(),
@@ -9848,7 +10101,7 @@ mod tests {
                 26,
             )
             .unwrap();
-        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(completed.status, TurnStatus::Completed);
         assert_eq!(event.sequence, 2);
         let handoff = completed.handoff.unwrap();
         assert_eq!(handoff.summary, "verified summary");
@@ -9856,11 +10109,17 @@ mod tests {
         assert_eq!(handoff.evidence[0].status, VerificationStatus::Passed);
 
         let without_baseline = start(None, 30);
-        record(without_baseline.run_id, "no-baseline", true, "manifest", 32);
+        record(
+            without_baseline.turn_id,
+            "no-baseline",
+            true,
+            "manifest",
+            32,
+        );
         assert!(
             store
                 .complete_verified(
-                    without_baseline.run_id,
+                    without_baseline.turn_id,
                     1,
                     &lease,
                     "summary".into(),
@@ -9876,11 +10135,11 @@ mod tests {
         let invalid_key = serde_json::to_string(&vec!["bad/path"]).unwrap();
         let invalid_baseline = std::collections::BTreeMap::from([(invalid_key, "digest".into())]);
         let invalid = start(Some(&invalid_baseline), 40);
-        record(invalid.run_id, "invalid-path", true, "manifest", 42);
+        record(invalid.turn_id, "invalid-path", true, "manifest", 42);
         assert!(
             store
                 .complete_verified(
-                    invalid.run_id,
+                    invalid.turn_id,
                     1,
                     &lease,
                     "summary".into(),
@@ -9928,15 +10187,15 @@ mod tests {
             Err(StorageError::LeaseLost)
         ));
 
-        let (session_id, run_id, queued) = create_linked_fixture(&store, &ids, "recover", 11);
+        let (session_id, turn_id, queued) = create_linked_fixture(&store, &ids, "recover", 11);
         let linked_lease = store.acquire_session_lease(session_id, 10, 10).unwrap();
         let running = commit_linked(
             &store,
             &ids,
             &linked_lease,
             &queued,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "recover:start".into(),
             },
             12,
@@ -9946,9 +10205,9 @@ mod tests {
             store
                 .recover_session_after_lease_loss(
                     session_id,
-                    run_id,
+                    turn_id,
                     &linked_lease,
-                    running.runs[0].run_revision,
+                    running.turns[0].turn_revision,
                     13,
                 )
                 .unwrap_err()
@@ -9956,13 +10215,13 @@ mod tests {
                 .contains("still authoritative")
         );
         assert!(matches!(
-            store.put_checkpoint(run_id, 1, &linked_lease, "{}", 13),
+            store.put_checkpoint(turn_id, 1, &linked_lease, "{}", 13),
             Err(StorageError::LeaseLost)
         ));
         assert!(
             store
                 .put_checkpoint(
-                    RunId::from_uuid(ids.next_uuid_v7()),
+                    TurnId::from_uuid(ids.next_uuid_v7()),
                     1,
                     &live,
                     "{",
@@ -9974,23 +10233,23 @@ mod tests {
         );
         assert_eq!(
             store
-                .checkpoint(RunId::from_uuid(ids.next_uuid_v7()))
+                .checkpoint(TurnId::from_uuid(ids.next_uuid_v7()))
                 .unwrap(),
             None
         );
 
-        let missing = RunId::from_uuid(ids.next_uuid_v7());
+        let missing = TurnId::from_uuid(ids.next_uuid_v7());
         assert!(matches!(
             store.recover_session_after_lease_loss(session_id, missing, &linked_lease, 0, 21),
-            Err(StorageError::RunNotFound(id)) if id == missing
+            Err(StorageError::TurnNotFound(id)) if id == missing
         ));
         assert!(matches!(
             store
                 .recover_session_after_lease_loss(
                     session_id,
-                    run_id,
+                    turn_id,
                     &linked_lease,
-                    running.runs[0].run_revision + 1,
+                    running.turns[0].turn_revision + 1,
                     21,
                 )
                 .unwrap(),
@@ -9999,9 +10258,9 @@ mod tests {
         let recovered = store
             .recover_session_after_lease_loss(
                 session_id,
-                run_id,
+                turn_id,
                 &linked_lease,
-                running.runs[0].run_revision,
+                running.turns[0].turn_revision,
                 21,
             )
             .unwrap();
@@ -10010,22 +10269,22 @@ mod tests {
             SessionLeaseLossRecovery::Recovered(response)
                 if response.snapshot.lifecycle == SessionLifecycle::Interrupted
         ));
-        let recovered_run = store.load_run(run_id).unwrap(); assert!(matches!(store.recover_session_after_lease_loss(session_id, run_id, &linked_lease, recovered_run.revision, 22).unwrap(), SessionLeaseLossRecovery::AlreadyTerminal(_)));
+        let recovered_turn = store.load_turn(turn_id).unwrap(); assert!(matches!(store.recover_session_after_lease_loss(session_id, turn_id, &linked_lease, recovered_turn.revision, 22).unwrap(), SessionLeaseLossRecovery::AlreadyTerminal(_)));
         assert!(matches!(
             store
-                .interrupt_after_lease_loss(run_id, &linked_lease, recovered_run.revision, 22),
+                .interrupt_after_lease_loss(turn_id, &linked_lease, recovered_turn.revision, 22),
             Err(StorageError::LeaseLost)
         ));
         assert!(matches!(
             store
-                .interrupt_after_lease_loss(run_id, &linked_lease, recovered_run.revision + 1, 22),
+                .interrupt_after_lease_loss(turn_id, &linked_lease, recovered_turn.revision + 1, 22),
             Err(StorageError::LeaseLost)
         ));
 
         let next = store.acquire_lease("next", 22, 100).unwrap();
-        let legacy = RunId::from_uuid(ids.next_uuid_v7());
-        let queued = RunState::queued(legacy);
-        store.create_run(&queued, 23).unwrap();
+        let legacy = TurnId::from_uuid(ids.next_uuid_v7());
+        let queued = TurnState::queued(legacy);
+        store.create_turn(&queued, 23).unwrap();
         let running = queued.transition(0, Transition::Start).unwrap();
         store
             .append_event(
@@ -10033,7 +10292,7 @@ mod tests {
                 0,
                 EventId::from_uuid(ids.next_uuid_v7()),
                 &RuntimeEvent::StateChanged {
-                    status: RunStatus::Running,
+                    status: TurnStatus::Running,
                 },
                 24,
                 &next,
@@ -10060,15 +10319,15 @@ mod tests {
                 .contains("binding is not prepared")
         );
 
-        let input_run = RunId::from_uuid(ids.next_uuid_v7());
-        let input_queued = RunState::queued(input_run);
-        store.create_run(&input_queued, 30).unwrap();
+        let input_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let input_queued = TurnState::queued(input_turn);
+        store.create_turn(&input_queued, 30).unwrap();
         let (input_running, _) = store
-            .apply_transition(input_run, 0, Transition::Start, 31, &next)
+            .apply_transition(input_turn, 0, Transition::Start, 31, &next)
             .unwrap();
         let (waiting_input, _) = store
             .apply_transition(
-                input_run,
+                input_turn,
                 input_running.revision,
                 Transition::RequestInput(PendingInput {
                     request_id: "input".into(),
@@ -10080,26 +10339,26 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .cancel_waiting(input_run, waiting_input.revision, &next, 33, true)
+                .cancel_waiting(input_turn, waiting_input.revision, &next, 33, true)
                 .unwrap_err()
                 .to_string()
                 .contains("not waiting for permission")
         );
         let (cancelled, event) = store
-            .cancel_waiting(input_run, waiting_input.revision, &next, 34, false)
+            .cancel_waiting(input_turn, waiting_input.revision, &next, 34, false)
             .unwrap();
-        assert_eq!(cancelled.status, RunStatus::Failed);
+        assert_eq!(cancelled.status, TurnStatus::Failed);
         assert_eq!(cancelled.failure.unwrap().code, FailureCode::Cancelled);
         assert!(event.is_some());
         let (terminal, duplicate) = store
-            .cancel_waiting(input_run, cancelled.revision, &next, 35, false)
+            .cancel_waiting(input_turn, cancelled.revision, &next, 35, false)
             .unwrap();
-        assert_eq!(terminal.status, RunStatus::Failed);
+        assert_eq!(terminal.status, TurnStatus::Failed);
         assert!(duplicate.is_none());
 
-        let running_only = RunId::from_uuid(ids.next_uuid_v7());
-        let queued = RunState::queued(running_only);
-        store.create_run(&queued, 40).unwrap();
+        let running_only = TurnId::from_uuid(ids.next_uuid_v7());
+        let queued = TurnState::queued(running_only);
+        store.create_turn(&queued, 40).unwrap();
         let (running, _) = store
             .apply_transition(running_only, 0, Transition::Start, 41, &next)
             .unwrap();
@@ -10108,12 +10367,12 @@ mod tests {
                 .cancel_waiting(running_only, running.revision, &next, 42, false)
                 .unwrap_err()
                 .to_string()
-                .contains("run is not waiting")
+                .contains("turn is not waiting")
         );
-        assert!(store.append_event(&running, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Running }, 43, &next).unwrap_err().to_string().contains("must increment once"));
+        assert!(store.append_event(&running, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: TurnStatus::Running }, 43, &next).unwrap_err().to_string().contains("must increment once"));
         assert!(matches!(store.apply_transition(running_only, 0, Transition::Cancel, 43, &next), Err(StorageError::StaleRevision { .. }))); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &forged), Err(StorageError::LeaseLost)));
-        store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: RunStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE runs SET lease_token=?1 WHERE run_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
-        store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { run_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
+        store.connection.lock().unwrap().execute("UPDATE turns SET lease_token=?1 WHERE turn_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: TurnStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE turns SET lease_token=?1 WHERE turn_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
+        store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { turn_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
     }
 
     #[test]
@@ -10122,13 +10381,13 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_session_lease(session_id, 1, 100).unwrap();
         let outcome = store
             .create_started_session_v2(
                 None,
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "hello",
@@ -10154,7 +10413,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_session_lease(session_id, 1, 100).unwrap();
 
         // First create
@@ -10162,7 +10421,7 @@ mod tests {
             .create_started_session_v2(
                 None,
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "hello",
@@ -10179,7 +10438,7 @@ mod tests {
             .create_started_session_v2(
                 None,
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "hello",
@@ -10198,7 +10457,7 @@ mod tests {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let command_id = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
         let lease = store.acquire_session_lease(session_id, 1, 100).unwrap();
 
@@ -10207,7 +10466,7 @@ mod tests {
             .create_started_session_v2(
                 Some(&command_id),
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "hello sk-this-is-a-secret-123456789",
@@ -10224,7 +10483,7 @@ mod tests {
         let result = store.create_started_session_v2(
             Some(&command_id),
             session_id,
-            run_id,
+            turn_id,
             &session_binding(),
             "/workspace",
             "hello sk-this-is-a-secret-987654321",
@@ -10268,21 +10527,21 @@ mod tests {
 
     #[test]
     fn status_name_covers_all_variants() {
-        assert_eq!(status_name(RunStatus::Queued), "queued");
-        assert_eq!(status_name(RunStatus::Running), "running");
+        assert_eq!(status_name(TurnStatus::Queued), "queued");
+        assert_eq!(status_name(TurnStatus::Running), "running");
         assert_eq!(
-            status_name(RunStatus::WaitingPermission),
+            status_name(TurnStatus::WaitingPermission),
             "waiting_permission"
         );
-        assert_eq!(status_name(RunStatus::WaitingInput), "waiting_input");
-        assert_eq!(status_name(RunStatus::Cancelling), "cancelling");
-        assert_eq!(status_name(RunStatus::Interrupted), "interrupted");
-        assert_eq!(status_name(RunStatus::Failed), "failed");
-        assert_eq!(status_name(RunStatus::Completed), "completed");
+        assert_eq!(status_name(TurnStatus::WaitingInput), "waiting_input");
+        assert_eq!(status_name(TurnStatus::Cancelling), "cancelling");
+        assert_eq!(status_name(TurnStatus::Interrupted), "interrupted");
+        assert_eq!(status_name(TurnStatus::Failed), "failed");
+        assert_eq!(status_name(TurnStatus::Completed), "completed");
     }
 
     #[test]
-    fn parse_session_id_and_run_id_reject_invalid() {
+    fn parse_session_id_and_turn_id_reject_invalid() {
         let id = SystemIdSource::default().next_uuid_v7();
         let s = id.to_string();
         assert_eq!(
@@ -10290,10 +10549,10 @@ mod tests {
             latte_core::SessionId::from_uuid(id)
         );
         assert!(parse_session_id("not-a-uuid").is_err());
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let rs = run_id.to_string();
-        assert_eq!(parse_run_id(&rs).unwrap(), run_id);
-        assert!(parse_run_id("not-a-uuid").is_err());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let rs = turn_id.to_string();
+        assert_eq!(parse_turn_id(&rs).unwrap(), turn_id);
+        assert!(parse_turn_id("not-a-uuid").is_err());
     }
 
     #[test]
@@ -10377,36 +10636,36 @@ mod tests {
     #[test]
     fn session_run_status_maps_all_variants() {
         assert_eq!(
-            session_run_status(RunStatus::Queued),
-            SessionRunStatus::Queued
+            session_turn_status(TurnStatus::Queued),
+            SessionTurnStatus::Queued
         );
         assert_eq!(
-            session_run_status(RunStatus::Running),
-            SessionRunStatus::Running
+            session_turn_status(TurnStatus::Running),
+            SessionTurnStatus::Running
         );
         assert_eq!(
-            session_run_status(RunStatus::Cancelling),
-            SessionRunStatus::Cancelling
+            session_turn_status(TurnStatus::Cancelling),
+            SessionTurnStatus::Cancelling
         );
         assert_eq!(
-            session_run_status(RunStatus::WaitingPermission),
-            SessionRunStatus::WaitingPermission
+            session_turn_status(TurnStatus::WaitingPermission),
+            SessionTurnStatus::WaitingPermission
         );
         assert_eq!(
-            session_run_status(RunStatus::WaitingInput),
-            SessionRunStatus::WaitingInput
+            session_turn_status(TurnStatus::WaitingInput),
+            SessionTurnStatus::WaitingInput
         );
         assert_eq!(
-            session_run_status(RunStatus::Interrupted),
-            SessionRunStatus::Interrupted
+            session_turn_status(TurnStatus::Interrupted),
+            SessionTurnStatus::Interrupted
         );
         assert_eq!(
-            session_run_status(RunStatus::Failed),
-            SessionRunStatus::Failed
+            session_turn_status(TurnStatus::Failed),
+            SessionTurnStatus::Failed
         );
         assert_eq!(
-            session_run_status(RunStatus::Completed),
-            SessionRunStatus::Completed
+            session_turn_status(TurnStatus::Completed),
+            SessionTurnStatus::Completed
         );
     }
 
@@ -10476,7 +10735,7 @@ mod tests {
         assert!(!redacted.request_id.contains('\x1b'));
         assert!(!redacted.prompt.contains('\x1b'));
 
-        let failure = RunFailure {
+        let failure = TurnFailure {
             code: FailureCode::RuntimeFailed,
             message: "fail\x1b[0m".into(),
             retryability: Retryability::Retryable,
@@ -10506,15 +10765,15 @@ mod tests {
     fn commit_session_run_update_rejects_invalid_effect_fields() {
         let store = Storage::memory().unwrap();
         let ids = SystemIdSource::default();
-        let (session_id, run_id, queued) = create_linked_fixture(&store, &ids, "validation", 11);
+        let (session_id, turn_id, queued) = create_linked_fixture(&store, &ids, "validation", 11);
         let lease = store.acquire_session_lease(session_id, 10, 10_000).unwrap();
         let running = commit_linked(
             &store,
             &ids,
             &lease,
             &queued,
-            run_id,
-            CommitSessionRunUpdate::Start {
+            turn_id,
+            CommitSessionTurnUpdate::Start {
                 source_key: "validate:start".into(),
             },
             12,
@@ -10530,20 +10789,20 @@ mod tests {
         };
         let canonical_json = serde_json::to_string(&canonical).unwrap();
         let session_rev = running.revision;
-        let run_rev = running.runs[0].run_revision;
+        let turn_rev = running.turns[0].turn_revision;
 
         // PrepareEffect: invalid source key (control character).
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: session_rev,
-                    expected_run_revision: run_rev,
+                    expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: Some("effect-validate".into()),
-                    update: CommitSessionRunUpdate::PrepareEffect {
+                    update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "bad\nsource".into(),
                         effect_id: "effect-validate".into(),
                         operation_digest: valid_digest.clone(),
@@ -10561,16 +10820,16 @@ mod tests {
         ));
         // PrepareEffect: invalid effect id (empty).
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: session_rev,
-                    expected_run_revision: run_rev,
+                    expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: Some(String::new()),
-                    update: CommitSessionRunUpdate::PrepareEffect {
+                    update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:empty-id".into(),
                         effect_id: String::new(),
                         operation_digest: valid_digest.clone(),
@@ -10588,16 +10847,16 @@ mod tests {
         ));
         // PrepareEffect: invalid digest (not 64 hex chars).
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: session_rev,
-                    expected_run_revision: run_rev,
+                    expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: Some("effect-validate".into()),
-                    update: CommitSessionRunUpdate::PrepareEffect {
+                    update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-digest".into(),
                         effect_id: "effect-validate".into(),
                         operation_digest: "short".into(),
@@ -10615,16 +10874,16 @@ mod tests {
         ));
         // PrepareEffect: invalid descriptor JSON.
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: session_rev,
-                    expected_run_revision: run_rev,
+                    expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: Some("effect-validate".into()),
-                    update: CommitSessionRunUpdate::PrepareEffect {
+                    update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-descriptor".into(),
                         effect_id: "effect-validate".into(),
                         operation_digest: valid_digest.clone(),
@@ -10642,16 +10901,16 @@ mod tests {
         ));
         // PrepareEffect: invalid checkpoint JSON.
         assert!(matches!(
-            store.commit_session_run_update(
+            store.commit_session_turn_update(
                 &SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: session_rev,
-                    expected_run_revision: run_rev,
+                    expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: Some("effect-validate".into()),
-                    update: CommitSessionRunUpdate::PrepareEffect {
+                    update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-checkpoint".into(),
                         effect_id: "effect-validate".into(),
                         operation_digest: valid_digest.clone(),
@@ -10674,16 +10933,16 @@ mod tests {
             ("effect-validate", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
-                store.commit_session_run_update(
+                store.commit_session_turn_update(
                     &SessionCommitRequest {
                         session_id,
-                        run_id,
+                        turn_id,
                         expected_session_revision: session_rev,
-                        expected_run_revision: run_rev,
+                        expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: Some(eid.into()),
                         effect_id: Some(eid.into()),
-                        update: CommitSessionRunUpdate::StartEffect {
+                        update: CommitSessionTurnUpdate::StartEffect {
                             source_key: "validate:start-effect".into(),
                             effect_id: eid.into(),
                             operation_digest: digest.into(),
@@ -10703,16 +10962,16 @@ mod tests {
             ("effect-validate", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
-                store.commit_session_run_update(
+                store.commit_session_turn_update(
                     &SessionCommitRequest {
                         session_id,
-                        run_id,
+                        turn_id,
                         expected_session_revision: session_rev,
-                        expected_run_revision: run_rev,
+                        expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
                         effect_id: Some(eid.into()),
-                        update: CommitSessionRunUpdate::ObserveEffect {
+                        update: CommitSessionTurnUpdate::ObserveEffect {
                             source_key: "validate:observe".into(),
                             effect_id: eid.into(),
                             operation_digest: digest.into(),
@@ -10735,16 +10994,16 @@ mod tests {
             ("effect-validate", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
-                store.commit_session_run_update(
+                store.commit_session_turn_update(
                     &SessionCommitRequest {
                         session_id,
-                        run_id,
+                        turn_id,
                         expected_session_revision: session_rev,
-                        expected_run_revision: run_rev,
+                        expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
                         effect_id: Some(eid.into()),
-                        update: CommitSessionRunUpdate::UnknownEffect {
+                        update: CommitSessionTurnUpdate::UnknownEffect {
                             source_key: "validate:unknown".into(),
                             effect_id: eid.into(),
                             operation_digest: digest.into(),
@@ -10760,16 +11019,16 @@ mod tests {
         // ReconcileUnknownEffect: invalid effect id, checkpoint.
         for (eid, cp) in [("", "{}"), ("effect-validate", "not json")] {
             assert!(matches!(
-                store.commit_session_run_update(
+                store.commit_session_turn_update(
                     &SessionCommitRequest {
                         session_id,
-                        run_id,
+                        turn_id,
                         expected_session_revision: session_rev,
-                        expected_run_revision: run_rev,
+                        expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
                         effect_id: Some(eid.into()),
-                        update: CommitSessionRunUpdate::ReconcileUnknownEffect {
+                        update: CommitSessionTurnUpdate::ReconcileUnknownEffect {
                             source_key: "validate:reconcile".into(),
                             effect_id: eid.into(),
                             checkpoint_json: cp.into(),
@@ -10788,18 +11047,18 @@ mod tests {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(id_source.next_uuid_v7());
-        let (run_id, _event_id) = ids();
+        let (turn_id, _event_id) = ids();
         let session_lease = store.acquire_session_lease(session_id, 1, 10_000).unwrap();
         let digest = "a".repeat(64);
         // cancel_waiting with a session lease → LeaseLost.
         assert!(matches!(
-            store.cancel_waiting(run_id, 0, &session_lease, 2, false),
+            store.cancel_waiting(turn_id, 0, &session_lease, 2, false),
             Err(StorageError::LeaseLost)
         ));
         // append_event with a session lease → LeaseLost.
-        let state = RunState::queued(run_id);
+        let state = TurnState::queued(turn_id);
         let event = RuntimeEvent::StateChanged {
-            status: RunStatus::Queued,
+            status: TurnStatus::Queued,
         };
         assert!(matches!(
             store.append_event(
@@ -10817,7 +11076,7 @@ mod tests {
             store.replace_pending_effect(
                 "old-effect",
                 "new-effect",
-                run_id,
+                turn_id,
                 0,
                 1,
                 "{}",
@@ -10831,7 +11090,7 @@ mod tests {
         assert!(matches!(
             store.create_prepared_permission(
                 "effect",
-                run_id,
+                turn_id,
                 0,
                 0,
                 1,
@@ -10844,12 +11103,12 @@ mod tests {
         ));
         // consume_permission_and_start with a session lease → LeaseLost.
         assert!(matches!(
-            store.consume_permission_and_start("effect", run_id, 0, &session_lease, &digest, 2),
+            store.consume_permission_and_start("effect", turn_id, 0, &session_lease, &digest, 2),
             Err(StorageError::LeaseLost)
         ));
         // reconcile_unknown_and_abort with a session lease → LeaseLost.
         assert!(matches!(
-            store.reconcile_unknown_and_abort(run_id, "effect", 0, &session_lease, 2),
+            store.reconcile_unknown_and_abort(turn_id, "effect", 0, &session_lease, 2),
             Err(StorageError::LeaseLost)
         ));
     }
@@ -10857,22 +11116,22 @@ mod tests {
     #[test]
     fn cancel_waiting_rejects_stale_revision_and_non_waiting_states() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Wrong expected revision → StaleRevision.
         assert!(matches!(
-            store.cancel_waiting(run_id, 99, &lease, 3, false),
+            store.cancel_waiting(turn_id, 99, &lease, 3, false),
             Err(StorageError::StaleRevision { .. })
         ));
         // Non-waiting run (queued) → InvalidData.
         assert!(matches!(
-            store.cancel_waiting(run_id, 0, &lease, 3, false),
+            store.cancel_waiting(turn_id, 0, &lease, 3, false),
             Err(StorageError::InvalidData(_))
         ));
         // Denied on a non-WaitingPermission run → InvalidData.
         assert!(matches!(
-            store.cancel_waiting(run_id, 0, &lease, 3, true),
+            store.cancel_waiting(turn_id, 0, &lease, 3, true),
             Err(StorageError::InvalidData(_))
         ));
     }
@@ -10881,13 +11140,13 @@ mod tests {
     fn append_event_rejects_unknown_run_and_stale_revision() {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        let state = RunState::queued(run_id);
+        let state = TurnState::queued(turn_id);
         let event = RuntimeEvent::StateChanged {
-            status: RunStatus::Queued,
+            status: TurnStatus::Queued,
         };
-        // Non-existent run → RunNotFound.
+        // Non-existent run → TurnNotFound.
         assert!(matches!(
             store.append_event(
                 &state,
@@ -10897,10 +11156,10 @@ mod tests {
                 2,
                 &lease,
             ),
-            Err(StorageError::RunNotFound(_))
+            Err(StorageError::TurnNotFound(_))
         ));
         // Create the run, then use a stale revision.
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         let mut next = state.clone();
         next.revision = 5; // does not match expected_revision + 1
         assert!(matches!(
@@ -10920,7 +11179,7 @@ mod tests {
     fn switch_session_binding_v2_rejects_invalid_binding_and_unknown_session() {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
-        let (session_id, _run_id, queued) =
+        let (session_id, _turn_id, queued) =
             create_linked_fixture(&store, &id_source, "binding switch", 11);
         let lease = store.acquire_session_lease(session_id, 10, 10_000).unwrap();
         // Invalid binding (empty provider_name) → InvalidData.
@@ -10959,14 +11218,14 @@ mod tests {
     #[test]
     fn create_prepared_permission_rejects_invalid_descriptor_json() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Invalid descriptor JSON → InvalidData.
         assert!(matches!(
             store.create_prepared_permission(
                 "effect",
-                run_id,
+                turn_id,
                 0,
                 0,
                 1,
@@ -10982,15 +11241,15 @@ mod tests {
     #[test]
     fn replace_pending_effect_rejects_invalid_json_and_missing_effect() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Invalid descriptor JSON → InvalidData.
         assert!(matches!(
             store.replace_pending_effect(
                 "old-effect",
                 "new-effect",
-                run_id,
+                turn_id,
                 0,
                 1,
                 "not json",
@@ -11005,7 +11264,7 @@ mod tests {
             store.replace_pending_effect(
                 "missing-effect",
                 "new-effect",
-                run_id,
+                turn_id,
                 0,
                 1,
                 "{}",
@@ -11020,14 +11279,14 @@ mod tests {
     #[test]
     fn consume_permission_and_start_rejects_missing_permission() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Non-existent permission → InvalidData.
         assert!(matches!(
             store.consume_permission_and_start(
                 "missing-effect",
-                run_id,
+                turn_id,
                 0,
                 &lease,
                 &"a".repeat(64),
@@ -11058,12 +11317,12 @@ mod tests {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
         let session_id = latte_core::SessionId::from_uuid(id_source.next_uuid_v7());
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let session_lease = store.acquire_session_lease(session_id, 1, 10_000).unwrap();
         let manifest = std::collections::BTreeMap::new();
         assert!(matches!(
             store.complete_verified(
-                run_id,
+                turn_id,
                 0,
                 &session_lease,
                 "summary".into(),
@@ -11138,12 +11397,12 @@ mod tests {
     #[test]
     fn reconcile_unknown_and_abort_rejects_stale_revision() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Wrong expected revision → StaleRevision.
         assert!(matches!(
-            store.reconcile_unknown_and_abort(run_id, "effect", 99, &lease, 3),
+            store.reconcile_unknown_and_abort(turn_id, "effect", 99, &lease, 3),
             Err(StorageError::StaleRevision { .. })
         ));
     }
@@ -11151,12 +11410,12 @@ mod tests {
     #[test]
     fn interrupt_after_lease_loss_rejects_still_authoritative_lease() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // Lease is still valid → InvalidData.
         assert!(matches!(
-            store.interrupt_after_lease_loss(run_id, &lease, 0, 3),
+            store.interrupt_after_lease_loss(turn_id, &lease, 0, 3),
             Err(StorageError::InvalidData(_))
         ));
     }
@@ -11164,9 +11423,9 @@ mod tests {
     #[test]
     fn apply_transition_rejects_stale_lease_token() {
         let store = Storage::memory().unwrap();
-        let (run_id, _) = ids();
+        let (turn_id, _) = ids();
         let lease = store.acquire_lease("owner", 1, 10_000).unwrap();
-        store.create_run(&RunState::queued(run_id), 2).unwrap();
+        store.create_turn(&TurnState::queued(turn_id), 2).unwrap();
         // A lease with a higher fencing token → LeaseLost.
         let stale = Lease {
             scope: lease.scope.clone(),
@@ -11175,7 +11434,7 @@ mod tests {
             expires_at_ms: lease.expires_at_ms,
         };
         assert!(matches!(
-            store.apply_transition(run_id, 0, Transition::Start, 3, &stale,),
+            store.apply_transition(turn_id, 0, Transition::Start, 3, &stale,),
             Err(StorageError::LeaseLost)
         ));
     }
@@ -11186,14 +11445,14 @@ mod tests {
         let id_source = SystemIdSource::default();
         let baseline = std::collections::BTreeMap::new();
         let session_id = latte_core::SessionId::from_uuid(id_source.next_uuid_v7());
-        let run_id = RunId::from_uuid(id_source.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(id_source.next_uuid_v7());
         // Invalid binding (empty provider_name) → InvalidData.
         let mut bad_binding = session_binding();
         bad_binding.provider_name = String::new();
         assert!(matches!(
             store.create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &bad_binding,
                 "/workspace",
                 "prompt",
@@ -11206,7 +11465,7 @@ mod tests {
         assert!(matches!(
             store.create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "bad\nroot",
                 "prompt",
@@ -11219,7 +11478,7 @@ mod tests {
         store
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 &session_binding(),
                 "/workspace",
                 "prompt",
@@ -11227,11 +11486,11 @@ mod tests {
                 1,
             )
             .unwrap();
-        let run_id2 = RunId::from_uuid(id_source.next_uuid_v7());
+        let turn_id2 = TurnId::from_uuid(id_source.next_uuid_v7());
         let duplicate = store
             .create_session_v2(
                 session_id,
-                run_id2,
+                turn_id2,
                 &session_binding(),
                 "/workspace",
                 "prompt",
@@ -11247,11 +11506,11 @@ mod tests {
         let store = Storage::memory().unwrap();
         let id_source = SystemIdSource::default();
         let baseline = std::collections::BTreeMap::new();
-        let (session_id, _run_id, queued) =
+        let (session_id, _turn_id, queued) =
             create_linked_fixture(&store, &id_source, "follow-up errors", 11);
         // Unknown session → SessionNotFound.
         let unknown = latte_core::SessionId::from_uuid(id_source.next_uuid_v7());
-        let follow_up = RunId::from_uuid(id_source.next_uuid_v7());
+        let follow_up = TurnId::from_uuid(id_source.next_uuid_v7());
         assert!(matches!(
             store.create_session_follow_up_v2(
                 unknown,
@@ -11278,5 +11537,383 @@ mod tests {
             ),
             Err(StorageError::LeaseLost)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn tool_round_counter_counts_only_tool_cards_replays_once_and_survives_drain() {
+        use latte_core::SessionCommandId;
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let (session_id, turn_id, mut snapshot) = create_linked_fixture(&store, &ids, "loop", 100);
+        let lease = store.acquire_session_lease(session_id, 10, 10_000).unwrap();
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            turn_id,
+            CommitSessionTurnUpdate::Start {
+                source_key: "start".into(),
+            },
+            101,
+        )
+        .snapshot;
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 0);
+
+        let tool_card = |source_key: &str, calls: serde_json::Value| {
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: source_key.into(),
+                kind: TranscriptKind::Assistant,
+                text: String::new(),
+                payload: Some(serde_json::json!({ "tool_calls": calls })),
+            }
+        };
+        let call = serde_json::json!([{"id":"c","name":"list_directory","input":{}}]);
+
+        // First tool round (sent explicitly so the exact request can be
+        // replayed below).
+        let first_round = SessionCommitRequest {
+            session_id,
+            turn_id,
+            expected_session_revision: snapshot.revision,
+            expected_turn_revision: snapshot.turns[0].turn_revision,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: tool_card("round-1", call),
+        };
+        snapshot = store
+            .commit_session_turn_update(&first_round, &lease, 102)
+            .unwrap()
+            .snapshot;
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 1);
+
+        // Plain assistant final, tool result, and an empty tool_calls array
+        // must not count.
+        for (now, source_key, kind, payload) in [
+            (103, "final", TranscriptKind::Assistant, None),
+            (
+                104,
+                "tool-result",
+                TranscriptKind::ToolResult,
+                Some(serde_json::json!({"ok": true})),
+            ),
+            (
+                105,
+                "empty",
+                TranscriptKind::Assistant,
+                Some(serde_json::json!({ "tool_calls": [] })),
+            ),
+        ] {
+            snapshot = commit_linked(
+                &store,
+                &ids,
+                &lease,
+                &snapshot,
+                turn_id,
+                CommitSessionTurnUpdate::AppendTranscript {
+                    source_key: source_key.into(),
+                    kind,
+                    text: String::new(),
+                    payload,
+                },
+                now,
+            )
+            .snapshot;
+        }
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 1);
+
+        // Second real tool round counts; multiple calls in one card are one
+        // round.
+        let six_calls = serde_json::json!(
+            (0..6)
+                .map(|i| serde_json::json!({
+                    "id": format!("c-{i}"),
+                    "name": "list_directory",
+                    "input": {}
+                }))
+                .collect::<Vec<_>>()
+        );
+        snapshot = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &snapshot,
+            turn_id,
+            tool_card("round-2", six_calls),
+            106,
+        )
+        .snapshot;
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 2);
+
+        // Idempotent replay of the first round's command must not increment
+        // again even though later commits moved the revision.
+        let replay = store
+            .commit_session_turn_update(&first_round, &lease, 107)
+            .unwrap()
+            .snapshot;
+        assert_ne!(
+            replay.revision, snapshot.revision,
+            "replay returns the stored result"
+        );
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 2);
+
+        // The counter is authoritative: draining the outbox into the JSONL
+        // conversation log leaves the count intact.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM conversation_outbox WHERE session_id=?1",
+                [session_id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema_14_migration_backfills_tool_round_counts_from_the_outbox() {
+        use latte_core::SessionId;
+        let (dir, path) = db();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let other_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let other_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        {
+            let store = Storage::open(&path).unwrap();
+            store
+                .create_session_v2(
+                    session_id,
+                    turn_id,
+                    &session_binding(),
+                    "/workspace",
+                    "long loop",
+                    &std::collections::BTreeMap::new(),
+                    1,
+                )
+                .unwrap();
+            store
+                .create_session_v2(
+                    other_session,
+                    other_turn,
+                    &session_binding(),
+                    "/workspace",
+                    "other",
+                    &std::collections::BTreeMap::new(),
+                    2,
+                )
+                .unwrap();
+            let conn = store.connection.lock().unwrap();
+            // seq 1 is the initial user card created above; lay out a run of
+            // 3 tool rounds interleaved with non-round cards.
+            let cards: Vec<(u64, TurnId, TranscriptKind, Option<serde_json::Value>)> = vec![
+                (
+                    2,
+                    turn_id,
+                    TranscriptKind::Assistant,
+                    Some(serde_json::json!({"tool_calls": [
+                        {"id":"a0","name":"list_directory","input":{}},
+                        {"id":"a1","name":"list_directory","input":{}},
+                        {"id":"a2","name":"list_directory","input":{}},
+                        {"id":"a3","name":"list_directory","input":{}},
+                        {"id":"a4","name":"list_directory","input":{}},
+                        {"id":"a5","name":"list_directory","input":{}},
+                    ]})),
+                ),
+                (3, turn_id, TranscriptKind::ToolResult, None),
+                (4, turn_id, TranscriptKind::Assistant, None),
+                (
+                    5,
+                    turn_id,
+                    TranscriptKind::Assistant,
+                    Some(serde_json::json!({"tool_calls": [
+                        {"id":"b","name":"read_file","input":{"path":"x"}},
+                    ]})),
+                ),
+                (6, turn_id, TranscriptKind::ToolResult, None),
+                (7, turn_id, TranscriptKind::User, None),
+                (
+                    8,
+                    turn_id,
+                    TranscriptKind::Assistant,
+                    Some(serde_json::json!({"tool_calls": []})),
+                ),
+                (
+                    9,
+                    turn_id,
+                    TranscriptKind::Assistant,
+                    Some(serde_json::json!({"tool_calls": [
+                        {"id":"c","name":"read_file","input":{"path":"y"}},
+                    ]})),
+                ),
+                (
+                    10,
+                    other_turn,
+                    TranscriptKind::Assistant,
+                    Some(serde_json::json!({"tool_calls": [
+                        {"id":"o","name":"list_directory","input":{}},
+                    ]})),
+                ),
+            ];
+            for (sequence, card_run, kind, payload) in cards {
+                let entry = TranscriptEntry {
+                    entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+                    sequence,
+                    turn_id: Some(card_run),
+                    kind,
+                    text: String::new(),
+                    payload,
+                    source_key: format!("fixture:{sequence}"),
+                    created_at_ms: sequence,
+                };
+                conn.execute(
+                    "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        if card_run == turn_id { session_id.to_string() } else { other_session.to_string() },
+                        to_i64(sequence).unwrap(),
+                        entry.entry_id.to_string(),
+                        card_run.to_string(),
+                        transcript_kind_name(kind),
+                        entry.source_key,
+                        serde_json::to_string(&entry).unwrap(),
+                        to_i64(sequence).unwrap(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // Undo schemas 14 and 15: reach a genuine v13 database (run columns,
+        // no counter) so reopening runs both migrations for real.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "{REVERSE_SCHEMA_15}\
+                 ALTER TABLE session_runs DROP COLUMN tool_round_count;\
+                 DELETE FROM schema_migrations WHERE version=14;\
+                 PRAGMA user_version=13;"
+            ))
+            .unwrap();
+        }
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(reopened.tool_round_count_for_turn(turn_id).unwrap(), 3);
+        assert_eq!(reopened.tool_round_count_for_turn(other_turn).unwrap(), 1);
+        let version: i64 = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        drop(dir);
+    }
+
+    /// Schema 15 renames the physical run graph to turns. Rows written by a
+    /// pre-15 binary serialize their durable JSON with the old `run_id` key
+    /// ([`TurnState`] in `runs.state_json`, [`EventEnvelope`] in
+    /// `events.event_json`); after the upgrade those rows must deserialize through the read-side
+    /// serde aliases without a rewrite, keeping UUIDs intact.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema_15_renames_the_graph_and_keeps_old_run_json_keys_readable() {
+        use latte_core::{SessionCommandId, SessionId};
+        let (dir, path) = db();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let initial = {
+            let store = Storage::open(&path).unwrap();
+            store
+                .create_session_v2(
+                    session_id,
+                    turn_id,
+                    &session_binding(),
+                    "/workspace",
+                    "upgrade me",
+                    &std::collections::BTreeMap::new(),
+                    1,
+                )
+                .unwrap();
+            let lease = store.acquire_session_lease(session_id, 1, 100).unwrap();
+            store
+                .commit_session_turn_update(
+                    &SessionCommitRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: 0,
+                        expected_turn_revision: 0,
+                        command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::Start {
+                            source_key: "start".into(),
+                        },
+                    },
+                    &lease,
+                    2,
+                )
+                .unwrap();
+            turn_id
+        };
+        // Rewind to a v14 database, then rewrite the durable JSON to carry
+        // the old `run_id` key the way a pre-15 binary wrote it. json_set's
+        // path is missing in the current document, so insert the value
+        // explicitly rather than copying a non-existent `$.turn_id`.
+        {
+            let run_id_json = serde_json::to_string(&turn_id).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("{REVERSE_SCHEMA_15} PRAGMA user_version=14;"))
+                .unwrap();
+            conn.execute(
+                "UPDATE runs SET state_json = json_insert( \
+                    json_remove(state_json,'$.turn_id'), '$.run_id', json(?1))",
+                [run_id_json.clone()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE events SET event_json = json_insert( \
+                    json_remove(event_json,'$.turn_id'), '$.run_id', json(?1))",
+                [run_id_json],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE run_read_model SET state_json = json_insert( \
+                    json_remove(state_json,'$.turn_id'), '$.run_id', json(?1))",
+                [serde_json::to_string(&turn_id).unwrap()],
+            )
+            .unwrap();
+            let state_json: String = conn
+                .query_row(
+                    "SELECT state_json FROM runs WHERE run_id=?1",
+                    [turn_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                state_json.contains("\"run_id\"") && !state_json.contains("\"turn_id\""),
+                "pre-15 state_json must carry run_id: {state_json}"
+            );
+        }
+        let reopened = Storage::open(&path).unwrap();
+        // The physical graph now uses turn names…
+        let version: i64 = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        // …and the pre-15 JSON rows are still readable with the same UUID.
+        // (Opening the catalog without a live engine recovery-sweeps an
+        // orphaned Running child to Interrupted; the point under test is that
+        // the old `run_id` key still deserializes, not the recovered status.)
+        let state = reopened.load_turn(initial).unwrap();
+        assert_eq!(state.turn_id, turn_id);
+        let snapshot = reopened.session_snapshot_tail_v2(session_id, 10).unwrap();
+        assert!(snapshot.turns.iter().any(|turn| turn.turn_id == turn_id));
+        drop(dir);
     }
 }

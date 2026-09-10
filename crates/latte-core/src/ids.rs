@@ -33,7 +33,7 @@ macro_rules! typed_id {
     };
 }
 
-typed_id!(RunId);
+typed_id!(TurnId);
 typed_id!(CommandId);
 typed_id!(EventId);
 // Session identifiers deliberately do not reuse the v1 run identifiers.  A

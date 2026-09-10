@@ -62,6 +62,90 @@ fn session_id(output: &std::process::Output) -> String {
         .to_owned()
 }
 
+/// Upgrading must not require hand-editing a shipped-old configuration: a user
+/// level `~/.latte/latte-code.jsonc` written by an earlier release still uses
+/// the `thread` settings block. That file is parsed *before* the engine or the
+/// database migration runs, so plain `deny_unknown_fields` rejection blocked
+/// startup entirely (and with it the durable-session upgrade path). The block
+/// is normalized to `session` during config layering: the binary starts, a
+/// turn completes, and a pre-existing Session can be resumed.
+#[test]
+fn final_binary_accepts_a_legacy_thread_block_in_user_config_and_resumes_a_session() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first answer"),
+        ProviderReply::completion("second answer"),
+    ]);
+    // Legacy user-level configuration: `thread` instead of `session`, no
+    // workspace config at all.
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},thread:{{provider_timeout_ms:7000}}}}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let first = scenario.output(&["--json", "run", "first turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "legacy-thread-config-secret");
+    });
+    assert!(
+        first.status.success(),
+        "a legacy `thread` block must not block startup:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        stderr.contains("`thread`") && stderr.contains("`session`"),
+        "the legacy block must surface a migration warning: {stderr}"
+    );
+    let session = session_id(&first);
+
+    // The Session from before the rename path is resumable under the same
+    // legacy configuration file.
+    let second = scenario.output(&["--json", "resume", &session, "second turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "legacy-thread-config-secret");
+    });
+    assert!(
+        second.status.success(),
+        "resume under the legacy config failed: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "both turns ran through the normalized config"
+    );
+}
+
+/// A layer that contains both `thread` and `session` is ambiguous: startup
+/// fails with an actionable conflict error instead of silently picking one.
+#[test]
+fn final_binary_rejects_thread_and_session_blocks_together() {
+    let scenario = Scenario::new();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        r#"{version:1,providers:{},verification:{argv:["true"]},
+            thread:{provider_timeout_ms:7000},session:{provider_timeout_ms:9000}}"#,
+    )
+    .unwrap();
+
+    let output = scenario.output(&["--json", "list"], |_| {});
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        (stderr.contains("`thread`") && stderr.contains("`session`"))
+            || (stdout.contains("`thread`") && stdout.contains("`session`")),
+        "the conflict must name both blocks: {stderr}{stdout}"
+    );
+}
+
 #[test]
 fn final_binary_creates_and_reopens_its_configured_sqlite_database() {
     let scenario = Scenario::new();
@@ -127,7 +211,7 @@ fn global_storage_home_ignores_workspace_database_redirect_and_is_shared_across_
 
 #[test]
 fn final_binary_imports_legacy_workspace_sessions_once_and_exports_jsonl() {
-    use latte_core::{IdSource, RunId, SessionId, SessionProviderBinding, SystemIdSource};
+    use latte_core::{IdSource, SessionId, SessionProviderBinding, SystemIdSource, TurnId};
 
     let scenario = Scenario::new();
     let legacy_path = scenario.root().join(".latte/latte-code.db");
@@ -142,7 +226,7 @@ fn final_binary_imports_legacy_workspace_sessions_once_and_exports_jsonl() {
     legacy
         .create_session_v2(
             session_id,
-            RunId::from_uuid(ids.next_uuid_v7()),
+            TurnId::from_uuid(ids.next_uuid_v7()),
             SessionProviderBinding {
                 version: 1,
                 provider_name: "test".into(),
@@ -167,7 +251,7 @@ fn final_binary_imports_legacy_workspace_sessions_once_and_exports_jsonl() {
         let conn = rusqlite::Connection::open(&legacy_path).unwrap();
         conn.execute_batch(&format!(
             "{} PRAGMA user_version=12;",
-            super::support::REVERSE_SCHEMA_13_SQL
+            super::support::REVERSE_TO_SCHEMA_12_SQL
         ))
         .unwrap();
     }
@@ -395,7 +479,7 @@ fn final_binary_reports_a_length_truncated_answer_as_unfinished() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(json(&output)["status"], "failed");
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     // Retryable, so the session still accepts a follow-up that continues it.
@@ -444,11 +528,11 @@ fn final_binary_persists_terminal_provider_failure_without_retrying() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(json(&output)["status"], "failed");
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["failure_code"],
+        json(&output)["data"]["session"]["turns"][0]["failure_code"],
         "runtime_failed"
     );
     provider.assert_consumed();
@@ -458,7 +542,7 @@ fn final_binary_persists_terminal_provider_failure_without_retrying() {
     let shown = scenario.output(&["--json", "show", &id], |_| {});
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(
@@ -648,7 +732,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -656,7 +740,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission");
     let (allow_status, _) = server.request(
         "POST",
@@ -665,7 +749,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -703,7 +787,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
                     Some(&serde_json::json!({
                         "allow": true,
                         "expected_session_revision": body["snapshot"]["revision"],
-                        "expected_run_revision": pending["expected_run_revision"],
+                        "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
                 );
@@ -814,7 +898,7 @@ fn final_binary_stops_a_turn_that_never_stops_calling_tools() {
         String::from_utf8_lossy(&output.stdout)
     );
     let body = json(&output);
-    assert_eq!(body["data"]["session"]["runs"][0]["status"], "failed");
+    assert_eq!(body["data"]["session"]["turns"][0]["status"], "failed");
     // Retryable: the Session stays usable and a follow-up can continue.
     assert_eq!(body["data"]["session"]["lifecycle"], "ready");
 
@@ -831,11 +915,13 @@ fn final_binary_stops_a_turn_that_never_stops_calling_tools() {
         "the failure must name the limit and how to raise it: {failure}"
     );
 
-    // The budget bounds provider calls: 3 rounds, not all 8 scripted replies.
+    // The bound is enforced when the next response tries to open another
+    // batch, so three batches execute and a fourth response is fetched and
+    // refused (no effects run for it). The loop never reaches the 8th reply.
     assert_eq!(
         provider.requests().len(),
-        3,
-        "the loop must stop at the configured round budget"
+        4,
+        "three tool batches execute; the fourth response is refused at the bound"
     );
 }
 
@@ -867,6 +953,15 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
         ),
         ProviderReply::tool_call(
             "t1-round-2",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        // The bound is enforced at the next response's tool-call decision, so
+        // turn 1 consumes one more response: this batch is refused without
+        // executing and turn 1 ends retryably. It must NOT consume turn 2's
+        // gated reply below.
+        ProviderReply::tool_call(
+            "t1-round-3-refused",
             "list_directory",
             &serde_json::json!({"path":"."}),
         ),
@@ -976,7 +1071,7 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
                     Some(&serde_json::json!({
                         "allow": true,
                         "expected_session_revision": body["snapshot"]["revision"],
-                        "expected_run_revision": pending["expected_run_revision"],
+                        "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
                 );
@@ -988,7 +1083,7 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
     // Turn 2 completed successfully.
     // Runs are ordered by ordinal; the last is turn 2. Turn 1 stays failed
     // (it exhausted the budget) while turn 2 completed with a fresh budget.
-    let runs = settled["snapshot"]["runs"].as_array().unwrap();
+    let runs = settled["snapshot"]["turns"].as_array().unwrap();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0]["status"], "failed", "turn one exhausted the budget");
     assert_eq!(
@@ -1015,7 +1110,7 @@ fn downgrade_to_v12(db: &std::path::Path, extra_sql: &str) {
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys=OFF;\n{}\nPRAGMA user_version=12;\n{}",
-        super::support::REVERSE_SCHEMA_13_SQL,
+        super::support::REVERSE_TO_SCHEMA_12_SQL,
         extra_sql
     ))
     .unwrap();
@@ -1042,7 +1137,7 @@ fn wait_session_idle(server: &ServeChild, sid: &str) -> serde_json::Value {
             let snapshot = &body["snapshot"];
             match snapshot["lifecycle"].as_str() {
                 Some("failed") => panic!("turn failed before reaching idle: {body:?}"),
-                Some("ready") if snapshot["active_run_id"].is_null() => {
+                Some("ready") if snapshot["active_turn_id"].is_null() => {
                     let revision = snapshot["revision"].as_u64().unwrap();
                     if previous_revision == Some(revision) {
                         return body;
@@ -1350,7 +1445,7 @@ fn final_binary_resumes_a_pre_upgrade_binding_after_schema_13() {
     );
     // The turn must actually run (provider resolved) and complete.
     let resumed = wait_session_idle(&server, &session_id);
-    let runs = resumed["snapshot"]["runs"].as_array().unwrap();
+    let runs = resumed["snapshot"]["turns"].as_array().unwrap();
     assert_eq!(
         runs.last().and_then(|run| run["status"].as_str()),
         Some("completed"),
@@ -1446,8 +1541,8 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
                         Some(&serde_json::json!({
                             "allow": true,
                             "expected_session_revision": body["snapshot"]["revision"],
-                            "expected_run_revision":
-                                body["snapshot"]["pending"]["expected_run_revision"],
+                            "expected_turn_revision":
+                                body["snapshot"]["pending"]["expected_turn_revision"],
                         })),
                         &[],
                     );
@@ -1524,8 +1619,8 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
                     Some(&serde_json::json!({
                         "allow": true,
                         "expected_session_revision": body["snapshot"]["revision"],
-                        "expected_run_revision":
-                            body["snapshot"]["pending"]["expected_run_revision"],
+                        "expected_turn_revision":
+                            body["snapshot"]["pending"]["expected_turn_revision"],
                     })),
                     &[],
                 );
@@ -1555,7 +1650,7 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
         }
     }
     let completed = completed.expect("the verified turn never completed after upgrade");
-    let runs = completed["snapshot"]["runs"].as_array().unwrap();
+    let runs = completed["snapshot"]["turns"].as_array().unwrap();
     assert_eq!(
         runs.last().and_then(|run| run["status"].as_str()),
         Some("completed"),
@@ -1659,7 +1754,7 @@ fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
                     Some(&serde_json::json!({
                         "allow": true,
                         "expected_session_revision": body["snapshot"]["revision"],
-                        "expected_run_revision": pending["expected_run_revision"],
+                        "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
                 );
@@ -1668,13 +1763,17 @@ fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
         }
     }
     let settled = settled.expect("session never settled");
-    assert_eq!(settled["snapshot"]["runs"][0]["status"], "failed");
+    assert_eq!(settled["snapshot"]["turns"][0]["status"], "failed");
 
-    // Two rounds total, spanning the approval — not two *after* it.
+    // Three batches execute (the third one is the gated write, completed by
+    // the approval), then the fourth response tries to open another batch and
+    // is refused at the bound — 4 provider requests total. Recovering through
+    // the approval must not refill the budget from zero (that would have
+    // executed plain-3..plain-5 and exhausted more replies).
     assert_eq!(
         provider.requests().len(),
-        3,
-        "an approval must not refill the round budget"
+        4,
+        "the round budget must survive the approval recovery path"
     );
 }
 
@@ -1753,7 +1852,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -1765,7 +1864,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached waiting_input");
 
     // Answer the input; the turn resumes and must exhaust at the budget: the
@@ -1778,7 +1877,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
             "request_id": request_id,
             "value": "focus on round two",
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -1810,7 +1909,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let settled = settled.expect("turn never settled after the input resume");
-    let runs = settled["snapshot"]["runs"].as_array().unwrap();
+    let runs = settled["snapshot"]["turns"].as_array().unwrap();
     assert_eq!(
         runs.last().and_then(|run| run["status"].as_str()),
         Some("failed"),
@@ -1828,13 +1927,195 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
         failure.contains("tool rounds"),
         "failure must be the round-budget stop, got: {failure}"
     );
-    // Two tool rounds were served (round A and round B); round C is blocked,
-    // so the provider saw exactly 3 requests: initial, post-round-A tool result,
-    // and post-input round-B tool result — never a fourth.
+    // Requests: initial batch, post-batch input request, post-answer batch,
+    // and the response that tries a third batch (refused at the bound).
+    assert_eq!(
+        provider.requests().len(),
+        4,
+        "an input answer must not refill the budget: the third batch's \
+         response is refused"
+    );
+}
+
+/// The persisted per-run round counter must survive beyond the tail-500
+/// transcript projection. Each tool batch here carries six calls, so 47
+/// batches persist ~611 assistant/tool cards (plus the user/input cards):
+/// over the 500-entry bound. Counting rounds from the commit snapshot would
+/// recover only 38 rounds, silently refilling the 48-round budget after the
+/// input answer. The counter must make the 48th batch run and the 49th stop.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_input() {
+    let scenario = Scenario::new();
+    let tool_batch = |prefix: &str| {
+        let calls = (0..6_u32)
+            .map(|ordinal| {
+                serde_json::json!({
+                    "id": format!("{prefix}-c{ordinal}"),
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": "{\"path\":\".\"}",
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "choices": [{
+                    "message": {"content": "", "tool_calls": calls}
+                }]
+            }),
+        )
+    };
+    let mut replies: Vec<ProviderReply> = Vec::new();
+    // 47 tool batches × 6 calls: 47 assistant cards + 564 tool cards ≈ 611.
+    for round in 0..47_u32 {
+        replies.push(tool_batch(&format!("r{round}")));
+    }
+    replies.push(ProviderReply::input_request(
+        "need-more-context",
+        "what next?",
+        false,
+    ));
+    // Batch 48: allowed (47 already spent).
+    replies.push(tool_batch("r47"));
+    // Batch 49: must be stopped by the counter, never executed.
+    replies.push(tool_batch("r48-blocked"));
+    let provider = ScriptedProvider::start(replies);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:48}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let (create_status, create_body) = server.create_session(
+        &workspace_id,
+        "a very long loop",
+        &server_binding(&scenario),
+    );
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait for the input gate after exactly 47 batches (~613 durable cards).
+    let mut pending = None;
+    for _ in 0..900 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            // The projection deliberately truncates here; the fix must not
+            // depend on what this snapshot contains.
+            let entries = body["snapshot"]["transcript"]["entries"]
+                .as_array()
+                .map_or(0, Vec::len);
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_turn_revision"]
+                    .as_u64()
+                    .unwrap(),
+                entries,
+            ));
+            break;
+        }
+        assert!(
+            !(status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed")),
+            "turn failed before the input gate: {body:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, turn_revision, visible_entries) =
+        pending.expect("session never reached waiting_input after 47 tool batches");
     assert!(
-        provider.requests().len() <= 3,
-        "an input answer must not allow a third tool round: {}",
-        provider.requests().len()
+        visible_entries <= 500,
+        "test premise: the gate snapshot must be truncated, saw {visible_entries} entries"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        48,
+        "47 batches + one input request"
+    );
+
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "keep going",
+            "expected_session_revision": revision,
+            "expected_turn_revision": turn_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+
+    // Batch 48 runs, the batch-49 response then stops the turn retryably.
+    let mut settled = None;
+    for _ in 0..600 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            settled = Some(body);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let settled = settled.expect("turn never settled after the input resume");
+    assert_eq!(
+        settled["snapshot"]["turns"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["status"],
+        "failed"
+    );
+    let failure = settled["snapshot"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "failure")
+        .filter_map(|entry| entry["text"].as_str())
+        .next_back()
+        .unwrap_or("");
+    assert!(
+        failure.contains("tool rounds") && failure.contains("max_tool_rounds"),
+        "the persisted counter must stop batch 49 even beyond the 500-card \
+         projection; got: {failure}"
+    );
+    // 47 batches, the input reply, batch 48, then the batch-49 response whose
+    // execution is refused. A tail-page count (38) would have kept going and
+    // exhausted the scripted provider instead.
+    assert_eq!(
+        provider.requests().len(),
+        50,
+        "exactly 48 batches may execute; the 49th response is refused"
     );
 }
 
@@ -2374,7 +2655,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": 0,
-            "expected_run_revision": 0
+            "expected_turn_revision": 0
         })),
         &[],
     );
@@ -2388,7 +2669,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
             "request_id": "req-1",
             "value": "v",
             "expected_session_revision": 0,
-            "expected_run_revision": 0
+            "expected_turn_revision": 0
         })),
         &[],
     );
@@ -2429,7 +2710,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         Some(&server.token),
         Some(&serde_json::json!({
             "expected_session_revision": 999,
-            "expected_run_revision": 999
+            "expected_turn_revision": 999
         })),
         &[],
     );
@@ -2629,7 +2910,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -2637,7 +2918,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission over HTTP");
 
     // Allowing the permission over HTTP executes the effect and continues the
@@ -2649,7 +2930,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -2761,7 +3042,7 @@ fn final_binary_server_denies_a_permission_request_through_http() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -2769,7 +3050,7 @@ fn final_binary_server_denies_a_permission_request_through_http() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission over HTTP");
 
     // Denying the permission over HTTP records the denial without executing
@@ -2781,7 +3062,7 @@ fn final_binary_server_denies_a_permission_request_through_http() {
         Some(&serde_json::json!({
             "allow": false,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -2884,11 +3165,11 @@ fn final_binary_server_rejects_secret_input_request_from_provider() {
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
-fn final_binary_server_rejects_stale_run_revision_on_permission() {
+fn final_binary_server_rejects_stale_turn_revision_on_permission() {
     let scenario = Scenario::new();
     // The scripted provider requests a tool call, parking the session at
-    // WaitingPermission. Resolving with a stale run_revision must 409;
-    // resolving with the correct run_revision must succeed.
+    // WaitingPermission. Resolving with a stale turn_revision must 409;
+    // resolving with the correct turn_revision must succeed.
     let provider = ScriptedProvider::start([
         ProviderReply::tool_call(
             "stale-run-perm",
@@ -2944,7 +3225,7 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -2952,10 +3233,10 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission over HTTP");
 
-    // A stale run_revision is rejected with 409.
+    // A stale turn_revision is rejected with 409.
     let (stale_status, stale_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -2963,16 +3244,16 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision + 999
+            "expected_turn_revision": turn_revision + 999
         })),
         &[],
     );
     assert_eq!(
         stale_status, 409,
-        "stale run_revision must 409: {stale_body:?}"
+        "stale turn_revision must 409: {stale_body:?}"
     );
 
-    // The correct run_revision succeeds.
+    // The correct turn_revision succeeds.
     let (ok_status, _) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -2980,7 +3261,7 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -2989,11 +3270,11 @@ fn final_binary_server_rejects_stale_run_revision_on_permission() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn final_binary_server_rejects_stale_run_revision_on_input() {
+fn final_binary_server_rejects_stale_turn_revision_on_input() {
     let scenario = Scenario::new();
     // The scripted provider requests non-secret input, parking the session at
-    // WaitingInput. Providing input with a stale run_revision must 409;
-    // providing with the correct run_revision must succeed.
+    // WaitingInput. Providing input with a stale turn_revision must 409;
+    // providing with the correct turn_revision must succeed.
     let provider = ScriptedProvider::start([
         ProviderReply::input_request("stale-run-input", "what value?", false),
         ProviderReply::completion("got it"),
@@ -3042,7 +3323,7 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -3050,10 +3331,10 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingInput over HTTP");
 
-    // A stale run_revision is rejected with 409.
+    // A stale turn_revision is rejected with 409.
     let (stale_status, stale_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/input"),
@@ -3062,16 +3343,16 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
             "request_id": request_id,
             "value": "stale",
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision + 999
+            "expected_turn_revision": turn_revision + 999
         })),
         &[],
     );
     assert_eq!(
         stale_status, 409,
-        "stale run_revision must 409: {stale_body:?}"
+        "stale turn_revision must 409: {stale_body:?}"
     );
 
-    // The correct run_revision succeeds.
+    // The correct turn_revision succeeds.
     let (ok_status, _) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/input"),
@@ -3080,7 +3361,7 @@ fn final_binary_server_rejects_stale_run_revision_on_input() {
             "request_id": request_id,
             "value": "correct",
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -3142,7 +3423,7 @@ fn final_binary_server_provides_input_through_http() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -3150,7 +3431,7 @@ fn final_binary_server_provides_input_through_http() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingInput over HTTP");
 
     // Queueing against a session parked on input is timing-dependent (the
@@ -3177,7 +3458,7 @@ fn final_binary_server_provides_input_through_http() {
             "request_id": request_id,
             "value": "the answer",
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -3220,7 +3501,7 @@ fn final_binary_server_provides_input_through_http() {
             Some(&server.token),
             Some(&serde_json::json!({
                 "expected_session_revision": final_rev,
-                "expected_run_revision": 0
+                "expected_turn_revision": 0
             })),
             &[],
         );
@@ -4454,7 +4735,7 @@ fn final_binary_cli_run_against_standalone_server() {
     let body = json(&output);
     assert_eq!(body["status"], "completed");
     assert_eq!(body["data"]["session"]["lifecycle"], "ready");
-    assert_eq!(body["data"]["session"]["runs"][0]["status"], "completed");
+    assert_eq!(body["data"]["session"]["turns"][0]["status"], "completed");
     assert!(
         body["data"]["session"]["transcript"]["entries"]
             .as_array()
@@ -4598,7 +4879,7 @@ fn final_binary_cli_show_list_resume_against_standalone_server() {
         String::from_utf8_lossy(&resume.stdout)
     );
     assert_eq!(
-        json(&resume)["data"]["session"]["runs"][0]["status"],
+        json(&resume)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     provider.assert_consumed();
@@ -4988,7 +5269,7 @@ fn final_binary_cli_show_denied_session_in_text_mode() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -4996,7 +5277,7 @@ fn final_binary_cli_show_denied_session_in_text_mode() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission over HTTP");
 
     // Deny the permission.
@@ -5007,7 +5288,7 @@ fn final_binary_cli_show_denied_session_in_text_mode() {
         Some(&serde_json::json!({
             "allow": false,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -5123,7 +5404,7 @@ fn final_binary_cli_show_running_session_renders_lifecycle() {
 
 /// CLI `run` interrupted by SIGINT maps to a best-effort cancel and exits 130
 /// (cancelled), covering the `observe_session` cancel branch, `cancel_session`,
-/// the `cancel` HTTP method, and `RunResult::Cancelled`.
+/// the `cancel` HTTP method, and `TurnResult::Cancelled`.
 #[cfg(unix)]
 #[test]
 fn final_binary_cli_run_sigint_returns_cancelled() {
@@ -5238,7 +5519,7 @@ fn final_binary_cli_run_with_read_only_tool_call_completes() {
 }
 
 /// CLI `run --json` interrupted by SIGINT emits the `cancelled` status envelope
-/// (covering `RunResult::Cancelled::status` in JSON mode).
+/// (covering `TurnResult::Cancelled::status` in JSON mode).
 #[cfg(unix)]
 #[test]
 fn final_binary_cli_run_sigint_json_emits_cancelled() {
@@ -5419,7 +5700,7 @@ fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
                 body["snapshot"]["revision"].as_u64().unwrap(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -5427,7 +5708,7 @@ fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, run_revision) = pending.expect("session never reached WaitingPermission");
+    let (revision, turn_revision) = pending.expect("session never reached WaitingPermission");
 
     // Cancel the waiting session.
     let (cancel_status, _) = server.request(
@@ -5436,7 +5717,7 @@ fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
         Some(&server.token),
         Some(&serde_json::json!({
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -5645,10 +5926,10 @@ fn handle_mock_request(mut stream: std::net::TcpStream, count: &std::sync::atomi
 
     let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
     let running_snapshot = format!(
-        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
     );
     let completed_snapshot = format!(
-        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_run_id":"01a0194a-0000-7000-8000-000000000002","active_run_id":null,"pending":null,"runs":[{{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_turn_id":"01a0194a-0000-7000-8000-000000000002","active_turn_id":null,"pending":null,"turns":[{{"turn_id":"01a0194a-0000-7000-8000-000000000002","parent_turn_id":null,"ordinal":0,"status":"completed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
     );
 
     let response: Vec<u8> = match (method, path) {
@@ -5806,10 +6087,10 @@ fn handle_rich_sse_request(
     let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
     let session_id = "01a0194a-0000-7000-8000-000000000001";
     let running_snapshot = format!(
-        r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+        r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
     );
     let completed_snapshot = format!(
-        r#"{{"snapshot":{{"session_id":"{session_id}","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_run_id":"01a0194a-0000-7000-8000-000000000002","active_run_id":null,"pending":null,"runs":[{{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+        r#"{{"snapshot":{{"session_id":"{session_id}","revision":2,"sequence":2,"lifecycle":"ready","binding":{binding},"latest_turn_id":"01a0194a-0000-7000-8000-000000000002","active_turn_id":null,"pending":null,"turns":[{{"turn_id":"01a0194a-0000-7000-8000-000000000002","parent_turn_id":null,"ordinal":0,"status":"completed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
     );
 
     let response: Vec<u8> = match (method, path) {
@@ -5843,16 +6124,16 @@ fn handle_rich_sse_request(
                     ": keepalive comment\n",
                     "\n",
                     "event: progress\n",
-                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"hello\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"turn_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"r1\",\"text\":\"hello\"}}}}\n",
                     "\n",
                     "event: progress\n",
-                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"tool_progress\",\"run_id\":\"r1\",\"name\":\"read_file\",\"detail\":\"reading\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"turn_id\":\"r1\",\"progress\":{{\"type\":\"tool_progress\",\"turn_id\":\"r1\",\"name\":\"read_file\",\"detail\":\"reading\"}}}}\n",
                     "\n",
                     "event: progress\n",
-                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"provider_attempt\",\"run_id\":\"r1\",\"number\":1}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"turn_id\":\"r1\",\"progress\":{{\"type\":\"provider_attempt\",\"turn_id\":\"r1\",\"number\":1}}}}\n",
                     "\n",
                     "event: progress\n",
-                    "data: {{\"session_id\":\"other-session\",\"run_id\":\"r2\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r2\",\"text\":\"other\"}}}}\n",
+                    "data: {{\"session_id\":\"other-session\",\"turn_id\":\"r2\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"r2\",\"text\":\"other\"}}}}\n",
                     "\n",
                     "event: session_changed\n",
                     "data: {{\"session_id\":\"{sid}\",\"revision\":2}}\n",
@@ -5867,8 +6148,8 @@ fn handle_rich_sse_request(
                     "data: not valid json\n",
                     "\n",
                     "event: progress\n",
-                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"multi\"}}}}\n",
-                    "data: {{\"session_id\":\"{sid}\",\"run_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"r1\",\"text\":\"line\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"turn_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"r1\",\"text\":\"multi\"}}}}\n",
+                    "data: {{\"session_id\":\"{sid}\",\"turn_id\":\"r1\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"r1\",\"text\":\"line\"}}}}\n",
                     "\n",
                 ),
                 sid = session_id,
@@ -6031,7 +6312,7 @@ fn handle_lifecycle_request(mut stream: std::net::TcpStream, snapshot_json: &str
 fn terminal_snapshot(lifecycle: &str, runs: &str) -> String {
     let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
     format!(
-        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"{lifecycle}","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":{runs},"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
+        r#"{{"snapshot":{{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"{lifecycle}","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":{runs},"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}}}"#
     )
 }
 
@@ -6040,8 +6321,8 @@ fn terminal_snapshot(lifecycle: &str, runs: &str) -> String {
 /// Denied, and Ready-with-no-runs.
 #[test]
 fn final_binary_cli_run_classifies_terminal_lifecycles() {
-    let denied_run = r#"[{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"failed","run_revision":1,"completed_at_ms":1234567890,"failure_code":"permission_denied"}]"#;
-    let failed_run = r#"[{"run_id":"01a0194a-0000-7000-8000-000000000002","parent_run_id":null,"ordinal":0,"status":"failed","run_revision":1,"completed_at_ms":1234567890,"failure_code":"runtime_failed"}]"#;
+    let denied_turn = r#"[{"turn_id":"01a0194a-0000-7000-8000-000000000002","parent_turn_id":null,"ordinal":0,"status":"failed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":"permission_denied"}]"#;
+    let failed_turn = r#"[{"turn_id":"01a0194a-0000-7000-8000-000000000002","parent_turn_id":null,"ordinal":0,"status":"failed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":"runtime_failed"}]"#;
 
     let cases: &[(&str, &str, i32, &str)] = &[
         ("interrupted", "[]", 130, "interrupted"),
@@ -6053,8 +6334,8 @@ fn final_binary_cli_run_classifies_terminal_lifecycles() {
         ),
         ("failed", "[]", 1, "failed"),
         ("ready", "[]", 1, "failed"), // Ready with no runs → Failed
-        ("ready", denied_run, 11, "denied"),
-        ("ready", failed_run, 1, "failed"),
+        ("ready", denied_turn, 11, "denied"),
+        ("ready", failed_turn, 1, "failed"),
     ];
 
     for (lifecycle, runs, expected_exit, expected_status) in cases {
@@ -6111,8 +6392,8 @@ fn final_binary_cli_list_renders_interrupted_and_reconciliation_lifecycles() {
     let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
     let sessions = format!(
         r#"{{"sessions":[
-            {{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"interrupted","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}},
-            {{"session_id":"01a0194a-0000-7000-8000-000000000002","revision":1,"sequence":1,"lifecycle":"reconciliation_required","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}
+            {{"session_id":"01a0194a-0000-7000-8000-000000000001","revision":1,"sequence":1,"lifecycle":"interrupted","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}},
+            {{"session_id":"01a0194a-0000-7000-8000-000000000002","revision":1,"sequence":1,"lifecycle":"reconciliation_required","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}
         ]}}"#
     );
     let server = MockLifecycleServer::start(sessions);
@@ -6140,7 +6421,7 @@ fn final_binary_cli_list_follows_pagination_cursor() {
     let binding = r#"{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"fp","tools_fingerprint":"fp","aliases":{},"credential_ref_id":"ref","data_scope_id":"scope","credential_generation":1}"#;
     let session = |id: &str| {
         format!(
-            r#"{{"session_id":"{id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{binding},"latest_run_id":null,"active_run_id":null,"pending":null,"runs":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}"#
+            r#"{{"session_id":"{id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{binding},"latest_turn_id":null,"active_turn_id":null,"pending":null,"turns":[],"transcript":{{"entries":[],"next_after":null,"has_more":false}},"focus":null}}"#
         )
     };
     let page1 = format!(
@@ -6216,11 +6497,11 @@ fn engine_paged_list_follows_cursor_across_pages() {
     let ids = latte_core::SystemIdSource::default();
     for index in 0..3u64 {
         let session_id = latte_core::SessionId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
-        let run_id = latte_core::RunId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
+        let turn_id = latte_core::TurnId::from_uuid(latte_core::IdSource::next_uuid_v7(&ids));
         engine
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 binding.clone(),
                 &format!("session {index}"),
                 index + 1,
@@ -6320,14 +6601,14 @@ fn engine_lifecycle_covers_run_transition_rename_fork_and_lease() {
 
     // Create a session and run.
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "lifecycle test", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "lifecycle test", 1)
         .unwrap();
 
     // Create a second session for more coverage.
     let session2 = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run2 = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let run2 = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
         .create_session_v2(session2, run2, binding.clone(), "second session", 2)
         .unwrap();
@@ -6388,9 +6669,9 @@ fn engine_snapshot_and_conversation_paths() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "snapshot test", 1)
+        .create_session_v2(session_id, turn_id, binding, "snapshot test", 1)
         .unwrap();
 
     // Session snapshot.
@@ -6459,29 +6740,29 @@ fn engine_run_lifecycle_covers_transitions() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "lifecycle", 1)
+        .create_session_v2(session_id, turn_id, binding, "lifecycle", 1)
         .unwrap();
 
     // The session's initial run should be in Queued state.
-    let state = engine.show(run_id).unwrap();
-    assert_eq!(state.status, latte_core::RunStatus::Queued);
+    let state = engine.show(turn_id).unwrap();
+    assert_eq!(state.status, latte_core::TurnStatus::Queued);
 
     // Linked v2 runs mutate exclusively through session commits, scoped to a
     // session lease — the legacy run-transition path rejects them by design.
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -6490,19 +6771,19 @@ fn engine_run_lifecycle_covers_transitions() {
         )
         .unwrap();
     assert_eq!(started.snapshot.session_id, session_id);
-    assert_eq!(started.snapshot.active_run_id, Some(run_id));
+    assert_eq!(started.snapshot.active_turn_id, Some(turn_id));
     assert_eq!(
-        engine.show(run_id).unwrap().status,
-        latte_core::RunStatus::Running
+        engine.show(turn_id).unwrap().status,
+        latte_core::TurnStatus::Running
     );
     let mut revision = started.snapshot.revision;
-    let mut run_revision = started
+    let mut turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .expect("started run appears in snapshot")
-        .run_revision;
+        .turn_revision;
 
     // Append transcript entries on both sides of the conversation.
     for (kind, text) in [
@@ -6510,16 +6791,16 @@ fn engine_run_lifecycle_covers_transitions() {
         (latte_core::TranscriptKind::Assistant, "first reply"),
     ] {
         let committed = engine
-            .commit_session_run_update(
+            .commit_session_turn_update(
                 latte_engine::SessionCommitRequest {
                     session_id,
-                    run_id,
+                    turn_id,
                     expected_session_revision: revision,
-                    expected_run_revision: run_revision,
+                    expected_turn_revision: turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: latte_engine::CommitSessionRunUpdate::AppendTranscript {
+                    update: latte_engine::CommitSessionTurnUpdate::AppendTranscript {
                         source_key: format!("append-{text}"),
                         kind,
                         text: text.into(),
@@ -6531,13 +6812,13 @@ fn engine_run_lifecycle_covers_transitions() {
             )
             .unwrap();
         revision = committed.snapshot.revision;
-        run_revision = committed
+        turn_revision = committed
             .snapshot
-            .runs
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
+            .find(|run| run.turn_id == turn_id)
             .expect("run still appears in snapshot")
-            .run_revision;
+            .turn_revision;
     }
     let snapshot = engine.session_snapshot_v2(session_id, None, 10).unwrap();
     // Start writes its own transcript entry, so the two appends make three.
@@ -6587,22 +6868,22 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
     // Create a session and complete its first run so the session is ready for
     // follow-up.
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "dedup", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "dedup", 1)
         .unwrap();
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -6611,28 +6892,28 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
         )
         .unwrap();
     let mut revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
 
     // Fail the run (retryable) so the session becomes ready for follow-up.
     let committed = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Fail {
+                update: latte_engine::CommitSessionTurnUpdate::Fail {
                     source_key: "fail".into(),
-                    failure: latte_core::RunFailure {
+                    failure: latte_core::TurnFailure {
                         code: latte_core::FailureCode::RuntimeFailed,
                         message: "test failure".into(),
                         retryability: latte_core::Retryability::Retryable,
@@ -6648,13 +6929,13 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
 
     // First follow-up with a stable command_id → Created.
     let command_id = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
-    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let follow_turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     let follow_lease = engine.acquire_session_lease(session_id, 5, 10_000).unwrap();
     let first = engine
         .create_started_session_follow_up_v2(
             Some(&command_id),
             session_id,
-            follow_run_id,
+            follow_turn_id,
             revision,
             "follow-up turn",
             &follow_lease,
@@ -6665,15 +6946,15 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
         latte_core::CreateOutcome::Created(snapshot) => snapshot,
         latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
     };
-    assert_eq!(first_snapshot.active_run_id, Some(follow_run_id));
+    assert_eq!(first_snapshot.active_turn_id, Some(follow_turn_id));
 
     // Replay with the same command_id + payload → Replayed, no duplicate turn.
-    let replay_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let replay_turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     let replay = engine
         .create_started_session_follow_up_v2(
             Some(&command_id),
             session_id,
-            replay_run_id,
+            replay_turn_id,
             revision,
             "follow-up turn",
             &follow_lease,
@@ -6689,11 +6970,11 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
     assert_eq!(replayed_snapshot.revision, first_snapshot.revision);
 
     // Same command_id but different prompt → SessionCommandReplayMismatch.
-    let mismatch_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let mismatch_turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     let mismatch = engine.create_started_session_follow_up_v2(
         Some(&command_id),
         session_id,
-        mismatch_run_id,
+        mismatch_turn_id,
         revision,
         "DIFFERENT prompt",
         &follow_lease,
@@ -6709,7 +6990,7 @@ fn engine_follow_up_durable_idempotency_replays_and_rejects_mismatch() {
     let mismatch2 = engine.create_started_session_follow_up_v2(
         Some(&command_id),
         session_id,
-        mismatch_run_id,
+        mismatch_turn_id,
         revision + 1,
         "follow-up turn",
         &follow_lease,
@@ -6778,25 +7059,25 @@ fn engine_session_management_covers_switch_rename_and_fork() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "manage me", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "manage me", 1)
         .unwrap();
 
     // Start and fail the run (retryable) so the session becomes ready for
     // management operations.
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -6805,26 +7086,26 @@ fn engine_session_management_covers_switch_rename_and_fork() {
         )
         .unwrap();
     let revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
     engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Fail {
+                update: latte_engine::CommitSessionTurnUpdate::Fail {
                     source_key: "fail".into(),
-                    failure: latte_core::RunFailure {
+                    failure: latte_core::TurnFailure {
                         code: latte_core::FailureCode::RuntimeFailed,
                         message: "test".into(),
                         retryability: latte_core::Retryability::Retryable,
@@ -6919,11 +7200,11 @@ fn engine_paged_queries_and_changed_files() {
     // Create two sessions.
     for i in 0..2 {
         let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-        let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
         engine
             .create_session_v2(
                 session_id,
-                run_id,
+                turn_id,
                 binding.clone(),
                 &format!("paged {i}"),
                 1,
@@ -6981,9 +7262,9 @@ fn engine_lease_recovery_reclaims_expired_session_lease() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "lease recovery", 1)
+        .create_session_v2(session_id, turn_id, binding, "lease recovery", 1)
         .unwrap();
 
     // Acquire a lease with a very short TTL.
@@ -7030,22 +7311,22 @@ fn engine_non_atomic_follow_up_queues_child() {
 
     // Create a session and complete its first run.
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "non-atomic", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "non-atomic", 1)
         .unwrap();
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -7054,26 +7335,26 @@ fn engine_non_atomic_follow_up_queues_child() {
         )
         .unwrap();
     let revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
     engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Fail {
+                update: latte_engine::CommitSessionTurnUpdate::Fail {
                     source_key: "fail".into(),
-                    failure: latte_core::RunFailure {
+                    failure: latte_core::TurnFailure {
                         code: latte_core::FailureCode::RuntimeFailed,
                         message: "test".into(),
                         retryability: latte_core::Retryability::Retryable,
@@ -7087,21 +7368,24 @@ fn engine_non_atomic_follow_up_queues_child() {
     engine.release_lease(&lease).unwrap();
 
     // Non-atomic follow-up (no lease): queues a child in Queued state.
-    let follow_run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let follow_turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     let snapshot = engine
-        .create_session_follow_up_v2(session_id, follow_run_id, 2, "queued follow-up", 5)
+        .create_session_follow_up_v2(session_id, follow_turn_id, 2, "queued follow-up", 5)
         .unwrap();
     assert_eq!(snapshot.session_id, session_id);
     // The follow-up child should appear in the snapshot.
     assert!(
-        snapshot.runs.iter().any(|run| run.run_id == follow_run_id),
+        snapshot
+            .turns
+            .iter()
+            .any(|run| run.turn_id == follow_turn_id),
         "follow-up child must appear in snapshot: {:?}",
-        snapshot.runs
+        snapshot.turns
     );
 }
 
 /// Engine-level changed-files and workspace manifest: covers the
-/// `session_run_changed_files` read path and workspace manifest computation.
+/// `session_turn_changed_files` read path and workspace manifest computation.
 #[test]
 fn engine_changed_files_and_workspace_manifest() {
     use latte_core::IdSource;
@@ -7128,13 +7412,13 @@ fn engine_changed_files_and_workspace_manifest() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "changed files", 1)
+        .create_session_v2(session_id, turn_id, binding, "changed files", 1)
         .unwrap();
 
     // Changed files for a fresh run (covers the read path).
-    let _changed = engine.session_run_changed_files(run_id).unwrap();
+    let _changed = engine.session_turn_changed_files(turn_id).unwrap();
 
     // Workspace manifest.
     let manifest = engine.workspace_manifest().unwrap();
@@ -7173,9 +7457,9 @@ fn engine_lease_lifecycle_and_subscriptions() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "lease test", 1)
+        .create_session_v2(session_id, turn_id, binding, "lease test", 1)
         .unwrap();
 
     // Acquire, renew, and release a session lease.
@@ -7192,8 +7476,8 @@ fn engine_lease_lifecycle_and_subscriptions() {
     let _session_events = engine.subscribe_sessions();
 
     // Show a run.
-    let state = engine.show(run_id).unwrap();
-    assert_eq!(state.run_id, run_id);
+    let state = engine.show(turn_id).unwrap();
+    assert_eq!(state.turn_id, turn_id);
 
     // List runs.
     let runs = engine.list().unwrap();
@@ -7228,24 +7512,24 @@ fn engine_cancel_and_unknown_effect_paths() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "cancel test", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "cancel test", 1)
         .unwrap();
 
     // Start the run.
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -7254,26 +7538,26 @@ fn engine_cancel_and_unknown_effect_paths() {
         )
         .unwrap();
     let revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
 
     // Cancel the run.
     let _cancelled = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Interrupt {
+                update: latte_engine::CommitSessionTurnUpdate::Interrupt {
                     source_key: "cancel".into(),
                     reconciliation_effect_id: None,
                 },
@@ -7312,24 +7596,24 @@ fn engine_permission_and_input_request_paths() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "perm test", 1)
+        .create_session_v2(session_id, turn_id, binding, "perm test", 1)
         .unwrap();
 
     // Start the run.
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -7338,13 +7622,13 @@ fn engine_permission_and_input_request_paths() {
         )
         .unwrap();
     let revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
 
     // Request permission.
     let permission = latte_core::PendingPermission {
@@ -7353,16 +7637,16 @@ fn engine_permission_and_input_request_paths() {
         description: "write test file".into(),
     };
     let _committed = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: Some("perm-req-1".into()),
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::RequestPermission {
+                update: latte_engine::CommitSessionTurnUpdate::RequestPermission {
                     source_key: "request-perm".into(),
                     request: permission,
                 },
@@ -7403,9 +7687,9 @@ fn engine_rename_and_fork_session() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "original", 1)
+        .create_session_v2(session_id, turn_id, binding, "original", 1)
         .unwrap();
 
     // Rename.
@@ -7470,24 +7754,24 @@ fn engine_effect_lifecycle_covers_prepare() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding, "effect test", 1)
+        .create_session_v2(session_id, turn_id, binding, "effect test", 1)
         .unwrap();
 
     // Start the run.
     let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
     let started = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: 0,
-                expected_run_revision: 0,
+                expected_turn_revision: 0,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: None,
-                update: latte_engine::CommitSessionRunUpdate::Start {
+                update: latte_engine::CommitSessionTurnUpdate::Start {
                     source_key: "start".into(),
                 },
             },
@@ -7496,27 +7780,27 @@ fn engine_effect_lifecycle_covers_prepare() {
         )
         .unwrap();
     let revision = started.snapshot.revision;
-    let run_revision = started
+    let turn_revision = started
         .snapshot
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|run| run.turn_id == turn_id)
         .unwrap()
-        .run_revision;
+        .turn_revision;
 
     // Prepare an effect.
     let effect_id = "effect-1".to_string();
     let _ = engine
-        .commit_session_run_update(
+        .commit_session_turn_update(
             latte_engine::SessionCommitRequest {
                 session_id,
-                run_id,
+                turn_id,
                 expected_session_revision: revision,
-                expected_run_revision: run_revision,
+                expected_turn_revision: turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,
                 effect_id: Some(effect_id.clone()),
-                update: latte_engine::CommitSessionRunUpdate::PrepareEffect {
+                update: latte_engine::CommitSessionTurnUpdate::PrepareEffect {
                     source_key: "prepare".into(),
                     effect_id: effect_id.clone(),
                     operation_digest: "a".repeat(64),
@@ -7613,7 +7897,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -7621,7 +7905,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission");
 
     // Grant the permission.
@@ -7632,7 +7916,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -7656,7 +7940,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -7670,7 +7954,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if let Some((revision, request_id, run_revision)) = verify_pending {
+    if let Some((revision, request_id, turn_revision)) = verify_pending {
         let (verify_status, _) = server.request(
             "POST",
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -7678,7 +7962,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
             Some(&serde_json::json!({
                 "allow": true,
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
             &[],
         );
@@ -7774,7 +8058,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -7782,7 +8066,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (revision, request_id, run_revision) =
+    let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingPermission");
 
     // Grant the permission.
@@ -7793,7 +8077,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         Some(&serde_json::json!({
             "allow": true,
             "expected_session_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -7817,7 +8101,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
                     .as_str()
                     .unwrap()
                     .to_string(),
-                body["snapshot"]["pending"]["expected_run_revision"]
+                body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
             ));
@@ -7831,7 +8115,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    if let Some((revision, request_id, run_revision)) = verify_pending {
+    if let Some((revision, request_id, turn_revision)) = verify_pending {
         let (verify_status, _) = server.request(
             "POST",
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -7839,7 +8123,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
             Some(&serde_json::json!({
                 "allow": true,
                 "expected_session_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
             &[],
         );
@@ -9184,9 +9468,9 @@ fn engine_session_management_error_paths() {
     };
 
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
     engine
-        .create_session_v2(session_id, run_id, binding.clone(), "error paths", 1)
+        .create_session_v2(session_id, turn_id, binding.clone(), "error paths", 1)
         .unwrap();
 
     // Rename with empty title should fail.
@@ -9212,7 +9496,7 @@ fn engine_session_management_error_paths() {
     assert!(engine.session_snapshot_v2(missing, None, 10).is_err());
 }
 
-/// Engine-level run lease and transition paths: covers `acquire_run_lease`,
+/// Engine-level run lease and transition paths: covers `acquire_turn_lease`,
 /// `renew_lease`, and `apply_transition` for non-session-linked runs.
 #[test]
 fn engine_run_lease_and_transition_paths() {
@@ -9223,14 +9507,14 @@ fn engine_run_lease_and_transition_paths() {
         .build()
         .unwrap();
     let ids = latte_core::SystemIdSource::default();
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
 
     // Create a standalone run (not linked to a session).
-    engine.create_run(run_id, 1).unwrap();
+    engine.create_turn(turn_id, 1).unwrap();
 
     // Acquire a run lease.
     let lease = engine
-        .acquire_run_lease(run_id, "owner-1", 2, 10_000)
+        .acquire_turn_lease(turn_id, "owner-1", 2, 10_000)
         .unwrap();
     assert_eq!(lease.owner(), "owner-1");
 
@@ -9240,12 +9524,12 @@ fn engine_run_lease_and_transition_paths() {
 
     // Apply a transition.
     let _ = engine
-        .apply_transition(run_id, 0, latte_core::Transition::Start, 4, &renewed)
+        .apply_transition(turn_id, 0, latte_core::Transition::Start, 4, &renewed)
         .unwrap();
 
     // Show the run.
-    let loaded = engine.show(run_id).unwrap();
-    assert_eq!(loaded.run_id, run_id);
+    let loaded = engine.show(turn_id).unwrap();
+    assert_eq!(loaded.turn_id, turn_id);
 }
 
 /// Engine-level validation error paths: covers binding validation and
@@ -9275,8 +9559,8 @@ fn engine_validation_error_paths() {
         credential_generation: 1,
     };
     let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
-    let run_id = latte_core::RunId::from_uuid(ids.next_uuid_v7());
-    let result = engine.create_session_v2(session_id, run_id, invalid_binding, "test", 1);
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let result = engine.create_session_v2(session_id, turn_id, invalid_binding, "test", 1);
     assert!(result.is_err());
 
     // Workspace-scoped queries on missing workspace should return empty.

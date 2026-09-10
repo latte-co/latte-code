@@ -60,7 +60,17 @@ pub struct SessionConfig {
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
     pub context_cap_bytes: usize,
-    pub max_tool_rounds: u32,
+    /// Optional hard round bound. Omitted (or null) means unlimited; an
+    /// explicit value must be at least 1. Unlimited is the default —
+    /// protection against a non-converging turn comes from the per-request
+    /// timeout and cancellation instead.
+    #[serde(default)]
+    pub max_tool_rounds: Option<u32>,
+    /// Session-level wall-clock budget for one provider request. The effective
+    /// deadline is the minimum of this value and the selected provider's own
+    /// `providers.<name>.timeout_ms` (default 60s); the shorter one wins. This
+    /// is unrelated to `verification.timeout_ms`, which bounds the verification
+    /// command instead.
     pub provider_timeout_ms: u64,
 }
 impl Default for SessionConfig {
@@ -213,7 +223,7 @@ fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
-    let overlay: Value = json5::from_str(&text)
+    let mut overlay: Value = json5::from_str(&text)
         .map_err(|error| format!("invalid JSONC {}: {error}", path.display()))?;
     if !overlay.is_object() {
         return Err(format!(
@@ -221,7 +231,41 @@ fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    normalize_legacy_thread_block(&mut overlay, path)?;
     merge_value(base, overlay);
+    Ok(())
+}
+
+/// Upgrades the pre-concept-alignment `thread` settings block to `session`
+/// before layer merging, so an old configuration file keeps working without a
+/// manual edit and is never rejected by `deny_unknown_fields` (which runs much
+/// later, after the database upgrade path was already blocked).
+///
+/// Conflict rule: a layer that contains both `thread` and `session` is an
+/// error — silently picking either side could hide the user's intent; the
+/// message tells them which file and which keys to consolidate.
+fn normalize_legacy_thread_block(overlay: &mut Value, path: &Path) -> Result<(), String> {
+    let Some(object) = overlay.as_object_mut() else {
+        return Ok(());
+    };
+    if !object.contains_key("thread") {
+        return Ok(());
+    }
+    if object.contains_key("session") {
+        return Err(format!(
+            "{} uses both the legacy `thread` settings block and the current \
+             `session` block; consolidate the settings under `session` and \
+             remove `thread`",
+            path.display()
+        ));
+    }
+    let thread = object.remove("thread").expect("checked contains_key");
+    object.insert("session".to_owned(), thread);
+    eprintln!(
+        "warning: {} uses the legacy `thread` settings block; it was read as \
+         `session` — rename the block to `session` to remove this warning",
+        path.display()
+    );
     Ok(())
 }
 
@@ -1018,14 +1062,14 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|run| run.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|run| run.turn_id == turn_id)
                                     })
-                                    .map_or(0, |run| run.run_revision);
+                                    .map_or(0, |run| run.turn_revision);
                                 handle
-                                    .cancel(&session_id, snapshot.revision, run_revision)
+                                    .cancel(&session_id, snapshot.revision, turn_revision)
                                     .await
                                     .map(|()| "interruption requested".into())
                                     .map_err(|error| error.to_string())
@@ -1047,17 +1091,17 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|r| r.turn_id == turn_id)
                                     })
-                                    .map_or(0, |r| r.run_revision);
+                                    .map_or(0, |r| r.turn_revision);
                                 handle
                                     .provide_input(
                                         &session_id,
                                         snapshot.revision,
-                                        run_revision,
+                                        turn_revision,
                                         &request_id,
                                         &value,
                                     )
@@ -1082,17 +1126,17 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|r| r.turn_id == turn_id)
                                     })
-                                    .map_or(0, |r| r.run_revision);
+                                    .map_or(0, |r| r.turn_revision);
                                 handle
                                     .resolve_permission(
                                         &session_id,
                                         snapshot.revision,
-                                        run_revision,
+                                        turn_revision,
                                         &request_id,
                                         allow,
                                     )
@@ -1530,15 +1574,15 @@ mod tests {
     use super::EXIT_COMPLETED;
     use super::bind_local_listener;
     use super::{
-        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, SessionConfig,
-        VerificationConfig, discover_workspace_root, dot, emit_client_error, emit_data, emit_error,
-        execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
-        merge_value, parse_serve_port, prepare_server, readiness_envelope, serve_bound,
-        storage_home_with, tui_setup, verify_timeout, workspace_display_path_with_home,
-        write_server_token,
+        AppConfig, DEFAULT_CONFIG, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE,
+        SessionConfig, VerificationConfig, discover_workspace_root, dot, emit_client_error,
+        emit_data, emit_error, execute_serve, execute_tui, exit_for_setup, generate_server_token,
+        merge_optional_config, merge_value, parse_serve_port, prepare_server, readiness_envelope,
+        serve_bound, storage_home_with, tui_setup, verify_timeout,
+        workspace_display_path_with_home, write_server_token,
     };
     use latte_core::{
-        IdSource, RunId, SessionId, SessionLifecycle, SessionProviderBinding, SystemIdSource,
+        IdSource, SessionId, SessionLifecycle, SessionProviderBinding, SystemIdSource, TurnId,
     };
     use latte_headless::session::SessionHistoryPolicy;
     use latte_tui::session::{SessionProjectionClient, SessionProjectionPoll};
@@ -1898,6 +1942,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_thread_block_is_normalized_to_session_before_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        // The built-in default already carries a `session` block; the legacy
+        // overlay must merge into it rather than collide as an unknown field.
+        let mut base: serde_json::Value = json5::from_str(DEFAULT_CONFIG).unwrap();
+        let legacy = dir.path().join("legacy.jsonc");
+        std::fs::write(
+            &legacy,
+            "{version:1,providers:{},verification:{argv:['true']},\
+             thread:{max_tool_rounds:3,provider_timeout_ms:7000}}",
+        )
+        .unwrap();
+        merge_optional_config(&mut base, &legacy).unwrap();
+        assert!(
+            base.get("thread").is_none(),
+            "the legacy key must not survive into the merged config"
+        );
+        assert_eq!(base["session"]["max_tool_rounds"], 3);
+        assert_eq!(base["session"]["provider_timeout_ms"], 7000);
+        // The merged document must deserialize under deny_unknown_fields.
+        let parsed: AppConfig = serde_json::from_value(base).unwrap();
+        assert_eq!(parsed.session.max_tool_rounds, Some(3));
+    }
+
+    #[test]
+    fn legacy_thread_in_home_and_session_in_workspace_merge_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".latte")).unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::write(
+            home.path().join(".latte/latte-code.jsonc"),
+            "{version:1,providers:{},verification:{argv:['true']},\
+             thread:{provider_timeout_ms:7000}}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(".latte/latte-code.jsonc"),
+            "{session:{max_tool_rounds:5}}",
+        )
+        .unwrap();
+        let (config, _registry) =
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
+        assert_eq!(config.session.provider_timeout_ms, 7000);
+        assert_eq!(config.session.max_tool_rounds, Some(5));
+    }
+
+    #[test]
+    fn thread_and_session_in_one_layer_is_a_conflict_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base: serde_json::Value = json5::from_str(DEFAULT_CONFIG).unwrap();
+        let conflict = dir.path().join("conflict.jsonc");
+        std::fs::write(
+            &conflict,
+            "{thread:{max_tool_rounds:1},session:{max_tool_rounds:2}}",
+        )
+        .unwrap();
+        let error = merge_optional_config(&mut base, &conflict).unwrap_err();
+        assert!(
+            error.contains("`thread`") && error.contains("`session`"),
+            "conflict error must name both keys: {error}"
+        );
+        assert!(
+            base.get("thread").is_none(),
+            "a rejected layer must not merge"
+        );
+    }
+
+    #[test]
     fn app_config_load_with_home_merges_home_config() {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -2143,10 +2256,10 @@ mod tests {
 
         // Create a session.
         let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let snapshot = workspace
             .engine
-            .create_session_v2(session_id, run_id, binding, "hello world", 1000)
+            .create_session_v2(session_id, turn_id, binding, "hello world", 1000)
             .expect("create_session_v2");
         assert_eq!(snapshot.session_id, session_id);
 
@@ -2746,9 +2859,9 @@ mod tests {
     }
 
     /// A terminal-ready snapshot JSON for mock server responses.
-    fn terminal_snapshot_json(session_id: &str, run_id: &str) -> String {
+    fn terminal_snapshot_json(session_id: &str, turn_id: &str) -> String {
         format!(
-            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":null,"runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_turn_id":"{turn_id}","active_turn_id":null,"turns":[{{"turn_id":"{turn_id}","parent_turn_id":null,"ordinal":1,"status":"completed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
         )
     }
 
@@ -2870,8 +2983,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_show_returns_snapshot() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (200, "application/json".into(), snapshot.clone())
@@ -2895,8 +3008,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_run_completes() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3108,7 +3221,7 @@ mod tests {
         format!(
             r#"{{"session_id":"{session_id}","revision":1,"sequence":0,"lifecycle":"ready",
                "binding":{{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"c","tools_fingerprint":"t","aliases":{{}},"credential_ref_id":"env:K","data_scope_id":"main/mock","credential_generation":0}},
-               "latest_run_id":null,"active_run_id":null,"runs":[],
+               "latest_turn_id":null,"active_turn_id":null,"turns":[],
                "transcript":{{"entries":[{entries}],"next_after":null,"has_more":false}}}}"#
         )
     }
@@ -3116,7 +3229,7 @@ mod tests {
     /// A user transcript entry with the given text and timestamp.
     fn projection_user_entry(text: &str, created_at_ms: u64) -> String {
         format!(
-            r#"{{"entry_id":"01900000-0000-7000-8000-0000000000a1","sequence":0,"run_id":null,"kind":"user","text":"{text}","source_key":"user","created_at_ms":{created_at_ms}}}"#
+            r#"{{"entry_id":"01900000-0000-7000-8000-0000000000a1","sequence":0,"turn_id":null,"kind":"user","text":"{text}","source_key":"user","created_at_ms":{created_at_ms}}}"#
         )
     }
 
@@ -3428,7 +3541,7 @@ mod tests {
                     .event("session_changed")
                     .data(r#"{"session_id":"s1","revision":7}"#)),
                 Ok(Event::default().event("progress").data(
-                    r#"{"session_id":"s1","run_id":"01900000-0000-7000-8000-000000000001","progress":{"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"hello"}}"#,
+                    r#"{"session_id":"s1","turn_id":"01900000-0000-7000-8000-000000000001","progress":{"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"hello"}}"#,
                 )),
             ]);
             Sse::new(stream)
@@ -3464,7 +3577,7 @@ mod tests {
         assert_eq!(
             progress,
             latte_core::SessionTransientProgress::AssistantDelta {
-                run_id: RunId::from_uuid(
+                turn_id: TurnId::from_uuid(
                     uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap()
                 ),
                 text: "hello".into(),
@@ -3715,8 +3828,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_run_renders_text_without_json() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3793,8 +3906,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_show_renders_text_without_json() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (200, "application/json".into(), snapshot.clone())
@@ -3818,8 +3931,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_resume_completes() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3858,8 +3971,8 @@ mod tests {
     #[tokio::test]
     async fn execute_session_command_inner_resume_renders_text_without_json() {
         let session_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&session_id, &run_id);
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -4111,7 +4224,7 @@ mod tests {
         {
             let stream = stream::iter(vec![Ok(Event::default()
                 .event("progress")
-                .data(r#"{"session_id":"s1","run_id":"r1","progress":{"type":"bogus"}}"#))]);
+                .data(r#"{"session_id":"s1","turn_id":"r1","progress":{"type":"bogus"}}"#))]);
             Sse::new(stream)
         }
 
@@ -4327,11 +4440,11 @@ mod tests {
         // Running (non-terminal) snapshot so the SSE stream is opened, and
         // the third returns a terminal snapshot to complete the run.
         let session_id = "01900000-0000-7000-8000-000000000001";
-        let run_id = "01900000-0000-7000-8000-000000000002";
+        let turn_id = "01900000-0000-7000-8000-000000000002";
         let running_snapshot = format!(
-            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":"{run_id}","runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"running","run_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_turn_id":"{turn_id}","active_turn_id":"{turn_id}","turns":[{{"turn_id":"{turn_id}","parent_turn_id":null,"ordinal":1,"status":"running","turn_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
         );
-        let terminal_snapshot = terminal_snapshot_json(session_id, run_id);
+        let terminal_snapshot = terminal_snapshot_json(session_id, turn_id);
         let snapshot_queue =
             std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
         let (url, _handle) = start_session_mock_server(move |method, path| {
@@ -4357,7 +4470,7 @@ mod tests {
                 // SSE stream with a progress event, then close (stream end →
                 // reconnect → resync finds the terminal snapshot).
                 let body = format!(
-                    "event: progress\ndata: {{\"session_id\":\"{session_id}\",\"run_id\":\"{run_id}\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"{run_id}\",\"text\":\"working\"}}}}\n\n"
+                    "event: progress\ndata: {{\"session_id\":\"{session_id}\",\"turn_id\":\"{turn_id}\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"{turn_id}\",\"text\":\"working\"}}}}\n\n"
                 );
                 (200, "text/event-stream".into(), body)
             } else if path.starts_with("/v1/sessions/") {

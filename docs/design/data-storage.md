@@ -15,7 +15,7 @@ fsync 到 JSONL 的已接受记录，同步成功后立即删除。当前 Worksp
 | --- | --- | --- |
 | Session 对话内容 | 全局、每 Session 一个 JSONL | 只追加 user、assistant、tool 与上下文记录。 |
 | Project、Workspace、Session 元数据 | 全局 SQLite | 当前 Workspace 发现与搜索、Provider Binding 和血缘。 |
-| Run 与 Effect 控制状态 | 全局 SQLite | 事务化 Run 状态、Effect、Permission、Lease、Checkpoint、Evidence 与去重。 |
+| Turn 与 Effect 控制状态 | 全局 SQLite | 事务化 Turn 状态、Effect、Permission、Lease、Checkpoint、Evidence 与去重。 |
 | Draft 与 Provider 运行时 | 进程内存 | 尚未接受的 Prompt、HTTP Stream、Retry、Cancellation、Delta 和原始 Provider Diagnostic。 |
 | Credential | 不持久化 | 只允许持久化非密钥的 Credential Reference 与 Generation。 |
 
@@ -34,7 +34,7 @@ fsync 到 JSONL 的已接受记录，同步成功后立即删除。当前 Worksp
 - **Project** 表示逻辑仓库身份，多个 Git Worktree 可以共享一个 Project。
 - **Workspace** 表示一个物理 Checkout 或非 Git 工作目录。
 - **Session** 表示一个用户可见的 Conversation，由 `SessionId` 标识。
-- **Run** 表示一次用户提交及其 Provider/Tool Continuation Loop。
+- **Turn** 表示一次用户提交及其 Provider/Tool Continuation Loop。（schema 15 改名前的类型/表名为 Run/`runs`。）
 - **Effect** 表示可能改变或观察外部状态、由 `latte-engine` 掌握权限的操作。
 - **Draft** 表示尚未通过本地校验并到达持久提交点、只存在于内存的新 Session 或
   Follow-up。
@@ -122,7 +122,7 @@ sessions
   preview
   lifecycle
   provider_binding_json
-  latest_run_id
+  latest_turn_id
   forked_from_session_id
   forked_from_seq
   last_content_seq
@@ -142,8 +142,8 @@ Data Scope 和 Credential Generation。它绝不包含 Credential Value。
 
 SQLite 继续作为以下数据的权威来源：
 
-- Run 状态与 Revision。
-- Session 当前 Active Run。
+- Turn 状态与 Revision。
+- Session 当前 Active Turn。
 - Effect 声明、仅 Engine 可读的精确 Descriptor、Attempt 与 Observation。
 - Pending Permission 与非密钥 Input Request。
 - Runtime Checkpoint 与 Verification Evidence。
@@ -165,13 +165,13 @@ runtime_lease
   expires_at_ms
 ```
 
-Legacy Headless Run 共用 `runtime` Scope；不同 v2 Session 使用不同 Scope，
+无 Session 归属的直连 Turn（旧称 Legacy Headless Run）共用 `runtime` Scope；不同 Session 使用不同 Scope，
 因此可以并发运行。一个 Session 最多只有一个有效 Engine Owner 和一个 JSONL
 Writer。Lease 过期后重新获取必须推进全局单调的 Fencing Token。旧 Owner 不能
 开始或观察 Effect，并且失去 Ownership 后必须关闭 Session Writer。
 
 一次持久化 `WaitingPermission` 或 `WaitingInput` 操作正常返回时，会先在同一事务
-中把关联 Run 与 Active Row 的 Lease Token 置为零，再删除 Lease Row。Token 零表示
+中把关联 Turn 与 Active Row 的 Lease Token 置为零，再删除 Lease Row。Token 零表示
 安全静止：启动恢复会保留这个等待中的 Child；后续 Coordinator 必须先获取新的全局
 Fencing Epoch 才能写入。没有 Lease 且仍保留非零 Token 则表示 Owner 非正常丢失，
 继续执行保守的 Interrupted/`Unknown` 恢复。用户在新 Epoch 中显式 Allow 已 Prepare
@@ -189,8 +189,8 @@ Fencing Epoch 才能写入。没有 Lease 且仍保留非零 Token 则表示 Own
 后续按顺序只追加 Conversation Record：
 
 ```json
-{"record":"message","entry_id":"019...","seq":1,"run_id":"019...","created_at_ms":1780000000001,"role":"user","content":"修复失败的测试"}
-{"record":"message","entry_id":"019...","seq":2,"run_id":"019...","created_at_ms":1780000000100,"role":"assistant","content":"我会先检查。","finish_reason":"stop","usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":0}}
+{"record":"message","entry_id":"019...","seq":1,"turn_id":"019...","created_at_ms":1780000000001,"role":"user","content":"修复失败的测试"}
+{"record":"message","entry_id":"019...","seq":2,"turn_id":"019...","created_at_ms":1780000000100,"role":"assistant","content":"我会先检查。","finish_reason":"stop","usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":0}}
 ```
 
 可回放 Record 刻意保持精简：
@@ -200,8 +200,8 @@ Fencing Epoch 才能写入。没有 Lease 且仍保留非零 Token 则表示 Own
 - 通过 `tool_call_id` 关联的 Tool Result。
 - `context_checkpoint` 和 `compaction_summary`。
 
-每条 Entry 都有稳定的 `entry_id`、单调递增的 `seq`、可选 `run_id` 和有界
-Content。Provider 生成的 ID 在写入前必须满足现有的安全 Opaque ID 语法。
+每条 Entry 都有稳定的 `entry_id`、单调递增的 `seq`、可选 `turn_id` 和有界
+Content。schema 15 之前写入的旧文件该键名为 `run_id`，读取时作为只读回退接受。Provider 生成的 ID 在写入前必须满足现有的安全 Opaque ID 语法。
 
 JSONL 不包含：
 
@@ -225,14 +225,14 @@ JSONL 不包含：
 ```text
 Prompt
 → 校验非密钥 Provider Binding
-→ 持久化 Session、Child Run 与 User Card
+→ 持久化 Session、Child Turn 与 User Card
 → 在该 Session Lease 下启动 Child
 → 在内存中解析 Credential Reference
 → 构造 Provider
 → 发起第一次 Provider Request
 ```
 
-持久创建之前的 Validation 或 Storage Failure 不留下 Session/Run，并精确保留
+持久创建之前的 Validation 或 Storage Failure 不留下 Session/Turn，并精确保留
 Draft。创建之后的 Configuration、Credential、Model、Authentication、
 Transport、Timeout 或其他 Provider 启动失败，会用一个有界、已脱敏的 Failure
 Card 终结该 Child；User Card 不会被删除或复制回 Composer。Provider 构造失败可
@@ -244,7 +244,7 @@ I/O。应用执行：
 
 1. 插入不可被列表发现的 `materializing` Session Metadata Row。
 2. 写入并 Sync JSONL Header 与 User Message。
-3. 创建持久化 Child Run/Control State。
+3. 创建持久化 Child Turn/Control State。
 4. 以 `Running` 状态把 Session 标记为可发现。
 
 完整 Assistant Message、Tool-Call Envelope、Input Request 或已脱敏 Failure 只在
@@ -288,7 +288,7 @@ Request 失败，则保留已有的 `Failed`、`Interrupted` 或
 
 精确可执行 Descriptor 继续只存在于 Engine 私有 SQLite 中。JSONL 只保存有界、
 已脱敏的 Provider History 表示。`Started` 之前 JSONL 追加失败会中止执行；
-Effect Observation 之后追加失败会停止 Run，且不得重试 Effect，恢复时根据权威
+Effect Observation 之后追加失败会停止 Turn，且不得重试 Effect，恢复时根据权威
 Observation 修复缺失的 Tool Result。
 
 ## 10. 读取与 Projection
@@ -326,11 +326,16 @@ Compaction 只追加 `context_checkpoint` 或 `compaction_summary`，不会删�
 
 ## 13. 迁移
 
+> 注：本节按迁移当时的命名叙述（`threads_v2` / `runs` / Run）。schema 13 已把
+> v2 表改名为 `sessions` / `session_turns` 等，schema 15 进一步把物理图
+> `runs` 改名为 `turns`、领域类型 Run 改名为 Turn；旧名仅在迁移 SQL、legacy
+> import 与只读兼容中保留。
+
 从当前 Workspace 数据库迁移必须是增量且幂等的：
 
 1. 解析全局 Product Home 并初始化全局 Schema。
 2. 打开 Workspace 时检测旧 `.latte/latte-code.db`。
-3. 把 Project、Workspace、Session、Run 与 Effect Metadata 导入全局数据库。
+3. 把 Project、Workspace、Session、Turn（迁移当时名 Run）与 Effect Metadata 导入全局数据库。
 4. 把 `thread_transcript_v2` Content 导出到 Workspace JSONL Bucket，保留顺序、
    ID、Redaction 和 Lineage。
 5. 记录 Import Fingerprint，防止重试时重复 Session 或 Effect。
@@ -402,7 +407,7 @@ Card 与已脱敏 Failure 保持持久化，后续 Follow-up 创建新 Child。�
 Response 与不安全的 Provider ID 仍属于 Terminal Protocol Failure。
 TUI 只使用已脱敏且来源为 New-Session/Follow-up Commit Path 的 User Card 对账
 Composer Submission；文本相同的 Input-Request Answer 不能误确认它。Input Answer
-使用独立的 Submission Identity，并绑定 Session、Run 与 Request ID。该 Request
+使用独立的 Submission Identity，并绑定 Session、Turn 与 Request ID。该 Request
 拥有 Editor 时，Shift+Enter 始终插入换行；Command 失败后，只有 Authoritative
 Snapshot 证明精确 Input Card 未提交，才恢复输入值。Terminal Session 的普通提交
 不会消费 Composer Draft；如果 Active Child 在 Queued Follow-up 提交前结束，则
@@ -425,10 +430,10 @@ Fingerprint，拒绝外部 Workspace Row 与 ID 冲突，保持源文件不变�
 恢复控制状态并把导入对话生成为 JSONL。TUI Discovery 与 Search 仅限当前
 Workspace；从孤立 JSONL 重建 Catalog 尚未实现。
 
-UT 覆盖全局 Home 解析、迁移至当前 Schema（12）、Worktree-Aware Catalog Identity、
+UT 覆盖全局 Home 解析、迁移至当前 Schema（15）、Worktree-Aware Catalog Identity、
 Scoped Authority、JSONL 尾行修复与读取权威、幂等 Legacy Import，以及持久、可重试
 的 Provider Failure。最终二进制 E2E 覆盖全局 State/JSONL 创建、旧库源文件不变的
-导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Run。
+导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Turn。
 
 ## 16. 交付阶段
 

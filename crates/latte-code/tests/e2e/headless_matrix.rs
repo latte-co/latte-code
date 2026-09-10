@@ -307,7 +307,7 @@ fn configured_alias_rejects_an_unmapped_provider_tool_name_before_execution() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(failure_text(&output).contains("provider returned an unknown tool alias"));
@@ -507,7 +507,7 @@ fn malformed_sse_variants_fail_durably_without_retry_or_side_effects() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            json(&output)["data"]["session"]["runs"][0]["status"],
+            json(&output)["data"]["session"]["turns"][0]["status"],
             "failed"
         );
         assert!(

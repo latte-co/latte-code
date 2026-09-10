@@ -3,7 +3,7 @@
 //! embedded HTTP+SSE server; `VerificationPlan` is retained because the v2
 //! `SessionRuntimeService` still consumes it.
 
-/// Describes how a completed file change is verified before the run is
+/// Describes how a completed file change is verified before the turn is
 /// declared successful.
 #[derive(Clone, Debug)]
 pub struct VerificationPlan {

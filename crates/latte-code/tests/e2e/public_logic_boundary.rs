@@ -1,9 +1,9 @@
 use super::support::Scenario;
 use latte_core::{
     CommandEnvelope, CommandId, CompletionPolicy, Evidence, FailureCode, Handoff, HeadlessOutcome,
-    IdSource, PendingInput, PendingPermission, Retryability, RunFailure, RunId, RunState,
-    RunStatus, RuntimeCommand, SessionCommand, SessionCommandEnvelope, SessionCommandId,
-    SessionLifecycle, SystemIdSource, Transition, TransitionError, VerificationStatus,
+    IdSource, PendingInput, PendingPermission, Retryability, RuntimeCommand, SessionCommand,
+    SessionCommandEnvelope, SessionCommandId, SessionLifecycle, SystemIdSource, Transition,
+    TransitionError, TurnFailure, TurnId, TurnState, TurnStatus, VerificationStatus,
     redact_session_text, redact_session_value, valid_openai_chat_input_request_id,
     valid_openai_chat_opaque_id, valid_openai_chat_tool_call_id,
 };
@@ -11,8 +11,8 @@ use latte_headless::{context, registry::ProviderRegistry};
 use latte_tui::command::{SlashResolution, resolve_slash, slash_suggestions};
 use std::path::Path;
 
-fn run_id() -> RunId {
-    RunId::from_uuid(SystemIdSource::default().next_uuid_v7())
+fn turn_id() -> TurnId {
+    TurnId::from_uuid(SystemIdSource::default().next_uuid_v7())
 }
 
 fn handoff(status: VerificationStatus) -> Handoff {
@@ -41,7 +41,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         SessionCommand::Cancel {
             session_id: latte_core::SessionId::from_uuid(ids.next_uuid_v7()),
             expected_session_revision: 1,
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         },
     );
     assert_eq!(session_envelope.command_id, session_command_id);
@@ -100,7 +100,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     assert!(slash_suggestions(&format!("/{}", "x".repeat(65))).is_empty());
     assert_eq!(slash_suggestions("/q")[0].name, "quit");
 
-    let queued = RunState::queued(run_id());
+    let queued = TurnState::queued(turn_id());
     assert!(matches!(
         queued.transition(1, Transition::Start),
         Err(TransitionError::StaleRevision { .. })
@@ -108,7 +108,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     assert!(matches!(
         queued.transition(0, Transition::Interrupt),
         Err(TransitionError::Invalid {
-            from: RunStatus::Queued
+            from: TurnStatus::Queued
         })
     ));
     let running = queued.transition(0, Transition::Start).unwrap();
@@ -151,7 +151,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
             },
         )
         .unwrap();
-    assert_eq!(denied.status, RunStatus::Failed);
+    assert_eq!(denied.status, TurnStatus::Failed);
     assert_eq!(
         denied.failure.as_ref().unwrap().code,
         FailureCode::PermissionDenied
@@ -160,7 +160,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     let retryable = running
         .transition(
             1,
-            Transition::Fail(RunFailure {
+            Transition::Fail(TurnFailure {
                 code: FailureCode::RuntimeFailed,
                 message: "retry".into(),
                 retryability: Retryability::Retryable,
@@ -169,7 +169,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         .unwrap();
     assert_eq!(
         retryable.transition(2, Transition::Resume).unwrap().status,
-        RunStatus::Queued
+        TurnStatus::Queued
     );
     let waiting_input = running
         .transition(
@@ -203,7 +203,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
             .transition(4, Transition::Interrupt)
             .unwrap()
             .status,
-        RunStatus::Interrupted
+        TurnStatus::Interrupted
     );
     let verification_failed = running
         .transition(
@@ -214,7 +214,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
             },
         )
         .unwrap();
-    assert_eq!(verification_failed.status, RunStatus::Failed);
+    assert_eq!(verification_failed.status, TurnStatus::Failed);
     let completed = running
         .transition(
             1,

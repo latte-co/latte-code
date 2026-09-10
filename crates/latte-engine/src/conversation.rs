@@ -1,5 +1,5 @@
 //! Append-only per-Session conversation storage.
-use latte_core::{RunId, SessionId, TranscriptEntry, TranscriptEntryId, TranscriptKind};
+use latte_core::{SessionId, TranscriptEntry, TranscriptEntryId, TranscriptKind, TurnId};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -92,7 +92,7 @@ impl ConversationStore {
                 "format_version": 1,
                 "entry_id": entry.entry_id,
                 "seq": entry.sequence,
-                "run_id": entry.run_id,
+                "turn_id": entry.turn_id,
                 "created_at_ms": entry.created_at_ms,
                 "kind": entry.kind,
                 "content": entry.text,
@@ -231,17 +231,21 @@ fn repair_and_read(
         let entry_id = uuid::Uuid::parse_str(entry_id)
             .map(TranscriptEntryId::from_uuid)
             .map_err(|error| format!("invalid conversation entry id: {error}"))?;
-        let run_id = record
-            .get("run_id")
+        // Pre-schema-15 binaries wrote this key as `run_id`; accept it as a
+        // read-only fallback so old JSONL keeps its turn attribution.
+        let turn_id = record
+            .get("turn_id")
+            .filter(|value| !value.is_null())
+            .or_else(|| record.get("run_id"))
             .filter(|value| !value.is_null())
             .map(|value| {
                 value
                     .as_str()
-                    .ok_or_else(|| "invalid conversation run id".to_owned())
+                    .ok_or_else(|| "invalid conversation turn id".to_owned())
                     .and_then(|value| {
                         uuid::Uuid::parse_str(value)
-                            .map(RunId::from_uuid)
-                            .map_err(|error| format!("invalid conversation run id: {error}"))
+                            .map(TurnId::from_uuid)
+                            .map_err(|error| format!("invalid conversation turn id: {error}"))
                     })
             })
             .transpose()?;
@@ -255,7 +259,7 @@ fn repair_and_read(
         transcript.push(TranscriptEntry {
             entry_id,
             sequence,
-            run_id,
+            turn_id,
             kind,
             text: record
                 .get("content")
@@ -308,7 +312,7 @@ mod tests {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::User,
             text: text.into(),
             payload: None,
@@ -337,7 +341,7 @@ mod tests {
             "format_version": 1,
             "entry_id": entry.entry_id,
             "seq": entry.sequence,
-            "run_id": entry.run_id,
+            "turn_id": entry.turn_id,
             "created_at_ms": entry.created_at_ms,
             "kind": entry.kind,
             "content": entry.text,
@@ -430,6 +434,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_legacy_records_keyed_run_id_as_turn_id() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_key = "workspace-legacy-run-key";
+        let store = ConversationStore::open(root.path(), workspace_key).unwrap();
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let legacy_turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let path = session_path(root.path(), workspace_key, session_id);
+
+        // Simulate a JSONL file written by a pre-schema-15 binary: entries
+        // carry `run_id`, not `turn_id`.
+        let mut legacy_entry = entry(1, "written before the rename");
+        legacy_entry.turn_id = Some(legacy_turn_id);
+        let mut legacy = record(&legacy_entry);
+        legacy["run_id"] = legacy["turn_id"].take();
+        overwrite_records(&path, &header(session_id, workspace_key), &[legacy]);
+
+        let page = store.read(session_id).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].turn_id, Some(legacy_turn_id));
+    }
+
+    #[test]
     fn rejects_unsafe_paths_and_bounded_storage_violations() {
         let root = tempfile::tempdir().unwrap();
         assert!(ConversationStore::open(root.path(), "workspace/unsafe").is_err());
@@ -519,9 +545,9 @@ mod tests {
         overwrite_records(&malformed_path, &valid_header, &[invalid_entry_id]);
         assert!(store.read(malformed_session).is_err());
 
-        let mut invalid_run_id = valid_record.clone();
-        invalid_run_id["run_id"] = json!(42);
-        overwrite_records(&malformed_path, &valid_header, &[invalid_run_id]);
+        let mut invalid_turn_id = valid_record.clone();
+        invalid_turn_id["turn_id"] = json!(42);
+        overwrite_records(&malformed_path, &valid_header, &[invalid_turn_id]);
         assert!(store.read(malformed_session).is_err());
 
         let mut missing_kind = valid_record.clone();

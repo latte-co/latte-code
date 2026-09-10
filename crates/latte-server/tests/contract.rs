@@ -280,9 +280,9 @@ async fn response_schema_snapshots() {
             "sequence",
             "lifecycle",
             "binding",
-            "latest_run_id",
-            "active_run_id",
-            "runs",
+            "latest_turn_id",
+            "active_turn_id",
+            "turns",
             "transcript",
         ],
     );
@@ -420,7 +420,7 @@ async fn error_enum_completeness() {
         &format!("/v1/sessions/{session_id}/cancel"),
         Some(serde_json::json!({
             "expected_session_revision": revision + 100,
-            "expected_run_revision": 0,
+            "expected_turn_revision": 0,
         })),
     )
     .await;
@@ -505,7 +505,7 @@ async fn sse_event_type_completeness() {
 
     let progress = serde_json::to_value(latte_server::http::ServerEvent::Progress {
         session_id: "s".into(),
-        run_id: "r".into(),
+        turn_id: "r".into(),
         progress: serde_json::json!({"delta": "x"}),
     })
     .unwrap();

@@ -6,8 +6,8 @@ use super::{
     },
 };
 use latte_core::{
-    IdSource, RunId, SessionId, SessionProviderBinding, SystemIdSource, TranscriptEntry,
-    TranscriptEntryId, TranscriptKind,
+    IdSource, SessionId, SessionProviderBinding, SystemIdSource, TranscriptEntry,
+    TranscriptEntryId, TranscriptKind, TurnId,
 };
 use rusqlite::{Connection, params};
 use std::{collections::BTreeMap, io::Write as _, time::Duration};
@@ -29,9 +29,9 @@ fn has_one_durable_terminal_tool_result(
         sessions.len() == 1
             && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
             && sessions[0]
-                .runs
+                .turns
                 .last()
-                .is_some_and(|run| run.status == latte_core::SessionRunStatus::Completed)
+                .is_some_and(|run| run.status == latte_core::SessionTurnStatus::Completed)
             && sessions[0]
                 .transcript
                 .entries
@@ -194,8 +194,8 @@ fn tui_provider_configuration_failure_is_durable_and_keeps_multiline_input_usabl
             .is_some_and(|sessions| {
                 sessions.len() == 1
                     && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                    && sessions[0].runs.len() == 1
-                    && sessions[0].runs[0].status == latte_core::SessionRunStatus::Failed
+                    && sessions[0].turns.len() == 1
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Failed
                     && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::User
                             && entry.text == "failed-start-visible-sentinel"
@@ -222,11 +222,11 @@ fn tui_provider_configuration_failure_is_durable_and_keeps_multiline_input_usabl
             .is_some_and(|sessions| {
                 sessions.len() == 1
                     && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                    && sessions[0].runs.len() == 2
+                    && sessions[0].turns.len() == 2
                     && sessions[0]
-                        .runs
+                        .turns
                         .iter()
-                        .all(|run| run.status == latte_core::SessionRunStatus::Failed)
+                        .all(|run| run.status == latte_core::SessionTurnStatus::Failed)
                     && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::User
                             && entry.text == "after-error-first\nafter-error-second"
@@ -284,7 +284,7 @@ fn tui_wrong_model_request_is_durable_retryable_and_never_restores_the_prompt() 
         engine.list_sessions().is_ok_and(|sessions| {
             sessions.len() == 1
                 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                && sessions[0].runs[0].status == latte_core::SessionRunStatus::Failed
+                && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Failed
                 && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == latte_core::TranscriptKind::User
                         && entry.text == "wrong-model-visible-sentinel"
@@ -304,8 +304,8 @@ fn tui_wrong_model_request_is_durable_retryable_and_never_restores_the_prompt() 
         engine.list_sessions().is_ok_and(|sessions| {
             sessions.len() == 1
                 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                && sessions[0].runs.len() == 2
-                && sessions[0].runs[1].status == latte_core::SessionRunStatus::Completed
+                && sessions[0].turns.len() == 2
+                && sessions[0].turns[1].status == latte_core::SessionTurnStatus::Completed
                 && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == latte_core::TranscriptKind::Assistant
                         && entry.text == "retry completed"
@@ -633,7 +633,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         .unwrap();
     for offset in 0..2 {
         let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let now = latte_core::wall_time_ms() + offset;
         let stale = local_engine
             .acquire_session_lease(session_id, now, 1)
@@ -641,7 +641,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         local_engine
             .create_started_session_v2_snapshot(
                 session_id,
-                run_id,
+                turn_id,
                 session_boundary_binding(),
                 "duplicate session title",
                 &stale,
@@ -650,7 +650,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             )
             .unwrap();
         local_engine
-            .recover_session_after_lease_loss(session_id, run_id, &stale, 1, now + 2)
+            .recover_session_after_lease_loss(session_id, turn_id, &stale, 1, now + 2)
             .unwrap();
     }
     drop(local_engine);
@@ -667,11 +667,11 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
     let foreign_lease = foreign_engine
         .acquire_session_lease(foreign_session_id, foreign_now, 1)
         .unwrap();
-    let foreign_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let foreign_turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
     foreign_engine
         .create_started_session_v2_snapshot(
             foreign_session_id,
-            foreign_run_id,
+            foreign_turn_id,
             session_boundary_binding(),
             "foreign session title",
             &foreign_lease,
@@ -682,7 +682,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
     foreign_engine
         .recover_session_after_lease_loss(
             foreign_session_id,
-            foreign_run_id,
+            foreign_turn_id,
             &foreign_lease,
             1,
             foreign_now + 2,
@@ -1123,8 +1123,8 @@ fn completed_tui_session_accepts_a_follow_up_as_an_immutable_child_with_history(
         .unwrap();
     let first = engine.list_sessions().unwrap();
     assert_eq!(first.len(), 1);
-    assert_eq!(first[0].runs.len(), 1);
-    let parent_id = first[0].runs[0].run_id;
+    assert_eq!(first[0].turns.len(), 1);
+    let parent_id = first[0].turns[0].turn_id;
 
     pty.write(b"follow up prompt\r");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
@@ -1133,7 +1133,7 @@ fn completed_tui_session_accepts_a_follow_up_as_an_immutable_child_with_history(
             engine.list_sessions().is_ok_and(|sessions| {
                 sessions.len() == 1
                     && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                    && sessions[0].runs.len() == 2
+                    && sessions[0].turns.len() == 2
                     && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::Assistant
                             && entry.text == "second answer"
@@ -1145,9 +1145,9 @@ fn completed_tui_session_accepts_a_follow_up_as_an_immutable_child_with_history(
     );
     provider.assert_consumed();
     let sessions = engine.list_sessions().unwrap();
-    assert_eq!(sessions[0].runs[0].run_id, parent_id);
-    assert_eq!(sessions[0].runs[1].parent_run_id, Some(parent_id));
-    assert_eq!(sessions[0].runs[1].ordinal, 1);
+    assert_eq!(sessions[0].turns[0].turn_id, parent_id);
+    assert_eq!(sessions[0].turns[1].parent_turn_id, Some(parent_id));
+    assert_eq!(sessions[0].turns[1].ordinal, 1);
     let requests = provider.requests();
     let second_messages = requests[1].body["messages"].as_array().unwrap();
     assert!(
@@ -1199,12 +1199,12 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         engine.list_sessions().is_ok_and(|sessions| {
             sessions.len() == 1
                 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                && sessions[0].runs.len() == 1
+                && sessions[0].turns.len() == 1
         })
     }));
     let initial = engine.list_sessions().unwrap().remove(0);
     let session_id = initial.session_id;
-    let parent_run_id = initial.runs[0].run_id;
+    let parent_turn_id = initial.turns[0].turn_id;
     first.write(F10);
     assert!(first.finish(Duration::from_secs(5)).0.success());
     drop(engine);
@@ -1227,7 +1227,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(uuid::Uuid::now_v7()),
             sequence: u64::try_from(sequence).unwrap(),
-            run_id: Some(parent_run_id),
+            turn_id: Some(parent_turn_id),
             kind: TranscriptKind::Assistant,
             text,
             payload: None,
@@ -1237,13 +1237,13 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         connection
             .execute(
                 "INSERT INTO conversation_outbox(\
-                    session_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms\
+                    session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
                  ) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
                 params![
                     session_id.to_string(),
                     sequence,
                     entry.entry_id.to_string(),
-                    parent_run_id.to_string(),
+                    parent_turn_id.to_string(),
                     entry.source_key,
                     serde_json::to_string(&entry).unwrap(),
                     sequence,
@@ -1300,8 +1300,8 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
             sessions.len() == 1
                 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
                 && sessions[0].pending.is_none()
-                && sessions[0].active_run_id.is_none()
-                && sessions[0].runs.len() == 2
+                && sessions[0].active_turn_id.is_none()
+                && sessions[0].turns.len() == 2
                 && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.sequence > u64::try_from(seeded_last_sequence).unwrap()
                         && entry.kind == TranscriptKind::User
@@ -1426,7 +1426,7 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
         denied_sessions[0].lifecycle,
         latte_core::SessionLifecycle::Ready
     );
-    assert_eq!(denied_sessions[0].runs.len(), 2);
+    assert_eq!(denied_sessions[0].turns.len(), 2);
     assert!(denied_sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == TranscriptKind::User
             && entry.text == "retry after denial\nwith a multiline prompt"

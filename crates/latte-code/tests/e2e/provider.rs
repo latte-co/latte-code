@@ -1,7 +1,7 @@
 use super::support::{ProviderReply, Scenario, ScriptedProvider, assert_secret_absent, json};
 use std::time::Duration;
 
-fn run_with_provider(
+fn turn_with_provider(
     scenario: &Scenario,
     provider: &ScriptedProvider,
     provider_fields: &str,
@@ -94,7 +94,7 @@ fn retryable_http_is_retried_exactly_once_then_completes_durably() {
             }),
         ),
     ]);
-    let output = run_with_provider(
+    let output = turn_with_provider(
         &scenario,
         &provider,
         ",timeout_ms:2000,max_attempts:2,temperature:0.25,max_tokens:64",
@@ -108,7 +108,7 @@ fn retryable_http_is_retried_exactly_once_then_completes_durably() {
     );
     assert_eq!(json(&output)["status"], "completed");
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     provider.assert_consumed();
@@ -128,7 +128,7 @@ fn terminal_http_and_malformed_success_never_retry_or_leak_the_secret() {
         &serde_json::json!({"error": "bad request"}),
     )
     .header("X-Request-Id", "safe-request-id")]);
-    let http = run_with_provider(
+    let http = turn_with_provider(
         &http_scenario,
         &http_provider,
         ",timeout_ms:1000,max_attempts:3",
@@ -136,7 +136,7 @@ fn terminal_http_and_malformed_success_never_retry_or_leak_the_secret() {
     assert_eq!(http.status.code(), Some(1));
     assert_eq!(json(&http)["status"], "failed");
     assert_eq!(
-        json(&http)["data"]["session"]["runs"][0]["status"],
+        json(&http)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(failure_text(&http).contains("http 400 (request safe-request-id)"));
@@ -157,14 +157,14 @@ fn terminal_http_and_malformed_success_never_retry_or_leak_the_secret() {
         200,
         &serde_json::json!({"choices": []}),
     )]);
-    let malformed = run_with_provider(
+    let malformed = turn_with_provider(
         &malformed_scenario,
         &malformed_provider,
         ",timeout_ms:1000,max_attempts:3",
     );
     assert_eq!(malformed.status.code(), Some(1));
     assert_eq!(
-        json(&malformed)["data"]["session"]["runs"][0]["status"],
+        json(&malformed)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(failure_text(&malformed).contains("missing choices"));
@@ -178,11 +178,11 @@ fn provider_timeout_is_bounded_failed_and_called_once() {
     let provider = ScriptedProvider::start([
         ProviderReply::completion("too late").delayed(Duration::from_millis(250))
     ]);
-    let output = run_with_provider(&scenario, &provider, ",timeout_ms:50,max_attempts:1");
+    let output = turn_with_provider(&scenario, &provider, ",timeout_ms:50,max_attempts:1");
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        json(&output)["data"]["session"]["runs"][0]["status"],
+        json(&output)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(failure_text(&output).contains("provider timeout"));
@@ -204,7 +204,7 @@ fn streaming_sse_completion_reaches_the_binary_and_persists_exact_text() {
         "text/event-stream; charset=utf-8",
         stream.as_bytes(),
     )]);
-    let output = run_with_provider(
+    let output = turn_with_provider(
         &scenario,
         &provider,
         ",timeout_ms:1000,max_attempts:1,streaming:true",
@@ -230,7 +230,7 @@ fn unsupported_empty_stream_response_falls_back_inline_once() {
         ProviderReply::raw(415, "application/json", Vec::new()),
         ProviderReply::completion("inline fallback"),
     ]);
-    let output = run_with_provider(
+    let output = turn_with_provider(
         &scenario,
         &provider,
         ",timeout_ms:1000,max_attempts:1,streaming:true",
@@ -256,7 +256,7 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
     let inline_scenario = Scenario::new();
     let inline_provider =
         ScriptedProvider::start([ProviderReply::completion("inline while streaming")]);
-    let inline = run_with_provider(
+    let inline = turn_with_provider(
         &inline_scenario,
         &inline_provider,
         ",timeout_ms:1000,max_attempts:2,streaming:true",
@@ -273,7 +273,7 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
         ProviderReply::json(429, &serde_json::json!({"error": "limited"}))
             .header("X-Request-Id", "fallback-request"),
     ]);
-    let fallback_http = run_with_provider(
+    let fallback_http = turn_with_provider(
         &fallback_http_scenario,
         &fallback_http_provider,
         ",timeout_ms:1000,max_attempts:3,streaming:true",
@@ -294,14 +294,14 @@ fn streaming_accepts_inline_json_but_fallback_failures_are_terminal_and_single_a
         ProviderReply::raw(422, "application/json", Vec::new()),
         ProviderReply::raw(200, "application/json", b"not-json".to_vec()),
     ]);
-    let fallback_malformed = run_with_provider(
+    let fallback_malformed = turn_with_provider(
         &fallback_malformed_scenario,
         &fallback_malformed_provider,
         ",timeout_ms:1000,max_attempts:3,streaming:true",
     );
     assert_eq!(fallback_malformed.status.code(), Some(1));
     assert_eq!(
-        json(&fallback_malformed)["data"]["session"]["runs"][0]["status"],
+        json(&fallback_malformed)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert!(!failure_text(&fallback_malformed).is_empty());
@@ -332,7 +332,7 @@ fn nonstandard_input_and_provider_state_fail_closed_without_a_second_call() {
     ] {
         let scenario = Scenario::new();
         let provider = ScriptedProvider::start([ProviderReply::json(200, &body)]);
-        let output = run_with_provider(&scenario, &provider, ",timeout_ms:1000,max_attempts:3");
+        let output = turn_with_provider(&scenario, &provider, ",timeout_ms:1000,max_attempts:3");
         assert_eq!(output.status.code(), Some(1));
         assert!(failure_text(&output).contains(expected));
         provider.assert_consumed();
@@ -420,7 +420,7 @@ fn secret_input_empty_assistant_and_nonobject_tool_input_fail_durably() {
         });
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
-            json(&output)["data"]["session"]["runs"][0]["status"],
+            json(&output)["data"]["session"]["turns"][0]["status"],
             "failed"
         );
         assert!(
@@ -468,7 +468,7 @@ fn malformed_inline_tool_calls_are_terminal_and_never_reenter_the_provider() {
     for (body, expected) in cases {
         let scenario = Scenario::new();
         let provider = ScriptedProvider::start([ProviderReply::json(200, &body)]);
-        let output = run_with_provider(&scenario, &provider, ",max_attempts:3");
+        let output = turn_with_provider(&scenario, &provider, ",max_attempts:3");
 
         assert_eq!(
             output.status.code(),
@@ -479,7 +479,7 @@ fn malformed_inline_tool_calls_are_terminal_and_never_reenter_the_provider() {
         );
         assert_eq!(json(&output)["status"], "failed");
         assert_eq!(
-            json(&output)["data"]["session"]["runs"][0]["status"],
+            json(&output)["data"]["session"]["turns"][0]["status"],
             "failed"
         );
         assert!(

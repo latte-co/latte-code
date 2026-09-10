@@ -228,12 +228,12 @@ fn corrupt_canonical_descriptor(scenario: &Scenario, effect_id: &str, descriptor
 
 /// Reads the canonical session-effect descriptor ID for a run via SQL.
 #[cfg(unix)]
-fn read_effect_id_for_run(scenario: &Scenario, run_id: &str) -> String {
+fn read_effect_id_for_run(scenario: &Scenario, turn_id: &str) -> String {
     use rusqlite::Connection;
     let conn = Connection::open(scenario.database_path()).unwrap();
     conn.query_row(
-        "SELECT effect_id FROM session_effect_canonical WHERE run_id=?1",
-        [run_id],
+        "SELECT effect_id FROM session_effect_canonical WHERE turn_id=?1",
+        [turn_id],
         |r| r.get(0),
     )
     .unwrap()
@@ -288,17 +288,17 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
     let snapshot = wait_for_lifecycle(&server, &session_id, &["waiting_permission"]);
-    let run_id_str = snapshot["active_run_id"].as_str().unwrap().to_string();
+    let turn_id_str = snapshot["active_turn_id"].as_str().unwrap().to_string();
     let session_revision = snapshot["revision"].as_u64().unwrap();
     let request_id = snapshot["pending"]["request_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let run_revision = snapshot["pending"]["expected_run_revision"]
+    let turn_revision = snapshot["pending"]["expected_turn_revision"]
         .as_u64()
         .unwrap();
 
-    let effect_id = read_effect_id_for_run(&scenario, &run_id_str);
+    let effect_id = read_effect_id_for_run(&scenario, &turn_id_str);
     assert!(
         effect_id.contains("checkpoint-write"),
         "effect_id should reference the tool call, got: {effect_id}"
@@ -374,7 +374,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
             Some(&serde_json::json!({
                 "allow": true,
                 "expected_session_revision": session_revision,
-                "expected_run_revision": run_revision
+                "expected_turn_revision": turn_revision
             })),
             &[],
         );
@@ -414,9 +414,9 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
     let current_revision = current_snapshot["revision"]
         .as_u64()
         .unwrap_or(session_revision);
-    let current_run_revision = current_snapshot["runs"][0]["run_revision"]
+    let current_turn_revision = current_snapshot["turns"][0]["turn_revision"]
         .as_u64()
-        .unwrap_or(run_revision);
+        .unwrap_or(turn_revision);
 
     if current_lifecycle == "waiting_permission" {
         let (deny_status, deny_body) = server.request(
@@ -426,7 +426,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
             Some(&serde_json::json!({
                 "allow": false,
                 "expected_session_revision": current_revision,
-                "expected_run_revision": current_run_revision
+                "expected_turn_revision": current_turn_revision
             })),
             &[],
         );

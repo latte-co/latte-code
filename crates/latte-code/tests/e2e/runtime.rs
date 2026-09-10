@@ -17,9 +17,9 @@ fn allow_process_to_completion(
     let workspace = server.create_workspace(scenario);
     let binding = server_binding(scenario);
     let session_id = server.create_session(&workspace, prompt, &binding);
-    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
     let (allow_status, allow_body) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
     // On macOS, process-group cleanup after SIGKILL can leave the lifecycle in
@@ -32,7 +32,7 @@ fn allow_process_to_completion(
         "expected ready or reconciliation_required, got {lifecycle}"
     );
     if lifecycle == "ready" {
-        assert_eq!(terminal["runs"][0]["status"], "completed");
+        assert_eq!(terminal["turns"][0]["status"], "completed");
     } else {
         // When the lifecycle is `reconciliation_required`, the run may still
         // be re-entering the provider with the timed-out tool result. Wait
@@ -45,7 +45,7 @@ fn allow_process_to_completion(
             "provider did not receive follow-up call after reconciliation_required"
         );
     }
-    (server, session_id, request_id, revision, run_revision)
+    (server, session_id, request_id, revision, turn_revision)
 }
 
 /// Extracts the tool-result message content from the provider's second request.
@@ -81,7 +81,7 @@ fn legacy_process_argv_approval_preserves_bounded_dual_stream_result() {
         ProviderReply::tool_call("legacy-argv-process", "process", &process),
         ProviderReply::completion("legacy argv observed"),
     ]);
-    let (server, session_id, request_id, revision, run_revision) =
+    let (server, session_id, request_id, revision, turn_revision) =
         allow_process_to_completion(&scenario, &provider, "run bounded argv");
 
     provider.assert_consumed();
@@ -97,7 +97,7 @@ fn legacy_process_argv_approval_preserves_bounded_dual_stream_result() {
     // A repeated permission decision on the consumed request is rejected and
     // never re-executes the effect or re-enters the provider.
     let (repeat_status, _) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert!(
         repeat_status == 404 || repeat_status == 409,
         "repeat permission returned {repeat_status}"
@@ -127,7 +127,7 @@ fn legacy_process_timeout_reaps_group_then_reenters_provider_once() {
         ProviderReply::tool_call("legacy-timeout-process", "process", &process),
         ProviderReply::completion("timeout observed"),
     ]);
-    let (_server, _session_id, _request_id, _revision, _run_revision) =
+    let (_server, _session_id, _request_id, _revision, _turn_revision) =
         allow_process_to_completion(&scenario, &provider, "run timeout process");
 
     let pgid = std::fs::read_to_string(&pgid_file)
@@ -170,7 +170,7 @@ fn legacy_process_exit_with_live_group_reaps_survivors_then_reenters_provider_on
         ProviderReply::tool_call("legacy-exit-live-group-process", "process", &process),
         ProviderReply::completion("exit with live group observed"),
     ]);
-    let (_server, _session_id, _request_id, _revision, _run_revision) =
+    let (_server, _session_id, _request_id, _revision, _turn_revision) =
         allow_process_to_completion(&scenario, &provider, "run exit-with-live-group process");
 
     let pgid = std::fs::read_to_string(&pgid_file)
@@ -215,7 +215,7 @@ fn legacy_process_timeout_escalates_to_sigkill_when_group_ignores_sigterm() {
         ProviderReply::tool_call("legacy-sigkill-escalation-process", "process", &process),
         ProviderReply::completion("sigkill escalation observed"),
     ]);
-    let (_server, _session_id, _request_id, _revision, _run_revision) =
+    let (_server, _session_id, _request_id, _revision, _turn_revision) =
         allow_process_to_completion(&scenario, &provider, "run sigkill escalation process");
 
     let pgid = std::fs::read_to_string(&pgid_file)

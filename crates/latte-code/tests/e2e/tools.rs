@@ -332,7 +332,7 @@ fn typed_read_only_tool_failures_are_bounded_and_do_not_reenter_provider() {
             .unwrap();
         let runs = engine.list().unwrap();
         assert_eq!(runs.len(), 1);
-        assert_ne!(runs[0].status, latte_core::RunStatus::Completed);
+        assert_ne!(runs[0].status, latte_core::TurnStatus::Completed);
     }
 }
 
@@ -618,7 +618,7 @@ fn edit_file_allow_uses_a_fresh_read_then_verifies_the_durable_change() {
             engine.list_sessions().is_ok_and(|sessions| {
                 sessions.len() == 1
                     && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
-                    && sessions[0].runs[0].status == latte_core::SessionRunStatus::Completed
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Completed
             })
         }),
         "edit/verification did not complete: {}",
@@ -917,7 +917,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
                 sessions.len() == 1
                     && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
                     && sessions[0].pending.is_none()
-                    && sessions[0].runs[0].status == latte_core::SessionRunStatus::Completed
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Completed
             })
         }),
         "queued writes did not complete: {:?}; terminal={}",

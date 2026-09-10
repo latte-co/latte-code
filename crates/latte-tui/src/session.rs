@@ -14,9 +14,9 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use latte_core::{
-    RunId, SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle, SessionPendingRequest,
-    SessionRunStatus, SessionSnapshot, SessionSummary, SessionTransientProgress, TranscriptEntry,
-    TranscriptKind, redact_session_text,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle, SessionPendingRequest,
+    SessionSnapshot, SessionSummary, SessionTransientProgress, SessionTurnStatus, TranscriptEntry,
+    TranscriptKind, TurnId, redact_session_text,
 };
 use ratatui::{
     Frame, Terminal,
@@ -329,7 +329,7 @@ pub struct PendingSubmission {
 pub struct PendingInputSubmission {
     pub submission_id: u64,
     pub session_id: SessionId,
-    pub run_id: RunId,
+    pub turn_id: TurnId,
     pub request_id: String,
     pub value: String,
     pub after_sequence: u64,
@@ -799,10 +799,10 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 SessionEvent::TranscriptAppended { entry } => {
                     session.transcript.entries.push(entry);
                 }
-                SessionEvent::RunLinked { run } => {
-                    session.latest_run_id = Some(run.run_id);
-                    session.active_run_id = Some(run.run_id);
-                    session.runs.push(run);
+                SessionEvent::TurnLinked { turn } => {
+                    session.latest_turn_id = Some(turn.turn_id);
+                    session.active_turn_id = Some(turn.turn_id);
+                    session.turns.push(turn);
                     session.lifecycle = SessionLifecycle::Running;
                 }
                 SessionEvent::BindingChanged { .. } => {
@@ -1044,7 +1044,9 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
             return Vec::new();
         }
         if let Some(SessionPendingRequest::Input {
-            run_id, request_id, ..
+            turn_id,
+            request_id,
+            ..
         }) = session.pending.as_ref()
         {
             if model.pending_input_submission.is_some() {
@@ -1057,7 +1059,7 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
                 model.pending_input_submission = Some(PendingInputSubmission {
                     submission_id,
                     session_id: session.session_id,
-                    run_id: *run_id,
+                    turn_id: *turn_id,
                     request_id: request_id.clone(),
                     value: value.clone(),
                     after_sequence: session.sequence,
@@ -1319,7 +1321,7 @@ fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Ses
             model.model_picker = None;
             if let Some(session) = model.selected_session() {
                 if !session.lifecycle.accepts_follow_up()
-                    || session.active_run_id.is_some()
+                    || session.active_turn_id.is_some()
                     || session.pending.is_some()
                 {
                     model.status =
@@ -1372,7 +1374,7 @@ fn session_switch_available(model: &SessionUiModel) -> bool {
     model.pending_submission.is_none()
         && model.pending_model_switch.is_none()
         && model.selected_session().is_none_or(|session| {
-            session.active_run_id.is_none()
+            session.active_turn_id.is_none()
                 && session.pending.is_none()
                 && session.lifecycle != SessionLifecycle::ReconciliationRequired
         })
@@ -1593,12 +1595,12 @@ fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgres
         return;
     }
     match progress {
-        SessionTransientProgress::AssistantDelta { run_id, text } => {
+        SessionTransientProgress::AssistantDelta { turn_id, text } => {
             if let Some(SessionTransientProgress::AssistantDelta {
-                run_id: current_run,
+                turn_id: current_turn,
                 text: current,
             }) = model.progress.last_mut()
-                && *current_run == run_id
+                && *current_turn == turn_id
             {
                 append_bounded(current, &text, 16 * 1024);
                 return;
@@ -1606,38 +1608,38 @@ fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgres
             if model.progress.len() < 64 {
                 model
                     .progress
-                    .push(SessionTransientProgress::AssistantDelta { run_id, text });
+                    .push(SessionTransientProgress::AssistantDelta { turn_id, text });
             }
         }
-        SessionTransientProgress::ProviderAttempt { run_id, number } => {
+        SessionTransientProgress::ProviderAttempt { turn_id, number } => {
             if let Some(SessionTransientProgress::ProviderAttempt {
-                run_id: current_run,
+                turn_id: current_turn,
                 number: current,
             }) = model.progress.iter_mut().rev().find(|item| {
-                matches!(item, SessionTransientProgress::ProviderAttempt { run_id: candidate, .. } if *candidate == run_id)
+                matches!(item, SessionTransientProgress::ProviderAttempt { turn_id: candidate, .. } if *candidate == turn_id)
             }) {
-                *current_run = run_id;
+                *current_turn = turn_id;
                 *current = number;
             } else if model.progress.len() < 64 {
                 model
                     .progress
-                    .push(SessionTransientProgress::ProviderAttempt { run_id, number });
+                    .push(SessionTransientProgress::ProviderAttempt { turn_id, number });
             }
         }
         SessionTransientProgress::ToolProgress {
-            run_id,
+            turn_id,
             name,
             detail,
         } => {
             if let Some(SessionTransientProgress::ToolProgress {
                 detail: current, ..
             }) = model.progress.iter_mut().rev().find(|item| {
-                matches!(item, SessionTransientProgress::ToolProgress { run_id: candidate, name: candidate_name, .. } if *candidate == run_id && candidate_name == &name)
+                matches!(item, SessionTransientProgress::ToolProgress { turn_id: candidate, name: candidate_name, .. } if *candidate == turn_id && candidate_name == &name)
             }) {
                 *current = detail;
             } else if model.progress.len() < 64 {
                 model.progress.push(SessionTransientProgress::ToolProgress {
-                    run_id,
+                    turn_id,
                     name,
                     detail,
                 });
@@ -1736,7 +1738,7 @@ fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
     if let Some(session) = model.selected_session()
         && session.lifecycle != SessionLifecycle::Ready
         && !(session.lifecycle == SessionLifecycle::Running
-            && session.active_run_id.is_some()
+            && session.active_turn_id.is_some()
             && session.pending.is_none())
     {
         model.status =
@@ -1795,7 +1797,7 @@ fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
         }
         Some(session)
             if session.lifecycle == SessionLifecycle::Running
-                && session.active_run_id.is_some()
+                && session.active_turn_id.is_some()
                 && session.pending.is_none()
                 && model.queued_follow_up.is_none() =>
         {
@@ -1869,7 +1871,7 @@ fn reconcile_pending_input_submission(model: &mut SessionUiModel) {
     let Some(pending) = model.pending_input_submission.as_ref() else {
         return;
     };
-    let source_key = format!("{}:input:{}:card", pending.run_id, pending.request_id);
+    let source_key = format!("{}:input:{}:card", pending.turn_id, pending.request_id);
     let durable = model.sessions.iter().any(|session| {
         session.session_id == pending.session_id
             && session.transcript.entries.iter().any(|entry| {
@@ -1921,7 +1923,7 @@ fn restore_stranded_follow_up(model: &mut SessionUiModel) {
     let stranded = model.queued_follow_up.is_some()
         && model.pending_submission.is_some()
         && model.selected_session().is_some_and(|session| {
-            session.active_run_id.is_none()
+            session.active_turn_id.is_none()
                 && session.pending.is_none()
                 && session.lifecycle != SessionLifecycle::Ready
         });
@@ -2118,32 +2120,32 @@ enum PresentationItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RunPresentation {
-    run_id: Option<RunId>,
+struct TurnPresentation {
+    turn_id: Option<TurnId>,
     heading: String,
     items: Vec<PresentationItem>,
 }
 
 /// Pure, display-only projection. It consumes only the public redacted
-/// transcript and run summaries, groups cards by run, and pairs tool calls and
+/// transcript and turn summaries, groups cards by turn, and pairs tool calls and
 /// results by their public `tool_call_id` when that identifier is present.
 #[allow(clippy::too_many_lines)]
-fn project_transcript(session: &SessionSnapshot) -> Vec<RunPresentation> {
-    let mut groups: Vec<(Option<RunId>, Vec<&TranscriptEntry>)> = Vec::new();
+fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
+    let mut groups: Vec<(Option<TurnId>, Vec<&TranscriptEntry>)> = Vec::new();
     for entry in &session.transcript.entries {
         if let Some((_, entries)) = groups
             .iter_mut()
-            .find(|(run_id, _)| *run_id == entry.run_id)
+            .find(|(turn_id, _)| *turn_id == entry.turn_id)
         {
             entries.push(entry);
         } else {
-            groups.push((entry.run_id, vec![entry]));
+            groups.push((entry.turn_id, vec![entry]));
         }
     }
     groups
         .into_iter()
-        .map(|(run_id, entries)| {
-            let heading = run_heading(session, run_id);
+        .map(|(turn_id, entries)| {
+            let heading = turn_heading(session, turn_id);
             let mut items = Vec::new();
             for entry in entries {
                 match entry.kind {
@@ -2155,7 +2157,7 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<RunPresentation> {
                         let name = payload_string(entry, &["descriptor", "name"])
                             .or_else(|| payload_string(entry, &["name"]))
                             .unwrap_or_else(|| "Tool action".into());
-                        let state = if run_id == session.active_run_id {
+                        let state = if turn_id == session.active_turn_id {
                             match session.lifecycle {
                                 SessionLifecycle::WaitingPermission => ActivityState::Waiting,
                                 SessionLifecycle::Running | SessionLifecycle::WaitingInput => {
@@ -2258,8 +2260,8 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<RunPresentation> {
                     }
                 }
             }
-            RunPresentation {
-                run_id,
+            TurnPresentation {
+                turn_id,
                 heading,
                 items,
             }
@@ -2356,30 +2358,30 @@ fn presentation_text(value: &str, cap: usize) -> String {
     output
 }
 
-fn run_heading(session: &SessionSnapshot, run_id: Option<RunId>) -> String {
-    let Some(run_id) = run_id else {
+fn turn_heading(session: &SessionSnapshot, turn_id: Option<TurnId>) -> String {
+    let Some(turn_id) = turn_id else {
         return "Conversation".into();
     };
     session
-        .runs
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|turn| turn.turn_id == turn_id)
         .map_or_else(
-            || "Run activity".into(),
-            |run| format!("Run {} · {}", run.ordinal, run_status_label(run.status)),
+            || "Turn activity".into(),
+            |turn| format!("Turn {} · {}", turn.ordinal, turn_status_label(turn.status)),
         )
 }
 
-const fn run_status_label(status: SessionRunStatus) -> &'static str {
+const fn turn_status_label(status: SessionTurnStatus) -> &'static str {
     match status {
-        SessionRunStatus::Queued => "Queued",
-        SessionRunStatus::Running => "Running",
-        SessionRunStatus::Cancelling => "Cancelling",
-        SessionRunStatus::WaitingPermission => "Waiting permission",
-        SessionRunStatus::WaitingInput => "Waiting input",
-        SessionRunStatus::Interrupted => "Interrupted",
-        SessionRunStatus::Failed => "Failed",
-        SessionRunStatus::Completed => "Completed",
+        SessionTurnStatus::Queued => "Queued",
+        SessionTurnStatus::Running => "Running",
+        SessionTurnStatus::Cancelling => "Cancelling",
+        SessionTurnStatus::WaitingPermission => "Waiting permission",
+        SessionTurnStatus::WaitingInput => "Waiting input",
+        SessionTurnStatus::Interrupted => "Interrupted",
+        SessionTurnStatus::Failed => "Failed",
+        SessionTurnStatus::Completed => "Completed",
     }
 }
 
@@ -2874,12 +2876,12 @@ fn visual_state(model: &SessionUiModel) -> VisualState {
     {
         return VisualState::Permission;
     }
-    let latest_run_completed = session.latest_run_id.is_some_and(|latest_run_id| {
+    let latest_turn_completed = session.latest_turn_id.is_some_and(|latest_turn_id| {
         session
-            .runs
+            .turns
             .iter()
-            .find(|run| run.run_id == latest_run_id)
-            .is_some_and(|run| run.status == SessionRunStatus::Completed)
+            .find(|turn| turn.turn_id == latest_turn_id)
+            .is_some_and(|turn| turn.status == SessionTurnStatus::Completed)
     });
     let latest_transcript_card_is_completion = session
         .transcript
@@ -2889,7 +2891,7 @@ fn visual_state(model: &SessionUiModel) -> VisualState {
         .find(|entry| entry.kind != TranscriptKind::System)
         .is_some_and(|entry| entry.kind == TranscriptKind::Completion);
     if session.lifecycle == SessionLifecycle::Ready
-        && (latest_run_completed || latest_transcript_card_is_completion)
+        && (latest_turn_completed || latest_transcript_card_is_completion)
     {
         return VisualState::Complete;
     }
@@ -3329,14 +3331,14 @@ fn render_transcript(
         }
         for group in project_transcript(session) {
             let phase_color = group
-                .run_id
-                .and_then(|run_id| session.runs.iter().find(|run| run.run_id == run_id))
-                .map_or(TEXT_SOFT, |run| run_status_color(run.status));
+                .turn_id
+                .and_then(|turn_id| session.turns.iter().find(|turn| turn.turn_id == turn_id))
+                .map_or(TEXT_SOFT, |turn| turn_status_color(turn.status));
             let last_action_index = group
                 .items
                 .iter()
                 .rposition(|item| matches!(item, PresentationItem::Action { .. }));
-            let mut heading_rendered = group.run_id.is_none();
+            let mut heading_rendered = group.turn_id.is_none();
             for (item_index, item) in group.items.into_iter().enumerate() {
                 if !heading_rendered
                     && !matches!(
@@ -3461,7 +3463,7 @@ fn render_transcript(
     for progress in &model.progress {
         if model
             .selected_session()
-            .is_none_or(|session| session.active_run_id != Some(progress_run_id(progress)))
+            .is_none_or(|session| session.active_turn_id != Some(progress_turn_id(progress)))
         {
             continue;
         }
@@ -4424,14 +4426,16 @@ const fn lifecycle_color(lifecycle: SessionLifecycle) -> Color {
     }
 }
 
-const fn run_status_color(status: SessionRunStatus) -> Color {
+const fn turn_status_color(status: SessionTurnStatus) -> Color {
     match status {
-        SessionRunStatus::Queued | SessionRunStatus::Running | SessionRunStatus::Cancelling => CYAN,
-        SessionRunStatus::WaitingPermission
-        | SessionRunStatus::WaitingInput
-        | SessionRunStatus::Interrupted => AMBER,
-        SessionRunStatus::Failed => RED,
-        SessionRunStatus::Completed => GREEN,
+        SessionTurnStatus::Queued | SessionTurnStatus::Running | SessionTurnStatus::Cancelling => {
+            CYAN
+        }
+        SessionTurnStatus::WaitingPermission
+        | SessionTurnStatus::WaitingInput
+        | SessionTurnStatus::Interrupted => AMBER,
+        SessionTurnStatus::Failed => RED,
+        SessionTurnStatus::Completed => GREEN,
     }
 }
 
@@ -4575,11 +4579,11 @@ fn progress_text(progress: &SessionTransientProgress) -> String {
     }
 }
 
-const fn progress_run_id(progress: &SessionTransientProgress) -> RunId {
+const fn progress_turn_id(progress: &SessionTransientProgress) -> TurnId {
     match progress {
-        SessionTransientProgress::ProviderAttempt { run_id, .. }
-        | SessionTransientProgress::AssistantDelta { run_id, .. }
-        | SessionTransientProgress::ToolProgress { run_id, .. } => *run_id,
+        SessionTransientProgress::ProviderAttempt { turn_id, .. }
+        | SessionTransientProgress::AssistantDelta { turn_id, .. }
+        | SessionTransientProgress::ToolProgress { turn_id, .. } => *turn_id,
     }
 }
 
@@ -4890,8 +4894,8 @@ pub fn run_with_feedback_and_progress(
 mod tests {
     use super::*;
     use latte_core::{
-        IdSource, RunId, SessionEvent, SessionEventEnvelope, SessionEventId,
-        SessionProviderBinding, SystemIdSource, TranscriptEntry, TranscriptEntryId,
+        IdSource, SessionEvent, SessionEventEnvelope, SessionEventId, SessionProviderBinding,
+        SystemIdSource, TranscriptEntry, TranscriptEntryId, TurnId,
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::VecDeque;
@@ -4920,15 +4924,15 @@ mod tests {
                 data_scope_id: "scope".into(),
                 credential_generation: 1,
             },
-            latest_run_id: None,
-            active_run_id: None,
+            latest_turn_id: None,
+            active_turn_id: None,
             pending: None,
-            runs: vec![],
+            turns: vec![],
             transcript: latte_core::TranscriptPage {
                 entries: vec![TranscriptEntry {
                     entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
                     sequence: 1,
-                    run_id: None,
+                    turn_id: None,
                     kind: TranscriptKind::User,
                     text: "hello".into(),
                     payload: None,
@@ -4944,16 +4948,16 @@ mod tests {
 
     fn running_snapshot() -> SessionSnapshot {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Running);
-        session.latest_run_id = Some(run_id);
-        session.active_run_id = Some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.latest_turn_id = Some(turn_id);
+        session.active_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 0,
-            status: SessionRunStatus::Running,
-            run_revision: 1,
+            status: SessionTurnStatus::Running,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         });
@@ -5178,7 +5182,7 @@ mod tests {
                 session_id
             }
         );
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut model = SessionUiModel::default();
         reduce(&mut model, SessionUiInput::Resize(99, 31));
         assert_eq!(model.size, (99, 31));
@@ -5187,7 +5191,7 @@ mod tests {
         reduce(
             &mut model,
             SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "discarded while disconnected".into(),
             }),
         );
@@ -5201,10 +5205,10 @@ mod tests {
         assert!(reduce(&mut model, SessionUiInput::Tick).is_empty());
 
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission".into(),
             description: "write".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         model.command_palette = true;
         model.help = true;
@@ -5220,7 +5224,7 @@ mod tests {
             sequence: 2,
             event: SessionEvent::LifecycleChanged {
                 lifecycle: SessionLifecycle::Ready,
-                run_id: None,
+                turn_id: None,
             },
         };
         assert_eq!(
@@ -5237,18 +5241,18 @@ mod tests {
             sequence: 2,
             event: SessionEvent::LifecycleChanged {
                 lifecycle: SessionLifecycle::Ready,
-                run_id: None,
+                turn_id: None,
             },
         };
         assert!(reduce(&mut model, SessionUiInput::Event(lifecycle)).is_empty());
         assert_eq!(model.sessions[0].lifecycle, SessionLifecycle::Ready);
 
-        let run = latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        let run = latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Running,
-            run_revision: 1,
+            status: SessionTurnStatus::Running,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         };
@@ -5258,11 +5262,11 @@ mod tests {
             session_id,
             revision: 3,
             sequence: 3,
-            event: SessionEvent::RunLinked { run: run.clone() },
+            event: SessionEvent::TurnLinked { turn: run.clone() },
         };
         assert!(reduce(&mut model, SessionUiInput::Event(linked)).is_empty());
-        assert_eq!(model.sessions[0].active_run_id, Some(run_id));
-        assert_eq!(model.sessions[0].runs, vec![run]);
+        assert_eq!(model.sessions[0].active_turn_id, Some(turn_id));
+        assert_eq!(model.sessions[0].turns, vec![run]);
 
         let reconciliation = SessionEventEnvelope {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
@@ -5271,7 +5275,7 @@ mod tests {
             revision: 4,
             sequence: 4,
             event: SessionEvent::ReconciliationRequired {
-                run_id,
+                turn_id,
                 effect_id: "effect-1".into(),
             },
         };
@@ -5284,13 +5288,13 @@ mod tests {
 
     #[test]
     fn progress_editor_and_submission_boundaries_are_bounded_and_correlated() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let mut model = SessionUiModel::default();
         for text in ["one", " two"] {
             record_progress(
                 &mut model,
                 SessionTransientProgress::AssistantDelta {
-                    run_id,
+                    turn_id,
                     text: text.into(),
                 },
             );
@@ -5298,14 +5302,14 @@ mod tests {
         for number in [1, 2] {
             record_progress(
                 &mut model,
-                SessionTransientProgress::ProviderAttempt { run_id, number },
+                SessionTransientProgress::ProviderAttempt { turn_id, number },
             );
         }
         for detail in ["starting", "complete"] {
             record_progress(
                 &mut model,
                 SessionTransientProgress::ToolProgress {
-                    run_id,
+                    turn_id,
                     name: "read_file".into(),
                     detail: detail.into(),
                 },
@@ -5368,14 +5372,14 @@ mod tests {
     #[test]
     fn projection_helpers_reject_private_or_malformed_payloads_and_keep_safe_metadata() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Running);
-        session.active_run_id = Some(run_id);
+        session.active_turn_id = Some(turn_id);
         session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "run",
                 Some(serde_json::json!({
@@ -5395,7 +5399,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::System,
                 "started",
                 Some(serde_json::json!({"status":"started","effect_id":"effect-process"})),
@@ -5403,7 +5407,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "orphan failed",
                 Some(serde_json::json!({"tool_call_id":"other","name":"fallback","error":{}})),
@@ -5411,7 +5415,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Completion,
                 "done",
                 Some(serde_json::json!({"handoff":"invalid"})),
@@ -5466,8 +5470,8 @@ mod tests {
         );
         assert!(payload_string(&invalid, &["missing"]).is_none());
         assert!(payload_string(&invalid, &["value"]).is_none());
-        assert_eq!(run_heading(&session, None), "Conversation");
-        assert_eq!(run_heading(&session, Some(run_id)), "Run activity");
+        assert_eq!(turn_heading(&session, None), "Conversation");
+        assert_eq!(turn_heading(&session, Some(turn_id)), "Turn activity");
     }
 
     #[test]
@@ -5521,7 +5525,7 @@ mod tests {
         model.pending_input_submission = Some(PendingInputSubmission {
             submission_id: 8,
             session_id: SessionId::from_uuid(ids.next_uuid_v7()),
-            run_id: RunId::from_uuid(ids.next_uuid_v7()),
+            turn_id: TurnId::from_uuid(ids.next_uuid_v7()),
             request_id: "input-1".into(),
             value: "restore this input".into(),
             after_sequence: 0,
@@ -5568,7 +5572,7 @@ mod tests {
             .unwrap();
         progress_tx
             .send(SessionTransientProgress::ProviderAttempt {
-                run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 number: 1,
             })
             .unwrap();
@@ -5638,7 +5642,7 @@ mod tests {
         current.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Completion,
             text: "current card after event gap".into(),
             payload: None,
@@ -5654,7 +5658,7 @@ mod tests {
         model
             .progress
             .push(SessionTransientProgress::AssistantDelta {
-                run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+                turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 text: "non-durable delta".into(),
             });
         let actions = match projection.poll() {
@@ -5725,7 +5729,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -5766,7 +5770,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -5814,12 +5818,12 @@ mod tests {
             [SessionUiAction::FollowUp { prompt, .. }] if prompt == "x\n"
         ));
         assert!(model.composer.is_empty());
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         model.sessions[0].pending = Some(SessionPendingRequest::Permission {
-            run_id: run,
+            turn_id: run,
             request_id: "p".into(),
             description: "write".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         model.composer = "kept".into();
         model.input = "also kept".into();
@@ -5836,22 +5840,24 @@ mod tests {
         assert_eq!(model.input, "also kept");
 
         let ids = SystemIdSource::default();
-        let failed_run = RunId::from_uuid(ids.next_uuid_v7());
+        let failed_turn = TurnId::from_uuid(ids.next_uuid_v7());
         let mut retryable_failure = snapshot(SessionLifecycle::Ready);
-        retryable_failure.latest_run_id = Some(failed_run);
-        retryable_failure.runs.push(latte_core::SessionRunSummary {
-            run_id: failed_run,
-            parent_run_id: None,
-            ordinal: 0,
-            status: SessionRunStatus::Failed,
-            run_revision: 2,
-            completed_at_ms: Some(2),
-            failure_code: None,
-        });
+        retryable_failure.latest_turn_id = Some(failed_turn);
+        retryable_failure
+            .turns
+            .push(latte_core::SessionTurnSummary {
+                turn_id: failed_turn,
+                parent_turn_id: None,
+                ordinal: 0,
+                status: SessionTurnStatus::Failed,
+                turn_revision: 2,
+                completed_at_ms: Some(2),
+                failure_code: None,
+            });
         retryable_failure.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(failed_run),
+            turn_id: Some(failed_turn),
             kind: TranscriptKind::Failure,
             text: "provider configuration failed".into(),
             payload: None,
@@ -5883,13 +5889,13 @@ mod tests {
 
     #[test]
     fn permission_allow_requires_exact_ctrl_a() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-exact-chord".into(),
             description: "write".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let session_id = session.session_id;
         let mut model = SessionUiModel {
@@ -5929,7 +5935,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -6065,7 +6071,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::User,
             text: "durable-sentinel".into(),
             payload: None,
@@ -6118,7 +6124,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 1,
-            run_id: session.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
             text: "retry me".into(),
             payload: None,
@@ -6152,13 +6158,13 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: session.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
             text: redact_session_text(secret_prompt),
             payload: None,
             source_key: format!(
                 "{}:input:answer:card",
-                session.active_run_id.expect("running fixture")
+                session.active_turn_id.expect("running fixture")
             ),
             created_at_ms: 2,
         });
@@ -6168,7 +6174,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 3,
-            run_id: session.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
             text: redact_session_text(secret_prompt),
             payload: None,
@@ -6207,7 +6213,7 @@ mod tests {
             SessionUiInput::SubmissionError { submission_id },
         );
         terminal.session_id = session_id;
-        terminal.active_run_id = None;
+        terminal.active_turn_id = None;
         terminal.pending = None;
         reduce(&mut model, SessionUiInput::Snapshot(vec![terminal]));
         assert_eq!(model.composer, "queued once");
@@ -6219,13 +6225,13 @@ mod tests {
     fn input_submission_restores_only_after_exact_snapshot_reconciliation() {
         let ids = SystemIdSource::default();
         let mut session = running_snapshot();
-        let run_id = session.active_run_id.expect("running fixture");
+        let turn_id = session.active_turn_id.expect("running fixture");
         session.lifecycle = SessionLifecycle::WaitingInput;
         session.pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "request-1".into(),
             prompt: "value".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         let session_id = session.session_id;
         let mut model = SessionUiModel::default();
@@ -6261,11 +6267,11 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: "x".into(),
             payload: None,
-            source_key: format!("{run_id}:input:request-1:card"),
+            source_key: format!("{turn_id}:input:request-1:card"),
             created_at_ms: 2,
         });
         reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
@@ -6335,7 +6341,7 @@ mod tests {
         session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -6367,13 +6373,13 @@ mod tests {
     #[test]
     fn permission_card_shows_redacted_bounded_operation_context_before_ctrl_a() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-card".into(),
             description: "Write src/generated.rs (create or replace; 43 bytes of content) api_key=live-secret-value\n\u{1b}[31m".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let mut model = SessionUiModel {
             sessions: vec![session.clone()],
@@ -6413,19 +6419,19 @@ mod tests {
     #[test]
     fn process_permission_card_is_pinned_at_the_active_waterfall_tail() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let request_id = "process-permission-card";
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: request_id.into(),
             description: "Run argv: git status (cwd: .)".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Run argv: git status (cwd: .)",
             Some(serde_json::json!({
@@ -6465,7 +6471,7 @@ mod tests {
 
     #[test]
     fn gap_clears_progress_after_mailbox_submission() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let mut model = SessionUiModel {
             sessions: vec![running_snapshot()],
             composer: "later".into(),
@@ -6474,14 +6480,14 @@ mod tests {
         reduce(
             &mut model,
             SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "partial".into(),
             }),
         );
         reduce(
             &mut model,
             SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: " delta".into(),
             }),
         );
@@ -6509,15 +6515,15 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn reducer_dispatches_only_typed_session_actions_for_all_active_states() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut ready = snapshot(SessionLifecycle::Ready);
-        ready.latest_run_id = Some(run_id);
-        ready.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        ready.latest_turn_id = Some(turn_id);
+        ready.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: latte_core::SessionRunStatus::Completed,
-            run_revision: 3,
+            status: latte_core::SessionTurnStatus::Completed,
+            turn_revision: 3,
             completed_at_ms: Some(3),
             failure_code: None,
         });
@@ -6553,11 +6559,11 @@ mod tests {
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: "f".into(),
             payload: None,
-            source_key: format!("follow-up:{run_id}:user"),
+            source_key: format!("follow-up:{turn_id}:user"),
             created_at_ms: 2,
         };
         assert!(
@@ -6588,7 +6594,7 @@ mod tests {
                     sequence: 3,
                     event: SessionEvent::LifecycleChanged {
                         lifecycle: SessionLifecycle::Ready,
-                        run_id: Some(run_id),
+                        turn_id: Some(turn_id),
                     },
                 }),
             ),
@@ -6599,10 +6605,10 @@ mod tests {
         reduce(&mut model, SessionUiInput::Snapshot(vec![ready.clone()]));
         model.sessions[0].lifecycle = SessionLifecycle::WaitingPermission;
         model.sessions[0].pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-1".into(),
             description: "write file".into(),
-            expected_run_revision: 4,
+            expected_turn_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         reduce(&mut model, SessionUiInput::FrameRendered);
@@ -6631,10 +6637,10 @@ mod tests {
 
         model.sessions[0].lifecycle = SessionLifecycle::WaitingInput;
         model.sessions[0].pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "input-1".into(),
             prompt: "need value".into(),
-            expected_run_revision: 4,
+            expected_turn_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Char('é'), KeyModifiers::NONE)).is_empty());
         assert_eq!(model.input, "é");
@@ -7246,7 +7252,7 @@ mod tests {
         );
 
         let mut running = snapshot(SessionLifecycle::Running);
-        running.active_run_id = Some(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
+        running.active_turn_id = Some(TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()));
         let mut blocked = SessionUiModel::default();
         reduce(&mut blocked, SessionUiInput::Snapshot(vec![running]));
         blocked.composer = "/new".into();
@@ -7819,13 +7825,13 @@ mod tests {
     #[test]
     fn pending_input_uses_the_same_exact_boundary_layout_and_caret() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingInput);
         session.pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "boundary-input".into(),
             prompt: "value".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let model = SessionUiModel {
             startup: Some(test_startup()),
@@ -7922,13 +7928,13 @@ mod tests {
     #[test]
     fn permission_and_input_branches_consume_the_whole_key_event() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut permission = snapshot(SessionLifecycle::WaitingPermission);
         permission.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "exact-permission".into(),
             description: "write one file".into(),
-            expected_run_revision: 7,
+            expected_turn_revision: 7,
         });
         let mut model = SessionUiModel {
             sessions: vec![permission],
@@ -7960,10 +7966,10 @@ mod tests {
 
         model.sessions[0].lifecycle = SessionLifecycle::WaitingInput;
         model.sessions[0].pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "exact-input".into(),
             prompt: "value".into(),
-            expected_run_revision: 8,
+            expected_turn_revision: 8,
         });
         model.input.clear();
         reduce(&mut model, key(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -7985,15 +7991,15 @@ mod tests {
     #[test]
     fn presentation_groups_runs_and_pairs_tool_results_without_private_payloads() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
-        session.latest_run_id = Some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 3,
-            status: SessionRunStatus::Completed,
-            run_revision: 4,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 4,
             completed_at_ms: Some(4),
             failure_code: None,
         });
@@ -8001,7 +8007,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "检查输入",
                 None,
@@ -8009,7 +8015,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "Read crates/latte-tui/src/session.rs",
                 Some(serde_json::json!({
@@ -8024,7 +8030,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "1,900 lines inspected",
                 Some(serde_json::json!({
@@ -8036,7 +8042,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "orphan result remains readable",
                 Some(serde_json::json!({"unexpected": [1, 2, 3]})),
@@ -8045,7 +8051,7 @@ mod tests {
 
         let projection = project_transcript(&session);
         assert_eq!(projection.len(), 1);
-        assert_eq!(projection[0].heading, "Run 3 · Completed");
+        assert_eq!(projection[0].heading, "Turn 3 · Completed");
         assert!(matches!(
             &projection[0].items[1],
             PresentationItem::Action {
@@ -8065,16 +8071,16 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn render_is_single_transcript_with_nested_activity_and_bounded_disclosure() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Running);
-        session.active_run_id = Some(run_id);
-        session.latest_run_id = Some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.active_turn_id = Some(turn_id);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Running,
-            run_revision: 2,
+            status: SessionTurnStatus::Running,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
@@ -8082,7 +8088,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "修复按键输入",
                 None,
@@ -8090,7 +8096,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "Search reduce_key in crates/latte-tui",
                 Some(serde_json::json!({
@@ -8105,7 +8111,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "18 matches",
                 Some(serde_json::json!({
@@ -8117,7 +8123,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Assistant,
                 "Input path located.",
                 Some(serde_json::json!({"private_checkpoint": "never render this"})),
@@ -8131,7 +8137,7 @@ mod tests {
             focus: SessionFocus::Navigation,
             expanded_actions: BTreeSet::from([action_key]),
             progress: vec![SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "Running tests...".into(),
             }],
             ..Default::default()
@@ -8140,7 +8146,7 @@ mod tests {
         assert!(screen.contains("Latte Code"));
         assert!(screen.contains("·  Running"));
         assert!(screen.contains("▎  ›"), "{screen}");
-        assert!(screen.contains("Run 1 · Running"));
+        assert!(screen.contains("Turn 1 · Running"));
         assert!(screen.contains("search  Search reduce_key"));
         assert!(screen.contains("18 matches"));
         assert!(screen.contains("Input path located"));
@@ -8260,13 +8266,13 @@ mod tests {
         assert!(!idle.contains("Composer ·"));
 
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut permission = snapshot(SessionLifecycle::WaitingPermission);
         permission.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-state".into(),
             description: "Edit one file".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let permission_screen = rendered(
             &SessionUiModel {
@@ -8287,17 +8293,17 @@ mod tests {
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "Composer input handling fixed.",
             None,
         ));
-        complete.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        complete.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
@@ -8436,12 +8442,12 @@ mod tests {
     fn scrolling_only_changes_the_transcript_band() {
         let mut model = working_model();
         let ids = SystemIdSource::default();
-        let run_id = model.sessions[0].active_run_id.unwrap();
+        let turn_id = model.sessions[0].active_turn_id.unwrap();
         for sequence in 4..=48 {
             model.sessions[0].transcript.entries.push(transcript_entry(
                 &ids,
                 sequence,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Assistant,
                 &format!("scroll fixture row {sequence}"),
                 None,
@@ -8625,13 +8631,13 @@ mod tests {
     #[test]
     fn permission_reconciliation_and_completion_keep_distinct_hierarchy() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut permission = snapshot(SessionLifecycle::WaitingPermission);
         permission.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-geometry".into(),
             description: "Edit src/lib.rs".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let permission_buffer = rendered_buffer(
             &SessionUiModel {
@@ -8678,20 +8684,20 @@ mod tests {
         );
 
         let mut complete = snapshot(SessionLifecycle::Ready);
-        complete.latest_run_id = Some(run_id);
-        complete.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        complete.latest_turn_id = Some(turn_id);
+        complete.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "The change is complete.",
             None,
@@ -8958,14 +8964,14 @@ mod tests {
         }
 
         for (status, expected) in [
-            (SessionRunStatus::Queued, CYAN),
-            (SessionRunStatus::Running, CYAN),
-            (SessionRunStatus::Cancelling, CYAN),
-            (SessionRunStatus::WaitingPermission, AMBER),
-            (SessionRunStatus::WaitingInput, AMBER),
-            (SessionRunStatus::Interrupted, AMBER),
-            (SessionRunStatus::Failed, RED),
-            (SessionRunStatus::Completed, GREEN),
+            (SessionTurnStatus::Queued, CYAN),
+            (SessionTurnStatus::Running, CYAN),
+            (SessionTurnStatus::Cancelling, CYAN),
+            (SessionTurnStatus::WaitingPermission, AMBER),
+            (SessionTurnStatus::WaitingInput, AMBER),
+            (SessionTurnStatus::Interrupted, AMBER),
+            (SessionTurnStatus::Failed, RED),
+            (SessionTurnStatus::Completed, GREEN),
         ] {
             let model = run_status_model(status);
             let buffer = rendered_buffer(&model, 120, 40);
@@ -9117,10 +9123,10 @@ mod tests {
 
         let mut waiting = snapshot(SessionLifecycle::WaitingInput);
         waiting.pending = Some(SessionPendingRequest::Input {
-            run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             request_id: "input-matrix".into(),
             prompt: "value?".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         model.sessions = vec![waiting];
         model.input.clear();
@@ -9360,17 +9366,17 @@ mod tests {
         assert_eq!(composer_text_layout("1234", 4).caret_row, 1);
 
         for (status, label) in [
-            (SessionRunStatus::Queued, "Queued"),
-            (SessionRunStatus::Running, "Running"),
-            (SessionRunStatus::Cancelling, "Cancelling"),
-            (SessionRunStatus::WaitingPermission, "Waiting permission"),
-            (SessionRunStatus::WaitingInput, "Waiting input"),
-            (SessionRunStatus::Interrupted, "Interrupted"),
-            (SessionRunStatus::Failed, "Failed"),
-            (SessionRunStatus::Completed, "Completed"),
+            (SessionTurnStatus::Queued, "Queued"),
+            (SessionTurnStatus::Running, "Running"),
+            (SessionTurnStatus::Cancelling, "Cancelling"),
+            (SessionTurnStatus::WaitingPermission, "Waiting permission"),
+            (SessionTurnStatus::WaitingInput, "Waiting input"),
+            (SessionTurnStatus::Interrupted, "Interrupted"),
+            (SessionTurnStatus::Failed, "Failed"),
+            (SessionTurnStatus::Completed, "Completed"),
         ] {
-            assert_eq!(run_status_label(status), label);
-            let _ = run_status_color(status);
+            assert_eq!(turn_status_label(status), label);
+            let _ = turn_status_color(status);
         }
         for lifecycle in [
             SessionLifecycle::Ready,
@@ -9406,7 +9412,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn permission_progress_visual_state_and_tiny_rendering_matrix_remains_secret_safe() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         for (name, input, operation, target) in [
             (
                 "write_file",
@@ -9456,7 +9462,7 @@ mod tests {
             session.transcript.entries.push(transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "operation",
                 Some(serde_json::json!({"descriptor":{
@@ -9475,18 +9481,18 @@ mod tests {
         }
 
         for progress in [
-            SessionTransientProgress::ProviderAttempt { run_id, number: 3 },
+            SessionTransientProgress::ProviderAttempt { turn_id, number: 3 },
             SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "answer".into(),
             },
             SessionTransientProgress::ToolProgress {
-                run_id,
+                turn_id,
                 name: "read_file".into(),
                 detail: "reading".into(),
             },
         ] {
-            assert_eq!(progress_run_id(&progress), run_id);
+            assert_eq!(progress_turn_id(&progress), turn_id);
             assert!(progress_text(&progress).starts_with('…'));
         }
 
@@ -9517,7 +9523,7 @@ mod tests {
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "done",
             None,
@@ -9612,10 +9618,10 @@ mod tests {
         assert!(evidence.contains("· cargo clippy · blocked"));
 
         lines.clear();
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         render_progress(
             &mut lines,
-            &SessionTransientProgress::ProviderAttempt { run_id, number: 2 },
+            &SessionTransientProgress::ProviderAttempt { turn_id, number: 2 },
         );
         assert!(lines_text(&lines).contains("provider attempt 2"));
         assert_eq!(surface_line("x", 4, TERMINAL, None).spans[0].content, " ");
@@ -9690,13 +9696,13 @@ mod tests {
         ));
         assert!(rendered(&reconciliation, 120, 40).contains("Ctrl+A confirm failed"));
 
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut waiting = snapshot(SessionLifecycle::WaitingInput);
         waiting.pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "input-prompt".into(),
             prompt: "enter the durable value".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let input_model = SessionUiModel {
             startup: Some(test_startup()),
@@ -9738,18 +9744,18 @@ mod tests {
 
     fn permission_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "permission-matrix".into(),
             description: "Edit src/lib.rs".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Edit src/lib.rs",
             Some(serde_json::json!({
@@ -9791,22 +9797,22 @@ mod tests {
 
     fn complete_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
-        session.latest_run_id = Some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "The requested repository change is complete.",
             Some(serde_json::json!({
@@ -9835,23 +9841,23 @@ mod tests {
         }
     }
 
-    fn run_status_model(status: SessionRunStatus) -> SessionUiModel {
+    fn run_status_model(status: SessionTurnStatus) -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Running);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
             status,
-            run_revision: 2,
-            completed_at_ms: (status == SessionRunStatus::Completed).then_some(2),
+            turn_revision: 2,
+            completed_at_ms: (status == SessionTurnStatus::Completed).then_some(2),
             failure_code: None,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Inspect the repository",
             Some(serde_json::json!({
@@ -9866,31 +9872,31 @@ mod tests {
 
     fn activity_model(state: ActivityState) -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lifecycle = if state == ActivityState::Waiting {
             SessionLifecycle::WaitingPermission
         } else {
             SessionLifecycle::Running
         };
         let mut session = snapshot(lifecycle);
-        session.active_run_id = (state != ActivityState::Recorded).then_some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.active_turn_id = (state != ActivityState::Recorded).then_some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
             status: if state == ActivityState::Waiting {
-                SessionRunStatus::WaitingPermission
+                SessionTurnStatus::WaitingPermission
             } else {
-                SessionRunStatus::Running
+                SessionTurnStatus::Running
             },
-            run_revision: 2,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Inspect the repository",
             Some(serde_json::json!({
@@ -9901,7 +9907,7 @@ mod tests {
             session.transcript.entries.push(transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 if state == ActivityState::Failed {
                     "Inspection failed"
@@ -9986,16 +9992,16 @@ mod tests {
 
     fn working_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Running);
-        session.active_run_id = Some(run_id);
-        session.latest_run_id = Some(run_id);
-        session.runs.push(latte_core::SessionRunSummary {
-            run_id,
-            parent_run_id: None,
+        session.active_turn_id = Some(turn_id);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: SessionRunStatus::Running,
-            run_revision: 2,
+            status: SessionTurnStatus::Running,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
@@ -10003,7 +10009,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "Fix the composer input path.",
                 None,
@@ -10011,7 +10017,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "Search reducer input handling",
                 Some(serde_json::json!({
@@ -10025,7 +10031,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "Located the reducer.",
                 Some(serde_json::json!({"tool_call_id": "call-search"})),
@@ -10043,7 +10049,7 @@ mod tests {
     fn transcript_entry(
         ids: &SystemIdSource,
         sequence: u64,
-        run_id: Option<RunId>,
+        turn_id: Option<TurnId>,
         kind: TranscriptKind,
         text: &str,
         payload: Option<serde_json::Value>,
@@ -10051,7 +10057,7 @@ mod tests {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence,
-            run_id,
+            turn_id,
             kind,
             text: text.into(),
             payload,
@@ -10136,13 +10142,13 @@ mod tests {
     #[test]
     fn frame_rendered_without_a_permission_request_leaves_no_rendered_request() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingInput);
         session.pending = Some(SessionPendingRequest::Input {
-            run_id,
+            turn_id,
             request_id: "request-1".into(),
             prompt: "answer".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         let mut model = SessionUiModel {
             sessions: vec![session],
@@ -10295,29 +10301,29 @@ mod tests {
         };
         let ids = SystemIdSource::default();
         for _ in 0..64 {
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
             record_progress(
                 &mut model,
-                SessionTransientProgress::ProviderAttempt { run_id, number: 1 },
+                SessionTransientProgress::ProviderAttempt { turn_id, number: 1 },
             );
         }
         assert_eq!(model.progress.len(), 64);
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         record_progress(
             &mut model,
             SessionTransientProgress::AssistantDelta {
-                run_id,
+                turn_id,
                 text: "overflow".into(),
             },
         );
         record_progress(
             &mut model,
-            SessionTransientProgress::ProviderAttempt { run_id, number: 2 },
+            SessionTransientProgress::ProviderAttempt { turn_id, number: 2 },
         );
         record_progress(
             &mut model,
             SessionTransientProgress::ToolProgress {
-                run_id,
+                turn_id,
                 name: "tool".into(),
                 detail: "complete".into(),
             },
@@ -10362,7 +10368,7 @@ mod tests {
     fn stranded_follow_up_is_restored_after_snapshot() {
         let _ids = SystemIdSource::default();
         let mut session = snapshot(SessionLifecycle::Running);
-        session.active_run_id = None;
+        session.active_turn_id = None;
         let mut model = SessionUiModel {
             sessions: Vec::new(),
             active_conversation: Some(ActiveConversation::Session(session.session_id)),
@@ -10388,7 +10394,7 @@ mod tests {
             pending_input_submission: Some(PendingInputSubmission {
                 submission_id: 1,
                 session_id: SessionId::from_uuid(ids.next_uuid_v7()),
-                run_id: RunId::from_uuid(ids.next_uuid_v7()),
+                turn_id: TurnId::from_uuid(ids.next_uuid_v7()),
                 request_id: "request-1".into(),
                 value: "answer".into(),
                 after_sequence: 0,
@@ -10410,14 +10416,14 @@ mod tests {
     #[test]
     fn projection_falls_back_for_tool_names_and_skips_empty_text() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
-        session.active_run_id = Some(run_id);
+        session.active_turn_id = Some(turn_id);
         session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "named",
                 Some(serde_json::json!({"name": "custom_tool"})),
@@ -10425,12 +10431,12 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "anonymous",
                 None,
             ),
-            transcript_entry(&ids, 3, Some(run_id), TranscriptKind::User, "", None),
+            transcript_entry(&ids, 3, Some(turn_id), TranscriptKind::User, "", None),
         ];
         let groups = project_transcript(&session);
         assert_eq!(groups.len(), 1);
@@ -10559,18 +10565,18 @@ mod tests {
     #[test]
     fn permission_presentation_falls_back_without_a_tool_descriptor() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "effect-1".into(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "tool",
             None,
@@ -10713,16 +10719,16 @@ mod tests {
     #[test]
     fn frame_rendered_tracks_permission_requests_and_handles_missing_pending() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let request_id = "request-1".to_owned();
 
         // Permission pending is recorded.
         let mut permission_session = snapshot(SessionLifecycle::WaitingPermission);
         permission_session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: request_id.clone(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         let mut model = SessionUiModel {
             sessions: vec![permission_session],
@@ -10746,13 +10752,13 @@ mod tests {
     #[test]
     fn multiple_actions_branch_with_tee_and_ell() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
         session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "first",
                 Some(serde_json::json!({"name": "first_tool"})),
@@ -10760,7 +10766,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "second",
                 Some(serde_json::json!({"name": "second_tool"})),
@@ -10779,13 +10785,13 @@ mod tests {
     #[test]
     fn expanded_failed_result_renders_in_red() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
         session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "call",
                 Some(serde_json::json!({
@@ -10795,7 +10801,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "it failed",
                 Some(serde_json::json!({"tool_call_id": "call-1", "error": "denied"})),
@@ -10822,11 +10828,11 @@ mod tests {
     fn progress_for_other_runs_is_skipped() {
         let ids = SystemIdSource::default();
         let mut model = working_model();
-        let other_run = RunId::from_uuid(ids.next_uuid_v7());
+        let other_turn = TurnId::from_uuid(ids.next_uuid_v7());
         model
             .progress
             .push(SessionTransientProgress::AssistantDelta {
-                run_id: other_run,
+                turn_id: other_turn,
                 text: "unrelated".into(),
             });
         // Rendering must not panic and the unrelated progress is skipped.
@@ -10836,12 +10842,12 @@ mod tests {
     #[test]
     fn completion_handoff_with_files_but_no_evidence_renders() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::Ready);
         session.transcript.entries = vec![transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "done",
             Some(serde_json::json!({
@@ -10864,18 +10870,18 @@ mod tests {
     #[test]
     fn permission_presentation_falls_back_when_descriptor_is_absent() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let mut session = snapshot(SessionLifecycle::WaitingPermission);
         session.pending = Some(SessionPendingRequest::Permission {
-            run_id,
+            turn_id,
             request_id: "effect-1".into(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "tool",
             Some(serde_json::json!({})),

@@ -140,7 +140,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         .await
         .unwrap();
     assert_eq!(followed.lifecycle, SessionLifecycle::Ready);
-    assert_eq!(followed.runs.len(), 2);
+    assert_eq!(followed.turns.len(), 2);
 
     assert!(matches!(
         service
@@ -269,21 +269,21 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
         latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
     };
-    let run_revision = waiting
-        .active_run_id
-        .and_then(|run_id| {
+    let turn_revision = waiting
+        .active_turn_id
+        .and_then(|turn_id| {
             waiting
-                .runs
+                .turns
                 .iter()
-                .find(|r| r.run_id == run_id)
-                .map(|r| r.run_revision)
+                .find(|r| r.turn_id == turn_id)
+                .map(|r| r.turn_revision)
         })
         .unwrap_or(0);
     let failed_verification = no_verification
         .resolve_permission(
             waiting.session_id,
             waiting.revision,
-            run_revision,
+            turn_revision,
             request_id,
             true,
         )

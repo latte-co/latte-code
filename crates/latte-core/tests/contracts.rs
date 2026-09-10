@@ -1,11 +1,11 @@
 use latte_core::*;
 use uuid::Uuid;
 
-fn id() -> RunId {
-    RunId::from_uuid(Uuid::nil())
+fn id() -> TurnId {
+    TurnId::from_uuid(Uuid::nil())
 }
-fn failure(retryability: Retryability) -> RunFailure {
-    RunFailure {
+fn failure(retryability: Retryability) -> TurnFailure {
+    TurnFailure {
         code: FailureCode::RuntimeFailed,
         message: "crash".into(),
         retryability,
@@ -34,10 +34,10 @@ fn handoff_with(status: VerificationStatus) -> Handoff {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn transition_table_covers_lifecycle_and_revision_guards() {
-    let queued = RunState::queued(id());
+    let queued = TurnState::queued(id());
     assert_eq!(
         queued.transition(0, Transition::Cancel).unwrap().status,
-        RunStatus::Cancelling
+        TurnStatus::Cancelling
     );
     assert!(matches!(
         queued.transition(1, Transition::Start),
@@ -54,7 +54,7 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
             }),
         )
         .unwrap();
-    assert_eq!(permission.status, RunStatus::WaitingPermission);
+    assert_eq!(permission.status, TurnStatus::WaitingPermission);
     assert_eq!(
         permission.transition(
             2,
@@ -104,11 +104,11 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
             )
             .unwrap()
             .status,
-        RunStatus::Running
+        TurnStatus::Running
     );
     assert_eq!(
         input.transition(2, Transition::Cancel).unwrap().status,
-        RunStatus::Cancelling
+        TurnStatus::Cancelling
     );
     assert_eq!(
         running
@@ -117,7 +117,7 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
             .transition(2, Transition::Interrupt)
             .unwrap()
             .status,
-        RunStatus::Interrupted
+        TurnStatus::Interrupted
     );
     let cancelling = running.transition(1, Transition::Cancel).unwrap();
     assert_eq!(
@@ -125,7 +125,7 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
             .transition(2, Transition::Fail(failure(Retryability::Terminal)))
             .unwrap()
             .status,
-        RunStatus::Failed
+        TurnStatus::Failed
     );
 
     let crashed = running
@@ -133,7 +133,7 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
         .unwrap();
     assert_eq!(
         crashed.transition(2, Transition::Resume).unwrap().status,
-        RunStatus::Queued
+        TurnStatus::Queued
     );
     let terminal = running
         .transition(1, Transition::Fail(failure(Retryability::Terminal)))
@@ -160,26 +160,26 @@ fn transition_table_covers_lifecycle_and_revision_guards() {
 #[test]
 fn every_status_has_expected_legal_or_rejected_transitions() {
     let states = [
-        RunStatus::Queued,
-        RunStatus::Running,
-        RunStatus::WaitingPermission,
-        RunStatus::WaitingInput,
-        RunStatus::Cancelling,
-        RunStatus::Interrupted,
-        RunStatus::Failed,
-        RunStatus::Completed,
+        TurnStatus::Queued,
+        TurnStatus::Running,
+        TurnStatus::WaitingPermission,
+        TurnStatus::WaitingInput,
+        TurnStatus::Cancelling,
+        TurnStatus::Interrupted,
+        TurnStatus::Failed,
+        TurnStatus::Completed,
     ];
     for status in states {
-        let mut state = RunState::queued(id());
+        let mut state = TurnState::queued(id());
         state.status = status;
         let result = state.transition(0, Transition::Start);
-        assert_eq!(result.is_ok(), status == RunStatus::Queued);
+        assert_eq!(result.is_ok(), status == TurnStatus::Queued);
     }
 }
 
 #[test]
 fn completion_policy_prevents_false_success() {
-    let running = RunState::queued(id())
+    let running = TurnState::queued(id())
         .transition(0, Transition::Start)
         .unwrap();
 
@@ -192,7 +192,7 @@ fn completion_policy_prevents_false_success() {
             },
         )
         .unwrap();
-    assert_eq!(passed.status, RunStatus::Completed);
+    assert_eq!(passed.status, TurnStatus::Completed);
 
     for handoff in [
         handoff_with(VerificationStatus::Failed),
@@ -208,7 +208,7 @@ fn completion_policy_prevents_false_success() {
                 },
             )
             .unwrap();
-        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.status, TurnStatus::Failed);
         assert_eq!(failed.revision, 2);
         assert_eq!(
             failed.failure.unwrap().code,
@@ -225,7 +225,7 @@ fn completion_policy_prevents_false_success() {
             },
         )
         .unwrap();
-    assert_eq!(unverified.status, RunStatus::Completed);
+    assert_eq!(unverified.status, TurnStatus::Completed);
     assert!(matches!(
         unverified.transition(2, Transition::Cancel),
         Err(TransitionError::CompletedImmutable)
@@ -248,15 +248,15 @@ fn protocol_json_is_exact() {
     let event = EventEnvelope {
         protocol_version: PROTOCOL_VERSION,
         event_id: EventId::from_uuid(Uuid::nil()),
-        run_id: id(),
+        turn_id: id(),
         revision: 3,
         event: RuntimeEvent::StateChanged {
-            status: RunStatus::Running,
+            status: TurnStatus::Running,
         },
     };
     assert_eq!(
         serde_json::to_string(&event).unwrap(),
-        r#"{"protocol_version":1,"event_id":"00000000-0000-0000-0000-000000000000","run_id":"00000000-0000-0000-0000-000000000000","revision":3,"event":{"type":"state_changed","status":"running"}}"#
+        r#"{"protocol_version":1,"event_id":"00000000-0000-0000-0000-000000000000","turn_id":"00000000-0000-0000-0000-000000000000","revision":3,"event":{"type":"state_changed","status":"running"}}"#
     );
     assert_eq!(
         serde_json::from_str::<EventEnvelope>(&serde_json::to_string(&event).unwrap()).unwrap(),
@@ -265,15 +265,22 @@ fn protocol_json_is_exact() {
 
     let read_model = ReadModelEnvelope {
         protocol_version: PROTOCOL_VERSION,
-        run: RunState::queued(id()),
+        turn: TurnState::queued(id()),
     };
     assert_eq!(
         serde_json::to_string(&read_model).unwrap(),
-        r#"{"protocol_version":1,"run":{"run_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}}"#
+        r#"{"protocol_version":1,"turn":{"turn_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}}"#
     );
     assert_eq!(
         serde_json::from_str::<ReadModelEnvelope>(&serde_json::to_string(&read_model).unwrap())
             .unwrap(),
+        read_model
+    );
+    // Read-only compatibility: a pre-schema-15 payload keyed "run" with
+    // "run_id" must still deserialize into the renamed types.
+    let legacy_json = r#"{"protocol_version":1,"run":{"run_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}}"#;
+    assert_eq!(
+        serde_json::from_str::<ReadModelEnvelope>(legacy_json).unwrap(),
         read_model
     );
 }

@@ -177,7 +177,7 @@ Windows 已支持任意外部进程执行。
 - [x] Engine 事务性事件、Session event stream、snapshot reload 与有界 transient progress。
 - [x] 持久化的 Run/Effect/permission/checkpoint/verification 控制信息。
 - [ ] 以 JSONL Conversation 为权威的离线回放；回放不调用 Provider 或执行 Effect。
-- [ ] 可查询的 Session/Run/Effect 时间线、结构化诊断与脱敏审计导出。
+- [ ] 可查询的 Session/Turn/Effect 时间线、结构化诊断与脱敏审计导出。
 - [ ] 按 Provider、模型、任务、工具与上下文归因的 token/成本/延迟使用报告。
 - [ ] opt-in 遥测、隐私边界、崩溃报告与运行指标。
 - [ ] 事件保留、分页、版本演进与迁移策略。
@@ -192,7 +192,7 @@ Windows 已支持任意外部进程执行。
 - [ ] 可安装 Plugin/Skill 的发现、版本、签名、依赖、生命周期与可撤销权限。
 - [ ] Hook/automation 的声明式生命周期事件、输入输出 schema、超时和失败策略；
   不为 Hook 绕开 Engine 的权限、sandbox 或审计。
-- [ ] 受限 delegated child Run：预算、deadline、tool allowlist、取消和结果摘要。
+- [ ] 受限 delegated child Turn：预算、deadline、tool allowlist、取消和结果摘要。
 - [ ] 多 Agent 的 parent/child 可视化、批准隔离、资源治理与恢复。
 - [ ] Agent 间消息、任务分配、共享受限上下文与用户可见的协作记录。
 

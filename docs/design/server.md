@@ -107,7 +107,7 @@ Response: 200 { "snapshot": {...} }
 **取消**
 ```
 POST /v1/sessions/{id}/cancel
-Body: { "expected_session_revision": 42, "expected_run_revision": 10 }
+Body: { "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
@@ -121,14 +121,14 @@ Response: 202 { "position": 0 }
 **解析权限请求**
 ```
 POST /v1/sessions/{id}/permissions/{request_id}
-Body: { "allow": true, "expected_session_revision": 42, "expected_run_revision": 10 }
+Body: { "allow": true, "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
 **提供输入**
 ```
 POST /v1/sessions/{id}/input
-Body: { "request_id": "...", "value": "...", "expected_session_revision": 42, "expected_run_revision": 10 }
+Body: { "request_id": "...", "value": "...", "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
@@ -170,7 +170,7 @@ event: session_changed
 data: {"session_id": "...", "revision": 42}
 
 event: progress
-data: {"session_id": "...", "run_id": "...", "progress": {...}}
+data: {"session_id": "...", "turn_id": "...", "progress": {...}}
 
 event: resync_required
 data: {}
@@ -269,7 +269,7 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 - [x] 所有 session 端点（create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile）
 - [x] 异步 create/follow-up：持久化 + 注册后返回 202，turn 后台执行，通过 SSE 观察完成
 - [x] `Idempotency-Key` 持久化变更去重，按 `(token, key)` 索引
-- [x] 版本栅栏：cancel/permission/input 校验 session 和 run 版本，不匹配时返回 409 + 当前版本
+- [x] 版本栅栏：cancel/permission/input 校验 session 和 turn 版本，不匹配时返回 409 + 当前版本
 - [x] list/search/get 返回 workspace engine 的真实持久化快照
 - [x] Server 模式接入 `latte-code` 二进制（`latte-code serve [--port N]`），0600 token 文件，优雅关闭
 - [x] 单元测试和最终二进制 E2E（portable），覆盖 HTTP 接口和 session 生命周期
