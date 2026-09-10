@@ -834,6 +834,605 @@ fn final_binary_stops_a_turn_that_never_stops_calling_tools() {
     );
 }
 
+/// The round budget is per-turn. A completed earlier turn that spent the whole
+/// budget must not leave the next turn with zero rounds: after a follow-up
+/// enters a permission gate, approving it must resume against that turn's own
+/// budget, not the cumulative count over the whole Session.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_round_budget_does_not_accumulate_across_turns() {
+    let scenario = Scenario::new();
+    // Budget is 3 tool rounds. Turn 1 exhausts it: 3 ungated tool calls, then
+    // the turn stops retryable (Session returns to ready, the work stays
+    // durable). Turn 2 then asks for a gated write on its first round. If the
+    // round count were cumulative over the whole Session, the approval
+    // recovery would measure turn 1's 3 rounds and refuse turn 2 outright;
+    // measured per-turn, turn 2 resumes at its own round 0 and completes.
+    let mut replies = vec![
+        ProviderReply::tool_call(
+            "t1-round-0",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        ProviderReply::tool_call(
+            "t1-round-1",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        ProviderReply::tool_call(
+            "t1-round-2",
+            "list_directory",
+            &serde_json::json!({"path":"."}),
+        ),
+        ProviderReply::tool_call(
+            "t2-gated",
+            "write_file",
+            &serde_json::json!({"path":"a.txt","content":"x\n","create_intent":true}),
+        ),
+        ProviderReply::completion("turn two done"),
+    ];
+    for i in 0..12 {
+        replies.push(ProviderReply::tool_call(
+            &format!("extra-{i}"),
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ));
+    }
+    let provider = ScriptedProvider::start(replies);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:3}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(&workspace_id, "turn one", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Wait for turn 1 to settle ready (it completes).
+    let mut turn1_revision = None;
+    for _ in 0..600 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            turn1_revision = body["snapshot"]["revision"].as_u64();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let revision = turn1_revision.expect("turn one never settled ready");
+
+    // Turn 2: a follow-up that hits the permission gate on its first round.
+    let command = "01900000-0000-7000-8000-000000000021";
+    let (fu, fu_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": command,
+            "prompt": "turn two",
+            "expected_session_revision": revision
+        })),
+        &[("Idempotency-Key", command)],
+    );
+    assert_eq!(fu, 202, "follow-up returned {fu_body:?}");
+
+    // Approve the gate, then let turn 2 settle. A budget wrongly accumulated
+    // over turn 1 would fail turn 2; it must instead complete.
+    let mut settled = None;
+    for _ in 0..600 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status != 200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        match body["snapshot"]["lifecycle"].as_str() {
+            Some("ready") => {
+                settled = Some(body);
+                break;
+            }
+            Some("failed") => {
+                panic!(
+                    "turn two failed (round budget leaked across turns): {}",
+                    body["snapshot"]["transcript"]["entries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e["kind"] == "failure")
+                        .filter_map(|e| e["text"].as_str())
+                        .next_back()
+                        .unwrap_or("")
+                );
+            }
+            Some("waiting_permission") => {
+                let pending = &body["snapshot"]["pending"];
+                server.request(
+                    "POST",
+                    &format!(
+                        "/v1/sessions/{session_id}/permissions/{}",
+                        pending["request_id"].as_str().unwrap()
+                    ),
+                    Some(&server.token),
+                    Some(&serde_json::json!({
+                        "allow": true,
+                        "expected_session_revision": body["snapshot"]["revision"],
+                        "expected_run_revision": pending["expected_run_revision"],
+                    })),
+                    &[],
+                );
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let settled = settled.expect("turn two never settled");
+    // Turn 2 completed successfully.
+    // Runs are ordered by ordinal; the last is turn 2. Turn 1 stays failed
+    // (it exhausted the budget) while turn 2 completed with a fresh budget.
+    let runs = settled["snapshot"]["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["status"], "failed", "turn one exhausted the budget");
+    assert_eq!(
+        runs[1]["status"], "completed",
+        "turn two must complete with its own fresh budget, not inherit turn one's"
+    );
+}
+
+//
+// Schema 13 (Thread→Session rename) upgrade compatibility.
+//
+// These tests build a fully-migrated v13 database with the current binary,
+// reverse migration 13 to recreate the pre-upgrade v12 shape, rewrite the
+// affected durable rows to the bytes a pre-rename binary would have written,
+// then start a fresh binary that migrates v12→v13 and prove the upgrade does
+// not break (a) idempotent replay of a pre-upgrade durable accept or (b)
+// approval of a pre-upgrade waiting verification effect.
+//
+
+/// Rewinds a v13 database to the pre-rename v12 shape and applies extra
+/// fixture SQL (also run with foreign keys off) before restarting the binary,
+/// which re-runs migration 13.
+fn downgrade_to_v12(db: &std::path::Path, extra_sql: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA foreign_keys=OFF;\n{}\nPRAGMA user_version=12;\n{}",
+        super::support::REVERSE_SCHEMA_13_SQL,
+        extra_sql
+    ))
+    .unwrap();
+}
+
+/// Polls a session until it reaches `ready`, returning the settled body.
+/// Panics (with the failure card) if the turn instead settles `failed`, or if
+/// it never settles within the bounded window.
+fn wait_session_ready(server: &ServeChild, sid: &str) -> serde_json::Value {
+    for _ in 0..600 {
+        let (st, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{sid}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if st == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            return body;
+        }
+        assert!(
+            !(st == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed")),
+            "pre-upgrade turn failed: {body:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("session {sid} never settled ready");
+}
+
+/// Requests durably accepted before the Thread→Session rename store the old
+/// `thread.*` idempotency digests (`thread.start` / `thread.follow_up`) and a
+/// snapshot whose id field is `thread_id`. After upgrading to v13, retrying the
+/// same `command_id`s must replay the original acceptances (HTTP 200) instead
+/// of failing with `idempotency_mismatch` or a deserialization error — for both
+/// the initial session create and a later follow-up turn.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn done"),
+        ProviderReply::completion("second turn done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
+            verification = verification_fragment(),
+        ),
+    )
+    .unwrap();
+    let root = scenario.root().canonicalize().unwrap();
+    let root_str = root.to_string_lossy().into_owned();
+    let binding_value = server_binding(&scenario);
+    let binding: latte_core::SessionProviderBinding =
+        serde_json::from_value(binding_value.clone()).unwrap();
+
+    // Stable, client-generated identities so the post-upgrade retries are byte
+    // identical to the pre-upgrade accepts.
+    let session_id = "01900000-0000-7000-8000-0000000000b1";
+    let create_command = "01900000-0000-7000-8000-0000000000b2";
+    let follow_command = "01900000-0000-7000-8000-0000000000b3";
+    let create_prompt = "replay me after upgrade";
+    let follow_prompt = "replay the follow-up too";
+
+    // --- Current binary: create the session (v13 layout), then a follow-up. ---
+    let follow_revision;
+    {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root_str })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let create_body = serde_json::json!({
+            "session_id": session_id,
+            "command_id": create_command,
+            "prompt": create_prompt,
+            "binding": binding_value,
+        });
+        let (status, body) = server.request(
+            "POST",
+            &format!("/v1/workspaces/{workspace_id}/sessions"),
+            Some(&server.token),
+            Some(&create_body),
+            &[("Idempotency-Key", create_command)],
+        );
+        assert_eq!(status, 202, "fresh create returned {body:?}");
+        let sid = body["session_id"].as_str().unwrap().to_string();
+        let settled = wait_session_ready(&server, &sid);
+        follow_revision = settled["snapshot"]["revision"].as_u64().unwrap();
+
+        // Durable follow-up accept (its dedup row uses `thread.follow_up`).
+        let (fu_status, fu_body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{sid}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": follow_command,
+                "prompt": follow_prompt,
+                "expected_session_revision": follow_revision
+            })),
+            &[("Idempotency-Key", follow_command)],
+        );
+        assert_eq!(fu_status, 202, "fresh follow-up returned {fu_body:?}");
+        wait_session_ready(&server, &sid);
+    }
+
+    // --- Rewind to the v12 shape and rewrite BOTH durable accepts to the exact
+    // bytes a pre-rename binary wrote: the `thread.start` / `thread.follow_up`
+    // digest namespaces and the `thread_id` snapshot field. ---
+    let sid_uuid = latte_core::SessionId::from_uuid(uuid::Uuid::parse_str(session_id).unwrap());
+    let legacy_create_digest = latte_engine::legacy_create_command_digest(
+        sid_uuid,
+        &root_str,
+        create_prompt,
+        &binding,
+        None,
+    );
+    // The follow-up accept fenced on the settled post-create revision; its
+    // stored expected revision is the pre-follow-up one.
+    let legacy_follow_digest =
+        latte_engine::legacy_follow_up_command_digest(sid_uuid, follow_revision, follow_prompt);
+    let q = |value: &str| value.replace('\'', "''");
+    downgrade_to_v12(
+        &scenario.database_path(),
+        &format!(
+            "UPDATE thread_command_dedup_v2 \
+             SET digest = '{cd}', \
+                 result_json = REPLACE(result_json, '\"session_id\"', '\"thread_id\"') \
+             WHERE command_id = '{cid}'; \
+             UPDATE thread_command_dedup_v2 \
+             SET digest = '{fd}', \
+                 result_json = REPLACE(result_json, '\"session_id\"', '\"thread_id\"') \
+             WHERE command_id = '{fid}';",
+            cd = q(&legacy_create_digest),
+            cid = q(create_command),
+            fd = q(&legacy_follow_digest),
+            fid = q(follow_command),
+        ),
+    );
+
+    // --- Upgraded binary (runs migration 13 on open): retry the SAME create and
+    // follow-up. Each must replay (HTTP 200) rather than fail idempotency. ---
+    let server = ServeChild::start(&scenario);
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root_str })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let retry_body = serde_json::json!({
+        "session_id": session_id,
+        "command_id": create_command,
+        "prompt": create_prompt,
+        "binding": binding_value,
+    });
+    let (status, body) = server.request(
+        "POST",
+        &format!("/v1/workspaces/{workspace_id}/sessions"),
+        Some(&server.token),
+        Some(&retry_body),
+        &[("Idempotency-Key", create_command)],
+    );
+    assert_eq!(
+        status, 200,
+        "pre-upgrade durable create must replay after schema 13, got {body:?}"
+    );
+    assert_eq!(
+        body["session_id"].as_str(),
+        Some(session_id),
+        "replay must return the original session: {body:?}"
+    );
+
+    // The follow-up replay fences on the same pre-turn revision the original
+    // accept used; the durable lookup runs before the revision fence, so it
+    // replays the post-turn snapshot even though the live revision has advanced.
+    let (fu_status, fu_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": follow_command,
+            "prompt": follow_prompt,
+            "expected_session_revision": follow_revision
+        })),
+        &[("Idempotency-Key", follow_command)],
+    );
+    assert_eq!(
+        fu_status, 200,
+        "pre-upgrade durable follow-up must replay after schema 13, got {fu_body:?}"
+    );
+    assert!(
+        fu_body["accepted_revision"].as_u64().is_some(),
+        "follow-up replay must return the durable accepted revision: {fu_body:?}"
+    );
+}
+
+/// A verification effect left `waiting_permission` by a pre-rename binary
+/// carries a `thread-verification:` effect id. After upgrading to v13 the code
+/// only mints `session-verification:`, so approving the persisted gate must
+/// still be routed as a verification continuation (not a normal provider tool
+/// call, which would fail because the engine-owned verification id is not a
+/// model tool call). The approved verification runs and the turn completes.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
+    let scenario = Scenario::new();
+    // Round 1: the model changes a file (write_file is gated). After that
+    // approval it returns a completion; changed files then trigger the
+    // configured `true` verification, which is itself gated (process policy is
+    // Ask) — that is the boundary at which we park before the upgrade.
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "pre-upgrade-write",
+            "write_file",
+            &serde_json::json!({"path":"a.txt","content":"x\n","create_intent":true}),
+        ),
+        ProviderReply::completion("changed files, now verify"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let root = scenario
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| scenario.root().to_path_buf());
+    let root_str = root.to_string_lossy().into_owned();
+    let binding = server_binding(&scenario);
+
+    let session_id = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root_str })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (status, create_body) =
+            server.create_session(&workspace_id, "change then verify", &binding);
+        assert_eq!(status, 202, "create returned {create_body:?}");
+        let sid = create_body["session_id"].as_str().unwrap().to_string();
+
+        // Approve the write gate, then stop once the verification gate (an
+        // engine-owned `session-verification:` effect) is waiting.
+        let mut parked = false;
+        for _ in 0..600 {
+            let (st, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{sid}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if st != 200 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            match body["snapshot"]["lifecycle"].as_str() {
+                Some("waiting_permission") => {
+                    let request_id = body["snapshot"]["pending"]["request_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    if request_id.starts_with("session-verification:") {
+                        parked = true;
+                        break;
+                    }
+                    // The write_file gate: approve so the turn proceeds to
+                    // verification.
+                    let (allow_status, allow_body) = server.request(
+                        "POST",
+                        &format!("/v1/sessions/{sid}/permissions/{request_id}"),
+                        Some(&server.token),
+                        Some(&serde_json::json!({
+                            "allow": true,
+                            "expected_session_revision": body["snapshot"]["revision"],
+                            "expected_run_revision":
+                                body["snapshot"]["pending"]["expected_run_revision"],
+                        })),
+                        &[],
+                    );
+                    assert_eq!(allow_status, 200, "write approval failed: {allow_body:?}");
+                }
+                Some("ready" | "failed") => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            parked,
+            "the verification gate never became the waiting boundary"
+        );
+        sid
+    };
+
+    // --- Rewind to v12 and relabel the waiting verification effect to the
+    // pre-rename `thread-verification:` identity across every control table. ---
+    downgrade_to_v12(
+        &scenario.database_path(),
+        "UPDATE runs SET state_json = REPLACE(state_json,'session-verification:','thread-verification:') \
+         WHERE state_json LIKE '%session-verification:%'; \
+         UPDATE effects SET effect_id = REPLACE(effect_id,'session-verification:','thread-verification:'), \
+             descriptor_json = REPLACE(descriptor_json,'session-verification:','thread-verification:') \
+         WHERE effect_id LIKE 'session-verification:%'; \
+         UPDATE pending_permissions SET effect_id = REPLACE(effect_id,'session-verification:','thread-verification:') \
+         WHERE effect_id LIKE 'session-verification:%'; \
+         UPDATE thread_effect_canonical_v2 SET effect_id = REPLACE(effect_id,'session-verification:','thread-verification:'), \
+             descriptor_json = REPLACE(descriptor_json,'session-verification:','thread-verification:') \
+         WHERE effect_id LIKE 'session-verification:%';",
+    );
+
+    // --- Upgraded binary: the gate now carries the legacy prefix. Approve it;
+    // the verification must run (`true`) and the turn complete durably. ---
+    let server = ServeChild::start(&scenario);
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root_str })),
+        &[],
+    );
+    // Opening the workspace loads its runtime/session catalog in the upgraded
+    // process; the session is then reached through the global session routes.
+    let _workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+    let mut completed = None;
+    for _ in 0..600 {
+        let (st, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if st != 200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        match body["snapshot"]["lifecycle"].as_str() {
+            Some("waiting_permission") => {
+                let request_id = body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    request_id.starts_with("thread-verification:"),
+                    "the persisted gate must keep its pre-upgrade id: {request_id}"
+                );
+                let (allow_status, allow_body) = server.request(
+                    "POST",
+                    &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
+                    Some(&server.token),
+                    Some(&serde_json::json!({
+                        "allow": true,
+                        "expected_session_revision": body["snapshot"]["revision"],
+                        "expected_run_revision":
+                            body["snapshot"]["pending"]["expected_run_revision"],
+                    })),
+                    &[],
+                );
+                assert_eq!(
+                    allow_status, 200,
+                    "approving the legacy verification gate must be accepted: {allow_body:?}"
+                );
+            }
+            Some("ready") => {
+                completed = Some(body);
+                break;
+            }
+            Some("failed") => {
+                panic!(
+                    "turn failed after approving the pre-upgrade verification: {}",
+                    body["snapshot"]["transcript"]["entries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e["kind"] == "failure")
+                        .filter_map(|e| e["text"].as_str())
+                        .next_back()
+                        .unwrap_or("")
+                );
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let completed = completed.expect("the verified turn never completed after upgrade");
+    let runs = completed["snapshot"]["runs"].as_array().unwrap();
+    assert_eq!(
+        runs.last().and_then(|run| run["status"].as_str()),
+        Some("completed"),
+        "the turn must complete via the recognized verification effect: {completed:?}"
+    );
+}
+
 /// A permission approval re-enters the loop from a snapshot rather than from
 /// the in-memory counter. If the budget were recomputed from zero there, a
 /// model could take unlimited rounds simply by asking for one gated tool per

@@ -231,6 +231,10 @@ pub struct TranscriptPage {
 /// Authoritative read projection for a conversation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    // Read-compat for durable rows written before the Thread→Session rename
+    // (schema <13 serialized this as `thread_id`). Wire commands stay a hard
+    // break; this only deserializes persisted snapshots/results.
+    #[serde(alias = "thread_id")]
     pub session_id: SessionId,
     pub revision: u64,
     pub sequence: u64,
@@ -250,10 +254,15 @@ pub struct SessionSnapshot {
 /// Provider credentials and executable effect data are intentionally absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    #[serde(alias = "thread_id")]
     pub session_id: SessionId,
     pub title: String,
     pub workspace_root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "parent_thread_id"
+    )]
     pub parent_session_id: Option<SessionId>,
     pub lifecycle: SessionLifecycle,
     pub provider_name: String,
@@ -358,6 +367,7 @@ pub enum SessionCommand {
 pub struct SessionEventEnvelope {
     pub protocol_version: u16,
     pub event_id: SessionEventId,
+    #[serde(alias = "thread_id")]
     pub session_id: SessionId,
     pub revision: u64,
     pub sequence: u64,

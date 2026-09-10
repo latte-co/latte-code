@@ -1118,6 +1118,8 @@ impl Storage {
     ) -> Result<Option<SessionSnapshot>, StorageError> {
         let workspace_root = validate_workspace_root(workspace_root)?;
         let digest = create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let legacy_digest =
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1129,7 +1131,7 @@ impl Storage {
         let Some((stored_digest, result_json)) = row else {
             return Ok(None);
         };
-        if stored_digest != digest {
+        if stored_digest != digest && stored_digest != legacy_digest {
             return Err(StorageError::SessionCommandReplayMismatch);
         }
         let snapshot: SessionSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
@@ -1149,6 +1151,8 @@ impl Storage {
         prompt: &str,
     ) -> Result<Option<SessionSnapshot>, StorageError> {
         let digest = follow_up_command_digest(session_id, expected_session_revision, prompt);
+        let legacy_digest =
+            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1160,7 +1164,7 @@ impl Storage {
         let Some((stored_digest, result_json)) = row else {
             return Ok(None);
         };
-        if stored_digest != digest {
+        if stored_digest != digest && stored_digest != legacy_digest {
             return Err(StorageError::SessionCommandReplayMismatch);
         }
         let snapshot: SessionSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
@@ -1235,6 +1239,11 @@ impl Storage {
         // digests and fail with 422 idempotency_mismatch on replay.
         let command_digest =
             create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        // Pre-rename (schema <13) durable accepts stored the `thread.*` digest
+        // namespace; compute it from the same raw identity so an upgraded binary
+        // recognizes a pre-upgrade retry as a replay instead of a mismatch.
+        let legacy_command_digest =
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
         // Redacted text is used for all durable readable records (transcript,
         // title); the raw prompt is never persisted.
         let prompt = redact_session_text(prompt);
@@ -1273,7 +1282,7 @@ impl Storage {
                 )
                 .optional()?;
             if let Some((stored_digest, result_json)) = previous {
-                if stored_digest != command_digest {
+                if stored_digest != command_digest && stored_digest != legacy_command_digest {
                     return Err(StorageError::SessionCommandReplayMismatch);
                 }
                 let snapshot: SessionSnapshot =
@@ -1507,6 +1516,11 @@ impl Storage {
         // Durable idempotency digest binds the raw request identity.
         let follow_up_digest =
             follow_up_command_digest(session_id, expected_session_revision, prompt);
+        // Pre-rename (schema <13) follow-up accepts stored the
+        // `thread.follow_up` digest namespace; accept it on replay so an
+        // upgraded binary recognizes a pre-upgrade retry.
+        let legacy_follow_up_digest =
+            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt);
         // Redacted text is used for all durable readable records.
         let prompt = redact_session_text(prompt);
         if prompt.trim().is_empty() {
@@ -1543,7 +1557,7 @@ impl Storage {
                 )
                 .optional()?;
             if let Some((stored_digest, result_json)) = previous {
-                if stored_digest != follow_up_digest {
+                if stored_digest != follow_up_digest && stored_digest != legacy_follow_up_digest {
                     return Err(StorageError::SessionCommandReplayMismatch);
                 }
                 let snapshot: SessionSnapshot =
@@ -5588,6 +5602,64 @@ fn follow_up_command_digest(
         "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
         "session_id": session_id.to_string(),
         "expected_session_revision": expected_session_revision,
+        "prompt": prompt,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
+/// Legacy digest reproducing the exact bytes a pre-rename (schema <13) binary
+/// wrote for a session-create command. The binding serializes identically and
+/// the protocol version value is unchanged, so only the operation namespace and
+/// the id/revision key names differ. A durable accept made before the upgrade
+/// stores this digest; on replay we accept either form so a retried request is
+/// recognized as the same command instead of a false `idempotency_mismatch`.
+///
+/// Fixture-only: exposed so integration tests can reproduce a pre-rename
+/// durable-accept digest byte-for-byte; production replay never calls it.
+#[doc(hidden)]
+#[must_use]
+pub fn legacy_create_command_digest(
+    session_id: latte_core::SessionId,
+    workspace_root: &str,
+    prompt: &str,
+    binding: &SessionProviderBinding,
+    focus: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "thread.start",
+        "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
+        "workspace": workspace_root,
+        "thread_id": session_id.to_string(),
+        "prompt": prompt,
+        "binding": binding,
+        "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
+/// Legacy digest for a pre-rename follow-up command. See
+/// [`legacy_create_command_digest`] for why both forms are accepted on replay.
+/// Fixture-only; production replay never calls it directly.
+#[doc(hidden)]
+#[must_use]
+pub fn legacy_follow_up_command_digest(
+    session_id: latte_core::SessionId,
+    expected_session_revision: u64,
+    prompt: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "thread.follow_up",
+        "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
+        "thread_id": session_id.to_string(),
+        "expected_thread_revision": expected_session_revision,
         "prompt": prompt,
     });
     format!(

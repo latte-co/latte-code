@@ -1,7 +1,10 @@
 # Latte Code 概念体系对齐
 
-状态：**提案**。本文档定义 Latte Code 的规范概念层级与术语，并给出从现状到目标的
-改名映射与分批方案。它不改变任何已交付能力的行为边界。
+状态：**分批进行中**。本文档定义 Latte Code 的规范概念层级与术语，并给出改名映射
+与分批方案。批次 0（文档与死代码）与批次 1（`Thread → Session`，含 schema 13 迁移与
+升级兼容）**已落地**；批次 2（`Run → Turn`）仍被 v1 状态/事件退役阻塞，批次 3/4 待
+启动。各批次当前状态以第 5 节为准；已落地批次的权威是当前代码，本文档记录其决策与
+映射，剩余批次仍按本文提案执行。
 
 调查范围：`crates/` 全部六个 crate、`docs/` 全部设计文档、HTTP 契约与契约测试、
 CLI/TUI 用户可见文案。所有结论附 `file:line` 证据。
@@ -228,6 +231,24 @@ CLI `--json` 字段、配置键 `thread` → `session` 与模块文件名（`thr
 - legacy import 改写为读旧名（attach 的 `legacy_import.threads_v2` 等历史表）写新名
   （`main.sessions` 等）；版本门收紧为 `9..SCHEMA_VERSION`（不包含当前版本——当前
   schema 的库没有可导入的旧表）。
+- **升级重放兼容（破坏性改名的读侧补偿）**：schema 13 只改 DDL，但升级前已持久化的
+  幂等记录与权限边界按旧命名存数据，重试必须仍被识别为同一条命令、而不是误判
+  `idempotency_mismatch`：
+  - 幂等 digest：`session_command_dedup.digest` 里旧值用 `thread.start` /
+    `thread.follow_up` 命名空间和 `thread_id` / `expected_thread_revision` 键。
+    重放比对时同时接受新旧两种 digest（`legacy_{create,follow_up}_command_digest`
+    逐字节复现旧摘要；协议版本值与 binding 序列化均未变，仅操作命名与键名不同）。
+  - 结果快照：旧 `result_json` 的 id 字段是 `thread_id` / `parent_thread_id`；
+    `SessionSnapshot` / `SessionSummary` / `SessionEventEnvelope` 上加
+    `#[serde(alias = "thread_id")]` / `alias = "parent_thread_id"` 只读兼容反序列化，
+    线协议仍为硬 break。
+  - 验证 Effect：升级前停在 `waiting_permission` 的验证 effect id 是
+    `thread-verification:<run>`；审批识别改为同时接受
+    `session-verification:` 与 `thread-verification:` 前缀，否则旧验证会被误当成
+    普通 provider 工具续跑而失败。
+  - 由最终二进制 E2E 守护：真实构造 v13 库后反向到 v12，分别验证「升级前 durable
+    accept 后重试同 `command_id` 重放为 200」与「升级前等待中的 verification gate
+    升级后批准并完成」。
 
 **协议决策点（已定并执行）**：v1 端点承诺过稳定性
 （`versioned-rpc-contract.md` §2.1），字段改名属 breaking change，按该文档

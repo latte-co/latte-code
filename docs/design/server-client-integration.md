@@ -194,7 +194,7 @@ pub struct CreateSessionRequest {
 
 **竞态闭合路径**：当前 `start_one` 先 `acquire(session_id)` 再 engine create（`session.rs:304-316`）。crash 后立即重启时旧 lease 最长仍有效 60s，`acquire` 会先报 `EngineUnavailable`，根本进不到 durable dedup。必须固定为：
 
-1. **dedup lookup 先于 lease acquire**：engine create 入口先查 `thread_command_dedup_v2`（无 lease），命中 → 返回 `Replayed`（不 acquire、不启动 runner）
+1. **dedup lookup 先于 lease acquire**：engine create 入口先查 `session_command_dedup`（无 lease），命中 → 返回 `Replayed`（不 acquire、不启动 runner）
 2. **miss 后 acquire + 事务内二次检查**：dedup miss → acquire lease → 在同一事务内二次检查 dedup（防止并发请求同时 miss 后重复创建）→ 插入 dedup 记录 → 返回 `Created`
 
 ```rust
@@ -210,7 +210,7 @@ pub enum CreateOutcome {
 - 测试覆盖：活 owner 持续续租不得误恢复 / owner crash 后只恢复一次 / 多 server sweeper 竞争（durable dedup 保证幂等）。
 - **Exactly-once 范围限定**：只保证 "session admission exactly-once"（不重复创建 session）。create replay 不重放 external effect；Started 未确认结果转 `Unknown`，需显式 reconcile（reconciliation 不能补偿重复副作用，只能标记 Unknown 后人工/自动确认）。
 
-**实现**：engine 的 `create_started_session_v2` 接入已有的 `thread_command_dedup_v2` 表和 `commit_session_run_update` 的 digest replay 逻辑（`storage.rs:499-503, 2005-2031`）。`SessionCommandEnvelope { command_id, command: Start { session_id, prompt, binding, focus } }` 为目标定义（当前 core 的 `Start` 缺 focus，需补上），把 create 路径接入。
+**实现**：engine 的 `create_started_session_v2` 接入已有的 `session_command_dedup` 表和 `commit_session_run_update` 的 digest replay 逻辑（`storage.rs:499-503, 2005-2031`）。`SessionCommandEnvelope { command_id, command: Start { session_id, prompt, binding, focus } }` 为目标定义（当前 core 的 `Start` 缺 focus，需补上），把 create 路径接入。
 
 内存 HTTP ledger（`ServerState.idempotency`）保留作为同进程快速 replay 路径，但不承担 crash correctness。
 
@@ -444,7 +444,7 @@ SSE 线程（std::thread::spawn，专用）
 3. **Action worker 用固定 OS 线程 + `reqwest::blocking`**（不用 Tokio task + blocking client，会阻塞 async worker）。bounded queue + 固定 worker，per-session 串行化。
 4. **bounded queue 满时语义**：sink 仍返回 `Ok(())`，但立即发送与 action 对应的失败 feedback（如 `SubmissionResult(Err("action queue full"))`），不静默丢弃。
 5. **Projection 唤醒用 sticky 原子位**：`AtomicU8` 状态位（`Idle | Dirty | Lagged | Closed | Error`，5 态），SSE 线程 `fetch_max` 置位（保证 `LAGGED > DIRTY > IDLE` 优先级），重连成功用 `store(LAGGED)` 替换旧状态，TUI `poll()` 时 `swap` 取位并清零。
-6. **Progress 用 scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶，`AssistantDelta` 有界追加，`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active thread demux。不用全局 latest-slot（会丢 chunk + 串 session）。
+6. **Progress 用 scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶，`AssistantDelta` 有界追加，`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux。不用全局 latest-slot（会丢 chunk + 串 session）。
 7. **不用 `tokio::runtime::Runtime::new()` 在 TUI 侧**：client 侧纯 `reqwest::blocking` + `std::thread`，避免双 runtime 复杂性。
 
 ### 5.5 Binary 接线
@@ -580,7 +580,7 @@ latte-code run [--focus <path>] [--json] [--server url] [--token token] <prompt>
   ├─ GET /v1/workspaces/{ws}/events（SSE 流式观察）
   │    ├── 连接后立即 GET /v1/sessions/{id}（unconditional resync，§8.1）
   │    ├── progress → 打印流式文本到 stderr（--json 模式 stdout 保持纯净）
-  │    └── thread_changed → GET /v1/sessions/{id} 检查状态
+  │    └── session_changed → GET /v1/sessions/{id} 检查状态
   │
   ├─ Session 到达终态（按 §6.4 完整判定表）
   │    ├── 打印最终结果
@@ -679,7 +679,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 
 - in-process：`SessionProgressSink` → mpsc → TUI `progress_rx`。
 - HTTP：`SessionProgressSink`（带 session_id）→ `ServerEvent::Progress` → SSE → **scoped accumulator** → TUI `progress_rx`。
-- **Scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶。`AssistantDelta` 有界追加（reducer 按 run 追加 chunk），`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active thread demux，后台 session 的 progress 不显示。
+- **Scoped accumulator**：按 `(session_id, run_id, kind/tool_name)` 分桶。`AssistantDelta` 有界追加（reducer 按 run 追加 chunk），`ProviderAttempt`/`ToolProgress` 取最新。向 reducer 交付前按当前 active session demux，后台 session 的 progress 不显示。
 - progress 是瞬态，snapshot 刷新/断线/重连时清空（reducer 已有 `model.progress.clear()`）。
 
 ### 7.5 Sink 错误语义
@@ -714,7 +714,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 |---|---|
 | 客户端超时，server 存活 | 内存 ledger replay（同 Idempotency-Key） |
 | 客户端超时，server 存活，ledger 丢失（极端） | client command_id + durable digest replay |
-| server crash 在 durable accept 后、202 前 | client command_id + durable digest replay（重启后命中 `thread_command_dedup_v2`，返回 `Replayed`，不重启 provider） |
+| server crash 在 durable accept 后、202 前 | client command_id + durable digest replay（重启后命中 `session_command_dedup`，返回 `Replayed`，不重启 provider） |
 | server crash 在 durable accept 前 | 用同一 session_id/command_id 重试创建原目标 session（无副作用） |
 | 同 command_id + 不同 payload | 422 idempotency_mismatch（digest mismatch） |
 | 同 session_id 已存在（非重放） | 409 Conflict |
@@ -722,7 +722,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 **契约**：
 - client 生成 `session_id`（UUID v7）+ `command_id`（UUID v7）。
 - `Idempotency-Key` header 必须等于 body `command_id`，否则 400 拒绝。
-- engine 在 create 的同一事务内检查 `thread_command_dedup_v2`：同 command_id+digest → replay（返回 `Replayed`）；digest mismatch → 422。
+- engine 在 create 的同一事务内检查 `session_command_dedup`：同 command_id+digest → replay（返回 `Replayed`）；digest mismatch → 422。
 - 只有 `Created` 启动 provider runner；`Replayed` 走 orphan recovery（lease 到期后恢复）。
 - **Exactly-once 范围**：只保证 session admission exactly-once（不重复创建 session），不保证 provider/effect execution exactly-once。
 - 内存 ledger 只做同进程快速 replay，不承担 crash correctness。
@@ -762,9 +762,9 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 - [x] `SessionCommand::Start` 增加 `focus` 字段
 - [x] **Digest 绑定完整命令身份**：`operation_kind + protocol_version + workspace_identity + session_id + prompt + binding + normalized_focus`
 - [x] **Idempotency-Key 与 body command_id 一致性校验**（不一致 → 400）
-- [x] **Dedup lookup 先于 lease acquire**：engine create 入口先查 `thread_command_dedup_v2`（无 lease），命中 → `Replayed`；miss → acquire + 事务内二次检查 → `Created`
+- [x] **Dedup lookup 先于 lease acquire**：engine create 入口先查 `session_command_dedup`（无 lease），命中 → `Replayed`；miss → acquire + 事务内二次检查 → `Created`
 - [x] engine create 返回 `Created | Replayed`；只有 `Created` 启动 provider runner
-- [x] engine create 路径接入 `thread_command_dedup_v2`（同 command_id+digest replay，mismatch 422）
+- [x] engine create 路径接入 `session_command_dedup`（同 command_id+digest replay，mismatch 422）
 - [x] **Recovery sweeper task**：server 侧周期 task（如每 30s）调用 engine-level recovery API（恢复事务提交后广播 `ResyncRequired` 或 committed `SessionEventEnvelope`）；测试活 owner 续租不误恢复 / owner crash 只恢复一次 / 多 server sweeper 竞争 / **客户端保持 SSE 时 recovery 后收到 wake 并退出**
 - [x] `PATCH /v1/sessions/{id}` 重命名端点（+SessionChanged 事件）
 - [x] `POST /v1/sessions/{id}/fork` 分叉端点（+SessionChanged 事件）
@@ -781,7 +781,7 @@ HTTP 路径必须保持以下 reducer 输入序列与 in-process 路径等价：
 - [x] `HttpProjectionClient` 实现（REST reads + mpsc `ProjectionEvent` 通道 poll：SessionChanged/Closed；原设计的 5 态 sticky 原子位在评审中简化为通道）
 - [x] Action dispatch 实现（闭包 over `ServerHandle`，非阻塞，6 种 feedback 全覆盖，绝不返回 Err，409 置 dirty 位，queue 满发失败 feedback；原设计的 `HttpActionSink` struct 在评审中简化为闭包）
 - [x] SSE 线程（专用 OS 线程，reqwest::blocking，demux：progress scoped accumulator / dirty 信号 / 带退避重连）
-- [x] Progress scoped accumulator（按 session_id+run_id+kind 分桶，AssistantDelta 有界追加，交付前按 active thread demux）
+- [x] Progress scoped accumulator（按 session_id+run_id+kind 分桶，AssistantDelta 有界追加，交付前按 active session demux）
 - [x] 执行模型：TUI loop 用 `spawn_blocking(...).await`，bounded action queue + 固定 OS 线程 worker，per-session 顺序
 - [x] `ClientWorkers` RAII owner（所有模式：cancel + join SSE/action workers）
 - [x] TUI 启动时内嵌 server（serve_with_shutdown + 独立 server shutdown token）+ HTTP client 接线

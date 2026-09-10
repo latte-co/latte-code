@@ -27,6 +27,11 @@ pub use storage::{
     SessionCommitResponse, SessionEffectPolicy, SessionLeaseLossRecovery, StorageError,
     StoredEvent, StoredSessionEvent,
 };
+// `#[doc(hidden)]`: upgrade-compat digest helpers used only by integration
+// fixtures that reproduce a pre-rename durable accept; production replay never
+// calls them directly.
+#[doc(hidden)]
+pub use storage::{legacy_create_command_digest, legacy_follow_up_command_digest};
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 fn manifest_map_digest(

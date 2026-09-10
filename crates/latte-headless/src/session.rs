@@ -35,7 +35,20 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const SESSION_VERIFICATION_EFFECT_PREFIX: &str = "session-verification:";
+/// Pre-rename (schema <13) prefix minted into durable verification effect ids.
+/// A verification effect left `waiting_permission` by an old binary carries this
+/// id; after upgrade its approval must still be routed as verification rather
+/// than a normal provider tool continuation.
+const LEGACY_THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
 const SESSION_MAILBOX_CAPACITY: usize = 8;
+
+/// Identifies a verification effect whether it was minted by a current binary
+/// (`session-verification:`) or persisted before the Thread→Session rename
+/// (`thread-verification:`).
+fn is_verification_effect_id(request_id: &str) -> bool {
+    request_id.starts_with(SESSION_VERIFICATION_EFFECT_PREFIX)
+        || request_id.starts_with(LEGACY_THREAD_VERIFICATION_EFFECT_PREFIX)
+}
 
 /// Whether some assistant message in this segment declared `tool_call_id`.
 ///
@@ -53,15 +66,24 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
-/// Tool rounds already present in a rebuilt history.
+/// Tool rounds already present in the current turn's rebuilt history.
 ///
 /// The round budget has to survive a restart or a permission approval, both of
 /// which re-enter the loop from a snapshot rather than from the in-memory
 /// counter. Counting the assistant messages that carry calls recovers the
 /// position; without it, every approval would silently reset the budget.
+///
+/// The budget is per-turn, so only the *active* turn counts. A turn starts at
+/// its user prompt; messages after the last `User` entry belong to the turn in
+/// progress, while earlier user segments are completed turns whose rounds must
+/// not consume the new turn's budget.
 fn tool_rounds_in(messages: &[Message]) -> u32 {
+    let active_start = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+        .map_or(0, |index| index + 1);
     u32::try_from(
-        messages
+        messages[active_start..]
             .iter()
             .filter(|message| {
                 matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
@@ -897,7 +919,7 @@ impl SessionRuntimeService {
         {
             return Err(SessionRuntimeError::InvalidState);
         }
-        let verification = request_id.starts_with(SESSION_VERIFICATION_EFFECT_PREFIX);
+        let verification = is_verification_effect_id(&request_id);
         // Validate the immutable Provider binding before approval can start an
         // external effect. A configuration/model mismatch is not authority to
         // consume permission or execute the tool; the Session remains at the
@@ -5782,6 +5804,50 @@ mod tests {
         ];
         assert_eq!(tool_rounds_in(&history), 2);
         assert_eq!(tool_rounds_in(&[]), 0);
+
+        // The budget is per-turn. Tool rounds in a completed earlier turn must
+        // not count against the active turn, which begins at its own user
+        // prompt. Here turn 1 already ran 2 tool rounds; turn 2 (after the
+        // last User) has run 1, so only that 1 is charged to turn 2.
+        let cross_turn = vec![
+            Message::System {
+                content: "prompt".into(),
+            },
+            Message::User {
+                content: "turn one".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![call("old-1")],
+            },
+            Message::Tool {
+                tool_call_id: "old-1".into(),
+                name: None,
+                content: "r".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![call("old-2")],
+            },
+            Message::Tool {
+                tool_call_id: "old-2".into(),
+                name: None,
+                content: "r".into(),
+            },
+            Message::User {
+                content: "turn two".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![call("new-1")],
+            },
+            Message::Tool {
+                tool_call_id: "new-1".into(),
+                name: None,
+                content: "r".into(),
+            },
+        ];
+        assert_eq!(tool_rounds_in(&cross_turn), 1);
     }
 
     #[test]
