@@ -584,6 +584,11 @@ fn final_binary_omits_tool_calls_when_replaying_a_plain_assistant_answer() {
 /// the Chat Completions grammar forbids — and since history is rebuilt from
 /// the transcript every turn, that would break *every* later turn of the
 /// Session, not just one.
+//
+// Unix-only: the scenario approves a supervised `write_file` process effect
+// and then takes a verified turn; Windows has no process supervision, so the
+// engine fails closed there and this verification path cannot exist.
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history() {
@@ -1028,10 +1033,15 @@ fn downgrade_to_v12(db: &std::path::Path, extra_sql: &str) {
     .unwrap();
 }
 
-/// Polls a session until it reaches `ready`, returning the settled body.
-/// Panics (with the failure card) if the turn instead settles `failed`, or if
-/// it never settles within the bounded window.
-fn wait_session_ready(server: &ServeChild, sid: &str) -> serde_json::Value {
+/// Waits for a genuinely *idle* session — `ready`, no active child, and a
+/// revision that is unchanged across two consecutive reads. The active-row
+/// clearing and the lifecycle flip commit together, but a follow-up sent on
+/// the very first ready observation can still race the background runner's
+/// teardown on a slow (Windows) runner; requiring the active child to be gone
+/// and the revision to be stable makes the next fenced mutation deterministic.
+/// Panics (with the failure card) if the turn instead settles `failed`.
+fn wait_session_idle(server: &ServeChild, sid: &str) -> serde_json::Value {
+    let mut previous_revision: Option<u64> = None;
     for _ in 0..600 {
         let (st, body) = server.request(
             "GET",
@@ -1040,16 +1050,23 @@ fn wait_session_ready(server: &ServeChild, sid: &str) -> serde_json::Value {
             None,
             &[],
         );
-        if st == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            return body;
+        if st == 200 {
+            let snapshot = &body["snapshot"];
+            match snapshot["lifecycle"].as_str() {
+                Some("failed") => panic!("turn failed before reaching idle: {body:?}"),
+                Some("ready") if snapshot["active_run_id"].is_null() => {
+                    let revision = snapshot["revision"].as_u64().unwrap();
+                    if previous_revision == Some(revision) {
+                        return body;
+                    }
+                    previous_revision = Some(revision);
+                }
+                _ => previous_revision = None,
+            }
         }
-        assert!(
-            !(st == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed")),
-            "pre-upgrade turn failed: {body:?}"
-        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("session {sid} never settled ready");
+    panic!("session {sid} never became idle (ready with no active child)");
 }
 
 /// Requests durably accepted before the Thread→Session rename store the old
@@ -1117,7 +1134,7 @@ fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
         );
         assert_eq!(status, 202, "fresh create returned {body:?}");
         let sid = body["session_id"].as_str().unwrap().to_string();
-        let settled = wait_session_ready(&server, &sid);
+        let settled = wait_session_idle(&server, &sid);
         follow_revision = settled["snapshot"]["revision"].as_u64().unwrap();
 
         // Durable follow-up accept (its dedup row uses `thread.follow_up`).
@@ -1133,7 +1150,7 @@ fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
             &[("Idempotency-Key", follow_command)],
         );
         assert_eq!(fu_status, 202, "fresh follow-up returned {fu_body:?}");
-        wait_session_ready(&server, &sid);
+        wait_session_idle(&server, &sid);
     }
 
     // --- Rewind to the v12 shape and rewrite BOTH durable accepts to the exact
