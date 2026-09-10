@@ -910,23 +910,11 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
-    // Wait for turn 1 to settle ready (it completes).
-    let mut turn1_revision = None;
-    for _ in 0..600 {
-        let (status, body) = server.request(
-            "GET",
-            &format!("/v1/sessions/{session_id}"),
-            Some(&server.token),
-            None,
-            &[],
-        );
-        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            turn1_revision = body["snapshot"]["revision"].as_u64();
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let revision = turn1_revision.expect("turn one never settled ready");
+    // Wait for turn 1 to settle fully idle (ready, no active child, stable
+    // revision) so the follow-up cannot race the runner's teardown on a slow
+    // machine.
+    let settled = wait_session_idle(&server, &session_id);
+    let revision = settled["snapshot"]["revision"].as_u64().unwrap();
 
     // Turn 2: a follow-up that hits the permission gate on its first round.
     let command = "01900000-0000-7000-8000-000000000021";
@@ -1242,6 +1230,131 @@ fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
     assert!(
         fu_body["accepted_revision"].as_u64().is_some(),
         "follow-up replay must return the durable accepted revision: {fu_body:?}"
+    );
+}
+
+/// Cross-platform (no process effects). A session created before the binding
+/// fingerprint inputs changed — the provider carried no `headers` field and the
+/// built-in tools were documented with the legacy placeholder text — must still
+/// resume on the upgraded binary. The follow-up turn resolves the provider
+/// against the persisted binding; without the empty-headers fingerprint
+/// preservation and the placeholder-docs compat shim, the persisted
+/// `tools_fingerprint` mismatches the newly computed one and provider
+/// resolution fails, breaking every post-upgrade continuation.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_resumes_a_pre_upgrade_binding_after_schema_13() {
+    let scenario = Scenario::new();
+    // Plain completions only: no tools, no file changes, no verification, so the
+    // turn completes identically on every platform.
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("first turn done"),
+        ProviderReply::completion("resumed after upgrade"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}}}"#
+        ),
+    )
+    .unwrap();
+    let root = scenario
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| scenario.root().to_path_buf());
+    let root_str = root.to_string_lossy().into_owned();
+    let binding_value = server_binding(&scenario);
+    let current_tools_fp = binding_value["tools_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The tools fingerprint a pre-upgrade binary persisted (legacy placeholder
+    // tool documentation), recomputed over the identical current tool set.
+    let legacy_tools_fp = {
+        let (_config, registry) =
+            latte_code::AppConfig::load(scenario.root()).expect("config loads");
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(scenario.root())
+            .build()
+            .expect("engine builds");
+        registry
+            .legacy_tools_fingerprint_for_model("main", "mock", &engine.tool_descriptors())
+            .expect("legacy tools fingerprint resolves")
+    };
+    assert_ne!(
+        current_tools_fp, legacy_tools_fp,
+        "the fixture must persist a genuinely base-version tools fingerprint"
+    );
+
+    // --- Current binary: create a session and let turn 1 settle. ---
+    let (session_id, follow_revision) = {
+        let server = ServeChild::start(&scenario);
+        let (_, ws_body) = server.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&server.token),
+            Some(&serde_json::json!({ "path": root_str })),
+            &[],
+        );
+        let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+        let (status, body) =
+            server.create_session(&workspace_id, "resume my binding", &binding_value);
+        assert_eq!(status, 202, "create returned {body:?}");
+        let sid = body["session_id"].as_str().unwrap().to_string();
+        let settled = wait_session_idle(&server, &sid);
+        (sid, settled["snapshot"]["revision"].as_u64().unwrap())
+    };
+
+    // --- Rewind to v12 and rewrite the persisted binding's tools_fingerprint
+    // to the base-version (placeholder-docs) value. The config_fingerprint is
+    // left as-is: a headerless provider's fingerprint is byte-identical to the
+    // pre-upgrade value once empty headers are omitted, so it must match too. ---
+    let esc = |value: &str| value.replace('\'', "''");
+    downgrade_to_v12(
+        &scenario.database_path(),
+        &format!(
+            "UPDATE threads_v2 SET binding_json = REPLACE(binding_json, '{cur}', '{legacy}');",
+            cur = esc(&current_tools_fp),
+            legacy = esc(&legacy_tools_fp),
+        ),
+    );
+
+    // --- Upgraded binary: a follow-up must resolve the provider against the
+    // base-version binding and run the turn, not fail on binding mismatch. ---
+    let server = ServeChild::start(&scenario);
+    server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root_str })),
+        &[],
+    );
+    let follow_command = "01900000-0000-7000-8000-0000000000c1";
+    let (fu_status, fu_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": follow_command,
+            "prompt": "resume now",
+            "expected_session_revision": follow_revision
+        })),
+        &[("Idempotency-Key", follow_command)],
+    );
+    assert_eq!(
+        fu_status, 202,
+        "post-upgrade follow-up with a base-version binding must be accepted, got {fu_body:?}"
+    );
+    // The turn must actually run (provider resolved) and complete.
+    let resumed = wait_session_idle(&server, &session_id);
+    let runs = resumed["snapshot"]["runs"].as_array().unwrap();
+    assert_eq!(
+        runs.last().and_then(|run| run["status"].as_str()),
+        Some("completed"),
+        "the resumed turn must run to completion against the persisted binding: {resumed:?}"
     );
 }
 
@@ -1562,6 +1675,166 @@ fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
         provider.requests().len(),
         3,
         "an approval must not refill the round budget"
+    );
+}
+
+/// Answering an input request continues the *same* run, so it must not refill
+/// that turn's tool budget. With a budget of 2 the model takes one tool round,
+/// requests input, then on the answer takes a second tool round; a third tool
+/// round must be stopped even though the persisted input answer is itself a
+/// `User` transcript card (which a naive "messages after the last user"
+/// counter would treat as a fresh turn).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
+    let scenario = Scenario::new();
+    // Provider must advertise the input-request capability.
+    // Round A: tool call (auto-allowed). Then input request. After the answer:
+    // round B tool call, round C tool call — the third round must be denied.
+    let replies = vec![
+        ProviderReply::tool_call(
+            "round-a",
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ),
+        ProviderReply::input_request("need-context", "what should I focus on?", false),
+        ProviderReply::tool_call(
+            "round-b",
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ),
+        ProviderReply::tool_call(
+            "round-c-must-be-blocked",
+            "list_directory",
+            &serde_json::json!({"path": "."}),
+        ),
+        ProviderReply::completion("should never be reached"),
+    ];
+    let provider = ScriptedProvider::start(replies);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:2}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, "loop with input", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Park at the input request after the first (auto-allowed) tool round.
+    let mut pending = None;
+    for _ in 0..400 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_run_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        assert!(
+            !(status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed")),
+            "turn failed before the input gate: {body:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, run_revision) =
+        pending.expect("session never reached waiting_input");
+
+    // Answer the input; the turn resumes and must exhaust at the budget: the
+    // second tool round runs, the third is stopped retryably.
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "focus on round two",
+            "expected_session_revision": revision,
+            "expected_run_revision": run_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+
+    // The run settles failed (retryable budget stop), never consuming the
+    // third tool round's provider response.
+    let mut settled = None;
+    for _ in 0..400 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 {
+            match body["snapshot"]["lifecycle"].as_str() {
+                Some("ready" | "failed") => {
+                    settled = Some(body);
+                    break;
+                }
+                Some("waiting_input" | "waiting_permission") => {
+                    panic!("unexpected gate after input resume: {body:?}");
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let settled = settled.expect("turn never settled after the input resume");
+    let runs = settled["snapshot"]["runs"].as_array().unwrap();
+    assert_eq!(
+        runs.last().and_then(|run| run["status"].as_str()),
+        Some("failed"),
+        "the same run must stop at its 2-round budget after an input answer: {settled:?}"
+    );
+    let failure = settled["snapshot"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "failure")
+        .filter_map(|entry| entry["text"].as_str())
+        .next_back()
+        .unwrap_or("");
+    assert!(
+        failure.contains("tool rounds"),
+        "failure must be the round-budget stop, got: {failure}"
+    );
+    // Two tool rounds were served (round A and round B); round C is blocked,
+    // so the provider saw exactly 3 requests: initial, post-round-A tool result,
+    // and post-input round-B tool result — never a fourth.
+    assert!(
+        provider.requests().len() <= 3,
+        "an input answer must not allow a third tool round: {}",
+        provider.requests().len()
     );
 }
 

@@ -15,8 +15,9 @@ use crate::{
 };
 use latte_core::{
     FailureCode, Retryability, RunFailure, RunId, SessionCommandId, SessionId, SessionLifecycle,
-    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptKind,
-    redact_session_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
+    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptEntry,
+    TranscriptKind, redact_session_text, valid_openai_chat_input_request_id,
+    wall_time_ms as now_ms,
 };
 use latte_engine::{
     CancellationToken, CommitSessionRunUpdate, EngineHandle, Lease, SessionCommitRequest,
@@ -66,27 +67,44 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
-/// Tool rounds already present in the current turn's rebuilt history.
+/// Tool rounds the *active run* has already taken, counted from the durable
+/// transcript rather than rebuilt provider messages.
 ///
-/// The round budget has to survive a restart or a permission approval, both of
-/// which re-enter the loop from a snapshot rather than from the in-memory
-/// counter. Counting the assistant messages that carry calls recovers the
-/// position; without it, every approval would silently reset the budget.
+/// The per-turn round budget has to survive a permission approval, an answered
+/// input request, and a restart — every path re-enters the loop from a snapshot
+/// rather than from the in-memory counter. Reconstructing the count from
+/// provider messages fails because an answered input request is itself
+/// persisted as a `User` transcript entry: "assistant calls after the last
+/// User message" then discards the rounds taken before that answer within the
+/// very same run, letting a model loop "call a tool → request input" to exceed
+/// the budget.
 ///
-/// The budget is per-turn, so only the *active* turn counts. A turn starts at
-/// its user prompt; messages after the last `User` entry belong to the turn in
-/// progress, while earlier user segments are completed turns whose rounds must
-/// not consume the new turn's budget.
-fn tool_rounds_in(messages: &[Message]) -> u32 {
-    let active_start = messages
-        .iter()
-        .rposition(|message| matches!(message, Message::User { .. }))
-        .map_or(0, |index| index + 1);
+/// Counting persisted assistant tool-round cards (`Assistant` carrying a
+/// non-empty `tool_calls` payload) that belong to the active `run_id` is stable
+/// across all three resume paths: earlier turns have a different `run_id`, a
+/// resume re-reads the same durable records, and an input answer adds only a
+/// `User` entry, never a tool round.
+fn durable_tool_rounds_for_run(snapshot: &SessionSnapshot, run_id: RunId) -> u32 {
+    durable_tool_rounds_in(&snapshot.transcript.entries, run_id)
+}
+
+/// Counts the persisted assistant tool-round cards for one run.
+fn durable_tool_rounds_in(entries: &[TranscriptEntry], run_id: RunId) -> u32 {
     u32::try_from(
-        messages[active_start..]
+        entries
             .iter()
-            .filter(|message| {
-                matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            .filter(|entry| entry.run_id == Some(run_id))
+            .filter(|entry| {
+                entry.kind == TranscriptKind::Assistant
+                    && entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| {
+                            payload
+                                .get("tool_calls")
+                                .and_then(serde_json::Value::as_array)
+                        })
+                        .is_some_and(|calls| !calls.is_empty())
             })
             .count(),
     )
@@ -989,8 +1007,10 @@ impl SessionRuntimeService {
         })?;
         let messages = self.history_from_snapshot(&after_effect)?;
         // Re-entering after an approval or a restart: recover how many rounds
-        // this turn already took so the budget is not reset by the detour.
-        let round = tool_rounds_in(&messages).saturating_sub(1);
+        // this turn already took from the durable transcript so the budget is
+        // not reset by the detour. The current assistant round's card is
+        // already persisted at the gate, so subtract that one in-flight round.
+        let round = durable_tool_rounds_for_run(&after_effect, run_id).saturating_sub(1);
         self.continue_provider_tool_round(
             after_effect,
             messages,
@@ -1696,7 +1716,15 @@ impl SessionRuntimeService {
         provider: Arc<dyn Provider>,
         lease: SessionLeaseGuard,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        self.run_provider_round(snapshot, messages, provider, lease, 0)
+        // Resume the per-turn budget from the durable record. A fresh start has
+        // zero persisted rounds; continuing after an answered input request
+        // carries the rounds that run already spent (the input answer itself
+        // only appends a `User` entry, never a tool round).
+        let run_id = snapshot
+            .active_run_id
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        let round = durable_tool_rounds_for_run(&snapshot, run_id);
+        self.run_provider_round(snapshot, messages, provider, lease, round)
             .await
     }
 
@@ -5764,90 +5792,74 @@ mod tests {
     }
 
     #[test]
-    fn tool_rounds_in_counts_only_assistant_messages_that_called_something() {
-        use crate::provider::{Message, ToolCall};
-        let call = |id: &str| ToolCall {
-            id: id.into(),
-            name: "read_file".into(),
-            input: serde_json::json!({}),
+    fn durable_tool_rounds_are_per_run_and_survive_input_within_a_run() {
+        let run_one = RunId::from_uuid(Uuid::now_v7());
+        let run_two = RunId::from_uuid(Uuid::now_v7());
+        let tool_calls = serde_json::json!([{"id":"c","name":"read_file","input":{}}]);
+        let entry = |run: RunId,
+                     seq: u64,
+                     kind: TranscriptKind,
+                     payload: Option<serde_json::Value>| TranscriptEntry {
+            entry_id: latte_core::TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: seq,
+            run_id: Some(run),
+            kind,
+            text: String::new(),
+            payload,
+            source_key: format!("{run}:{seq}"),
+            created_at_ms: seq,
         };
-        let history = vec![
-            Message::System {
-                content: "prompt".into(),
-            },
-            Message::User {
-                content: "do it".into(),
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![call("c1")],
-            },
-            Message::Tool {
-                tool_call_id: "c1".into(),
-                name: None,
-                content: "r".into(),
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![call("c2")],
-            },
-            Message::Tool {
-                tool_call_id: "c2".into(),
-                name: None,
-                content: "r".into(),
-            },
-            // A plain answer is not a tool round.
-            Message::Assistant {
-                content: Some("done".into()),
-                tool_calls: vec![],
-            },
+        // Turn one (run_one): two tool rounds.
+        let mut entries = vec![
+            entry(run_one, 1, TranscriptKind::User, None),
+            entry(
+                run_one,
+                2,
+                TranscriptKind::Assistant,
+                Some(serde_json::json!({"tool_calls": tool_calls})),
+            ),
+            entry(run_one, 3, TranscriptKind::ToolResult, None),
+            entry(
+                run_one,
+                4,
+                TranscriptKind::Assistant,
+                Some(serde_json::json!({"tool_calls": tool_calls})),
+            ),
+            entry(run_one, 5, TranscriptKind::ToolResult, None),
+            // A plain assistant answer carries no tool_calls: not a round.
+            entry(run_one, 6, TranscriptKind::Assistant, None),
         ];
-        assert_eq!(tool_rounds_in(&history), 2);
-        assert_eq!(tool_rounds_in(&[]), 0);
+        // Turn two (run_two): one tool round, then an input request and the
+        // model's answer as a persisted `User` entry, then another tool round.
+        entries.extend_from_slice(&[
+            entry(run_two, 7, TranscriptKind::User, None),
+            entry(
+                run_two,
+                8,
+                TranscriptKind::Assistant,
+                Some(serde_json::json!({"tool_calls": tool_calls})),
+            ),
+            entry(run_two, 9, TranscriptKind::ToolResult, None),
+            entry(run_two, 10, TranscriptKind::Input, None),
+            // The answered input request is persisted as a `User` card. It must
+            // NOT reset run_two's round count the way a "messages after the
+            // last User" heuristic would.
+            entry(run_two, 11, TranscriptKind::User, None),
+            entry(
+                run_two,
+                12,
+                TranscriptKind::Assistant,
+                Some(serde_json::json!({"tool_calls": tool_calls})),
+            ),
+            entry(run_two, 13, TranscriptKind::ToolResult, None),
+        ]);
 
-        // The budget is per-turn. Tool rounds in a completed earlier turn must
-        // not count against the active turn, which begins at its own user
-        // prompt. Here turn 1 already ran 2 tool rounds; turn 2 (after the
-        // last User) has run 1, so only that 1 is charged to turn 2.
-        let cross_turn = vec![
-            Message::System {
-                content: "prompt".into(),
-            },
-            Message::User {
-                content: "turn one".into(),
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![call("old-1")],
-            },
-            Message::Tool {
-                tool_call_id: "old-1".into(),
-                name: None,
-                content: "r".into(),
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![call("old-2")],
-            },
-            Message::Tool {
-                tool_call_id: "old-2".into(),
-                name: None,
-                content: "r".into(),
-            },
-            Message::User {
-                content: "turn two".into(),
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![call("new-1")],
-            },
-            Message::Tool {
-                tool_call_id: "new-1".into(),
-                name: None,
-                content: "r".into(),
-            },
-        ];
-        assert_eq!(tool_rounds_in(&cross_turn), 1);
+        // Prior turns never count against the active run.
+        assert_eq!(durable_tool_rounds_in(&entries, run_one), 2);
+        // The active run accumulates across the in-run input answer: both tool
+        // rounds are charged to run_two, not just the one after the User card.
+        assert_eq!(durable_tool_rounds_in(&entries, run_two), 2);
+        assert_eq!(durable_tool_rounds_in(&[], run_two), 0);
     }
 
     #[test]

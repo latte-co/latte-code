@@ -249,6 +249,26 @@ CLI `--json` 字段、配置键 `thread` → `session` 与模块文件名（`thr
   - 由最终二进制 E2E 守护：真实构造 v13 库后反向到 v12，分别验证「升级前 durable
     accept 后重试同 `command_id` 重放为 200」与「升级前等待中的 verification gate
     升级后批准并完成」。
+- **旧会话 Provider binding 升级兼容（评审 P1）**：升级保留旧 `binding_json`，但本批
+  带入了两项会改变指纹的改动，直接全等比对会让旧会话的 follow-up / input / 工具批准
+  全部解析失败：
+  - provider 新增 `headers` 字段：空 map 加 `skip_serializing_if`，无自定义 headers 的
+    provider 配置指纹与升级前逐字节一致；配置了非空 headers 仍参与绑定。
+  - 内建工具描述从占位符 `Engine-owned <name> operation` 改为真实文档，改变
+    `tools_fingerprint`。`resolve_session_bound` 增加窄兼容桥：除 `tools_fingerprint`
+    外的安全身份字段（provider/model/版本/config 指纹/凭证引用与代数/data scope/
+    aliases）必须全等；tools 指纹额外接受「用当前工具集按旧占位符描述重算」的值。
+    这不是放宽：重算基于当前工具，任何 `name` / `input_schema` / `effect` / `version`
+    漂移都会失配，只接受纯描述文字（模型指引字段，非权限边界）。
+  - 由跨平台最终二进制 E2E 守护：持久化真实旧版（占位符）指纹的 binding，升级后
+    follow-up 仍能解析 provider 并跑完。
+- **轮次预算按 active run 的持久记录累计（评审 P2）**：`max_tool_rounds` 必须在同一
+  run 内跨 input 回答、工具批准、重启续跑累计。早期基于「最后一个 User 消息之后」的
+  消息计数会被 input 回答（它也持久化为 `User` transcript 卡片）重置，模型可
+  「调工具→请求输入」循环突破预算。改为按 active `run_id` 计数持久 transcript 中
+  `Assistant` 且 `payload.tool_calls` 非空的卡片（`durable_tool_rounds_for_run`）；
+  历史 turn 的 run_id 不同、input 回答只加 `User` 卡片，三者都不会重置。由
+  「工具→input→回答→再工具，第三轮被预算拦住」的最终二进制 E2E 守护。
 
 **协议决策点（已定并执行）**：v1 端点承诺过稳定性
 （`versioned-rpc-contract.md` §2.1），字段改名属 breaking change，按该文档

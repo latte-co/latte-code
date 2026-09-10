@@ -55,7 +55,11 @@ pub enum ProviderDefinition {
         /// Completions protocol. `${session_id}` in a value expands to an
         /// opaque per-Session identifier; other `${...}` names are rejected at
         /// load time. Reserved headers cannot be set here.
-        #[serde(default)]
+        // Empty maps are omitted from serialization so the config fingerprint of
+        // a headerless provider is byte-identical to bindings persisted before
+        // the `headers` field existed (upgrade compatibility). Configured
+        // (non-empty) headers still serialize and bind.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
@@ -501,13 +505,34 @@ impl ProviderRegistry {
         }
         let proposed =
             self.session_binding_for_model(&binding.provider_name, &binding.model, tools)?;
-        if &proposed != binding {
+        // Upgrade compatibility: accept a pre-upgrade binding whose only drift
+        // is the built-in tool description prose (the security-identity fields,
+        // including tool effects/schemas via the legacy recomputation, still
+        // match). See `legacy_placeholder_tools_fingerprint`.
+        let legacy_tools_fingerprint =
+            legacy_placeholder_tools_fingerprint(tools, &proposed.aliases)?;
+        if !binding_matches_with_legacy_tools(binding, &proposed, &legacy_tools_fingerprint) {
             return Err(RegistryError::BindingMismatch(
                 "provider binding, aliases, credential reference/generation, or data scope changed"
                     .into(),
             ));
         }
         self.resolve_model(&binding.provider_name, &binding.model, tools)
+    }
+
+    /// `#[doc(hidden)]` upgrade-compat helper for integration fixtures:
+    /// reproduces the pre-upgrade `tools_fingerprint` (legacy placeholder tool
+    /// documentation) for a configured model against the current tool set, so a
+    /// fixture can persist real base-version binding bytes.
+    #[doc(hidden)]
+    pub fn legacy_tools_fingerprint_for_model(
+        &self,
+        name: &str,
+        model: &str,
+        tools: &[ToolDescriptor],
+    ) -> Result<String, RegistryError> {
+        let proposed = self.session_binding_for_model(name, model, tools)?;
+        legacy_placeholder_tools_fingerprint(tools, &proposed.aliases)
     }
 
     /// Resolves one explicit configured provider/model pair.
@@ -905,6 +930,55 @@ fn canonical_tools(
         .map_err(|e| RegistryError::Invalid(e.to_string()))
 }
 
+/// The tools fingerprint a pre-upgrade binary computed, reproduced over the
+/// *current* built-in tool set but with the legacy placeholder descriptions.
+///
+/// This is an upgrade-compat shim, not a relaxation: it recomputes the hash
+/// from the current tools, so any change to tool names, `input_schema`,
+/// `effect`, or `version` makes it differ and the stored binding is rejected.
+/// The only drift it accepts is the human-facing description prose moving from
+/// the `"Engine-owned <name> operation"` placeholder to real documentation — a
+/// model-guidance field, never a permission boundary (`effect`/`input_schema`
+/// remain authoritative and are still compared).
+fn legacy_placeholder_tools_fingerprint(
+    tools: &[ToolDescriptor],
+    aliases: &BTreeMap<String, String>,
+) -> Result<String, RegistryError> {
+    let legacy: Vec<ToolDescriptor> = tools
+        .iter()
+        .map(|tool| ToolDescriptor {
+            description: format!("Engine-owned {} operation", tool.name.replace('_', " ")),
+            ..tool.clone()
+        })
+        .collect();
+    Ok(fingerprint(&canonical_tools(&legacy, aliases)?))
+}
+
+/// Whether a persisted (pre-upgrade) binding is still valid against the binding
+/// the current binary would mint. Every security-identity field must match
+/// exactly; only `tools_fingerprint` is allowed to be the legacy placeholder
+/// description hash for the identical tool set (see
+/// [`legacy_placeholder_tools_fingerprint`]).
+fn binding_matches_with_legacy_tools(
+    stored: &SessionProviderBinding,
+    proposed: &SessionProviderBinding,
+    legacy_tools_fingerprint: &str,
+) -> bool {
+    let identity_matches = stored.version == proposed.version
+        && stored.provider_name == proposed.provider_name
+        && stored.provider_type == proposed.provider_type
+        && stored.protocol == proposed.protocol
+        && stored.model == proposed.model
+        && stored.config_fingerprint == proposed.config_fingerprint
+        && stored.credential_ref_id == proposed.credential_ref_id
+        && stored.data_scope_id == proposed.data_scope_id
+        && stored.credential_generation == proposed.credential_generation
+        && stored.aliases == proposed.aliases;
+    let tools_matches = stored.tools_fingerprint == proposed.tools_fingerprint
+        || stored.tools_fingerprint == legacy_tools_fingerprint;
+    identity_matches && tools_matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,6 +1138,83 @@ mod tests {
         assert!(matches!(
             registry.session_binding_for_model("unknown", "gpt-test", &tools),
             Err(RegistryError::Invalid(message)) if message.contains("unknown provider")
+        ));
+    }
+
+    #[test]
+    fn empty_headers_are_absent_from_the_config_fingerprint_payload() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+        )
+        .unwrap();
+        let definition = registry
+            .config
+            .providers
+            .get("main")
+            .expect("provider exists");
+        let semantic = semantic_definition_for_model(definition, "m").unwrap();
+        // A headerless provider must not carry a `headers` key at all: its
+        // config fingerprint must be byte-identical to a binding persisted
+        // before the `headers` field existed (upgrade compatibility).
+        assert!(
+            semantic["provider"].get("headers").is_none(),
+            "empty headers must be omitted from the fingerprint payload: {semantic}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_a_pre_upgrade_binding_with_placeholder_tool_docs() {
+        // Current tools carry real documentation rather than the legacy
+        // placeholder text.
+        let tools = {
+            let mut read = tool("read_file");
+            read.description =
+                "Reads a UTF-8 file under the workspace root with a bounded size.".into();
+            vec![read]
+        };
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+        )
+        .unwrap();
+        let proposed = registry.session_binding_for_default(&tools).unwrap();
+        let legacy_fp = legacy_placeholder_tools_fingerprint(&tools, &proposed.aliases).unwrap();
+        // The real-doc fingerprint genuinely differs from the placeholder one,
+        // otherwise this test would not be exercising the compat shim.
+        assert_ne!(legacy_fp, proposed.tools_fingerprint);
+
+        // A binding persisted by the pre-upgrade binary (placeholder tool docs)
+        // still resolves. Passing the binding check proceeds to secret lookup,
+        // which fails with MissingSecret — the sentinel that the binding was
+        // accepted rather than rejected as BindingMismatch.
+        let mut legacy = proposed.clone();
+        legacy.tools_fingerprint = legacy_fp;
+        assert!(matches!(
+            registry.resolve_session_bound(&legacy, &tools),
+            Err(RegistryError::MissingSecret(name)) if name == "K"
+        ));
+
+        // The shim is description-only. A real tool-effect change must still be
+        // rejected even when the stored binding carries a placeholder hash: the
+        // legacy value is recomputed over the *current* tool set.
+        let changed_tools = {
+            let mut modified = tools[0].clone();
+            modified.effect = "modify".into();
+            vec![modified]
+        };
+        // `legacy` holds the placeholder hash of the ORIGINAL read tool; against
+        // the changed tool set neither the current nor the recomputed legacy
+        // hash matches, so it must fail closed.
+        assert!(matches!(
+            registry.resolve_session_bound(&legacy, &changed_tools),
+            Err(RegistryError::BindingMismatch(_))
+        ));
+
+        // Any other security-identity drift is still a hard mismatch.
+        let mut rebind = proposed;
+        rebind.model = "other".into();
+        assert!(matches!(
+            registry.resolve_session_bound(&rebind, &tools),
+            Err(RegistryError::BindingMismatch(_))
         ));
     }
 
