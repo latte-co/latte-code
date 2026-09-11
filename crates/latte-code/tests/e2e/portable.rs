@@ -1906,7 +1906,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
                 _ => {}
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
     }
     let settled = settled.expect("turn never settled after the input resume");
     let runs = settled["snapshot"]["turns"].as_array().unwrap();
@@ -2011,11 +2011,13 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
     // Wait for the input gate after exactly 47 batches (~613 durable cards).
-    // Windows debug builds serve each poll by rebuilding a 500-card bounded
-    // snapshot, so keep the wall-clock budget generous (150s); the loop exits
-    // the instant the gate is reached on fast platforms.
+    // Poll at 1 Hz, not faster: every GET rebuilds a 500-card bounded snapshot
+    // through the storage's single connection lock, so tight polling on a
+    // Windows debug (or coverage-instrumented) build starves the turn's own
+    // commits and makes the gate unreachable. The 10-minute window is a
+    // ceiling; fast platforms exit on the first poll that observes the gate.
     let mut pending = None;
-    for _ in 0..3000 {
+    for _ in 0..600 {
         let (status, body) = server.request(
             "GET",
             &format!("/v1/sessions/{session_id}"),
@@ -2046,7 +2048,7 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
             !(status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed")),
             "turn failed before the input gate: {body:?}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
     }
     let (revision, request_id, turn_revision, visible_entries) =
         pending.expect("session never reached waiting_input after 47 tool batches");
@@ -2075,9 +2077,9 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
     assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
 
     // Batch 48 runs, the batch-49 response then stops the turn retryably.
-    // Generous window for the same Windows debug snapshot cost (100s).
+    // Same 1 Hz polling / 10-minute ceiling as the gate wait above.
     let mut settled = None;
-    for _ in 0..2000 {
+    for _ in 0..600 {
         let (status, body) = server.request(
             "GET",
             &format!("/v1/sessions/{session_id}"),
@@ -2089,7 +2091,7 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
             settled = Some(body);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(1000));
     }
     let settled = settled.expect("turn never settled after the input resume");
     assert_eq!(
