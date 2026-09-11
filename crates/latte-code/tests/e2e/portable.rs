@@ -1937,10 +1937,12 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
     );
 }
 
-/// The persisted per-run round counter must survive beyond the tail-500
-/// transcript projection. Each tool batch here carries six calls, so 47
-/// batches persist ~611 assistant/tool cards (plus the user/input cards):
-/// over the 500-entry bound. Counting rounds from the commit snapshot would
+/// The persisted per-turn round counter must survive beyond the tail-500
+/// transcript projection. Each tool batch carries six calls, and every call
+/// persists three effect cards (prepare `tool_call`, start `system`, observe
+/// `tool_result`) plus the one assistant card: 19 cards per batch, so 47
+/// batches persist 893 cards (plus the initial user card) — well over the
+/// 500-entry tail bound. Counting rounds from the commit snapshot would
 /// recover only 38 rounds, silently refilling the 48-round budget after the
 /// input answer. The counter must make the 48th batch run and the 49th stop.
 // Unix-only: this is a high-volume durability stress (47 batches × 6 calls =
@@ -1979,7 +1981,7 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
         )
     };
     let mut replies: Vec<ProviderReply> = Vec::new();
-    // 47 tool batches × 6 calls: 47 assistant cards + 564 tool cards ≈ 611.
+    // 47 batches × 19 cards each (1 assistant + 6 calls × 3 effect stages) = 893.
     for round in 0..47_u32 {
         replies.push(tool_batch(&format!("r{round}")));
     }
@@ -2020,7 +2022,7 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
     assert_eq!(create_status, 202);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
-    // Wait for the input gate after exactly 47 batches (~613 durable cards).
+    // Wait for the input gate after exactly 47 batches (893+ durable cards).
     // Poll at 1 Hz, not faster: every GET rebuilds a 500-card bounded snapshot
     // through the storage's single connection lock, so tight polling on a
     // Windows debug (or coverage-instrumented) build starves the turn's own
