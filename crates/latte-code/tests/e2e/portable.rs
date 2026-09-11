@@ -1943,6 +1943,16 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
 /// over the 500-entry bound. Counting rounds from the commit snapshot would
 /// recover only 38 rounds, silently refilling the 48-round budget after the
 /// input answer. The counter must make the 48th batch run and the 49th stop.
+// Unix-only: this is a high-volume durability stress (47 batches × 6 calls =
+// ~280 effects, each committed in separate fsync=full transactions whose
+// JSONL outbox drain re-parses the whole growing file — O(N^2), >600 cards).
+// It completes in ~45s on Linux/macOS debug but exceeds ten minutes on the
+// GitHub Windows runner (Defender + slower fsync), and the >500-card premise
+// rules out shrinking it. The counter logic itself is cross-platform: the
+// engine storage tests (counter increment/replay/backfill, schema 14/15) and
+// the headless budget unit tests run on every platform; Windows keeps the
+// non-stress budget E2Es in this suite.
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_input() {
