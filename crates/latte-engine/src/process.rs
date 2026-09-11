@@ -1,8 +1,8 @@
 use crate::{
-    EngineHandle, Lease, ThreadEffectDescriptor, ThreadEffectExecutionError,
-    ThreadEffectObservedValue,
+    EngineHandle, Lease, SessionEffectDescriptor, SessionEffectExecutionError,
+    SessionEffectObservedValue,
 };
-use latte_core::RunId;
+use latte_core::TurnId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -51,7 +51,7 @@ pub struct ProcessInvocation<'a> {
     pub grace_ms: u64,
     pub stdout_cap: usize,
     pub stderr_cap: usize,
-    pub run_revision: u64,
+    pub turn_revision: u64,
     pub effect_id: &'a str,
     pub attempt: u64,
     pub approval_digest: Option<&'a str>,
@@ -169,7 +169,7 @@ struct Binding<'a> {
     grace_ms: u64,
     stdout_cap: usize,
     stderr_cap: usize,
-    run_revision: u64,
+    turn_revision: u64,
     effect_id: &'a str,
     attempt: u64,
     lease_owner: &'a str,
@@ -186,7 +186,7 @@ pub(crate) fn digest(i: &ProcessInvocation<'_>) -> String {
         grace_ms: i.grace_ms,
         stdout_cap: i.stdout_cap,
         stderr_cap: i.stderr_cap,
-        run_revision: i.run_revision,
+        turn_revision: i.turn_revision,
         effect_id: i.effect_id,
         attempt: i.attempt,
         lease_owner: i.lease_owner,
@@ -203,7 +203,7 @@ pub(crate) fn digest(i: &ProcessInvocation<'_>) -> String {
 /// They are converted to the borrowed legacy supervisor invocation only after
 /// the Started transaction has committed.
 #[derive(Clone, Debug)]
-pub(crate) struct ThreadProcessSpec {
+pub(crate) struct SessionProcessSpec {
     pub argv: Vec<String>,
     pub shell: Option<String>,
     pub cwd: String,
@@ -214,7 +214,7 @@ pub(crate) struct ThreadProcessSpec {
     pub stderr_cap: usize,
 }
 
-impl ThreadProcessSpec {
+impl SessionProcessSpec {
     pub(crate) fn from_input(input: &Value) -> Result<Self, ProcessError> {
         let object = input
             .as_object()
@@ -297,8 +297,8 @@ impl ThreadProcessSpec {
     }
     pub(crate) fn invocation<'a>(
         &'a self,
-        run_revision: u64,
-        descriptor: &'a ThreadEffectDescriptor,
+        turn_revision: u64,
+        descriptor: &'a SessionEffectDescriptor,
         lease: &'a Lease,
     ) -> ProcessInvocation<'a> {
         ProcessInvocation {
@@ -310,7 +310,7 @@ impl ThreadProcessSpec {
             grace_ms: self.grace_ms,
             stdout_cap: self.stdout_cap,
             stderr_cap: self.stderr_cap,
-            run_revision,
+            turn_revision,
             effect_id: &descriptor.effect_id,
             attempt: descriptor.attempt,
             approval_digest: None,
@@ -321,29 +321,29 @@ impl ThreadProcessSpec {
 }
 
 impl EngineHandle {
-    pub(crate) async fn execute_started_thread_process(
+    pub(crate) async fn execute_started_session_process(
         &self,
-        descriptor: &ThreadEffectDescriptor,
-        run_revision: u64,
+        descriptor: &SessionEffectDescriptor,
+        turn_revision: u64,
         lease: &Lease,
         cancellation: &CancellationToken,
-    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+    ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         if !self.process_supervision_supported {
-            return Err(ThreadEffectExecutionError::Certified(
+            return Err(SessionEffectExecutionError::Certified(
                 ProcessError::Unsupported.to_string(),
             ));
         }
-        let spec = ThreadProcessSpec::from_input(&descriptor.input)
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
-        let invocation = spec.invocation(run_revision, descriptor, lease);
+        let spec = SessionProcessSpec::from_input(&descriptor.input)
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
+        let invocation = spec.invocation(turn_revision, descriptor, lease);
         let cwd = self
             .tools
             .resolve_cwd(&spec.cwd)
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
         let _operation = std::sync::Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
-            .map_err(|_| ThreadEffectExecutionError::Uncertain("operation gate closed".into()))?;
+            .map_err(|_| SessionEffectExecutionError::Uncertain("operation gate closed".into()))?;
         match supervise(
             &invocation,
             &cwd,
@@ -353,20 +353,20 @@ impl EngineHandle {
         .await
         {
             Ok(output) if output.termination == ProcessTermination::Cancelled => {
-                Err(ThreadEffectExecutionError::Uncertain(
+                Err(SessionEffectExecutionError::Uncertain(
                     "process cancelled after its external outcome may have happened".into(),
                 ))
             }
-            Ok(output) => Ok(ThreadEffectObservedValue {
+            Ok(output) => Ok(SessionEffectObservedValue {
                 result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
-                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                payload: Some(latte_core::redact_session_value(serde_json::json!({
                     "tool_call_id":descriptor.tool_call_id,
                     "name":descriptor.name,
                     "output":output,
                 }))),
                 success: true,
             }),
-            Err(error) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
+            Err(error) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
         }
     }
 }
@@ -375,28 +375,28 @@ impl EngineHandle {
     /// Executes and durably records an actual verification process outcome.
     pub async fn execute_verification(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.reject_linked_run(run_id)
+        self.reject_linked_turn(turn_id)
             .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
             .map_err(|_| ProcessError::Supervision("operation gate closed".into()))?;
-        if invocation.run_revision != expected_revision {
+        if invocation.turn_revision != expected_revision {
             return Err(ProcessError::Invalid(
                 "verification revision mismatch".into(),
             ));
         }
         let output = self
-            .execute_process_inner(run_id, lease, now_ms, invocation, cancellation)
+            .execute_process_inner(turn_id, lease, now_ms, invocation, cancellation)
             .await?;
-        let effect_epoch = self.storage.effect_epoch(run_id).map_err(storage)?;
+        let effect_epoch = self.storage.effect_epoch(turn_id).map_err(storage)?;
         let workspace_manifest_digest = self
             .manifest_digest()
             .map_err(|error| ProcessError::Supervision(error.to_string()))?;
@@ -413,7 +413,7 @@ impl EngineHandle {
             serde_json::to_string(&record).map_err(|e| ProcessError::Supervision(e.to_string()))?;
         self.storage
             .record_verification_evidence(
-                run_id,
+                turn_id,
                 expected_revision,
                 lease,
                 &crate::VerificationEvidence {
@@ -430,12 +430,12 @@ impl EngineHandle {
     pub fn reissue_process_permission(
         &self,
         old_effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         lease: &Lease,
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
     ) -> Result<String, ProcessError> {
-        self.reject_linked_run(run_id)
+        self.reject_linked_turn(turn_id)
             .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         if classify(invocation) != ProcessDecision::Ask {
             return Err(ProcessError::Invalid(
@@ -452,7 +452,7 @@ impl EngineHandle {
             grace_ms: invocation.grace_ms,
             stdout_cap: invocation.stdout_cap,
             stderr_cap: invocation.stderr_cap,
-            run_revision: invocation.run_revision,
+            turn_revision: invocation.turn_revision,
             effect_id: invocation.effect_id,
             attempt: invocation.attempt,
             lease_owner: invocation.lease_owner,
@@ -464,8 +464,8 @@ impl EngineHandle {
             .replace_pending_effect(
                 old_effect_id,
                 invocation.effect_id,
-                run_id,
-                invocation.run_revision,
+                turn_id,
+                invocation.turn_revision,
                 invocation.attempt,
                 &descriptor,
                 &exact,
@@ -478,25 +478,25 @@ impl EngineHandle {
     #[allow(clippy::too_many_lines)]
     pub async fn execute_process(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         lease: &Lease,
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.reject_linked_run(run_id)
+        self.reject_linked_turn(turn_id)
             .map_err(|error| ProcessError::Invalid(error.to_string()))?;
         let _operation = Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
             .map_err(|_| ProcessError::Supervision("operation gate closed".into()))?;
-        self.execute_process_inner(run_id, lease, now_ms, invocation, cancellation)
+        self.execute_process_inner(turn_id, lease, now_ms, invocation, cancellation)
             .await
     }
     #[allow(clippy::too_many_lines)]
     async fn execute_process_inner(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         lease: &Lease,
         now_ms: u64,
         invocation: &ProcessInvocation<'_>,
@@ -537,7 +537,7 @@ impl EngineHandle {
                 grace_ms: invocation.grace_ms,
                 stdout_cap: invocation.stdout_cap,
                 stderr_cap: invocation.stderr_cap,
-                run_revision: invocation.run_revision,
+                turn_revision: invocation.turn_revision,
                 effect_id: invocation.effect_id,
                 attempt: invocation.attempt,
                 lease_owner: invocation.lease_owner,
@@ -548,9 +548,9 @@ impl EngineHandle {
             self.storage
                 .create_prepared_permission(
                     invocation.effect_id,
-                    run_id,
-                    invocation.run_revision.saturating_sub(2),
-                    invocation.run_revision,
+                    turn_id,
+                    invocation.turn_revision.saturating_sub(2),
+                    invocation.turn_revision,
                     invocation.attempt,
                     &descriptor,
                     &exact,
@@ -564,9 +564,9 @@ impl EngineHandle {
             self.storage
                 .create_prepared_permission(
                     invocation.effect_id,
-                    run_id,
-                    invocation.run_revision,
-                    invocation.run_revision,
+                    turn_id,
+                    invocation.turn_revision,
+                    invocation.turn_revision,
                     invocation.attempt,
                     "{}",
                     &exact,
@@ -577,8 +577,8 @@ impl EngineHandle {
             self.storage
                 .consume_permission_and_start(
                     invocation.effect_id,
-                    run_id,
-                    invocation.run_revision,
+                    turn_id,
+                    invocation.turn_revision,
                     lease,
                     &exact,
                     now_ms,
@@ -591,8 +591,8 @@ impl EngineHandle {
             self.storage
                 .consume_permission_and_start(
                     invocation.effect_id,
-                    run_id,
-                    invocation.run_revision,
+                    turn_id,
+                    invocation.turn_revision,
                     lease,
                     &exact,
                     now_ms,
@@ -752,7 +752,7 @@ fn supervise_git(
                 grace_ms: 100,
                 stdout_cap: cap,
                 stderr_cap: 1024,
-                run_revision: 0,
+                turn_revision: 0,
                 effect_id: "internal-git-diff",
                 attempt: 1,
                 approval_digest: None,
@@ -767,7 +767,7 @@ fn supervise_git(
         })
     })
     .join()
-    .map_err(|_| ProcessError::Supervision("git supervisor thread panicked".into()))?
+    .map_err(|_| ProcessError::Supervision("git supervisor session panicked".into()))?
 }
 
 #[cfg(unix)]
@@ -999,7 +999,7 @@ mod non_unix_tests {
     #[tokio::test]
     async fn process_capability_is_absent_and_execution_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
@@ -1010,7 +1010,7 @@ mod non_unix_tests {
                 .iter()
                 .all(|tool| tool.name != "process")
         );
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let argv = vec!["echo".into(), "x".into()];
         let env = BTreeMap::new();
@@ -1023,7 +1023,7 @@ mod non_unix_tests {
             grace_ms: 10,
             stdout_cap: 1_024,
             stderr_cap: 1_024,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "unsupported-process",
             attempt: 1,
             approval_digest: None,
@@ -1084,7 +1084,7 @@ mod tests {
             grace_ms: 50,
             stdout_cap: 128,
             stderr_cap: 128,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: effect,
             attempt: 1,
             approval_digest: approval,
@@ -1195,8 +1195,8 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn thread_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
-        let defaults = ThreadProcessSpec::from_input(&serde_json::json!({
+    fn session_process_spec_parses_defaults_exactly_and_rejects_typed_boundaries() {
+        let defaults = SessionProcessSpec::from_input(&serde_json::json!({
             "argv": ["/bin/pwd"]
         }))
         .unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(defaults.stdout_cap, 64 * 1024);
         assert_eq!(defaults.stderr_cap, 64 * 1024);
 
-        let configured = ThreadProcessSpec::from_input(&serde_json::json!({
+        let configured = SessionProcessSpec::from_input(&serde_json::json!({
             "shell": "printf ok",
             "cwd": "subdir",
             "env": {"LANG": "C"},
@@ -1233,7 +1233,7 @@ mod tests {
             fencing_token: 7,
             expires_at_ms: 99,
         };
-        let descriptor = ThreadEffectDescriptor {
+        let descriptor = SessionEffectDescriptor {
             effect_id: "effect".into(),
             tool_call_id: "call_1".into(),
             name: "process".into(),
@@ -1241,7 +1241,7 @@ mod tests {
             attempt: 3,
         };
         let invocation = configured.invocation(11, &descriptor, &lease);
-        assert_eq!(invocation.run_revision, 11);
+        assert_eq!(invocation.turn_revision, 11);
         assert_eq!(invocation.effect_id, "effect");
         assert_eq!(invocation.attempt, 3);
         assert_eq!(invocation.lease_owner, "owner");
@@ -1297,7 +1297,7 @@ mod tests {
             ),
         ];
         for (input, expected) in invalid {
-            let error = ThreadProcessSpec::from_input(&input).unwrap_err();
+            let error = SessionProcessSpec::from_input(&input).unwrap_err();
             assert!(
                 matches!(error, ProcessError::Invalid(message) if message.contains(expected)),
                 "input {input} did not produce {expected}"
@@ -1328,12 +1328,12 @@ mod tests {
     async fn execute_process_rejects_invalid_requests_before_creating_effect_authority() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("not-a-directory"), "x").unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let empty = Vec::new();
         let pwd = vec!["/bin/pwd".into()];
@@ -1423,8 +1423,8 @@ mod tests {
             );
         }
 
-        let descriptor = ThreadEffectDescriptor {
-            effect_id: "thread-process".into(),
+        let descriptor = SessionEffectDescriptor {
+            effect_id: "session-process".into(),
             tool_call_id: "call".into(),
             name: "process".into(),
             input: serde_json::json!({"argv":["/bin/echo","ok"]}),
@@ -1434,9 +1434,9 @@ mod tests {
         unsupported.process_supervision_supported = false;
         assert!(matches!(
             unsupported
-                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .execute_started_session_process(&descriptor, 0, &lease, &CancellationToken::new())
                 .await,
-            Err(ThreadEffectExecutionError::Certified(_))
+            Err(SessionEffectExecutionError::Certified(_))
         ));
         let gated = EngineBuilder::new()
             .workspace_root(dir.path())
@@ -1445,9 +1445,9 @@ mod tests {
         gated.operation_gate.close();
         assert!(matches!(
             gated
-                .execute_started_thread_process(&descriptor, 0, &lease, &CancellationToken::new())
+                .execute_started_session_process(&descriptor, 0, &lease, &CancellationToken::new())
                 .await,
-            Err(ThreadEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
+            Err(SessionEffectExecutionError::Uncertain(message)) if message.contains("gate closed")
         ));
         assert!(
             storage(crate::StorageError::LeaseLost)
@@ -1459,12 +1459,12 @@ mod tests {
     #[tokio::test]
     async fn permission_dual_stream_bounds_and_timeout_are_durable() {
         let dir = tempfile::tempdir().unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         let empty = Vec::new();
         let command =
@@ -1521,12 +1521,12 @@ mod tests {
     async fn cancellation_terminates_process_group_once() {
         let dir = tempfile::tempdir().unwrap();
         let pgid_file = dir.path().join("cancelled-process-group");
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         let empty = Vec::new();
         let shell = format!("echo $$ > {}; sleep 10 & wait", pgid_file.to_string_lossy());
@@ -1575,12 +1575,12 @@ mod tests {
     #[tokio::test]
     async fn leader_exit_still_kills_term_ignoring_pipe_holder_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         let empty = Vec::new();
         let mut ask = invocation(
@@ -1622,12 +1622,12 @@ mod tests {
     #[tokio::test]
     async fn unsupported_preflight_creates_no_effect() {
         let dir = tempfile::tempdir().unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let unsupported = EngineHandle {
             process_supervision_supported: false,
@@ -1654,12 +1654,12 @@ mod tests {
         let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let argv = vec!["git".into(), "diff".into(), "--ext-diff".into()];
         let env = BTreeMap::from([
@@ -1688,12 +1688,12 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn uncertain_group_probe_makes_started_effect_unknown() {
         let dir = tempfile::tempdir().unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let uncertain = EngineHandle {
             process_group_probe_override: Some(GroupProbe::Uncertain),
@@ -1738,7 +1738,7 @@ mod tests {
             grace_ms: 100,
             stdout_cap: 65536,
             stderr_cap: 1024,
-            run_revision: 1,
+            turn_revision: 1,
             effect_id: "effect-1",
             attempt: 1,
             approval_digest: None,
@@ -1900,8 +1900,8 @@ mod tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let ask = invocation(Some("echo test"), &[], "reissue-effect", &lease, None);
 

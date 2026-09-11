@@ -8,8 +8,8 @@
 use crate::prepare_server;
 use futures::StreamExt;
 use latte_core::{
-    FailureCode, ThreadCommandId, ThreadId, ThreadLifecycle, ThreadRunStatus, ThreadSessionSummary,
-    ThreadSnapshot, ThreadTransientProgress, TranscriptKind,
+    FailureCode, SessionCommandId, SessionId, SessionLifecycle, SessionSnapshot, SessionSummary,
+    SessionTransientProgress, SessionTurnStatus, TranscriptKind,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -258,9 +258,9 @@ fn next_value<'a, I: Iterator<Item = &'a String>>(
 ///
 /// # Errors
 /// Returns a usage error for malformed ids.
-pub fn parse_session_id(value: &str) -> Result<ThreadId, ClientError> {
+pub fn parse_session_id(value: &str) -> Result<SessionId, ClientError> {
     Uuid::parse_str(value)
-        .map(ThreadId::from_uuid)
+        .map(SessionId::from_uuid)
         .map_err(|_| ClientError::Usage(format!("invalid session id: {value}")))
 }
 
@@ -268,7 +268,7 @@ pub fn parse_session_id(value: &str) -> Result<ThreadId, ClientError> {
 // Terminal classification (pure, mirrors design doc §6.4)
 // ---------------------------------------------------------------------------
 
-/// The terminal outcome of a session, derived from lifecycle + latest run.
+/// The terminal outcome of a session, derived from lifecycle + latest turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Completed,
@@ -307,21 +307,21 @@ impl TerminalOutcome {
 /// Classifies a snapshot per the §6.4 exit-code table. Returns `None` while the
 /// session is still running.
 #[must_use]
-pub fn classify(snapshot: &ThreadSnapshot) -> Option<TerminalOutcome> {
+pub fn classify(snapshot: &SessionSnapshot) -> Option<TerminalOutcome> {
     match snapshot.lifecycle {
-        ThreadLifecycle::Running => None,
-        ThreadLifecycle::WaitingPermission | ThreadLifecycle::WaitingInput => {
+        SessionLifecycle::Running => None,
+        SessionLifecycle::WaitingPermission | SessionLifecycle::WaitingInput => {
             Some(TerminalOutcome::Waiting)
         }
-        ThreadLifecycle::Interrupted => Some(TerminalOutcome::Interrupted),
-        ThreadLifecycle::ReconciliationRequired => Some(TerminalOutcome::ReconciliationRequired),
-        ThreadLifecycle::Failed => Some(TerminalOutcome::Failed),
-        ThreadLifecycle::Ready => match latest_run(snapshot) {
-            Some(run) if run.status == ThreadRunStatus::Completed => {
+        SessionLifecycle::Interrupted => Some(TerminalOutcome::Interrupted),
+        SessionLifecycle::ReconciliationRequired => Some(TerminalOutcome::ReconciliationRequired),
+        SessionLifecycle::Failed => Some(TerminalOutcome::Failed),
+        SessionLifecycle::Ready => match latest_turn(snapshot) {
+            Some(turn) if turn.status == SessionTurnStatus::Completed => {
                 Some(TerminalOutcome::Completed)
             }
-            Some(run) if run.status == ThreadRunStatus::Failed => {
-                if run.failure_code == Some(FailureCode::PermissionDenied) {
+            Some(turn) if turn.status == SessionTurnStatus::Failed => {
+                if turn.failure_code == Some(FailureCode::PermissionDenied) {
                     Some(TerminalOutcome::Denied)
                 } else {
                     Some(TerminalOutcome::Failed)
@@ -332,24 +332,24 @@ pub fn classify(snapshot: &ThreadSnapshot) -> Option<TerminalOutcome> {
     }
 }
 
-/// The newest child run by ordinal.
-fn latest_run(snapshot: &ThreadSnapshot) -> Option<&latte_core::ThreadRunSummary> {
-    snapshot.runs.iter().max_by_key(|run| run.ordinal)
+/// The newest child turn by ordinal.
+fn latest_turn(snapshot: &SessionSnapshot) -> Option<&latte_core::SessionTurnSummary> {
+    snapshot.turns.iter().max_by_key(|turn| turn.ordinal)
 }
 
 /// The result of observing a session to completion.
 #[derive(Debug)]
-pub enum RunResult {
+pub enum TurnResult {
     /// The session reached a terminal state.
     Terminal {
-        snapshot: ThreadSnapshot,
+        snapshot: SessionSnapshot,
         outcome: TerminalOutcome,
     },
     /// The user interrupted locally (Ctrl+C); a best-effort cancel was sent.
-    Cancelled { snapshot: Option<ThreadSnapshot> },
+    Cancelled { snapshot: Option<SessionSnapshot> },
 }
 
-impl RunResult {
+impl TurnResult {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
@@ -367,7 +367,7 @@ impl RunResult {
     }
 
     #[must_use]
-    pub fn snapshot(&self) -> Option<&ThreadSnapshot> {
+    pub fn snapshot(&self) -> Option<&SessionSnapshot> {
         match self {
             Self::Terminal { snapshot, .. }
             | Self::Cancelled {
@@ -386,11 +386,11 @@ impl RunResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// Durable session state changed; refetch the snapshot.
-    ThreadChanged { session_id: String, revision: u64 },
+    SessionChanged { session_id: String, revision: u64 },
     /// Transient provider progress.
     Progress {
         session_id: String,
-        run_id: String,
+        turn_id: String,
         progress: Value,
     },
     /// The client fell behind or the server signalled a resync.
@@ -402,13 +402,13 @@ pub enum StreamEvent {
 pub fn parse_sse_frame(event_type: Option<&str>, data: &str) -> Option<StreamEvent> {
     let value: Value = serde_json::from_str(data).ok()?;
     match event_type {
-        Some("thread_changed") => Some(StreamEvent::ThreadChanged {
+        Some("session_changed") => Some(StreamEvent::SessionChanged {
             session_id: value.get("session_id")?.as_str()?.to_string(),
             revision: value.get("revision")?.as_u64()?,
         }),
         Some("progress") => Some(StreamEvent::Progress {
             session_id: value.get("session_id")?.as_str()?.to_string(),
-            run_id: value.get("run_id")?.as_str()?.to_string(),
+            turn_id: value.get("turn_id")?.as_str()?.to_string(),
             progress: value.get("progress")?.clone(),
         }),
         Some("resync_required") => Some(StreamEvent::ResyncRequired),
@@ -454,41 +454,41 @@ impl SseDecoder {
 /// are noise on the CLI and render as nothing.
 #[must_use]
 pub fn render_progress(progress: &Value) -> Option<String> {
-    let progress: ThreadTransientProgress = serde_json::from_value(progress.clone()).ok()?;
+    let progress: SessionTransientProgress = serde_json::from_value(progress.clone()).ok()?;
     match progress {
-        ThreadTransientProgress::AssistantDelta { text, .. } => Some(text),
-        ThreadTransientProgress::ToolProgress { name, detail, .. } => {
+        SessionTransientProgress::AssistantDelta { text, .. } => Some(text),
+        SessionTransientProgress::ToolProgress { name, detail, .. } => {
             Some(format!("[tool] {name}: {detail}\n"))
         }
-        ThreadTransientProgress::ProviderAttempt { .. } => None,
+        SessionTransientProgress::ProviderAttempt { .. } => None,
     }
 }
 
 /// The lifecycle's stable `snake_case` name (the serde representation).
 #[must_use]
-pub const fn lifecycle_name(lifecycle: ThreadLifecycle) -> &'static str {
+pub const fn lifecycle_name(lifecycle: SessionLifecycle) -> &'static str {
     match lifecycle {
-        ThreadLifecycle::Ready => "ready",
-        ThreadLifecycle::Running => "running",
-        ThreadLifecycle::WaitingPermission => "waiting_permission",
-        ThreadLifecycle::WaitingInput => "waiting_input",
-        ThreadLifecycle::Interrupted => "interrupted",
-        ThreadLifecycle::Failed => "failed",
-        ThreadLifecycle::ReconciliationRequired => "reconciliation_required",
+        SessionLifecycle::Ready => "ready",
+        SessionLifecycle::Running => "running",
+        SessionLifecycle::WaitingPermission => "waiting_permission",
+        SessionLifecycle::WaitingInput => "waiting_input",
+        SessionLifecycle::Interrupted => "interrupted",
+        SessionLifecycle::Failed => "failed",
+        SessionLifecycle::ReconciliationRequired => "reconciliation_required",
     }
 }
 
 /// Renders the human-readable session summary: header line plus the last
 /// assistant (or failure) message text.
 #[must_use]
-pub fn render_session_text(snapshot: &ThreadSnapshot) -> String {
+pub fn render_session_text(snapshot: &SessionSnapshot) -> String {
     let status = classify(snapshot).map_or_else(
         || lifecycle_name(snapshot.lifecycle),
         TerminalOutcome::status,
     );
     let mut out = format!(
         "session {}: {} (revision {})",
-        snapshot.thread_id, status, snapshot.revision
+        snapshot.session_id, status, snapshot.revision
     );
     if let Some(text) = last_message_text(snapshot) {
         out.push('\n');
@@ -499,16 +499,16 @@ pub fn render_session_text(snapshot: &ThreadSnapshot) -> String {
 
 /// Renders one session list row.
 #[must_use]
-pub fn render_session_row(snapshot: &ThreadSnapshot) -> String {
+pub fn render_session_row(snapshot: &SessionSnapshot) -> String {
     format!(
         "{}\t{}\trev {}",
-        snapshot.thread_id,
+        snapshot.session_id,
         lifecycle_name(snapshot.lifecycle),
         snapshot.revision
     )
 }
 
-fn last_message_text(snapshot: &ThreadSnapshot) -> Option<String> {
+fn last_message_text(snapshot: &SessionSnapshot) -> Option<String> {
     snapshot
         .transcript
         .entries
@@ -524,7 +524,7 @@ fn last_message_text(snapshot: &ThreadSnapshot) -> Option<String> {
 }
 
 #[must_use]
-pub fn run_envelope(result: &RunResult) -> Value {
+pub fn run_envelope(result: &TurnResult) -> Value {
     json!({
         "version": 2,
         "status": result.status(),
@@ -533,7 +533,7 @@ pub fn run_envelope(result: &RunResult) -> Value {
 }
 
 #[must_use]
-pub fn list_envelope(sessions: &[ThreadSnapshot]) -> Value {
+pub fn list_envelope(sessions: &[SessionSnapshot]) -> Value {
     json!({
         "version": 2,
         "status": "completed",
@@ -542,7 +542,7 @@ pub fn list_envelope(sessions: &[ThreadSnapshot]) -> Value {
 }
 
 #[must_use]
-pub fn session_envelope(snapshot: &ThreadSnapshot) -> Value {
+pub fn session_envelope(snapshot: &SessionSnapshot) -> Value {
     json!({
         "version": 2,
         "status": "completed",
@@ -575,8 +575,8 @@ pub trait SessionServer {
     async fn create_session(
         &mut self,
         workspace_id: &str,
-        thread_id: ThreadId,
-        command_id: ThreadCommandId,
+        session_id: SessionId,
+        command_id: SessionCommandId,
         prompt: &str,
         focus: Option<&Path>,
         binding: &Value,
@@ -588,24 +588,24 @@ pub trait SessionServer {
     /// turn must reuse it so the server replays instead of duplicating.
     async fn follow_up(
         &mut self,
-        session_id: &ThreadId,
-        command_id: &ThreadCommandId,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError>;
     /// Fetches the authoritative session snapshot.
-    async fn snapshot(&mut self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError>;
+    async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError>;
     /// Lists the workspace's durable sessions.
     async fn list_sessions(
         &mut self,
         workspace_id: &str,
-    ) -> Result<Vec<ThreadSnapshot>, ClientError>;
-    /// Requests cancellation of the active run.
+    ) -> Result<Vec<SessionSnapshot>, ClientError>;
+    /// Requests cancellation of the active turn.
     async fn cancel(
         &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
+        session_id: &SessionId,
+        session_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError>;
     /// Opens the workspace event stream; subsequent
     /// [`next_event`](Self::next_event) calls read from it.
@@ -627,22 +627,22 @@ pub async fn run_session(
     focus: Option<&Path>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     let workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
     let binding = tokio::select! {
         result = server.default_binding(&workspace_id) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
-    let thread_id = ThreadId::from_uuid(Uuid::now_v7());
-    let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+    let session_id = SessionId::from_uuid(Uuid::now_v7());
+    let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     tokio::select! {
         result = server.create_session(
             &workspace_id,
-            thread_id,
+            session_id,
             command_id,
             prompt,
             focus,
@@ -651,11 +651,11 @@ pub async fn run_session(
         () = &mut cancel => {
             // The session may have been created server-side even though the
             // response hasn't arrived; best-effort cancel to avoid leaving
-            // a background provider run.
-            return Ok(cancel_session(server, &thread_id).await);
+            // a background provider call.
+            return Ok(cancel_session(server, &session_id).await);
         }
     };
-    observe_session(server, &workspace_id, &thread_id, on_progress, cancel).await
+    observe_session(server, &workspace_id, &session_id, on_progress, cancel).await
 }
 
 /// Appends a follow-up turn and observes the session to a terminal state.
@@ -666,26 +666,33 @@ pub async fn resume_session(
     prompt: &str,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     let _workspace_id = tokio::select! {
         result = server.resolve_workspace(root) => result?,
-        () = &mut cancel => return Ok(RunResult::Cancelled { snapshot: None }),
+        () = &mut cancel => return Ok(TurnResult::Cancelled { snapshot: None }),
     };
-    let thread_id = parse_session_id(session_id)?;
+    let session_id = parse_session_id(session_id)?;
     let snapshot = tokio::select! {
-        result = server.snapshot(&thread_id) => result?,
-        () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
+        result = server.snapshot(&session_id) => result?,
+        () = &mut cancel => return Ok(cancel_session(server, &session_id).await),
     };
     // One stable command identity for the whole turn: every HTTP attempt of
     // this resume reuses it, so a crash-safe retry replays the acceptance
     // instead of appending a duplicate turn.
-    let command_id = ThreadCommandId::from_uuid(Uuid::now_v7());
+    let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     let (_, event_workspace_id) = tokio::select! {
-        result = server.follow_up(&thread_id, &command_id, snapshot.revision, prompt) => result?,
-        () = &mut cancel => return Ok(cancel_session(server, &thread_id).await),
+        result = server.follow_up(&session_id, &command_id, snapshot.revision, prompt) => result?,
+        () = &mut cancel => return Ok(cancel_session(server, &session_id).await),
     };
-    observe_session(server, &event_workspace_id, &thread_id, on_progress, cancel).await
+    observe_session(
+        server,
+        &event_workspace_id,
+        &session_id,
+        on_progress,
+        cancel,
+    )
+    .await
 }
 
 /// Observes a session to a terminal state: unconditional snapshot resync on
@@ -693,10 +700,10 @@ pub async fn resume_session(
 async fn observe_session(
     server: &mut impl SessionServer,
     workspace_id: &str,
-    session_id: &ThreadId,
+    session_id: &SessionId,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
-) -> Result<RunResult, ClientError> {
+) -> Result<TurnResult, ClientError> {
     let mut cancel = std::pin::pin!(cancel);
     // Resync before subscribing: a fast turn may already be terminal.
     let pre_terminal = tokio::select! {
@@ -771,7 +778,7 @@ async fn observe_session(
                     Some(StreamEvent::Progress { .. }) => {
                         // Progress for another session in the same workspace.
                     }
-                    Some(StreamEvent::ThreadChanged { .. } | StreamEvent::ResyncRequired) => {
+                    Some(StreamEvent::SessionChanged { .. } | StreamEvent::ResyncRequired) => {
                         let changed_terminal = tokio::select! {
                             result = check_terminal(server, session_id) => result?,
                             () = &mut cancel => return Ok(cancel_session(server, session_id).await),
@@ -788,21 +795,21 @@ async fn observe_session(
 
 async fn check_terminal(
     server: &mut impl SessionServer,
-    session_id: &ThreadId,
-) -> Result<Option<RunResult>, ClientError> {
+    session_id: &SessionId,
+) -> Result<Option<TurnResult>, ClientError> {
     let snapshot = server.snapshot(session_id).await?;
-    Ok(classify(&snapshot).map(|outcome| RunResult::Terminal { snapshot, outcome }))
+    Ok(classify(&snapshot).map(|outcome| TurnResult::Terminal { snapshot, outcome }))
 }
 
-async fn cancel_session(server: &mut impl SessionServer, session_id: &ThreadId) -> RunResult {
+async fn cancel_session(server: &mut impl SessionServer, session_id: &SessionId) -> TurnResult {
     let snapshot = server.snapshot(session_id).await.ok();
     if let Some(snapshot) = &snapshot {
-        let run_revision = latest_run(snapshot).map_or(0, |run| run.run_revision);
+        let turn_revision = latest_turn(snapshot).map_or(0, |turn| turn.turn_revision);
         let _ = server
-            .cancel(session_id, snapshot.revision, run_revision)
+            .cancel(session_id, snapshot.revision, turn_revision)
             .await;
     }
-    RunResult::Cancelled { snapshot }
+    TurnResult::Cancelled { snapshot }
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,7 +1115,7 @@ impl ServerHandle {
     pub async fn list_sessions(
         &self,
         workspace_id: &str,
-    ) -> Result<Vec<ThreadSnapshot>, ClientError> {
+    ) -> Result<Vec<SessionSnapshot>, ClientError> {
         self.fetch_all_sessions(
             &format!("/v1/workspaces/{workspace_id}/sessions?limit=200"),
             "sessions list",
@@ -1117,7 +1124,7 @@ impl ServerHandle {
     }
 
     /// Fetches the authoritative snapshot for one session.
-    pub async fn snapshot(&self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
+    pub async fn snapshot(&self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError> {
         let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
         let snapshot = value
             .get("snapshot")
@@ -1130,8 +1137,8 @@ impl ServerHandle {
     /// Fetches a session snapshot, returning `None` if the session does not exist.
     pub async fn try_snapshot(
         &self,
-        session_id: &ThreadId,
-    ) -> Result<Option<ThreadSnapshot>, ClientError> {
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSnapshot>, ClientError> {
         match self.snapshot(session_id).await {
             Ok(snapshot) => Ok(Some(snapshot)),
             Err(ClientError::NotFound(_)) => Ok(None),
@@ -1143,13 +1150,13 @@ impl ServerHandle {
     pub async fn create_session(
         &self,
         workspace_id: &str,
-        thread_id: ThreadId,
-        command_id: ThreadCommandId,
+        session_id: SessionId,
+        command_id: SessionCommandId,
         prompt: &str,
         binding: &Value,
     ) -> Result<u64, ClientError> {
         let body = json!({
-            "thread_id": thread_id.to_string(),
+            "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
@@ -1173,15 +1180,15 @@ impl ServerHandle {
     /// instead of appending a duplicate turn.
     pub async fn follow_up(
         &self,
-        session_id: &ThreadId,
-        command_id: &ThreadCommandId,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(), ClientError> {
         let body = json!({
             "command_id": command_id.to_string(),
             "prompt": prompt,
-            "expected_thread_revision": expected_revision,
+            "expected_session_revision": expected_revision,
         });
         self.post(
             &format!("/v1/sessions/{session_id}/follow-up"),
@@ -1192,16 +1199,16 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Requests cancellation of the active run.
+    /// Requests cancellation of the active turn.
     pub async fn cancel(
         &self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
+        session_id: &SessionId,
+        session_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError> {
         let body = json!({
-            "expected_thread_revision": thread_revision,
-            "expected_run_revision": run_revision,
+            "expected_session_revision": session_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
             .await?;
@@ -1211,7 +1218,7 @@ impl ServerHandle {
     /// Renames a session.
     pub async fn rename_session(
         &self,
-        session_id: &ThreadId,
+        session_id: &SessionId,
         title: &str,
     ) -> Result<(), ClientError> {
         self.patch(
@@ -1222,12 +1229,12 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Forks a session. Returns the new fork's thread id.
+    /// Forks a session. Returns the new fork's session id.
     pub async fn fork_session(
         &self,
-        session_id: &ThreadId,
+        session_id: &SessionId,
         title: Option<&str>,
-    ) -> Result<ThreadId, ClientError> {
+    ) -> Result<SessionId, ClientError> {
         let body = match title {
             Some(title) => json!({ "title": title }),
             None => json!({}),
@@ -1238,23 +1245,23 @@ impl ServerHandle {
         let snapshot = value
             .get("snapshot")
             .ok_or_else(|| ClientError::Failed("fork response missing snapshot".into()))?;
-        let thread_id = snapshot
-            .get("thread_id")
+        let session_id = snapshot
+            .get("session_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| ClientError::Failed("fork snapshot missing thread_id".into()))?;
-        parse_session_id(thread_id)
+            .ok_or_else(|| ClientError::Failed("fork snapshot missing session_id".into()))?;
+        parse_session_id(session_id)
     }
 
     /// Switches the model binding for a session.
     pub async fn switch_model(
         &self,
-        session_id: &ThreadId,
+        session_id: &SessionId,
         expected_revision: u64,
         binding: &Value,
     ) -> Result<(), ClientError> {
         let body = json!({
             "binding": binding,
-            "expected_thread_revision": expected_revision,
+            "expected_session_revision": expected_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/model"), body, None)
             .await?;
@@ -1264,7 +1271,7 @@ impl ServerHandle {
     /// Queues a follow-up prompt for a busy session. Returns the queue position.
     pub async fn queue_follow_up(
         &self,
-        session_id: &ThreadId,
+        session_id: &SessionId,
         prompt: &str,
     ) -> Result<u64, ClientError> {
         let value = self
@@ -1283,17 +1290,17 @@ impl ServerHandle {
     /// Provides input for a waiting-input session.
     pub async fn provide_input(
         &self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
+        session_id: &SessionId,
+        session_revision: u64,
+        turn_revision: u64,
         request_id: &str,
         value: &str,
     ) -> Result<(), ClientError> {
         let body = json!({
             "request_id": request_id,
             "value": value,
-            "expected_thread_revision": thread_revision,
-            "expected_run_revision": run_revision,
+            "expected_session_revision": session_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/input"), body, None)
             .await?;
@@ -1303,16 +1310,16 @@ impl ServerHandle {
     /// Resolves a pending permission request.
     pub async fn resolve_permission(
         &self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
+        session_id: &SessionId,
+        session_revision: u64,
+        turn_revision: u64,
         request_id: &str,
         allow: bool,
     ) -> Result<(), ClientError> {
         let body = json!({
             "allow": allow,
-            "expected_thread_revision": thread_revision,
-            "expected_run_revision": run_revision,
+            "expected_session_revision": session_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
@@ -1326,7 +1333,7 @@ impl ServerHandle {
     /// Reconciles an unknown effect (aborts the child process).
     pub async fn reconcile_effect(
         &self,
-        session_id: &ThreadId,
+        session_id: &SessionId,
         effect_id: &str,
     ) -> Result<(), ClientError> {
         self.post(
@@ -1344,7 +1351,7 @@ impl ServerHandle {
         &self,
         workspace_id: &str,
         query: &str,
-    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+    ) -> Result<Vec<SessionSummary>, ClientError> {
         self.fetch_all_sessions(
             &format!(
                 "/v1/workspaces/{workspace_id}/sessions/search?q={}&limit=200",
@@ -1362,7 +1369,7 @@ impl ServerHandle {
         &self,
         workspace_id: &str,
         title: &str,
-    ) -> Result<Vec<ThreadSessionSummary>, ClientError> {
+    ) -> Result<Vec<SessionSummary>, ClientError> {
         self.fetch_all_sessions(
             &format!(
                 "/v1/workspaces/{workspace_id}/sessions/exact-title?q={}&limit=200",
@@ -1523,14 +1530,14 @@ impl SessionServer for ServerClient {
     async fn create_session(
         &mut self,
         workspace_id: &str,
-        thread_id: ThreadId,
-        command_id: ThreadCommandId,
+        session_id: SessionId,
+        command_id: SessionCommandId,
         prompt: &str,
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError> {
         let body = json!({
-            "thread_id": thread_id.to_string(),
+            "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
@@ -1551,15 +1558,15 @@ impl SessionServer for ServerClient {
 
     async fn follow_up(
         &mut self,
-        session_id: &ThreadId,
-        command_id: &ThreadCommandId,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError> {
         let body = json!({
             "command_id": command_id.to_string(),
             "prompt": prompt,
-            "expected_thread_revision": expected_revision,
+            "expected_session_revision": expected_revision,
         });
         // Follow-up is a durable mutation: the stable command_id doubles as
         // the Idempotency-Key so a timeout/retry replays instead of
@@ -1585,7 +1592,7 @@ impl SessionServer for ServerClient {
         Ok((revision, workspace_id))
     }
 
-    async fn snapshot(&mut self, session_id: &ThreadId) -> Result<ThreadSnapshot, ClientError> {
+    async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError> {
         let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
         let snapshot = value
             .get("snapshot")
@@ -1598,7 +1605,7 @@ impl SessionServer for ServerClient {
     async fn list_sessions(
         &mut self,
         workspace_id: &str,
-    ) -> Result<Vec<ThreadSnapshot>, ClientError> {
+    ) -> Result<Vec<SessionSnapshot>, ClientError> {
         // Follow cursor pagination so sessions beyond the first page are not
         // silently dropped (regression guard: clients must honor next_cursor).
         self.handle
@@ -1611,13 +1618,13 @@ impl SessionServer for ServerClient {
 
     async fn cancel(
         &mut self,
-        session_id: &ThreadId,
-        thread_revision: u64,
-        run_revision: u64,
+        session_id: &SessionId,
+        session_revision: u64,
+        turn_revision: u64,
     ) -> Result<(), ClientError> {
         let body = json!({
-            "expected_thread_revision": thread_revision,
-            "expected_run_revision": run_revision,
+            "expected_session_revision": session_revision,
+            "expected_turn_revision": turn_revision,
         });
         self.post(&format!("/v1/sessions/{session_id}/cancel"), body, None)
             .await?;
@@ -1686,13 +1693,13 @@ impl SessionServer for ServerClient {
 mod tests {
     use super::*;
     use latte_core::{
-        RunId, ThreadProviderBindingV2, ThreadRunSummary, TranscriptEntry, TranscriptEntryId,
-        TranscriptPage,
+        SessionProviderBinding, SessionTurnSummary, TranscriptEntry, TranscriptEntryId,
+        TranscriptPage, TurnId,
     };
     use std::sync::{Arc, Mutex};
 
-    fn binding() -> ThreadProviderBindingV2 {
-        ThreadProviderBindingV2 {
+    fn binding() -> SessionProviderBinding {
+        SessionProviderBinding {
             version: 1,
             provider_name: "main".into(),
             provider_type: "openai-chat".into(),
@@ -1707,17 +1714,17 @@ mod tests {
         }
     }
 
-    fn snapshot(lifecycle: ThreadLifecycle, runs: Vec<ThreadRunSummary>) -> ThreadSnapshot {
-        ThreadSnapshot {
-            thread_id: ThreadId::from_uuid(Uuid::now_v7()),
+    fn snapshot(lifecycle: SessionLifecycle, runs: Vec<SessionTurnSummary>) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: SessionId::from_uuid(Uuid::now_v7()),
             revision: 1,
             sequence: 0,
             lifecycle,
             binding: binding(),
-            latest_run_id: runs.last().map(|run| run.run_id),
-            active_run_id: None,
+            latest_turn_id: runs.last().map(|run| run.turn_id),
+            active_turn_id: None,
             pending: None,
-            runs,
+            turns: runs,
             transcript: TranscriptPage {
                 entries: Vec::new(),
                 next_after: None,
@@ -1727,13 +1734,16 @@ mod tests {
         }
     }
 
-    fn run_summary(status: ThreadRunStatus, failure_code: Option<FailureCode>) -> ThreadRunSummary {
-        ThreadRunSummary {
-            run_id: RunId::from_uuid(Uuid::now_v7()),
-            parent_run_id: None,
+    fn turn_summary(
+        status: SessionTurnStatus,
+        failure_code: Option<FailureCode>,
+    ) -> SessionTurnSummary {
+        SessionTurnSummary {
+            turn_id: TurnId::from_uuid(Uuid::now_v7()),
+            parent_turn_id: None,
             ordinal: 1,
             status,
-            run_revision: 1,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code,
         }
@@ -1843,20 +1853,20 @@ mod tests {
 
     #[test]
     fn lifecycle_name_covers_every_variant() {
-        assert_eq!(lifecycle_name(ThreadLifecycle::Ready), "ready");
-        assert_eq!(lifecycle_name(ThreadLifecycle::Running), "running");
+        assert_eq!(lifecycle_name(SessionLifecycle::Ready), "ready");
+        assert_eq!(lifecycle_name(SessionLifecycle::Running), "running");
         assert_eq!(
-            lifecycle_name(ThreadLifecycle::WaitingPermission),
+            lifecycle_name(SessionLifecycle::WaitingPermission),
             "waiting_permission"
         );
         assert_eq!(
-            lifecycle_name(ThreadLifecycle::WaitingInput),
+            lifecycle_name(SessionLifecycle::WaitingInput),
             "waiting_input"
         );
-        assert_eq!(lifecycle_name(ThreadLifecycle::Interrupted), "interrupted");
-        assert_eq!(lifecycle_name(ThreadLifecycle::Failed), "failed");
+        assert_eq!(lifecycle_name(SessionLifecycle::Interrupted), "interrupted");
+        assert_eq!(lifecycle_name(SessionLifecycle::Failed), "failed");
         assert_eq!(
-            lifecycle_name(ThreadLifecycle::ReconciliationRequired),
+            lifecycle_name(SessionLifecycle::ReconciliationRequired),
             "reconciliation_required"
         );
     }
@@ -1865,19 +1875,19 @@ mod tests {
 
     #[test]
     fn classifies_every_terminal_state() {
-        assert_eq!(classify(&snapshot(ThreadLifecycle::Running, vec![])), None);
+        assert_eq!(classify(&snapshot(SessionLifecycle::Running, vec![])), None);
         assert_eq!(
             classify(&snapshot(
-                ThreadLifecycle::Ready,
-                vec![run_summary(ThreadRunStatus::Completed, None)]
+                SessionLifecycle::Ready,
+                vec![turn_summary(SessionTurnStatus::Completed, None)]
             )),
             Some(TerminalOutcome::Completed)
         );
         assert_eq!(
             classify(&snapshot(
-                ThreadLifecycle::Ready,
-                vec![run_summary(
-                    ThreadRunStatus::Failed,
+                SessionLifecycle::Ready,
+                vec![turn_summary(
+                    SessionTurnStatus::Failed,
                     Some(FailureCode::PermissionDenied)
                 )]
             )),
@@ -1885,43 +1895,43 @@ mod tests {
         );
         assert_eq!(
             classify(&snapshot(
-                ThreadLifecycle::Ready,
-                vec![run_summary(ThreadRunStatus::Failed, None)]
+                SessionLifecycle::Ready,
+                vec![turn_summary(SessionTurnStatus::Failed, None)]
             )),
             Some(TerminalOutcome::Failed)
         );
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::WaitingPermission, vec![])),
+            classify(&snapshot(SessionLifecycle::WaitingPermission, vec![])),
             Some(TerminalOutcome::Waiting)
         );
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::WaitingInput, vec![])),
+            classify(&snapshot(SessionLifecycle::WaitingInput, vec![])),
             Some(TerminalOutcome::Waiting)
         );
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::Interrupted, vec![])),
+            classify(&snapshot(SessionLifecycle::Interrupted, vec![])),
             Some(TerminalOutcome::Interrupted)
         );
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::ReconciliationRequired, vec![])),
+            classify(&snapshot(SessionLifecycle::ReconciliationRequired, vec![])),
             Some(TerminalOutcome::ReconciliationRequired)
         );
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::Failed, vec![])),
+            classify(&snapshot(SessionLifecycle::Failed, vec![])),
             Some(TerminalOutcome::Failed)
         );
         // Ready without a usable run still terminates as failed.
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::Ready, vec![])),
+            classify(&snapshot(SessionLifecycle::Ready, vec![])),
             Some(TerminalOutcome::Failed)
         );
         // The newest run by ordinal wins.
-        let mut older = run_summary(ThreadRunStatus::Failed, None);
+        let mut older = turn_summary(SessionTurnStatus::Failed, None);
         older.ordinal = 1;
-        let mut newer = run_summary(ThreadRunStatus::Completed, None);
+        let mut newer = turn_summary(SessionTurnStatus::Completed, None);
         newer.ordinal = 2;
         assert_eq!(
-            classify(&snapshot(ThreadLifecycle::Ready, vec![older, newer])),
+            classify(&snapshot(SessionLifecycle::Ready, vec![older, newer])),
             Some(TerminalOutcome::Completed)
         );
     }
@@ -1950,17 +1960,17 @@ mod tests {
     fn decodes_sse_frames() {
         assert_eq!(
             parse_sse_frame(
-                Some("thread_changed"),
+                Some("session_changed"),
                 r#"{"session_id":"01900000-0000-7000-8000-000000000001","revision":7}"#
             ),
-            Some(StreamEvent::ThreadChanged {
+            Some(StreamEvent::SessionChanged {
                 session_id: "01900000-0000-7000-8000-000000000001".into(),
                 revision: 7
             })
         );
         let progress = parse_sse_frame(
             Some("progress"),
-            r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"hi"}}"#,
+            r#"{"session_id":"s","turn_id":"r","progress":{"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"hi"}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1975,13 +1985,13 @@ mod tests {
             Some(StreamEvent::ResyncRequired)
         );
         assert_eq!(parse_sse_frame(Some("unknown"), "{}"), None);
-        assert_eq!(parse_sse_frame(Some("thread_changed"), "not json"), None);
+        assert_eq!(parse_sse_frame(Some("session_changed"), "not json"), None);
     }
 
     #[test]
     fn sse_decoder_accumulates_frames() {
         let mut decoder = SseDecoder::default();
-        assert!(decoder.line("event: thread_changed").is_none());
+        assert!(decoder.line("event: session_changed").is_none());
         assert!(
             decoder
                 .line("data: {\"session_id\":\"s\",\"revision\":1}")
@@ -1990,7 +2000,7 @@ mod tests {
         let event = decoder.line("").unwrap();
         assert_eq!(
             event,
-            StreamEvent::ThreadChanged {
+            StreamEvent::SessionChanged {
                 session_id: "s".into(),
                 revision: 1
             }
@@ -2002,15 +2012,15 @@ mod tests {
 
     #[test]
     fn progress_rendering_covers_every_variant() {
-        let run_id = "01900000-0000-7000-8000-000000000001";
-        let delta = serde_json::json!({"type":"assistant_delta","run_id":run_id,"text":"hello"});
+        let turn_id = "01900000-0000-7000-8000-000000000001";
+        let delta = serde_json::json!({"type":"assistant_delta","turn_id":turn_id,"text":"hello"});
         assert_eq!(render_progress(&delta), Some("hello".into()));
-        let tool = serde_json::json!({"type":"tool_progress","run_id":run_id,"name":"read","detail":"src/lib.rs"});
+        let tool = serde_json::json!({"type":"tool_progress","turn_id":turn_id,"name":"read","detail":"src/lib.rs"});
         assert_eq!(
             render_progress(&tool),
             Some("[tool] read: src/lib.rs\n".into())
         );
-        let attempt = serde_json::json!({"type":"provider_attempt","run_id":run_id,"number":1});
+        let attempt = serde_json::json!({"type":"provider_attempt","turn_id":turn_id,"number":1});
         assert_eq!(render_progress(&attempt), None);
         assert_eq!(render_progress(&serde_json::json!({"type":"bogus"})), None);
     }
@@ -2020,13 +2030,13 @@ mod tests {
     #[test]
     fn renders_session_text_and_rows() {
         let mut snapshot = snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         );
         snapshot.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "final answer".into(),
             payload: None,
@@ -2040,7 +2050,7 @@ mod tests {
         let row = render_session_row(&snapshot);
         assert!(row.contains("\tready\trev 1"));
         assert_eq!(
-            lifecycle_name(ThreadLifecycle::WaitingPermission),
+            lifecycle_name(SessionLifecycle::WaitingPermission),
             "waiting_permission"
         );
     }
@@ -2048,10 +2058,10 @@ mod tests {
     #[test]
     fn envelopes_use_version_2() {
         let snapshot = snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         );
-        let result = RunResult::Terminal {
+        let result = TurnResult::Terminal {
             snapshot: snapshot.clone(),
             outcome: TerminalOutcome::Completed,
         };
@@ -2059,20 +2069,20 @@ mod tests {
         assert_eq!(envelope["version"], 2);
         assert_eq!(envelope["status"], "completed");
         assert!(envelope["data"]["session"].is_object());
-        let cancelled = RunResult::Cancelled {
+        let cancelled = TurnResult::Cancelled {
             snapshot: Some(snapshot.clone()),
         };
         assert_eq!(run_envelope(&cancelled)["status"], "cancelled");
         assert!(
-            run_envelope(&RunResult::Cancelled { snapshot: None })["data"]["session"].is_null()
+            run_envelope(&TurnResult::Cancelled { snapshot: None })["data"]["session"].is_null()
         );
         assert_eq!(
-            list_envelope(std::slice::from_ref(&snapshot))["data"]["sessions"][0]["thread_id"],
-            snapshot.thread_id.to_string()
+            list_envelope(std::slice::from_ref(&snapshot))["data"]["sessions"][0]["session_id"],
+            snapshot.session_id.to_string()
         );
         assert_eq!(
-            session_envelope(&snapshot)["data"]["session"]["thread_id"],
-            snapshot.thread_id.to_string()
+            session_envelope(&snapshot)["data"]["session"]["session_id"],
+            snapshot.session_id.to_string()
         );
         let error = ClientError::Unreachable("nope".into());
         assert_eq!(
@@ -2098,7 +2108,7 @@ mod tests {
     struct MockServer {
         workspace_id: String,
         binding: Value,
-        snapshots: Mutex<std::collections::VecDeque<Result<ThreadSnapshot, ClientError>>>,
+        snapshots: Mutex<std::collections::VecDeque<Result<SessionSnapshot, ClientError>>>,
         events: Mutex<std::collections::VecDeque<Option<StreamEvent>>>,
         created: Mutex<Vec<(String, String, Option<String>)>>,
         followed_up: Mutex<Vec<(String, String, u64, String)>>,
@@ -2152,7 +2162,7 @@ mod tests {
             }
         }
 
-        fn push_snapshot(&self, snapshot: ThreadSnapshot) {
+        fn push_snapshot(&self, snapshot: SessionSnapshot) {
             self.snapshots.lock().unwrap().push_back(Ok(snapshot));
         }
 
@@ -2199,8 +2209,8 @@ mod tests {
         async fn create_session(
             &mut self,
             _workspace_id: &str,
-            thread_id: ThreadId,
-            command_id: ThreadCommandId,
+            session_id: SessionId,
+            command_id: SessionCommandId,
             prompt: &str,
             focus: Option<&Path>,
             _binding: &Value,
@@ -2215,7 +2225,7 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             self.created.lock().unwrap().push((
-                thread_id.to_string(),
+                session_id.to_string(),
                 prompt.to_string(),
                 focus.map(|path| path.display().to_string()),
             ));
@@ -2225,8 +2235,8 @@ mod tests {
 
         async fn follow_up(
             &mut self,
-            session_id: &ThreadId,
-            command_id: &ThreadCommandId,
+            session_id: &SessionId,
+            command_id: &SessionCommandId,
             expected_revision: u64,
             prompt: &str,
         ) -> Result<(u64, String), ClientError> {
@@ -2247,8 +2257,8 @@ mod tests {
 
         async fn snapshot(
             &mut self,
-            _session_id: &ThreadId,
-        ) -> Result<ThreadSnapshot, ClientError> {
+            _session_id: &SessionId,
+        ) -> Result<SessionSnapshot, ClientError> {
             let should_fire = {
                 let mut guard = self.snapshot_gate.lock().unwrap();
                 match guard.as_mut() {
@@ -2277,21 +2287,21 @@ mod tests {
         async fn list_sessions(
             &mut self,
             _workspace_id: &str,
-        ) -> Result<Vec<ThreadSnapshot>, ClientError> {
+        ) -> Result<Vec<SessionSnapshot>, ClientError> {
             *self.listed.lock().unwrap() += 1;
             Ok(Vec::new())
         }
 
         async fn cancel(
             &mut self,
-            _session_id: &ThreadId,
-            thread_revision: u64,
-            run_revision: u64,
+            _session_id: &SessionId,
+            session_revision: u64,
+            turn_revision: u64,
         ) -> Result<(), ClientError> {
             self.cancelled
                 .lock()
                 .unwrap()
-                .push((thread_revision, run_revision));
+                .push((session_revision, turn_revision));
             Ok(())
         }
 
@@ -2344,11 +2354,11 @@ mod tests {
             Ok(event.map(|event| match (created_id, event) {
                 (
                     Some(created),
-                    StreamEvent::ThreadChanged {
+                    StreamEvent::SessionChanged {
                         session_id,
                         revision,
                     },
-                ) if session_id == "self" => StreamEvent::ThreadChanged {
+                ) if session_id == "self" => StreamEvent::SessionChanged {
                     session_id: created,
                     revision,
                 },
@@ -2356,12 +2366,12 @@ mod tests {
                     Some(created),
                     StreamEvent::Progress {
                         session_id,
-                        run_id,
+                        turn_id,
                         progress,
                     },
                 ) if session_id == "self" => StreamEvent::Progress {
                     session_id: created,
-                    run_id,
+                    turn_id,
                     progress,
                 },
                 (_, other) => other,
@@ -2372,8 +2382,8 @@ mod tests {
     fn assistant_progress(session_id: &str) -> StreamEvent {
         StreamEvent::Progress {
             session_id: session_id.into(),
-            run_id: "01900000-0000-7000-8000-000000000001".into(),
-            progress: json!({"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"chunk"}),
+            turn_id: "01900000-0000-7000-8000-000000000001".into(),
+            progress: json!({"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"chunk"}),
         }
     }
 
@@ -2381,18 +2391,18 @@ mod tests {
     async fn run_session_streams_progress_and_completes() {
         let mut server = MockServer::new();
         // observe: resync (running), post-connect resync (running), then events.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // Another session's progress must not leak into this run's output.
         server.push_event(assistant_progress("other-session"));
         server.push_event(assistant_progress("self"));
-        server.push_event(StreamEvent::ThreadChanged {
+        server.push_event(StreamEvent::SessionChanged {
             session_id: "self".into(),
             revision: 2,
         });
         server.push_snapshot(snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let mut printed = String::new();
         let result = run_session(
@@ -2418,35 +2428,35 @@ mod tests {
     async fn run_session_maps_every_terminal_outcome() {
         for (lifecycle, runs, expected_code, expected_status) in [
             (
-                ThreadLifecycle::Ready,
-                vec![run_summary(ThreadRunStatus::Completed, None)],
+                SessionLifecycle::Ready,
+                vec![turn_summary(SessionTurnStatus::Completed, None)],
                 0,
                 "completed",
             ),
             (
-                ThreadLifecycle::Ready,
-                vec![run_summary(
-                    ThreadRunStatus::Failed,
+                SessionLifecycle::Ready,
+                vec![turn_summary(
+                    SessionTurnStatus::Failed,
                     Some(FailureCode::PermissionDenied),
                 )],
                 11,
                 "denied",
             ),
             (
-                ThreadLifecycle::Ready,
-                vec![run_summary(ThreadRunStatus::Failed, None)],
+                SessionLifecycle::Ready,
+                vec![turn_summary(SessionTurnStatus::Failed, None)],
                 1,
                 "failed",
             ),
-            (ThreadLifecycle::WaitingPermission, vec![], 10, "waiting"),
-            (ThreadLifecycle::Interrupted, vec![], 130, "interrupted"),
+            (SessionLifecycle::WaitingPermission, vec![], 10, "waiting"),
+            (SessionLifecycle::Interrupted, vec![], 130, "interrupted"),
             (
-                ThreadLifecycle::ReconciliationRequired,
+                SessionLifecycle::ReconciliationRequired,
                 vec![],
                 1,
                 "reconciliation_required",
             ),
-            (ThreadLifecycle::Failed, vec![], 1, "failed"),
+            (SessionLifecycle::Failed, vec![], 1, "failed"),
         ] {
             let mut server = MockServer::new();
             server.push_snapshot(snapshot(lifecycle, runs));
@@ -2470,9 +2480,9 @@ mod tests {
         let (observe_tx, observe_rx) = tokio::sync::oneshot::channel::<()>();
         let mut server = MockServer::new();
         server.observe_signal = Some(observe_tx);
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // The cancel future can only complete after `open_events` fires, which
         // happens inside `observe_session` — so init (resolve/binding/create)
         // is guaranteed to have finished and the cancel deterministically
@@ -2532,12 +2542,12 @@ mod tests {
         server.reconnect_signal = Some(reconnect_tx);
         server.park_reconnect = true;
         // observe: pre-subscribe resync (running), post-connect resync (running)
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // reconnect: resync (running), then cancel_session's snapshot
         server.end_stream();
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = reconnect_rx.await;
         };
@@ -2559,18 +2569,18 @@ mod tests {
     #[tokio::test]
     async fn run_session_reconnects_after_stream_end() {
         let mut server = MockServer::new();
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.end_stream();
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // second stream: a change event then terminal snapshot.
-        server.push_event(StreamEvent::ThreadChanged {
+        server.push_event(StreamEvent::SessionChanged {
             session_id: "s".into(),
             revision: 3,
         });
         server.push_snapshot(snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = run_session(
             &mut server,
@@ -2590,17 +2600,17 @@ mod tests {
     async fn run_session_reconnects_after_sse_read_error() {
         let mut server = MockServer::new();
         // Initial check: running.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // Post-connect resync: still running.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // Simulate a transient SSE read error.
         *server.read_error_once.lock().unwrap() = true;
         // Reconnect resync: still running.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // Post-reconnect resync: terminal.
         server.push_snapshot(snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = run_session(
             &mut server,
@@ -2653,13 +2663,13 @@ mod tests {
         let id = "01900000-0000-7000-8000-000000000001";
         // Revision fetch (Ready), pre-subscribe resync, post-connect resync,
         // then the resync event's terminal snapshot.
-        server.push_snapshot(snapshot(ThreadLifecycle::Ready, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Ready, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.push_event(StreamEvent::ResyncRequired);
         server.push_snapshot(snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = resume_session(
             &mut server,
@@ -2686,13 +2696,13 @@ mod tests {
         // subscription must use the session's workspace, not the cwd's.
         let mut server = MockServer::new();
         let id = "01900000-0000-7000-8000-000000000001";
-        server.push_snapshot(snapshot(ThreadLifecycle::Ready, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Ready, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.push_event(StreamEvent::ResyncRequired);
         server.push_snapshot(snapshot(
-            ThreadLifecycle::Ready,
-            vec![run_summary(ThreadRunStatus::Completed, None)],
+            SessionLifecycle::Ready,
+            vec![turn_summary(SessionTurnStatus::Completed, None)],
         ));
         let result = resume_session(
             &mut server,
@@ -2797,7 +2807,7 @@ mod tests {
             api.created.fetch_add(1, Ordering::SeqCst);
             (
                 axum::http::StatusCode::ACCEPTED,
-                axum::Json(json!({ "session_id": body["thread_id"], "accepted_revision": 3 })),
+                axum::Json(json!({ "session_id": body["session_id"], "accepted_revision": 3 })),
             )
         }
 
@@ -2805,7 +2815,7 @@ mod tests {
             (
                 axum::http::StatusCode::OK,
                 axum::Json(json!({ "snapshot": {
-                    "thread_id": id,
+                    "session_id": id,
                     "revision": 3,
                     "sequence": 0,
                     "lifecycle": "ready",
@@ -2816,9 +2826,9 @@ mod tests {
                         "credential_ref_id": "env:K", "data_scope_id": "main/mock",
                         "credential_generation": 0
                     },
-                    "latest_run_id": null,
-                    "active_run_id": null,
-                    "runs": [],
+                    "latest_turn_id": null,
+                    "active_turn_id": null,
+                    "turns": [],
                     "transcript": { "entries": [], "next_after": null, "has_more": false }
                 } })),
             )
@@ -2837,7 +2847,7 @@ mod tests {
             headers: axum::http::HeaderMap,
             axum::Json(body): axum::Json<Value>,
         ) -> impl IntoResponse {
-            assert_eq!(body["expected_thread_revision"], 1);
+            assert_eq!(body["expected_session_revision"], 1);
             assert!(
                 body["command_id"]
                     .as_str()
@@ -2869,7 +2879,7 @@ mod tests {
             assert!(body.get("title").is_some(), "rename requires title");
             (
                 axum::http::StatusCode::OK,
-                axum::Json(json!({ "snapshot": { "thread_id": id, "revision": 1 } })),
+                axum::Json(json!({ "snapshot": { "session_id": id, "revision": 1 } })),
             )
         }
 
@@ -2877,7 +2887,7 @@ mod tests {
             let fork_id = Uuid::now_v7().to_string();
             (
                 axum::http::StatusCode::OK,
-                axum::Json(json!({ "snapshot": { "thread_id": fork_id, "revision": 1 } })),
+                axum::Json(json!({ "snapshot": { "session_id": fork_id, "revision": 1 } })),
             )
         }
 
@@ -2890,8 +2900,8 @@ mod tests {
                 "switch_model requires binding"
             );
             assert!(
-                body.get("expected_thread_revision").is_some(),
-                "switch_model requires expected_thread_revision"
+                body.get("expected_session_revision").is_some(),
+                "switch_model requires expected_session_revision"
             );
             axum::http::StatusCode::OK
         }
@@ -2945,7 +2955,7 @@ mod tests {
         async fn events() -> impl IntoResponse {
             let stream = futures::stream::iter([Ok::<_, std::convert::Infallible>(
                 axum::response::sse::Event::default()
-                    .event("thread_changed")
+                    .event("session_changed")
                     .data(r#"{"session_id":"s","revision":9}"#),
             )]);
             axum::response::sse::Sse::new(stream)
@@ -3029,8 +3039,8 @@ mod tests {
         let revision = client
             .create_session(
                 &ws,
-                ThreadId::from_uuid(Uuid::now_v7()),
-                ThreadCommandId::from_uuid(Uuid::now_v7()),
+                SessionId::from_uuid(Uuid::now_v7()),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 "hello",
                 None,
                 &binding,
@@ -3039,7 +3049,7 @@ mod tests {
             .unwrap();
         assert_eq!(revision, 3);
         let snapshot = client
-            .snapshot(&ThreadId::from_uuid(
+            .snapshot(&SessionId::from_uuid(
                 Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
             ))
             .await
@@ -3048,10 +3058,10 @@ mod tests {
         assert!(client.list_sessions(&ws).await.unwrap().is_empty());
         let revision = client
             .follow_up(
-                &ThreadId::from_uuid(
+                &SessionId::from_uuid(
                     Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
                 ),
-                &ThreadCommandId::from_uuid(Uuid::now_v7()),
+                &SessionCommandId::from_uuid(Uuid::now_v7()),
                 1,
                 "more",
             )
@@ -3064,7 +3074,7 @@ mod tests {
         let event = client.next_event().await.unwrap().unwrap();
         assert_eq!(
             event,
-            StreamEvent::ThreadChanged {
+            StreamEvent::SessionChanged {
                 session_id: "s".into(),
                 revision: 9
             }
@@ -3072,7 +3082,7 @@ mod tests {
         assert!(client.next_event().await.unwrap().is_none());
         client
             .cancel(
-                &ThreadId::from_uuid(
+                &SessionId::from_uuid(
                     Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
                 ),
                 1,
@@ -3083,7 +3093,7 @@ mod tests {
         // TUI operations go through ServerHandle (the TUI's production path),
         // not the SessionServer trait.
         let session_id =
-            ThreadId::from_uuid(Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap());
+            SessionId::from_uuid(Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap());
         client
             .handle()
             .rename_session(&session_id, "new title")
@@ -3166,7 +3176,7 @@ mod tests {
         };
         let mut client = mock.client("token");
         let error = client
-            .snapshot(&ThreadId::from_uuid(Uuid::now_v7()))
+            .snapshot(&SessionId::from_uuid(Uuid::now_v7()))
             .await
             .unwrap_err();
         assert_eq!(
@@ -3186,7 +3196,7 @@ mod tests {
         let server_requests = requests.clone();
         let summary = |id: &str| {
             json!({
-                "thread_id": id,
+                "session_id": id,
                 "title": format!("session {id}"),
                 "workspace_root": "/tmp/ws",
                 "lifecycle": "ready",
@@ -3244,11 +3254,11 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 3, "all three pages must be fetched");
         assert_eq!(
-            results[0].thread_id.to_string(),
+            results[0].session_id.to_string(),
             "01900000-0000-7000-8000-000000000100"
         );
         assert_eq!(
-            results[2].thread_id.to_string(),
+            results[2].session_id.to_string(),
             "01900000-0000-7000-8000-000000000300"
         );
         assert_eq!(
@@ -3391,7 +3401,7 @@ mod tests {
         let mock = mock_http_app(app).await;
         let client = mock.client("token");
         let handle = client.handle();
-        let id = ThreadId::from_uuid(Uuid::now_v7());
+        let id = SessionId::from_uuid(Uuid::now_v7());
 
         // resolve_workspace_id: missing workspace_id.
         let error = handle
@@ -3484,7 +3494,7 @@ mod tests {
         let mock = mock_http_app(app).await;
         let mut client = mock.client("token");
         let handle = client.handle();
-        let id = ThreadId::from_uuid(Uuid::now_v7());
+        let id = SessionId::from_uuid(Uuid::now_v7());
 
         // Invalid JSON body → Failed("invalid JSON from server").
         let error = handle.list_sessions("ws").await.unwrap_err();
@@ -3567,7 +3577,7 @@ mod tests {
         assert_eq!(second, "ws-cached");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // try_snapshot maps NotFound → None.
-        let id = ThreadId::from_uuid(Uuid::now_v7());
+        let id = SessionId::from_uuid(Uuid::now_v7());
         let handle = client.handle();
         assert!(handle.try_snapshot(&id).await.unwrap().is_none());
         let _ = mock;
@@ -3624,7 +3634,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let event = Event::default()
-                    .event("thread_changed")
+                    .event("session_changed")
                     .data(format!(r#"{{"session_id":"s","revision":{i}}}"#));
                 Some((Ok(event), i + 1))
             });
@@ -3823,7 +3833,7 @@ mod tests {
     #[tokio::test]
     async fn tui_rename_session_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle.rename_session(&unknown_id, "new title").await;
         assert!(matches!(result, Err(ClientError::NotFound(_))));
         embedded.shutdown().await;
@@ -3832,7 +3842,7 @@ mod tests {
     #[tokio::test]
     async fn tui_fork_session_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle.fork_session(&unknown_id, None).await;
         assert!(matches!(result, Err(ClientError::NotFound(_))));
         embedded.shutdown().await;
@@ -3841,7 +3851,7 @@ mod tests {
     #[tokio::test]
     async fn tui_switch_model_returns_error_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         // The server may reject the invalid binding (400) before checking
         // the session (404); either proves the HTTP round-trip works.
         let result = handle
@@ -3854,7 +3864,7 @@ mod tests {
     #[tokio::test]
     async fn tui_queue_follow_up_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle.queue_follow_up(&unknown_id, "prompt").await;
         assert!(matches!(result, Err(ClientError::NotFound(_))));
         embedded.shutdown().await;
@@ -3863,7 +3873,7 @@ mod tests {
     #[tokio::test]
     async fn tui_provide_input_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle
             .provide_input(&unknown_id, 0, 0, "req-1", "value")
             .await;
@@ -3874,7 +3884,7 @@ mod tests {
     #[tokio::test]
     async fn tui_resolve_permission_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle
             .resolve_permission(&unknown_id, 0, 0, "req-1", true)
             .await;
@@ -3885,7 +3895,7 @@ mod tests {
     #[tokio::test]
     async fn tui_reconcile_effect_returns_not_found_for_unknown_id() {
         let (embedded, _workspace_id, handle) = tui_test_server().await;
-        let unknown_id = ThreadId::from_uuid(Uuid::now_v7());
+        let unknown_id = SessionId::from_uuid(Uuid::now_v7());
         let result = handle.reconcile_effect(&unknown_id, "effect-1").await;
         assert!(matches!(result, Err(ClientError::NotFound(_))));
         embedded.shutdown().await;
@@ -3919,44 +3929,44 @@ mod tests {
     #[test]
     fn parse_sse_frame_rejects_malformed_and_missing_fields() {
         // Invalid JSON data.
-        assert_eq!(parse_sse_frame(Some("thread_changed"), "not json"), None);
-        // thread_changed missing session_id / revision.
-        assert_eq!(parse_sse_frame(Some("thread_changed"), "{}"), None);
+        assert_eq!(parse_sse_frame(Some("session_changed"), "not json"), None);
+        // session_changed missing session_id / revision.
+        assert_eq!(parse_sse_frame(Some("session_changed"), "{}"), None);
         assert_eq!(
-            parse_sse_frame(Some("thread_changed"), r#"{"session_id":"s"}"#),
+            parse_sse_frame(Some("session_changed"), r#"{"session_id":"s"}"#),
             None
         );
         assert_eq!(
-            parse_sse_frame(Some("thread_changed"), r#"{"revision":3}"#),
+            parse_sse_frame(Some("session_changed"), r#"{"revision":3}"#),
             None
         );
         assert_eq!(
-            parse_sse_frame(Some("thread_changed"), r#"{"session_id":7,"revision":1}"#),
+            parse_sse_frame(Some("session_changed"), r#"{"session_id":7,"revision":1}"#),
             None
         );
         // Fields present but wrong type.
         assert_eq!(
             parse_sse_frame(
-                Some("thread_changed"),
+                Some("session_changed"),
                 r#"{"session_id":"s","revision":"not-a-number"}"#
             ),
             None
         );
-        // progress missing session_id / run_id / progress.
+        // progress missing session_id / turn_id / progress.
         assert_eq!(parse_sse_frame(Some("progress"), "{}"), None);
         assert_eq!(
             parse_sse_frame(Some("progress"), r#"{"session_id":"s"}"#),
             None
         );
         assert_eq!(
-            parse_sse_frame(Some("progress"), r#"{"session_id":"s","run_id":"r"}"#),
+            parse_sse_frame(Some("progress"), r#"{"session_id":"s","turn_id":"r"}"#),
             None
         );
         // progress fields present but wrong type.
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":123,"progress":{}}"#
+                r#"{"session_id":"s","turn_id":123,"progress":{}}"#
             ),
             None
         );
@@ -3964,11 +3974,11 @@ mod tests {
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":"r","progress":"not-an-object"}"#
+                r#"{"session_id":"s","turn_id":"r","progress":"not-an-object"}"#
             ),
             Some(StreamEvent::Progress {
                 session_id: "s".into(),
-                run_id: "r".into(),
+                turn_id: "r".into(),
                 progress: json!("not-an-object"),
             })
         );
@@ -3976,12 +3986,12 @@ mod tests {
         assert_eq!(
             parse_sse_frame(
                 Some("progress"),
-                r#"{"session_id":"s","run_id":"r","progress":{"type":"assistant_delta","run_id":"r","text":"hi"}}"#
+                r#"{"session_id":"s","turn_id":"r","progress":{"type":"assistant_delta","turn_id":"r","text":"hi"}}"#
             ),
             Some(StreamEvent::Progress {
                 session_id: "s".into(),
-                run_id: "r".into(),
-                progress: json!({"type":"assistant_delta","run_id":"r","text":"hi"}),
+                turn_id: "r".into(),
+                progress: json!({"type":"assistant_delta","turn_id":"r","text":"hi"}),
             })
         );
         // resync_required ignores the payload shape.
@@ -4000,13 +4010,13 @@ mod tests {
         // Comments and unknown fields are ignored.
         assert_eq!(decoder.line(": keepalive"), None);
         assert_eq!(decoder.line("id: 42"), None);
-        assert_eq!(decoder.line("event: thread_changed"), None);
+        assert_eq!(decoder.line("event: session_changed"), None);
         // Multi-line data payloads are joined with newlines.
         assert_eq!(decoder.line("data: {\"session_id\":\"s\","), None);
         assert_eq!(decoder.line("data: \"revision\": 7}"), None);
         assert_eq!(
             decoder.line(""),
-            Some(StreamEvent::ThreadChanged {
+            Some(StreamEvent::SessionChanged {
                 session_id: "s".into(),
                 revision: 7,
             })
@@ -4022,11 +4032,11 @@ mod tests {
     #[test]
     fn render_session_text_covers_non_terminal_and_message_kinds() {
         // Non-terminal snapshot: status comes from lifecycle_name, not classify.
-        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        let mut snap = snapshot(SessionLifecycle::Running, vec![]);
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "working on it".into(),
             payload: None,
@@ -4038,11 +4048,11 @@ mod tests {
         assert!(text.contains("working on it"), "{text}");
 
         // Failure entries are surfaced too.
-        let mut snap = snapshot(ThreadLifecycle::Failed, vec![]);
+        let mut snap = snapshot(SessionLifecycle::Failed, vec![]);
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "boom".into(),
             payload: None,
@@ -4053,11 +4063,11 @@ mod tests {
         assert!(text.contains("boom"), "{text}");
 
         // Only the latest assistant/failure entry is appended.
-        let mut snap = snapshot(ThreadLifecycle::Running, vec![]);
+        let mut snap = snapshot(SessionLifecycle::Running, vec![]);
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 0,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "first".into(),
             payload: None,
@@ -4067,7 +4077,7 @@ mod tests {
         snap.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
             sequence: 1,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Assistant,
             text: "second".into(),
             payload: None,
@@ -4079,7 +4089,7 @@ mod tests {
         assert!(!text.contains("first"), "{text}");
 
         // No assistant/failure entry → no message appended.
-        let snap = snapshot(ThreadLifecycle::Running, vec![]);
+        let snap = snapshot(SessionLifecycle::Running, vec![]);
         let text = render_session_text(&snap);
         assert!(!text.contains('\n'), "{text}");
     }
@@ -4117,7 +4127,7 @@ mod tests {
         server.park_create = true;
         server.create_signal = Some(tx);
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4196,7 +4206,7 @@ mod tests {
         *server.snapshot_gate.lock().unwrap() = Some((1, tx));
         server.park_snapshot = true;
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4218,9 +4228,9 @@ mod tests {
     async fn resume_session_cancel_during_follow_up_returns_cancelled() {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let mut server = MockServer::new();
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.park_follow_up = true;
         server.follow_up_signal = Some(tx);
         let cancel = async {
@@ -4248,7 +4258,7 @@ mod tests {
         *server.snapshot_gate.lock().unwrap() = Some((1, tx));
         server.park_snapshot = true;
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4273,9 +4283,9 @@ mod tests {
         let mut server = MockServer::new();
         server.observe_signal = Some(tx);
         server.park_open = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4300,9 +4310,9 @@ mod tests {
         let mut server = MockServer::new();
         *server.snapshot_gate.lock().unwrap() = Some((2, tx));
         server.park_snapshot = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4327,10 +4337,10 @@ mod tests {
         let mut server = MockServer::new();
         *server.snapshot_gate.lock().unwrap() = Some((3, tx));
         server.park_snapshot = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // reconnect resync snapshot + cancel_session snapshot.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.end_stream();
         let cancel = async {
             let _ = rx.await;
@@ -4356,12 +4366,12 @@ mod tests {
         // backoff starts the timed cancel is already pending — the backoff
         // select! is cancel-aware without any parking.
         let mut server = MockServer::new();
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.end_stream();
         // reconnect resync snapshot + cancel_session snapshot.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = tokio::time::sleep(Duration::from_millis(50));
         let result = run_session(
             &mut server,
@@ -4384,13 +4394,13 @@ mod tests {
         let mut server = MockServer::new();
         *server.snapshot_gate.lock().unwrap() = Some((4, tx));
         server.park_snapshot = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.end_stream();
         // reconnect resync snapshot; the gate parks the post-reconnect resync.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let cancel = async {
             let _ = rx.await;
         };
@@ -4415,11 +4425,11 @@ mod tests {
         let mut server = MockServer::new();
         *server.snapshot_gate.lock().unwrap() = Some((3, tx));
         server.park_snapshot = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         // cancel_session fetches one last snapshot before cancelling.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_event(StreamEvent::ThreadChanged {
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_event(StreamEvent::SessionChanged {
             session_id: "self".into(),
             revision: 2,
         });
@@ -4445,11 +4455,11 @@ mod tests {
     async fn run_session_propagates_reconnect_open_failure() {
         let mut server = MockServer::new();
         server.fail_reopen = true;
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.end_stream();
         // The reconnect resync needs a snapshot before open_events fails.
-        server.push_snapshot(snapshot(ThreadLifecycle::Running, vec![]));
+        server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         let error = run_session(
             &mut server,
             Path::new("/workspace"),

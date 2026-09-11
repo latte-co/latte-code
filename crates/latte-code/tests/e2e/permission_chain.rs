@@ -121,7 +121,7 @@ impl ServeChild {
     }
 
     /// Creates a session through the crash-safe contract: a fresh client
-    /// `thread_id` + `command_id` in the body and a matching `Idempotency-Key`.
+    /// `session_id` + `command_id` in the body and a matching `Idempotency-Key`.
     fn create_session(
         &self,
         workspace_id: &str,
@@ -170,18 +170,18 @@ fn server_binding(scenario: &Scenario) -> serde_json::Value {
         .expect("engine builds for binding");
     let tools = engine.tool_descriptors();
     let binding = registry
-        .thread_binding_for_default(&tools)
+        .session_binding_for_default(&tools)
         .expect("default binding resolves");
     serde_json::to_value(binding).expect("binding serializes")
 }
 
-/// A create-session request body carrying the client-generated `thread_id`
+/// A create-session request body carrying the client-generated `session_id`
 /// and `command_id` the crash-safe contract now requires.
 fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Value, String) {
-    let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-    let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
     let body = serde_json::json!({
-        "thread_id": thread_id,
+        "session_id": session_id,
         "command_id": command_id,
         "prompt": prompt,
         "binding": binding,
@@ -288,7 +288,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
         .as_str()
         .unwrap()
         .to_string();
-    let run_revision = snapshot["pending"]["expected_run_revision"]
+    let turn_revision = snapshot["pending"]["expected_turn_revision"]
         .as_u64()
         .unwrap();
     assert_eq!(provider.requests().len(), 1);
@@ -300,8 +300,8 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
         Some(&server.token),
         Some(&serde_json::json!({
             "allow": true,
-            "expected_thread_revision": revision,
-            "expected_run_revision": run_revision
+            "expected_session_revision": revision,
+            "expected_turn_revision": turn_revision
         })),
         &[],
     );
@@ -311,7 +311,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
     // and the provider completes the turn.
     let snapshot = wait_for_lifecycle(&server, &session_id, &["ready"]);
     assert_eq!(
-        snapshot["runs"][0]["status"].as_str(),
+        snapshot["turns"][0]["status"].as_str(),
         Some("completed"),
         "run should complete after process permission allowed: {snapshot:?}"
     );
@@ -359,7 +359,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
 
     // A follow-up on a ready (completed) session is accepted (the session is
     // not terminal in v2 — ready sessions accept follow-up turns).
-    let thread_revision = snapshot["revision"].as_u64().unwrap();
+    let session_revision = snapshot["revision"].as_u64().unwrap();
     let follow_command_id = "01900000-0000-7000-8000-0000000000b1".to_string();
     let (follow_status, _) = server.request(
         "POST",
@@ -368,7 +368,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
         Some(&serde_json::json!({
             "command_id": follow_command_id,
             "prompt": "continue",
-            "expected_thread_revision": thread_revision
+            "expected_session_revision": session_revision
         })),
         &[("Idempotency-Key", &follow_command_id)],
     );

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use latte_core::ThreadProviderBindingV2;
+use latte_core::SessionProviderBinding;
 use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
 use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 use latte_server::http::router;
@@ -24,8 +24,8 @@ use tower::util::ServiceExt;
 const TOKEN: &str = "contract-token";
 
 /// 构造一个合法的、可通过 validate() 的 binding。
-fn valid_binding() -> ThreadProviderBindingV2 {
-    ThreadProviderBindingV2 {
+fn valid_binding() -> SessionProviderBinding {
+    SessionProviderBinding {
         version: 1,
         provider_name: "contract".into(),
         provider_type: "openai-chat".into(),
@@ -43,8 +43,8 @@ fn valid_binding() -> ThreadProviderBindingV2 {
 /// Server state whose provider factory completes every turn in one step, so a
 /// created session reaches a durable idle state.
 fn completing_state() -> Arc<ServerState> {
-    let factory: latte_headless::thread::ThreadProviderFactory =
-        Arc::new(|binding: &ThreadProviderBindingV2| {
+    let factory: latte_headless::session::SessionProviderFactory =
+        Arc::new(|binding: &SessionProviderBinding| {
             let provider = FakeProvider::scripted([ProviderResponse {
                 message: Some("done".into()),
                 tool_calls: Vec::new(),
@@ -76,7 +76,7 @@ fn completing_state() -> Arc<ServerState> {
             .conversation_root(root.join(".latte/sessions"))
             .build()
             .map_err(|e| e.to_string())?;
-        let runtime = latte_headless::thread::ThreadRuntimeService::new(
+        let runtime = latte_headless::session::SessionRuntimeService::new(
             engine.clone(),
             root,
             Default::default(),
@@ -164,13 +164,13 @@ async fn create_workspace(state: &Arc<ServerState>, path: &str) -> String {
 /// Creates a session and waits until it is durably idle.
 async fn completed_session(state: &Arc<ServerState>, workspace_id: &str) -> (String, u64) {
     let command_id = uuid::Uuid::now_v7().to_string();
-    let thread_id = uuid::Uuid::now_v7().to_string();
+    let session_id = uuid::Uuid::now_v7().to_string();
     let (status, body) = call_with_headers(
         state,
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": "hello",
             "binding": valid_binding(),
@@ -235,7 +235,7 @@ async fn response_schema_snapshots() {
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": uuid::Uuid::now_v7().to_string(),
+            "session_id": uuid::Uuid::now_v7().to_string(),
             "command_id": command_id,
             "prompt": "hello",
             "binding": valid_binding(),
@@ -275,14 +275,14 @@ async fn response_schema_snapshots() {
     assert_keys(
         &body["snapshot"],
         &[
-            "thread_id",
+            "session_id",
             "revision",
             "sequence",
             "lifecycle",
             "binding",
-            "latest_run_id",
-            "active_run_id",
-            "runs",
+            "latest_turn_id",
+            "active_turn_id",
+            "turns",
             "transcript",
         ],
     );
@@ -296,7 +296,7 @@ async fn response_schema_snapshots() {
         Some(serde_json::json!({
             "command_id": command_id,
             "prompt": "again",
-            "expected_thread_revision": body["snapshot"]["revision"].as_u64().unwrap_or(1),
+            "expected_session_revision": body["snapshot"]["revision"].as_u64().unwrap_or(1),
         })),
         &[("idempotency-key", &command_id)],
     )
@@ -419,8 +419,8 @@ async fn error_enum_completeness() {
         Method::POST,
         &format!("/v1/sessions/{session_id}/cancel"),
         Some(serde_json::json!({
-            "expected_thread_revision": revision + 100,
-            "expected_run_revision": 0,
+            "expected_session_revision": revision + 100,
+            "expected_turn_revision": 0,
         })),
     )
     .await;
@@ -433,13 +433,13 @@ async fn error_enum_completeness() {
 
     // idempotency_mismatch（422）：同一 Idempotency-Key 搭配不同 payload。
     let key = uuid::Uuid::now_v7().to_string();
-    let thread_a = uuid::Uuid::now_v7().to_string();
+    let session_a = uuid::Uuid::now_v7().to_string();
     let _ = call_with_headers(
         &state,
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": thread_a,
+            "session_id": session_a,
             "command_id": key,
             "prompt": "first",
             "binding": valid_binding(),
@@ -452,7 +452,7 @@ async fn error_enum_completeness() {
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": uuid::Uuid::now_v7().to_string(),
+            "session_id": uuid::Uuid::now_v7().to_string(),
             "command_id": key,
             "prompt": "different payload",
             "binding": valid_binding(),
@@ -494,18 +494,18 @@ async fn error_enum_completeness() {
 #[tokio::test]
 async fn sse_event_type_completeness() {
     // ServerEvent 的 serde tag 必须固定为三个契约事件名。
-    let changed = serde_json::to_value(latte_server::http::ServerEvent::ThreadChanged {
+    let changed = serde_json::to_value(latte_server::http::ServerEvent::SessionChanged {
         session_id: "s".into(),
         revision: 1,
     })
     .unwrap();
-    assert_eq!(changed["type"].as_str(), Some("thread_changed"));
+    assert_eq!(changed["type"].as_str(), Some("session_changed"));
     assert_eq!(changed["session_id"].as_str(), Some("s"));
     assert_eq!(changed["revision"].as_u64(), Some(1));
 
     let progress = serde_json::to_value(latte_server::http::ServerEvent::Progress {
         session_id: "s".into(),
-        run_id: "r".into(),
+        turn_id: "r".into(),
         progress: serde_json::json!({"delta": "x"}),
     })
     .unwrap();
@@ -514,7 +514,7 @@ async fn sse_event_type_completeness() {
     let resync = serde_json::to_value(latte_server::http::ServerEvent::ResyncRequired).unwrap();
     assert_eq!(resync["type"].as_str(), Some("resync_required"));
 
-    // 端到端：创建 session 后，事件流必须出现 event: thread_changed 帧。
+    // 端到端：创建 session 后，事件流必须出现 event: session_changed 帧。
     let state = completing_state();
     let workspace = tempfile::tempdir().unwrap();
     let workspace_id = create_workspace(&state, &workspace.path().to_string_lossy()).await;
@@ -543,25 +543,25 @@ async fn sse_event_type_completeness() {
         "unexpected content-type {content_type}"
     );
 
-    // 在后台消费事件流，同时创建 session 触发 thread_changed。
+    // 在后台消费事件流，同时创建 session 触发 session_changed。
     let state_for_task = state.clone();
     let workspace_for_task = workspace_id.clone();
     let _ = completed_session(&state_for_task, &workspace_for_task).await;
 
     let mut stream = response.into_body().into_data_stream();
     use futures::StreamExt;
-    let mut saw_thread_changed = false;
+    let mut saw_session_changed = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.unwrap();
         let text = String::from_utf8_lossy(&chunk);
-        if text.contains("event: thread_changed") {
-            saw_thread_changed = true;
+        if text.contains("event: session_changed") {
+            saw_session_changed = true;
             break;
         }
     }
     assert!(
-        saw_thread_changed,
-        "SSE stream never emitted thread_changed"
+        saw_session_changed,
+        "SSE stream never emitted session_changed"
     );
 }
 
@@ -594,7 +594,7 @@ async fn pagination_contract() {
     assert!(body["sessions"].as_array().unwrap().is_empty());
     assert!(body["next_cursor"].is_null());
 
-    // limit=2 → 第一页 2 条 + cursor；cursor 不透明（不含 thread_id 等可解析字段）。
+    // limit=2 → 第一页 2 条 + cursor；cursor 不透明（不含 session_id 等可解析字段）。
     let (status, page1) = call(
         &state,
         Method::GET,
@@ -654,13 +654,13 @@ async fn typed_binding_round_trips_through_persistence() {
     let workspace_id = create_workspace(&state, &workspace.path().to_string_lossy()).await;
     let binding = valid_binding();
     let command_id = uuid::Uuid::now_v7().to_string();
-    let thread_id = uuid::Uuid::now_v7().to_string();
+    let session_id = uuid::Uuid::now_v7().to_string();
     let (status, body) = call_with_headers(
         &state,
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": "hello",
             "binding": binding,
@@ -681,7 +681,7 @@ async fn typed_binding_round_trips_through_persistence() {
         )
         .await;
         if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            let persisted: ThreadProviderBindingV2 =
+            let persisted: SessionProviderBinding =
                 serde_json::from_value(body["snapshot"]["binding"].clone()).unwrap();
             assert_eq!(persisted, binding, "binding round-trip mismatch");
             return;
@@ -702,7 +702,7 @@ async fn invalid_binding_is_rejected_with_typed_error_envelope() {
         Method::POST,
         &format!("/v1/workspaces/{workspace_id}/sessions"),
         Some(serde_json::json!({
-            "thread_id": uuid::Uuid::now_v7().to_string(),
+            "session_id": uuid::Uuid::now_v7().to_string(),
             "command_id": command_id,
             "prompt": "hello",
             "binding": {"version": 1},

@@ -6,8 +6,8 @@ use super::{
     },
 };
 use latte_core::{
-    IdSource, RunId, SystemIdSource, ThreadId, ThreadProviderBindingV2, TranscriptEntry,
-    TranscriptEntryId, TranscriptKind,
+    IdSource, SessionId, SessionProviderBinding, SystemIdSource, TranscriptEntry,
+    TranscriptEntryId, TranscriptKind, TurnId,
 };
 use rusqlite::{Connection, params};
 use std::{collections::BTreeMap, io::Write as _, time::Duration};
@@ -25,14 +25,14 @@ fn has_one_durable_terminal_tool_result(
     engine: &latte_engine::EngineHandle,
     tool_call_id: &str,
 ) -> bool {
-    engine.list_threads_v2().is_ok_and(|threads| {
-        threads.len() == 1
-            && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-            && threads[0]
-                .runs
+    engine.list_sessions().is_ok_and(|sessions| {
+        sessions.len() == 1
+            && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+            && sessions[0]
+                .turns
                 .last()
-                .is_some_and(|run| run.status == latte_core::ThreadRunStatus::Completed)
-            && threads[0]
+                .is_some_and(|run| run.status == latte_core::SessionTurnStatus::Completed)
+            && sessions[0]
                 .transcript
                 .entries
                 .iter()
@@ -50,8 +50,8 @@ fn has_one_durable_terminal_tool_result(
     })
 }
 
-fn session_boundary_binding() -> ThreadProviderBindingV2 {
-    ThreadProviderBindingV2 {
+fn session_boundary_binding() -> SessionProviderBinding {
+    SessionProviderBinding {
         version: 1,
         provider_name: "main".into(),
         provider_type: "openai-chat".into(),
@@ -92,8 +92,8 @@ fn tui_without_provider_opens_and_guides_before_first_submission() {
             .workspace_root(scenario.root())
             .database_path(scenario.database_path())
             .build()
-            .and_then(|engine| engine.list_threads_v2())
-            .is_ok_and(|threads| threads.is_empty())
+            .and_then(|engine| engine.list_sessions())
+            .is_ok_and(|sessions| sessions.is_empty())
     }));
 
     pty.write(SHIFT_ENTER);
@@ -144,10 +144,10 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
         .build()
         .unwrap();
     let user_entries = engine
-        .list_threads_v2()
+        .list_sessions()
         .unwrap()
         .into_iter()
-        .flat_map(|thread| thread.transcript.entries)
+        .flat_map(|session| session.transcript.entries)
         .filter(|entry| entry.kind == latte_core::TranscriptKind::User)
         .map(|entry| entry.text)
         .collect::<Vec<_>>();
@@ -190,17 +190,17 @@ fn tui_provider_configuration_failure_is_durable_and_keeps_multiline_input_usabl
             .database_path(scenario.database_path())
             .build()
             .ok()
-            .and_then(|engine| engine.list_threads_v2().ok())
-            .is_some_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].runs.len() == 1
-                    && threads[0].runs[0].status == latte_core::ThreadRunStatus::Failed
-                    && threads[0].transcript.entries.iter().any(|entry| {
+            .and_then(|engine| engine.list_sessions().ok())
+            .is_some_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].turns.len() == 1
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Failed
+                    && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::User
                             && entry.text == "failed-start-visible-sentinel"
                     })
-                    && threads[0].transcript.entries.iter().any(|entry| {
+                    && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::Failure
                             && entry.text.contains("selected model could not be started")
                     })
@@ -218,16 +218,16 @@ fn tui_provider_configuration_failure_is_durable_and_keeps_multiline_input_usabl
             .database_path(scenario.database_path())
             .build()
             .ok()
-            .and_then(|engine| engine.list_threads_v2().ok())
-            .is_some_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].runs.len() == 2
-                    && threads[0]
-                        .runs
+            .and_then(|engine| engine.list_sessions().ok())
+            .is_some_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].turns.len() == 2
+                    && sessions[0]
+                        .turns
                         .iter()
-                        .all(|run| run.status == latte_core::ThreadRunStatus::Failed)
-                    && threads[0].transcript.entries.iter().any(|entry| {
+                        .all(|run| run.status == latte_core::SessionTurnStatus::Failed)
+                    && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::User
                             && entry.text == "after-error-first\nafter-error-second"
                     })
@@ -281,15 +281,15 @@ fn tui_wrong_model_request_is_durable_retryable_and_never_restores_the_prompt() 
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].runs[0].status == latte_core::ThreadRunStatus::Failed
-                && threads[0].transcript.entries.iter().any(|entry| {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Failed
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == latte_core::TranscriptKind::User
                         && entry.text == "wrong-model-visible-sentinel"
                 })
-                && threads[0].transcript.entries.iter().any(|entry| {
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == latte_core::TranscriptKind::Failure
                         && entry.text.contains("http 400")
                 })
@@ -301,12 +301,12 @@ fn tui_wrong_model_request_is_durable_retryable_and_never_restores_the_prompt() 
     pty.write(b"retry-second\r");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].runs.len() == 2
-                && threads[0].runs[1].status == latte_core::ThreadRunStatus::Completed
-                && threads[0].transcript.entries.iter().any(|entry| {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].turns.len() == 2
+                && sessions[0].turns[1].status == latte_core::SessionTurnStatus::Completed
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == latte_core::TranscriptKind::Assistant
                         && entry.text == "retry completed"
                 })
@@ -393,10 +393,10 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].binding.provider_name == "alpha"
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].binding.provider_name == "alpha"
             })
         }),
         "alpha completion did not become durable: {}",
@@ -421,10 +421,10 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
     let before_switch = pty.output().len();
     pty.write(ENTER);
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].binding.provider_name == "beta"
-                && threads[0].binding.model == "beta-reasoning"
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].binding.provider_name == "beta"
+                && sessions[0].binding.model == "beta-reasoning"
         })
     }));
     assert!(pty.wait_for_growth(before_switch, Duration::from_secs(5)));
@@ -432,10 +432,10 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
     pty.write(b"follow up on beta\r");
     assert!(beta.wait_for_calls(1, Duration::from_secs(5)));
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].transcript.entries.iter().any(|entry| {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == TranscriptKind::Assistant && entry.text == "beta completed"
                 })
         })
@@ -445,11 +445,11 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
     assert_eq!(request.body["reasoning_effort"], "high");
     assert_eq!(request.body["max_tokens"], 4096);
 
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].binding.provider_name, "beta");
-    assert_eq!(threads[0].binding.model, "beta-reasoning");
-    assert!(threads[0].transcript.entries.iter().any(|entry| {
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].binding.provider_name, "beta");
+    assert_eq!(sessions[0].binding.model, "beta-reasoning");
+    assert!(sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == TranscriptKind::System
             && entry.text == "Model switched to beta/beta-reasoning"
     }));
@@ -462,22 +462,24 @@ fn rename_and_fork_from_tui(
     tui: &mut PtySession,
     engine: &latte_engine::EngineHandle,
     workspace: &std::path::Path,
-    parent_thread_id: ThreadId,
+    parent_session_id: SessionId,
 ) {
     tui.write(b"/rename Renamed TUI source\r");
     assert!(wait_until(Duration::from_secs(5), || {
         engine
-            .search_thread_sessions_v2("renamed tui source", 10)
-            .is_ok_and(|sessions| sessions.len() == 1 && sessions[0].thread_id == parent_thread_id)
+            .search_sessions("renamed tui source", 10)
+            .is_ok_and(|sessions| {
+                sessions.len() == 1 && sessions[0].session_id == parent_session_id
+            })
     }));
     tui.write(b"/fork TUI fork session\r");
     assert!(wait_until(Duration::from_secs(5), || {
         engine
-            .list_thread_sessions_v2_for_workspace(workspace.to_str().unwrap(), 10)
+            .list_session_summaries_for_workspace(workspace.to_str().unwrap(), 10)
             .is_ok_and(|sessions| {
                 sessions.len() == 2
                     && sessions.iter().any(|session| {
-                        session.parent_thread_id == Some(parent_thread_id)
+                        session.parent_session_id == Some(parent_session_id)
                             && session.title == "TUI fork session"
                     })
             })
@@ -513,9 +515,9 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
             .database_path(scenario.database_path())
             .build()
             .ok()
-            .and_then(|engine| engine.list_threads_v2().ok())
+            .and_then(|engine| engine.list_sessions().ok())
             .is_some_and(|sessions| {
-                sessions.len() == 1 && sessions[0].lifecycle == latte_core::ThreadLifecycle::Ready
+                sessions.len() == 1 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
             })
     }));
     first.write(F10);
@@ -537,11 +539,11 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+    let session_id = engine.list_sessions().unwrap()[0].session_id;
     let workspace = std::fs::canonicalize(scenario.root()).unwrap();
     assert_eq!(
         engine
-            .list_thread_sessions_v2_for_workspace(workspace.to_str().unwrap(), 10)
+            .list_session_summaries_for_workspace(workspace.to_str().unwrap(), 10)
             .unwrap()
             .len(),
         1
@@ -558,8 +560,8 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
             .any(|value| value == b"NEWEST_MOUSE_MARKER"),
         "TUI startup must keep a fresh draft instead of rendering the latest Session"
     );
-    let missing_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
-    resumed.write(format!("/resume {missing_thread_id}\r").as_bytes());
+    let missing_session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    resumed.write(format!("/resume {missing_session_id}\r").as_bytes());
     assert!(
         resumed.wait_for_visible_text("No saved sessions", Duration::from_secs(5)),
         "missing exact Session id was not reported: {}",
@@ -604,14 +606,14 @@ fn tui_new_and_resume_use_workspace_session_catalog_without_calling_provider() {
     );
     resumed.write(b"\x1b[27u");
 
-    rename_and_fork_from_tui(&mut resumed, &engine, &workspace, thread_id);
+    rename_and_fork_from_tui(&mut resumed, &engine, &workspace, session_id);
 
     resumed.write(b"/new\r");
     assert!(wait_until(Duration::from_secs(2), || provider
         .requests()
         .len()
         == 1));
-    assert_eq!(engine.list_threads_v2().unwrap().len(), 2);
+    assert_eq!(engine.list_sessions().unwrap().len(), 2);
     assert_eq!(provider.requests().len(), 1);
     resumed.write(F10);
     assert!(resumed.finish(Duration::from_secs(5)).0.success());
@@ -630,16 +632,16 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         .build()
         .unwrap();
     for offset in 0..2 {
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let now = latte_core::wall_time_ms() + offset;
         let stale = local_engine
-            .acquire_thread_lease(thread_id, now, 1)
+            .acquire_session_lease(session_id, now, 1)
             .unwrap();
         local_engine
-            .create_started_thread_v2_snapshot(
-                thread_id,
-                run_id,
+            .create_started_session_v2_snapshot(
+                session_id,
+                turn_id,
                 session_boundary_binding(),
                 "duplicate session title",
                 &stale,
@@ -648,14 +650,14 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
             )
             .unwrap();
         local_engine
-            .recover_thread_after_lease_loss(thread_id, run_id, &stale, 1, now + 2)
+            .recover_session_after_lease_loss(session_id, turn_id, &stale, 1, now + 2)
             .unwrap();
     }
     drop(local_engine);
 
     let foreign_workspace = tempfile::tempdir().unwrap();
     std::fs::create_dir(foreign_workspace.path().join(".git")).unwrap();
-    let foreign_thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let foreign_session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
     let foreign_engine = latte_engine::EngineBuilder::new()
         .workspace_root(foreign_workspace.path())
         .database_path(scenario.database_path())
@@ -663,13 +665,13 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         .unwrap();
     let foreign_now = latte_core::wall_time_ms();
     let foreign_lease = foreign_engine
-        .acquire_thread_lease(foreign_thread_id, foreign_now, 1)
+        .acquire_session_lease(foreign_session_id, foreign_now, 1)
         .unwrap();
-    let foreign_run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    let foreign_turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
     foreign_engine
-        .create_started_thread_v2_snapshot(
-            foreign_thread_id,
-            foreign_run_id,
+        .create_started_session_v2_snapshot(
+            foreign_session_id,
+            foreign_turn_id,
             session_boundary_binding(),
             "foreign session title",
             &foreign_lease,
@@ -678,9 +680,9 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         )
         .unwrap();
     foreign_engine
-        .recover_thread_after_lease_loss(
-            foreign_thread_id,
-            foreign_run_id,
+        .recover_session_after_lease_loss(
+            foreign_session_id,
+            foreign_turn_id,
             &foreign_lease,
             1,
             foreign_now + 2,
@@ -712,7 +714,7 @@ fn tui_session_lookup_distinguishes_duplicate_missing_and_foreign_catalog_entrie
         "duplicate title picker did not contain both matching Sessions"
     );
     pty.write(b"\x1b[27u");
-    pty.write(format!("/resume {foreign_thread_id}\r").as_bytes());
+    pty.write(format!("/resume {foreign_session_id}\r").as_bytes());
     assert!(
         pty.wait_for_visible_text("belongs to another workspace", Duration::from_secs(5)),
         "foreign Session was not rejected: {}",
@@ -757,10 +759,10 @@ fn tui_dispatches_prompt_and_consumes_runtime_feedback_without_fixed_sleeps() {
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].lifecycle, latte_core::ThreadLifecycle::Ready);
-    assert!(threads[0].transcript.entries.iter().any(|entry| {
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].lifecycle, latte_core::SessionLifecycle::Ready);
+    assert!(sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Assistant && entry.text == "done"
     }));
     provider.assert_consumed();
@@ -825,11 +827,11 @@ fn running_tui_queues_and_automatically_runs_the_next_multiline_turn() {
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
                 && ["first answer", "queued answer"].iter().all(|answer| {
-                    threads[0].transcript.entries.iter().any(|entry| {
+                    sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::Assistant && entry.text == *answer
                     })
                 })
@@ -881,12 +883,12 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::WaitingInput
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::WaitingInput
                     && matches!(
-                        threads[0].pending.as_ref(),
-                        Some(latte_core::ThreadPendingRequest::Input {
+                        sessions[0].pending.as_ref(),
+                        Some(latte_core::SessionPendingRequest::Input {
                             request_id,
                             prompt,
                             ..
@@ -897,7 +899,7 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
         "input request was not durable: {}",
         String::from_utf8_lossy(&first.output())
     );
-    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+    let session_id = engine.list_sessions().unwrap()[0].session_id;
     first.write(F10);
     let (status, _) = first.finish(Duration::from_secs(5));
     assert!(status.success());
@@ -907,7 +909,7 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
     resumed_command.env("TEST_OPENAI_KEY", "input-e2e-secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    resumed.write(format!("/resume {thread_id}\r").as_bytes());
+    resumed.write(format!("/resume {session_id}\r").as_bytes());
     assert!(resumed.wait_for_output(b"Input required", Duration::from_secs(5)));
     resumed.write(b"durable-first");
     resumed.write(SHIFT_ENTER);
@@ -915,11 +917,11 @@ fn input_request_survives_tui_restart_and_exact_value_completes_the_same_child()
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].pending.is_none()
-                    && threads[0].transcript.entries.iter().any(|entry| {
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].pending.is_none()
+                    && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::Assistant
                             && entry.text == "input accepted"
                     })
@@ -973,7 +975,7 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+    let session_id = engine.list_sessions().unwrap()[0].session_id;
 
     // Changing the immutable binding makes provider resolution fail before
     // ProvideInput can commit its user card.
@@ -988,7 +990,7 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
     resumed_command.env("TEST_OPENAI_KEY", "input-restore-secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    resumed.write(format!("/resume {thread_id}\r").as_bytes());
+    resumed.write(format!("/resume {session_id}\r").as_bytes());
     assert!(resumed.wait_for_output(b"Input required", Duration::from_secs(5)));
     resumed.write(b"restore-first");
     resumed.write(SHIFT_ENTER);
@@ -1010,14 +1012,14 @@ fn failed_input_submission_restores_multiline_value_without_committing_a_user_ca
         String::from_utf8_lossy(&resumed.output())
     );
 
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
     assert_eq!(
-        threads[0].lifecycle,
-        latte_core::ThreadLifecycle::WaitingInput
+        sessions[0].lifecycle,
+        latte_core::SessionLifecycle::WaitingInput
     );
     assert_eq!(
-        threads[0]
+        sessions[0]
             .transcript
             .entries
             .iter()
@@ -1070,18 +1072,18 @@ fn invalid_input_request_id_fails_before_any_pending_card_is_persisted() {
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
-                    && threads[0].pending.is_none()
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Failed
+                    && sessions[0].pending.is_none()
             })
         }),
         "invalid input id did not fail closed: {}",
         String::from_utf8_lossy(&pty.output())
     );
-    let threads = engine.list_threads_v2().unwrap();
+    let sessions = engine.list_sessions().unwrap();
     assert!(
-        !threads[0]
+        !sessions[0]
             .transcript
             .entries
             .iter()
@@ -1095,7 +1097,7 @@ fn invalid_input_request_id_fails_before_any_pending_card_is_persisted() {
 }
 
 #[test]
-fn completed_tui_thread_accepts_a_follow_up_as_an_immutable_child_with_history() {
+fn completed_tui_session_accepts_a_follow_up_as_an_immutable_child_with_history() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([
         ProviderReply::completion("first answer"),
@@ -1119,20 +1121,20 @@ fn completed_tui_thread_accepts_a_follow_up_as_an_immutable_child_with_history()
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let first = engine.list_threads_v2().unwrap();
+    let first = engine.list_sessions().unwrap();
     assert_eq!(first.len(), 1);
-    assert_eq!(first[0].runs.len(), 1);
-    let parent_id = first[0].runs[0].run_id;
+    assert_eq!(first[0].turns.len(), 1);
+    let parent_id = first[0].turns[0].turn_id;
 
     pty.write(b"follow up prompt\r");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].runs.len() == 2
-                    && threads[0].transcript.entries.iter().any(|entry| {
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].turns.len() == 2
+                    && sessions[0].transcript.entries.iter().any(|entry| {
                         entry.kind == latte_core::TranscriptKind::Assistant
                             && entry.text == "second answer"
                     })
@@ -1142,10 +1144,10 @@ fn completed_tui_thread_accepts_a_follow_up_as_an_immutable_child_with_history()
         String::from_utf8_lossy(&pty.output())
     );
     provider.assert_consumed();
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads[0].runs[0].run_id, parent_id);
-    assert_eq!(threads[0].runs[1].parent_run_id, Some(parent_id));
-    assert_eq!(threads[0].runs[1].ordinal, 1);
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions[0].turns[0].turn_id, parent_id);
+    assert_eq!(sessions[0].turns[1].parent_turn_id, Some(parent_id));
+    assert_eq!(sessions[0].turns[1].ordinal, 1);
     let requests = provider.requests();
     let second_messages = requests[1].body["messages"].as_array().unwrap();
     assert!(
@@ -1194,15 +1196,15 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].runs.len() == 1
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].turns.len() == 1
         })
     }));
-    let initial = engine.list_threads_v2().unwrap().remove(0);
-    let thread_id = initial.thread_id;
-    let parent_run_id = initial.runs[0].run_id;
+    let initial = engine.list_sessions().unwrap().remove(0);
+    let session_id = initial.session_id;
+    let parent_turn_id = initial.turns[0].turn_id;
     first.write(F10);
     assert!(first.finish(Duration::from_secs(5)).0.success());
     drop(engine);
@@ -1210,8 +1212,8 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
     let connection = Connection::open(scenario.database_path()).unwrap();
     let initial_last_sequence: i64 = connection
         .query_row(
-            "SELECT last_seq FROM threads_v2 WHERE thread_id=?1",
-            [thread_id.to_string()],
+            "SELECT last_seq FROM sessions WHERE session_id=?1",
+            [session_id.to_string()],
             |row| row.get(0),
         )
         .unwrap();
@@ -1225,7 +1227,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(uuid::Uuid::now_v7()),
             sequence: u64::try_from(sequence).unwrap(),
-            run_id: Some(parent_run_id),
+            turn_id: Some(parent_turn_id),
             kind: TranscriptKind::Assistant,
             text,
             payload: None,
@@ -1235,13 +1237,13 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         connection
             .execute(
                 "INSERT INTO conversation_outbox(\
-                    thread_id,seq,entry_id,run_id,kind,source_key,entry_json,created_at_ms\
+                    session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
                  ) VALUES(?1,?2,?3,?4,'assistant',?5,?6,?7)",
                 params![
-                    thread_id.to_string(),
+                    session_id.to_string(),
                     sequence,
                     entry.entry_id.to_string(),
-                    parent_run_id.to_string(),
+                    parent_turn_id.to_string(),
                     entry.source_key,
                     serde_json::to_string(&entry).unwrap(),
                     sequence,
@@ -1252,11 +1254,11 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
     let seeded_last_sequence = initial_last_sequence + 501;
     connection
         .execute(
-            "UPDATE threads_v2 SET last_seq=?1,updated_at_ms=?2 WHERE thread_id=?3",
+            "UPDATE sessions SET last_seq=?1,updated_at_ms=?2 WHERE session_id=?3",
             params![
                 seeded_last_sequence,
                 seeded_last_sequence,
-                thread_id.to_string()
+                session_id.to_string()
             ],
         )
         .unwrap();
@@ -1267,7 +1269,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let tail = engine.thread_snapshot_tail_v2(thread_id, 500).unwrap();
+    let tail = engine.session_snapshot_tail_v2(session_id, 500).unwrap();
     assert_eq!(tail.transcript.entries.len(), 500);
     assert!(tail.transcript.has_more);
     assert_eq!(
@@ -1285,7 +1287,7 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
     resumed_command.env("TEST_OPENAI_KEY", "secret");
     let mut resumed = PtySession::spawn(resumed_command);
     assert!(resumed.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    resumed.write(format!("/resume {thread_id}\r").as_bytes());
+    resumed.write(format!("/resume {session_id}\r").as_bytes());
     assert!(
         resumed.wait_for_output(b"newest bounded-tail marker", Duration::from_secs(5)),
         "TUI resumed an old transcript page: {}",
@@ -1294,18 +1296,18 @@ fn tui_resumes_the_newest_500_cards_and_reconciles_a_follow_up_after_the_boundar
     resumed.write(b"follow up beyond the 500-card boundary\r");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].pending.is_none()
-                && threads[0].active_run_id.is_none()
-                && threads[0].runs.len() == 2
-                && threads[0].transcript.entries.iter().any(|entry| {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].pending.is_none()
+                && sessions[0].active_turn_id.is_none()
+                && sessions[0].turns.len() == 2
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.sequence > u64::try_from(seeded_last_sequence).unwrap()
                         && entry.kind == TranscriptKind::User
                         && entry.text == "follow up beyond the 500-card boundary"
                 })
-                && threads[0].transcript.entries.iter().any(|entry| {
+                && sessions[0].transcript.entries.iter().any(|entry| {
                     entry.kind == TranscriptKind::Assistant
                         && entry.text == "answer after bounded-tail resume"
                 })
@@ -1361,23 +1363,23 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
             .database_path(denied_scenario.database_path())
             .build()
             .unwrap();
-        let threads = engine.list_threads_v2().unwrap();
-        assert_eq!(threads.len(), 1);
+        let sessions = engine.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
         assert_eq!(
-            threads[0].lifecycle,
-            latte_core::ThreadLifecycle::WaitingPermission
+            sessions[0].lifecycle,
+            latte_core::SessionLifecycle::WaitingPermission
         );
-        assert!(threads[0].pending.is_some());
+        assert!(sessions[0].pending.is_some());
     };
     assert_still_waiting();
-    let denied_thread_id = latte_engine::EngineBuilder::new()
+    let denied_session_id = latte_engine::EngineBuilder::new()
         .workspace_root(denied_scenario.root())
         .database_path(denied_scenario.database_path())
         .build()
         .unwrap()
-        .list_threads_v2()
+        .list_sessions()
         .unwrap()[0]
-        .thread_id;
+        .session_id;
     assert!(!denied_scenario.root().join("new.txt").exists());
     assert_eq!(denied_provider.requests().len(), 1);
 
@@ -1385,7 +1387,7 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
     shifted_command.env("TEST_OPENAI_KEY", "secret");
     let mut shifted_pty = PtySession::spawn(shifted_command);
     assert!(shifted_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    shifted_pty.write(format!("/resume {denied_thread_id}\r").as_bytes());
+    shifted_pty.write(format!("/resume {denied_session_id}\r").as_bytes());
     assert!(shifted_pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     shifted_pty.write(SHIFT_ENTER);
     shifted_pty.write(F10);
@@ -1399,7 +1401,7 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
     deny_command.env("TEST_OPENAI_KEY", "secret");
     let mut deny_pty = PtySession::spawn(deny_command);
     assert!(deny_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    deny_pty.write(format!("/resume {denied_thread_id}\r").as_bytes());
+    deny_pty.write(format!("/resume {denied_session_id}\r").as_bytes());
     assert!(deny_pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     deny_pty.write(b"d");
     assert!(deny_pty.wait_for_output(b"permission denied", Duration::from_secs(5)));
@@ -1413,19 +1415,19 @@ fn permission_card_requires_exact_keys_and_resolves_once() {
         "TUI did not render the post-denial follow-up: {}",
         String::from_utf8_lossy(&deny_pty.output())
     );
-    let denied_threads = latte_engine::EngineBuilder::new()
+    let denied_sessions = latte_engine::EngineBuilder::new()
         .workspace_root(denied_scenario.root())
         .database_path(denied_scenario.database_path())
         .build()
         .unwrap()
-        .list_threads_v2()
+        .list_sessions()
         .unwrap();
     assert_eq!(
-        denied_threads[0].lifecycle,
-        latte_core::ThreadLifecycle::Ready
+        denied_sessions[0].lifecycle,
+        latte_core::SessionLifecycle::Ready
     );
-    assert_eq!(denied_threads[0].runs.len(), 2);
-    assert!(denied_threads[0].transcript.entries.iter().any(|entry| {
+    assert_eq!(denied_sessions[0].turns.len(), 2);
+    assert!(denied_sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == TranscriptKind::User
             && entry.text == "retry after denial\nwith a multiline prompt"
     }));
@@ -1526,13 +1528,13 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
     assert_eq!(
-        threads[0].lifecycle,
-        latte_core::ThreadLifecycle::ReconciliationRequired
+        sessions[0].lifecycle,
+        latte_core::SessionLifecycle::ReconciliationRequired
     );
-    let effect_ids = threads[0]
+    let effect_ids = sessions[0]
         .transcript
         .entries
         .iter()
@@ -1552,7 +1554,7 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
         latte_engine::EffectStatus::Unknown
     );
     assert_eq!(
-        threads[0]
+        sessions[0]
             .transcript
             .entries
             .iter()
@@ -1568,7 +1570,7 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
             .count(),
         0
     );
-    assert!(!threads[0].transcript.entries.iter().any(|entry| {
+    assert!(!sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Assistant && entry.text == "done"
     }));
 
@@ -1576,7 +1578,7 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
     restart_command.env("TEST_OPENAI_KEY", "secret");
     let mut restarted = PtySession::spawn(restart_command);
     assert!(restarted.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    restarted.write(format!("/resume {}\r", threads[0].thread_id).as_bytes());
+    restarted.write(format!("/resume {}\r", sessions[0].session_id).as_bytes());
     assert!(restarted.wait_for_output(b"Reconciliation", Duration::from_secs(5)));
     restarted.write(CTRL_R);
     assert!(
@@ -1593,8 +1595,8 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
         latte_engine::EffectStatus::Unknown
     );
     assert_eq!(
-        engine.list_threads_v2().unwrap()[0].lifecycle,
-        latte_core::ThreadLifecycle::ReconciliationRequired
+        engine.list_sessions().unwrap()[0].lifecycle,
+        latte_core::SessionLifecycle::ReconciliationRequired
     );
 
     restarted.write(CTRL_A);
@@ -1603,10 +1605,10 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
             engine
                 .effect_status(&effect_ids[0])
                 .is_ok_and(|status| status == latte_engine::EffectStatus::ObservedFailed)
-                && engine.list_threads_v2().is_ok_and(|threads| {
-                    threads.len() == 1
-                        && threads[0].lifecycle == latte_core::ThreadLifecycle::Failed
-                        && threads[0].pending.is_none()
+                && engine.list_sessions().is_ok_and(|sessions| {
+                    sessions.len() == 1
+                        && sessions[0].lifecycle == latte_core::SessionLifecycle::Failed
+                        && sessions[0].pending.is_none()
                 })
         }),
         "unknown effect was not reconciled exactly once: {}",
@@ -1696,11 +1698,11 @@ fn process_timeout_reaps_the_group_and_returns_one_terminal_tool_result() {
     pty.write(F10);
     let (status, _) = pty.finish(Duration::from_secs(5));
     assert!(status.success());
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].lifecycle, latte_core::ThreadLifecycle::Ready);
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].lifecycle, latte_core::SessionLifecycle::Ready);
     assert_eq!(
-        threads[0]
+        sessions[0]
             .transcript
             .entries
             .iter()

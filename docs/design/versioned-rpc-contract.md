@@ -71,22 +71,22 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
   `Serialize/Deserialize`。
 - **禁止 `serde_json::Value` 作为字段类型**，除非该字段是真正的不透明 JSON
   （如 transcript payload）。
-- DTO 与 `latte-core` 类型共享时，直接引用 core 类型（如 `ThreadId`、
-  `ThreadSnapshot`），不重新定义。
+- DTO 与 `latte-core` 类型共享时，直接引用 core 类型（如 `SessionId`、
+  `SessionSnapshot`），不重新定义。
 
 ### 3.2 当前需类型化的字段
 
 | 端点 | 字段 | 当前类型 | 目标类型 |
 |---|---|---|---|
-| `POST /v1/workspaces/{ws}/sessions` | `binding` | `serde_json::Value` | `ThreadProviderBindingV2` |
-| `POST /v1/sessions/{id}/model` | `binding` | `serde_json::Value` | `ThreadProviderBindingV2` |
+| `POST /v1/workspaces/{ws}/sessions` | `binding` | `serde_json::Value` | `SessionProviderBinding` |
+| `POST /v1/sessions/{id}/model` | `binding` | `serde_json::Value` | `SessionProviderBinding` |
 
 `GET /v1/workspaces/{ws}/bindings` 的 `binding` 字段**已经是**
-`ThreadProviderBindingV2`（`BindingCatalogEntry` 在 `latte-headless/src/registry.rs`
+`SessionProviderBinding`（`BindingCatalogEntry` 在 `latte-headless/src/registry.rs`
 中已类型化），无需改动。
 
-`ThreadProviderBindingV2` 已在 `latte-core` 定义且派生 `Serialize/Deserialize`，
-直接引用即可。server 侧的 `resolve_thread_bound` 已经消费这个类型，类型化后
+`SessionProviderBinding` 已在 `latte-core` 定义且派生 `Serialize/Deserialize`，
+直接引用即可。server 侧的 `resolve_session_bound` 已经消费这个类型，类型化后
 消除一层 JSON 序列化/反序列化。
 
 ### 3.3 DTO 清单
@@ -103,7 +103,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 以下响应体当前是 `serde_json::Value` 或 `Json<Value>`，应在 v1 内类型化
 （非 breaking，因为 JSON 结构不变）：
 
-- `GET /v1/sessions/{id}` → `SessionResponse { snapshot: ThreadSnapshot }`
+- `GET /v1/sessions/{id}` → `SessionResponse { snapshot: SessionSnapshot }`
 - `POST /v1/sessions/{id}/follow-up` → `FollowUpResponse { accepted_revision: u64, workspace_id: String }`（`workspace_id` 是客户端订阅正确事件流的必需字段，当前实现已返回）
 - `POST /v1/sessions/{id}/cancel` → `SessionResponse`
 - `POST /v1/sessions/{id}/model` → `SessionResponse`
@@ -181,8 +181,8 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 
 | event | data 字段 | 语义 | 丢失影响 |
 |---|---|---|---|
-| `thread_changed` | `{session_id, revision}` | session 的持久状态变更 | 客户端下次 resync 时补齐 |
-| `progress` | `{session_id, run_id, progress}` | 瞬态流式进度 | 丢失只影响 UI 流畅度，不影响正确性 |
+| `session_changed` | `{session_id, revision}` | session 的持久状态变更 | 客户端下次 resync 时补齐 |
+| `progress` | `{session_id, turn_id, progress}` | 瞬态流式进度 | 丢失只影响 UI 流畅度，不影响正确性 |
 | `resync_required` | `{}` | 客户端必须全量 resync | 不适用（这就是 resync 信号） |
 
 **未知 event type**：客户端必须忽略（不报错、不断开）。这允许 v1 内新增 event type。
@@ -228,7 +228,7 @@ search/exact-title 只消费 `limit`（`limit=0` 被 clamp 为 1）；cursor 被
 - 非法 cursor 返回 `400 rejected`。
 
 实现位于 engine 的 keyset 分页（`(updated_at_ms, rowid)` 降序），list 返回
-`ThreadSnapshot` 页，search/exact-title 返回 `ThreadSessionSummary` 页。
+`SessionSnapshot` 页，search/exact-title 返回 `SessionSummary` 页。
 
 ## 7. 兼容性规则
 
@@ -267,7 +267,7 @@ v1 客户端必须：
 ### Phase B：DTO 类型化 + 分页实现（~1.5 天）
 
 - [x] `CreateSessionRequest.binding` / `SwitchModelRequest.binding` 改为
-      `ThreadProviderBindingV2`（`BindingCatalogEntry.binding` 已经是该类型，无需改动）
+      `SessionProviderBinding`（`BindingCatalogEntry.binding` 已经是该类型，无需改动）
 - [x] 响应体从 `Json<Value>` 改为类型化 struct（§3.3 清单）
 - [x] 实现 server 侧 cursor 分页（list + search + exact-title），使 §6.2 升格为正式契约
 - [x] UT + E2E 覆盖
@@ -295,6 +295,6 @@ v1 客户端必须：
   直接改 v1，不强制走 /v2/ 并存。但必须在 CHANGELOG 和 PR 描述中明确标注 breaking。
   第一个外部用户出现后，恢复"任何 breaking 走 v2"的正式政策。
 - **binding 类型化的迁移**：现有 session 的 binding 已持久化为 JSON。类型化后
-  反序列化是否兼容？——**已验证**：`ThreadProviderBindingV2` 派生了 `Deserialize`
+  反序列化是否兼容？——**已验证**：`SessionProviderBinding` 派生了 `Deserialize`
   且字段未变，契约测试 `typed_binding_round_trips_through_persistence` 覆盖
   发送 → 持久化 → snapshot 读回的完整 round-trip。

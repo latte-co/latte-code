@@ -23,7 +23,7 @@ catalog 只含 metadata，不能携带任意 executable callback。TUI popup 与
 
 ## 3. Delegation
 
-delegated agent 是 primary Session 的受限 child Run，不是并发写同一 Session 的第二 owner。它有独立 input budget、deadline、cancellation token、tool allowlist 与 provenance，通过 engine 申请所有 effect，并以 bounded redacted result summary 回父 runner。父 runner 串行决定 start/await/merge/cancel。child effect 绑定自己的 Run revision、lease 与 approval，不能继承父 Run 已消费 approval。主 conversation 只追加用户可见 delegation summary，不写 private scratchpad、partial stream 或 credential。
+delegated agent 是 primary Session 的受限 child Turn，不是并发写同一 Session 的第二 owner。它有独立 input budget、deadline、cancellation token、tool allowlist 与 provenance，通过 engine 申请所有 effect，并以 bounded redacted result summary 回父 runner。父 runner 串行决定 start/await/merge/cancel。child effect 绑定自己的 Turn revision、lease 与 approval，不能继承父 Turn 已消费 approval。主 conversation 只追加用户可见 delegation summary，不写 private scratchpad、partial stream 或 credential。
 
 ## 4. 验收
 

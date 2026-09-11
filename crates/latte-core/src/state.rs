@@ -1,37 +1,39 @@
 use crate::{
-    FailureCode, Handoff, PendingInput, PendingPermission, Retryability, RunFailure, RunId,
-    RunStatus, VerificationStatus,
+    FailureCode, Handoff, PendingInput, PendingPermission, Retryability, TurnFailure, TurnId,
+    TurnStatus, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Complete durable state for one run.
+/// Complete durable state for one turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunState {
-    /// Run identifier.
-    pub run_id: RunId,
+pub struct TurnState {
+    /// Turn identifier. Read-compat: pre-schema-15 rows serialized this as
+    /// `run_id` in durable `turns.state_json`.
+    #[serde(alias = "run_id")]
+    pub turn_id: TurnId,
     /// Revision incremented exactly once per accepted transition.
     pub revision: u64,
     /// Current status.
-    pub status: RunStatus,
+    pub status: TurnStatus,
     /// Outstanding permission, if any.
     pub pending_permission: Option<PendingPermission>,
     /// Outstanding input, if any.
     pub pending_input: Option<PendingInput>,
     /// Failure details when failed.
-    pub failure: Option<RunFailure>,
+    pub failure: Option<TurnFailure>,
     /// Final handoff when completed.
     pub handoff: Option<Handoff>,
 }
 
-impl RunState {
-    /// Creates a queued run at revision zero.
+impl TurnState {
+    /// Creates a queued turn at revision zero.
     #[must_use]
-    pub const fn queued(run_id: RunId) -> Self {
+    pub const fn queued(turn_id: TurnId) -> Self {
         Self {
-            run_id,
+            turn_id,
             revision: 0,
-            status: RunStatus::Queued,
+            status: TurnStatus::Queued,
             pending_permission: None,
             pending_input: None,
             failure: None,
@@ -57,7 +59,7 @@ impl RunState {
                 actual: self.revision,
             });
         }
-        if self.status == RunStatus::Completed {
+        if self.status == TurnStatus::Completed {
             return Err(TransitionError::CompletedImmutable);
         }
         let mut next = self.clone();
@@ -66,17 +68,17 @@ impl RunState {
             .checked_add(1)
             .ok_or(TransitionError::RevisionOverflow)?;
         match transition {
-            Transition::Start if self.status == RunStatus::Queued => {
-                next.status = RunStatus::Running;
+            Transition::Start if self.status == TurnStatus::Queued => {
+                next.status = TurnStatus::Running;
             }
-            Transition::RequestPermission(request) if self.status == RunStatus::Running => {
-                next.status = RunStatus::WaitingPermission;
+            Transition::RequestPermission(request) if self.status == TurnStatus::Running => {
+                next.status = TurnStatus::WaitingPermission;
                 next.pending_permission = Some(request);
             }
             Transition::ResolvePermission {
                 request_id,
                 allowed,
-            } if self.status == RunStatus::WaitingPermission => {
+            } if self.status == TurnStatus::WaitingPermission => {
                 let pending = self
                     .pending_permission
                     .as_ref()
@@ -86,10 +88,10 @@ impl RunState {
                 }
                 next.pending_permission = None;
                 if allowed {
-                    next.status = RunStatus::Running;
+                    next.status = TurnStatus::Running;
                 } else {
-                    next.status = RunStatus::Failed;
-                    next.failure = Some(RunFailure {
+                    next.status = TurnStatus::Failed;
+                    next.failure = Some(TurnFailure {
                         code: FailureCode::PermissionDenied,
                         message: "permission was denied".into(),
                         retryability: Retryability::Terminal,
@@ -97,16 +99,16 @@ impl RunState {
                 }
             }
             Transition::RefreshPermission(request)
-                if self.status == RunStatus::WaitingPermission =>
+                if self.status == TurnStatus::WaitingPermission =>
             {
-                next.status = RunStatus::WaitingPermission;
+                next.status = TurnStatus::WaitingPermission;
                 next.pending_permission = Some(request);
             }
-            Transition::RequestInput(request) if self.status == RunStatus::Running => {
-                next.status = RunStatus::WaitingInput;
+            Transition::RequestInput(request) if self.status == TurnStatus::Running => {
+                next.status = TurnStatus::WaitingInput;
                 next.pending_input = Some(request);
             }
-            Transition::ProvideInput { request_id } if self.status == RunStatus::WaitingInput => {
+            Transition::ProvideInput { request_id } if self.status == TurnStatus::WaitingInput => {
                 let pending = self
                     .pending_input
                     .as_ref()
@@ -115,46 +117,46 @@ impl RunState {
                     return Err(TransitionError::MismatchedRequest);
                 }
                 next.pending_input = None;
-                next.status = RunStatus::Running;
+                next.status = TurnStatus::Running;
             }
             Transition::Cancel
                 if matches!(
                     self.status,
-                    RunStatus::Queued
-                        | RunStatus::Running
-                        | RunStatus::WaitingPermission
-                        | RunStatus::WaitingInput
+                    TurnStatus::Queued
+                        | TurnStatus::Running
+                        | TurnStatus::WaitingPermission
+                        | TurnStatus::WaitingInput
                 ) =>
             {
-                next.status = RunStatus::Cancelling;
+                next.status = TurnStatus::Cancelling;
                 next.pending_input = None;
                 next.pending_permission = None;
             }
             Transition::Interrupt
-                if matches!(self.status, RunStatus::Running | RunStatus::Cancelling) =>
+                if matches!(self.status, TurnStatus::Running | TurnStatus::Cancelling) =>
             {
-                next.status = RunStatus::Interrupted;
+                next.status = TurnStatus::Interrupted;
             }
             Transition::Fail(failure)
                 if matches!(
                     self.status,
-                    RunStatus::Queued | RunStatus::Running | RunStatus::Cancelling
+                    TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
                 ) =>
             {
-                next.status = RunStatus::Failed;
+                next.status = TurnStatus::Failed;
                 next.failure = Some(failure);
             }
             Transition::Resume
-                if self.status == RunStatus::Interrupted
-                    || (self.status == RunStatus::Failed
+                if self.status == TurnStatus::Interrupted
+                    || (self.status == TurnStatus::Failed
                         && self.failure.as_ref().is_some_and(|failure| {
                             failure.retryability == Retryability::Retryable
                         })) =>
             {
-                next.status = RunStatus::Queued;
+                next.status = TurnStatus::Queued;
                 next.failure = None;
             }
-            Transition::Complete { handoff, policy } if self.status == RunStatus::Running => {
+            Transition::Complete { handoff, policy } if self.status == TurnStatus::Running => {
                 let verification_passed = match policy {
                     CompletionPolicy::VerificationNotRequired => true,
                     CompletionPolicy::VerificationRequired => {
@@ -166,11 +168,11 @@ impl RunState {
                     }
                 };
                 if verification_passed {
-                    next.status = RunStatus::Completed;
+                    next.status = TurnStatus::Completed;
                     next.handoff = Some(handoff);
                 } else {
-                    next.status = RunStatus::Failed;
-                    next.failure = Some(RunFailure {
+                    next.status = TurnStatus::Failed;
+                    next.failure = Some(TurnFailure {
                         code: FailureCode::VerificationFailed,
                         message: "required verification did not pass".into(),
                         retryability: Retryability::Terminal,
@@ -200,7 +202,7 @@ pub enum Transition {
     },
     Cancel,
     Interrupt,
-    Fail(RunFailure),
+    Fail(TurnFailure),
     Resume,
     Complete {
         /// Final reviewable output.
@@ -210,7 +212,7 @@ pub enum Transition {
     },
 }
 
-/// Verification precondition for completing a run.
+/// Verification precondition for completing a turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionPolicy {
     /// Completion is permitted without verification evidence.
@@ -225,7 +227,7 @@ pub enum TransitionError {
     #[error("stale revision: expected {expected}, actual {actual}")]
     StaleRevision { expected: u64, actual: u64 },
     #[error("transition is invalid from {from:?}")]
-    Invalid { from: RunStatus },
+    Invalid { from: TurnStatus },
     #[error("request id does not match the pending request")]
     MismatchedRequest,
     #[error("state is missing its pending request")]
@@ -266,8 +268,8 @@ mod tests {
     use super::*;
     use crate::{Evidence, IdSource, SystemIdSource};
 
-    fn queued() -> RunState {
-        RunState::queued(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()))
+    fn queued() -> TurnState {
+        TurnState::queued(TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()))
     }
 
     fn permission(id: &str) -> PendingPermission {
@@ -285,8 +287,8 @@ mod tests {
         }
     }
 
-    fn failure(retryability: Retryability) -> RunFailure {
-        RunFailure {
+    fn failure(retryability: Retryability) -> TurnFailure {
+        TurnFailure {
             code: FailureCode::RuntimeFailed,
             message: "failed".into(),
             retryability,
@@ -318,7 +320,7 @@ mod tests {
                 Transition::RequestPermission(permission("permission-1")),
             )
             .unwrap();
-        assert_eq!(waiting.status, RunStatus::WaitingPermission);
+        assert_eq!(waiting.status, TurnStatus::WaitingPermission);
         assert_eq!(
             waiting.transition(
                 waiting.revision,
@@ -348,7 +350,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(allowed.status, RunStatus::Running);
+        assert_eq!(allowed.status, TurnStatus::Running);
         assert!(allowed.pending_permission.is_none());
 
         let waiting_input = allowed
@@ -371,7 +373,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(resumed.status, RunStatus::Running);
+        assert_eq!(resumed.status, TurnStatus::Running);
         assert!(resumed.pending_input.is_none());
 
         let denied_waiting = running
@@ -389,7 +391,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(denied.status, RunStatus::Failed);
+        assert_eq!(denied.status, TurnStatus::Failed);
         assert_eq!(denied.failure.unwrap().code, FailureCode::PermissionDenied);
     }
 
@@ -404,15 +406,15 @@ mod tests {
             })
         );
         let cancelling = initial.transition(0, Transition::Cancel).unwrap();
-        assert_eq!(cancelling.status, RunStatus::Cancelling);
+        assert_eq!(cancelling.status, TurnStatus::Cancelling);
         let interrupted = cancelling
             .transition(cancelling.revision, Transition::Interrupt)
             .unwrap();
-        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(interrupted.status, TurnStatus::Interrupted);
         let resumed = interrupted
             .transition(interrupted.revision, Transition::Resume)
             .unwrap();
-        assert_eq!(resumed.status, RunStatus::Queued);
+        assert_eq!(resumed.status, TurnStatus::Queued);
 
         for state in [
             queued().transition(0, Transition::Start).unwrap(),
@@ -430,7 +432,7 @@ mod tests {
             let cancelled = state
                 .transition(state.revision, Transition::Cancel)
                 .unwrap();
-            assert_eq!(cancelled.status, RunStatus::Cancelling);
+            assert_eq!(cancelled.status, TurnStatus::Cancelling);
             assert!(cancelled.pending_permission.is_none());
             assert!(cancelled.pending_input.is_none());
         }
@@ -445,7 +447,7 @@ mod tests {
         let retried = failed
             .transition(failed.revision, Transition::Resume)
             .unwrap();
-        assert_eq!(retried.status, RunStatus::Queued);
+        assert_eq!(retried.status, TurnStatus::Queued);
         assert!(retried.failure.is_none());
 
         let terminal = queued()
@@ -454,7 +456,7 @@ mod tests {
         assert_eq!(
             terminal.transition(terminal.revision, Transition::Resume),
             Err(TransitionError::Invalid {
-                from: RunStatus::Failed
+                from: TurnStatus::Failed
             })
         );
 
@@ -478,7 +480,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(no_verification.status, RunStatus::Completed);
+        assert_eq!(no_verification.status, TurnStatus::Completed);
         assert!(no_verification.handoff.is_some());
         assert_eq!(
             no_verification.transition(no_verification.revision, Transition::Cancel),
@@ -500,7 +502,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(failed.status, RunStatus::Failed);
+            assert_eq!(failed.status, TurnStatus::Failed);
             assert_eq!(
                 failed.failure.unwrap().code,
                 FailureCode::VerificationFailed
@@ -517,13 +519,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(completed.status, TurnStatus::Completed);
     }
 
     #[test]
     fn malformed_waiting_states_and_invalid_transitions_are_rejected() {
         let mut missing_permission = queued();
-        missing_permission.status = RunStatus::WaitingPermission;
+        missing_permission.status = TurnStatus::WaitingPermission;
         assert_eq!(
             missing_permission.transition(
                 0,
@@ -535,7 +537,7 @@ mod tests {
             Err(TransitionError::MissingPending)
         );
         let mut missing_input = queued();
-        missing_input.status = RunStatus::WaitingInput;
+        missing_input.status = TurnStatus::WaitingInput;
         assert_eq!(
             missing_input.transition(
                 0,
@@ -548,7 +550,7 @@ mod tests {
         assert_eq!(
             queued().transition(0, Transition::Interrupt),
             Err(TransitionError::Invalid {
-                from: RunStatus::Queued
+                from: TurnStatus::Queued
             })
         );
     }

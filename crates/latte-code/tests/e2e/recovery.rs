@@ -150,17 +150,17 @@ impl ServerChild {
     }
 
     /// Creates a session through the crash-safe contract: a fresh client
-    /// `thread_id` + `command_id` in the body and a matching `Idempotency-Key`.
+    /// `session_id` + `command_id` in the body and a matching `Idempotency-Key`.
     pub(super) fn create_session(
         &self,
         workspace_id: &str,
         prompt: &str,
         binding: &serde_json::Value,
     ) -> String {
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let body = serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": prompt,
             "binding": binding,
@@ -183,7 +183,7 @@ impl ServerChild {
     }
 
     /// Polls until the session parks at `WaitingPermission`, returning the
-    /// (thread revision, request id, run revision) needed for the decision.
+    /// (session revision, request id, run revision) needed for the decision.
     pub(super) fn wait_for_permission(&self, session_id: &str) -> (u64, String, u64) {
         for _ in 0..200 {
             let snapshot = self.snapshot(session_id);
@@ -194,7 +194,7 @@ impl ServerChild {
                         .as_str()
                         .unwrap()
                         .to_string(),
-                    snapshot["pending"]["expected_run_revision"]
+                    snapshot["pending"]["expected_turn_revision"]
                         .as_u64()
                         .unwrap(),
                 );
@@ -210,7 +210,7 @@ impl ServerChild {
         session_id: &str,
         request_id: &str,
         revision: u64,
-        run_revision: u64,
+        turn_revision: u64,
         allow: bool,
     ) -> (u16, serde_json::Value) {
         self.request(
@@ -218,8 +218,8 @@ impl ServerChild {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(&serde_json::json!({
                 "allow": allow,
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision,
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision,
             })),
             &[],
         )
@@ -280,7 +280,7 @@ pub(super) fn server_binding(scenario: &Scenario) -> serde_json::Value {
         .expect("engine builds for binding");
     let tools = engine.tool_descriptors();
     let binding = registry
-        .thread_binding_for_default(&tools)
+        .session_binding_for_default(&tools)
         .expect("default binding resolves");
     serde_json::to_value(binding).expect("binding serializes")
 }
@@ -355,13 +355,13 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     let workspace = server.create_workspace(&scenario);
     let binding = server_binding(&scenario);
     let session_id = server.create_session(&workspace, "finish safely", &binding);
-    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
     let (allow_status, allow_body) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
     assert_eq!(terminal["lifecycle"], "ready");
-    assert_eq!(terminal["runs"][0]["status"], "completed");
+    assert_eq!(terminal["turns"][0]["status"], "completed");
 
     // The completed session is visible through the v2 CLI show/list contract.
     let shown = cli_show(&scenario, &server, &session_id);
@@ -372,7 +372,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
         String::from_utf8_lossy(&shown.stderr)
     );
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     let listed = cli_list(&scenario, &server);
@@ -382,7 +382,7 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|session| session["thread_id"] == session_id)
+            .any(|session| session["session_id"] == session_id)
     );
     assert!(!scenario.root().join("state/nested/custom.db").exists());
     assert!(scenario.database_path().exists());
@@ -414,14 +414,14 @@ fn run_waiting_resume_allow_and_deny_are_durable_across_processes() {
     assert_eq!(deny_status, 200, "deny: {deny_body:?}");
     let denied_terminal = denied_server.wait_for_terminal(&denied_session);
     assert_eq!(denied_terminal["lifecycle"], "ready");
-    assert_eq!(denied_terminal["runs"][0]["status"], "failed");
+    assert_eq!(denied_terminal["turns"][0]["status"], "failed");
     assert_eq!(
-        denied_terminal["runs"][0]["failure_code"],
+        denied_terminal["turns"][0]["failure_code"],
         "permission_denied"
     );
     // The denied run is terminal and its pending permission is consumed; the
     // session returns to `ready` for a follow-up but the failed child cannot
-    // be resumed (v2 thread-linked runs carry no runtime checkpoint).
+    // be resumed (v2 session-linked runs carry no runtime checkpoint).
     assert!(denied_terminal["pending"].is_null());
     denied_provider.assert_consumed();
     drop(denied_server);
@@ -442,7 +442,7 @@ fn write_file_deny_never_mutates_and_never_reenters_the_provider() {
     let workspace = server.create_workspace(&scenario);
     let binding = server_binding(&scenario);
     let session_id = server.create_session(&workspace, "create new.txt", &binding);
-    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
     let waiting = server.snapshot(&session_id);
     let effect_id = waiting["pending"]["request_id"]
         .as_str()
@@ -451,11 +451,11 @@ fn write_file_deny_never_mutates_and_never_reenters_the_provider() {
     assert!(!scenario.root().join("new.txt").exists());
 
     let (deny_status, deny_body) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, false);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, false);
     assert_eq!(deny_status, 200, "deny: {deny_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
-    assert_eq!(terminal["runs"][0]["status"], "failed");
-    assert_eq!(terminal["runs"][0]["failure_code"], "permission_denied");
+    assert_eq!(terminal["turns"][0]["status"], "failed");
+    assert_eq!(terminal["turns"][0]["failure_code"], "permission_denied");
     assert!(!scenario.root().join("new.txt").exists());
     provider.assert_consumed();
     assert_eq!(provider.requests().len(), 1);
@@ -480,13 +480,13 @@ fn write_file_allow_resumes_in_a_new_process_verifies_and_completes_once() {
     let workspace = server.create_workspace(&scenario);
     let binding = server_binding(&scenario);
     let session_id = server.create_session(&workspace, "create new.txt", &binding);
-    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
     let (allow_status, allow_body) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
     assert_eq!(terminal["lifecycle"], "ready");
-    assert_eq!(terminal["runs"][0]["status"], "completed");
+    assert_eq!(terminal["turns"][0]["status"], "completed");
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("new.txt")).unwrap(),
         "created by e2e\n"
@@ -502,7 +502,7 @@ fn write_file_allow_resumes_in_a_new_process_verifies_and_completes_once() {
     // A repeated permission decision on the consumed request is rejected and
     // never re-executes the effect or re-enters the provider.
     let (repeat_status, _) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert!(
         repeat_status == 404 || repeat_status == 409,
         "repeat permission returned {repeat_status}"
@@ -530,13 +530,13 @@ fn failed_verification_is_durable_and_never_claims_completion() {
     let workspace = server.create_workspace(&scenario);
     let binding = server_binding(&scenario);
     let session_id = server.create_session(&workspace, "create new.txt", &binding);
-    let (revision, request_id, run_revision) = server.wait_for_permission(&session_id);
+    let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
     let (allow_status, allow_body) =
-        server.resolve_permission(&session_id, &request_id, revision, run_revision, true);
+        server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
     assert_eq!(terminal["lifecycle"], "failed");
-    assert_eq!(terminal["runs"][0]["status"], "failed");
+    assert_eq!(terminal["turns"][0]["status"], "failed");
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("new.txt")).unwrap(),
         "created by e2e\n"
@@ -556,11 +556,11 @@ fn failed_verification_is_durable_and_never_claims_completion() {
     let shown = cli_show(&scenario, &server, &session_id);
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert_ne!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     provider.assert_consumed();

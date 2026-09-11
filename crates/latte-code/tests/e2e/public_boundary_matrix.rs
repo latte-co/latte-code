@@ -1,12 +1,12 @@
 use super::support::{Scenario, json};
 use latte_core::{
-    CompletionPolicy, FailureCode, Handoff, PendingPermission, RunId, RunStatus, Transition,
+    CompletionPolicy, FailureCode, Handoff, PendingPermission, Transition, TurnId, TurnStatus,
     wall_time_ms,
 };
 use latte_engine::{EngineHandle, ToolError, ToolInvocation};
 
-fn run_id() -> RunId {
-    RunId::from_uuid(uuid::Uuid::now_v7())
+fn turn_id() -> TurnId {
+    TurnId::from_uuid(uuid::Uuid::now_v7())
 }
 
 fn build_engine(scenario: &Scenario) -> EngineHandle {
@@ -28,14 +28,14 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     let lease = engine
         .acquire_lease("boundary-owner", now, 120_000)
         .unwrap();
-    let run_id = run_id();
-    engine.create_run(run_id, now + 1).unwrap();
+    let turn_id = turn_id();
+    engine.create_turn(turn_id, now + 1).unwrap();
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, now + 2, &lease)
+        .apply_transition(turn_id, 0, Transition::Start, now + 2, &lease)
         .unwrap();
     engine
         .persist_runtime_checkpoint(
-            run_id,
+            turn_id,
             running.revision,
             &lease,
             r#"{"boundary":"stable","attempt":1}"#,
@@ -44,12 +44,12 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
         .unwrap();
     assert!(
         engine
-            .persist_runtime_checkpoint(run_id, running.revision, &lease, "{", now + 4)
+            .persist_runtime_checkpoint(turn_id, running.revision, &lease, "{", now + 4)
             .is_err()
     );
     assert!(matches!(
         engine.persist_runtime_checkpoint(
-            run_id,
+            turn_id,
             running.revision - 1,
             &lease,
             r#"{"boundary":"stale"}"#,
@@ -59,9 +59,9 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     ));
 
     let stale = engine.apply_transition(
-        run_id,
+        turn_id,
         0,
-        Transition::Fail(latte_core::RunFailure {
+        Transition::Fail(latte_core::TurnFailure {
             code: FailureCode::RuntimeFailed,
             message: "must not commit".into(),
             retryability: latte_core::Retryability::Terminal,
@@ -92,7 +92,7 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     ));
     assert!(matches!(
         engine.persist_runtime_checkpoint(
-            run_id,
+            turn_id,
             running.revision,
             &foreign,
             r#"{"boundary":"foreign"}"#,
@@ -102,7 +102,7 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     ));
     assert!(matches!(
         engine.apply_transition(
-            run_id,
+            turn_id,
             running.revision,
             Transition::Cancel,
             now + 11,
@@ -115,7 +115,7 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     let wrong_authority = ToolInvocation {
         name: "read_file",
         input: &input,
-        run_revision: running.revision,
+        turn_revision: running.revision,
         effect_id: "foreign-read-effect",
         attempt: 1,
         precondition: None,
@@ -126,14 +126,14 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
         lease_token: foreign.fencing_token(),
     };
     assert!(matches!(
-        engine.execute_tool(run_id, &lease, now + 12, &wrong_authority),
+        engine.execute_tool(turn_id, &lease, now + 12, &wrong_authority),
         Err(ToolError::InvalidApproval)
     ));
     assert!(engine.effect_status("foreign-read-effect").is_err());
     assert!(
         engine
             .apply_transition(
-                run_id,
+                turn_id,
                 running.revision,
                 Transition::Resume,
                 now + 13,
@@ -144,7 +144,7 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     assert!(
         engine
             .apply_transition(
-                run_id,
+                turn_id,
                 running.revision,
                 Transition::Complete {
                     handoff: Handoff {
@@ -161,8 +161,8 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
     );
     assert!(
         engine
-            .complete_verified_run(
-                run_id,
+            .complete_verified_turn(
+                turn_id,
                 running.revision,
                 &lease,
                 "missing evidence must fail".into(),
@@ -171,13 +171,13 @@ fn stale_revision_and_foreign_authority_leave_final_projection_unchanged() {
             .is_err()
     );
 
-    assert_eq!(engine.show(run_id).unwrap(), running);
+    assert_eq!(engine.show(turn_id).unwrap(), running);
     assert_eq!(
-        engine.runtime_checkpoint(run_id).unwrap().as_deref(),
+        engine.runtime_checkpoint(turn_id).unwrap().as_deref(),
         Some(r#"{"boundary":"stable","attempt":1}"#)
     );
     // v2 boundary: legacy v1 runs are not projected as v2 sessions.
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &turn_id.to_string()], |_| {});
     assert_eq!(shown.status.code(), Some(4));
     assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -202,10 +202,10 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
     let lease = engine
         .acquire_lease("permission-boundary", now, 120_000)
         .unwrap();
-    let run_id = run_id();
-    engine.create_run(run_id, now + 1).unwrap();
+    let turn_id = turn_id();
+    engine.create_turn(turn_id, now + 1).unwrap();
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, now + 2, &lease)
+        .apply_transition(turn_id, 0, Transition::Start, now + 2, &lease)
         .unwrap();
     let input = serde_json::json!({
         "path":"must-not-exist.txt",
@@ -215,7 +215,7 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
     let initial = ToolInvocation {
         name: "write_file",
         input: &input,
-        run_revision: running.revision + 2,
+        turn_revision: running.revision + 2,
         effect_id: "boundary-write",
         attempt: 1,
         precondition: None,
@@ -225,7 +225,7 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
         lease_owner: lease.owner(),
         lease_token: lease.fencing_token(),
     };
-    let digest = match engine.execute_tool(run_id, &lease, now + 3, &initial) {
+    let digest = match engine.execute_tool(turn_id, &lease, now + 3, &initial) {
         Err(ToolError::PermissionRequired { digest, .. }) => digest,
         other => panic!("expected prepared permission, got {other:?}"),
     };
@@ -233,7 +233,7 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
 
     let waiting = engine
         .apply_transition(
-            run_id,
+            turn_id,
             running.revision,
             Transition::RequestPermission(PendingPermission {
                 request_id: "boundary-write".into(),
@@ -248,7 +248,7 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
         engine
             .permission_matches(
                 "boundary-write",
-                run_id,
+                turn_id,
                 waiting.revision + 1,
                 &lease,
                 &digest,
@@ -260,7 +260,7 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
         !engine
             .permission_matches(
                 "boundary-write",
-                run_id,
+                turn_id,
                 waiting.revision + 1,
                 &lease,
                 "wrong-digest",
@@ -274,16 +274,16 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
         ..initial
     };
     assert!(matches!(
-        engine.execute_tool(run_id, &lease, now + 7, &wrong_digest),
+        engine.execute_tool(turn_id, &lease, now + 7, &wrong_digest),
         Err(ToolError::InvalidApproval)
     ));
     assert!(!scenario.root().join("must-not-exist.txt").exists());
-    assert_eq!(engine.show(run_id).unwrap(), waiting);
+    assert_eq!(engine.show(turn_id).unwrap(), waiting);
 
     let denied = engine
-        .deny_waiting_permission(run_id, waiting.revision, &lease, now + 8)
+        .deny_waiting_permission(turn_id, waiting.revision, &lease, now + 8)
         .unwrap();
-    assert_eq!(denied.status, RunStatus::Failed);
+    assert_eq!(denied.status, TurnStatus::Failed);
     assert_eq!(
         denied.failure.as_ref().unwrap().code,
         FailureCode::PermissionDenied
@@ -296,25 +296,28 @@ fn prepared_write_wrong_digest_then_public_deny_is_visible_and_never_mutates() {
     assert!(!scenario.root().join("must-not-exist.txt").exists());
     assert_eq!(
         engine
-            .deny_waiting_permission(run_id, denied.revision, &lease, now + 9)
+            .deny_waiting_permission(turn_id, denied.revision, &lease, now + 9)
             .unwrap(),
         denied
     );
     assert_eq!(
         engine
-            .cancel_waiting_run(run_id, denied.revision, &lease, now + 10)
+            .cancel_waiting_turn(turn_id, denied.revision, &lease, now + 10)
             .unwrap(),
         denied
     );
     engine.release_lease(&lease).unwrap();
 
     // v2 removed `resume <run-id> --allow|--deny`; the flag is now a usage error.
-    let redundant = scenario.output(&["--json", "resume", &run_id.to_string(), "--deny"], |_| {});
+    let redundant = scenario.output(
+        &["--json", "resume", &turn_id.to_string(), "--deny"],
+        |_| {},
+    );
     assert_eq!(redundant.status.code(), Some(2));
     assert_eq!(json(&redundant)["error"]["code"], "usage");
 
     // v2 boundary: legacy v1 runs are not projected as v2 sessions.
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &turn_id.to_string()], |_| {});
     assert_eq!(shown.status.code(), Some(4));
     assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -360,17 +363,17 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         .unwrap();
     let now = wall_time_ms();
     let lease = engine.acquire_lease("tool-matrix", now, 120_000).unwrap();
-    let run_id = run_id();
-    engine.create_run(run_id, now + 1).unwrap();
+    let turn_id = turn_id();
+    engine.create_turn(turn_id, now + 1).unwrap();
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, now + 2, &lease)
+        .apply_transition(turn_id, 0, Transition::Start, now + 2, &lease)
         .unwrap();
 
     let read_input = serde_json::json!({"path":"readable.txt"});
     let read = ToolInvocation {
         name: "read_file",
         input: &read_input,
-        run_revision: running.revision,
+        turn_revision: running.revision,
         effect_id: "allow-read",
         attempt: 1,
         precondition: None,
@@ -382,14 +385,14 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
     };
     assert!(
         engine
-            .execute_tool(run_id, &lease, now + 3, &read)
+            .execute_tool(turn_id, &lease, now + 3, &read)
             .unwrap()
             .value
             .to_string()
             .contains("public read")
     );
     assert!(matches!(
-        engine.reissue_tool_permission("unused", run_id, &lease, now + 4, &read),
+        engine.reissue_tool_permission("unused", turn_id, &lease, now + 4, &read),
         Err(ToolError::Input(message)) if message.contains("only ask")
     ));
 
@@ -400,7 +403,9 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         effect_id: "allow-list",
         ..read
     };
-    let listed = engine.execute_tool(run_id, &lease, now + 4, &list).unwrap();
+    let listed = engine
+        .execute_tool(turn_id, &lease, now + 4, &list)
+        .unwrap();
     assert!(listed.value.to_string().contains("readable.txt"));
 
     let search_input = serde_json::json!({
@@ -416,7 +421,7 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         ..read
     };
     let searched = engine
-        .execute_tool(run_id, &lease, now + 4, &search)
+        .execute_tool(turn_id, &lease, now + 4, &search)
         .unwrap();
     assert!(searched.value.to_string().contains("searchable.txt"));
 
@@ -428,7 +433,7 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         ..read
     };
     let manifest = engine
-        .execute_tool(run_id, &lease, now + 4, &manifest)
+        .execute_tool(turn_id, &lease, now + 4, &manifest)
         .unwrap();
     assert!(manifest.value.to_string().contains("workspace"));
 
@@ -439,11 +444,11 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         name: "write_file",
         input: &denied_input,
         effect_id: "denied-write",
-        run_revision: running.revision + 2,
+        turn_revision: running.revision + 2,
         ..read
     };
     assert!(matches!(
-        engine.execute_tool(run_id, &lease, now + 5, &denied),
+        engine.execute_tool(turn_id, &lease, now + 5, &denied),
         Err(ToolError::Denied(_))
     ));
     assert!(!scenario.root().join("private/denied.txt").exists());
@@ -456,13 +461,13 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         effect_id: "allowed-write",
         ..denied
     };
-    let digest = match engine.execute_tool(run_id, &lease, now + 6, &initial) {
+    let digest = match engine.execute_tool(turn_id, &lease, now + 6, &initial) {
         Err(ToolError::PermissionRequired { digest, .. }) => digest,
         other => panic!("expected permission, got {other:?}"),
     };
     let waiting = engine
         .apply_transition(
-            run_id,
+            turn_id,
             running.revision,
             Transition::RequestPermission(PendingPermission {
                 request_id: "allowed-write".into(),
@@ -479,7 +484,7 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
     };
     let resumed = engine
         .apply_transition(
-            run_id,
+            turn_id,
             waiting.revision,
             Transition::ResolvePermission {
                 request_id: "allowed-write".into(),
@@ -490,17 +495,17 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         )
         .unwrap();
     engine
-        .execute_tool(run_id, &lease, now + 9, &approved)
+        .execute_tool(turn_id, &lease, now + 9, &approved)
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("allowed.txt")).unwrap(),
         "allowed public write\n"
     );
     assert!(matches!(
-        engine.execute_tool(run_id, &lease, now + 10, &approved),
+        engine.execute_tool(turn_id, &lease, now + 10, &approved),
         Err(ToolError::InvalidApproval)
     ));
-    assert_eq!(engine.show(run_id).unwrap(), resumed);
+    assert_eq!(engine.show(turn_id).unwrap(), resumed);
 
     let unknown = ToolInvocation {
         name: "not_a_tool",
@@ -509,14 +514,14 @@ fn public_engine_tool_allow_ask_deny_and_reissue_matrix_is_final_cli_visible() {
         ..read
     };
     assert!(matches!(
-        engine.execute_tool(run_id, &lease, now + 11, &unknown),
+        engine.execute_tool(turn_id, &lease, now + 11, &unknown),
         Err(ToolError::Unknown(_))
     ));
     engine.release_lease(&lease).unwrap();
     drop(engine);
 
     // v2 boundary: legacy v1 runs are not projected as v2 sessions.
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &turn_id.to_string()], |_| {});
     assert_eq!(shown.status.code(), Some(4));
     assert_eq!(json(&shown)["error"]["code"], "not_found");
 }
@@ -530,14 +535,14 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
     let lease = engine
         .acquire_lease("expired-boundary", logical_now, 100)
         .unwrap();
-    let run_id = run_id();
-    engine.create_run(run_id, logical_now + 1).unwrap();
+    let turn_id = turn_id();
+    engine.create_turn(turn_id, logical_now + 1).unwrap();
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, logical_now + 2, &lease)
+        .apply_transition(turn_id, 0, Transition::Start, logical_now + 2, &lease)
         .unwrap();
     engine
         .persist_runtime_checkpoint(
-            run_id,
+            turn_id,
             running.revision,
             &lease,
             r#"{"boundary":"reopen","history":["first","second"]}"#,
@@ -546,7 +551,7 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
         .unwrap();
     assert!(matches!(
         engine.apply_transition(
-            run_id,
+            turn_id,
             running.revision,
             Transition::Cancel,
             logical_now + 100,
@@ -554,11 +559,11 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
         ),
         Err(latte_engine::StorageError::LeaseLost)
     ));
-    assert_eq!(engine.show(run_id).unwrap(), running);
+    assert_eq!(engine.show(turn_id).unwrap(), running);
     drop(engine);
 
     // v2 boundary: legacy v1 runs are not projected as v2 sessions.
-    let shown = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    let shown = scenario.output(&["--json", "show", &turn_id.to_string()], |_| {});
     assert_eq!(shown.status.code(), Some(4));
     assert_eq!(json(&shown)["error"]["code"], "not_found");
     let listed = scenario.output(&["--json", "list"], |_| {});
@@ -572,31 +577,31 @@ fn expired_owner_reopens_as_interrupted_without_losing_checkpoint_or_history() {
 
     let reopened = build_engine(&scenario);
     assert_eq!(
-        reopened.runtime_checkpoint(run_id).unwrap().as_deref(),
+        reopened.runtime_checkpoint(turn_id).unwrap().as_deref(),
         Some(r#"{"boundary":"reopen","history":["first","second"]}"#)
     );
     assert_eq!(
-        reopened.show(run_id).unwrap().status,
-        RunStatus::Interrupted
+        reopened.show(turn_id).unwrap().status,
+        TurnStatus::Interrupted
     );
     assert!(matches!(
         reopened
-            .interrupt_after_lease_loss(run_id, &lease, 2, real_now + 1)
+            .interrupt_after_lease_loss(turn_id, &lease, 2, real_now + 1)
             .unwrap(),
         latte_engine::LeaseLossRecovery::AlreadyTerminal(ref state)
-            if state.status == RunStatus::Interrupted
+            if state.status == TurnStatus::Interrupted
     ));
     let fresh = reopened
         .acquire_lease("reopen-boundary", real_now + 2, 120_000)
         .unwrap();
     assert_eq!(
         reopened
-            .cancel_waiting_run(run_id, 2, &fresh, real_now + 3)
+            .cancel_waiting_turn(turn_id, 2, &fresh, real_now + 3)
             .unwrap()
             .status,
-        RunStatus::Interrupted
+        TurnStatus::Interrupted
     );
-    let shown_again = scenario.output(&["--json", "show", &run_id.to_string()], |_| {});
+    let shown_again = scenario.output(&["--json", "show", &turn_id.to_string()], |_| {});
     assert_eq!(shown_again.status.code(), Some(4));
     assert_eq!(json(&shown_again)["error"]["code"], "not_found");
     reopened.release_lease(&fresh).unwrap();

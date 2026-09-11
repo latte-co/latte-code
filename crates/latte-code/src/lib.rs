@@ -1,8 +1,8 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
-use latte_core::{IdSource, SystemIdSource, ThreadId, ThreadProviderBindingV2, wall_time_ms};
+use latte_core::{IdSource, SessionId, SessionProviderBinding, SystemIdSource, wall_time_ms};
 use latte_engine::EngineBuilder;
 use latte_headless::{
-    registry::ProviderRegistry, runtime::VerificationPlan, thread::ThreadHistoryPolicy,
+    registry::ProviderRegistry, runtime::VerificationPlan, session::SessionHistoryPolicy,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,7 +21,7 @@ const CONFIG_RELATIVE_PATH: &str = ".latte/latte-code.jsonc";
 const STORAGE_HOME_ENV: &str = "LATTE_CODE_HOME";
 const DEFAULT_CONFIG: &str = r#"{
   version: 1,
-  thread: {
+  session: {
     max_request_bytes: 524288,
     max_input_bytes: 393216,
     reserved_output_bytes: 131072,
@@ -48,27 +48,41 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     pub verification: VerificationConfig,
     #[serde(default)]
-    pub thread: ThreadConfig,
+    pub session: SessionConfig,
 }
 
 /// Limits for v2 transcript-history construction. Values are bytes and the
 /// reserved output is subtracted before provider history can be sent.
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ThreadConfig {
+pub struct SessionConfig {
     pub max_request_bytes: usize,
     pub max_input_bytes: usize,
     pub reserved_output_bytes: usize,
     pub context_cap_bytes: usize,
+    /// Optional hard round bound. Omitted (or null) means unlimited; an
+    /// explicit value must be at least 1. Unlimited is the default —
+    /// protection against a non-converging turn comes from the per-request
+    /// timeout and cancellation instead.
+    #[serde(default)]
+    pub max_tool_rounds: Option<u32>,
+    /// Session-level wall-clock budget for one provider request. The effective
+    /// deadline is the minimum of this value and the selected provider's own
+    /// `providers.<name>.timeout_ms` (default 60s); the shorter one wins. This
+    /// is unrelated to `verification.timeout_ms`, which bounds the verification
+    /// command instead.
+    pub provider_timeout_ms: u64,
 }
-impl Default for ThreadConfig {
+impl Default for SessionConfig {
     fn default() -> Self {
-        let defaults = ThreadHistoryPolicy::default();
+        let defaults = SessionHistoryPolicy::default();
         Self {
             max_request_bytes: defaults.max_request_bytes,
             max_input_bytes: defaults.max_input_bytes,
             reserved_output_bytes: defaults.reserved_output_bytes,
             context_cap_bytes: defaults.context_cap_bytes,
+            max_tool_rounds: defaults.max_tool_rounds,
+            provider_timeout_ms: defaults.provider_timeout_ms,
         }
     }
 }
@@ -132,14 +146,16 @@ impl AppConfig {
         if config.verification.argv.is_empty() {
             return Err("verification.argv must not be empty".into());
         }
-        ThreadHistoryPolicy {
-            max_request_bytes: config.thread.max_request_bytes,
-            max_input_bytes: config.thread.max_input_bytes,
-            reserved_output_bytes: config.thread.reserved_output_bytes,
-            context_cap_bytes: config.thread.context_cap_bytes,
+        SessionHistoryPolicy {
+            max_request_bytes: config.session.max_request_bytes,
+            max_input_bytes: config.session.max_input_bytes,
+            reserved_output_bytes: config.session.reserved_output_bytes,
+            context_cap_bytes: config.session.context_cap_bytes,
+            max_tool_rounds: config.session.max_tool_rounds,
+            provider_timeout_ms: config.session.provider_timeout_ms,
         }
         .validate()
-        .map_err(|error| format!("invalid thread configuration: {error}"))?;
+        .map_err(|error| format!("invalid session configuration: {error}"))?;
         let merged_text = serde_json::to_string(&merged)
             .map_err(|error| format!("cannot serialize merged configuration: {error}"))?;
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
@@ -163,12 +179,14 @@ impl AppConfig {
             root.join(path)
         }
     }
-    fn thread_policy(&self) -> ThreadHistoryPolicy {
-        ThreadHistoryPolicy {
-            max_request_bytes: self.thread.max_request_bytes,
-            max_input_bytes: self.thread.max_input_bytes,
-            reserved_output_bytes: self.thread.reserved_output_bytes,
-            context_cap_bytes: self.thread.context_cap_bytes,
+    fn session_policy(&self) -> SessionHistoryPolicy {
+        SessionHistoryPolicy {
+            max_request_bytes: self.session.max_request_bytes,
+            max_input_bytes: self.session.max_input_bytes,
+            reserved_output_bytes: self.session.reserved_output_bytes,
+            context_cap_bytes: self.session.context_cap_bytes,
+            max_tool_rounds: self.session.max_tool_rounds,
+            provider_timeout_ms: self.session.provider_timeout_ms,
         }
     }
 }
@@ -205,7 +223,7 @@ fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
-    let overlay: Value = json5::from_str(&text)
+    let mut overlay: Value = json5::from_str(&text)
         .map_err(|error| format!("invalid JSONC {}: {error}", path.display()))?;
     if !overlay.is_object() {
         return Err(format!(
@@ -213,7 +231,41 @@ fn merge_optional_config(base: &mut Value, path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    normalize_legacy_thread_block(&mut overlay, path)?;
     merge_value(base, overlay);
+    Ok(())
+}
+
+/// Upgrades the pre-concept-alignment `thread` settings block to `session`
+/// before layer merging, so an old configuration file keeps working without a
+/// manual edit and is never rejected by `deny_unknown_fields` (which runs much
+/// later, after the database upgrade path was already blocked).
+///
+/// Conflict rule: a layer that contains both `thread` and `session` is an
+/// error — silently picking either side could hide the user's intent; the
+/// message tells them which file and which keys to consolidate.
+fn normalize_legacy_thread_block(overlay: &mut Value, path: &Path) -> Result<(), String> {
+    let Some(object) = overlay.as_object_mut() else {
+        return Ok(());
+    };
+    if !object.contains_key("thread") {
+        return Ok(());
+    }
+    if object.contains_key("session") {
+        return Err(format!(
+            "{} uses both the legacy `thread` settings block and the current \
+             `session` block; consolidate the settings under `session` and \
+             remove `thread`",
+            path.display()
+        ));
+    }
+    let thread = object.remove("thread").expect("checked contains_key");
+    object.insert("session".to_owned(), thread);
+    eprintln!(
+        "warning: {} uses the legacy `thread` settings block; it was read as \
+         `session` — rename the block to `session` to remove this warning",
+        path.display()
+    );
     Ok(())
 }
 
@@ -279,17 +331,17 @@ fn workspace_display_path_with_home(root: &Path, home: Option<&Path>) -> String 
 /// Events bridged from the SSE stream to the synchronous TUI poll loop.
 #[derive(Clone, Debug)]
 enum ProjectionEvent {
-    /// A thread changed or a resync was requested; the TUI should refresh.
-    ThreadChanged,
+    /// A session changed or a resync was requested; the TUI should refresh.
+    SessionChanged,
     /// The SSE stream was closed (server shut down or unrecoverable error).
     Closed,
 }
 
-/// HTTP-backed [`ThreadProjectionClient`] that reads snapshots from the server
+/// HTTP-backed [`SessionProjectionClient`] that reads snapshots from the server
 /// and polls a bridged SSE event channel for change notifications.
 ///
 /// The TUI main loop is synchronous; async HTTP calls are made through
-/// `block_in_place` + `block_on` (safe on the multi-threaded tokio runtime).
+/// `block_in_place` + `block_on` (safe on the multi-sessioned tokio runtime).
 struct HttpProjectionClient {
     handle: server_client::ServerHandle,
     workspace_id: String,
@@ -300,7 +352,7 @@ struct HttpProjectionClient {
 impl HttpProjectionClient {
     /// Runs an async HTTP call from the synchronous TUI loop.
     ///
-    /// `block_in_place` moves the current task to a blocking thread so
+    /// `block_in_place` moves the current task to a blocking session so
     /// `block_on` can drive the HTTP future without deadlocking the runtime.
     fn block_on<F, T>(&self, future: F) -> Result<T, String>
     where
@@ -311,12 +363,12 @@ impl HttpProjectionClient {
     }
 }
 
-impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
-    fn snapshots(&mut self) -> Result<Vec<latte_core::ThreadSnapshot>, String> {
+impl latte_tui::session::SessionProjectionClient for HttpProjectionClient {
+    fn snapshots(&mut self) -> Result<Vec<latte_core::SessionSnapshot>, String> {
         self.block_on(self.handle.list_sessions(&self.workspace_id))
     }
 
-    fn session_catalog(&mut self) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+    fn session_catalog(&mut self) -> Result<Vec<latte_core::SessionSummary>, String> {
         // Use the search endpoint with an empty query to get all sessions
         // with their durable metadata (including renamed titles), rather than
         // reconstructing summaries from snapshots (which drops the durable
@@ -327,27 +379,27 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
     fn exact_session_catalog(
         &mut self,
         query: &str,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
-        // If the query is a valid thread ID, fetch that session directly.
-        if let Ok(thread_id) =
-            serde_json::from_value::<ThreadId>(serde_json::Value::String(query.to_string()))
+    ) -> Result<Vec<latte_core::SessionSummary>, String> {
+        // If the query is a valid session ID, fetch that session directly.
+        if let Ok(session_id) =
+            serde_json::from_value::<SessionId>(serde_json::Value::String(query.to_string()))
         {
             // A missing session is not an error — return an empty catalog
             // so the TUI shows "session not found" rather than failing.
-            return match self.block_on(self.handle.try_snapshot(&thread_id)) {
+            return match self.block_on(self.handle.try_snapshot(&session_id)) {
                 Ok(Some(_snapshot)) => {
                     // Verify the session belongs to this workspace and get
                     // its durable summary (with the renamed title, if any).
                     let search_results = self.block_on(
                         self.handle
-                            .search_sessions(&self.workspace_id, &thread_id.to_string()),
+                            .search_sessions(&self.workspace_id, &session_id.to_string()),
                     )?;
                     let summary = search_results
                         .into_iter()
-                        .find(|summary| summary.thread_id == thread_id)
+                        .find(|summary| summary.session_id == session_id)
                         .ok_or_else(|| {
                             format!(
-                                "session {thread_id} belongs to another workspace; explicit rebinding is required"
+                                "session {session_id} belongs to another workspace; explicit rebinding is required"
                             )
                         })?;
                     Ok(vec![summary])
@@ -369,25 +421,25 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
     fn search_session_catalog(
         &mut self,
         query: &str,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, String> {
+    ) -> Result<Vec<latte_core::SessionSummary>, String> {
         self.block_on(self.handle.search_sessions(&self.workspace_id, query))
     }
 
-    fn session(&mut self, thread_id: ThreadId) -> Result<latte_core::ThreadSnapshot, String> {
+    fn session(&mut self, session_id: SessionId) -> Result<latte_core::SessionSnapshot, String> {
         // The server returns the tail (newest 500 entries) via
-        // `thread_snapshot_tail_v2`, matching the old engine behavior.
-        self.block_on(self.handle.snapshot(&thread_id))
+        // `session_snapshot_tail_v2`, matching the old engine behavior.
+        self.block_on(self.handle.snapshot(&session_id))
     }
 
-    fn poll(&mut self) -> latte_tui::thread::ThreadProjectionPoll {
+    fn poll(&mut self) -> latte_tui::session::SessionProjectionPoll {
         match self.event_rx.try_recv() {
-            Ok(ProjectionEvent::ThreadChanged) => latte_tui::thread::ThreadProjectionPoll::Event,
-            Ok(ProjectionEvent::Closed) => latte_tui::thread::ThreadProjectionPoll::Closed,
+            Ok(ProjectionEvent::SessionChanged) => latte_tui::session::SessionProjectionPoll::Event,
+            Ok(ProjectionEvent::Closed) => latte_tui::session::SessionProjectionPoll::Closed,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                latte_tui::thread::ThreadProjectionPoll::Empty
+                latte_tui::session::SessionProjectionPoll::Empty
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                latte_tui::thread::ThreadProjectionPoll::Closed
+                latte_tui::session::SessionProjectionPoll::Closed
             }
         }
     }
@@ -397,13 +449,13 @@ impl latte_tui::thread::ThreadProjectionClient for HttpProjectionClient {
 /// synchronous mpsc channels for the TUI.
 ///
 /// The task reconnects automatically on stream end or read error (§8.1:
-/// resync → reconnect → resync). Thread change events go to `event_tx`;
+/// resync → reconnect → resync). Session change events go to `event_tx`;
 /// progress events go to `progress_tx`.
 fn spawn_sse_bridge(
     mut client: server_client::ServerClient,
     workspace_id: String,
     event_tx: std::sync::mpsc::Sender<ProjectionEvent>,
-    progress_tx: std::sync::mpsc::Sender<latte_core::ThreadTransientProgress>,
+    progress_tx: std::sync::mpsc::Sender<latte_core::SessionTransientProgress>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut first = true;
@@ -418,7 +470,7 @@ fn spawn_sse_bridge(
             // land after it but before resubscription are lost from the
             // stream, so a second resync after reconnect closes that window
             // (§8.1: resync → reconnect → resync).
-            if !first && event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+            if !first && event_tx.send(ProjectionEvent::SessionChanged).is_err() {
                 return; // TUI dropped the receiver
             }
             first = false;
@@ -426,16 +478,16 @@ fn spawn_sse_bridge(
             loop {
                 match client.next_event().await {
                     Ok(Some(
-                        server_client::StreamEvent::ThreadChanged { .. }
+                        server_client::StreamEvent::SessionChanged { .. }
                         | server_client::StreamEvent::ResyncRequired,
                     )) => {
-                        if event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+                        if event_tx.send(ProjectionEvent::SessionChanged).is_err() {
                             return; // TUI dropped the receiver
                         }
                     }
                     Ok(Some(server_client::StreamEvent::Progress { progress, .. })) => {
                         if let Ok(progress) =
-                            serde_json::from_value::<latte_core::ThreadTransientProgress>(progress)
+                            serde_json::from_value::<latte_core::SessionTransientProgress>(progress)
                         {
                             let _ = progress_tx.send(progress);
                         }
@@ -444,7 +496,7 @@ fn spawn_sse_bridge(
                     // before reconnecting so it doesn't stay stale (§8.1:
                     // resync → reconnect → resync).
                     Ok(None) | Err(_) => {
-                        if event_tx.send(ProjectionEvent::ThreadChanged).is_err() {
+                        if event_tx.send(ProjectionEvent::SessionChanged).is_err() {
                             return; // TUI dropped the receiver
                         }
                         break;
@@ -641,9 +693,9 @@ async fn execute_session_command_inner(
             Ok(EXIT_COMPLETED)
         }
         server_client::SessionCommand::Show { session_id } => {
-            let thread_id = server_client::parse_session_id(&session_id)?;
+            let session_id = server_client::parse_session_id(&session_id)?;
             let snapshot = tokio::select! {
-                result = client.snapshot(&thread_id) => result?,
+                result = client.snapshot(&session_id) => result?,
                 () = &mut cancel => return Ok(EXIT_INTERRUPTED),
             };
             if json {
@@ -670,11 +722,11 @@ fn emit_client_error(json: bool, error: &server_client::ClientError) -> i32 {
 /// Holds the fully-resolved state the TUI main loop needs.
 struct TuiSetup {
     projection: HttpProjectionClient,
-    startup_binding: Option<ThreadProviderBindingV2>,
-    startup: latte_tui::thread::ThreadStartupPresentation,
-    progress_rx: std::sync::mpsc::Receiver<latte_core::ThreadTransientProgress>,
-    feedback_tx: std::sync::mpsc::Sender<latte_tui::thread::ThreadUiFeedback>,
-    feedback_rx: std::sync::mpsc::Receiver<latte_tui::thread::ThreadUiFeedback>,
+    startup_binding: Option<SessionProviderBinding>,
+    startup: latte_tui::session::SessionStartupPresentation,
+    progress_rx: std::sync::mpsc::Receiver<latte_core::SessionTransientProgress>,
+    feedback_tx: std::sync::mpsc::Sender<latte_tui::session::SessionUiFeedback>,
+    feedback_rx: std::sync::mpsc::Receiver<latte_tui::session::SessionUiFeedback>,
     server_handle: server_client::ServerHandle,
     workspace_id: String,
     bindings: Vec<Value>,
@@ -748,10 +800,10 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
         .or_else(|| bindings.first());
     let startup_binding = default_entry.and_then(|entry| {
         entry.get("binding").and_then(|binding| {
-            serde_json::from_value::<ThreadProviderBindingV2>(binding.clone()).ok()
+            serde_json::from_value::<SessionProviderBinding>(binding.clone()).ok()
         })
     });
-    let startup = latte_tui::thread::ThreadStartupPresentation {
+    let startup = latte_tui::session::SessionStartupPresentation {
         default_provider: startup_binding
             .as_ref()
             .map_or_else(String::new, |binding| binding.provider_name.clone()),
@@ -760,7 +812,7 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
             .map_or_else(String::new, |binding| binding.model.clone()),
         model_catalog: bindings
             .iter()
-            .map(|entry| latte_tui::thread::ThreadModelOption {
+            .map(|entry| latte_tui::session::SessionModelOption {
                 provider_name: entry
                     .get("provider_name")
                     .and_then(Value::as_str)
@@ -779,12 +831,12 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
             })
             .collect(),
         workspace_display: workspace_display_path(root),
-        permission_mode: latte_tui::thread::ThreadPermissionMode::Ask,
+        permission_mode: latte_tui::session::SessionPermissionMode::Ask,
     };
     // Spawn the SSE bridge: background task → mpsc channels for the sync TUI.
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ProjectionEvent>();
     let (progress_tx, progress_rx) =
-        std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+        std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
     let sse_task = spawn_sse_bridge(client, workspace_id.clone(), event_tx, progress_tx);
     let projection = HttpProjectionClient {
         handle: server_handle.clone(),
@@ -793,7 +845,7 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
         runtime: tokio::runtime::Handle::current(),
     };
     let (feedback_tx, feedback_rx) =
-        std::sync::mpsc::channel::<latte_tui::thread::ThreadUiFeedback>();
+        std::sync::mpsc::channel::<latte_tui::session::SessionUiFeedback>();
     Ok(TuiSetup {
         projection,
         startup_binding,
@@ -859,19 +911,21 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
             })
             .and_then(|entry| entry.get("binding").cloned())
     };
-    let result = latte_tui::thread::run_with_feedback_and_progress(
+    let result = latte_tui::session::run_with_feedback_and_progress(
         &mut projection,
         startup,
         move |action| {
-            use latte_tui::thread::{SessionManagementOutcome, ThreadUiAction, ThreadUiFeedback};
+            use latte_tui::session::{
+                SessionManagementOutcome, SessionUiAction, SessionUiFeedback,
+            };
             // Session management actions (rename/fork) are dispatched first.
             let action = match action {
-                ThreadUiAction::RenameSession { thread_id, title } => {
+                SessionUiAction::RenameSession { session_id, title } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .rename_session(&thread_id, &title)
+                            .rename_session(&session_id, &title)
                             .await
                             .map(|()| {
                                 SessionManagementOutcome::Updated(format!(
@@ -879,33 +933,33 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                                 ))
                             })
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::session_management(result));
+                        let _ = feedback.send(SessionUiFeedback::session_management(result));
                     });
                     return Ok(());
                 }
-                ThreadUiAction::ForkSession { thread_id, title } => {
+                SessionUiAction::ForkSession { session_id, title } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .fork_session(&thread_id, title.as_deref())
+                            .fork_session(&session_id, title.as_deref())
                             .await
                             .map(SessionManagementOutcome::Forked)
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::session_management(result));
+                        let _ = feedback.send(SessionUiFeedback::session_management(result));
                     });
                     return Ok(());
                 }
                 other => other,
             };
             match action {
-                ThreadUiAction::Start {
+                SessionUiAction::Start {
                     submission_id,
                     prompt,
                 } => {
                     let Some(binding) = startup_binding.clone() else {
                         let _ = feedback_tx.send(
-                            ThreadUiFeedback::submission(
+                            SessionUiFeedback::submission(
                                 submission_id,
                                 Err("configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code".into()),
                             ),
@@ -915,31 +969,31 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     let ws = workspace_id.clone();
-                    let thread_id =
-                        ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
-                    let command_id = latte_core::ThreadCommandId::from_uuid(
+                    let session_id =
+                        SessionId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
+                    let command_id = latte_core::SessionCommandId::from_uuid(
                         latte_core::SystemIdSource::default().next_uuid_v7(),
                     );
-                    let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
+                    let _ = feedback.send(SessionUiFeedback::assigned(submission_id, session_id));
                     let binding_value =
                         serde_json::to_value(&binding).map_err(|error| error.to_string())?;
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(&ws, thread_id, command_id, &prompt, &binding_value)
+                            .create_session(&ws, session_id, command_id, &prompt, &binding_value)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
+                        let _ = feedback.send(SessionUiFeedback::submission(submission_id, result));
                     });
                 }
-                ThreadUiAction::StartWithModel {
+                SessionUiAction::StartWithModel {
                     submission_id,
                     prompt,
                     provider_name,
                     model,
                 } => {
                     let Some(binding_value) = resolve_binding(&provider_name, &model) else {
-                        let _ = feedback_tx.send(ThreadUiFeedback::submission(
+                        let _ = feedback_tx.send(SessionUiFeedback::submission(
                             submission_id,
                             Err(format!("no binding found for {provider_name}/{model}")),
                         ));
@@ -948,25 +1002,25 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     let ws = workspace_id.clone();
-                    let thread_id =
-                        ThreadId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
-                    let command_id = latte_core::ThreadCommandId::from_uuid(
+                    let session_id =
+                        SessionId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
+                    let command_id = latte_core::SessionCommandId::from_uuid(
                         latte_core::SystemIdSource::default().next_uuid_v7(),
                     );
-                    let _ = feedback.send(ThreadUiFeedback::assigned(submission_id, thread_id));
+                    let _ = feedback.send(SessionUiFeedback::assigned(submission_id, session_id));
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(&ws, thread_id, command_id, &prompt, &binding_value)
+                            .create_session(&ws, session_id, command_id, &prompt, &binding_value)
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
+                        let _ = feedback.send(SessionUiFeedback::submission(submission_id, result));
                     });
                 }
-                ThreadUiAction::FollowUp {
+                SessionUiAction::FollowUp {
                     submission_id,
-                    thread_id,
-                    expected_thread_revision,
+                    session_id,
+                    expected_session_revision,
                     prompt,
                 } => {
                     let handle = server_handle.clone();
@@ -976,78 +1030,78 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         // retry of this submission replays instead of
                         // appending a duplicate turn.
                         let command_id =
-                            latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
+                            latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7());
                         let result = handle
-                            .follow_up(&thread_id, &command_id, expected_thread_revision, &prompt)
+                            .follow_up(&session_id, &command_id, expected_session_revision, &prompt)
                             .await
                             .map(|()| "follow-up completed".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
+                        let _ = feedback.send(SessionUiFeedback::submission(submission_id, result));
                     });
                 }
-                ThreadUiAction::QueueFollowUp {
+                SessionUiAction::QueueFollowUp {
                     submission_id,
-                    thread_id,
+                    session_id,
                     prompt,
                 } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .queue_follow_up(&thread_id, &prompt)
+                            .queue_follow_up(&session_id, &prompt)
                             .await
                             .map(|position| format!("follow-up queued at position {position}"))
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::submission(submission_id, result));
+                        let _ = feedback.send(SessionUiFeedback::submission(submission_id, result));
                     });
                 }
-                ThreadUiAction::Cancel { thread_id } => {
+                SessionUiAction::Cancel { session_id } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
-                        let snapshot = handle.snapshot(&thread_id).await;
+                        let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|run| run.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|run| run.turn_id == turn_id)
                                     })
-                                    .map_or(0, |run| run.run_revision);
+                                    .map_or(0, |run| run.turn_revision);
                                 handle
-                                    .cancel(&thread_id, snapshot.revision, run_revision)
+                                    .cancel(&session_id, snapshot.revision, turn_revision)
                                     .await
                                     .map(|()| "interruption requested".into())
                                     .map_err(|error| error.to_string())
                             }
                             Err(error) => Err(error.to_string()),
                         };
-                        let _ = feedback.send(ThreadUiFeedback::command(result));
+                        let _ = feedback.send(SessionUiFeedback::command(result));
                     });
                 }
-                ThreadUiAction::ProvideInput {
+                SessionUiAction::ProvideInput {
                     submission_id,
-                    thread_id,
+                    session_id,
                     request_id,
                     value,
                 } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
-                        let snapshot = handle.snapshot(&thread_id).await;
+                        let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|r| r.turn_id == turn_id)
                                     })
-                                    .map_or(0, |r| r.run_revision);
+                                    .map_or(0, |r| r.turn_revision);
                                 handle
                                     .provide_input(
-                                        &thread_id,
+                                        &session_id,
                                         snapshot.revision,
-                                        run_revision,
+                                        turn_revision,
                                         &request_id,
                                         &value,
                                     )
@@ -1058,31 +1112,31 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                             Err(error) => Err(error.to_string()),
                         };
                         let _ = feedback
-                            .send(ThreadUiFeedback::input_submission(submission_id, result));
+                            .send(SessionUiFeedback::input_submission(submission_id, result));
                     });
                 }
-                ThreadUiAction::ResolvePermission {
-                    thread_id,
+                SessionUiAction::ResolvePermission {
+                    session_id,
                     request_id,
                     allow,
                 } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
-                        let snapshot = handle.snapshot(&thread_id).await;
+                        let snapshot = handle.snapshot(&session_id).await;
                         let result = match snapshot {
                             Ok(snapshot) => {
-                                let run_revision = snapshot
-                                    .active_run_id
-                                    .and_then(|run_id| {
-                                        snapshot.runs.iter().find(|r| r.run_id == run_id)
+                                let turn_revision = snapshot
+                                    .active_turn_id
+                                    .and_then(|turn_id| {
+                                        snapshot.turns.iter().find(|r| r.turn_id == turn_id)
                                     })
-                                    .map_or(0, |r| r.run_revision);
+                                    .map_or(0, |r| r.turn_revision);
                                 handle
                                     .resolve_permission(
-                                        &thread_id,
+                                        &session_id,
                                         snapshot.revision,
-                                        run_revision,
+                                        turn_revision,
                                         &request_id,
                                         allow,
                                     )
@@ -1098,33 +1152,33 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                             }
                             Err(error) => Err(error.to_string()),
                         };
-                        let _ = feedback.send(ThreadUiFeedback::command(result));
+                        let _ = feedback.send(SessionUiFeedback::command(result));
                     });
                 }
-                ThreadUiAction::ReconcileUnknown {
-                    thread_id,
+                SessionUiAction::ReconcileUnknown {
+                    session_id,
                     effect_id,
                 } => {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .reconcile_effect(&thread_id, &effect_id)
+                            .reconcile_effect(&session_id, &effect_id)
                             .await
                             .map(|()| "unknown effect acknowledged; child aborted".into())
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::command(result));
+                        let _ = feedback.send(SessionUiFeedback::command(result));
                     });
                 }
-                ThreadUiAction::SwitchModel {
+                SessionUiAction::SwitchModel {
                     switch_id,
-                    thread_id,
-                    expected_thread_revision,
+                    session_id,
+                    expected_session_revision,
                     provider_name,
                     model,
                 } => {
                     let Some(binding_value) = resolve_binding(&provider_name, &model) else {
-                        let _ = feedback_tx.send(ThreadUiFeedback::model_switch(
+                        let _ = feedback_tx.send(SessionUiFeedback::model_switch(
                             switch_id,
                             Err(format!("no binding found for {provider_name}/{model}")),
                         ));
@@ -1134,19 +1188,19 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .switch_model(&thread_id, expected_thread_revision, &binding_value)
+                            .switch_model(&session_id, expected_session_revision, &binding_value)
                             .await
                             .map(|()| format!("Model switched to {provider_name}/{model}"))
                             .map_err(|error| error.to_string());
-                        let _ = feedback.send(ThreadUiFeedback::model_switch(switch_id, result));
+                        let _ = feedback.send(SessionUiFeedback::model_switch(switch_id, result));
                     });
                 }
-                ThreadUiAction::RefreshSnapshots
-                | ThreadUiAction::ShowSessions { .. }
-                | ThreadUiAction::SearchSessions { .. }
-                | ThreadUiAction::OpenSession { .. }
-                | ThreadUiAction::Quit => {}
-                ThreadUiAction::RenameSession { .. } | ThreadUiAction::ForkSession { .. } => {
+                SessionUiAction::RefreshSnapshots
+                | SessionUiAction::ShowSessions { .. }
+                | SessionUiAction::SearchSessions { .. }
+                | SessionUiAction::OpenSession { .. }
+                | SessionUiAction::Quit => {}
+                SessionUiAction::RenameSession { .. } | SessionUiAction::ForkSession { .. } => {
                     unreachable!("session management actions are dispatched before this match")
                 }
             }
@@ -1363,16 +1417,16 @@ fn prepare_server(
                 .map_err(|error| format!("legacy import: {error}"))?;
             let factory_engine = engine.clone();
             let factory_registry = registry.clone();
-            let factory: latte_headless::thread::ThreadProviderFactory =
-                std::sync::Arc::new(move |binding: &ThreadProviderBindingV2| {
+            let factory: latte_headless::session::SessionProviderFactory =
+                std::sync::Arc::new(move |binding: &SessionProviderBinding| {
                     factory_registry
-                        .resolve_thread_bound(binding, &factory_engine.tool_descriptors())
+                        .resolve_session_bound(binding, &factory_engine.tool_descriptors())
                         .map_err(|error| error.to_string())
                 });
-            let runtime = latte_headless::thread::ThreadRuntimeService::new(
+            let runtime = latte_headless::session::SessionRuntimeService::new(
                 engine.clone(),
                 workspace_root,
-                config.thread_policy(),
+                config.session_policy(),
                 factory,
             )
             .with_verification(config.plan());
@@ -1390,7 +1444,7 @@ fn prepare_server(
     // Session locator: resolve a session's owning workspace from the durable
     // global catalog so reads work after a restart, before any in-memory index
     // is populated. Uses a catalog engine bound to the startup root (queries by
-    // thread id are workspace-independent lookups against the shared store).
+    // session id are workspace-independent lookups against the shared store).
     let catalog_engine = EngineBuilder::new()
         .workspace_root(root)
         .database_path(&database_path)
@@ -1402,9 +1456,9 @@ fn prepare_server(
             message: error.to_string(),
         })?;
     let session_locator: latte_server::SessionLocator =
-        std::sync::Arc::new(move |thread_id: latte_core::ThreadId| {
+        std::sync::Arc::new(move |session_id: latte_core::SessionId| {
             catalog_engine
-                .thread_session_v2(thread_id)
+                .session_v2(session_id)
                 .ok()
                 .flatten()
                 .map(|summary| PathBuf::from(summary.workspace_root))
@@ -1520,18 +1574,18 @@ mod tests {
     use super::EXIT_COMPLETED;
     use super::bind_local_listener;
     use super::{
-        AppConfig, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE, ThreadConfig,
-        VerificationConfig, discover_workspace_root, dot, emit_client_error, emit_data, emit_error,
-        execute_serve, execute_tui, exit_for_setup, generate_server_token, merge_optional_config,
-        merge_value, parse_serve_port, prepare_server, readiness_envelope, serve_bound,
-        storage_home_with, tui_setup, verify_timeout, workspace_display_path_with_home,
-        write_server_token,
+        AppConfig, DEFAULT_CONFIG, DEFAULT_SERVER_PORT, DatabaseConfig, EXIT_INTERNAL, EXIT_USAGE,
+        SessionConfig, VerificationConfig, discover_workspace_root, dot, emit_client_error,
+        emit_data, emit_error, execute_serve, execute_tui, exit_for_setup, generate_server_token,
+        merge_optional_config, merge_value, parse_serve_port, prepare_server, readiness_envelope,
+        serve_bound, storage_home_with, tui_setup, verify_timeout,
+        workspace_display_path_with_home, write_server_token,
     };
     use latte_core::{
-        IdSource, RunId, SystemIdSource, ThreadId, ThreadLifecycle, ThreadProviderBindingV2,
+        IdSource, SessionId, SessionLifecycle, SessionProviderBinding, SystemIdSource, TurnId,
     };
-    use latte_headless::thread::ThreadHistoryPolicy;
-    use latte_tui::thread::{ThreadProjectionClient, ThreadProjectionPoll};
+    use latte_headless::session::SessionHistoryPolicy;
+    use latte_tui::session::{SessionProjectionClient, SessionProjectionPoll};
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},
@@ -1542,12 +1596,12 @@ mod tests {
 
     #[test]
     fn remaining_run_statuses_and_config_value_objects_are_exact() {
-        let threads = ThreadConfig::default();
-        let policy = ThreadHistoryPolicy::default();
-        assert_eq!(threads.max_request_bytes, policy.max_request_bytes);
-        assert_eq!(threads.max_input_bytes, policy.max_input_bytes);
-        assert_eq!(threads.reserved_output_bytes, policy.reserved_output_bytes);
-        assert_eq!(threads.context_cap_bytes, policy.context_cap_bytes);
+        let sessions = SessionConfig::default();
+        let policy = SessionHistoryPolicy::default();
+        assert_eq!(sessions.max_request_bytes, policy.max_request_bytes);
+        assert_eq!(sessions.max_input_bytes, policy.max_input_bytes);
+        assert_eq!(sessions.reserved_output_bytes, policy.reserved_output_bytes);
+        assert_eq!(sessions.context_cap_bytes, policy.context_cap_bytes);
         assert_eq!(DatabaseConfig::default().path, ".latte/latte-code.db");
 
         let config = AppConfig {
@@ -1560,7 +1614,7 @@ mod tests {
                 cwd: "checks".into(),
                 timeout_ms: 42,
             },
-            thread: threads,
+            session: sessions,
         };
         let plan = config.plan();
         assert_eq!(plan.argv, ["cargo", "test"]);
@@ -1569,7 +1623,7 @@ mod tests {
         assert_eq!(plan.grace_ms, 250);
         assert_eq!(plan.stdout_cap, 16 * 1024);
         assert_eq!(plan.stderr_cap, 16 * 1024);
-        let derived = config.thread_policy();
+        let derived = config.session_policy();
         assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
         assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
     }
@@ -1613,7 +1667,7 @@ mod tests {
                 cwd: ".".into(),
                 timeout_ms: 1,
             },
-            thread: ThreadConfig::default(),
+            session: SessionConfig::default(),
         };
         assert_eq!(config.database.path, configured.display().to_string());
     }
@@ -1655,13 +1709,13 @@ mod tests {
         assert_eq!(config.database.path, " ");
         std::fs::write(
             &config_path,
-            r"{ thread: { max_input_bytes: 8, reserved_output_bytes: 8 } }",
+            r"{ session: { max_input_bytes: 8, reserved_output_bytes: 8 } }",
         )
         .unwrap();
         assert!(
             AppConfig::load_with_home(root.path(), Some(home.path()))
                 .unwrap_err()
-                .contains("invalid thread configuration")
+                .contains("invalid session configuration")
         );
         std::fs::write(&config_path, r"{ unexpected: true }").unwrap();
         assert!(
@@ -1798,7 +1852,7 @@ mod tests {
                 cwd: ".".into(),
                 timeout_ms: 1000,
             },
-            thread: ThreadConfig::default(),
+            session: SessionConfig::default(),
         };
         assert_eq!(
             config.legacy_database_path(root),
@@ -1888,6 +1942,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_thread_block_is_normalized_to_session_before_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        // The built-in default already carries a `session` block; the legacy
+        // overlay must merge into it rather than collide as an unknown field.
+        let mut base: serde_json::Value = json5::from_str(DEFAULT_CONFIG).unwrap();
+        let legacy = dir.path().join("legacy.jsonc");
+        std::fs::write(
+            &legacy,
+            "{version:1,providers:{},verification:{argv:['true']},\
+             thread:{max_tool_rounds:3,provider_timeout_ms:7000}}",
+        )
+        .unwrap();
+        merge_optional_config(&mut base, &legacy).unwrap();
+        assert!(
+            base.get("thread").is_none(),
+            "the legacy key must not survive into the merged config"
+        );
+        assert_eq!(base["session"]["max_tool_rounds"], 3);
+        assert_eq!(base["session"]["provider_timeout_ms"], 7000);
+        // The merged document must deserialize under deny_unknown_fields.
+        let parsed: AppConfig = serde_json::from_value(base).unwrap();
+        assert_eq!(parsed.session.max_tool_rounds, Some(3));
+    }
+
+    #[test]
+    fn legacy_thread_in_home_and_session_in_workspace_merge_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".latte")).unwrap();
+        std::fs::create_dir_all(root.path().join(".latte")).unwrap();
+        std::fs::write(
+            home.path().join(".latte/latte-code.jsonc"),
+            "{version:1,providers:{},verification:{argv:['true']},\
+             thread:{provider_timeout_ms:7000}}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join(".latte/latte-code.jsonc"),
+            "{session:{max_tool_rounds:5}}",
+        )
+        .unwrap();
+        let (config, _registry) =
+            AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
+        assert_eq!(config.session.provider_timeout_ms, 7000);
+        assert_eq!(config.session.max_tool_rounds, Some(5));
+    }
+
+    #[test]
+    fn thread_and_session_in_one_layer_is_a_conflict_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base: serde_json::Value = json5::from_str(DEFAULT_CONFIG).unwrap();
+        let conflict = dir.path().join("conflict.jsonc");
+        std::fs::write(
+            &conflict,
+            "{thread:{max_tool_rounds:1},session:{max_tool_rounds:2}}",
+        )
+        .unwrap();
+        let error = merge_optional_config(&mut base, &conflict).unwrap_err();
+        assert!(
+            error.contains("`thread`") && error.contains("`session`"),
+            "conflict error must name both keys: {error}"
+        );
+        assert!(
+            base.get("thread").is_none(),
+            "a rejected layer must not merge"
+        );
+    }
+
+    #[test]
     fn app_config_load_with_home_merges_home_config() {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -1935,7 +2058,7 @@ mod tests {
         .unwrap();
 
         let (config, registry) = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
-        let binding = registry.thread_binding_for_default(&[]).unwrap();
+        let binding = registry.session_binding_for_default(&[]).unwrap();
 
         assert_eq!(config.database.path, "workspace.db");
         assert_eq!(config.verification.timeout_ms, 9000);
@@ -2078,8 +2201,8 @@ mod tests {
         assert!(workspace.list_sessions().unwrap().is_empty());
         assert!(storage_home.join("state.db").is_file());
 
-        // The durable session locator resolves nothing for an unknown thread.
-        let missing = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        // The durable session locator resolves nothing for an unknown session.
+        let missing = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         assert!(
             state
                 .workspaces
@@ -2132,18 +2255,18 @@ mod tests {
             .clone();
 
         // Create a session.
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let snapshot = workspace
             .engine
-            .create_thread_v2(thread_id, run_id, binding, "hello world", 1000)
-            .expect("create_thread_v2");
-        assert_eq!(snapshot.thread_id, thread_id);
+            .create_session_v2(session_id, turn_id, binding, "hello world", 1000)
+            .expect("create_session_v2");
+        assert_eq!(snapshot.session_id, session_id);
 
         // List sessions.
         let sessions = workspace.list_sessions().expect("list_sessions");
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].thread_id, thread_id);
+        assert_eq!(sessions[0].session_id, session_id);
 
         // Search sessions.
         let results = workspace
@@ -2158,55 +2281,51 @@ mod tests {
             .into_owned();
         let summaries = workspace
             .engine
-            .list_thread_sessions_v2_for_workspace(&workspace_root, 200)
-            .expect("list_thread_sessions_v2_for_workspace");
+            .list_session_summaries_for_workspace(&workspace_root, 200)
+            .expect("list_sessions_for_workspace");
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].thread_id, thread_id);
+        assert_eq!(summaries[0].session_id, session_id);
 
         // Find by exact title.
         let exact = workspace
             .engine
-            .find_thread_sessions_v2_by_exact_title_for_workspace(
-                &workspace_root,
-                "hello world",
-                200,
-            )
-            .expect("find_thread_sessions_v2_by_exact_title_for_workspace");
+            .find_sessions_by_exact_title_for_workspace(&workspace_root, "hello world", 200)
+            .expect("find_sessions_by_exact_title_for_workspace");
         assert_eq!(exact.len(), 1);
 
-        // List all threads (not workspace-filtered) with conversation enrichment.
-        let all_threads = workspace.engine.list_threads_v2().expect("list_threads_v2");
-        assert!(!all_threads.is_empty());
+        // List all sessions (not workspace-filtered) with conversation enrichment.
+        let all_sessions = workspace.engine.list_sessions().expect("list_sessions");
+        assert!(!all_sessions.is_empty());
 
         // Get session metadata.
         let metadata = workspace
             .engine
-            .thread_session_v2(thread_id)
-            .expect("thread_session_v2")
+            .session_v2(session_id)
+            .expect("session_v2")
             .expect("session exists");
-        assert_eq!(metadata.thread_id, thread_id);
+        assert_eq!(metadata.session_id, session_id);
 
-        // Subscribe to thread events.
-        let _subscription = workspace.engine.subscribe_threads();
+        // Subscribe to session events.
+        let _subscription = workspace.engine.subscribe_sessions();
 
         // Get a snapshot.
-        let fetched = workspace.snapshot(thread_id).expect("snapshot");
-        assert_eq!(fetched.thread_id, thread_id);
+        let fetched = workspace.snapshot(session_id).expect("snapshot");
+        assert_eq!(fetched.session_id, session_id);
 
         // Rename the session.
         let renamed = workspace
             .engine
-            .rename_thread_session_v2(thread_id, "renamed session")
-            .expect("rename_thread_session_v2");
+            .rename_session_v2(session_id, "renamed session")
+            .expect("rename_session_v2");
         assert_eq!(renamed.title, "renamed session");
 
         // Fork the session.
-        let fork_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let fork_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let forked = workspace
             .engine
-            .fork_thread_session_v2(thread_id, fork_id, None, 2000)
-            .expect("fork_thread_session_v2");
-        assert_eq!(forked.thread_id, fork_id);
+            .fork_session_v2(session_id, fork_id, None, 2000)
+            .expect("fork_session_v2");
+        assert_eq!(forked.session_id, fork_id);
 
         // List now shows both sessions.
         let sessions = workspace.list_sessions().expect("list_sessions after fork");
@@ -2479,11 +2598,11 @@ mod tests {
         let workspace = state.workspaces.get_or_create(root.path()).await.unwrap();
 
         // A binding whose provider is no longer configured: the per-workspace
-        // factory built inside prepare_server is invoked when the thread
+        // factory built inside prepare_server is invoked when the session
         // starts, and its resolution failure surfaces as a retryable child
         // failure rather than a startup error.
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let binding = ThreadProviderBindingV2 {
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let binding = SessionProviderBinding {
             version: 1,
             provider_name: "missing".into(),
             provider_type: "openai-chat".into(),
@@ -2498,12 +2617,12 @@ mod tests {
         };
         let snapshot = workspace
             .runtime
-            .start(thread_id, "hello".into(), binding, None)
+            .start(session_id, "hello".into(), binding, None)
             .await
             .unwrap();
         assert_eq!(
             snapshot.lifecycle,
-            ThreadLifecycle::Ready,
+            SessionLifecycle::Ready,
             "provider construction failure must be a retryable child failure"
         );
     }
@@ -2740,9 +2859,9 @@ mod tests {
     }
 
     /// A terminal-ready snapshot JSON for mock server responses.
-    fn terminal_snapshot_json(thread_id: &str, run_id: &str) -> String {
+    fn terminal_snapshot_json(session_id: &str, turn_id: &str) -> String {
         format!(
-            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":null,"runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"completed","run_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"ready","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_turn_id":"{turn_id}","active_turn_id":null,"turns":[{{"turn_id":"{turn_id}","parent_turn_id":null,"ordinal":1,"status":"completed","turn_revision":1,"completed_at_ms":1234567890,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
         )
     }
 
@@ -2863,9 +2982,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_show_returns_snapshot() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (200, "application/json".into(), snapshot.clone())
@@ -2879,9 +2998,7 @@ mod tests {
         });
         let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
         let root = std::path::Path::new("/tmp");
-        let command = crate::server_client::SessionCommand::Show {
-            session_id: thread_id,
-        };
+        let command = crate::server_client::SessionCommand::Show { session_id };
         let cancel = std::future::pending::<()>();
         let result =
             super::execute_session_command_inner(&mut client, command, root, true, cancel).await;
@@ -2890,9 +3007,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_run_completes() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3100,11 +3217,11 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A minimal valid session snapshot body (the object inside `snapshot`).
-    fn projection_snapshot_body(thread_id: &str, entries: &str) -> String {
+    fn projection_snapshot_body(session_id: &str, entries: &str) -> String {
         format!(
-            r#"{{"thread_id":"{thread_id}","revision":1,"sequence":0,"lifecycle":"ready",
+            r#"{{"session_id":"{session_id}","revision":1,"sequence":0,"lifecycle":"ready",
                "binding":{{"version":1,"provider_name":"main","provider_type":"openai-chat","protocol":"openai-chat","model":"mock","config_fingerprint":"c","tools_fingerprint":"t","aliases":{{}},"credential_ref_id":"env:K","data_scope_id":"main/mock","credential_generation":0}},
-               "latest_run_id":null,"active_run_id":null,"runs":[],
+               "latest_turn_id":null,"active_turn_id":null,"turns":[],
                "transcript":{{"entries":[{entries}],"next_after":null,"has_more":false}}}}"#
         )
     }
@@ -3112,14 +3229,14 @@ mod tests {
     /// A user transcript entry with the given text and timestamp.
     fn projection_user_entry(text: &str, created_at_ms: u64) -> String {
         format!(
-            r#"{{"entry_id":"01900000-0000-7000-8000-0000000000a1","sequence":0,"run_id":null,"kind":"user","text":"{text}","source_key":"user","created_at_ms":{created_at_ms}}}"#
+            r#"{{"entry_id":"01900000-0000-7000-8000-0000000000a1","sequence":0,"turn_id":null,"kind":"user","text":"{text}","source_key":"user","created_at_ms":{created_at_ms}}}"#
         )
     }
 
     /// A minimal session summary JSON for search results.
-    fn projection_summary_json(thread_id: &str, title: &str) -> String {
+    fn projection_summary_json(session_id: &str, title: &str) -> String {
         format!(
-            r#"{{"thread_id":"{thread_id}","title":"{title}","workspace_root":"","lifecycle":"ready","provider_name":"main","model":"mock","created_at_ms":1000,"updated_at_ms":2000}}"#
+            r#"{{"session_id":"{session_id}","title":"{title}","workspace_root":"","lifecycle":"ready","provider_name":"main","model":"mock","created_at_ms":1000,"updated_at_ms":2000}}"#
         )
     }
 
@@ -3182,12 +3299,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_session_fetches_snapshot() {
-        let thread_id = ThreadId::from_uuid(
+        let session_id = SessionId::from_uuid(
             uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
         );
         let body = format!(
             r#"{{"snapshot":{}}}"#,
-            projection_snapshot_body(&thread_id.to_string(), &projection_user_entry("hi", 1000))
+            projection_snapshot_body(&session_id.to_string(), &projection_user_entry("hi", 1000))
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
@@ -3201,21 +3318,21 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let snapshot = projection.session(thread_id).unwrap();
-        assert_eq!(snapshot.thread_id, thread_id);
+        let snapshot = projection.session(session_id).unwrap();
+        assert_eq!(snapshot.session_id, session_id);
         assert_eq!(snapshot.revision, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_exact_catalog_by_id_verifies_workspace() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let snapshot_body = format!(
             r#"{{"snapshot":{}}}"#,
-            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+            projection_snapshot_body(session_id, &projection_user_entry("hello", 1000))
         );
         let search_body = format!(
             r#"{{"sessions":[{}]}}"#,
-            projection_summary_json(thread_id, "hello")
+            projection_summary_json(session_id, "hello")
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
@@ -3231,18 +3348,18 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let catalog = projection.exact_session_catalog(thread_id).unwrap();
+        let catalog = projection.exact_session_catalog(session_id).unwrap();
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].thread_id.to_string(), thread_id);
+        assert_eq!(catalog[0].session_id.to_string(), session_id);
         assert_eq!(catalog[0].title, "hello");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_exact_catalog_rejects_foreign_workspace() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let snapshot_body = format!(
             r#"{{"snapshot":{}}}"#,
-            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+            projection_snapshot_body(session_id, &projection_user_entry("hello", 1000))
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
@@ -3259,13 +3376,13 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        let error = projection.exact_session_catalog(session_id).unwrap_err();
         assert!(error.contains("belongs to another workspace"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_exact_catalog_missing_returns_empty() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let (url, _server) = start_session_mock_server(move |_method, _path| {
             (
                 404,
@@ -3274,7 +3391,7 @@ mod tests {
             )
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let catalog = projection.exact_session_catalog(thread_id).unwrap();
+        let catalog = projection.exact_session_catalog(session_id).unwrap();
         assert!(catalog.is_empty());
     }
 
@@ -3390,30 +3507,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_poll_returns_empty_when_idle() {
         let (mut projection, _tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Empty));
+        assert!(matches!(projection.poll(), SessionProjectionPoll::Empty));
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn http_projection_client_poll_forwards_thread_changed() {
+    async fn http_projection_client_poll_forwards_session_changed() {
         let (mut projection, tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
-        tx.send(super::ProjectionEvent::ThreadChanged).unwrap();
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Event));
+        tx.send(super::ProjectionEvent::SessionChanged).unwrap();
+        assert!(matches!(projection.poll(), SessionProjectionPoll::Event));
         // Event consumed → back to Empty.
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Empty));
+        assert!(matches!(projection.poll(), SessionProjectionPoll::Empty));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_poll_returns_closed_on_disconnect() {
         let (mut projection, tx) = http_projection_client("http://127.0.0.1:0", "ws-1");
         tx.send(super::ProjectionEvent::Closed).unwrap();
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Closed));
+        assert!(matches!(projection.poll(), SessionProjectionPoll::Closed));
         // Sender dropped → Disconnected → Closed.
         drop(tx);
-        assert!(matches!(projection.poll(), ThreadProjectionPoll::Closed));
+        assert!(matches!(projection.poll(), SessionProjectionPoll::Closed));
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn sse_bridge_forwards_thread_changed_and_progress() {
+    async fn sse_bridge_forwards_session_changed_and_progress() {
         use axum::response::sse::{Event, Sse};
         use futures::stream;
 
@@ -3421,10 +3538,10 @@ mod tests {
         {
             let stream = stream::iter(vec![
                 Ok(Event::default()
-                    .event("thread_changed")
+                    .event("session_changed")
                     .data(r#"{"session_id":"s1","revision":7}"#)),
                 Ok(Event::default().event("progress").data(
-                    r#"{"session_id":"s1","run_id":"01900000-0000-7000-8000-000000000001","progress":{"type":"assistant_delta","run_id":"01900000-0000-7000-8000-000000000001","text":"hello"}}"#,
+                    r#"{"session_id":"s1","turn_id":"01900000-0000-7000-8000-000000000001","progress":{"type":"assistant_delta","turn_id":"01900000-0000-7000-8000-000000000001","text":"hello"}}"#,
                 )),
             ]);
             Sse::new(stream)
@@ -3444,14 +3561,14 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
-        // ThreadChanged forwarded.
+        // SessionChanged forwarded.
         let event = event_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("timed out waiting for ThreadChanged");
-        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+            .expect("timed out waiting for SessionChanged");
+        assert!(matches!(event, super::ProjectionEvent::SessionChanged));
 
         // Progress forwarded.
         let progress = progress_rx
@@ -3459,20 +3576,20 @@ mod tests {
             .expect("timed out waiting for progress");
         assert_eq!(
             progress,
-            latte_core::ThreadTransientProgress::AssistantDelta {
-                run_id: RunId::from_uuid(
+            latte_core::SessionTransientProgress::AssistantDelta {
+                turn_id: TurnId::from_uuid(
                     uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap()
                 ),
                 text: "hello".into(),
             }
         );
 
-        // After the stream ends, the bridge sends a ThreadChanged resync
+        // After the stream ends, the bridge sends a SessionChanged resync
         // signal before reconnecting so the TUI doesn't stay stale.
         let event = event_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("timed out waiting for resync ThreadChanged after stream end");
-        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+            .expect("timed out waiting for resync SessionChanged after stream end");
+        assert!(matches!(event, super::ProjectionEvent::SessionChanged));
 
         bridge.abort();
         server.abort();
@@ -3481,7 +3598,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn sse_bridge_resyncs_after_reconnect() {
         // When the stream ends and the bridge reconnects, it must signal a
-        // second ThreadChanged once the new subscription is live, so events
+        // second SessionChanged once the new subscription is live, so events
         // lost in the reconnect window (stream end → resubscribe) are picked
         // up by the TUI. Without the post-reconnect resync, the TUI would
         // stay stale after a drop.
@@ -3523,22 +3640,22 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, _progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         // First resync: the initial stream ended, so the bridge signals
-        // ThreadChanged before reconnecting.
+        // SessionChanged before reconnecting.
         let event = event_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for pre-reconnect resync");
-        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+        assert!(matches!(event, super::ProjectionEvent::SessionChanged));
 
         // Second resync: after the bridge resubscribes, it signals
-        // ThreadChanged again so the TUI refreshes against the live stream.
+        // SessionChanged again so the TUI refreshes against the live stream.
         let event = event_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for post-reconnect resync");
-        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+        assert!(matches!(event, super::ProjectionEvent::SessionChanged));
 
         // The new stream stays open, so no further events arrive.
         assert!(
@@ -3561,7 +3678,7 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, _progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         let event = event_rx
@@ -3606,10 +3723,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_exact_catalog_propagates_search_error() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let snapshot_body = format!(
             r#"{{"snapshot":{}}}"#,
-            projection_snapshot_body(thread_id, &projection_user_entry("hello", 1000))
+            projection_snapshot_body(session_id, &projection_user_entry("hello", 1000))
         );
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
@@ -3629,13 +3746,13 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        let error = projection.exact_session_catalog(session_id).unwrap_err();
         assert!(error.contains("500"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_projection_client_exact_catalog_propagates_snapshot_error() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let (url, _server) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (
@@ -3652,7 +3769,7 @@ mod tests {
             }
         });
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
-        let error = projection.exact_session_catalog(thread_id).unwrap_err();
+        let error = projection.exact_session_catalog(session_id).unwrap_err();
         assert!(error.contains("500"), "{error}");
     }
 
@@ -3710,9 +3827,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_run_renders_text_without_json() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3756,9 +3873,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_list_renders_rows_without_json() {
-        let thread_id = "01900000-0000-7000-8000-000000000001";
+        let session_id = "01900000-0000-7000-8000-000000000001";
         let session =
-            projection_snapshot_body(thread_id, &projection_user_entry("first prompt", 1000));
+            projection_snapshot_body(session_id, &projection_user_entry("first prompt", 1000));
         let body = format!(r#"{{"sessions":[{session}],"next_cursor":null}}"#);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path == "/v1/workspaces" {
@@ -3788,9 +3905,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_show_renders_text_without_json() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |_method, path| {
             if path.starts_with("/v1/sessions/") {
                 (200, "application/json".into(), snapshot.clone())
@@ -3804,9 +3921,7 @@ mod tests {
         });
         let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
         let root = std::path::Path::new("/tmp");
-        let command = crate::server_client::SessionCommand::Show {
-            session_id: thread_id,
-        };
+        let command = crate::server_client::SessionCommand::Show { session_id };
         let cancel = std::future::pending::<()>();
         let result =
             super::execute_session_command_inner(&mut client, command, root, false, cancel).await;
@@ -3815,9 +3930,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_resume_completes() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3844,7 +3959,7 @@ mod tests {
         let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
         let root = std::path::Path::new("/tmp");
         let command = crate::server_client::SessionCommand::Resume {
-            session_id: thread_id,
+            session_id,
             prompt: "continue".to_string(),
         };
         let cancel = std::future::pending::<()>();
@@ -3855,9 +3970,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_session_command_inner_resume_renders_text_without_json() {
-        let thread_id = uuid::Uuid::now_v7().to_string();
-        let run_id = uuid::Uuid::now_v7().to_string();
-        let snapshot = terminal_snapshot_json(&thread_id, &run_id);
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let turn_id = uuid::Uuid::now_v7().to_string();
+        let snapshot = terminal_snapshot_json(&session_id, &turn_id);
         let (url, _handle) = start_session_mock_server(move |method, path| {
             if path == "/v1/workspaces" && method == "POST" {
                 (
@@ -3884,7 +3999,7 @@ mod tests {
         let mut client = crate::server_client::ServerClient::new(url, "dummy".into());
         let root = std::path::Path::new("/tmp");
         let command = crate::server_client::SessionCommand::Resume {
-            session_id: thread_id,
+            session_id,
             prompt: "continue".to_string(),
         };
         let cancel = std::future::pending::<()>();
@@ -3980,7 +4095,7 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, _progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         // Drop the receiver immediately; the bridge's first resync send (after
@@ -3993,7 +4108,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn sse_bridge_exits_when_receiver_dropped_before_event() {
-        // When the event receiver is dropped and a ThreadChanged event
+        // When the event receiver is dropped and a SessionChanged event
         // arrives, the send fails and the bridge exits (line 433).
         use axum::response::sse::{Event, Sse};
         use futures::stream;
@@ -4007,7 +4122,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 Some((
                     Ok(Event::default()
-                        .event("thread_changed")
+                        .event("session_changed")
                         .data(r#"{"session_id":"s1","revision":1}"#)),
                     i + 1,
                 ))
@@ -4029,7 +4144,7 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, _progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         // Drop the receiver before the delayed event arrives.
@@ -4079,7 +4194,7 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, _progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         // Receive the first resync (stream end), then drop the receiver so the
@@ -4087,7 +4202,7 @@ mod tests {
         let event = event_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first resync");
-        assert!(matches!(event, super::ProjectionEvent::ThreadChanged));
+        assert!(matches!(event, super::ProjectionEvent::SessionChanged));
         drop(event_rx);
 
         let result = tokio::time::timeout(Duration::from_secs(15), bridge).await;
@@ -4101,7 +4216,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn sse_bridge_drops_unparseable_progress() {
         // A progress event whose payload cannot deserialize into
-        // ThreadTransientProgress is silently dropped (line 441).
+        // SessionTransientProgress is silently dropped (line 441).
         use axum::response::sse::{Event, Sse};
         use futures::stream;
 
@@ -4109,7 +4224,7 @@ mod tests {
         {
             let stream = stream::iter(vec![Ok(Event::default()
                 .event("progress")
-                .data(r#"{"session_id":"s1","run_id":"r1","progress":{"type":"bogus"}}"#))]);
+                .data(r#"{"session_id":"s1","turn_id":"r1","progress":{"type":"bogus"}}"#))]);
             Sse::new(stream)
         }
 
@@ -4127,7 +4242,7 @@ mod tests {
         let client = crate::server_client::ServerClient::new(url, "token".into());
         let (event_tx, _event_rx) = std::sync::mpsc::channel::<super::ProjectionEvent>();
         let (progress_tx, progress_rx) =
-            std::sync::mpsc::channel::<latte_core::ThreadTransientProgress>();
+            std::sync::mpsc::channel::<latte_core::SessionTransientProgress>();
         let bridge = super::spawn_sse_bridge(client, "ws-1".into(), event_tx, progress_tx);
 
         // The bogus progress must not be forwarded.
@@ -4324,12 +4439,12 @@ mod tests {
         // The mock is stateful: the first two snapshot fetches return a
         // Running (non-terminal) snapshot so the SSE stream is opened, and
         // the third returns a terminal snapshot to complete the run.
-        let thread_id = "01900000-0000-7000-8000-000000000001";
-        let run_id = "01900000-0000-7000-8000-000000000002";
+        let session_id = "01900000-0000-7000-8000-000000000001";
+        let turn_id = "01900000-0000-7000-8000-000000000002";
         let running_snapshot = format!(
-            r#"{{"snapshot":{{"thread_id":"{thread_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_run_id":"{run_id}","active_run_id":"{run_id}","runs":[{{"run_id":"{run_id}","parent_run_id":null,"ordinal":1,"status":"running","run_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
+            r#"{{"snapshot":{{"session_id":"{session_id}","revision":1,"sequence":1,"lifecycle":"running","binding":{{"version":2,"provider_name":"test","provider_type":"test","protocol":"test","model":"test","config_fingerprint":"test","tools_fingerprint":"test","aliases":{{}},"credential_ref_id":"test","data_scope_id":"test","credential_generation":1}},"latest_turn_id":"{turn_id}","active_turn_id":"{turn_id}","turns":[{{"turn_id":"{turn_id}","parent_turn_id":null,"ordinal":1,"status":"running","turn_revision":1,"completed_at_ms":null,"failure_code":null}}],"transcript":{{"entries":[],"next_after":null,"has_more":false}}}}}}"#
         );
-        let terminal_snapshot = terminal_snapshot_json(thread_id, run_id);
+        let terminal_snapshot = terminal_snapshot_json(session_id, turn_id);
         let snapshot_queue =
             std::sync::Mutex::new(vec![running_snapshot.clone(), terminal_snapshot]);
         let (url, _handle) = start_session_mock_server(move |method, path| {
@@ -4355,7 +4470,7 @@ mod tests {
                 // SSE stream with a progress event, then close (stream end →
                 // reconnect → resync finds the terminal snapshot).
                 let body = format!(
-                    "event: progress\ndata: {{\"session_id\":\"{thread_id}\",\"run_id\":\"{run_id}\",\"progress\":{{\"type\":\"assistant_delta\",\"run_id\":\"{run_id}\",\"text\":\"working\"}}}}\n\n"
+                    "event: progress\ndata: {{\"session_id\":\"{session_id}\",\"turn_id\":\"{turn_id}\",\"progress\":{{\"type\":\"assistant_delta\",\"turn_id\":\"{turn_id}\",\"text\":\"working\"}}}}\n\n"
                 );
                 (200, "text/event-stream".into(), body)
             } else if path.starts_with("/v1/sessions/") {

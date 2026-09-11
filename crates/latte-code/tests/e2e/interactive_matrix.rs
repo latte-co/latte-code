@@ -10,7 +10,7 @@ const INSTRUMENTED_WAIT: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
-fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
+fn chunked_stream_resize_follow_up_and_input_complete_one_durable_session() {
     let scenario = Scenario::new();
     let first_event = "data: {\"choices\":[{\"delta\":{\"content\":\"live delta sentinel\"}}]}\n\n";
     let final_events = concat!(
@@ -73,7 +73,7 @@ fn chunked_stream_resize_follow_up_and_input_complete_one_durable_thread() {
                 .as_array()
                 .is_some_and(|sessions| {
                     sessions.len() == 1
-                        && sessions[0]["runs"].as_array().is_some_and(|runs| {
+                        && sessions[0]["turns"].as_array().is_some_and(|runs| {
                             runs.iter()
                                 .filter(|run| run["status"] == "completed")
                                 .count()
@@ -155,20 +155,20 @@ fn ctrl_c_during_provider_wait_interrupts_cleanly_and_restart_never_reenters() {
             .iter()
             .any(|session| session["lifecycle"] == "interrupted")
     );
-    let thread_id = latte_engine::EngineBuilder::new()
+    let session_id = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
         .database_path(scenario.database_path())
         .build()
         .unwrap()
-        .list_threads_v2()
+        .list_sessions()
         .unwrap()[0]
-        .thread_id;
+        .session_id;
 
     let mut restart_command = scenario.command(&["tui"]);
     restart_command.env("TEST_OPENAI_KEY", "cancel-secret");
     let mut restart = PtySession::spawn(restart_command);
     assert!(restart.wait_for_output(TUI_READY, Duration::from_secs(5)));
-    restart.write(format!("/resume {thread_id}\r").as_bytes());
+    restart.write(format!("/resume {session_id}\r").as_bytes());
     assert!(restart.wait_for_output(b"Interrupted", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     restart.write(F10);
@@ -231,7 +231,7 @@ fn edit_observed_failure_reaches_provider_then_verifies_without_mutation() {
             .unwrap()
             .iter()
             .any(|session| {
-                session["runs"]
+                session["turns"]
                     .as_array()
                     .is_some_and(|runs| runs.iter().any(|run| run["status"] == "completed"))
             })

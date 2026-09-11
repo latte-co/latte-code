@@ -1,5 +1,5 @@
 //! Append-only per-Session conversation storage.
-use latte_core::{RunId, ThreadId, TranscriptEntry, TranscriptEntryId, TranscriptKind};
+use latte_core::{SessionId, TranscriptEntry, TranscriptEntryId, TranscriptKind, TurnId};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -40,12 +40,12 @@ impl ConversationStore {
 
     pub(crate) fn sync(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         created_at_ms: u64,
         entries: &[TranscriptEntry],
     ) -> Result<(), String> {
         let _guard = self.io.lock().expect("conversation mutex poisoned");
-        let path = self.workspace_dir.join(format!("{thread_id}.jsonl"));
+        let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
         let mut file = open_session_file(&path)?;
         // Different Latte Code processes have distinct in-memory mutexes but may
         // drain the same transactional outbox. Serialize the repair/read/append
@@ -61,14 +61,14 @@ impl ConversationStore {
             let header = json!({
                 "record": "session",
                 "format_version": 1,
-                "session_id": thread_id,
+                "session_id": session_id,
                 "workspace_id": self.workspace_key,
                 "created_at_ms": created_at_ms,
             });
             write_record(&mut file, &header)?;
             file.sync_data().map_err(io_error)?;
         }
-        let (existing, _) = repair_and_read(&mut file, thread_id, &self.workspace_key)?;
+        let (existing, _) = repair_and_read(&mut file, session_id, &self.workspace_key)?;
         let mut last_sequence = existing.keys().next_back().copied().unwrap_or(0);
         file.seek(SeekFrom::End(0)).map_err(io_error)?;
         for entry in entries {
@@ -92,7 +92,7 @@ impl ConversationStore {
                 "format_version": 1,
                 "entry_id": entry.entry_id,
                 "seq": entry.sequence,
-                "run_id": entry.run_id,
+                "turn_id": entry.turn_id,
                 "created_at_ms": entry.created_at_ms,
                 "kind": entry.kind,
                 "content": entry.text,
@@ -105,12 +105,12 @@ impl ConversationStore {
         file.sync_data().map_err(io_error)
     }
 
-    pub(crate) fn read(&self, thread_id: ThreadId) -> Result<Vec<TranscriptEntry>, String> {
+    pub(crate) fn read(&self, session_id: SessionId) -> Result<Vec<TranscriptEntry>, String> {
         let _guard = self.io.lock().expect("conversation mutex poisoned");
-        let path = self.workspace_dir.join(format!("{thread_id}.jsonl"));
+        let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
         let mut file = open_session_file(&path)?;
         file.lock().map_err(io_error)?;
-        let (_, entries) = repair_and_read(&mut file, thread_id, &self.workspace_key)?;
+        let (_, entries) = repair_and_read(&mut file, session_id, &self.workspace_key)?;
         Ok(entries)
     }
 }
@@ -167,7 +167,7 @@ fn open_session_file(path: &Path) -> Result<File, String> {
 #[allow(clippy::too_many_lines)]
 fn repair_and_read(
     file: &mut File,
-    thread_id: ThreadId,
+    session_id: SessionId,
     workspace_key: &str,
 ) -> Result<(BTreeMap<u64, String>, Vec<TranscriptEntry>), String> {
     let length = file.metadata().map_err(io_error)?.len();
@@ -198,7 +198,7 @@ fn repair_and_read(
     .map_err(json_error)?;
     if header.get("record").and_then(Value::as_str) != Some("session")
         || header.get("format_version").and_then(Value::as_u64) != Some(1)
-        || header.get("session_id").and_then(Value::as_str) != Some(&thread_id.to_string())
+        || header.get("session_id").and_then(Value::as_str) != Some(&session_id.to_string())
         || header.get("workspace_id").and_then(Value::as_str) != Some(workspace_key)
     {
         return Err("conversation header identity mismatch".into());
@@ -231,17 +231,21 @@ fn repair_and_read(
         let entry_id = uuid::Uuid::parse_str(entry_id)
             .map(TranscriptEntryId::from_uuid)
             .map_err(|error| format!("invalid conversation entry id: {error}"))?;
-        let run_id = record
-            .get("run_id")
+        // Pre-schema-15 binaries wrote this key as `run_id`; accept it as a
+        // read-only fallback so old JSONL keeps its turn attribution.
+        let turn_id = record
+            .get("turn_id")
+            .filter(|value| !value.is_null())
+            .or_else(|| record.get("run_id"))
             .filter(|value| !value.is_null())
             .map(|value| {
                 value
                     .as_str()
-                    .ok_or_else(|| "invalid conversation run id".to_owned())
+                    .ok_or_else(|| "invalid conversation turn id".to_owned())
                     .and_then(|value| {
                         uuid::Uuid::parse_str(value)
-                            .map(RunId::from_uuid)
-                            .map_err(|error| format!("invalid conversation run id: {error}"))
+                            .map(TurnId::from_uuid)
+                            .map_err(|error| format!("invalid conversation turn id: {error}"))
                     })
             })
             .transpose()?;
@@ -255,7 +259,7 @@ fn repair_and_read(
         transcript.push(TranscriptEntry {
             entry_id,
             sequence,
-            run_id,
+            turn_id,
             kind,
             text: record
                 .get("content")
@@ -308,7 +312,7 @@ mod tests {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::User,
             text: text.into(),
             payload: None,
@@ -317,15 +321,15 @@ mod tests {
         }
     }
 
-    fn session_path(root: &Path, workspace_key: &str, thread_id: ThreadId) -> PathBuf {
-        root.join(workspace_key).join(format!("{thread_id}.jsonl"))
+    fn session_path(root: &Path, workspace_key: &str, session_id: SessionId) -> PathBuf {
+        root.join(workspace_key).join(format!("{session_id}.jsonl"))
     }
 
-    fn header(thread_id: ThreadId, workspace_key: &str) -> Value {
+    fn header(session_id: SessionId, workspace_key: &str) -> Value {
         json!({
             "record": "session",
             "format_version": 1,
-            "session_id": thread_id,
+            "session_id": session_id,
             "workspace_id": workspace_key,
             "created_at_ms": 1,
         })
@@ -337,7 +341,7 @@ mod tests {
             "format_version": 1,
             "entry_id": entry.entry_id,
             "seq": entry.sequence,
-            "run_id": entry.run_id,
+            "turn_id": entry.turn_id,
             "created_at_ms": entry.created_at_ms,
             "kind": entry.kind,
             "content": entry.text,
@@ -360,13 +364,13 @@ mod tests {
     fn sync_repairs_only_a_torn_final_line_and_preserves_contiguous_entries() {
         let root = tempfile::tempdir().unwrap();
         let store = ConversationStore::open(root.path(), "workspace-abc").unwrap();
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let entries = vec![entry(1, "first"), entry(2, "second")];
-        store.sync(thread_id, 1, &entries).unwrap();
+        store.sync(session_id, 1, &entries).unwrap();
         let path = root
             .path()
             .join("workspace-abc")
-            .join(format!("{thread_id}.jsonl"));
+            .join(format!("{session_id}.jsonl"));
         OpenOptions::new()
             .append(true)
             .open(&path)
@@ -376,7 +380,7 @@ mod tests {
 
         let mut completed = entries;
         completed.push(entry(3, "third"));
-        store.sync(thread_id, 1, &completed).unwrap();
+        store.sync(session_id, 1, &completed).unwrap();
         let bytes = fs::read(path).unwrap();
         assert!(bytes.ends_with(b"\n"));
         let records = bytes
@@ -400,13 +404,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = ConversationStore::open(root.path(), "workspace-abc").unwrap();
         let second = ConversationStore::open(root.path(), "workspace-abc").unwrap();
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let entries = vec![entry(1, "first"), entry(2, "second")];
-        first.sync(thread_id, 1, &entries[..1]).unwrap();
+        first.sync(session_id, 1, &entries[..1]).unwrap();
         let path = root
             .path()
             .join("workspace-abc")
-            .join(format!("{thread_id}.jsonl"));
+            .join(format!("{session_id}.jsonl"));
         let locked = OpenOptions::new()
             .read(true)
             .write(true)
@@ -418,7 +422,7 @@ mod tests {
         let worker_started = Arc::clone(&started);
         let worker = thread::spawn(move || {
             worker_started.wait();
-            second.sync(thread_id, 1, &entries)
+            second.sync(session_id, 1, &entries)
         });
         started.wait();
         thread::sleep(Duration::from_millis(25));
@@ -426,7 +430,29 @@ mod tests {
         drop(locked);
         worker.join().unwrap().unwrap();
 
-        assert_eq!(first.read(thread_id).unwrap().len(), 2);
+        assert_eq!(first.read(session_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reads_legacy_records_keyed_run_id_as_turn_id() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_key = "workspace-legacy-run-key";
+        let store = ConversationStore::open(root.path(), workspace_key).unwrap();
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let legacy_turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let path = session_path(root.path(), workspace_key, session_id);
+
+        // Simulate a JSONL file written by a pre-schema-15 binary: entries
+        // carry `run_id`, not `turn_id`.
+        let mut legacy_entry = entry(1, "written before the rename");
+        legacy_entry.turn_id = Some(legacy_turn_id);
+        let mut legacy = record(&legacy_entry);
+        legacy["run_id"] = legacy["turn_id"].take();
+        overwrite_records(&path, &header(session_id, workspace_key), &[legacy]);
+
+        let page = store.read(session_id).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].turn_id, Some(legacy_turn_id));
     }
 
     #[test]
@@ -442,32 +468,32 @@ mod tests {
 
         let store = ConversationStore::open(root.path(), "workspace-safe").unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        store.sync(thread_id, 1, &[entry(1, "first")]).unwrap();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        store.sync(session_id, 1, &[entry(1, "first")]).unwrap();
 
         #[cfg(unix)]
         {
-            let path = session_path(root.path(), "workspace-safe", thread_id);
-            let linked_thread = ThreadId::from_uuid(ids.next_uuid_v7());
+            let path = session_path(root.path(), "workspace-safe", session_id);
+            let linked_session = SessionId::from_uuid(ids.next_uuid_v7());
             std::os::unix::fs::symlink(
                 &path,
-                session_path(root.path(), "workspace-safe", linked_thread),
+                session_path(root.path(), "workspace-safe", linked_session),
             )
             .unwrap();
-            assert!(store.read(linked_thread).is_err());
+            assert!(store.read(linked_session).is_err());
         }
 
-        let oversized_thread = ThreadId::from_uuid(ids.next_uuid_v7());
-        let oversized_path = session_path(root.path(), "workspace-safe", oversized_thread);
+        let oversized_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let oversized_path = session_path(root.path(), "workspace-safe", oversized_session);
         let oversized = File::create(&oversized_path).unwrap();
         oversized.set_len(MAX_FILE_BYTES + 1).unwrap();
-        assert!(store.read(oversized_thread).is_err());
+        assert!(store.read(oversized_session).is_err());
 
         let huge = "x".repeat(MAX_RECORD_BYTES + 1);
-        assert!(store.sync(thread_id, 1, &[entry(2, &huge)]).is_err());
+        assert!(store.sync(session_id, 1, &[entry(2, &huge)]).is_err());
 
-        let empty_thread = ThreadId::from_uuid(ids.next_uuid_v7());
-        assert!(store.sync(empty_thread, 1, &[]).is_err());
+        let empty_session = SessionId::from_uuid(ids.next_uuid_v7());
+        assert!(store.sync(empty_session, 1, &[]).is_err());
         assert!(io_error(std::io::Error::other("io")).contains("conversation storage failure"));
         let json = serde_json::from_str::<Value>("{").unwrap_err();
         assert!(json_error(json).contains("invalid conversation JSONL"));
@@ -479,65 +505,65 @@ mod tests {
         let workspace_key = "workspace-errors";
         let store = ConversationStore::open(root.path(), workspace_key).unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         let first = entry(1, "first");
         store
-            .sync(thread_id, 1, std::slice::from_ref(&first))
+            .sync(session_id, 1, std::slice::from_ref(&first))
             .unwrap();
 
         let collision = entry(1, "collision");
-        assert!(store.sync(thread_id, 1, &[collision]).is_err());
-        assert!(store.sync(thread_id, 1, &[entry(0, "zero")]).is_err());
+        assert!(store.sync(session_id, 1, &[collision]).is_err());
+        assert!(store.sync(session_id, 1, &[entry(0, "zero")]).is_err());
 
-        let path = session_path(root.path(), workspace_key, thread_id);
-        let another_thread = ThreadId::from_uuid(ids.next_uuid_v7());
-        let another_path = session_path(root.path(), workspace_key, another_thread);
+        let path = session_path(root.path(), workspace_key, session_id);
+        let another_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let another_path = session_path(root.path(), workspace_key, another_session);
         fs::copy(&path, &another_path).unwrap();
-        assert!(store.read(another_thread).is_err());
+        assert!(store.read(another_session).is_err());
 
-        let malformed_thread = ThreadId::from_uuid(ids.next_uuid_v7());
-        let malformed_path = session_path(root.path(), workspace_key, malformed_thread);
-        let valid_header = header(malformed_thread, workspace_key);
+        let malformed_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let malformed_path = session_path(root.path(), workspace_key, malformed_session);
+        let valid_header = header(malformed_session, workspace_key);
         let valid_record = record(&first);
         let mut invalid_type = valid_record.clone();
         invalid_type["record"] = json!("unknown");
         overwrite_records(&malformed_path, &valid_header, &[invalid_type]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_sequence = valid_record.clone();
         missing_sequence.as_object_mut().unwrap().remove("seq");
         overwrite_records(&malformed_path, &valid_header, &[missing_sequence]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_entry_id = valid_record.clone();
         missing_entry_id.as_object_mut().unwrap().remove("entry_id");
         overwrite_records(&malformed_path, &valid_header, &[missing_entry_id]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut invalid_entry_id = valid_record.clone();
         invalid_entry_id["entry_id"] = json!("not-a-uuid");
         overwrite_records(&malformed_path, &valid_header, &[invalid_entry_id]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
-        let mut invalid_run_id = valid_record.clone();
-        invalid_run_id["run_id"] = json!(42);
-        overwrite_records(&malformed_path, &valid_header, &[invalid_run_id]);
-        assert!(store.read(malformed_thread).is_err());
+        let mut invalid_turn_id = valid_record.clone();
+        invalid_turn_id["turn_id"] = json!(42);
+        overwrite_records(&malformed_path, &valid_header, &[invalid_turn_id]);
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_kind = valid_record.clone();
         missing_kind.as_object_mut().unwrap().remove("kind");
         overwrite_records(&malformed_path, &valid_header, &[missing_kind]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_content = valid_record.clone();
         missing_content.as_object_mut().unwrap().remove("content");
         overwrite_records(&malformed_path, &valid_header, &[missing_content]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_source = valid_record.clone();
         missing_source.as_object_mut().unwrap().remove("source_key");
         overwrite_records(&malformed_path, &valid_header, &[missing_source]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut missing_created_at = valid_record;
         missing_created_at
@@ -545,27 +571,27 @@ mod tests {
             .unwrap()
             .remove("created_at_ms");
         overwrite_records(&malformed_path, &valid_header, &[missing_created_at]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let mut duplicate = record(&first);
         duplicate["entry_id"] = json!(TranscriptEntryId::from_uuid(ids.next_uuid_v7()));
         overwrite_records(&malformed_path, &valid_header, &[record(&first), duplicate]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
 
         let oversized_line = Value::String("x".repeat(MAX_RECORD_BYTES + 1));
         overwrite_records(&malformed_path, &valid_header, &[oversized_line]);
-        assert!(store.read(malformed_thread).is_err());
+        assert!(store.read(malformed_session).is_err());
     }
 
     #[test]
     fn repair_rejects_file_with_no_newline() {
         let root = tempfile::tempdir().unwrap();
         let store = ConversationStore::open(root.path(), "workspace-torn").unwrap();
-        let thread_id = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         // Write a file with content but no newline at all — the header is torn.
-        let path = session_path(root.path(), "workspace-torn", thread_id);
+        let path = session_path(root.path(), "workspace-torn", session_id);
         fs::write(&path, b"{\"record\":\"header\"").unwrap();
         // read should fail because the header cannot be parsed.
-        assert!(store.read(thread_id).is_err());
+        assert!(store.read(session_id).is_err());
     }
 }

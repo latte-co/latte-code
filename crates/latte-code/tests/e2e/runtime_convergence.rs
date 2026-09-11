@@ -170,12 +170,12 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(json(&first)["status"], "completed");
-    let session_id = json(&first)["data"]["session"]["thread_id"]
+    let session_id = json(&first)["data"]["session"]["session_id"]
         .as_str()
         .unwrap()
         .to_owned();
     assert_eq!(
-        json(&first)["data"]["session"]["runs"][0]["status"],
+        json(&first)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     assert!(provider.wait_for_calls(6, Duration::from_secs(5)));
@@ -270,7 +270,7 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
     let shown = invoke(&scenario, &["--json", "show", &session_id]);
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "completed"
     );
     assert_eq!(
@@ -287,7 +287,7 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
     let listed_json = json(&listed);
     let sessions = listed_json["data"]["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["thread_id"], session_id);
+    assert_eq!(sessions[0]["session_id"], session_id);
     assert_eq!(sessions[0]["lifecycle"], "ready");
     assert_eq!(provider.requests().len(), 6);
 }
@@ -301,7 +301,7 @@ fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_
     )
     .unwrap();
     let read = serde_json::json!({"path": "bounded.txt", "max_output": 1024});
-    // The v2 thread runtime has no agent step limit: the loop is bounded by the
+    // The v2 session runtime has no agent step limit: the loop is bounded by the
     // provider. 16 read-only tool rounds are served, then the provider errors,
     // which must terminate the run durably without an unbounded extra request.
     let provider = ScriptedProvider::start(
@@ -334,7 +334,7 @@ fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_
     );
     assert_eq!(json(&output)["status"], "failed");
     let session = &json(&output)["data"]["session"];
-    assert_eq!(session["runs"][0]["status"], "failed");
+    assert_eq!(session["turns"][0]["status"], "failed");
     // The provider error is recorded durably in the transcript failure card.
     assert!(
         session["transcript"]["entries"]
@@ -355,11 +355,11 @@ fn headless_provider_error_after_bounded_rounds_fails_durably_without_unbounded_
         Some(&("bounded-round-15", "read_file"))
     );
 
-    let session_id = session["thread_id"].as_str().unwrap().to_owned();
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
     let shown = invoke(&scenario, &["--json", "show", &session_id]);
     assert!(shown.status.success());
     assert_eq!(
-        json(&shown)["data"]["session"]["runs"][0]["status"],
+        json(&shown)["data"]["session"]["turns"][0]["status"],
         "failed"
     );
     assert_eq!(provider.requests().len(), 17);

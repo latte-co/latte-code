@@ -10,8 +10,8 @@ mod workspace;
 
 pub(crate) use latte_core::wall_time_ms as wall_now_ms;
 use latte_core::{
-    EventEnvelope, RunId, RunState, ThreadEventEnvelope, ThreadId, ThreadProviderBindingV2,
-    ThreadSnapshot, TranscriptPage, Transition,
+    EventEnvelope, SessionEventEnvelope, SessionId, SessionProviderBinding, SessionSnapshot,
+    TranscriptPage, Transition, TurnId, TurnState,
 };
 pub use process::{
     CancellationToken, ProcessDecision, ProcessError, ProcessInvocation, ProcessOutput,
@@ -23,10 +23,15 @@ use std::{
     sync::Arc,
 };
 pub use storage::{
-    CommitThreadRunUpdate, EffectStatus, Lease, LeaseLossRecovery, StorageError, StoredEvent,
-    StoredThreadEvent, ThreadCommitRequest, ThreadCommitResponse, ThreadEffectPolicy,
-    ThreadLeaseLossRecovery,
+    CommitSessionTurnUpdate, EffectStatus, Lease, LeaseLossRecovery, SessionCommitRequest,
+    SessionCommitResponse, SessionEffectPolicy, SessionLeaseLossRecovery, StorageError,
+    StoredEvent, StoredSessionEvent,
 };
+// `#[doc(hidden)]`: upgrade-compat digest helpers used only by integration
+// fixtures that reproduce a pre-rename durable accept; production replay never
+// calls them directly.
+#[doc(hidden)]
+pub use storage::{legacy_create_command_digest, legacy_follow_up_command_digest};
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 fn manifest_map_digest(
@@ -104,13 +109,13 @@ fn resolve_git_common_dir(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn validate_thread_effect_descriptor(
-    descriptor: &ThreadEffectDescriptor,
+fn validate_session_effect_descriptor(
+    descriptor: &SessionEffectDescriptor,
 ) -> Result<(), StorageError> {
     for value in [&descriptor.effect_id, &descriptor.name] {
         if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
             return Err(StorageError::InvalidData(
-                "invalid thread effect descriptor identifier".into(),
+                "invalid session effect descriptor identifier".into(),
             ));
         }
     }
@@ -121,24 +126,24 @@ fn validate_thread_effect_descriptor(
     }
     if descriptor.attempt == 0 || !descriptor.input.is_object() {
         return Err(StorageError::InvalidData(
-            "invalid thread effect descriptor input".into(),
+            "invalid session effect descriptor input".into(),
         ));
     }
     Ok(())
 }
 
-fn thread_effect_checkpoint(
+fn session_effect_checkpoint(
     phase: &str,
-    descriptor: &ThreadEffectDescriptor,
+    descriptor: &SessionEffectDescriptor,
     operation_digest: &str,
 ) -> String {
     serde_json::json!({
-        "thread_effect": {
+        "session_effect": {
             "phase": phase,
-            "effect_id": latte_core::redact_thread_text(&descriptor.effect_id),
-            "tool_call_id": latte_core::redact_thread_text(&descriptor.tool_call_id),
-            "name": latte_core::redact_thread_text(&descriptor.name),
-            "operation_digest": latte_core::redact_thread_text(operation_digest),
+            "effect_id": latte_core::redact_session_text(&descriptor.effect_id),
+            "tool_call_id": latte_core::redact_session_text(&descriptor.tool_call_id),
+            "name": latte_core::redact_session_text(&descriptor.name),
+            "operation_digest": latte_core::redact_session_text(operation_digest),
         }
     })
     .to_string()
@@ -147,7 +152,7 @@ fn thread_effect_checkpoint(
 const PERMISSION_SUMMARY_CAP: usize = 360;
 
 fn summary_text(value: &str) -> String {
-    let sanitized = latte_core::redact_thread_text(value);
+    let sanitized = latte_core::redact_session_text(value);
     let mut output = String::with_capacity(sanitized.len().min(PERMISSION_SUMMARY_CAP));
     for ch in sanitized.chars() {
         if ch.is_control() {
@@ -201,7 +206,7 @@ fn summary_argv(value: &str) -> String {
 /// approval. It intentionally summarizes content shape rather than rendering
 /// raw content, while preserving enough target/invocation detail for a user
 /// to distinguish the requested operation.
-fn thread_effect_permission_summary(descriptor: &ThreadEffectDescriptor) -> String {
+fn session_effect_permission_summary(descriptor: &SessionEffectDescriptor) -> String {
     let input = &descriptor.input;
     let summary = match descriptor.name.as_str() {
         "write_file" => {
@@ -264,13 +269,13 @@ fn thread_effect_permission_summary(descriptor: &ThreadEffectDescriptor) -> Stri
     summary_text(&summary)
 }
 
-fn run_revision(snapshot: &ThreadSnapshot, _effect_id: &str) -> Option<u64> {
-    snapshot.active_run_id.and_then(|run_id| {
+fn turn_revision(snapshot: &SessionSnapshot, _effect_id: &str) -> Option<u64> {
+    snapshot.active_turn_id.and_then(|turn_id| {
         snapshot
-            .runs
+            .turns
             .iter()
-            .find(|run| run.run_id == run_id)
-            .map(|run| run.run_revision)
+            .find(|turn| turn.turn_id == turn_id)
+            .map(|turn| turn.turn_revision)
     })
 }
 #[cfg(test)]
@@ -286,7 +291,7 @@ pub use tools::{ToolDescriptor, ToolError, ToolInvocation, ToolOutput};
 /// engine's private descriptor store. It must never be reconstructed from a
 /// transcript card, checkpoint, event, or provider-history message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEffectDescriptor {
+pub struct SessionEffectDescriptor {
     pub effect_id: String,
     pub tool_call_id: String,
     pub name: String,
@@ -296,25 +301,25 @@ pub struct ThreadEffectDescriptor {
 
 /// Exact fenced inputs for an engine-owned v2 effect operation.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectRequest {
-    pub thread_id: ThreadId,
-    pub run_id: RunId,
-    pub expected_thread_revision: u64,
-    pub expected_run_revision: u64,
-    pub command_id: latte_core::ThreadCommandId,
+pub struct SessionEffectRequest {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub expected_session_revision: u64,
+    pub expected_turn_revision: u64,
+    pub command_id: latte_core::SessionCommandId,
     pub source_key: String,
-    pub descriptor: ThreadEffectDescriptor,
+    pub descriptor: SessionEffectDescriptor,
 }
 
 /// Fenced start request for a previously prepared v2 effect. The caller names
 /// the durable effect but cannot supply or alter its executable descriptor.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectStartRequest {
-    pub thread_id: ThreadId,
-    pub run_id: RunId,
-    pub expected_thread_revision: u64,
-    pub expected_run_revision: u64,
-    pub command_id: latte_core::ThreadCommandId,
+pub struct SessionEffectStartRequest {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub expected_session_revision: u64,
+    pub expected_turn_revision: u64,
+    pub command_id: latte_core::SessionCommandId,
     pub source_key: String,
     pub effect_id: String,
 }
@@ -322,16 +327,16 @@ pub struct ThreadEffectStartRequest {
 /// Result of preparing an effect. Ask is returned only after a durable
 /// pending permission has been committed.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectPrepared {
-    pub snapshot: ThreadSnapshot,
-    pub policy: ThreadEffectPolicy,
+pub struct SessionEffectPrepared {
+    pub snapshot: SessionSnapshot,
+    pub policy: SessionEffectPolicy,
     pub operation_digest: String,
 }
 
 /// Safe display projection accompanying an engine-started v2 effect. This is
-/// intentionally distinct from the exact descriptor held by `ThreadEffectStarted`.
+/// intentionally distinct from the exact descriptor held by `SessionEffectStarted`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ThreadEffectPresentation {
+pub struct SessionEffectPresentation {
     pub effect_id: String,
     pub tool_call_id: String,
     pub name: String,
@@ -339,13 +344,13 @@ pub struct ThreadEffectPresentation {
     pub attempt: u64,
 }
 
-impl ThreadEffectPresentation {
-    fn from_descriptor(descriptor: &ThreadEffectDescriptor) -> Self {
+impl SessionEffectPresentation {
+    fn from_descriptor(descriptor: &SessionEffectDescriptor) -> Self {
         Self {
-            effect_id: latte_core::redact_thread_text(&descriptor.effect_id),
-            tool_call_id: latte_core::redact_thread_text(&descriptor.tool_call_id),
-            name: latte_core::redact_thread_text(&descriptor.name),
-            input: latte_core::redact_thread_value(descriptor.input.clone()),
+            effect_id: latte_core::redact_session_text(&descriptor.effect_id),
+            tool_call_id: latte_core::redact_session_text(&descriptor.tool_call_id),
+            name: latte_core::redact_session_text(&descriptor.name),
+            input: latte_core::redact_session_value(descriptor.input.clone()),
             attempt: descriptor.attempt,
         }
     }
@@ -356,26 +361,26 @@ impl ThreadEffectPresentation {
 /// engine external execution method. Its exact descriptor is private to the
 /// engine; coordinators receive only `presentation`.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectStarted {
-    pub snapshot: ThreadSnapshot,
-    pub presentation: ThreadEffectPresentation,
+pub struct SessionEffectStarted {
+    pub snapshot: SessionSnapshot,
+    pub presentation: SessionEffectPresentation,
     pub operation_digest: String,
-    descriptor: ThreadEffectDescriptor,
+    descriptor: SessionEffectDescriptor,
 }
 
 /// Certified result delivered to a provider as a tool message only after the
 /// observation transaction succeeds.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectObserved {
-    pub snapshot: ThreadSnapshot,
+pub struct SessionEffectObserved {
+    pub snapshot: SessionSnapshot,
     pub result: String,
     pub success: bool,
 }
 
 /// Uncommitted external execution output.  It is intentionally not exposed to
-/// a provider until `observe_thread_effect` has committed it.
+/// a provider until `observe_session_effect` has committed it.
 #[derive(Clone, Debug)]
-pub struct ThreadEffectObservedValue {
+pub struct SessionEffectObservedValue {
     pub result: String,
     pub payload: Option<Value>,
     pub success: bool,
@@ -385,7 +390,7 @@ pub struct ThreadEffectObservedValue {
 /// whether it may write an observed failure or must conservatively write
 /// Unknown.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadEffectExecutionError {
+pub enum SessionEffectExecutionError {
     Certified(String),
     Uncertain(String),
 }
@@ -525,10 +530,10 @@ impl EngineBuilder {
             .map_err(StorageError::InvalidData)?
             .map(Arc::new);
         let (events, _) = broadcast::channel(32);
-        let (thread_events, _) = broadcast::channel(64);
+        let (session_events, _) = broadcast::channel(64);
         let handle = EngineHandle {
             events,
-            thread_events,
+            session_events,
             storage: Arc::new(storage),
             tools: Arc::new(tools),
             workspace_root: Arc::from(workspace_root),
@@ -542,9 +547,9 @@ impl EngineBuilder {
         if handle.conversation_store.is_some() {
             for session in handle
                 .storage
-                .list_thread_sessions_v2_for_workspace(&handle.workspace_root, 500)?
+                .list_session_summaries_for_workspace(&handle.workspace_root, 500)?
             {
-                handle.sync_thread_conversation(session.thread_id)?;
+                handle.sync_session_conversation(session.session_id)?;
             }
         }
         Ok(handle)
@@ -556,20 +561,20 @@ impl EngineBuilder {
 ///
 /// | Class | Methods |
 /// |---|---|
-/// | Read-only | `tool_descriptors`, `changed_files`, `workspace_manifest`, `subscribe`, `show`, `list`, `effect_status`, `unknown_effects_for_run`, `runtime_checkpoint`, `permission_matches` |
-/// | Bootstrap authority | `create_run`, `acquire_lease`, `renew_lease`, `release_lease` |
-/// | Fenced authoritative mutation | `execute_tool`, `reissue_tool_permission`, `execute_process`, `execute_verification`, `reissue_process_permission`, `apply_transition`, `complete_verified_run`, `interrupt_after_lease_loss`, `resolve_unknown_effect_and_abort`, `persist_runtime_checkpoint` |
+/// | Read-only | `tool_descriptors`, `changed_files`, `workspace_manifest`, `subscribe`, `show`, `list`, `effect_status`, `unknown_effects_for_turn`, `runtime_checkpoint`, `permission_matches` |
+/// | Bootstrap authority | `create_turn`, `acquire_lease`, `renew_lease`, `release_lease` |
+/// | Fenced authoritative mutation | `execute_tool`, `reissue_tool_permission`, `execute_process`, `execute_verification`, `reissue_process_permission`, `apply_transition`, `complete_verified_turn`, `interrupt_after_lease_loss`, `resolve_unknown_effect_and_abort`, `persist_runtime_checkpoint` |
 ///
 /// Raw effect-ledger mutation is intentionally absent from this public handle.
 /// These compile-fail examples are an API-boundary contract, not usage examples.
 ///
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId) {
 ///     h.record_effect_started("effect", run, 0).unwrap();
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId) {
 ///     h.record_effect_declared("effect", run, 1, "{}", 0).unwrap();
 /// }
 /// ```
@@ -599,12 +604,12 @@ impl EngineBuilder {
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId) {
 ///     h.record_evidence("evidence", run, "{}", None).unwrap();
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId) {
 ///     h.put_runtime_checkpoint(run, "{}", 0).unwrap();
 /// }
 /// ```
@@ -619,7 +624,7 @@ impl EngineBuilder {
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId) {
 ///     h.abandon_pending_effect("effect", run, 0).unwrap();
 /// }
 /// ```
@@ -629,19 +634,19 @@ impl EngineBuilder {
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, state: latte_core::RunState, lease: &latte_engine::Lease) {
+/// fn forge(h: &latte_engine::EngineHandle, state: latte_core::TurnState, lease: &latte_engine::Lease) {
 ///     h.append_event(&state, 0, panic!(), &panic!(), 0, lease).unwrap();
 /// }
 /// ```
 /// ```compile_fail
-/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::RunId, lease: &latte_engine::Lease) {
+/// fn forge(h: &latte_engine::EngineHandle, run: latte_core::TurnId, lease: &latte_engine::Lease) {
 ///     h.record_verification_evidence(run, 0, lease, panic!(), 0).unwrap();
 /// }
 /// ```
 #[derive(Clone)]
 pub struct EngineHandle {
     events: broadcast::Sender<EventEnvelope>,
-    thread_events: broadcast::Sender<ThreadEventEnvelope>,
+    session_events: broadcast::Sender<SessionEventEnvelope>,
     storage: Arc<storage::Storage>,
     tools: Arc<tools::ToolRegistry>,
     workspace_root: Arc<str>,
@@ -660,33 +665,33 @@ impl std::fmt::Debug for EngineHandle {
     }
 }
 impl EngineHandle {
-    fn sync_thread_conversation(&self, thread_id: ThreadId) -> Result<(), StorageError> {
+    fn sync_session_conversation(&self, session_id: SessionId) -> Result<(), StorageError> {
         let Some(store) = &self.conversation_store else {
             return Ok(());
         };
         let metadata = self
             .storage
-            .thread_session_v2(thread_id)?
-            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+            .session_v2(session_id)?
+            .ok_or(StorageError::SessionNotFound(session_id))?;
         if metadata.workspace_root != self.workspace_root.as_ref() {
             return Err(StorageError::InvalidData(
                 "cannot write a Session conversation from a foreign workspace".into(),
             ));
         }
-        let entries = self.storage.conversation_outbox_entries(thread_id)?;
+        let entries = self.storage.conversation_outbox_entries(session_id)?;
         store
-            .sync(thread_id, metadata.created_at_ms, &entries)
+            .sync(session_id, metadata.created_at_ms, &entries)
             .map_err(StorageError::InvalidData)?;
         if let Some(sequence) = entries.last().map(|entry| entry.sequence) {
             self.storage
-                .acknowledge_conversation_outbox(thread_id, sequence)?;
+                .acknowledge_conversation_outbox(session_id, sequence)?;
         }
         Ok(())
     }
 
     fn conversation_page(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         after: Option<u64>,
         limit: usize,
         tail: bool,
@@ -694,8 +699,8 @@ impl EngineHandle {
         let Some(store) = &self.conversation_store else {
             return Ok(None);
         };
-        self.sync_thread_conversation(thread_id)?;
-        let mut entries = store.read(thread_id).map_err(StorageError::InvalidData)?;
+        self.sync_session_conversation(session_id)?;
+        let mut entries = store.read(session_id).map_err(StorageError::InvalidData)?;
         let bounded = limit.clamp(1, 500);
         if tail {
             let start = entries.len().saturating_sub(bounded);
@@ -719,29 +724,29 @@ impl EngineHandle {
         }))
     }
 
-    fn finish_thread_response(
+    fn finish_session_response(
         &self,
-        mut response: ThreadCommitResponse,
-    ) -> Result<ThreadCommitResponse, StorageError> {
-        self.sync_thread_conversation(response.snapshot.thread_id)?;
-        response.snapshot = self.thread_snapshot_tail_v2(response.snapshot.thread_id, 500)?;
+        mut response: SessionCommitResponse,
+    ) -> Result<SessionCommitResponse, StorageError> {
+        self.sync_session_conversation(response.snapshot.session_id)?;
+        response.snapshot = self.session_snapshot_tail_v2(response.snapshot.session_id, 500)?;
         let _ = self
-            .thread_events
-            .send(response.thread_event.envelope.clone());
+            .session_events
+            .send(response.session_event.envelope.clone());
         Ok(response)
     }
 
-    fn ensure_thread_lease(thread_id: ThreadId, lease: &Lease) -> Result<(), StorageError> {
-        if lease.scope == format!("thread:{thread_id}") {
+    fn ensure_session_lease(session_id: SessionId, lease: &Lease) -> Result<(), StorageError> {
+        if lease.scope == format!("session:{session_id}") {
             Ok(())
         } else {
             Err(StorageError::LeaseLost)
         }
     }
 
-    fn reject_linked_run(&self, run_id: RunId) -> Result<(), StorageError> {
-        if self.storage.is_thread_linked_run(run_id)? {
-            Err(StorageError::LinkedRunRequiresThreadCommit)
+    fn reject_linked_turn(&self, turn_id: TurnId) -> Result<(), StorageError> {
+        if self.storage.is_session_linked_turn(turn_id)? {
+            Err(StorageError::LinkedTurnRequiresSessionCommit)
         } else {
             Ok(())
         }
@@ -770,9 +775,9 @@ impl EngineHandle {
             };
             let first = manifest_map_digest(&first_manifest)?;
             #[cfg(test)]
-            self.run_completion_hook(1);
+            self.turn_completion_hook(1);
             #[cfg(test)]
-            self.run_completion_hook(2);
+            self.turn_completion_hook(2);
             let second_manifest = match self.workspace_manifest() {
                 Ok(value) => value,
                 Err(ToolError::WorkspaceUnstable(_)) => continue,
@@ -780,7 +785,7 @@ impl EngineHandle {
             };
             let second = manifest_map_digest(&second_manifest)?;
             #[cfg(test)]
-            self.run_completion_hook(3);
+            self.turn_completion_hook(3);
             if first == second {
                 return Ok((second, second_manifest));
             }
@@ -794,7 +799,7 @@ impl EngineHandle {
         *self.completion_hook.lock().expect("hook mutex poisoned") = Some(Arc::new(hook));
     }
     #[cfg(test)]
-    fn run_completion_hook(&self, stage: u8) {
+    fn turn_completion_hook(&self, stage: u8) {
         let hook = self
             .completion_hook
             .lock()
@@ -811,7 +816,7 @@ impl EngineHandle {
         if self.process_supervision_supported {
             tools.push(ToolDescriptor {
                 name: "process".into(),
-                description: "Engine-owned supervised process operation".into(),
+                description: crate::tools::tool_description("process").into(),
                 input_schema: crate::tools::tool_schema("process"),
                 version: 1,
                 effect: "process".into(),
@@ -833,13 +838,13 @@ impl EngineHandle {
     /// Executes an engine-owned operation. Mutations cannot bypass the durable effect ledger.
     pub fn execute_tool(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         lease: &Lease,
         now_ms: u64,
         invocation: &ToolInvocation<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let _operation = self.operation_permit();
-        self.reject_linked_run(run_id)
+        self.reject_linked_turn(turn_id)
             .map_err(|error| ToolError::Input(error.to_string()))?;
         if lease.owner != invocation.lease_owner || lease.fencing_token != invocation.lease_token {
             return Err(ToolError::InvalidApproval);
@@ -855,9 +860,9 @@ impl EngineHandle {
             self.storage
                 .create_prepared_permission(
                     invocation.effect_id,
-                    run_id,
-                    invocation.run_revision.saturating_sub(2),
-                    invocation.run_revision,
+                    turn_id,
+                    invocation.turn_revision.saturating_sub(2),
+                    invocation.turn_revision,
                     invocation.attempt,
                     &descriptor,
                     &digest,
@@ -880,8 +885,8 @@ impl EngineHandle {
             .storage
             .consume_permission_and_start(
                 invocation.effect_id,
-                run_id,
-                invocation.run_revision,
+                turn_id,
+                invocation.turn_revision,
                 lease,
                 supplied,
                 now_ms,
@@ -922,12 +927,12 @@ impl EngineHandle {
     pub fn reissue_tool_permission(
         &self,
         old_effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         lease: &Lease,
         now_ms: u64,
         invocation: &ToolInvocation<'_>,
     ) -> Result<String, ToolError> {
-        self.reject_linked_run(run_id)
+        self.reject_linked_turn(turn_id)
             .map_err(|error| ToolError::Input(error.to_string()))?;
         let (_prepared, decision, digest) = self.tools.prepare_for_engine(invocation)?;
         if decision != policy::PolicyDecision::Ask {
@@ -942,8 +947,8 @@ impl EngineHandle {
             .replace_pending_effect(
                 old_effect_id,
                 invocation.effect_id,
-                run_id,
-                invocation.run_revision,
+                turn_id,
+                invocation.turn_revision,
                 invocation.attempt,
                 &descriptor,
                 &digest,
@@ -960,66 +965,66 @@ impl EngineHandle {
             receiver: self.events.subscribe(),
         }
     }
-    /// Subscribes to v2 durable thread events. A lag is a signal to reload a
+    /// Subscribes to v2 durable session events. A lag is a signal to reload a
     /// snapshot; events are not a second source of truth.
     #[must_use]
-    pub fn subscribe_threads(&self) -> ThreadSubscription {
-        ThreadSubscription {
-            receiver: self.thread_events.subscribe(),
+    pub fn subscribe_sessions(&self) -> SessionSubscription {
+        SessionSubscription {
+            receiver: self.session_events.subscribe(),
         }
     }
-    /// Creates a durable v2 thread and its initial linked child. This performs
+    /// Creates a durable v2 session and its initial linked child. This performs
     /// no provider call or credential resolution.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn create_thread_v2(
+    pub fn create_session_v2(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
-        binding: ThreadProviderBindingV2,
+        session_id: SessionId,
+        turn_id: TurnId,
+        binding: SessionProviderBinding,
         prompt: &str,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<SessionSnapshot, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.create_thread_v2(
-            thread_id,
-            run_id,
+        self.storage.create_session_v2(
+            session_id,
+            turn_id,
             &binding,
             &self.workspace_root,
             prompt,
             &baseline,
             now_ms,
         )?;
-        self.sync_thread_conversation(thread_id)?;
-        self.thread_snapshot_tail_v2(thread_id, 500)
+        self.sync_session_conversation(session_id)?;
+        self.session_snapshot_tail_v2(session_id, 500)
     }
     /// Atomically accepts a new Session submission and starts its first child
-    /// under the exact thread lease. A failure commits neither the user card nor
+    /// under the exact session lease. A failure commits neither the user card nor
     /// a token-zero active child.
     ///
     /// `command_id` drives crash-safe idempotent creation: the caller must
     /// first call [`Self::lookup_create_replay`] before acquiring the lease;
     /// this method rechecks the dedup record inside the write transaction.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-    pub fn create_started_thread_v2(
+    pub fn create_started_session_v2(
         &self,
-        command_id: &latte_core::ThreadCommandId,
-        thread_id: ThreadId,
-        run_id: RunId,
-        binding: ThreadProviderBindingV2,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        binding: SessionProviderBinding,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
         focus: Option<&str>,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let outcome = self.storage.create_started_thread_v2(
+        let outcome = self.storage.create_started_session_v2(
             Some(command_id),
-            thread_id,
-            run_id,
+            session_id,
+            turn_id,
             &binding,
             &self.workspace_root,
             prompt,
@@ -1030,16 +1035,16 @@ impl EngineHandle {
         )?;
         match outcome {
             latte_core::CreateOutcome::Created(snapshot) => {
-                // Broadcast the thread event for the new snapshot.
-                let _ = self.thread_events.send(latte_core::ThreadEventEnvelope {
-                    protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-                    event_id: latte_core::ThreadEventId::from_uuid(uuid::Uuid::now_v7()),
-                    thread_id,
+                // Broadcast the session event for the new snapshot.
+                let _ = self.session_events.send(latte_core::SessionEventEnvelope {
+                    protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+                    event_id: latte_core::SessionEventId::from_uuid(uuid::Uuid::now_v7()),
+                    session_id,
                     revision: snapshot.revision,
                     sequence: snapshot.sequence,
-                    event: latte_core::ThreadEvent::LifecycleChanged {
+                    event: latte_core::SessionEvent::LifecycleChanged {
                         lifecycle: snapshot.lifecycle,
-                        run_id: snapshot.latest_run_id,
+                        turn_id: snapshot.latest_turn_id,
                     },
                 });
                 Ok(latte_core::CreateOutcome::Created(snapshot))
@@ -1054,19 +1059,19 @@ impl EngineHandle {
     /// means the command was already durably accepted (possibly by a process
     /// that crashed before responding); the caller replays the snapshot and
     /// must not acquire a lease or start a runner. A miss proceeds to lease
-    /// acquisition and [`Self::create_started_thread_v2`].
+    /// acquisition and [`Self::create_started_session_v2`].
     #[allow(clippy::too_many_arguments)]
     pub fn lookup_create_replay(
         &self,
-        command_id: &latte_core::ThreadCommandId,
-        thread_id: ThreadId,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
         prompt: &str,
-        binding: &ThreadProviderBindingV2,
+        binding: &SessionProviderBinding,
         focus: Option<&str>,
-    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+    ) -> Result<Option<SessionSnapshot>, StorageError> {
         self.storage.lookup_create_replay(
             command_id,
-            thread_id,
+            session_id,
             &self.workspace_root,
             prompt,
             binding,
@@ -1077,23 +1082,23 @@ impl EngineHandle {
     /// Convenience: create and return the snapshot, treating replay as success.
     /// Generates a fresh command id, so it is suitable for in-process callers
     /// that do not need crash-safe replay; HTTP clients must use
-    /// [`Self::lookup_create_replay`] + [`Self::create_started_thread_v2`].
+    /// [`Self::lookup_create_replay`] + [`Self::create_started_session_v2`].
     #[allow(clippy::too_many_arguments)]
-    pub fn create_started_thread_v2_snapshot(
+    pub fn create_started_session_v2_snapshot(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
-        binding: ThreadProviderBindingV2,
+        session_id: SessionId,
+        turn_id: TurnId,
+        binding: SessionProviderBinding,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
         focus: Option<&str>,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
-        match self.create_started_thread_v2(
+    ) -> Result<SessionSnapshot, StorageError> {
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7());
+        match self.create_started_session_v2(
             &command_id,
-            thread_id,
-            run_id,
+            session_id,
+            turn_id,
             binding,
             prompt,
             lease,
@@ -1103,28 +1108,28 @@ impl EngineHandle {
             latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => Ok(s),
         }
     }
-    /// Creates an immutable child run for a ready completed thread.
-    pub fn create_thread_follow_up_v2(
+    /// Creates an immutable child run for a ready completed session.
+    pub fn create_session_follow_up_v2(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
         prompt: &str,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<SessionSnapshot, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.create_thread_follow_up_v2(
-            thread_id,
-            run_id,
-            expected_thread_revision,
+        self.storage.create_session_follow_up_v2(
+            session_id,
+            turn_id,
+            expected_session_revision,
             prompt,
             &baseline,
             now_ms,
         )?;
-        self.sync_thread_conversation(thread_id)?;
-        self.thread_snapshot_tail_v2(thread_id, 500)
+        self.sync_session_conversation(session_id)?;
+        self.session_snapshot_tail_v2(session_id, 500)
     }
     /// Atomically accepts and starts a follow-up child under the exact Session
     /// lease, preserving the completed parent if any precondition fails.
@@ -1134,26 +1139,26 @@ impl EngineHandle {
     /// runner (callers should first consult
     /// [`Self::lookup_follow_up_replay`] before acquiring a lease), and a
     /// same-id different-digest retry fails with
-    /// [`StorageError::ThreadCommandReplayMismatch`].
+    /// [`StorageError::SessionCommandReplayMismatch`].
     #[allow(clippy::too_many_arguments)]
-    pub fn create_started_thread_follow_up_v2(
+    pub fn create_started_session_follow_up_v2(
         &self,
-        command_id: Option<&latte_core::ThreadCommandId>,
-        thread_id: ThreadId,
-        run_id: RunId,
-        expected_thread_revision: u64,
+        command_id: Option<&latte_core::SessionCommandId>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
         prompt: &str,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<latte_core::CreateOutcome<ThreadSnapshot>, StorageError> {
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let (outcome, thread_event) = self.storage.create_started_thread_follow_up_v2(
+        let (outcome, session_event) = self.storage.create_started_session_follow_up_v2(
             command_id,
-            thread_id,
-            run_id,
-            expected_thread_revision,
+            session_id,
+            turn_id,
+            expected_session_revision,
             prompt,
             &baseline,
             lease,
@@ -1161,9 +1166,9 @@ impl EngineHandle {
         )?;
         match outcome {
             latte_core::CreateOutcome::Created(snapshot) => {
-                let response = self.finish_thread_response(ThreadCommitResponse {
+                let response = self.finish_session_response(SessionCommitResponse {
                     snapshot,
-                    thread_event: thread_event.ok_or_else(|| {
+                    session_event: session_event.ok_or_else(|| {
                         StorageError::InvalidData(
                             "atomic follow-up start omitted its durable event".into(),
                         )
@@ -1181,50 +1186,50 @@ impl EngineHandle {
     /// the follow-up was already durably accepted (possibly by a process that
     /// crashed before responding); the caller replays the snapshot and must
     /// not acquire a lease or start a runner. A miss proceeds to lease
-    /// acquisition and [`Self::create_started_thread_follow_up_v2`].
+    /// acquisition and [`Self::create_started_session_follow_up_v2`].
     pub fn lookup_follow_up_replay(
         &self,
-        command_id: &latte_core::ThreadCommandId,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
+        expected_session_revision: u64,
         prompt: &str,
-    ) -> Result<Option<ThreadSnapshot>, StorageError> {
+    ) -> Result<Option<SessionSnapshot>, StorageError> {
         self.storage.lookup_follow_up_replay(
             command_id,
-            thread_id,
-            expected_thread_revision,
+            session_id,
+            expected_session_revision,
             prompt,
         )
     }
 
     /// Switches the provider/model binding for subsequent children of an idle
     /// Session and publishes the durable binding-change event.
-    pub fn switch_thread_binding_v2(
+    pub fn switch_session_binding_v2(
         &self,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
-        binding: &ThreadProviderBindingV2,
+        session_id: SessionId,
+        expected_session_revision: u64,
+        binding: &SessionProviderBinding,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        let response = self.storage.switch_thread_binding_v2(
-            thread_id,
-            expected_thread_revision,
+    ) -> Result<SessionSnapshot, StorageError> {
+        let response = self.storage.switch_session_binding_v2(
+            session_id,
+            expected_session_revision,
             binding,
             lease,
             now_ms,
         )?;
-        Ok(self.finish_thread_response(response)?.snapshot)
+        Ok(self.finish_session_response(response)?.snapshot)
     }
-    /// Reads one paged thread projection.
-    pub fn thread_snapshot_v2(
+    /// Reads one paged session projection.
+    pub fn session_snapshot_v2(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         after: Option<u64>,
         limit: usize,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        let mut snapshot = self.storage.thread_snapshot_v2(thread_id, after, limit)?;
-        if let Some(page) = self.conversation_page(thread_id, after, limit, false)? {
+    ) -> Result<SessionSnapshot, StorageError> {
+        let mut snapshot = self.storage.session_snapshot_v2(session_id, after, limit)?;
+        if let Some(page) = self.conversation_page(session_id, after, limit, false)? {
             snapshot.transcript = page;
         }
         Ok(snapshot)
@@ -1232,45 +1237,53 @@ impl EngineHandle {
 
     /// Recovers all expired leases in this engine's storage and, for every
     /// recovered linked child, refreshes its snapshot and broadcasts the
-    /// committed thread event so connected SSE clients wake and refetch.
+    /// committed session event so connected SSE clients wake and refetch.
     /// Called periodically by the server's recovery sweeper.
     pub fn recover_expired_leases(&self) -> Result<(), StorageError> {
         let recovered = self.storage.recover_at(crate::wall_now_ms())?;
         for response in recovered {
-            self.sync_thread_conversation(response.snapshot.thread_id)?;
+            self.sync_session_conversation(response.snapshot.session_id)?;
             let _ = self
-                .thread_events
-                .send(response.thread_event.envelope.clone());
+                .session_events
+                .send(response.session_event.envelope.clone());
         }
         Ok(())
     }
 
     /// Reads the newest bounded transcript cards for presentation and resume
     /// reconciliation. Durable history reconstruction continues to use the
-    /// forward-paged `thread_snapshot_v2` API.
-    pub fn thread_snapshot_tail_v2(
+    /// forward-paged `session_snapshot_v2` API.
+    pub fn session_snapshot_tail_v2(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         limit: usize,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        let mut snapshot = self.storage.thread_snapshot_tail_v2(thread_id, limit)?;
-        if let Some(page) = self.conversation_page(thread_id, None, limit, true)? {
+    ) -> Result<SessionSnapshot, StorageError> {
+        let mut snapshot = self.storage.session_snapshot_tail_v2(session_id, limit)?;
+        if let Some(page) = self.conversation_page(session_id, None, limit, true)? {
             snapshot.transcript = page;
         }
         Ok(snapshot)
     }
-    /// Lists thread sessions with bounded recent transcript cards.
-    pub fn list_threads_v2(&self) -> Result<Vec<ThreadSnapshot>, StorageError> {
-        let mut snapshots = self.storage.list_threads_v2()?;
+
+    /// Reads the authoritative persisted tool-round count for a turn. The
+    /// transcript projection is tail-bounded (and outbox rows drain into the
+    /// JSONL conversation log), so the per-turn budget must resume from this
+    /// counter rather than from the snapshot the commit response carries.
+    pub fn session_turn_tool_round_count(&self, turn_id: TurnId) -> Result<u32, StorageError> {
+        self.storage.tool_round_count_for_turn(turn_id)
+    }
+    /// Lists session sessions with bounded recent transcript cards.
+    pub fn list_sessions(&self) -> Result<Vec<SessionSnapshot>, StorageError> {
+        let mut snapshots = self.storage.list_sessions()?;
         if self.conversation_store.is_some() {
             for snapshot in &mut snapshots {
                 let is_local = self
                     .storage
-                    .thread_session_v2(snapshot.thread_id)?
+                    .session_v2(snapshot.session_id)?
                     .is_some_and(|session| session.workspace_root == self.workspace_root.as_ref());
                 if is_local
                     && let Some(page) =
-                        self.conversation_page(snapshot.thread_id, None, 500, true)?
+                        self.conversation_page(snapshot.session_id, None, 500, true)?
                 {
                     snapshot.transcript = page;
                 }
@@ -1278,15 +1291,15 @@ impl EngineHandle {
         }
         Ok(snapshots)
     }
-    /// Lists thread projections belonging to one exact workspace identity.
-    pub fn list_threads_v2_for_workspace(
+    /// Lists session projections belonging to one exact workspace identity.
+    pub fn list_sessions_for_workspace(
         &self,
         workspace_root: &str,
-    ) -> Result<Vec<ThreadSnapshot>, StorageError> {
-        let mut snapshots = self.storage.list_threads_v2_for_workspace(workspace_root)?;
+    ) -> Result<Vec<SessionSnapshot>, StorageError> {
+        let mut snapshots = self.storage.list_sessions_for_workspace(workspace_root)?;
         if workspace_root == self.workspace_root.as_ref() {
             for snapshot in &mut snapshots {
-                if let Some(page) = self.conversation_page(snapshot.thread_id, None, 500, true)? {
+                if let Some(page) = self.conversation_page(snapshot.session_id, None, 500, true)? {
                     snapshot.transcript = page;
                 }
             }
@@ -1294,55 +1307,55 @@ impl EngineHandle {
         Ok(snapshots)
     }
     /// Searches the current workspace's local Session catalog.
-    pub fn search_thread_sessions_v2(
+    pub fn search_sessions(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+    ) -> Result<Vec<latte_core::SessionSummary>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         self.storage
-            .search_thread_sessions(&self.workspace_root, query, limit)
+            .search_sessions(&self.workspace_root, query, limit)
     }
     /// Gives a Session a bounded, redacted user-visible title.
-    pub fn rename_thread_session_v2(
+    pub fn rename_session_v2(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         title: &str,
-    ) -> Result<latte_core::ThreadSessionSummary, StorageError> {
-        self.require_local_session(thread_id)?;
-        self.storage.rename_thread_session(thread_id, title)?;
+    ) -> Result<latte_core::SessionSummary, StorageError> {
+        self.require_local_session(session_id)?;
+        self.storage.rename_session(session_id, title)?;
         self.storage
-            .thread_session_v2(thread_id)?
-            .ok_or(StorageError::ThreadNotFound(thread_id))
+            .session_v2(session_id)?
+            .ok_or(StorageError::SessionNotFound(session_id))
     }
     /// Forks committed conversation history into a new Ready Session. Runtime
     /// authority, Runs, Effects, permissions, and leases are never copied.
-    pub fn fork_thread_session_v2(
+    pub fn fork_session_v2(
         &self,
-        source_thread_id: ThreadId,
-        fork_thread_id: ThreadId,
+        source_session_id: SessionId,
+        fork_session_id: SessionId,
         title: Option<&str>,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        self.require_local_session(source_thread_id)?;
-        self.sync_thread_conversation(source_thread_id)?;
+    ) -> Result<SessionSnapshot, StorageError> {
+        self.require_local_session(source_session_id)?;
+        self.sync_session_conversation(source_session_id)?;
         let store = self.conversation_store.as_ref().ok_or_else(|| {
             StorageError::InvalidData("Session forking requires JSONL storage".into())
         })?;
         let history = store
-            .read(source_thread_id)
+            .read(source_session_id)
             .map_err(StorageError::InvalidData)?;
-        self.storage.create_thread_session_fork(
-            source_thread_id,
-            fork_thread_id,
+        self.storage.create_session_fork(
+            source_session_id,
+            fork_session_id,
             &history,
             title,
             now_ms,
         )?;
-        self.sync_thread_conversation(fork_thread_id)?;
-        self.thread_snapshot_v2(fork_thread_id, None, 500)
+        self.sync_session_conversation(fork_session_id)?;
+        self.session_snapshot_v2(fork_session_id, None, 500)
     }
     /// Imports one compatible workspace-local database into the global
     /// authority without modifying the source file. Repeated imports of the
@@ -1388,50 +1401,50 @@ impl EngineHandle {
         if imported {
             for session in self
                 .storage
-                .list_thread_sessions_v2_for_workspace(&self.workspace_root, 500)?
+                .list_session_summaries_for_workspace(&self.workspace_root, 500)?
             {
-                self.sync_thread_conversation(session.thread_id)?;
+                self.sync_session_conversation(session.session_id)?;
             }
         }
         Ok(imported)
     }
     /// Lists bounded Session metadata for one exact workspace identity.
-    pub fn list_thread_sessions_v2_for_workspace(
+    pub fn list_session_summaries_for_workspace(
         &self,
         workspace_root: &str,
         limit: usize,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+    ) -> Result<Vec<latte_core::SessionSummary>, StorageError> {
         self.storage
-            .list_thread_sessions_v2_for_workspace(workspace_root, limit)
+            .list_session_summaries_for_workspace(workspace_root, limit)
     }
     /// Finds exact-title matches across the full workspace catalogue without
     /// inheriting the recent-session picker window.
-    pub fn find_thread_sessions_v2_by_exact_title_for_workspace(
+    pub fn find_sessions_by_exact_title_for_workspace(
         &self,
         workspace_root: &str,
         title: &str,
         limit: usize,
-    ) -> Result<Vec<latte_core::ThreadSessionSummary>, StorageError> {
+    ) -> Result<Vec<latte_core::SessionSummary>, StorageError> {
         self.storage
-            .find_thread_sessions_v2_by_exact_title_for_workspace(workspace_root, title, limit)
+            .find_sessions_by_exact_title_for_workspace(workspace_root, title, limit)
     }
 
-    /// Lists one page of thread projections belonging to one exact workspace
+    /// Lists one page of session projections belonging to one exact workspace
     /// identity, ordered by `(updated_at_ms, rowid)` descending. `cursor` is
     /// the opaque `next_cursor` of the previous page.
-    pub fn list_threads_v2_for_workspace_paged(
+    pub fn list_sessions_for_workspace_paged(
         &self,
         workspace_root: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<ThreadSnapshot>, StorageError> {
+    ) -> Result<latte_core::Paged<SessionSnapshot>, StorageError> {
         let mut page =
             self.storage
-                .list_threads_v2_for_workspace_paged(workspace_root, cursor, limit)?;
+                .list_sessions_for_workspace_paged(workspace_root, cursor, limit)?;
         if workspace_root == self.workspace_root.as_ref() {
             for snapshot in &mut page.items {
                 if let Some(transcript) =
-                    self.conversation_page(snapshot.thread_id, None, 500, true)?
+                    self.conversation_page(snapshot.session_id, None, 500, true)?
                 {
                     snapshot.transcript = transcript;
                 }
@@ -1442,51 +1455,46 @@ impl EngineHandle {
 
     /// Searches the current workspace's local Session catalog one page at a
     /// time, in the same order as
-    /// [`Self::list_threads_v2_for_workspace_paged`].
-    pub fn search_thread_sessions_v2_paged(
+    /// [`Self::list_sessions_for_workspace_paged`].
+    pub fn search_sessions_paged(
         &self,
         query: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+    ) -> Result<latte_core::Paged<latte_core::SessionSummary>, StorageError> {
         self.storage
-            .search_thread_sessions_paged(&self.workspace_root, query, cursor, limit)
+            .search_sessions_paged(&self.workspace_root, query, cursor, limit)
     }
 
     /// Finds sessions whose title exactly matches `title` one page at a time,
     /// in the same order as
-    /// [`Self::list_threads_v2_for_workspace_paged`].
-    pub fn find_thread_sessions_v2_by_exact_title_for_workspace_paged(
+    /// [`Self::list_sessions_for_workspace_paged`].
+    pub fn find_sessions_by_exact_title_for_workspace_paged(
         &self,
         workspace_root: &str,
         title: &str,
         cursor: Option<&str>,
         limit: usize,
-    ) -> Result<latte_core::Paged<latte_core::ThreadSessionSummary>, StorageError> {
+    ) -> Result<latte_core::Paged<latte_core::SessionSummary>, StorageError> {
         self.storage
-            .find_thread_sessions_v2_by_exact_title_for_workspace_paged(
-                workspace_root,
-                title,
-                cursor,
-                limit,
-            )
+            .find_sessions_by_exact_title_for_workspace_paged(workspace_root, title, cursor, limit)
     }
     /// Reads exact Session metadata without applying a recent-list cap.
-    pub fn thread_session_v2(
+    pub fn session_v2(
         &self,
-        thread_id: ThreadId,
-    ) -> Result<Option<latte_core::ThreadSessionSummary>, StorageError> {
-        self.storage.thread_session_v2(thread_id)
+        session_id: SessionId,
+    ) -> Result<Option<latte_core::SessionSummary>, StorageError> {
+        self.storage.session_v2(session_id)
     }
 
     fn require_local_session(
         &self,
-        thread_id: ThreadId,
-    ) -> Result<latte_core::ThreadSessionSummary, StorageError> {
+        session_id: SessionId,
+    ) -> Result<latte_core::SessionSummary, StorageError> {
         let session = self
             .storage
-            .thread_session_v2(thread_id)?
-            .ok_or(StorageError::ThreadNotFound(thread_id))?;
+            .session_v2(session_id)?
+            .ok_or(StorageError::SessionNotFound(session_id))?;
         if session.workspace_root != self.workspace_root.as_ref() {
             return Err(StorageError::InvalidData(
                 "Session management is confined to the current workspace".into(),
@@ -1496,13 +1504,13 @@ impl EngineHandle {
     }
     /// The only public mutation path for a linked v2 child run.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn commit_thread_run_update(
+    pub fn commit_session_turn_update(
         &self,
-        request: ThreadCommitRequest,
+        request: SessionCommitRequest,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadCommitResponse, StorageError> {
-        if matches!(&request.update, CommitThreadRunUpdate::Complete { .. }) {
+    ) -> Result<SessionCommitResponse, StorageError> {
+        if matches!(&request.update, CommitSessionTurnUpdate::Complete { .. }) {
             // `VerificationNotRequired` is legal only for a child whose
             // engine-owned baseline still equals a stable current workspace
             // snapshot.  This keeps the public v2 commit entrypoint from
@@ -1511,7 +1519,7 @@ impl EngineHandle {
             let (_, current_manifest) = self.stable_completion_snapshot()?;
             if !self
                 .storage
-                .thread_changed_files(request.run_id, &current_manifest)?
+                .session_changed_files(request.turn_id, &current_manifest)?
                 .is_empty()
             {
                 return Err(StorageError::InvalidData(
@@ -1521,24 +1529,24 @@ impl EngineHandle {
         }
         let response = self
             .storage
-            .commit_thread_run_update(&request, lease, now_ms)?;
-        self.finish_thread_response(response)
+            .commit_session_turn_update(&request, lease, now_ms)?;
+        self.finish_session_response(response)
     }
     /// Returns the exact files changed since this linked v2 child began.
     /// The comparison is against an engine-owned baseline captured before the
     /// provider can receive effect authority.
-    pub fn thread_run_changed_files(&self, run_id: RunId) -> Result<Vec<String>, StorageError> {
+    pub fn session_turn_changed_files(&self, turn_id: TurnId) -> Result<Vec<String>, StorageError> {
         let current = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.thread_changed_files(run_id, &current)
+        self.storage.session_changed_files(turn_id, &current)
     }
     /// Persists the actual configured verification result under the linked
     /// child's current fenced revision/effect epoch.  This is deliberately
     /// separate from transcript output: a provider cannot fabricate it.
-    pub fn record_thread_verification(
+    pub fn record_session_verification(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         effect_id: &str,
         output: &ProcessOutput,
@@ -1546,9 +1554,9 @@ impl EngineHandle {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         let (workspace_manifest_digest, _) = self.stable_completion_snapshot()?;
-        let effect_epoch = self.storage.effect_epoch(run_id)?;
+        let effect_epoch = self.storage.effect_epoch(turn_id)?;
         let summary = serde_json::to_string(output)
-            .map(|value| latte_core::redact_thread_text(&value))
+            .map(|value| latte_core::redact_session_text(&value))
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         let metadata = serde_json::to_string(&storage::VerificationRecord {
             revision: expected_revision,
@@ -1560,7 +1568,7 @@ impl EngineHandle {
         })
         .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         self.storage.record_verification_evidence(
-            run_id,
+            turn_id,
             expected_revision,
             lease,
             &VerificationEvidence {
@@ -1574,35 +1582,35 @@ impl EngineHandle {
     /// Atomically transitions a linked v2 child to completed only when its
     /// current engine-recorded verification evidence matches a stable current
     /// workspace manifest.
-    pub fn complete_thread_verified(
+    pub fn complete_session_verified(
         &self,
-        snapshot: &ThreadSnapshot,
+        snapshot: &SessionSnapshot,
         summary: String,
         verification_effect_id: String,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<SessionSnapshot, StorageError> {
         let _operation = self.operation_permit();
-        let run_id = snapshot
-            .active_run_id
-            .ok_or(StorageError::ThreadActiveRunMismatch)?;
-        let expected_run_revision = run_revision(snapshot, &verification_effect_id)
+        let turn_id = snapshot
+            .active_turn_id
+            .ok_or(StorageError::SessionActiveTurnMismatch)?;
+        let expected_turn_revision = turn_revision(snapshot, &verification_effect_id)
             .ok_or_else(|| StorageError::InvalidData("linked child is missing".into()))?;
         let (verified_manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
         let files_changed = self
             .storage
-            .thread_changed_files(run_id, &current_manifest)?;
-        self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: snapshot.thread_id,
-                run_id,
-                expected_thread_revision: snapshot.revision,
-                expected_run_revision,
-                command_id: latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()),
+            .session_changed_files(turn_id, &current_manifest)?;
+        self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: snapshot.session_id,
+                turn_id,
+                expected_session_revision: snapshot.revision,
+                expected_turn_revision,
+                command_id: latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
                 request_id: None,
                 effect_id: Some(verification_effect_id.clone()),
-                update: CommitThreadRunUpdate::CompleteVerified {
-                    source_key: format!("{run_id}:complete-verified"),
+                update: CommitSessionTurnUpdate::CompleteVerified {
+                    source_key: format!("{turn_id}:complete-verified"),
                     summary,
                     verification_effect_id,
                     verified_manifest_digest,
@@ -1616,50 +1624,50 @@ impl EngineHandle {
     }
     /// Validates policy and effect preconditions, then durably records a
     /// prepared v2 descriptor.  It never executes the descriptor.
-    pub fn prepare_thread_effect(
+    pub fn prepare_session_effect(
         &self,
-        request: ThreadEffectRequest,
+        request: SessionEffectRequest,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadEffectPrepared, StorageError> {
-        validate_thread_effect_descriptor(&request.descriptor)?;
-        let (policy, mut operation_digest) = self.thread_effect_policy_and_digest(
+    ) -> Result<SessionEffectPrepared, StorageError> {
+        validate_session_effect_descriptor(&request.descriptor)?;
+        let (policy, mut operation_digest) = self.session_effect_policy_and_digest(
             &request.descriptor,
-            request.expected_run_revision,
+            request.expected_turn_revision,
             lease,
         )?;
-        if policy == ThreadEffectPolicy::Ask {
+        if policy == SessionEffectPolicy::Ask {
             let post_approval_revision = request
-                .expected_run_revision
+                .expected_turn_revision
                 .checked_add(2)
                 .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
-            let (_same_policy, rebound_digest) = self.thread_effect_policy_and_digest(
+            let (_same_policy, rebound_digest) = self.session_effect_policy_and_digest(
                 &request.descriptor,
                 post_approval_revision,
                 lease,
             )?;
             operation_digest = rebound_digest;
         }
-        let persisted = ThreadEffectDescriptor {
-            input: latte_core::redact_thread_value(request.descriptor.input.clone()),
+        let persisted = SessionEffectDescriptor {
+            input: latte_core::redact_session_value(request.descriptor.input.clone()),
             ..request.descriptor.clone()
         };
         let descriptor_json = serde_json::to_string(&persisted)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         let canonical_descriptor_json = serde_json::to_string(&request.descriptor)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let checkpoint_json = thread_effect_checkpoint("prepared", &persisted, &operation_digest);
-        let description = thread_effect_permission_summary(&request.descriptor);
-        let response = self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: request.thread_id,
-                run_id: request.run_id,
-                expected_thread_revision: request.expected_thread_revision,
-                expected_run_revision: request.expected_run_revision,
+        let checkpoint_json = session_effect_checkpoint("prepared", &persisted, &operation_digest);
+        let description = session_effect_permission_summary(&request.descriptor);
+        let response = self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: request.session_id,
+                turn_id: request.turn_id,
+                expected_session_revision: request.expected_session_revision,
+                expected_turn_revision: request.expected_turn_revision,
                 command_id: request.command_id,
                 request_id: None,
                 effect_id: Some(persisted.effect_id.clone()),
-                update: CommitThreadRunUpdate::PrepareEffect {
+                update: CommitSessionTurnUpdate::PrepareEffect {
                     source_key: request.source_key,
                     effect_id: persisted.effect_id,
                     operation_digest: operation_digest.clone(),
@@ -1673,7 +1681,7 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        Ok(ThreadEffectPrepared {
+        Ok(SessionEffectPrepared {
             snapshot: response.snapshot,
             policy,
             operation_digest,
@@ -1684,49 +1692,49 @@ impl EngineHandle {
     /// digest and single-use capability are rebound atomically to the current
     /// fencing epoch before the effect may start.
     #[allow(clippy::too_many_arguments)]
-    pub fn resolve_thread_effect_permission(
+    pub fn resolve_session_effect_permission(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
-        expected_thread_revision: u64,
-        expected_run_revision: u64,
+        session_id: SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
+        expected_turn_revision: u64,
         request_id: String,
         source_key: String,
         allow: bool,
-        command_id: latte_core::ThreadCommandId,
+        command_id: latte_core::SessionCommandId,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
+    ) -> Result<SessionSnapshot, StorageError> {
         let rebound_operation_digest = if allow {
             let descriptor = self
                 .storage
-                .thread_effect_canonical_descriptor(&request_id, run_id)?;
-            validate_thread_effect_descriptor(&descriptor)?;
+                .session_effect_canonical_descriptor(&request_id, turn_id)?;
+            validate_session_effect_descriptor(&descriptor)?;
             if descriptor.effect_id != request_id {
                 return Err(StorageError::InvalidData(
-                    "canonical thread effect identifier mismatch".into(),
+                    "canonical session effect identifier mismatch".into(),
                 ));
             }
-            let post_approval_revision = expected_run_revision
+            let post_approval_revision = expected_turn_revision
                 .checked_add(1)
                 .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
             Some(
-                self.thread_effect_policy_and_digest(&descriptor, post_approval_revision, lease)?
+                self.session_effect_policy_and_digest(&descriptor, post_approval_revision, lease)?
                     .1,
             )
         } else {
             None
         };
-        self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id,
-                run_id,
-                expected_thread_revision,
-                expected_run_revision,
+        self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id,
+                turn_id,
+                expected_session_revision,
+                expected_turn_revision,
                 command_id,
                 request_id: Some(request_id.clone()),
                 effect_id: Some(request_id.clone()),
-                update: CommitThreadRunUpdate::ResolvePermission {
+                update: CommitSessionTurnUpdate::ResolvePermission {
                     source_key,
                     request_id,
                     allow,
@@ -1740,43 +1748,43 @@ impl EngineHandle {
     }
     /// Atomically consumes a durable ask approval (or the durable allow
     /// marker) and records Started before returning executable authority.
-    pub fn start_thread_effect(
+    pub fn start_session_effect(
         &self,
-        request: ThreadEffectStartRequest,
+        request: SessionEffectStartRequest,
         operation_digest: String,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadEffectStarted, StorageError> {
+    ) -> Result<SessionEffectStarted, StorageError> {
         let descriptor = self
             .storage
-            .thread_effect_canonical_descriptor(&request.effect_id, request.run_id)?;
-        validate_thread_effect_descriptor(&descriptor)?;
+            .session_effect_canonical_descriptor(&request.effect_id, request.turn_id)?;
+        validate_session_effect_descriptor(&descriptor)?;
         if descriptor.effect_id != request.effect_id {
             return Err(StorageError::InvalidData(
-                "canonical thread effect identifier mismatch".into(),
+                "canonical session effect identifier mismatch".into(),
             ));
         }
-        let (_policy, exact_digest) = self.thread_effect_policy_and_digest(
+        let (_policy, exact_digest) = self.session_effect_policy_and_digest(
             &descriptor,
-            request.expected_run_revision,
+            request.expected_turn_revision,
             lease,
         )?;
         if exact_digest != operation_digest {
             return Err(StorageError::InvalidData(
-                "canonical thread effect digest mismatch".into(),
+                "canonical session effect digest mismatch".into(),
             ));
         }
-        let checkpoint_json = thread_effect_checkpoint("started", &descriptor, &operation_digest);
-        let response = self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: request.thread_id,
-                run_id: request.run_id,
-                expected_thread_revision: request.expected_thread_revision,
-                expected_run_revision: request.expected_run_revision,
+        let checkpoint_json = session_effect_checkpoint("started", &descriptor, &operation_digest);
+        let response = self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: request.session_id,
+                turn_id: request.turn_id,
+                expected_session_revision: request.expected_session_revision,
+                expected_turn_revision: request.expected_turn_revision,
                 command_id: request.command_id,
                 request_id: Some(request.effect_id.clone()),
                 effect_id: Some(request.effect_id.clone()),
-                update: CommitThreadRunUpdate::StartEffect {
+                update: CommitSessionTurnUpdate::StartEffect {
                     source_key: request.source_key,
                     effect_id: request.effect_id,
                     operation_digest: operation_digest.clone(),
@@ -1786,9 +1794,9 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        Ok(ThreadEffectStarted {
+        Ok(SessionEffectStarted {
             snapshot: response.snapshot,
-            presentation: ThreadEffectPresentation::from_descriptor(&descriptor),
+            presentation: SessionEffectPresentation::from_descriptor(&descriptor),
             operation_digest,
             descriptor,
         })
@@ -1796,43 +1804,43 @@ impl EngineHandle {
     /// Runs a descriptor only after a successful Started transaction.  The
     /// effect ledger is intentionally not finalized here; observation is a
     /// separate fenced commit so a crash in between remains Unknown-safe.
-    pub async fn execute_started_thread_effect(
+    pub async fn execute_started_session_effect(
         &self,
-        started: &ThreadEffectStarted,
+        started: &SessionEffectStarted,
         lease: &Lease,
         cancellation: &CancellationToken,
-    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
-        Self::ensure_thread_lease(started.snapshot.thread_id, lease)
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+    ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
+        Self::ensure_session_lease(started.snapshot.session_id, lease)
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
         let descriptor = &started.descriptor;
         let (_policy, digest) = self
-            .thread_effect_policy_and_digest(
+            .session_effect_policy_and_digest(
                 descriptor,
-                run_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
-                    || ThreadEffectExecutionError::Uncertain("started run is missing".into()),
+                turn_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                    || SessionEffectExecutionError::Uncertain("started run is missing".into()),
                 )?,
                 lease,
             )
-            .map_err(|error| ThreadEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
         if digest != started.operation_digest {
-            return Err(ThreadEffectExecutionError::Uncertain(
+            return Err(SessionEffectExecutionError::Uncertain(
                 "prepared descriptor no longer has the exact operation digest".into(),
             ));
         }
         if descriptor.name == "process" {
-            self.execute_started_thread_process(
+            self.execute_started_session_process(
                 descriptor,
-                run_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
-                    || ThreadEffectExecutionError::Uncertain("started run is missing".into()),
+                turn_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                    || SessionEffectExecutionError::Uncertain("started run is missing".into()),
                 )?,
                 lease,
                 cancellation,
             )
             .await
         } else {
-            let revision = run_revision(&started.snapshot, descriptor.effect_id.as_str())
+            let revision = turn_revision(&started.snapshot, descriptor.effect_id.as_str())
                 .ok_or_else(|| {
-                    ThreadEffectExecutionError::Uncertain("started run is missing".into())
+                    SessionEffectExecutionError::Uncertain("started run is missing".into())
                 })?;
             let engine = self.clone();
             let descriptor = descriptor.clone();
@@ -1840,7 +1848,7 @@ impl EngineHandle {
             let lease = lease.clone();
             let cancellation = cancellation.clone();
             tokio::task::spawn_blocking(move || {
-                engine.execute_started_thread_tool(
+                engine.execute_started_session_tool(
                     &descriptor,
                     revision,
                     &operation_digest,
@@ -1850,7 +1858,7 @@ impl EngineHandle {
             })
             .await
             .map_err(|error| {
-                ThreadEffectExecutionError::Uncertain(format!(
+                SessionEffectExecutionError::Uncertain(format!(
                     "started tool worker terminated before observation: {error}"
                 ))
             })?
@@ -1860,23 +1868,23 @@ impl EngineHandle {
     /// Runs a non-process descriptor away from the async lease heartbeat.  A
     /// filesystem stall must not block the coordinator reactor and silently
     /// let a Started effect outlive its authority window.
-    fn execute_started_thread_tool(
+    fn execute_started_session_tool(
         &self,
-        descriptor: &ThreadEffectDescriptor,
+        descriptor: &SessionEffectDescriptor,
         revision: u64,
         operation_digest: &str,
         lease: &Lease,
         cancellation: &CancellationToken,
-    ) -> Result<ThreadEffectObservedValue, ThreadEffectExecutionError> {
+    ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         if cancellation.is_cancelled() {
-            return Err(ThreadEffectExecutionError::Uncertain(
+            return Err(SessionEffectExecutionError::Uncertain(
                 "tool cancelled after Started".into(),
             ));
         }
         let invocation = ToolInvocation {
             name: &descriptor.name,
             input: &descriptor.input,
-            run_revision: revision,
+            turn_revision: revision,
             effect_id: &descriptor.effect_id,
             attempt: descriptor.attempt,
             precondition: descriptor.input.get("precondition").and_then(Value::as_str),
@@ -1890,20 +1898,20 @@ impl EngineHandle {
             self.tools
                 .prepare_for_engine(&invocation)
                 .map_err(|error| {
-                    ThreadEffectExecutionError::Uncertain(format!(
+                    SessionEffectExecutionError::Uncertain(format!(
                         "effect precondition changed: {error}"
                     ))
                 })?;
         if exact != operation_digest || decision == policy::PolicyDecision::Deny {
-            return Err(ThreadEffectExecutionError::Uncertain(
+            return Err(SessionEffectExecutionError::Uncertain(
                 "effect authorization changed before execution".into(),
             ));
         }
         let _operation = self.operation_permit();
         match self.tools.execute_prepared(prepared) {
-            Ok(output) => Ok(ThreadEffectObservedValue {
+            Ok(output) => Ok(SessionEffectObservedValue {
                 result: serde_json::to_string(&output.value).unwrap_or_else(|_| "null".into()),
-                payload: Some(latte_core::redact_thread_value(serde_json::json!({
+                payload: Some(latte_core::redact_session_value(serde_json::json!({
                     "tool_call_id": descriptor.tool_call_id,
                     "name": descriptor.name,
                     "output": output.value,
@@ -1913,8 +1921,8 @@ impl EngineHandle {
             }),
             Err(
                 error @ (ToolError::Io(_) | ToolError::Path(_) | ToolError::WorkspaceUnsafe(_)),
-            ) => Err(ThreadEffectExecutionError::Uncertain(error.to_string())),
-            Err(error) => Ok(ThreadEffectObservedValue {
+            ) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
+            Err(error) => Ok(SessionEffectObservedValue {
                 result: serde_json::json!({"error":error.to_string()}).to_string(),
                 payload: Some(serde_json::json!({
                     "tool_call_id":descriptor.tool_call_id,
@@ -1926,38 +1934,38 @@ impl EngineHandle {
         }
     }
     /// Durably observes an already started effect and returns the next
-    /// authoritative thread snapshot.
-    pub fn observe_thread_effect(
+    /// authoritative session snapshot.
+    pub fn observe_session_effect(
         &self,
-        started: &ThreadEffectStarted,
+        started: &SessionEffectStarted,
         source_key: String,
-        command_id: latte_core::ThreadCommandId,
-        value: ThreadEffectObservedValue,
+        command_id: latte_core::SessionCommandId,
+        value: SessionEffectObservedValue,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadEffectObserved, StorageError> {
-        let revision = run_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+    ) -> Result<SessionEffectObserved, StorageError> {
+        let revision = turn_revision(&started.snapshot, started.descriptor.effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
-        let response = self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: started.snapshot.thread_id,
-                run_id: started
+        let response = self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: started.snapshot.session_id,
+                turn_id: started
                     .snapshot
-                    .active_run_id
-                    .ok_or(StorageError::ThreadActiveRunMismatch)?,
-                expected_thread_revision: started.snapshot.revision,
-                expected_run_revision: revision,
+                    .active_turn_id
+                    .ok_or(StorageError::SessionActiveTurnMismatch)?,
+                expected_session_revision: started.snapshot.revision,
+                expected_turn_revision: revision,
                 command_id,
                 request_id: Some(started.descriptor.effect_id.clone()),
                 effect_id: Some(started.descriptor.effect_id.clone()),
-                update: CommitThreadRunUpdate::ObserveEffect {
+                update: CommitSessionTurnUpdate::ObserveEffect {
                     source_key,
                     effect_id: started.descriptor.effect_id.clone(),
                     operation_digest: started.operation_digest.clone(),
                     success: value.success,
                     result: value.result.clone(),
                     payload: value.payload,
-                    checkpoint_json: thread_effect_checkpoint(
+                    checkpoint_json: session_effect_checkpoint(
                         if value.success {
                             "observed_success"
                         } else {
@@ -1971,7 +1979,7 @@ impl EngineHandle {
             lease,
             now_ms,
         )?;
-        Ok(ThreadEffectObserved {
+        Ok(SessionEffectObserved {
             snapshot: response.snapshot,
             result: value.result,
             success: value.success,
@@ -1979,33 +1987,33 @@ impl EngineHandle {
     }
     /// Maps an uncertain post-Started boundary to Unknown and removes the
     /// active child through the v2 transaction path.
-    pub fn mark_thread_effect_unknown(
+    pub fn mark_session_effect_unknown(
         &self,
-        started: &ThreadEffectStarted,
+        started: &SessionEffectStarted,
         source_key: String,
-        command_id: latte_core::ThreadCommandId,
+        command_id: latte_core::SessionCommandId,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        let revision = run_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+    ) -> Result<SessionSnapshot, StorageError> {
+        let revision = turn_revision(&started.snapshot, started.descriptor.effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
-        self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id: started.snapshot.thread_id,
-                run_id: started
+        self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: started.snapshot.session_id,
+                turn_id: started
                     .snapshot
-                    .active_run_id
-                    .ok_or(StorageError::ThreadActiveRunMismatch)?,
-                expected_thread_revision: started.snapshot.revision,
-                expected_run_revision: revision,
+                    .active_turn_id
+                    .ok_or(StorageError::SessionActiveTurnMismatch)?,
+                expected_session_revision: started.snapshot.revision,
+                expected_turn_revision: revision,
                 command_id,
                 request_id: Some(started.descriptor.effect_id.clone()),
                 effect_id: Some(started.descriptor.effect_id.clone()),
-                update: CommitThreadRunUpdate::UnknownEffect {
+                update: CommitSessionTurnUpdate::UnknownEffect {
                     source_key,
                     effect_id: started.descriptor.effect_id.clone(),
                     operation_digest: started.operation_digest.clone(),
-                    checkpoint_json: thread_effect_checkpoint(
+                    checkpoint_json: session_effect_checkpoint(
                         "unknown",
                         &started.descriptor,
                         &started.operation_digest,
@@ -2020,31 +2028,31 @@ impl EngineHandle {
     /// Explicitly acknowledges an unknown v2 effect and terminalizes the
     /// linked child without reaching a legacy reconciliation entrypoint.
     #[allow(clippy::too_many_arguments)]
-    pub fn reconcile_thread_effect_unknown(
+    pub fn reconcile_session_effect_unknown(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
-        expected_thread_revision: u64,
-        expected_run_revision: u64,
+        session_id: SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
+        expected_turn_revision: u64,
         effect_id: String,
         source_key: String,
-        command_id: latte_core::ThreadCommandId,
+        command_id: latte_core::SessionCommandId,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<ThreadSnapshot, StorageError> {
-        self.commit_thread_run_update(
-            ThreadCommitRequest {
-                thread_id,
-                run_id,
-                expected_thread_revision,
-                expected_run_revision,
+    ) -> Result<SessionSnapshot, StorageError> {
+        self.commit_session_turn_update(
+            SessionCommitRequest {
+                session_id,
+                turn_id,
+                expected_session_revision,
+                expected_turn_revision,
                 command_id,
                 request_id: Some(effect_id.clone()),
                 effect_id: Some(effect_id.clone()),
-                update: CommitThreadRunUpdate::ReconcileUnknownEffect {
+                update: CommitSessionTurnUpdate::ReconcileUnknownEffect {
                     source_key,
                     effect_id,
-                    checkpoint_json: serde_json::json!({"thread_effect":"reconciled_unknown"})
+                    checkpoint_json: serde_json::json!({"session_effect":"reconciled_unknown"})
                         .to_string(),
                 },
             },
@@ -2055,54 +2063,54 @@ impl EngineHandle {
     }
     /// Conservatively recovers a linked v2 child after its lease renewal has
     /// failed.  The storage transaction updates the legacy run/effects and
-    /// the v2 thread projection together; only the committed final thread
+    /// the v2 session projection together; only the committed final session
     /// event is broadcast to connected clients.
-    pub fn recover_thread_after_lease_loss(
+    pub fn recover_session_after_lease_loss(
         &self,
-        thread_id: ThreadId,
-        run_id: RunId,
+        session_id: SessionId,
+        turn_id: TurnId,
         stale: &Lease,
-        expected_run_revision: u64,
+        expected_turn_revision: u64,
         now_ms: u64,
-    ) -> Result<ThreadLeaseLossRecovery, StorageError> {
-        Self::ensure_thread_lease(thread_id, stale)?;
-        let result = self.storage.recover_thread_after_lease_loss(
-            thread_id,
-            run_id,
+    ) -> Result<SessionLeaseLossRecovery, StorageError> {
+        Self::ensure_session_lease(session_id, stale)?;
+        let result = self.storage.recover_session_after_lease_loss(
+            session_id,
+            turn_id,
             stale,
-            expected_run_revision,
+            expected_turn_revision,
             now_ms,
         )?;
-        if let ThreadLeaseLossRecovery::Recovered(response) = &result {
-            self.sync_thread_conversation(response.snapshot.thread_id)?;
+        if let SessionLeaseLossRecovery::Recovered(response) = &result {
+            self.sync_session_conversation(response.snapshot.session_id)?;
             let _ = self
-                .thread_events
-                .send(response.thread_event.envelope.clone());
+                .session_events
+                .send(response.session_event.envelope.clone());
         }
         Ok(result)
     }
-    fn thread_effect_policy_and_digest(
+    fn session_effect_policy_and_digest(
         &self,
-        descriptor: &ThreadEffectDescriptor,
-        run_revision: u64,
+        descriptor: &SessionEffectDescriptor,
+        turn_revision: u64,
         lease: &Lease,
-    ) -> Result<(ThreadEffectPolicy, String), StorageError> {
+    ) -> Result<(SessionEffectPolicy, String), StorageError> {
         if descriptor.name == "process" {
             if !self.process_supervision_supported {
                 return Err(StorageError::InvalidData(
                     "process supervision is unsupported on this platform".into(),
                 ));
             }
-            let spec = process::ThreadProcessSpec::from_input(&descriptor.input)
+            let spec = process::SessionProcessSpec::from_input(&descriptor.input)
                 .map_err(|error| StorageError::InvalidData(error.to_string()))?;
             self.tools
                 .resolve_cwd(&spec.cwd)
                 .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-            let invocation = spec.invocation(run_revision, descriptor, lease);
+            let invocation = spec.invocation(turn_revision, descriptor, lease);
             let decision = process::classify(&invocation);
             let policy = match decision {
-                ProcessDecision::Allow => ThreadEffectPolicy::Allow,
-                ProcessDecision::Ask => ThreadEffectPolicy::Ask,
+                ProcessDecision::Allow => SessionEffectPolicy::Allow,
+                ProcessDecision::Ask => SessionEffectPolicy::Ask,
                 ProcessDecision::Deny => {
                     return Err(StorageError::InvalidData(
                         "process policy denied operation".into(),
@@ -2114,7 +2122,7 @@ impl EngineHandle {
         let invocation = ToolInvocation {
             name: &descriptor.name,
             input: &descriptor.input,
-            run_revision,
+            turn_revision,
             effect_id: &descriptor.effect_id,
             attempt: descriptor.attempt,
             precondition: descriptor.input.get("precondition").and_then(Value::as_str),
@@ -2129,8 +2137,8 @@ impl EngineHandle {
             .prepare_for_engine(&invocation)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         let policy = match decision {
-            policy::PolicyDecision::Allow => ThreadEffectPolicy::Allow,
-            policy::PolicyDecision::Ask => ThreadEffectPolicy::Ask,
+            policy::PolicyDecision::Allow => SessionEffectPolicy::Allow,
+            policy::PolicyDecision::Ask => SessionEffectPolicy::Ask,
             policy::PolicyDecision::Deny => {
                 return Err(StorageError::InvalidData(
                     "tool policy denied operation".into(),
@@ -2140,8 +2148,8 @@ impl EngineHandle {
         Ok((policy, digest))
     }
     /// Persists a new queued run.
-    pub fn create_run(&self, run_id: RunId, now_ms: u64) -> Result<RunState, StorageError> {
-        let state = RunState::queued(run_id);
+    pub fn create_turn(&self, turn_id: TurnId, now_ms: u64) -> Result<TurnState, StorageError> {
+        let state = TurnState::queued(turn_id);
         let baseline = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
@@ -2150,48 +2158,48 @@ impl EngineHandle {
         Ok(state)
     }
     /// Reads one durable run projection.
-    pub fn show(&self, run_id: RunId) -> Result<RunState, StorageError> {
-        self.storage.load_run(run_id)
+    pub fn show(&self, turn_id: TurnId) -> Result<TurnState, StorageError> {
+        self.storage.load_turn(turn_id)
     }
     /// Lists durable run projections.
-    pub fn list(&self) -> Result<Vec<RunState>, StorageError> {
+    pub fn list(&self) -> Result<Vec<TurnState>, StorageError> {
         self.storage.list_runs()
     }
     /// Applies one core-validated transition and emits its canonical event atomically.
     pub fn apply_transition(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         transition: latte_core::Transition,
         now_ms: u64,
         lease: &Lease,
-    ) -> Result<RunState, StorageError> {
-        self.reject_linked_run(run_id)?;
+    ) -> Result<TurnState, StorageError> {
+        self.reject_linked_turn(turn_id)?;
         if matches!(transition, Transition::Complete { .. }) {
             return Err(StorageError::InvalidData(
-                "Complete is engine-owned; use complete_verified_run".into(),
+                "Complete is engine-owned; use complete_verified_turn".into(),
             ));
         }
         let (next, stored) =
             self.storage
-                .apply_transition(run_id, expected_revision, transition, now_ms, lease)?;
+                .apply_transition(turn_id, expected_revision, transition, now_ms, lease)?;
         let _ = self.events.send(stored.envelope);
         Ok(next)
     }
     /// Completes only from engine-recorded passing verification at this exact revision.
-    pub fn complete_verified_run(
+    pub fn complete_verified_turn(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         summary: String,
         now_ms: u64,
-    ) -> Result<RunState, StorageError> {
+    ) -> Result<TurnState, StorageError> {
         let _operation = self.operation_permit();
-        self.reject_linked_run(run_id)?;
+        self.reject_linked_turn(turn_id)?;
         let (manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
         let (next, stored) = self.storage.complete_verified(
-            run_id,
+            turn_id,
             expected_revision,
             lease,
             summary,
@@ -2203,17 +2211,17 @@ impl EngineHandle {
         Ok(next)
     }
     /// Atomically cancels a run that is blocked on input or permission.
-    pub fn cancel_waiting_run(
+    pub fn cancel_waiting_turn(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<RunState, StorageError> {
-        self.reject_linked_run(run_id)?;
+    ) -> Result<TurnState, StorageError> {
+        self.reject_linked_turn(turn_id)?;
         let (state, event) =
             self.storage
-                .cancel_waiting(run_id, expected_revision, lease, now_ms, false)?;
+                .cancel_waiting(turn_id, expected_revision, lease, now_ms, false)?;
         if let Some(event) = event {
             let _ = self.events.send(event.envelope);
         }
@@ -2222,15 +2230,15 @@ impl EngineHandle {
     /// Atomically denies a waiting permission without constructing a provider.
     pub fn deny_waiting_permission(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<RunState, StorageError> {
-        self.reject_linked_run(run_id)?;
+    ) -> Result<TurnState, StorageError> {
+        self.reject_linked_turn(turn_id)?;
         let (state, event) =
             self.storage
-                .cancel_waiting(run_id, expected_revision, lease, now_ms, true)?;
+                .cancel_waiting(turn_id, expected_revision, lease, now_ms, true)?;
         if let Some(event) = event {
             let _ = self.events.send(event.envelope);
         }
@@ -2246,24 +2254,25 @@ impl EngineHandle {
         self.storage.acquire_lease(owner, now_ms, ttl_ms)
     }
     /// Acquires the legacy runtime scope and binds it to one exact unlinked run.
-    pub fn acquire_run_lease(
+    pub fn acquire_turn_lease(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         owner: &str,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
         self.storage
-            .acquire_run_lease(run_id, owner, now_ms, ttl_ms)
+            .acquire_turn_lease(turn_id, owner, now_ms, ttl_ms)
     }
     /// Acquires the runtime lease isolated to one durable Session.
-    pub fn acquire_thread_lease(
+    pub fn acquire_session_lease(
         &self,
-        thread_id: ThreadId,
+        session_id: SessionId,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<Lease, StorageError> {
-        self.storage.acquire_thread_lease(thread_id, now_ms, ttl_ms)
+        self.storage
+            .acquire_session_lease(session_id, now_ms, ttl_ms)
     }
     /// Renews a currently valid lease.
     pub fn renew_lease(
@@ -2277,7 +2286,7 @@ impl EngineHandle {
     /// Releases a lease if its fencing token still matches.
     pub fn release_lease(&self, lease: &Lease) -> Result<(), StorageError> {
         if let Some(response) = self.storage.release_lease(lease)? {
-            self.finish_thread_response(response)?;
+            self.finish_session_response(response)?;
         }
         Ok(())
     }
@@ -2286,41 +2295,41 @@ impl EngineHandle {
         self.storage.effect_status(effect_id)
     }
     /// Reads the private durable digest for a v2 prepared effect.  The value
-    /// is returned only to the engine-owned thread coordinator so transcript
+    /// is returned only to the engine-owned session coordinator so transcript
     /// redaction never becomes an approval transport.
-    pub fn thread_effect_digest(&self, effect_id: &str) -> Result<String, StorageError> {
-        self.storage.thread_effect_digest(effect_id)
+    pub fn session_effect_digest(&self, effect_id: &str) -> Result<String, StorageError> {
+        self.storage.session_effect_digest(effect_id)
     }
     /// Lists every unknown effect for a run, including allow-path effects without approval rows.
-    pub fn unknown_effects_for_run(&self, run_id: RunId) -> Result<Vec<String>, StorageError> {
-        self.reject_linked_run(run_id)?;
-        self.storage.unknown_effects_for_run(run_id)
+    pub fn unknown_effects_for_turn(&self, turn_id: TurnId) -> Result<Vec<String>, StorageError> {
+        self.reject_linked_turn(turn_id)?;
+        self.storage.unknown_effects_for_turn(turn_id)
     }
     /// Fences a stale owner and durably interrupts its run after heartbeat loss.
     pub fn interrupt_after_lease_loss(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         stale: &Lease,
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<LeaseLossRecovery, StorageError> {
-        self.reject_linked_run(run_id)?;
+        self.reject_linked_turn(turn_id)?;
         self.storage
-            .interrupt_after_lease_loss(run_id, stale, expected_revision, now_ms)
+            .interrupt_after_lease_loss(turn_id, stale, expected_revision, now_ms)
     }
     /// Atomically reconciles one run-owned unknown effect and aborts that exact run.
     #[cfg(test)]
     pub fn resolve_unknown_effect_and_abort(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         effect_id: &str,
         expected_revision: u64,
         lease: &Lease,
         now_ms: u64,
-    ) -> Result<RunState, StorageError> {
-        self.reject_linked_run(run_id)?;
+    ) -> Result<TurnState, StorageError> {
+        self.reject_linked_turn(turn_id)?;
         self.storage.reconcile_unknown_and_abort(
-            run_id,
+            turn_id,
             effect_id,
             expected_revision,
             lease,
@@ -2330,34 +2339,40 @@ impl EngineHandle {
     /// Persists renderer-neutral runtime state under fenced run authority.
     pub fn persist_runtime_checkpoint(
         &self,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         payload_json: &str,
         now_ms: u64,
     ) -> Result<(), StorageError> {
-        self.reject_linked_run(run_id)?;
+        self.reject_linked_turn(turn_id)?;
         self.storage
-            .put_checkpoint(run_id, expected_revision, lease, payload_json, now_ms)
+            .put_checkpoint(turn_id, expected_revision, lease, payload_json, now_ms)
     }
     /// Loads renderer-neutral agent runtime state.
-    pub fn runtime_checkpoint(&self, run_id: RunId) -> Result<Option<String>, StorageError> {
-        self.reject_linked_run(run_id)?;
-        self.storage.checkpoint(run_id)
+    pub fn runtime_checkpoint(&self, turn_id: TurnId) -> Result<Option<String>, StorageError> {
+        self.reject_linked_turn(turn_id)?;
+        self.storage.checkpoint(turn_id)
     }
     /// Validates a durable permission without consuming it or starting the effect.
     pub fn permission_matches(
         &self,
         effect_id: &str,
-        run_id: RunId,
+        turn_id: TurnId,
         expected_revision: u64,
         lease: &Lease,
         digest: &str,
         now_ms: u64,
     ) -> Result<bool, StorageError> {
-        self.reject_linked_run(run_id)?;
-        self.storage
-            .permission_matches(effect_id, run_id, expected_revision, lease, digest, now_ms)
+        self.reject_linked_turn(turn_id)?;
+        self.storage.permission_matches(
+            effect_id,
+            turn_id,
+            expected_revision,
+            lease,
+            digest,
+            now_ms,
+        )
     }
 }
 /// Event subscription.
@@ -2366,15 +2381,15 @@ pub struct Subscription {
     receiver: broadcast::Receiver<EventEnvelope>,
 }
 
-/// V2 thread event subscription. It intentionally shares the same lag/closed
+/// V2 session event subscription. It intentionally shares the same lag/closed
 /// semantics as the legacy run stream while carrying only v2 envelopes.
 #[derive(Debug)]
-pub struct ThreadSubscription {
-    receiver: broadcast::Receiver<ThreadEventEnvelope>,
+pub struct SessionSubscription {
+    receiver: broadcast::Receiver<SessionEventEnvelope>,
 }
-impl ThreadSubscription {
+impl SessionSubscription {
     /// Polls without blocking a terminal renderer.
-    pub fn try_recv(&mut self) -> Result<Option<ThreadEventEnvelope>, SubscriptionError> {
+    pub fn try_recv(&mut self) -> Result<Option<SessionEventEnvelope>, SubscriptionError> {
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(broadcast::error::TryRecvError::Empty) => Ok(None),
@@ -2384,8 +2399,8 @@ impl ThreadSubscription {
             }
         }
     }
-    /// Receives the next thread event.
-    pub async fn recv(&mut self) -> Result<ThreadEventEnvelope, SubscriptionError> {
+    /// Receives the next session event.
+    pub async fn recv(&mut self) -> Result<SessionEventEnvelope, SubscriptionError> {
         self.receiver.recv().await.map_err(|error| match error {
             broadcast::error::RecvError::Closed => SubscriptionError::Closed,
             broadcast::error::RecvError::Lagged(count) => SubscriptionError::Lagged(count),
@@ -2499,12 +2514,12 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         engine
-            .create_thread_v2(
-                thread_id,
-                RunId::from_uuid(ids.next_uuid_v7()),
-                test_thread_binding(),
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
                 "authoritative JSONL",
                 1,
             )
@@ -2512,8 +2527,8 @@ mod tool_effect_tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         let pending: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM conversation_outbox WHERE thread_id=?1",
-                [thread_id.to_string()],
+                "SELECT COUNT(*) FROM conversation_outbox WHERE session_id=?1",
+                [session_id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2524,19 +2539,19 @@ mod tool_effect_tests {
             .unwrap()
             .unwrap()
             .path();
-        let path = workspace_dir.join(format!("{thread_id}.jsonl"));
+        let path = workspace_dir.join(format!("{session_id}.jsonl"));
         let jsonl = std::fs::read_to_string(&path)
             .unwrap()
             .replace("authoritative JSONL", "JSONL only");
         std::fs::write(path, jsonl).unwrap();
-        let snapshot = engine.thread_snapshot_v2(thread_id, None, 10).unwrap();
+        let snapshot = engine.session_snapshot_v2(session_id, None, 10).unwrap();
         assert_eq!(snapshot.transcript.entries[0].text, "JSONL only");
-        let tail = engine.thread_snapshot_tail_v2(thread_id, 1).unwrap();
+        let tail = engine.session_snapshot_tail_v2(session_id, 1).unwrap();
         assert_eq!(tail.transcript.entries[0].text, "JSONL only");
         assert!(!tail.transcript.has_more);
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let workspace_sessions = engine
-            .list_threads_v2_for_workspace(canonical_root.to_str().unwrap())
+            .list_sessions_for_workspace(canonical_root.to_str().unwrap())
             .unwrap();
         assert_eq!(workspace_sessions.len(), 1);
         assert_eq!(
@@ -2545,7 +2560,7 @@ mod tool_effect_tests {
         );
         assert!(
             engine
-                .list_threads_v2_for_workspace("/foreign/workspace")
+                .list_sessions_for_workspace("/foreign/workspace")
                 .unwrap()
                 .is_empty()
         );
@@ -2563,68 +2578,68 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let source = ThreadId::from_uuid(ids.next_uuid_v7());
+        let source = SessionId::from_uuid(ids.next_uuid_v7());
         engine
-            .create_thread_v2(
+            .create_session_v2(
                 source,
-                RunId::from_uuid(ids.next_uuid_v7()),
-                test_thread_binding(),
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
                 "source prompt",
                 1,
             )
             .unwrap();
         let renamed = engine
-            .rename_thread_session_v2(source, "  durable work  ")
+            .rename_session_v2(source, "  durable work  ")
             .unwrap();
         assert_eq!(renamed.title, "durable work");
-        let found = engine.search_thread_sessions_v2("durable", 10).unwrap();
+        let found = engine.search_sessions("durable", 10).unwrap();
         assert_eq!(
-            found.iter().map(|item| item.thread_id).collect::<Vec<_>>(),
+            found.iter().map(|item| item.session_id).collect::<Vec<_>>(),
             vec![source]
         );
 
-        let fork = ThreadId::from_uuid(ids.next_uuid_v7());
+        let fork = SessionId::from_uuid(ids.next_uuid_v7());
         let forked = engine
-            .fork_thread_session_v2(source, fork, Some("safe branch"), 2)
+            .fork_session_v2(source, fork, Some("safe branch"), 2)
             .unwrap();
-        assert_eq!(forked.thread_id, fork);
-        assert!(forked.runs.is_empty());
-        let fork_metadata = engine.thread_session_v2(fork).unwrap().unwrap();
-        assert_eq!(fork_metadata.parent_thread_id, Some(source));
-        assert_eq!(forked.transcript.entries[0].run_id, None);
+        assert_eq!(forked.session_id, fork);
+        assert!(forked.turns.is_empty());
+        let fork_metadata = engine.session_v2(fork).unwrap().unwrap();
+        assert_eq!(fork_metadata.parent_session_id, Some(source));
+        assert_eq!(forked.transcript.entries[0].turn_id, None);
 
-        let runnable_fork = ThreadId::from_uuid(ids.next_uuid_v7());
+        let runnable_fork = SessionId::from_uuid(ids.next_uuid_v7());
         let runnable = engine
-            .fork_thread_session_v2(source, runnable_fork, None, 2)
+            .fork_session_v2(source, runnable_fork, None, 2)
             .unwrap();
         let first_child = engine
-            .create_thread_follow_up_v2(
+            .create_session_follow_up_v2(
                 runnable_fork,
-                RunId::from_uuid(ids.next_uuid_v7()),
+                TurnId::from_uuid(ids.next_uuid_v7()),
                 runnable.revision,
                 "first fork prompt",
                 3,
             )
             .unwrap();
-        assert_eq!(first_child.runs.len(), 1);
-        assert_eq!(first_child.runs[0].parent_run_id, None);
+        assert_eq!(first_child.turns.len(), 1);
+        assert_eq!(first_child.turns[0].parent_turn_id, None);
 
         assert_eq!(
-            engine.search_thread_sessions_v2("safe branch", 10).unwrap()[0].thread_id,
+            engine.search_sessions("safe branch", 10).unwrap()[0].session_id,
             fork
         );
-        assert!(engine.search_thread_sessions_v2("", 0).unwrap().is_empty());
+        assert!(engine.search_sessions("", 0).unwrap().is_empty());
         assert!(
             engine
-                .search_thread_sessions_v2("durable", 10)
+                .search_sessions("durable", 10)
                 .unwrap()
                 .iter()
-                .any(|session| session.thread_id == source)
+                .any(|session| session.session_id == source)
         );
-        assert!(engine.rename_thread_session_v2(source, "   ").is_err());
+        assert!(engine.rename_session_v2(source, "   ").is_err());
         assert!(
             engine
-                .fork_thread_session_v2(source, source, Some("duplicate"), 4)
+                .fork_session_v2(source, source, Some("duplicate"), 4)
                 .is_err()
         );
 
@@ -2632,21 +2647,21 @@ mod tool_effect_tests {
             .workspace_root(root.path())
             .build()
             .unwrap();
-        let memory_thread = ThreadId::from_uuid(ids.next_uuid_v7());
+        let memory_session = SessionId::from_uuid(ids.next_uuid_v7());
         memory_only
-            .create_thread_v2(
-                memory_thread,
-                RunId::from_uuid(ids.next_uuid_v7()),
-                test_thread_binding(),
+            .create_session_v2(
+                memory_session,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
                 "memory only",
                 5,
             )
             .unwrap();
         assert!(
             memory_only
-                .fork_thread_session_v2(
-                    memory_thread,
-                    ThreadId::from_uuid(ids.next_uuid_v7()),
+                .fork_session_v2(
+                    memory_session,
+                    SessionId::from_uuid(ids.next_uuid_v7()),
                     None,
                     6,
                 )
@@ -2660,7 +2675,7 @@ mod tool_effect_tests {
         let database = root.path().join("state.db");
         let conversations = root.path().join("sessions");
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         {
             let engine = EngineBuilder::new()
                 .workspace_root(root.path())
@@ -2668,10 +2683,10 @@ mod tool_effect_tests {
                 .build()
                 .unwrap();
             engine
-                .create_thread_v2(
-                    thread_id,
-                    RunId::from_uuid(ids.next_uuid_v7()),
-                    test_thread_binding(),
+                .create_session_v2(
+                    session_id,
+                    TurnId::from_uuid(ids.next_uuid_v7()),
+                    test_session_binding(),
                     "survives restart",
                     1,
                 )
@@ -2685,7 +2700,7 @@ mod tool_effect_tests {
             .unwrap();
         assert_eq!(
             engine
-                .thread_snapshot_v2(thread_id, None, 10)
+                .session_snapshot_v2(session_id, None, 10)
                 .unwrap()
                 .transcript
                 .entries[0]
@@ -2708,22 +2723,26 @@ mod tool_effect_tests {
         let global_database = root.path().join("global.db");
         let conversations = root.path().join("sessions");
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         let legacy = EngineBuilder::new()
             .workspace_root(root.path())
             .database_path(&legacy_database)
             .build()
             .unwrap();
         legacy
-            .create_thread_v2(
-                thread_id,
-                RunId::from_uuid(ids.next_uuid_v7()),
-                test_thread_binding(),
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
                 "import me",
                 1,
             )
             .unwrap();
         drop(legacy);
+        // Legacy import consumes a pre-13 database; present that historical
+        // layout before snapshotting the source bytes (import itself must not
+        // touch the source, which the byte-equality assertion below pins).
+        storage::downgrade_database_to_v12_for_legacy_fixture(&legacy_database);
         let source_before = std::fs::read(&legacy_database).unwrap();
         let global = EngineBuilder::new()
             .workspace_root(root.path())
@@ -2750,7 +2769,7 @@ mod tool_effect_tests {
         assert_eq!(std::fs::read(&legacy_database).unwrap(), source_before);
         assert_eq!(
             global
-                .thread_snapshot_v2(thread_id, None, 10)
+                .session_snapshot_v2(session_id, None, 10)
                 .unwrap()
                 .transcript
                 .entries[0]
@@ -2766,8 +2785,8 @@ mod tool_effect_tests {
         );
     }
 
-    fn descriptor(name: &str, input: Value) -> ThreadEffectDescriptor {
-        ThreadEffectDescriptor {
+    fn descriptor(name: &str, input: Value) -> SessionEffectDescriptor {
+        SessionEffectDescriptor {
             effect_id: format!("effect-{name}"),
             tool_call_id: format!("call-{name}"),
             name: name.into(),
@@ -2776,8 +2795,8 @@ mod tool_effect_tests {
         }
     }
 
-    fn test_thread_binding() -> ThreadProviderBindingV2 {
-        ThreadProviderBindingV2 {
+    fn test_session_binding() -> SessionProviderBinding {
+        SessionProviderBinding {
             version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
@@ -2798,12 +2817,12 @@ mod tool_effect_tests {
             "write_file",
             json!({"path":"safe.txt","content":"ok","create_intent":false}),
         );
-        assert!(validate_thread_effect_descriptor(&valid).is_ok());
+        assert!(validate_session_effect_descriptor(&valid).is_ok());
         let checkpoint =
-            thread_effect_checkpoint("prepared", &valid, "authorization=Bearer live-secret-value");
+            session_effect_checkpoint("prepared", &valid, "authorization=Bearer live-secret-value");
         assert!(checkpoint.contains("prepared"));
         assert!(!checkpoint.contains("live-secret-value"));
-        let presentation = ThreadEffectPresentation::from_descriptor(&ThreadEffectDescriptor {
+        let presentation = SessionEffectPresentation::from_descriptor(&SessionEffectDescriptor {
             input: json!({"token":"live-secret-value","path":"safe.txt"}),
             ..valid.clone()
         });
@@ -2811,29 +2830,29 @@ mod tool_effect_tests {
         assert_ne!(presentation.input["token"], "live-secret-value");
 
         for invalid in [
-            ThreadEffectDescriptor {
+            SessionEffectDescriptor {
                 effect_id: String::new(),
                 ..valid.clone()
             },
-            ThreadEffectDescriptor {
+            SessionEffectDescriptor {
                 name: "bad\nname".into(),
                 ..valid.clone()
             },
-            ThreadEffectDescriptor {
+            SessionEffectDescriptor {
                 tool_call_id: "bad id".into(),
                 ..valid.clone()
             },
-            ThreadEffectDescriptor {
+            SessionEffectDescriptor {
                 attempt: 0,
                 ..valid.clone()
             },
-            ThreadEffectDescriptor {
+            SessionEffectDescriptor {
                 input: json!([]),
                 ..valid.clone()
             },
         ] {
             assert!(matches!(
-                validate_thread_effect_descriptor(&invalid),
+                validate_session_effect_descriptor(&invalid),
                 Err(StorageError::InvalidData(_))
             ));
         }
@@ -2872,7 +2891,7 @@ mod tool_effect_tests {
             ),
         ];
         for (descriptor, expected) in cases {
-            let summary = thread_effect_permission_summary(&descriptor);
+            let summary = session_effect_permission_summary(&descriptor);
             assert!(summary.contains(expected), "summary={summary}");
             assert!(summary.len() <= PERMISSION_SUMMARY_CAP + '…'.len_utf8());
             assert!(!summary.chars().any(char::is_control));
@@ -2886,7 +2905,7 @@ mod tool_effect_tests {
 
     #[test]
     fn permission_summaries_show_operation_context_without_values_or_controls() {
-        let write = ThreadEffectDescriptor {
+        let write = SessionEffectDescriptor {
             effect_id: "write".into(),
             tool_call_id: "call-write".into(),
             name: "write_file".into(),
@@ -2897,14 +2916,14 @@ mod tool_effect_tests {
             }),
             attempt: 1,
         };
-        let write_summary = thread_effect_permission_summary(&write);
+        let write_summary = session_effect_permission_summary(&write);
         assert!(write_summary.contains("Write src/generated.rs"));
         assert!(write_summary.contains("create or replace"));
         assert!(write_summary.contains("bytes of content"));
         assert!(!write_summary.contains("live-secret-value"));
         assert!(!write_summary.contains("token=value"));
 
-        let process = ThreadEffectDescriptor {
+        let process = SessionEffectDescriptor {
             effect_id: "process".into(),
             tool_call_id: "call-process".into(),
             name: "process".into(),
@@ -2914,7 +2933,7 @@ mod tool_effect_tests {
             }),
             attempt: 1,
         };
-        let process_summary = thread_effect_permission_summary(&process);
+        let process_summary = session_effect_permission_summary(&process);
         assert!(process_summary.contains("Run argv: cargo test"));
         assert!(process_summary.contains("cwd: crates/latte-engine"));
         assert!(!process_summary.contains("live-secret-value"));
@@ -2928,7 +2947,7 @@ mod tool_effect_tests {
             "execute_tool",
             "reissue_tool_permission",
             "apply_transition",
-            "complete_verified_run",
+            "complete_verified_turn",
             "resolve_unknown_effect_and_abort",
             "persist_runtime_checkpoint",
         ] {
@@ -2943,8 +2962,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let running = engine
             .apply_transition(run, 0, latte_core::Transition::Start, 3, &lease)
@@ -2983,14 +3002,14 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let running = engine
             .apply_transition(run, 0, Transition::Start, 3, &lease)
             .unwrap();
         assert!(matches!(
-            engine.cancel_waiting_run(run, running.revision, &lease, 4),
+            engine.cancel_waiting_turn(run, running.revision, &lease, 4),
             Err(StorageError::InvalidData(_))
         ));
         let waiting = engine
@@ -3009,18 +3028,18 @@ mod tool_effect_tests {
             .persist_runtime_checkpoint(run, waiting.revision, &lease, "{}", 5)
             .unwrap();
         assert!(matches!(
-            engine.cancel_waiting_run(run, 0, &lease, 6),
+            engine.cancel_waiting_turn(run, 0, &lease, 6),
             Err(StorageError::StaleRevision { .. })
         ));
         let fresh = engine.acquire_lease("fresh", 200, 100).unwrap();
         assert!(matches!(
-            engine.cancel_waiting_run(run, waiting.revision, &lease, 201),
+            engine.cancel_waiting_turn(run, waiting.revision, &lease, 201),
             Err(StorageError::LeaseLost)
         ));
         let cancelled = engine
-            .cancel_waiting_run(run, waiting.revision, &fresh, 201)
+            .cancel_waiting_turn(run, waiting.revision, &fresh, 201)
             .unwrap();
-        assert_eq!(cancelled.status, latte_core::RunStatus::Failed);
+        assert_eq!(cancelled.status, latte_core::TurnStatus::Failed);
         assert_eq!(
             cancelled.failure.as_ref().unwrap().code,
             latte_core::FailureCode::Cancelled
@@ -3029,7 +3048,7 @@ mod tool_effect_tests {
         assert!(engine.runtime_checkpoint(run).unwrap().is_none());
         assert_eq!(
             engine
-                .cancel_waiting_run(run, cancelled.revision, &fresh, 202)
+                .cancel_waiting_turn(run, cancelled.revision, &fresh, 202)
                 .unwrap(),
             cancelled
         );
@@ -3043,8 +3062,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let running = engine
             .apply_transition(run, 0, Transition::Start, 3, &lease)
@@ -3060,7 +3079,7 @@ mod tool_effect_tests {
             grace_ms: 10,
             stdout_cap: 1024,
             stderr_cap: 1024,
-            run_revision: running.revision + 2,
+            turn_revision: running.revision + 2,
             effect_id: "cancel-effect",
             attempt: 1,
             approval_digest: None,
@@ -3089,7 +3108,7 @@ mod tool_effect_tests {
             )
             .unwrap();
         let cancelled = engine
-            .cancel_waiting_run(run, waiting.revision, &lease, 6)
+            .cancel_waiting_turn(run, waiting.revision, &lease, 6)
             .unwrap();
         assert_eq!(
             cancelled.failure.unwrap().code,
@@ -3117,8 +3136,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let running = engine
             .apply_transition(run, 0, Transition::Start, 3, &lease)
@@ -3126,7 +3145,7 @@ mod tool_effect_tests {
 
         assert!(
             engine
-                .complete_verified_run(run, running.revision, &lease, "no proof".into(), 4)
+                .complete_verified_turn(run, running.revision, &lease, "no proof".into(), 4)
                 .unwrap_err()
                 .to_string()
                 .contains("missing current")
@@ -3148,7 +3167,7 @@ mod tool_effect_tests {
             grace_ms: 10,
             stdout_cap: 1024,
             stderr_cap: 1024,
-            run_revision: running.revision,
+            turn_revision: running.revision,
             effect_id: "failed-verification",
             attempt: 1,
             approval_digest: None,
@@ -3169,7 +3188,7 @@ mod tool_effect_tests {
         assert!(!output.command_succeeded());
         assert!(
             engine
-                .complete_verified_run(run, running.revision, &lease, "failed".into(), 6)
+                .complete_verified_turn(run, running.revision, &lease, "failed".into(), 6)
                 .unwrap_err()
                 .to_string()
                 .contains("verification failed")
@@ -3195,14 +3214,14 @@ mod tool_effect_tests {
         std::fs::write(dir.path().join("external.txt"), "changed outside engine").unwrap();
         assert!(
             engine
-                .complete_verified_run(run, running.revision, &lease, "changed".into(), 8)
+                .complete_verified_turn(run, running.revision, &lease, "changed".into(), 8)
                 .unwrap_err()
                 .to_string()
                 .contains("workspace changed")
         );
         std::fs::remove_file(dir.path().join("external.txt")).unwrap();
         assert!(matches!(
-            engine.complete_verified_run(run, running.revision + 1, &lease, "stale".into(), 9),
+            engine.complete_verified_turn(run, running.revision + 1, &lease, "stale".into(), 9),
             Err(StorageError::StaleRevision { .. })
         ));
         let argv = vec![
@@ -3229,7 +3248,7 @@ mod tool_effect_tests {
             .unwrap();
         assert!(
             engine
-                .complete_verified_run(run, running.revision, &lease, "newer failed".into(), 11)
+                .complete_verified_turn(run, running.revision, &lease, "newer failed".into(), 11)
                 .unwrap_err()
                 .to_string()
                 .contains("verification failed")
@@ -3268,7 +3287,7 @@ mod tool_effect_tests {
             });
             assert!(
                 engine
-                    .complete_verified_run(run, running.revision, &lease, "raced".into(), now + 1)
+                    .complete_verified_turn(run, running.revision, &lease, "raced".into(), now + 1)
                     .is_err()
             );
             engine.set_completion_hook(|_| {});
@@ -3299,7 +3318,13 @@ mod tool_effect_tests {
             symlink("link-b", dir.path().join("topology-link")).unwrap();
             assert!(
                 engine
-                    .complete_verified_run(run, running.revision, &lease, "swapped link".into(), 30)
+                    .complete_verified_turn(
+                        run,
+                        running.revision,
+                        &lease,
+                        "swapped link".into(),
+                        30
+                    )
                     .is_err()
             );
         }
@@ -3320,9 +3345,9 @@ mod tool_effect_tests {
             .await
             .unwrap();
         let completed = engine
-            .complete_verified_run(run, running.revision, &lease, "done".into(), 32)
+            .complete_verified_turn(run, running.revision, &lease, "done".into(), 32)
             .unwrap();
-        assert_eq!(completed.status, latte_core::RunStatus::Completed);
+        assert_eq!(completed.status, latte_core::TurnStatus::Completed);
         let handoff = completed.handoff.unwrap();
         assert_eq!(handoff.summary, "done");
         assert_eq!(
@@ -3337,19 +3362,19 @@ mod tool_effect_tests {
         let db = dir.path().join("state.db");
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "old").unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .database_path(&db)
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         let read_input = json!({"path":"a.txt"});
         let read = ToolInvocation {
             name: "read_file",
             input: &read_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "read",
             attempt: 1,
             precondition: None,
@@ -3365,7 +3390,7 @@ mod tool_effect_tests {
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "write",
             attempt: 1,
             precondition: Some(&hash),
@@ -3413,18 +3438,18 @@ mod tool_effect_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "old").unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        engine.create_run(run, 1).unwrap();
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let read_input = json!({"path":"a.txt"});
         let read = ToolInvocation {
             name: "read_file",
             input: &read_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "read-u",
             attempt: 1,
             precondition: None,
@@ -3442,7 +3467,7 @@ mod tool_effect_tests {
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "unsupported",
             attempt: 1,
             precondition: Some(&hash),
@@ -3510,12 +3535,12 @@ mod tool_effect_tests {
         assert!(engine.changed_files().is_err());
 
         let ids = SystemIdSource::default();
-        let run = RunId::from_uuid(ids.next_uuid_v7());
+        let run = TurnId::from_uuid(ids.next_uuid_v7());
         assert_eq!(
-            engine.create_run(run, 1).unwrap().status,
-            latte_core::RunStatus::Queued
+            engine.create_turn(run, 1).unwrap().status,
+            latte_core::TurnStatus::Queued
         );
-        assert_eq!(engine.show(run).unwrap().run_id, run);
+        assert_eq!(engine.show(run).unwrap().turn_id, run);
         assert_eq!(engine.list().unwrap().len(), 1);
 
         let lease = engine.acquire_lease("owner-a", 2, 5).unwrap();
@@ -3535,8 +3560,8 @@ mod tool_effect_tests {
         let running = engine
             .apply_transition(run, 0, Transition::Start, 6, &renewed)
             .unwrap();
-        assert_eq!(running.status, latte_core::RunStatus::Running);
-        assert_eq!(events.try_recv().unwrap().unwrap().run_id, run);
+        assert_eq!(running.status, latte_core::TurnStatus::Running);
+        assert_eq!(events.try_recv().unwrap().unwrap().turn_id, run);
         assert!(events.try_recv().unwrap().is_none());
         engine
             .persist_runtime_checkpoint(
@@ -3561,7 +3586,7 @@ mod tool_effect_tests {
             ),
             Err(StorageError::LeaseLost)
         ));
-        assert!(engine.unknown_effects_for_run(run).unwrap().is_empty());
+        assert!(engine.unknown_effects_for_turn(run).unwrap().is_empty());
         assert!(engine.effect_status("missing-effect").is_err());
         assert!(
             !engine
@@ -3576,7 +3601,7 @@ mod tool_effect_tests {
                 .unwrap()
         );
         assert!(matches!(
-            engine.cancel_waiting_run(run, running.revision, &renewed, 9),
+            engine.cancel_waiting_turn(run, running.revision, &renewed, 9),
             Err(StorageError::InvalidData(_))
         ));
         assert!(matches!(
@@ -3603,7 +3628,7 @@ mod tool_effect_tests {
             .unwrap();
         let interrupted_revision = match interrupted {
             LeaseLossRecovery::Interrupted(state) => {
-                assert_eq!(state.status, latte_core::RunStatus::Interrupted);
+                assert_eq!(state.status, latte_core::TurnStatus::Interrupted);
                 state.revision
             }
             other => panic!("expected interruption, got {other:?}"),
@@ -3619,7 +3644,7 @@ mod tool_effect_tests {
                 .interrupt_after_lease_loss(run, &renewed, interrupted_revision, 18)
                 .unwrap(),
             LeaseLossRecovery::AlreadyTerminal(state)
-                if state.status == latte_core::RunStatus::Interrupted
+                if state.status == latte_core::TurnStatus::Interrupted
         ));
         engine.release_lease(&takeover).unwrap();
         assert!(matches!(
@@ -3636,49 +3661,55 @@ mod tool_effect_tests {
             Err(StorageError::InvalidData(_))
         ));
 
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let linked_run = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let linked_turn = TurnId::from_uuid(ids.next_uuid_v7());
         engine
-            .create_thread_v2(thread_id, linked_run, test_thread_binding(), "linked", 20)
+            .create_session_v2(
+                session_id,
+                linked_turn,
+                test_session_binding(),
+                "linked",
+                20,
+            )
             .unwrap();
         let linked_lease = engine.acquire_lease("linked-owner", 21, 100).unwrap();
         for result in [
-            engine.runtime_checkpoint(linked_run).map(|_| ()),
-            engine.unknown_effects_for_run(linked_run).map(|_| ()),
-            engine.persist_runtime_checkpoint(linked_run, 0, &linked_lease, "{}", 22),
+            engine.runtime_checkpoint(linked_turn).map(|_| ()),
+            engine.unknown_effects_for_turn(linked_turn).map(|_| ()),
+            engine.persist_runtime_checkpoint(linked_turn, 0, &linked_lease, "{}", 22),
             engine
-                .interrupt_after_lease_loss(linked_run, &linked_lease, 0, 22)
+                .interrupt_after_lease_loss(linked_turn, &linked_lease, 0, 22)
                 .map(|_| ()),
             engine
-                .resolve_unknown_effect_and_abort(linked_run, "missing", 0, &linked_lease, 22)
+                .resolve_unknown_effect_and_abort(linked_turn, "missing", 0, &linked_lease, 22)
                 .map(|_| ()),
             engine
-                .cancel_waiting_run(linked_run, 0, &linked_lease, 22)
+                .cancel_waiting_turn(linked_turn, 0, &linked_lease, 22)
                 .map(|_| ()),
             engine
-                .deny_waiting_permission(linked_run, 0, &linked_lease, 22)
+                .deny_waiting_permission(linked_turn, 0, &linked_lease, 22)
                 .map(|_| ()),
         ] {
             assert!(matches!(
                 result,
-                Err(StorageError::LinkedRunRequiresThreadCommit)
+                Err(StorageError::LinkedTurnRequiresSessionCommit)
             ));
         }
         assert!(matches!(
-            engine.apply_transition(linked_run, 0, Transition::Start, 22, &linked_lease),
-            Err(StorageError::LinkedRunRequiresThreadCommit)
+            engine.apply_transition(linked_turn, 0, Transition::Start, 22, &linked_lease),
+            Err(StorageError::LinkedTurnRequiresSessionCommit)
         ));
     }
 
     #[tokio::test]
     async fn recovering_an_expired_lease_broadcasts_a_wakeup_to_live_subscribers() {
         // The recovery sweeper must not silently recover: a crash leaves an
-        // active run whose lease expires, and an *already-connected* SSE
+        // active turn whose lease expires, and an *already-connected* SSE
         // client must be woken so it refetches the now-terminal snapshot.
         // recover_expired_leases therefore has to broadcast the committed
-        // thread event, not just mutate the row. This proves the engine-level
+        // session event, not just mutate the row. This proves the engine-level
         // half of that contract (the server bridge turns the event into an SSE
-        // ThreadChanged).
+        // SessionChanged).
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
@@ -3686,19 +3717,19 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
 
         // Acquire a lease valid at the create timestamp (epoch 2ms) but whose
         // absolute expiry (epoch 1001ms) is long past against the real wall
         // clock, so a later sweep treats it as an expired crash lease.
-        let lease = engine.acquire_thread_lease(thread_id, 1, 1000).unwrap();
+        let lease = engine.acquire_session_lease(session_id, 1, 1000).unwrap();
         let started = match engine
-            .create_started_thread_v2(
-                &latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
-                thread_id,
-                run_id,
-                test_thread_binding(),
+            .create_started_session_v2(
+                &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                session_id,
+                turn_id,
+                test_session_binding(),
                 "crashed mid-run",
                 &lease,
                 2,
@@ -3708,11 +3739,11 @@ mod tool_effect_tests {
         {
             latte_core::CreateOutcome::Created(s) | latte_core::CreateOutcome::Replayed(s) => s,
         };
-        assert_eq!(started.lifecycle, latte_core::ThreadLifecycle::Running);
+        assert_eq!(started.lifecycle, latte_core::SessionLifecycle::Running);
 
         // Subscribe *before* recovery, mirroring a client that stayed connected
         // across the runner crash.
-        let mut subscription = engine.subscribe_threads();
+        let mut subscription = engine.subscribe_sessions();
         assert!(
             subscription.try_recv().unwrap().is_none(),
             "no event before recovery"
@@ -3720,18 +3751,21 @@ mod tool_effect_tests {
 
         engine.recover_expired_leases().unwrap();
 
-        // The live subscriber is woken with the recovered thread's event.
+        // The live subscriber is woken with the recovered session's event.
         let event = subscription
             .try_recv()
             .expect("recovery must not close the channel")
             .expect("recovery must broadcast a wakeup event");
-        assert_eq!(event.thread_id, thread_id);
+        assert_eq!(event.session_id, session_id);
 
-        // The recovered snapshot is terminal (no active run), so the woken
+        // The recovered snapshot is terminal (no active turn), so the woken
         // client refetches an interrupted session rather than hanging.
-        let snapshot = engine.thread_snapshot_v2(thread_id, None, 100).unwrap();
-        assert_eq!(snapshot.lifecycle, latte_core::ThreadLifecycle::Interrupted);
-        assert!(snapshot.active_run_id.is_none());
+        let snapshot = engine.session_snapshot_v2(session_id, None, 100).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            latte_core::SessionLifecycle::Interrupted
+        );
+        assert!(snapshot.active_turn_id.is_none());
     }
 
     #[tokio::test]
@@ -3744,7 +3778,7 @@ mod tool_effect_tests {
             .database_path(dir.path().join("state.db"))
             .build()
             .unwrap();
-        let mut subscription = engine.subscribe_threads();
+        let mut subscription = engine.subscribe_sessions();
         engine.recover_expired_leases().unwrap();
         assert!(
             subscription.try_recv().unwrap().is_none(),
@@ -3766,17 +3800,17 @@ mod tool_effect_tests {
         assert!(sync_events.try_recv().unwrap().is_none());
         let mut runs = Vec::new();
         for index in 0..40 {
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
             engine
-                .create_run(run_id, u64::try_from(index).unwrap())
+                .create_turn(turn_id, u64::try_from(index).unwrap())
                 .unwrap();
-            runs.push(run_id);
+            runs.push(turn_id);
         }
         let lease = engine.acquire_lease("event-producer", 100, 10_000).unwrap();
-        for (index, run_id) in runs.into_iter().enumerate() {
+        for (index, turn_id) in runs.into_iter().enumerate() {
             engine
                 .apply_transition(
-                    run_id,
+                    turn_id,
                     0,
                     Transition::Start,
                     u64::try_from(index + 101).unwrap(),
@@ -3794,51 +3828,51 @@ mod tool_effect_tests {
         ));
         assert!(sync_events.try_recv().unwrap().is_some());
 
-        let mut sync_threads = engine.subscribe_threads();
-        let mut async_threads = engine.subscribe_threads();
+        let mut sync_sessions = engine.subscribe_sessions();
+        let mut async_sessions = engine.subscribe_sessions();
         for index in 0..70 {
-            let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
             engine
-                .create_thread_v2(
-                    thread_id,
-                    run_id,
-                    test_thread_binding(),
-                    &format!("thread-{index}"),
+                .create_session_v2(
+                    session_id,
+                    turn_id,
+                    test_session_binding(),
+                    &format!("session-{index}"),
                     u64::try_from(index + 1_000).unwrap(),
                 )
                 .unwrap();
-            let thread_lease = engine
-                .acquire_thread_lease(thread_id, u64::try_from(index + 1_500).unwrap(), 10_000)
+            let session_lease = engine
+                .acquire_session_lease(session_id, u64::try_from(index + 1_500).unwrap(), 10_000)
                 .unwrap();
             engine
-                .commit_thread_run_update(
-                    ThreadCommitRequest {
-                        thread_id,
-                        run_id,
-                        expected_thread_revision: 0,
-                        expected_run_revision: 0,
-                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                .commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: 0,
+                        expected_turn_revision: 0,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
                         effect_id: None,
-                        update: CommitThreadRunUpdate::Start {
+                        update: CommitSessionTurnUpdate::Start {
                             source_key: format!("start-{index}"),
                         },
                     },
-                    &thread_lease,
+                    &session_lease,
                     u64::try_from(index + 2_000).unwrap(),
                 )
                 .unwrap();
         }
         assert!(matches!(
-            sync_threads.try_recv(),
+            sync_sessions.try_recv(),
             Err(SubscriptionError::Lagged(count)) if count > 0
         ));
         assert!(matches!(
-            async_threads.recv().await,
+            async_sessions.recv().await,
             Err(SubscriptionError::Lagged(count)) if count > 0
         ));
-        assert!(sync_threads.try_recv().unwrap().is_some());
+        assert!(sync_sessions.try_recv().unwrap().is_some());
 
         let closed = EngineBuilder::new()
             .workspace_root(dir.path())
@@ -3846,8 +3880,8 @@ mod tool_effect_tests {
             .unwrap();
         let mut legacy_events_receiver = closed.subscribe();
         let mut async_events_receiver = closed.subscribe();
-        let mut legacy_threads_receiver = closed.subscribe_threads();
-        let mut async_threads_receiver = closed.subscribe_threads();
+        let mut legacy_sessions_receiver = closed.subscribe_sessions();
+        let mut async_sessions_receiver = closed.subscribe_sessions();
         drop(closed);
         assert_eq!(
             legacy_events_receiver.try_recv(),
@@ -3858,11 +3892,11 @@ mod tool_effect_tests {
             Err(SubscriptionError::Closed)
         );
         assert_eq!(
-            legacy_threads_receiver.try_recv(),
+            legacy_sessions_receiver.try_recv(),
             Err(SubscriptionError::Closed)
         );
         assert_eq!(
-            async_threads_receiver.recv().await,
+            async_sessions_receiver.recv().await,
             Err(SubscriptionError::Closed)
         );
     }
@@ -3883,11 +3917,11 @@ mod tool_effect_tests {
 
         let read = descriptor("read_file", json!({"path":"read.txt"}));
         let (policy, read_digest) = engine
-            .thread_effect_policy_and_digest(&read, 1, &lease)
+            .session_effect_policy_and_digest(&read, 1, &lease)
             .unwrap();
-        assert_eq!(policy, ThreadEffectPolicy::Allow);
+        assert_eq!(policy, SessionEffectPolicy::Allow);
         let observed = engine
-            .execute_started_thread_tool(&read, 1, &read_digest, &lease, &CancellationToken::new())
+            .execute_started_session_tool(&read, 1, &read_digest, &lease, &CancellationToken::new())
             .unwrap();
         assert!(observed.success);
         assert!(observed.result.contains("read-value"));
@@ -3895,37 +3929,37 @@ mod tool_effect_tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
-            engine.execute_started_thread_tool(&read, 1, &read_digest, &lease, &cancelled),
-            Err(ThreadEffectExecutionError::Uncertain(message))
+            engine.execute_started_session_tool(&read, 1, &read_digest, &lease, &cancelled),
+            Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("cancelled")
         ));
         assert!(matches!(
-            engine.execute_started_thread_tool(
+            engine.execute_started_session_tool(
                 &read,
                 1,
                 "wrong-digest",
                 &lease,
                 &CancellationToken::new(),
             ),
-            Err(ThreadEffectExecutionError::Uncertain(message))
+            Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("authorization changed")
         ));
 
         let disappearing = descriptor("read_file", json!({"path":"disappearing.txt"}));
         std::fs::write(dir.path().join("disappearing.txt"), "present").unwrap();
         let (_, disappearing_digest) = engine
-            .thread_effect_policy_and_digest(&disappearing, 1, &lease)
+            .session_effect_policy_and_digest(&disappearing, 1, &lease)
             .unwrap();
         std::fs::remove_file(dir.path().join("disappearing.txt")).unwrap();
         assert!(matches!(
-            engine.execute_started_thread_tool(
+            engine.execute_started_session_tool(
                 &disappearing,
                 1,
                 &disappearing_digest,
                 &lease,
                 &CancellationToken::new(),
             ),
-            Err(ThreadEffectExecutionError::Uncertain(message))
+            Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("precondition changed")
         ));
 
@@ -3940,11 +3974,11 @@ mod tool_effect_tests {
             }),
         );
         let (policy, edit_digest) = engine
-            .thread_effect_policy_and_digest(&edit, 2, &lease)
+            .session_effect_policy_and_digest(&edit, 2, &lease)
             .unwrap();
-        assert_eq!(policy, ThreadEffectPolicy::Ask);
+        assert_eq!(policy, SessionEffectPolicy::Ask);
         let observed_failure = engine
-            .execute_started_thread_tool(&edit, 2, &edit_digest, &lease, &CancellationToken::new())
+            .execute_started_session_tool(&edit, 2, &edit_digest, &lease, &CancellationToken::new())
             .unwrap();
         assert!(!observed_failure.success);
         assert!(observed_failure.result.contains("match"));
@@ -3956,14 +3990,14 @@ mod tool_effect_tests {
             .unwrap();
         assert!(
             denied
-                .thread_effect_policy_and_digest(&edit, 2, &lease)
+                .session_effect_policy_and_digest(&edit, 2, &lease)
                 .unwrap_err()
                 .to_string()
                 .contains("denied")
         );
         let dangerous_process = descriptor("process", json!({"shell":"rm -rf /","cwd":"."}));
         let dangerous_error = engine
-            .thread_effect_policy_and_digest(&dangerous_process, 2, &lease)
+            .session_effect_policy_and_digest(&dangerous_process, 2, &lease)
             .unwrap_err()
             .to_string();
         #[cfg(unix)]
@@ -3974,7 +4008,7 @@ mod tool_effect_tests {
         unsupported.process_supervision_supported = false;
         assert!(
             unsupported
-                .thread_effect_policy_and_digest(
+                .session_effect_policy_and_digest(
                     &descriptor("process", json!({"argv":["/bin/pwd"]})),
                     2,
                     &lease,
@@ -3985,23 +4019,25 @@ mod tool_effect_tests {
         );
 
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "worker", 10)
+            .create_session_v2(session_id, turn_id, test_session_binding(), "worker", 10)
             .unwrap();
-        let lease = engine.acquire_thread_lease(thread_id, 10, 10_000).unwrap();
+        let lease = engine
+            .acquire_session_lease(session_id, 10, 10_000)
+            .unwrap();
         let snapshot = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: snapshot.revision,
-                    expected_run_revision: snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snapshot.revision,
+                    expected_turn_revision: snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionTurnUpdate::Start {
                         source_key: "worker:start".into(),
                     },
                 },
@@ -4010,61 +4046,61 @@ mod tool_effect_tests {
             )
             .unwrap()
             .snapshot;
-        let run_revision = snapshot.runs[0].run_revision;
+        let turn_revision = snapshot.turns[0].turn_revision;
 
         let read = descriptor("read_file", json!({"path":"read.txt"}));
         let (_, read_digest) = engine
-            .thread_effect_policy_and_digest(&read, run_revision, &lease)
+            .session_effect_policy_and_digest(&read, turn_revision, &lease)
             .unwrap();
-        let read_started = ThreadEffectStarted {
+        let read_started = SessionEffectStarted {
             snapshot: snapshot.clone(),
-            presentation: ThreadEffectPresentation::from_descriptor(&read),
+            presentation: SessionEffectPresentation::from_descriptor(&read),
             operation_digest: read_digest,
             descriptor: read,
         };
         assert!(
             engine
-                .execute_started_thread_effect(&read_started, &lease, &CancellationToken::new(),)
+                .execute_started_session_effect(&read_started, &lease, &CancellationToken::new(),)
                 .await
                 .unwrap()
                 .success
         );
         let completion_descriptor = read_started.descriptor.clone();
-        let mut missing_run = read_started.clone();
-        missing_run.snapshot.active_run_id = None;
+        let mut missing_turn = read_started.clone();
+        missing_turn.snapshot.active_turn_id = None;
         assert!(matches!(
             engine
-                .execute_started_thread_effect(
-                    &missing_run,
+                .execute_started_session_effect(
+                    &missing_turn,
                     &lease,
                     &CancellationToken::new(),
                 )
                 .await,
-            Err(ThreadEffectExecutionError::Uncertain(message))
+            Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("started run is missing")
         ));
         let mut stale_digest = read_started;
         stale_digest.operation_digest = "stale".into();
         assert!(matches!(
             engine
-                .execute_started_thread_effect(
+                .execute_started_session_effect(
                     &stale_digest,
                     &lease,
                     &CancellationToken::new(),
                 )
                 .await,
-            Err(ThreadEffectExecutionError::Uncertain(message))
+            Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("exact operation digest")
         ));
 
         let prepared = engine
-            .prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: snapshot.revision,
-                    expected_run_revision: run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snapshot.revision,
+                    expected_turn_revision: turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "worker:prepare-read".into(),
                     descriptor: completion_descriptor,
                 },
@@ -4073,17 +4109,17 @@ mod tool_effect_tests {
             )
             .unwrap();
         assert_eq!(
-            engine.thread_effect_digest("effect-read_file").unwrap(),
+            engine.session_effect_digest("effect-read_file").unwrap(),
             prepared.operation_digest
         );
         let started = engine
-            .start_thread_effect(
-                ThreadEffectStartRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: prepared.snapshot.revision,
-                    expected_run_revision: prepared.snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .start_session_effect(
+                SessionEffectStartRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: prepared.snapshot.revision,
+                    expected_turn_revision: prepared.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "worker:start-read".into(),
                     effect_id: "effect-read_file".into(),
                 },
@@ -4093,7 +4129,7 @@ mod tool_effect_tests {
             )
             .unwrap();
         let value = engine
-            .execute_started_thread_effect(&started, &lease, &CancellationToken::new())
+            .execute_started_session_effect(&started, &lease, &CancellationToken::new())
             .await
             .unwrap();
         let verification = ProcessOutput {
@@ -4105,19 +4141,19 @@ mod tool_effect_tests {
             termination: ProcessTermination::Exited,
         };
         let observed = engine
-            .observe_thread_effect(
+            .observe_session_effect(
                 &started,
                 "worker:observe-read".into(),
-                latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 value,
                 &lease,
                 14,
             )
             .unwrap();
-        let observed_revision = observed.snapshot.runs[0].run_revision;
+        let observed_revision = observed.snapshot.turns[0].turn_revision;
         engine
-            .record_thread_verification(
-                run_id,
+            .record_session_verification(
+                turn_id,
                 observed_revision,
                 "effect-read_file",
                 &verification,
@@ -4126,7 +4162,7 @@ mod tool_effect_tests {
             )
             .unwrap();
         let completed = engine
-            .complete_thread_verified(
+            .complete_session_verified(
                 &observed.snapshot,
                 "verified worker".into(),
                 "effect-read_file".into(),
@@ -4134,23 +4170,23 @@ mod tool_effect_tests {
                 16,
             )
             .unwrap();
-        assert_eq!(completed.lifecycle, latte_core::ThreadLifecycle::Ready);
-        assert_eq!(engine.list_threads_v2().unwrap()[0], completed);
+        assert_eq!(completed.lifecycle, latte_core::SessionLifecycle::Ready);
+        assert_eq!(engine.list_sessions().unwrap()[0], completed);
         assert_eq!(
-            engine.thread_snapshot_v2(thread_id, None, 100).unwrap(),
+            engine.session_snapshot_v2(session_id, None, 100).unwrap(),
             completed
         );
-        let follow_up_run = RunId::from_uuid(ids.next_uuid_v7());
+        let follow_up_run = TurnId::from_uuid(ids.next_uuid_v7());
         let follow_up = engine
-            .create_thread_follow_up_v2(
-                thread_id,
+            .create_session_follow_up_v2(
+                session_id,
                 follow_up_run,
                 completed.revision,
                 "follow up",
                 17,
             )
             .unwrap();
-        assert_eq!(follow_up.active_run_id, Some(follow_up_run));
+        assert_eq!(follow_up.active_turn_id, Some(follow_up_run));
     }
 
     // -- Pure helper coverage ------------------------------------------------
@@ -4250,14 +4286,14 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn run_revision_returns_none_without_active_run() {
-        // The None branch: no active run → None.
-        let snapshot = ThreadSnapshot {
-            thread_id: ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+    fn turn_revision_returns_none_without_active_run() {
+        // The None branch: no active turn → None.
+        let snapshot = SessionSnapshot {
+            session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             revision: 0,
             sequence: 0,
-            lifecycle: latte_core::ThreadLifecycle::Ready,
-            binding: ThreadProviderBindingV2 {
+            lifecycle: latte_core::SessionLifecycle::Ready,
+            binding: SessionProviderBinding {
                 version: 2,
                 provider_name: String::new(),
                 provider_type: String::new(),
@@ -4270,10 +4306,10 @@ mod tool_effect_tests {
                 data_scope_id: String::new(),
                 credential_generation: 0,
             },
-            latest_run_id: None,
-            active_run_id: None,
+            latest_turn_id: None,
+            active_turn_id: None,
             pending: None,
-            runs: vec![],
+            turns: vec![],
             transcript: TranscriptPage {
                 entries: vec![],
                 next_after: None,
@@ -4281,7 +4317,7 @@ mod tool_effect_tests {
             },
             focus: None,
         };
-        assert!(run_revision(&snapshot, "effect-1").is_none());
+        assert!(turn_revision(&snapshot, "effect-1").is_none());
     }
 
     #[test]
@@ -4305,8 +4341,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let hash = engine
             .execute_tool(
@@ -4316,7 +4352,7 @@ mod tool_effect_tests {
                 &ToolInvocation {
                     name: "read_file",
                     input: &json!({"path":"a.txt"}),
-                    run_revision: 0,
+                    turn_revision: 0,
                     effect_id: "read-for-hash",
                     attempt: 1,
                     precondition: None,
@@ -4336,7 +4372,7 @@ mod tool_effect_tests {
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "write-reissue",
             attempt: 1,
             precondition: Some(&hash),
@@ -4381,7 +4417,7 @@ mod tool_effect_tests {
                 &ToolInvocation {
                     name: "read_file",
                     input: &json!({"path":"a.txt"}),
-                    run_revision: 0,
+                    turn_revision: 0,
                     effect_id: "read-reissue",
                     attempt: 1,
                     precondition: None,
@@ -4405,8 +4441,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         // Lease owner mismatch → InvalidApproval.
         assert!(matches!(
@@ -4417,7 +4453,7 @@ mod tool_effect_tests {
                 &ToolInvocation {
                     name: "read_file",
                     input: &json!({"path":"a.txt"}),
-                    run_revision: 0,
+                    turn_revision: 0,
                     effect_id: "read-mismatch",
                     attempt: 1,
                     precondition: None,
@@ -4439,7 +4475,7 @@ mod tool_effect_tests {
                 &ToolInvocation {
                     name: "read_file",
                     input: &json!({"path":"a.txt"}),
-                    run_revision: 0,
+                    turn_revision: 0,
                     effect_id: "read-for-hash-2",
                     attempt: 1,
                     precondition: None,
@@ -4459,7 +4495,7 @@ mod tool_effect_tests {
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "write-wrong-digest",
             attempt: 1,
             precondition: Some(&hash),
@@ -4498,8 +4534,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 10_000).unwrap();
         let hash = engine
             .execute_tool(
@@ -4509,7 +4545,7 @@ mod tool_effect_tests {
                 &ToolInvocation {
                     name: "read_file",
                     input: &json!({"path":"a.txt"}),
-                    run_revision: 0,
+                    turn_revision: 0,
                     effect_id: "read-for-stale",
                     attempt: 1,
                     precondition: None,
@@ -4529,7 +4565,7 @@ mod tool_effect_tests {
         let ask = ToolInvocation {
             name: "write_file",
             input: &write_input,
-            run_revision: 0,
+            turn_revision: 0,
             effect_id: "write-stale",
             attempt: 1,
             precondition: Some(&hash),
@@ -4558,41 +4594,43 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn create_started_thread_v2_snapshot_creates_and_replays() {
+    fn create_started_session_v2_snapshot_creates_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let lease = engine.acquire_thread_lease(thread_id, 1, 10_000).unwrap();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let lease = engine.acquire_session_lease(session_id, 1, 10_000).unwrap();
         // First create via the snapshot convenience wrapper.
         let snapshot = engine
-            .create_started_thread_v2_snapshot(
-                thread_id,
-                run_id,
-                test_thread_binding(),
+            .create_started_session_v2_snapshot(
+                session_id,
+                turn_id,
+                test_session_binding(),
                 "started snapshot",
                 &lease,
                 2,
                 None,
             )
             .unwrap();
-        assert_eq!(snapshot.thread_id, thread_id);
-        assert_eq!(snapshot.active_run_id, Some(run_id));
-        // A second thread exercises the explicit command-id replay path.
-        let thread_id2 = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id2 = RunId::from_uuid(ids.next_uuid_v7());
-        let lease2 = engine.acquire_thread_lease(thread_id2, 3, 10_000).unwrap();
-        let command_id2 = latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7());
+        assert_eq!(snapshot.session_id, session_id);
+        assert_eq!(snapshot.active_turn_id, Some(turn_id));
+        // A second session exercises the explicit command-id replay path.
+        let session_id2 = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id2 = TurnId::from_uuid(ids.next_uuid_v7());
+        let lease2 = engine
+            .acquire_session_lease(session_id2, 3, 10_000)
+            .unwrap();
+        let command_id2 = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
         let created = engine
-            .create_started_thread_v2(
+            .create_started_session_v2(
                 &command_id2,
-                thread_id2,
-                run_id2,
-                test_thread_binding(),
+                session_id2,
+                turn_id2,
+                test_session_binding(),
                 "replay test",
                 &lease2,
                 4,
@@ -4602,11 +4640,11 @@ mod tool_effect_tests {
         assert!(matches!(created, latte_core::CreateOutcome::Created(_)));
         // Replaying the same command id returns the same snapshot.
         let replayed = engine
-            .create_started_thread_v2(
+            .create_started_session_v2(
                 &command_id2,
-                thread_id2,
-                run_id2,
-                test_thread_binding(),
+                session_id2,
+                turn_id2,
+                test_session_binding(),
                 "replay test",
                 &lease2,
                 5,
@@ -4617,36 +4655,36 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn prepare_thread_effect_rejects_invalid_descriptor_and_overflow() {
+    fn prepare_session_effect_rejects_invalid_descriptor_and_overflow() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
-            .create_thread_v2(
-                thread_id,
-                run_id,
-                test_thread_binding(),
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
                 "prepare errors",
                 1,
             )
             .unwrap();
-        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
         let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: snapshot.revision,
-                    expected_run_revision: snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snapshot.revision,
+                    expected_turn_revision: snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionTurnUpdate::Start {
                         source_key: "test:start".into(),
                     },
                 },
@@ -4656,18 +4694,18 @@ mod tool_effect_tests {
             .unwrap()
             .snapshot;
         // Invalid descriptor (empty effect_id) → InvalidData.
-        let invalid = ThreadEffectDescriptor {
+        let invalid = SessionEffectDescriptor {
             effect_id: String::new(),
             ..descriptor("write_file", json!({"path":"x.txt","content":"y"}))
         };
         assert!(matches!(
-            engine.prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: running.revision,
-                    expected_run_revision: running.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            engine.prepare_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: running.revision,
+                    expected_turn_revision: running.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:invalid".into(),
                     descriptor: invalid,
                 },
@@ -4679,13 +4717,13 @@ mod tool_effect_tests {
         // Revision overflow → InvalidData.
         let valid = descriptor("write_file", json!({"path":"x.txt","content":"y"}));
         assert!(matches!(
-            engine.prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: running.revision,
-                    expected_run_revision: u64::MAX,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            engine.prepare_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: running.revision,
+                    expected_turn_revision: u64::MAX,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:overflow".into(),
                     descriptor: valid,
                 },
@@ -4697,7 +4735,7 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn start_thread_effect_rejects_unknown_effect_and_digest_mismatch() {
+    fn start_session_effect_rejects_unknown_effect_and_digest_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
         let engine = EngineBuilder::new()
@@ -4705,23 +4743,29 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "start errors", 1)
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "start errors",
+                1,
+            )
             .unwrap();
-        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
         let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: snapshot.revision,
-                    expected_run_revision: snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snapshot.revision,
+                    expected_turn_revision: snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionTurnUpdate::Start {
                         source_key: "test:start".into(),
                     },
                 },
@@ -4730,16 +4774,16 @@ mod tool_effect_tests {
             )
             .unwrap()
             .snapshot;
-        // Unknown effect → error from thread_effect_canonical_descriptor.
+        // Unknown effect → error from session_effect_canonical_descriptor.
         assert!(
             engine
-                .start_thread_effect(
-                    ThreadEffectStartRequest {
-                        thread_id,
-                        run_id,
-                        expected_thread_revision: running.revision,
-                        expected_run_revision: running.runs[0].run_revision,
-                        command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+                .start_session_effect(
+                    SessionEffectStartRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: running.revision,
+                        expected_turn_revision: running.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         source_key: "test:unknown".into(),
                         effect_id: "effect-nonexistent".into(),
                     },
@@ -4752,13 +4796,13 @@ mod tool_effect_tests {
         // Prepare a real effect, then start with a wrong digest.
         let desc = descriptor("read_file", json!({"path":"read.txt"}));
         let prepared = engine
-            .prepare_thread_effect(
-                ThreadEffectRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: running.revision,
-                    expected_run_revision: running.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: running.revision,
+                    expected_turn_revision: running.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:prepare".into(),
                     descriptor: desc.clone(),
                 },
@@ -4767,13 +4811,13 @@ mod tool_effect_tests {
             )
             .unwrap();
         assert!(matches!(
-            engine.start_thread_effect(
-                ThreadEffectStartRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: prepared.snapshot.revision,
-                    expected_run_revision: prepared.snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            engine.start_session_effect(
+                SessionEffectStartRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: prepared.snapshot.revision,
+                    expected_turn_revision: prepared.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:start-wrong".into(),
                     effect_id: desc.effect_id,
                 },
@@ -4786,7 +4830,7 @@ mod tool_effect_tests {
     }
 
     #[tokio::test]
-    async fn execute_started_thread_effect_rejects_wrong_lease_scope() {
+    async fn execute_started_session_effect_rejects_wrong_lease_scope() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("read.txt"), "read-value").unwrap();
         let engine = EngineBuilder::new()
@@ -4794,23 +4838,29 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "lease scope", 1)
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "lease scope",
+                1,
+            )
             .unwrap();
-        let lease = engine.acquire_thread_lease(thread_id, 2, 10_000).unwrap();
+        let lease = engine.acquire_session_lease(session_id, 2, 10_000).unwrap();
         let running = engine
-            .commit_thread_run_update(
-                ThreadCommitRequest {
-                    thread_id,
-                    run_id,
-                    expected_thread_revision: snapshot.revision,
-                    expected_run_revision: snapshot.runs[0].run_revision,
-                    command_id: latte_core::ThreadCommandId::from_uuid(ids.next_uuid_v7()),
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snapshot.revision,
+                    expected_turn_revision: snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
                     effect_id: None,
-                    update: CommitThreadRunUpdate::Start {
+                    update: CommitSessionTurnUpdate::Start {
                         source_key: "test:start".into(),
                     },
                 },
@@ -4821,26 +4871,30 @@ mod tool_effect_tests {
             .snapshot;
         let desc = descriptor("read_file", json!({"path":"read.txt"}));
         let (_, digest) = engine
-            .thread_effect_policy_and_digest(&desc, running.runs[0].run_revision, &lease)
+            .session_effect_policy_and_digest(&desc, running.turns[0].turn_revision, &lease)
             .unwrap();
-        let started = ThreadEffectStarted {
+        let started = SessionEffectStarted {
             snapshot: running,
-            presentation: ThreadEffectPresentation::from_descriptor(&desc),
+            presentation: SessionEffectPresentation::from_descriptor(&desc),
             operation_digest: digest,
             descriptor: desc,
         };
         // A runtime lease (wrong scope) → Uncertain error.
         let runtime_lease = engine.acquire_lease("other", 4, 10_000).unwrap();
         assert!(matches!(
-            engine
-                .execute_started_thread_effect(&started, &runtime_lease, &CancellationToken::new(),)
-                .await,
-            Err(ThreadEffectExecutionError::Uncertain(_))
-        ));
+                engine
+                    .execute_started_session_effect(
+                        &started,
+                        &runtime_lease,
+                        &CancellationToken::new(),
+                    )
+                    .await,
+                Err(SessionEffectExecutionError::Uncertain(_))
+            ));
     }
 
     #[test]
-    fn engine_sync_thread_conversation_rejects_unknown_thread() {
+    fn engine_sync_session_conversation_rejects_unknown_session() {
         let dir = tempfile::tempdir().unwrap();
         let conversations = dir.path().join("sessions");
         let engine = EngineBuilder::new()
@@ -4848,10 +4902,10 @@ mod tool_effect_tests {
             .conversation_root(&conversations)
             .build()
             .unwrap();
-        let unknown = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let unknown = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         assert!(matches!(
-            engine.sync_thread_conversation(unknown),
-            Err(StorageError::ThreadNotFound(_))
+            engine.sync_session_conversation(unknown),
+            Err(StorageError::SessionNotFound(_))
         ));
     }
 
@@ -4863,8 +4917,8 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
         let lease = engine.acquire_lease("owner", 2, 100).unwrap();
         let running = engine
             .apply_transition(run, 0, Transition::Start, 3, &lease)
@@ -4880,7 +4934,7 @@ mod tool_effect_tests {
             grace_ms: 10,
             stdout_cap: 1024,
             stderr_cap: 1024,
-            run_revision: running.revision + 2,
+            turn_revision: running.revision + 2,
             effect_id: "deny-effect",
             attempt: 1,
             approval_digest: None,
@@ -4918,7 +4972,7 @@ mod tool_effect_tests {
     }
 
     #[test]
-    fn list_threads_v2_returns_local_snapshots() {
+    fn list_sessions_returns_local_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         let conversations = dir.path().join("sessions");
         let engine = EngineBuilder::new()
@@ -4927,22 +4981,22 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "list test", 1)
+            .create_session_v2(session_id, turn_id, test_session_binding(), "list test", 1)
             .unwrap();
-        let all = engine.list_threads_v2().unwrap();
+        let all = engine.list_sessions().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].thread_id, thread_id);
+        assert_eq!(all[0].session_id, session_id);
         let local = engine
-            .list_threads_v2_for_workspace(&engine.workspace_root)
+            .list_sessions_for_workspace(&engine.workspace_root)
             .unwrap();
         assert_eq!(local.len(), 1);
     }
 
     #[test]
-    fn fork_thread_session_v2_creates_ready_fork() {
+    fn fork_session_v2_creates_ready_fork() {
         let dir = tempfile::tempdir().unwrap();
         let conversations = dir.path().join("sessions");
         let engine = EngineBuilder::new()
@@ -4951,17 +5005,23 @@ mod tool_effect_tests {
             .build()
             .unwrap();
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         engine
-            .create_thread_v2(thread_id, run_id, test_thread_binding(), "fork source", 1)
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "fork source",
+                1,
+            )
             .unwrap();
-        let fork_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let fork_id = SessionId::from_uuid(ids.next_uuid_v7());
         let forked = engine
-            .fork_thread_session_v2(thread_id, fork_id, Some("forked title"), 2)
+            .fork_session_v2(session_id, fork_id, Some("forked title"), 2)
             .unwrap();
-        assert_eq!(forked.thread_id, fork_id);
-        assert_eq!(forked.lifecycle, latte_core::ThreadLifecycle::Ready);
+        assert_eq!(forked.session_id, fork_id);
+        assert_eq!(forked.lifecycle, latte_core::SessionLifecycle::Ready);
     }
 
     #[test]
@@ -4971,24 +5031,24 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        engine.create_run(run, 1).unwrap();
-        let lease = engine.acquire_run_lease(run, "owner", 2, 10_000).unwrap();
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        engine.create_turn(run, 1).unwrap();
+        let lease = engine.acquire_turn_lease(run, "owner", 2, 10_000).unwrap();
         assert_eq!(lease.scope, "runtime");
         assert_eq!(lease.owner, "owner");
     }
 
     #[test]
-    fn rename_thread_session_rejects_unknown_thread() {
+    fn rename_session_rejects_unknown_session() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(dir.path())
             .build()
             .unwrap();
-        let unknown = ThreadId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let unknown = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         assert!(matches!(
-            engine.rename_thread_session_v2(unknown, "title"),
-            Err(StorageError::ThreadNotFound(_))
+            engine.rename_session_v2(unknown, "title"),
+            Err(StorageError::SessionNotFound(_))
         ));
     }
 }

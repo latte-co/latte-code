@@ -1,4 +1,4 @@
-//! Transcript-first Thread v2 presentation.
+//! Transcript-first Session v2 presentation.
 //!
 //! This reducer owns only local text, focus, scroll, and a single safe
 //! follow-up queue. It has no provider, repository, or effect authority.
@@ -14,9 +14,9 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use latte_core::{
-    RunId, ThreadEvent, ThreadEventEnvelope, ThreadId, ThreadLifecycle, ThreadPendingRequest,
-    ThreadRunStatus, ThreadSessionSummary, ThreadSnapshot, ThreadTransientProgress,
-    TranscriptEntry, TranscriptKind, redact_thread_text,
+    SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle, SessionPendingRequest,
+    SessionSnapshot, SessionSummary, SessionTransientProgress, SessionTurnStatus, TranscriptEntry,
+    TranscriptKind, TurnId, redact_session_text,
 };
 use ratatui::{
     Frame, Terminal,
@@ -41,16 +41,16 @@ const CTRL_C_DUPLICATE_WINDOW: Duration = Duration::from_millis(120);
 const PROVIDER_SETUP_GUIDANCE: &str = "Provider setup required: configure default_model and providers in ~/.latte/latte-code.jsonc, then restart Latte Code";
 const MODEL_NOT_CONFIGURED: &str = "Not configured";
 
-/// Thread-only projection boundary; snapshots are authoritative after any
+/// Session-only projection boundary; snapshots are authoritative after any
 /// event gap and transient progress must be discarded.
-pub trait ThreadProjectionClient {
-    fn snapshots(&mut self) -> Result<Vec<ThreadSnapshot>, String>;
-    fn session_catalog(&mut self) -> Result<Vec<ThreadSessionSummary>, String> {
+pub trait SessionProjectionClient {
+    fn snapshots(&mut self) -> Result<Vec<SessionSnapshot>, String>;
+    fn session_catalog(&mut self) -> Result<Vec<SessionSummary>, String> {
         self.snapshots().map(|snapshots| {
             snapshots
                 .into_iter()
-                .map(|snapshot| ThreadSessionSummary {
-                    thread_id: snapshot.thread_id,
+                .map(|snapshot| SessionSummary {
+                    session_id: snapshot.session_id,
                     title: snapshot
                         .transcript
                         .entries
@@ -58,7 +58,7 @@ pub trait ThreadProjectionClient {
                         .find(|entry| entry.kind == TranscriptKind::User)
                         .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
                     workspace_root: String::new(),
-                    parent_thread_id: None,
+                    parent_session_id: None,
                     lifecycle: snapshot.lifecycle,
                     provider_name: snapshot.binding.provider_name,
                     model: snapshot.binding.model,
@@ -76,28 +76,28 @@ pub trait ThreadProjectionClient {
                 .collect()
         })
     }
-    fn session(&mut self, thread_id: ThreadId) -> Result<ThreadSnapshot, String> {
+    fn session(&mut self, session_id: SessionId) -> Result<SessionSnapshot, String> {
         self.snapshots()?
             .into_iter()
-            .find(|snapshot| snapshot.thread_id == thread_id)
-            .ok_or_else(|| format!("session {thread_id} was not found"))
+            .find(|snapshot| snapshot.session_id == session_id)
+            .ok_or_else(|| format!("session {session_id} was not found"))
     }
-    fn exact_session_catalog(&mut self, query: &str) -> Result<Vec<ThreadSessionSummary>, String> {
+    fn exact_session_catalog(&mut self, query: &str) -> Result<Vec<SessionSummary>, String> {
         self.session_catalog().map(|sessions| {
             sessions
                 .into_iter()
-                .filter(|session| session.thread_id.to_string() == query || session.title == query)
+                .filter(|session| session.session_id.to_string() == query || session.title == query)
                 .collect()
         })
     }
-    fn exact_session(&mut self, query: &str) -> Result<Option<ThreadSnapshot>, String> {
+    fn exact_session(&mut self, query: &str) -> Result<Option<SessionSnapshot>, String> {
         let matches = self.exact_session_catalog(query)?;
         let [session] = matches.as_slice() else {
             return Ok(None);
         };
-        self.session(session.thread_id).map(Some)
+        self.session(session.session_id).map(Some)
     }
-    fn search_session_catalog(&mut self, query: &str) -> Result<Vec<ThreadSessionSummary>, String> {
+    fn search_session_catalog(&mut self, query: &str) -> Result<Vec<SessionSummary>, String> {
         let query = query.trim().to_lowercase();
         self.session_catalog().map(|sessions| {
             sessions
@@ -105,16 +105,16 @@ pub trait ThreadProjectionClient {
                 .filter(|session| {
                     query.is_empty()
                         || session.title.to_lowercase().contains(&query)
-                        || session.thread_id.to_string().contains(&query)
+                        || session.session_id.to_string().contains(&query)
                 })
                 .collect()
         })
     }
-    fn poll(&mut self) -> ThreadProjectionPoll;
+    fn poll(&mut self) -> SessionProjectionPoll;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadProjectionPoll {
+pub enum SessionProjectionPoll {
     Event,
     Empty,
     Lagged(u64),
@@ -123,7 +123,7 @@ pub enum ThreadProjectionPoll {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ThreadUiInput {
+pub enum SessionUiInput {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
@@ -131,15 +131,15 @@ pub enum ThreadUiInput {
     /// Confirms that the current model state reached a terminal frame. This
     /// arms only the exact permission request visible in that frame.
     FrameRendered,
-    Snapshot(Vec<ThreadSnapshot>),
-    SessionCatalog(Vec<ThreadSessionSummary>),
+    Snapshot(Vec<SessionSnapshot>),
+    SessionCatalog(Vec<SessionSummary>),
     SessionCatalogReady {
-        sessions: Vec<ThreadSessionSummary>,
+        sessions: Vec<SessionSummary>,
         query: Option<String>,
     },
-    SessionOpened(Box<ThreadSnapshot>),
-    Event(ThreadEventEnvelope),
-    Progress(ThreadTransientProgress),
+    SessionOpened(Box<SessionSnapshot>),
+    Event(SessionEventEnvelope),
+    Progress(SessionTransientProgress),
     Lagged,
     Connected,
     Disconnected,
@@ -147,7 +147,7 @@ pub enum ThreadUiInput {
     CommandCompleted(String),
     SubmissionAssigned {
         submission_id: u64,
-        thread_id: ThreadId,
+        session_id: SessionId,
     },
     SubmissionError {
         submission_id: u64,
@@ -175,10 +175,10 @@ pub enum ThreadUiInput {
 /// feedback carries the reducer-issued identity so an old async failure can
 /// never restore a newer prompt.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadUiFeedback {
+pub enum SessionUiFeedback {
     SubmissionAssigned {
         submission_id: u64,
-        thread_id: ThreadId,
+        session_id: SessionId,
     },
     SubmissionResult {
         submission_id: u64,
@@ -199,15 +199,15 @@ pub enum ThreadUiFeedback {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionManagementOutcome {
     Updated(String),
-    Forked(ThreadId),
+    Forked(SessionId),
 }
 
-impl ThreadUiFeedback {
+impl SessionUiFeedback {
     #[must_use]
-    pub const fn assigned(submission_id: u64, thread_id: ThreadId) -> Self {
+    pub const fn assigned(submission_id: u64, session_id: SessionId) -> Self {
         Self::SubmissionAssigned {
             submission_id,
-            thread_id,
+            session_id,
         }
     }
 
@@ -243,10 +243,10 @@ impl ThreadUiFeedback {
     }
 }
 
-/// UI commands are thread-level requests. The caller maps them to the
+/// UI commands are session-level requests. The caller maps them to the
 /// headless service; the reducer never executes effects.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadUiAction {
+pub enum SessionUiAction {
     Start {
         submission_id: u64,
         prompt: String,
@@ -259,26 +259,26 @@ pub enum ThreadUiAction {
     },
     FollowUp {
         submission_id: u64,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         prompt: String,
     },
     QueueFollowUp {
         submission_id: u64,
-        thread_id: ThreadId,
+        session_id: SessionId,
         prompt: String,
     },
     Cancel {
-        thread_id: ThreadId,
+        session_id: SessionId,
     },
     ResolvePermission {
-        thread_id: ThreadId,
+        session_id: SessionId,
         request_id: String,
         allow: bool,
     },
     ProvideInput {
         submission_id: u64,
-        thread_id: ThreadId,
+        session_id: SessionId,
         request_id: String,
         value: String,
     },
@@ -286,7 +286,7 @@ pub enum ThreadUiAction {
     /// effect has an unknown outcome. This is deliberately separate from
     /// normal permission approval and requires its own confirmation chord.
     ReconcileUnknown {
-        thread_id: ThreadId,
+        session_id: SessionId,
         effect_id: String,
     },
     ShowSessions {
@@ -296,20 +296,20 @@ pub enum ThreadUiAction {
         query: String,
     },
     RenameSession {
-        thread_id: ThreadId,
+        session_id: SessionId,
         title: String,
     },
     ForkSession {
-        thread_id: ThreadId,
+        session_id: SessionId,
         title: Option<String>,
     },
     OpenSession {
-        thread_id: ThreadId,
+        session_id: SessionId,
     },
     SwitchModel {
         switch_id: u64,
-        thread_id: ThreadId,
-        expected_thread_revision: u64,
+        session_id: SessionId,
+        expected_session_revision: u64,
         provider_name: String,
         model: String,
     },
@@ -321,15 +321,15 @@ pub enum ThreadUiAction {
 pub struct PendingSubmission {
     pub submission_id: u64,
     pub prompt: String,
-    pub thread_id: Option<ThreadId>,
+    pub session_id: Option<SessionId>,
     pub after_sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingInputSubmission {
     pub submission_id: u64,
-    pub thread_id: ThreadId,
-    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
     pub request_id: String,
     pub value: String,
     pub after_sequence: u64,
@@ -338,7 +338,7 @@ pub struct PendingInputSubmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingModelSwitch {
     pub switch_id: u64,
-    pub thread_id: ThreadId,
+    pub session_id: SessionId,
     pub provider_name: String,
     pub model: String,
 }
@@ -347,17 +347,17 @@ pub struct PendingModelSwitch {
 /// the CLI has already resolved. Provider credentials and configuration
 /// fingerprints deliberately have no representation here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadStartupPresentation {
+pub struct SessionStartupPresentation {
     pub default_provider: String,
     pub default_model: String,
-    pub model_catalog: Vec<ThreadModelOption>,
+    pub model_catalog: Vec<SessionModelOption>,
     pub workspace_display: String,
-    pub permission_mode: ThreadPermissionMode,
+    pub permission_mode: SessionPermissionMode,
 }
 
 /// Secret-free provider/model row displayed by `/model`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadModelOption {
+pub struct SessionModelOption {
     pub provider_name: String,
     pub model: String,
     pub name: Option<String>,
@@ -371,11 +371,11 @@ struct ModelPickerState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadPermissionMode {
+pub enum SessionPermissionMode {
     Ask,
 }
 
-impl ThreadPermissionMode {
+impl SessionPermissionMode {
     const fn label(self) -> &'static str {
         match self {
             Self::Ask => "Ask",
@@ -392,7 +392,7 @@ impl ThreadPermissionMode {
 /// The composer is the default and owns every printable character. Transcript
 /// shortcuts are reachable only after an explicit mode switch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ThreadFocus {
+pub enum SessionFocus {
     #[default]
     Composer,
     Navigation,
@@ -402,7 +402,7 @@ pub enum ThreadFocus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveConversation {
     NewSessionDraft,
-    Session(ThreadId),
+    Session(SessionId),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -419,15 +419,15 @@ struct SubmissionRefreshState {
 }
 
 #[derive(Clone, Debug)]
-pub struct ThreadUiModel {
+pub struct SessionUiModel {
     /// Environment metadata resolved by the startup composition root. This is
     /// display-only and intentionally excludes every credential-bearing
     /// provider field.
-    pub startup: Option<ThreadStartupPresentation>,
-    /// Projection order is authoritative. The TUI keeps the focused thread by
-    /// identity across refreshes but never compares per-thread sequence values.
-    pub sessions: Vec<ThreadSnapshot>,
-    pub session_catalog: Vec<ThreadSessionSummary>,
+    pub startup: Option<SessionStartupPresentation>,
+    /// Projection order is authoritative. The TUI keeps the focused session by
+    /// identity across refreshes but never compares per-session sequence values.
+    pub sessions: Vec<SessionSnapshot>,
+    pub session_catalog: Vec<SessionSummary>,
     pub active_conversation: Option<ActiveConversation>,
     pub selected: usize,
     pub composer: String,
@@ -436,7 +436,7 @@ pub struct ThreadUiModel {
     /// new durable cards; `u16::MAX` represents the oldest available row.
     pub scroll: u16,
     pub connection: ConnectionState,
-    pub progress: Vec<ThreadTransientProgress>,
+    pub progress: Vec<SessionTransientProgress>,
     pub status: String,
     pub help: bool,
     /// Explicit command palette opened by Ctrl+P. Keeping this as local UI
@@ -449,7 +449,7 @@ pub struct ThreadUiModel {
     pub session_index: usize,
     model_picker: Option<ModelPickerState>,
     draft_model: Option<(String, String)>,
-    pub focus: ThreadFocus,
+    pub focus: SessionFocus,
     pub navigation_index: usize,
     pub expanded_actions: BTreeSet<String>,
     pub size: (u16, u16),
@@ -476,8 +476,8 @@ pub struct ThreadUiModel {
     /// reached a rendered frame. Projection updates are processed before
     /// terminal input, so this barrier prevents an already-buffered `d` or
     /// Ctrl+A from resolving a request the user has never seen.
-    rendered_permission_request: Option<(ThreadId, String)>,
-    input_target: Option<(ThreadId, String)>,
+    rendered_permission_request: Option<(SessionId, String)>,
+    input_target: Option<(SessionId, String)>,
     submission_refresh: SubmissionRefreshState,
     /// Secret-safe presentation copy for a correlated failure before the
     /// submission became durable. Provider/runtime failures are transcript
@@ -488,11 +488,11 @@ pub struct ThreadUiModel {
     /// A reconciliation acknowledgement is high-impact: it records the
     /// unknown effect as failed and terminalizes the linked child. Opening
     /// this state is not itself an action; only Ctrl+A can dispatch it.
-    pub reconciliation_confirmation: Option<(ThreadId, String)>,
+    pub reconciliation_confirmation: Option<(SessionId, String)>,
     /// Event-only hint retained until the next authoritative snapshot. Normal
     /// projection snapshots derive the same identifier from their durable
     /// failure card, so this is never an authority source.
-    pub reconciliation_hint: Option<(ThreadId, String)>,
+    pub reconciliation_hint: Option<(SessionId, String)>,
     /// A first Ctrl+C interrupts active work and arms a short, explicit exit
     /// confirmation. Only a second Ctrl+C inside the window exits the TUI.
     pub ctrl_c_exit_armed_until: Option<Instant>,
@@ -502,7 +502,7 @@ pub struct ThreadUiModel {
     pub ctrl_c_last_observed_at: Option<Instant>,
 }
 
-impl Default for ThreadUiModel {
+impl Default for SessionUiModel {
     fn default() -> Self {
         Self {
             startup: None,
@@ -525,7 +525,7 @@ impl Default for ThreadUiModel {
             session_index: 0,
             model_picker: None,
             draft_model: None,
-            focus: ThreadFocus::Composer,
+            focus: SessionFocus::Composer,
             navigation_index: 0,
             expanded_actions: BTreeSet::new(),
             size: (80, 24),
@@ -548,9 +548,9 @@ impl Default for ThreadUiModel {
     }
 }
 
-impl ThreadUiModel {
+impl SessionUiModel {
     #[must_use]
-    pub fn with_startup(startup: ThreadStartupPresentation) -> Self {
+    pub fn with_startup(startup: SessionStartupPresentation) -> Self {
         let draft_model = (!startup.default_provider.is_empty()
             && !startup.default_model.is_empty())
         .then(|| {
@@ -574,13 +574,13 @@ impl ThreadUiModel {
     }
 
     #[must_use]
-    pub fn selected_thread(&self) -> Option<&ThreadSnapshot> {
+    pub fn selected_session(&self) -> Option<&SessionSnapshot> {
         match self.active_conversation {
             Some(ActiveConversation::NewSessionDraft) => None,
-            Some(ActiveConversation::Session(thread_id)) => self
+            Some(ActiveConversation::Session(session_id)) => self
                 .sessions
                 .iter()
-                .find(|thread| thread.thread_id == thread_id),
+                .find(|session| session.session_id == session_id),
             None => self.sessions.get(self.selected),
         }
     }
@@ -590,89 +590,91 @@ impl ThreadUiModel {
     }
 
     fn mark_selected_permission_rendered(&mut self) {
-        self.rendered_permission_request = self.selected_thread().and_then(|thread| {
-            let ThreadPendingRequest::Permission { request_id, .. } = thread.pending.as_ref()?
+        self.rendered_permission_request = self.selected_session().and_then(|session| {
+            let SessionPendingRequest::Permission { request_id, .. } = session.pending.as_ref()?
             else {
                 return None;
             };
-            Some((thread.thread_id, request_id.clone()))
+            Some((session.session_id, request_id.clone()))
         });
     }
 
-    fn permission_was_rendered(&self, thread_id: ThreadId, request_id: &str) -> bool {
+    fn permission_was_rendered(&self, session_id: SessionId, request_id: &str) -> bool {
         self.rendered_permission_request.as_ref().is_some_and(
-            |(rendered_thread_id, rendered_request_id)| {
-                *rendered_thread_id == thread_id && rendered_request_id == request_id
+            |(rendered_session_id, rendered_request_id)| {
+                *rendered_session_id == session_id && rendered_request_id == request_id
             },
         )
     }
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAction> {
+pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionUiAction> {
     match input {
-        ThreadUiInput::Resize(width, height) => model.size = (width, height),
-        ThreadUiInput::FrameRendered => model.mark_selected_permission_rendered(),
-        ThreadUiInput::Connected => {
+        SessionUiInput::Resize(width, height) => model.size = (width, height),
+        SessionUiInput::FrameRendered => model.mark_selected_permission_rendered(),
+        SessionUiInput::Connected => {
             model.connection = ConnectionState::Connected;
             model.progress.clear();
             model.status = "Connected".into();
         }
-        ThreadUiInput::Disconnected => {
+        SessionUiInput::Disconnected => {
             model.connection = ConnectionState::Disconnected;
             model.status = "Disconnected: actions disabled".into();
         }
-        ThreadUiInput::Lagged => {
+        SessionUiInput::Lagged => {
             model.connection = ConnectionState::SnapshotRequired;
             model.progress.clear();
             model.status = "Event gap: reloading transcript snapshot".into();
-            return vec![ThreadUiAction::RefreshSnapshots];
+            return vec![SessionUiAction::RefreshSnapshots];
         }
-        ThreadUiInput::Snapshot(sessions) => {
-            let selected_id = model.selected_thread().map(|thread| thread.thread_id);
+        SessionUiInput::Snapshot(sessions) => {
+            let selected_id = model.selected_session().map(|session| session.session_id);
             model.sessions = sessions;
             if model.active_conversation == Some(ActiveConversation::NewSessionDraft)
                 && let Some(pending) = model.pending_submission.as_ref()
-                && let Some(thread_id) = pending.thread_id
+                && let Some(session_id) = pending.session_id
                 && model
                     .sessions
                     .iter()
-                    .any(|thread| thread.thread_id == thread_id)
+                    .any(|session| session.session_id == session_id)
             {
-                model.active_conversation = Some(ActiveConversation::Session(thread_id));
+                model.active_conversation = Some(ActiveConversation::Session(session_id));
             }
             model.selected = selected_id
                 .or(match model.active_conversation {
-                    Some(ActiveConversation::Session(thread_id)) => Some(thread_id),
+                    Some(ActiveConversation::Session(session_id)) => Some(session_id),
                     Some(ActiveConversation::NewSessionDraft) | None => None,
                 })
                 .and_then(|id| {
                     model
                         .sessions
                         .iter()
-                        .position(|thread| thread.thread_id == id)
+                        .position(|session| session.session_id == id)
                 })
                 .unwrap_or(0)
                 .min(model.sessions.len().saturating_sub(1));
-            model.navigation_index = model
-                .navigation_index
-                .min(action_keys(model.selected_thread()).len().saturating_sub(1));
+            model.navigation_index = model.navigation_index.min(
+                action_keys(model.selected_session())
+                    .len()
+                    .saturating_sub(1),
+            );
             model.connection = ConnectionState::Connected;
             model.progress.clear();
             model.status = "Transcript synchronized".into();
-            if model.selected_thread().is_some_and(|thread| {
-                thread.lifecycle == ThreadLifecycle::ReconciliationRequired
+            if model.selected_session().is_some_and(|session| {
+                session.lifecycle == SessionLifecycle::ReconciliationRequired
                     || matches!(
-                        thread.pending,
-                        Some(ThreadPendingRequest::Permission { .. })
+                        session.pending,
+                        Some(SessionPendingRequest::Permission { .. })
                     )
             }) {
                 model.command_palette = false;
                 model.help = false;
             }
-            model.reconciliation_hint = model.selected_thread().and_then(|thread| {
-                reconciliation_effect_from_snapshot(thread)
-                    .map(|effect_id| (thread.thread_id, effect_id))
+            model.reconciliation_hint = model.selected_session().and_then(|session| {
+                reconciliation_effect_from_snapshot(session)
+                    .map(|effect_id| (session.session_id, effect_id))
             });
             reconcile_pending_submission(model);
             reconcile_pending_input_submission(model);
@@ -683,11 +685,11 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             if model
                 .reconciliation_confirmation
                 .as_ref()
-                .is_some_and(|(thread_id, effect_id)| {
-                    model.selected_thread().is_none_or(|thread| {
-                        thread.thread_id != *thread_id
-                            || thread.lifecycle != ThreadLifecycle::ReconciliationRequired
-                            || reconciliation_effect_id(model, thread).as_deref()
+                .is_some_and(|(session_id, effect_id)| {
+                    model.selected_session().is_none_or(|session| {
+                        session.session_id != *session_id
+                            || session.lifecycle != SessionLifecycle::ReconciliationRequired
+                            || reconciliation_effect_id(model, session).as_deref()
                                 != Some(effect_id.as_str())
                     })
                 })
@@ -695,31 +697,31 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 model.reconciliation_confirmation = None;
             }
             if model.queued_follow_up.is_some()
-                && let Some((thread_id, expected_thread_revision)) = model
-                    .selected_thread()
-                    .filter(|thread| thread.lifecycle == ThreadLifecycle::Ready)
-                    .map(|thread| (thread.thread_id, thread.revision))
+                && let Some((session_id, expected_session_revision)) = model
+                    .selected_session()
+                    .filter(|session| session.lifecycle == SessionLifecycle::Ready)
+                    .map(|session| (session.session_id, session.revision))
                 && let Some(submission_id) = model
                     .pending_submission
                     .as_ref()
                     .map(|submission| submission.submission_id)
             {
                 let prompt = model.queued_follow_up.take().unwrap_or_default();
-                return vec![ThreadUiAction::FollowUp {
+                return vec![SessionUiAction::FollowUp {
                     submission_id,
-                    thread_id,
-                    expected_thread_revision,
+                    session_id,
+                    expected_session_revision,
                     prompt,
                 }];
             }
         }
-        ThreadUiInput::SessionCatalog(sessions) => {
+        SessionUiInput::SessionCatalog(sessions) => {
             model.session_catalog = sessions;
             model.session_index = model
                 .session_index
                 .min(model.session_catalog.len().saturating_sub(1));
         }
-        ThreadUiInput::SessionCatalogReady { sessions, query } => {
+        SessionUiInput::SessionCatalogReady { sessions, query } => {
             model.session_catalog = sessions;
             model.session_index = 0;
             let Some(query) = query.filter(|query| !query.is_empty()) else {
@@ -734,12 +736,12 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             let matches = model
                 .session_catalog
                 .iter()
-                .filter(|session| session.thread_id.to_string() == query || session.title == query)
-                .map(|session| session.thread_id)
+                .filter(|session| session.session_id.to_string() == query || session.title == query)
+                .map(|session| session.session_id)
                 .collect::<Vec<_>>();
             if matches.len() == 1 {
-                return vec![ThreadUiAction::OpenSession {
-                    thread_id: matches[0],
+                return vec![SessionUiAction::OpenSession {
+                    session_id: matches[0],
                 }];
             }
             model.session_picker = true;
@@ -754,21 +756,21 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 format!("Multiple sessions match {query}; choose one")
             };
         }
-        ThreadUiInput::SessionOpened(snapshot) => {
+        SessionUiInput::SessionOpened(snapshot) => {
             let snapshot = *snapshot;
-            let thread_id = snapshot.thread_id;
+            let session_id = snapshot.session_id;
             model.sessions = vec![snapshot];
             model.selected = 0;
-            model.active_conversation = Some(ActiveConversation::Session(thread_id));
+            model.active_conversation = Some(ActiveConversation::Session(session_id));
             model.session_picker = false;
             model.command_palette = false;
             model.help = false;
             model.progress.clear();
             model.scroll = 0;
-            model.status = format!("Resumed session {thread_id}");
-            model.reconciliation_hint = model.selected_thread().and_then(|thread| {
-                reconciliation_effect_from_snapshot(thread)
-                    .map(|effect_id| (thread.thread_id, effect_id))
+            model.status = format!("Resumed session {session_id}");
+            model.reconciliation_hint = model.selected_session().and_then(|session| {
+                reconciliation_effect_from_snapshot(session)
+                    .map(|effect_id| (session.session_id, effect_id))
             });
             reconcile_pending_submission(model);
             reconcile_pending_input_submission(model);
@@ -777,47 +779,49 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             restore_stranded_follow_up(model);
             synchronize_input_target(model);
         }
-        ThreadUiInput::Event(event) => {
-            let Some(thread) = model
+        SessionUiInput::Event(event) => {
+            let Some(session) = model
                 .sessions
                 .iter_mut()
-                .find(|thread| thread.thread_id == event.thread_id)
+                .find(|session| session.session_id == event.session_id)
             else {
-                return vec![ThreadUiAction::RefreshSnapshots];
+                return vec![SessionUiAction::RefreshSnapshots];
             };
-            if event.revision != thread.revision.saturating_add(1) {
+            if event.revision != session.revision.saturating_add(1) {
                 model.connection = ConnectionState::SnapshotRequired;
                 model.progress.clear();
-                return vec![ThreadUiAction::RefreshSnapshots];
+                return vec![SessionUiAction::RefreshSnapshots];
             }
-            thread.revision = event.revision;
-            thread.sequence = event.sequence;
+            session.revision = event.revision;
+            session.sequence = event.sequence;
             match event.event {
-                ThreadEvent::LifecycleChanged { lifecycle, .. } => thread.lifecycle = lifecycle,
-                ThreadEvent::TranscriptAppended { entry } => thread.transcript.entries.push(entry),
-                ThreadEvent::RunLinked { run } => {
-                    thread.latest_run_id = Some(run.run_id);
-                    thread.active_run_id = Some(run.run_id);
-                    thread.runs.push(run);
-                    thread.lifecycle = ThreadLifecycle::Running;
+                SessionEvent::LifecycleChanged { lifecycle, .. } => session.lifecycle = lifecycle,
+                SessionEvent::TranscriptAppended { entry } => {
+                    session.transcript.entries.push(entry);
                 }
-                ThreadEvent::BindingChanged { .. } => {
+                SessionEvent::TurnLinked { turn } => {
+                    session.latest_turn_id = Some(turn.turn_id);
+                    session.active_turn_id = Some(turn.turn_id);
+                    session.turns.push(turn);
+                    session.lifecycle = SessionLifecycle::Running;
+                }
+                SessionEvent::BindingChanged { .. } => {
                     model.connection = ConnectionState::SnapshotRequired;
-                    return vec![ThreadUiAction::RefreshSnapshots];
+                    return vec![SessionUiAction::RefreshSnapshots];
                 }
-                ThreadEvent::ReconciliationRequired { effect_id, .. } => {
-                    thread.lifecycle = ThreadLifecycle::ReconciliationRequired;
-                    model.reconciliation_hint = Some((thread.thread_id, effect_id));
+                SessionEvent::ReconciliationRequired { effect_id, .. } => {
+                    session.lifecycle = SessionLifecycle::ReconciliationRequired;
+                    model.reconciliation_hint = Some((session.session_id, effect_id));
                 }
             }
             reconcile_pending_submission(model);
             reconcile_pending_input_submission(model);
             synchronize_input_target(model);
         }
-        ThreadUiInput::Progress(progress) => record_progress(model, progress),
-        ThreadUiInput::CommandError(error) => model.status = format!("Command rejected: {error}"),
-        ThreadUiInput::CommandCompleted(message) => model.status = message,
-        ThreadUiInput::ModelSwitchError { switch_id, error } => {
+        SessionUiInput::Progress(progress) => record_progress(model, progress),
+        SessionUiInput::CommandError(error) => model.status = format!("Command rejected: {error}"),
+        SessionUiInput::CommandCompleted(message) => model.status = message,
+        SessionUiInput::ModelSwitchError { switch_id, error } => {
             if model
                 .pending_model_switch
                 .as_ref()
@@ -827,26 +831,26 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 model.status = format!("Model switch rejected: {error}");
             }
         }
-        ThreadUiInput::ModelSwitchCompleted { switch_id } => {
+        SessionUiInput::ModelSwitchCompleted { switch_id } => {
             if model
                 .pending_model_switch
                 .as_ref()
                 .is_some_and(|pending| pending.switch_id == switch_id)
             {
                 model.status = "Model switch accepted; synchronizing session".into();
-                return vec![ThreadUiAction::RefreshSnapshots];
+                return vec![SessionUiAction::RefreshSnapshots];
             }
         }
-        ThreadUiInput::SubmissionAssigned {
+        SessionUiInput::SubmissionAssigned {
             submission_id,
-            thread_id,
+            session_id,
         } => {
             let assigned = if let Some(pending) = model
                 .pending_submission
                 .as_mut()
                 .filter(|pending| pending.submission_id == submission_id)
             {
-                pending.thread_id = Some(thread_id);
+                pending.session_id = Some(session_id);
                 true
             } else {
                 false
@@ -856,15 +860,15 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                     && let Some(index) = model
                         .sessions
                         .iter()
-                        .position(|thread| thread.thread_id == thread_id)
+                        .position(|session| session.session_id == session_id)
                 {
-                    model.active_conversation = Some(ActiveConversation::Session(thread_id));
+                    model.active_conversation = Some(ActiveConversation::Session(session_id));
                     model.selected = index;
                 }
                 reconcile_pending_submission(model);
             }
         }
-        ThreadUiInput::SubmissionError { submission_id } => {
+        SessionUiInput::SubmissionError { submission_id } => {
             if model
                 .pending_submission
                 .as_ref()
@@ -872,10 +876,10 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             {
                 model.submission_refresh.composer = true;
                 model.status = "Submission result uncertain; checking durable transcript".into();
-                return vec![ThreadUiAction::RefreshSnapshots];
+                return vec![SessionUiAction::RefreshSnapshots];
             }
         }
-        ThreadUiInput::SubmissionCompleted { submission_id } => {
+        SessionUiInput::SubmissionCompleted { submission_id } => {
             if model
                 .pending_submission
                 .as_ref()
@@ -884,7 +888,7 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 model.status = "Submission accepted; synchronizing transcript".into();
             }
         }
-        ThreadUiInput::InputSubmissionError { submission_id } => {
+        SessionUiInput::InputSubmissionError { submission_id } => {
             if model
                 .pending_input_submission
                 .as_ref()
@@ -892,10 +896,10 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
             {
                 model.submission_refresh.input = true;
                 model.status = "Input result uncertain; checking durable transcript".into();
-                return vec![ThreadUiAction::RefreshSnapshots];
+                return vec![SessionUiAction::RefreshSnapshots];
             }
         }
-        ThreadUiInput::InputSubmissionCompleted { submission_id } => {
+        SessionUiInput::InputSubmissionCompleted { submission_id } => {
             if model
                 .pending_input_submission
                 .as_ref()
@@ -904,20 +908,20 @@ pub fn reduce(model: &mut ThreadUiModel, input: ThreadUiInput) -> Vec<ThreadUiAc
                 model.status = "Input accepted; synchronizing transcript".into();
             }
         }
-        ThreadUiInput::Key(key) => return reduce_key(model, key),
-        ThreadUiInput::Mouse(mouse) => reduce_mouse(model, mouse),
-        ThreadUiInput::Paste(value) => reduce_paste(model, &value),
-        ThreadUiInput::Tick => {}
+        SessionUiInput::Key(key) => return reduce_key(model, key),
+        SessionUiInput::Mouse(mouse) => reduce_mouse(model, mouse),
+        SessionUiInput::Paste(value) => reduce_paste(model, &value),
+        SessionUiInput::Tick => {}
     }
     Vec::new()
 }
 
 #[allow(clippy::too_many_lines)]
-fn reduce_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+fn reduce_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
     reduce_key_at(model, key, Instant::now())
 }
 
-fn reduce_mouse(model: &mut ThreadUiModel, mouse: MouseEvent) {
+fn reduce_mouse(model: &mut SessionUiModel, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => model.scroll = model.scroll.saturating_add(3),
         MouseEventKind::ScrollDown => model.scroll = model.scroll.saturating_sub(3),
@@ -926,12 +930,12 @@ fn reduce_mouse(model: &mut ThreadUiModel, mouse: MouseEvent) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<ThreadUiAction> {
+fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec<SessionUiAction> {
     if key.kind == KeyEventKind::Release {
         return Vec::new();
     }
     if key.code == KeyCode::F(10) {
-        return vec![ThreadUiAction::Quit];
+        return vec![SessionUiAction::Quit];
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if model.ctrl_c_last_observed_at.is_some_and(|observed_at| {
@@ -946,20 +950,20 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         {
             model.ctrl_c_exit_armed_until = None;
             model.ctrl_c_last_observed_at = None;
-            return vec![ThreadUiAction::Quit];
+            return vec![SessionUiAction::Quit];
         }
         model.ctrl_c_exit_armed_until = Some(now + CTRL_C_EXIT_WINDOW);
-        if let Some(thread) = model.selected_thread().filter(|thread| {
+        if let Some(session) = model.selected_session().filter(|session| {
             model.authority_enabled()
                 && matches!(
-                    thread.lifecycle,
-                    ThreadLifecycle::Running
-                        | ThreadLifecycle::WaitingPermission
-                        | ThreadLifecycle::WaitingInput
+                    session.lifecycle,
+                    SessionLifecycle::Running
+                        | SessionLifecycle::WaitingPermission
+                        | SessionLifecycle::WaitingInput
                 )
         }) {
-            return vec![ThreadUiAction::Cancel {
-                thread_id: thread.thread_id,
+            return vec![SessionUiAction::Cancel {
+                session_id: session.session_id,
             }];
         }
         return Vec::new();
@@ -970,9 +974,9 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && model.connection != ConnectionState::Connected
     {
-        return vec![ThreadUiAction::RefreshSnapshots];
+        return vec![SessionUiAction::RefreshSnapshots];
     }
-    if let Some((thread_id, effect_id)) = model.reconciliation_confirmation.clone() {
+    if let Some((session_id, effect_id)) = model.reconciliation_confirmation.clone() {
         // Enter is deliberately inert while the confirmation card is open:
         // it must never be able to acknowledge a potentially executed effect.
         if key.code == KeyCode::Enter {
@@ -983,8 +987,8 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
             && key.modifiers == KeyModifiers::CONTROL
         {
             model.reconciliation_confirmation = None;
-            return vec![ThreadUiAction::ReconcileUnknown {
-                thread_id,
+            return vec![SessionUiAction::ReconcileUnknown {
+                session_id,
                 effect_id,
             }];
         }
@@ -995,14 +999,14 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         }
         return Vec::new();
     }
-    if let Some(thread) = model.selected_thread().cloned() {
-        if thread.lifecycle == ThreadLifecycle::ReconciliationRequired {
+    if let Some(session) = model.selected_session().cloned() {
+        if session.lifecycle == SessionLifecycle::ReconciliationRequired {
             if model.authority_enabled()
                 && key.code == KeyCode::Char('r')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
-                && let Some(effect_id) = reconciliation_effect_id(model, &thread)
+                && let Some(effect_id) = reconciliation_effect_id(model, &session)
             {
-                model.reconciliation_confirmation = Some((thread.thread_id, effect_id));
+                model.reconciliation_confirmation = Some((session.session_id, effect_id));
                 model.status =
                     "Reconciliation acknowledgement open: Ctrl+A confirms; Enter does nothing"
                         .into();
@@ -1011,25 +1015,26 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
             // keys and Enter cannot leak into either text buffer.
             return Vec::new();
         }
-        if let Some(ThreadPendingRequest::Permission { request_id, .. }) = thread.pending.as_ref() {
+        if let Some(SessionPendingRequest::Permission { request_id, .. }) = session.pending.as_ref()
+        {
             if model.authority_enabled()
-                && model.permission_was_rendered(thread.thread_id, request_id)
+                && model.permission_was_rendered(session.session_id, request_id)
                 && key.code == KeyCode::Char('d')
                 && key.modifiers.is_empty()
             {
-                return vec![ThreadUiAction::ResolvePermission {
-                    thread_id: thread.thread_id,
+                return vec![SessionUiAction::ResolvePermission {
+                    session_id: session.session_id,
                     request_id: request_id.clone(),
                     allow: false,
                 }];
             }
             if model.authority_enabled()
-                && model.permission_was_rendered(thread.thread_id, request_id)
+                && model.permission_was_rendered(session.session_id, request_id)
                 && key.code == KeyCode::Char('a')
                 && key.modifiers == KeyModifiers::CONTROL
             {
-                return vec![ThreadUiAction::ResolvePermission {
-                    thread_id: thread.thread_id,
+                return vec![SessionUiAction::ResolvePermission {
+                    session_id: session.session_id,
                     request_id: request_id.clone(),
                     allow: true,
                 }];
@@ -1038,9 +1043,11 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
             // and navigation keys cannot mutate any pending input/composer.
             return Vec::new();
         }
-        if let Some(ThreadPendingRequest::Input {
-            run_id, request_id, ..
-        }) = thread.pending.as_ref()
+        if let Some(SessionPendingRequest::Input {
+            turn_id,
+            request_id,
+            ..
+        }) = session.pending.as_ref()
         {
             if model.pending_input_submission.is_some() {
                 return Vec::new();
@@ -1051,16 +1058,16 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
                 model.next_submission_id = model.next_submission_id.saturating_add(1);
                 model.pending_input_submission = Some(PendingInputSubmission {
                     submission_id,
-                    thread_id: thread.thread_id,
-                    run_id: *run_id,
+                    session_id: session.session_id,
+                    turn_id: *turn_id,
                     request_id: request_id.clone(),
                     value: value.clone(),
-                    after_sequence: thread.sequence,
+                    after_sequence: session.sequence,
                 });
                 model.submission_refresh.input = false;
-                return vec![ThreadUiAction::ProvideInput {
+                return vec![SessionUiAction::ProvideInput {
                     submission_id,
-                    thread_id: thread.thread_id,
+                    session_id: session.session_id,
                     request_id: request_id.clone(),
                     value,
                 }];
@@ -1104,26 +1111,26 @@ fn reduce_key_at(model: &mut ThreadUiModel, key: KeyEvent, now: Instant) -> Vec<
         return Vec::new();
     }
     match model.focus {
-        ThreadFocus::Composer => reduce_composer_key(model, key),
-        ThreadFocus::Navigation => reduce_navigation_key(model, key),
+        SessionFocus::Composer => reduce_composer_key(model, key),
+        SessionFocus::Navigation => reduce_navigation_key(model, key),
     }
 }
 
-fn slash_popup_suggestions(model: &ThreadUiModel) -> Vec<&'static CommandDescriptor> {
-    if model.focus != ThreadFocus::Composer
+fn slash_popup_suggestions(model: &SessionUiModel) -> Vec<&'static CommandDescriptor> {
+    if model.focus != SessionFocus::Composer
         || model.pending_submission.is_some()
         || model.slash_popup_state == SlashPopupState::Dismissed
         || model.help
         || model.command_palette
         || model.session_picker
         || model.model_picker.is_some()
-        || model.selected_thread().is_some_and(|thread| {
+        || model.selected_session().is_some_and(|session| {
             matches!(
-                thread.lifecycle,
-                ThreadLifecycle::WaitingPermission
-                    | ThreadLifecycle::WaitingInput
-                    | ThreadLifecycle::ReconciliationRequired
-            ) || thread.pending.is_some()
+                session.lifecycle,
+                SessionLifecycle::WaitingPermission
+                    | SessionLifecycle::WaitingInput
+                    | SessionLifecycle::ReconciliationRequired
+            ) || session.pending.is_some()
         })
     {
         return Vec::new();
@@ -1131,7 +1138,10 @@ fn slash_popup_suggestions(model: &ThreadUiModel) -> Vec<&'static CommandDescrip
     slash_suggestions(&model.composer)
 }
 
-fn reduce_slash_popup_key(model: &mut ThreadUiModel, key: KeyEvent) -> Option<Vec<ThreadUiAction>> {
+fn reduce_slash_popup_key(
+    model: &mut SessionUiModel,
+    key: KeyEvent,
+) -> Option<Vec<SessionUiAction>> {
     let suggestions = slash_popup_suggestions(model);
     if suggestions.is_empty() {
         return None;
@@ -1169,7 +1179,7 @@ fn reduce_slash_popup_key(model: &mut ThreadUiModel, key: KeyEvent) -> Option<Ve
     }
 }
 
-fn reduce_palette_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+fn reduce_palette_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
     match key.code {
         KeyCode::Esc => {
             model.command_palette = false;
@@ -1193,7 +1203,7 @@ fn reduce_palette_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiA
     Vec::new()
 }
 
-fn reduce_session_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+fn reduce_session_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
     match key.code {
         KeyCode::Esc => model.session_picker = false,
         KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
@@ -1205,8 +1215,8 @@ fn reduce_session_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Th
         }
         KeyCode::Enter => {
             if let Some(session) = model.session_catalog.get(model.session_index) {
-                return vec![ThreadUiAction::OpenSession {
-                    thread_id: session.thread_id,
+                return vec![SessionUiAction::OpenSession {
+                    session_id: session.session_id,
                 }];
             }
         }
@@ -1215,7 +1225,7 @@ fn reduce_session_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Th
     Vec::new()
 }
 
-fn filtered_model_options(model: &ThreadUiModel) -> Vec<ThreadModelOption> {
+fn filtered_model_options(model: &SessionUiModel) -> Vec<SessionModelOption> {
     let Some(startup) = model.startup.as_ref() else {
         return Vec::new();
     };
@@ -1243,19 +1253,19 @@ fn filtered_model_options(model: &ThreadUiModel) -> Vec<ThreadModelOption> {
         .collect()
 }
 
-fn selected_provider_model(model: &ThreadUiModel) -> Option<(String, String)> {
-    model.selected_thread().map_or_else(
+fn selected_provider_model(model: &SessionUiModel) -> Option<(String, String)> {
+    model.selected_session().map_or_else(
         || model.draft_model.clone(),
-        |thread| {
+        |session| {
             Some((
-                thread.binding.provider_name.clone(),
-                thread.binding.model.clone(),
+                session.binding.provider_name.clone(),
+                session.binding.model.clone(),
             ))
         },
     )
 }
 
-fn open_model_picker(model: &mut ThreadUiModel) {
+fn open_model_picker(model: &mut SessionUiModel) {
     let options = model
         .startup
         .as_ref()
@@ -1281,7 +1291,7 @@ fn open_model_picker(model: &mut ThreadUiModel) {
     model.session_picker = false;
 }
 
-fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
     let options = filtered_model_options(model);
     let Some(picker) = model.model_picker.as_mut() else {
         return Vec::new();
@@ -1309,17 +1319,17 @@ fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thre
                 return Vec::new();
             };
             model.model_picker = None;
-            if let Some(thread) = model.selected_thread() {
-                if !thread.lifecycle.accepts_follow_up()
-                    || thread.active_run_id.is_some()
-                    || thread.pending.is_some()
+            if let Some(session) = model.selected_session() {
+                if !session.lifecycle.accepts_follow_up()
+                    || session.active_turn_id.is_some()
+                    || session.pending.is_some()
                 {
                     model.status =
                         "Model switching is disabled while work or a request is active".into();
                     return Vec::new();
                 }
-                if thread.binding.provider_name == option.provider_name
-                    && thread.binding.model == option.model
+                if session.binding.provider_name == option.provider_name
+                    && session.binding.model == option.model
                 {
                     model.status = format!(
                         "Model already selected: {}/{}",
@@ -1327,13 +1337,13 @@ fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thre
                     );
                     return Vec::new();
                 }
-                let thread_id = thread.thread_id;
-                let expected_thread_revision = thread.revision;
+                let session_id = session.session_id;
+                let expected_session_revision = session.revision;
                 let switch_id = model.next_model_switch_id;
                 model.next_model_switch_id = model.next_model_switch_id.saturating_add(1);
                 model.pending_model_switch = Some(PendingModelSwitch {
                     switch_id,
-                    thread_id,
+                    session_id,
                     provider_name: option.provider_name.clone(),
                     model: option.model.clone(),
                 });
@@ -1341,10 +1351,10 @@ fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thre
                     "Switching model to {}/{}",
                     option.provider_name, option.model
                 );
-                return vec![ThreadUiAction::SwitchModel {
+                return vec![SessionUiAction::SwitchModel {
                     switch_id,
-                    thread_id,
-                    expected_thread_revision,
+                    session_id,
+                    expected_session_revision,
                     provider_name: option.provider_name,
                     model: option.model,
                 }];
@@ -1360,21 +1370,21 @@ fn reduce_model_picker_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thre
     Vec::new()
 }
 
-fn session_switch_available(model: &ThreadUiModel) -> bool {
+fn session_switch_available(model: &SessionUiModel) -> bool {
     model.pending_submission.is_none()
         && model.pending_model_switch.is_none()
-        && model.selected_thread().is_none_or(|thread| {
-            thread.active_run_id.is_none()
-                && thread.pending.is_none()
-                && thread.lifecycle != ThreadLifecycle::ReconciliationRequired
+        && model.selected_session().is_none_or(|session| {
+            session.active_turn_id.is_none()
+                && session.pending.is_none()
+                && session.lifecycle != SessionLifecycle::ReconciliationRequired
         })
 }
 
 fn dispatch_builtin(
-    model: &mut ThreadUiModel,
+    model: &mut SessionUiModel,
     command: BuiltinCommand,
     argument: String,
-) -> Vec<ThreadUiAction> {
+) -> Vec<SessionUiAction> {
     if matches!(
         command,
         BuiltinCommand::New
@@ -1412,14 +1422,14 @@ fn dispatch_builtin(
         }
         BuiltinCommand::Sessions => dispatch_session_search(model, &argument),
         BuiltinCommand::Rename => {
-            selected_session_action(model, |thread_id| ThreadUiAction::RenameSession {
-                thread_id,
+            selected_session_action(model, |session_id| SessionUiAction::RenameSession {
+                session_id,
                 title: argument,
             })
         }
         BuiltinCommand::Fork => {
-            selected_session_action(model, |thread_id| ThreadUiAction::ForkSession {
-                thread_id,
+            selected_session_action(model, |session_id| SessionUiAction::ForkSession {
+                session_id,
                 title: (!argument.is_empty()).then_some(argument),
             })
         }
@@ -1432,36 +1442,36 @@ fn dispatch_builtin(
             Vec::new()
         }
         BuiltinCommand::Navigation => {
-            model.focus = ThreadFocus::Navigation;
+            model.focus = SessionFocus::Navigation;
             model.help = false;
             Vec::new()
         }
-        BuiltinCommand::Refresh => vec![ThreadUiAction::RefreshSnapshots],
-        BuiltinCommand::Quit => vec![ThreadUiAction::Quit],
+        BuiltinCommand::Refresh => vec![SessionUiAction::RefreshSnapshots],
+        BuiltinCommand::Quit => vec![SessionUiAction::Quit],
     }
 }
 
 fn selected_session_action(
-    model: &mut ThreadUiModel,
-    action: impl FnOnce(ThreadId) -> ThreadUiAction,
-) -> Vec<ThreadUiAction> {
-    let Some(thread_id) = model.selected_thread().map(|thread| thread.thread_id) else {
+    model: &mut SessionUiModel,
+    action: impl FnOnce(SessionId) -> SessionUiAction,
+) -> Vec<SessionUiAction> {
+    let Some(session_id) = model.selected_session().map(|session| session.session_id) else {
         model.status = "This command requires an open saved session".into();
         return Vec::new();
     };
-    vec![action(thread_id)]
+    vec![action(session_id)]
 }
 
-fn parse_thread_id_argument(value: &str) -> Option<ThreadId> {
+fn parse_session_id_argument(value: &str) -> Option<SessionId> {
     serde_json::from_value(serde_json::Value::String(value.into())).ok()
 }
 
-fn dispatch_session_search(model: &mut ThreadUiModel, argument: &str) -> Vec<ThreadUiAction> {
+fn dispatch_session_search(model: &mut SessionUiModel, argument: &str) -> Vec<SessionUiAction> {
     if argument.is_empty() {
-        return vec![ThreadUiAction::ShowSessions { query: None }];
+        return vec![SessionUiAction::ShowSessions { query: None }];
     }
-    if parse_thread_id_argument(argument).is_some() {
-        return vec![ThreadUiAction::ShowSessions {
+    if parse_session_id_argument(argument).is_some() {
+        return vec![SessionUiAction::ShowSessions {
             query: Some(argument.into()),
         }];
     }
@@ -1472,15 +1482,15 @@ fn dispatch_session_search(model: &mut ThreadUiModel, argument: &str) -> Vec<Thr
         model.status = "The /sessions command accepts only a current-workspace query".into();
         return Vec::new();
     }
-    vec![ThreadUiAction::SearchSessions {
+    vec![SessionUiAction::SearchSessions {
         query: argument.into(),
     }]
 }
 
-fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
+fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
     match key.code {
         KeyCode::Esc => {
-            model.focus = ThreadFocus::Navigation;
+            model.focus = SessionFocus::Navigation;
             model.help = false;
         }
         KeyCode::Backspace => {
@@ -1513,14 +1523,14 @@ fn reduce_composer_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUi
     Vec::new()
 }
 
-fn reduce_navigation_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<ThreadUiAction> {
-    let keys = action_keys(model.selected_thread());
+fn reduce_navigation_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionUiAction> {
+    let keys = action_keys(model.selected_session());
     match key.code {
         KeyCode::Esc | KeyCode::Char('i') => {
-            model.focus = ThreadFocus::Composer;
+            model.focus = SessionFocus::Composer;
             model.help = false;
         }
-        KeyCode::Char('q') if key.modifiers.is_empty() => return vec![ThreadUiAction::Quit],
+        KeyCode::Char('q') if key.modifiers.is_empty() => return vec![SessionUiAction::Quit],
         KeyCode::Char('?') if key.modifiers.is_empty() => model.help = !model.help,
         KeyCode::Up | KeyCode::Char('k') => {
             model.navigation_index = model.navigation_index.saturating_sub(1);
@@ -1553,44 +1563,44 @@ fn reduce_navigation_key(model: &mut ThreadUiModel, key: KeyEvent) -> Vec<Thread
     Vec::new()
 }
 
-fn reduce_paste(model: &mut ThreadUiModel, value: &str) {
+fn reduce_paste(model: &mut SessionUiModel, value: &str) {
     model.ctrl_c_exit_armed_until = None;
     model.ctrl_c_last_observed_at = None;
     let blocked = model.pending_input_submission.is_some()
         || model.reconciliation_confirmation.is_some()
-        || model.selected_thread().is_some_and(|thread| {
-            thread.lifecycle == ThreadLifecycle::ReconciliationRequired
+        || model.selected_session().is_some_and(|session| {
+            session.lifecycle == SessionLifecycle::ReconciliationRequired
                 || matches!(
-                    thread.pending,
-                    Some(ThreadPendingRequest::Permission { .. })
+                    session.pending,
+                    Some(SessionPendingRequest::Permission { .. })
                 )
         });
     if blocked {
         return;
     }
     if model
-        .selected_thread()
-        .is_some_and(|thread| matches!(thread.pending, Some(ThreadPendingRequest::Input { .. })))
+        .selected_session()
+        .is_some_and(|session| matches!(session.pending, Some(SessionPendingRequest::Input { .. })))
     {
         append_editor_text(&mut model.input, value, 16 * 1024);
-    } else if model.focus == ThreadFocus::Composer {
+    } else if model.focus == SessionFocus::Composer {
         append_editor_text(&mut model.composer, value, 16 * 1024);
         model.slash_index = 0;
         model.slash_popup_state = SlashPopupState::Eligible;
     }
 }
 
-fn record_progress(model: &mut ThreadUiModel, progress: ThreadTransientProgress) {
+fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgress) {
     if model.connection != ConnectionState::Connected {
         return;
     }
     match progress {
-        ThreadTransientProgress::AssistantDelta { run_id, text } => {
-            if let Some(ThreadTransientProgress::AssistantDelta {
-                run_id: current_run,
+        SessionTransientProgress::AssistantDelta { turn_id, text } => {
+            if let Some(SessionTransientProgress::AssistantDelta {
+                turn_id: current_turn,
                 text: current,
             }) = model.progress.last_mut()
-                && *current_run == run_id
+                && *current_turn == turn_id
             {
                 append_bounded(current, &text, 16 * 1024);
                 return;
@@ -1598,38 +1608,38 @@ fn record_progress(model: &mut ThreadUiModel, progress: ThreadTransientProgress)
             if model.progress.len() < 64 {
                 model
                     .progress
-                    .push(ThreadTransientProgress::AssistantDelta { run_id, text });
+                    .push(SessionTransientProgress::AssistantDelta { turn_id, text });
             }
         }
-        ThreadTransientProgress::ProviderAttempt { run_id, number } => {
-            if let Some(ThreadTransientProgress::ProviderAttempt {
-                run_id: current_run,
+        SessionTransientProgress::ProviderAttempt { turn_id, number } => {
+            if let Some(SessionTransientProgress::ProviderAttempt {
+                turn_id: current_turn,
                 number: current,
             }) = model.progress.iter_mut().rev().find(|item| {
-                matches!(item, ThreadTransientProgress::ProviderAttempt { run_id: candidate, .. } if *candidate == run_id)
+                matches!(item, SessionTransientProgress::ProviderAttempt { turn_id: candidate, .. } if *candidate == turn_id)
             }) {
-                *current_run = run_id;
+                *current_turn = turn_id;
                 *current = number;
             } else if model.progress.len() < 64 {
                 model
                     .progress
-                    .push(ThreadTransientProgress::ProviderAttempt { run_id, number });
+                    .push(SessionTransientProgress::ProviderAttempt { turn_id, number });
             }
         }
-        ThreadTransientProgress::ToolProgress {
-            run_id,
+        SessionTransientProgress::ToolProgress {
+            turn_id,
             name,
             detail,
         } => {
-            if let Some(ThreadTransientProgress::ToolProgress {
+            if let Some(SessionTransientProgress::ToolProgress {
                 detail: current, ..
             }) = model.progress.iter_mut().rev().find(|item| {
-                matches!(item, ThreadTransientProgress::ToolProgress { run_id: candidate, name: candidate_name, .. } if *candidate == run_id && candidate_name == &name)
+                matches!(item, SessionTransientProgress::ToolProgress { turn_id: candidate, name: candidate_name, .. } if *candidate == turn_id && candidate_name == &name)
             }) {
                 *current = detail;
             } else if model.progress.len() < 64 {
-                model.progress.push(ThreadTransientProgress::ToolProgress {
-                    run_id,
+                model.progress.push(SessionTransientProgress::ToolProgress {
+                    turn_id,
                     name,
                     detail,
                 });
@@ -1681,7 +1691,7 @@ fn is_newline(key: KeyEvent) -> bool {
     key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT
 }
 
-fn submit_slash_candidate(model: &mut ThreadUiModel) -> Option<Vec<ThreadUiAction>> {
+fn submit_slash_candidate(model: &mut SessionUiModel) -> Option<Vec<SessionUiAction>> {
     match resolve_slash(&model.composer) {
         SlashResolution::ValidationError(error) => {
             model.status = error;
@@ -1707,7 +1717,7 @@ fn submit_slash_candidate(model: &mut ThreadUiModel) -> Option<Vec<ThreadUiActio
     }
 }
 
-fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
+fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
     if model.pending_submission.is_some() || model.composer.trim().is_empty() {
         return Vec::new();
     }
@@ -1718,18 +1728,18 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     if let Some(actions) = submit_slash_candidate(model) {
         return actions;
     }
-    if model.selected_thread().is_none()
+    if model.selected_session().is_none()
         && model.startup.is_some()
         && selected_provider_model(model).is_none()
     {
         model.status = PROVIDER_SETUP_GUIDANCE.into();
         return Vec::new();
     }
-    if let Some(thread) = model.selected_thread()
-        && thread.lifecycle != ThreadLifecycle::Ready
-        && !(thread.lifecycle == ThreadLifecycle::Running
-            && thread.active_run_id.is_some()
-            && thread.pending.is_none())
+    if let Some(session) = model.selected_session()
+        && session.lifecycle != SessionLifecycle::Ready
+        && !(session.lifecycle == SessionLifecycle::Running
+            && session.active_turn_id.is_some()
+            && session.pending.is_none())
     {
         model.status =
             "This session has no runnable child; use /new or /sessions before submitting".into();
@@ -1738,10 +1748,10 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     let prompt = std::mem::take(&mut model.composer);
     let submission_id = model.next_submission_id;
     model.next_submission_id = model.next_submission_id.saturating_add(1);
-    let (thread_id, after_sequence) = model.selected_thread().map_or((None, 0), |thread| {
+    let (session_id, after_sequence) = model.selected_session().map_or((None, 0), |session| {
         (
-            Some(thread.thread_id),
-            thread
+            Some(session.session_id),
+            session
                 .transcript
                 .entries
                 .iter()
@@ -1753,11 +1763,11 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     model.pending_submission = Some(PendingSubmission {
         submission_id,
         prompt: prompt.clone(),
-        thread_id,
+        session_id,
         after_sequence,
     });
     model.submission_error = None;
-    match model.selected_thread() {
+    match model.selected_session() {
         None => match selected_provider_model(model) {
             Some((provider_name, selected_model))
                 if model.startup.as_ref().is_some_and(|startup| {
@@ -1765,37 +1775,37 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
                         || startup.default_model != selected_model
                 }) =>
             {
-                vec![ThreadUiAction::StartWithModel {
+                vec![SessionUiAction::StartWithModel {
                     submission_id,
                     prompt,
                     provider_name,
                     model: selected_model,
                 }]
             }
-            _ => vec![ThreadUiAction::Start {
+            _ => vec![SessionUiAction::Start {
                 submission_id,
                 prompt,
             }],
         },
-        Some(thread) if thread.lifecycle == ThreadLifecycle::Ready => {
-            vec![ThreadUiAction::FollowUp {
+        Some(session) if session.lifecycle == SessionLifecycle::Ready => {
+            vec![SessionUiAction::FollowUp {
                 submission_id,
-                thread_id: thread.thread_id,
-                expected_thread_revision: thread.revision,
+                session_id: session.session_id,
+                expected_session_revision: session.revision,
                 prompt,
             }]
         }
-        Some(thread)
-            if thread.lifecycle == ThreadLifecycle::Running
-                && thread.active_run_id.is_some()
-                && thread.pending.is_none()
+        Some(session)
+            if session.lifecycle == SessionLifecycle::Running
+                && session.active_turn_id.is_some()
+                && session.pending.is_none()
                 && model.queued_follow_up.is_none() =>
         {
-            let thread_id = thread.thread_id;
+            let session_id = session.session_id;
             model.status = "Follow-up queued behind the active turn".into();
-            vec![ThreadUiAction::QueueFollowUp {
+            vec![SessionUiAction::QueueFollowUp {
                 submission_id,
-                thread_id,
+                session_id,
                 prompt,
             }]
         }
@@ -1808,20 +1818,20 @@ fn submit_composer(model: &mut ThreadUiModel) -> Vec<ThreadUiAction> {
     }
 }
 
-fn reconcile_pending_submission(model: &mut ThreadUiModel) {
+fn reconcile_pending_submission(model: &mut SessionUiModel) {
     let Some(pending) = model.pending_submission.as_ref() else {
         return;
     };
-    let Some(thread_id) = pending.thread_id else {
+    let Some(session_id) = pending.session_id else {
         return;
     };
-    let durable = model.sessions.iter().any(|thread| {
-        thread.thread_id == thread_id
-            && thread.transcript.entries.iter().any(|entry| {
+    let durable = model.sessions.iter().any(|session| {
+        session.session_id == session_id
+            && session.transcript.entries.iter().any(|entry| {
                 entry.kind == TranscriptKind::User
                     && entry.sequence > pending.after_sequence
                     && is_submission_user_card(entry)
-                    && entry.text == redact_thread_text(&pending.prompt)
+                    && entry.text == redact_session_text(&pending.prompt)
             })
     });
     if durable {
@@ -1838,11 +1848,11 @@ fn reconcile_pending_submission(model: &mut ThreadUiModel) {
 }
 
 fn is_submission_user_card(entry: &TranscriptEntry) -> bool {
-    entry.source_key == "thread:create:user"
+    entry.source_key == "session:create:user"
         || (entry.source_key.starts_with("follow-up:") && entry.source_key.ends_with(":user"))
 }
 
-fn restore_pending_submission(model: &mut ThreadUiModel) {
+fn restore_pending_submission(model: &mut SessionUiModel) {
     const MESSAGE: &str = "Unable to persist submission. Prompt restored for retry.";
     let Some(pending) = model.pending_submission.take() else {
         return;
@@ -1857,18 +1867,18 @@ fn restore_pending_submission(model: &mut ThreadUiModel) {
     model.submission_refresh.composer = false;
 }
 
-fn reconcile_pending_input_submission(model: &mut ThreadUiModel) {
+fn reconcile_pending_input_submission(model: &mut SessionUiModel) {
     let Some(pending) = model.pending_input_submission.as_ref() else {
         return;
     };
-    let source_key = format!("{}:input:{}:card", pending.run_id, pending.request_id);
-    let durable = model.sessions.iter().any(|thread| {
-        thread.thread_id == pending.thread_id
-            && thread.transcript.entries.iter().any(|entry| {
+    let source_key = format!("{}:input:{}:card", pending.turn_id, pending.request_id);
+    let durable = model.sessions.iter().any(|session| {
+        session.session_id == pending.session_id
+            && session.transcript.entries.iter().any(|entry| {
                 entry.kind == TranscriptKind::User
                     && entry.sequence > pending.after_sequence
                     && entry.source_key == source_key
-                    && entry.text == redact_thread_text(&pending.value)
+                    && entry.text == redact_session_text(&pending.value)
             })
     });
     if durable {
@@ -1878,14 +1888,14 @@ fn reconcile_pending_input_submission(model: &mut ThreadUiModel) {
     }
 }
 
-fn reconcile_pending_model_switch(model: &mut ThreadUiModel) {
+fn reconcile_pending_model_switch(model: &mut SessionUiModel) {
     let Some(pending) = model.pending_model_switch.as_ref() else {
         return;
     };
-    let durable = model.sessions.iter().any(|thread| {
-        thread.thread_id == pending.thread_id
-            && thread.binding.provider_name == pending.provider_name
-            && thread.binding.model == pending.model
+    let durable = model.sessions.iter().any(|session| {
+        session.session_id == pending.session_id
+            && session.binding.provider_name == pending.provider_name
+            && session.binding.model == pending.model
     });
     if durable {
         let provider_name = pending.provider_name.clone();
@@ -1895,7 +1905,7 @@ fn reconcile_pending_model_switch(model: &mut ThreadUiModel) {
     }
 }
 
-fn finalize_failed_submissions_after_snapshot(model: &mut ThreadUiModel) {
+fn finalize_failed_submissions_after_snapshot(model: &mut SessionUiModel) {
     if model.submission_refresh.composer && model.pending_submission.is_some() {
         restore_pending_submission(model);
     }
@@ -1903,19 +1913,19 @@ fn finalize_failed_submissions_after_snapshot(model: &mut ThreadUiModel) {
         && let Some(pending) = model.pending_input_submission.take()
     {
         model.input = pending.value;
-        model.input_target = Some((pending.thread_id, pending.request_id));
+        model.input_target = Some((pending.session_id, pending.request_id));
         model.submission_refresh.input = false;
         model.status = "Unable to persist input. Input restored for retry.".into();
     }
 }
 
-fn restore_stranded_follow_up(model: &mut ThreadUiModel) {
+fn restore_stranded_follow_up(model: &mut SessionUiModel) {
     let stranded = model.queued_follow_up.is_some()
         && model.pending_submission.is_some()
-        && model.selected_thread().is_some_and(|thread| {
-            thread.active_run_id.is_none()
-                && thread.pending.is_none()
-                && thread.lifecycle != ThreadLifecycle::Ready
+        && model.selected_session().is_some_and(|session| {
+            session.active_turn_id.is_none()
+                && session.pending.is_none()
+                && session.lifecycle != SessionLifecycle::Ready
         });
     if stranded {
         restore_pending_submission(model);
@@ -1925,17 +1935,17 @@ fn restore_stranded_follow_up(model: &mut ThreadUiModel) {
     }
 }
 
-fn synchronize_input_target(model: &mut ThreadUiModel) {
+fn synchronize_input_target(model: &mut SessionUiModel) {
     if model.pending_input_submission.is_some() {
         return;
     }
     let target = model
-        .selected_thread()
-        .and_then(|thread| match thread.pending.as_ref() {
-            Some(ThreadPendingRequest::Input { request_id, .. }) => {
-                Some((thread.thread_id, request_id.clone()))
+        .selected_session()
+        .and_then(|session| match session.pending.as_ref() {
+            Some(SessionPendingRequest::Input { request_id, .. }) => {
+                Some((session.session_id, request_id.clone()))
             }
-            Some(ThreadPendingRequest::Permission { .. }) | None => None,
+            Some(SessionPendingRequest::Permission { .. }) | None => None,
         });
     if model.input_target != target {
         model.input.clear();
@@ -2110,32 +2120,32 @@ enum PresentationItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RunPresentation {
-    run_id: Option<RunId>,
+struct TurnPresentation {
+    turn_id: Option<TurnId>,
     heading: String,
     items: Vec<PresentationItem>,
 }
 
 /// Pure, display-only projection. It consumes only the public redacted
-/// transcript and run summaries, groups cards by run, and pairs tool calls and
+/// transcript and turn summaries, groups cards by turn, and pairs tool calls and
 /// results by their public `tool_call_id` when that identifier is present.
 #[allow(clippy::too_many_lines)]
-fn project_transcript(thread: &ThreadSnapshot) -> Vec<RunPresentation> {
-    let mut groups: Vec<(Option<RunId>, Vec<&TranscriptEntry>)> = Vec::new();
-    for entry in &thread.transcript.entries {
+fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
+    let mut groups: Vec<(Option<TurnId>, Vec<&TranscriptEntry>)> = Vec::new();
+    for entry in &session.transcript.entries {
         if let Some((_, entries)) = groups
             .iter_mut()
-            .find(|(run_id, _)| *run_id == entry.run_id)
+            .find(|(turn_id, _)| *turn_id == entry.turn_id)
         {
             entries.push(entry);
         } else {
-            groups.push((entry.run_id, vec![entry]));
+            groups.push((entry.turn_id, vec![entry]));
         }
     }
     groups
         .into_iter()
-        .map(|(run_id, entries)| {
-            let heading = run_heading(thread, run_id);
+        .map(|(turn_id, entries)| {
+            let heading = turn_heading(session, turn_id);
             let mut items = Vec::new();
             for entry in entries {
                 match entry.kind {
@@ -2147,10 +2157,10 @@ fn project_transcript(thread: &ThreadSnapshot) -> Vec<RunPresentation> {
                         let name = payload_string(entry, &["descriptor", "name"])
                             .or_else(|| payload_string(entry, &["name"]))
                             .unwrap_or_else(|| "Tool action".into());
-                        let state = if run_id == thread.active_run_id {
-                            match thread.lifecycle {
-                                ThreadLifecycle::WaitingPermission => ActivityState::Waiting,
-                                ThreadLifecycle::Running | ThreadLifecycle::WaitingInput => {
+                        let state = if turn_id == session.active_turn_id {
+                            match session.lifecycle {
+                                SessionLifecycle::WaitingPermission => ActivityState::Waiting,
+                                SessionLifecycle::Running | SessionLifecycle::WaitingInput => {
                                     ActivityState::Running
                                 }
                                 _ => ActivityState::Recorded,
@@ -2250,8 +2260,8 @@ fn project_transcript(thread: &ThreadSnapshot) -> Vec<RunPresentation> {
                     }
                 }
             }
-            RunPresentation {
-                run_id,
+            TurnPresentation {
+                turn_id,
                 heading,
                 items,
             }
@@ -2268,7 +2278,7 @@ fn payload_string(entry: &TranscriptEntry, path: &[&str]) -> Option<String> {
     if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
         return None;
     }
-    Some(latte_core::redact_thread_text(value))
+    Some(latte_core::redact_session_text(value))
 }
 
 fn completion_handoff(entry: &TranscriptEntry) -> Option<latte_core::Handoff> {
@@ -2333,7 +2343,7 @@ fn tool_metadata(entry: &TranscriptEntry) -> Vec<(String, String)> {
 }
 
 fn presentation_text(value: &str, cap: usize) -> String {
-    let redacted = latte_core::redact_thread_text(value);
+    let redacted = latte_core::redact_session_text(value);
     let mut output = String::with_capacity(redacted.len().min(cap));
     for ch in redacted.chars() {
         if ch.is_control() && ch != '\n' && ch != '\t' {
@@ -2348,36 +2358,36 @@ fn presentation_text(value: &str, cap: usize) -> String {
     output
 }
 
-fn run_heading(thread: &ThreadSnapshot, run_id: Option<RunId>) -> String {
-    let Some(run_id) = run_id else {
+fn turn_heading(session: &SessionSnapshot, turn_id: Option<TurnId>) -> String {
+    let Some(turn_id) = turn_id else {
         return "Conversation".into();
     };
-    thread
-        .runs
+    session
+        .turns
         .iter()
-        .find(|run| run.run_id == run_id)
+        .find(|turn| turn.turn_id == turn_id)
         .map_or_else(
-            || "Run activity".into(),
-            |run| format!("Run {} · {}", run.ordinal, run_status_label(run.status)),
+            || "Turn activity".into(),
+            |turn| format!("Turn {} · {}", turn.ordinal, turn_status_label(turn.status)),
         )
 }
 
-const fn run_status_label(status: ThreadRunStatus) -> &'static str {
+const fn turn_status_label(status: SessionTurnStatus) -> &'static str {
     match status {
-        ThreadRunStatus::Queued => "Queued",
-        ThreadRunStatus::Running => "Running",
-        ThreadRunStatus::Cancelling => "Cancelling",
-        ThreadRunStatus::WaitingPermission => "Waiting permission",
-        ThreadRunStatus::WaitingInput => "Waiting input",
-        ThreadRunStatus::Interrupted => "Interrupted",
-        ThreadRunStatus::Failed => "Failed",
-        ThreadRunStatus::Completed => "Completed",
+        SessionTurnStatus::Queued => "Queued",
+        SessionTurnStatus::Running => "Running",
+        SessionTurnStatus::Cancelling => "Cancelling",
+        SessionTurnStatus::WaitingPermission => "Waiting permission",
+        SessionTurnStatus::WaitingInput => "Waiting input",
+        SessionTurnStatus::Interrupted => "Interrupted",
+        SessionTurnStatus::Failed => "Failed",
+        SessionTurnStatus::Completed => "Completed",
     }
 }
 
-fn action_keys(thread: Option<&ThreadSnapshot>) -> Vec<String> {
-    thread.map_or_else(Vec::new, |thread| {
-        project_transcript(thread)
+fn action_keys(session: Option<&SessionSnapshot>) -> Vec<String> {
+    session.map_or_else(Vec::new, |session| {
+        project_transcript(session)
             .into_iter()
             .flat_map(|group| group.items)
             .filter_map(|item| match item {
@@ -2390,7 +2400,7 @@ fn action_keys(thread: Option<&ThreadSnapshot>) -> Vec<String> {
 
 /// Renders one focused transcript, fixed composer, and non-durable progress
 /// without exposing checkpoint or private payload JSON.
-pub fn render(frame: &mut Frame<'_>, model: &ThreadUiModel) {
+pub fn render(frame: &mut Frame<'_>, model: &SessionUiModel) {
     let area = app_rect(frame.area());
     let visual_state = visual_state(model);
     frame.render_widget(
@@ -2442,7 +2452,7 @@ pub fn render(frame: &mut Frame<'_>, model: &ThreadUiModel) {
     }
 }
 
-fn render_slash_suggestions(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: ViewportLayout) {
+fn render_slash_suggestions(frame: &mut Frame<'_>, model: &SessionUiModel, layout: ViewportLayout) {
     let suggestions = slash_popup_suggestions(model);
     let available_height = layout.composer.y.saturating_sub(layout.app.y);
     let inset = bounded_inset(layout.composer.width, layout.composer_inset);
@@ -2517,7 +2527,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, model: &ThreadUiModel, layout
     );
 }
 
-fn render_command_palette(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
+fn render_command_palette(frame: &mut Frame<'_>, model: &SessionUiModel, area: Rect) {
     let overlay = centered(area, 62, 34);
     frame.render_widget(Clear, overlay);
     let lines = BUILTINS
@@ -2561,7 +2571,7 @@ fn render_command_palette(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Re
     );
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
+fn render_session_picker(frame: &mut Frame<'_>, model: &SessionUiModel, area: Rect) {
     let overlay = centered(area, 76, 54);
     frame.render_widget(Clear, overlay);
     let mut lines = model
@@ -2593,7 +2603,7 @@ fn render_session_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rec
                     ),
                 ]),
                 Line::from(Span::styled(
-                    format!("    {workspace}  ·  {}", session.thread_id),
+                    format!("    {workspace}  ·  {}", session.session_id),
                     Style::default().fg(FAINT),
                 )),
             ]
@@ -2624,7 +2634,7 @@ fn render_session_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rec
     );
 }
 
-fn render_model_picker(frame: &mut Frame<'_>, model: &ThreadUiModel, area: Rect) {
+fn render_model_picker(frame: &mut Frame<'_>, model: &SessionUiModel, area: Rect) {
     let overlay = centered(area, 72, 68);
     frame.render_widget(Clear, overlay);
     let options = filtered_model_options(model);
@@ -2735,7 +2745,7 @@ fn bounded_inset(width: u16, desired: u16) -> u16 {
     desired.min(width.saturating_sub(1) / 2)
 }
 
-fn viewport_layout(area: Rect, state: VisualState, model: &ThreadUiModel) -> ViewportLayout {
+fn viewport_layout(area: Rect, state: VisualState, model: &SessionUiModel) -> ViewportLayout {
     let tier = ViewportTier::for_width(area.width);
     let idle_composition = IdleComposition::for_area(area, tier);
     let desired_header_height = match state {
@@ -2832,10 +2842,10 @@ fn viewport_layout(area: Rect, state: VisualState, model: &ThreadUiModel) -> Vie
     }
 }
 
-fn editor_text(model: &ThreadUiModel) -> String {
+fn editor_text(model: &SessionUiModel) -> String {
     if model
-        .selected_thread()
-        .is_some_and(|thread| matches!(thread.pending, Some(ThreadPendingRequest::Input { .. })))
+        .selected_session()
+        .is_some_and(|session| matches!(session.pending, Some(SessionPendingRequest::Input { .. })))
     {
         model.input.clone()
     } else {
@@ -2847,41 +2857,41 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     wrap_text(text, width).len().max(1)
 }
 
-fn visual_state(model: &ThreadUiModel) -> VisualState {
-    let Some(thread) = model.selected_thread() else {
+fn visual_state(model: &SessionUiModel) -> VisualState {
+    let Some(session) = model.selected_session() else {
         return if model.pending_submission.is_some() {
             VisualState::Active
         } else {
             VisualState::Idle
         };
     };
-    if thread.lifecycle == ThreadLifecycle::ReconciliationRequired {
+    if session.lifecycle == SessionLifecycle::ReconciliationRequired {
         return VisualState::Reconciliation;
     }
-    if thread.lifecycle == ThreadLifecycle::WaitingPermission
+    if session.lifecycle == SessionLifecycle::WaitingPermission
         || matches!(
-            thread.pending,
-            Some(ThreadPendingRequest::Permission { .. })
+            session.pending,
+            Some(SessionPendingRequest::Permission { .. })
         )
     {
         return VisualState::Permission;
     }
-    let latest_run_completed = thread.latest_run_id.is_some_and(|latest_run_id| {
-        thread
-            .runs
+    let latest_turn_completed = session.latest_turn_id.is_some_and(|latest_turn_id| {
+        session
+            .turns
             .iter()
-            .find(|run| run.run_id == latest_run_id)
-            .is_some_and(|run| run.status == ThreadRunStatus::Completed)
+            .find(|turn| turn.turn_id == latest_turn_id)
+            .is_some_and(|turn| turn.status == SessionTurnStatus::Completed)
     });
-    let latest_transcript_card_is_completion = thread
+    let latest_transcript_card_is_completion = session
         .transcript
         .entries
         .iter()
         .rev()
         .find(|entry| entry.kind != TranscriptKind::System)
         .is_some_and(|entry| entry.kind == TranscriptKind::Completion);
-    if thread.lifecycle == ThreadLifecycle::Ready
-        && (latest_run_completed || latest_transcript_card_is_completion)
+    if session.lifecycle == SessionLifecycle::Ready
+        && (latest_turn_completed || latest_transcript_card_is_completion)
     {
         return VisualState::Complete;
     }
@@ -2890,7 +2900,7 @@ fn visual_state(model: &ThreadUiModel) -> VisualState {
 
 fn render_header(
     frame: &mut Frame<'_>,
-    model: &ThreadUiModel,
+    model: &SessionUiModel,
     visual_state: VisualState,
     layout: ViewportLayout,
 ) {
@@ -2901,7 +2911,7 @@ fn render_header(
         render_welcome_header(frame, model, layout);
         return;
     }
-    let Some(thread) = model.selected_thread() else {
+    let Some(session) = model.selected_session() else {
         let inset = bounded_inset(layout.app.width, layout.tier.compact_inset());
         let width = layout.app.width.saturating_sub(inset * 2);
         let x = layout.app.x + inset;
@@ -2929,8 +2939,8 @@ fn render_header(
         VisualState::Permission => ("Waiting for approval", AMBER),
         VisualState::Complete => ("Ready", GREEN),
         VisualState::Active => (
-            lifecycle_label(thread.lifecycle),
-            lifecycle_color(thread.lifecycle),
+            lifecycle_label(session.lifecycle),
+            lifecycle_color(session.lifecycle),
         ),
         VisualState::Idle => unreachable!(),
     };
@@ -2990,7 +3000,7 @@ fn render_header(
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_welcome_header(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: ViewportLayout) {
+fn render_welcome_header(frame: &mut Frame<'_>, model: &SessionUiModel, layout: ViewportLayout) {
     if layout.header.height < layout.idle_composition.header_height() || layout.app.width < 40 {
         render_constrained_welcome_header(frame, model, layout);
         return;
@@ -3102,7 +3112,7 @@ fn render_welcome_header(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: V
 
 fn render_constrained_welcome_header(
     frame: &mut Frame<'_>,
-    model: &ThreadUiModel,
+    model: &SessionUiModel,
     layout: ViewportLayout,
 ) {
     if layout.header.height == 0 {
@@ -3174,8 +3184,8 @@ fn render_constrained_welcome_header(
 
 fn render_environment_card(
     frame: &mut Frame<'_>,
-    ui: &ThreadUiModel,
-    startup: &ThreadStartupPresentation,
+    ui: &SessionUiModel,
+    startup: &SessionStartupPresentation,
     area: Rect,
 ) {
     let model = selected_provider_model(ui).map_or_else(
@@ -3217,7 +3227,7 @@ fn render_environment_card(
     );
 }
 
-fn render_welcome(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: ViewportLayout) {
+fn render_welcome(frame: &mut Frame<'_>, model: &SessionUiModel, layout: ViewportLayout) {
     if layout.transcript.height == 0 {
         return;
     }
@@ -3286,7 +3296,7 @@ fn render_welcome(frame: &mut Frame<'_>, model: &ThreadUiModel, layout: Viewport
 #[allow(clippy::too_many_lines)]
 fn render_transcript(
     frame: &mut Frame<'_>,
-    model: &ThreadUiModel,
+    model: &SessionUiModel,
     visual_state: VisualState,
     layout: ViewportLayout,
 ) {
@@ -3311,24 +3321,24 @@ fn render_transcript(
             area.width,
         );
     }
-    if let Some(thread) = model.selected_thread() {
-        if thread.transcript.has_more {
+    if let Some(session) = model.selected_session() {
+        if session.transcript.has_more {
             lines.push(Line::from(Span::styled(
                 "[… earlier transcript cards are omitted from this bounded current view]",
                 Style::default().fg(FAINT),
             )));
             lines.push(Line::from(""));
         }
-        for group in project_transcript(thread) {
+        for group in project_transcript(session) {
             let phase_color = group
-                .run_id
-                .and_then(|run_id| thread.runs.iter().find(|run| run.run_id == run_id))
-                .map_or(TEXT_SOFT, |run| run_status_color(run.status));
+                .turn_id
+                .and_then(|turn_id| session.turns.iter().find(|turn| turn.turn_id == turn_id))
+                .map_or(TEXT_SOFT, |turn| turn_status_color(turn.status));
             let last_action_index = group
                 .items
                 .iter()
                 .rposition(|item| matches!(item, PresentationItem::Action { .. }));
-            let mut heading_rendered = group.run_id.is_none();
+            let mut heading_rendered = group.turn_id.is_none();
             for (item_index, item) in group.items.into_iter().enumerate() {
                 if !heading_rendered
                     && !matches!(
@@ -3369,7 +3379,7 @@ fn render_transcript(
                         result,
                         ..
                     } => {
-                        let selected = model.focus == ThreadFocus::Navigation
+                        let selected = model.focus == SessionFocus::Navigation
                             && model.navigation_index == action_index;
                         let expanded = model.expanded_actions.contains(&key);
                         let (symbol, color) = activity_style(state);
@@ -3442,7 +3452,7 @@ fn render_transcript(
             }
             lines.push(Line::from(""));
         }
-        if let Some(ThreadPendingRequest::Input { prompt, .. }) = thread.pending.as_ref() {
+        if let Some(SessionPendingRequest::Input { prompt, .. }) = session.pending.as_ref() {
             lines.push(Line::from(Span::styled(
                 format!("? Input required · {}", presentation_text(prompt, 360)),
                 Style::default().fg(AMBER),
@@ -3452,8 +3462,8 @@ fn render_transcript(
     }
     for progress in &model.progress {
         if model
-            .selected_thread()
-            .is_none_or(|thread| thread.active_run_id != Some(progress_run_id(progress)))
+            .selected_session()
+            .is_none_or(|session| session.active_turn_id != Some(progress_turn_id(progress)))
         {
             continue;
         }
@@ -3570,29 +3580,29 @@ fn wrapped_presentation_line_height(line: &Line<'_>, width: u16) -> usize {
 /// offset can never move the required decision out of view.
 fn render_blocking_card(
     frame: &mut Frame<'_>,
-    model: &ThreadUiModel,
+    model: &SessionUiModel,
     visual_state: VisualState,
     area: Rect,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Some(thread) = model.selected_thread() else {
+    let Some(session) = model.selected_session() else {
         return;
     };
     let mut lines = Vec::new();
     let mut compact_lines = Vec::new();
     match visual_state {
         VisualState::Permission => {
-            let Some(ThreadPendingRequest::Permission {
+            let Some(SessionPendingRequest::Permission {
                 request_id,
                 description,
                 ..
-            }) = thread.pending.as_ref()
+            }) = session.pending.as_ref()
             else {
                 return;
             };
-            let permission = permission_presentation(thread, request_id, description);
+            let permission = permission_presentation(session, request_id, description);
             render_permission_card(&mut lines, &permission, area.width);
             compact_lines.extend([
                 Line::from(Span::styled(
@@ -3607,10 +3617,10 @@ fn render_blocking_card(
             ]);
         }
         VisualState::Reconciliation => {
-            let Some(effect_id) = reconciliation_effect_id(model, thread) else {
+            let Some(effect_id) = reconciliation_effect_id(model, session) else {
                 return;
             };
-            render_reconciliation_card(&mut lines, model, thread, &effect_id, area.width);
+            render_reconciliation_card(&mut lines, model, session, &effect_id, area.width);
             compact_lines.extend([
                 Line::from(Span::styled(
                     "! Reconciliation required",
@@ -3848,8 +3858,8 @@ fn render_permission_card(
 
 fn render_reconciliation_card(
     lines: &mut Vec<Line<'static>>,
-    model: &ThreadUiModel,
-    thread: &ThreadSnapshot,
+    model: &SessionUiModel,
+    session: &SessionSnapshot,
     effect_id: &str,
     width: u16,
 ) {
@@ -3872,7 +3882,7 @@ fn render_reconciliation_card(
     let open = model
         .reconciliation_confirmation
         .as_ref()
-        .is_some_and(|(thread_id, _)| *thread_id == thread.thread_id);
+        .is_some_and(|(session_id, _)| *session_id == session.session_id);
     card_row(
         lines,
         if open {
@@ -3935,9 +3945,9 @@ fn card_bottom(lines: &mut Vec<Line<'static>>, width: u16) {
     ]));
 }
 
-fn render_progress(lines: &mut Vec<Line<'static>>, progress: &ThreadTransientProgress) {
+fn render_progress(lines: &mut Vec<Line<'static>>, progress: &SessionTransientProgress) {
     match progress {
-        ThreadTransientProgress::AssistantDelta { text, .. } => lines.push(Line::from(vec![
+        SessionTransientProgress::AssistantDelta { text, .. } => lines.push(Line::from(vec![
             Span::styled(" • ", Style::default().fg(CYAN)),
             Span::styled(
                 presentation_text(text, 2 * 1024),
@@ -3954,7 +3964,7 @@ fn render_progress(lines: &mut Vec<Line<'static>>, progress: &ThreadTransientPro
 #[allow(clippy::too_many_lines)]
 fn render_composer(
     frame: &mut Frame<'_>,
-    model: &ThreadUiModel,
+    model: &SessionUiModel,
     visual_state: VisualState,
     layout: ViewportLayout,
 ) {
@@ -3962,19 +3972,19 @@ fn render_composer(
         if model.pending_submission.is_some() && model.composer.is_empty() {
             ("Submitting…".into(), true, CYAN)
         } else {
-            match model.selected_thread() {
-                Some(thread) if thread.lifecycle == ThreadLifecycle::ReconciliationRequired => (
+            match model.selected_session() {
+                Some(session) if session.lifecycle == SessionLifecycle::ReconciliationRequired => (
                     "Resolve the unknown effect outcome before continuing".into(),
                     true,
                     AMBER,
                 ),
-                Some(thread) => match thread.pending.as_ref() {
-                    Some(ThreadPendingRequest::Permission { .. }) => (
+                Some(session) => match session.pending.as_ref() {
+                    Some(SessionPendingRequest::Permission { .. }) => (
                         "Resolve the permission request to continue".into(),
                         true,
                         AMBER,
                     ),
-                    Some(ThreadPendingRequest::Input { prompt, .. }) => (
+                    Some(SessionPendingRequest::Input { prompt, .. }) => (
                         if model.input.is_empty() {
                             presentation_text(prompt, 160)
                         } else {
@@ -3994,7 +4004,7 @@ fn render_composer(
                             model.composer.clone()
                         },
                         model.composer.is_empty(),
-                        if model.focus == ThreadFocus::Composer {
+                        if model.focus == SessionFocus::Composer {
                             LATTE
                         } else {
                             FAINT
@@ -4126,7 +4136,7 @@ fn render_composer(
         visual_state,
         VisualState::Permission | VisualState::Reconciliation
     );
-    if !disabled && model.focus == ThreadFocus::Composer && inner.width > 0 {
+    if !disabled && model.focus == SessionFocus::Composer && inner.width > 0 {
         let visible_start = editor_layout
             .rows
             .len()
@@ -4146,14 +4156,14 @@ fn render_composer(
     }
 }
 
-fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) {
+fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String) {
     if model.pending_submission.is_some() {
         return (
             "Submitting".into(),
             "Compose next prompt · Shift+Enter newline".into(),
         );
     }
-    let Some(thread) = model.selected_thread() else {
+    let Some(session) = model.selected_session() else {
         if selected_provider_model(model).is_none()
             && model
                 .startup
@@ -4190,12 +4200,12 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
         });
         return (left, "Ctrl+Enter send · Ctrl+P commands".into());
     };
-    let model_name = presentation_text(&thread.binding.model, 80);
+    let model_name = presentation_text(&session.binding.model, 80);
     let left = match state {
         VisualState::Permission => format!("Attention · {model_name}"),
         VisualState::Reconciliation => format!("Reconciliation · {model_name}"),
         VisualState::Complete => format!("Ready for follow-up · {model_name}"),
-        VisualState::Active => format!("{} · {model_name}", lifecycle_label(thread.lifecycle)),
+        VisualState::Active => format!("{} · {model_name}", lifecycle_label(session.lifecycle)),
         VisualState::Idle => unreachable!(),
     };
     let right = if model
@@ -4213,9 +4223,9 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
         }
     } else if state == VisualState::Permission {
         "d deny · Ctrl+A allow once · Enter does nothing".into()
-    } else if matches!(thread.pending, Some(ThreadPendingRequest::Input { .. })) {
+    } else if matches!(session.pending, Some(SessionPendingRequest::Input { .. })) {
         "Enter send · Shift+Enter newline".into()
-    } else if model.focus == ThreadFocus::Navigation {
+    } else if model.focus == SessionFocus::Navigation {
         "j/k select · Enter expand · Esc composer".into()
     } else {
         "Enter send · Shift+Enter newline · Ctrl+P commands".into()
@@ -4224,7 +4234,7 @@ fn composer_meta(model: &ThreadUiModel, state: VisualState) -> (String, String) 
 }
 
 #[cfg(test)]
-fn status_line(model: &ThreadUiModel) -> String {
+fn status_line(model: &SessionUiModel) -> String {
     composer_meta(model, visual_state(model)).1
 }
 
@@ -4392,38 +4402,40 @@ fn grapheme_width_at(grapheme: &str, column: usize) -> usize {
     }
 }
 
-const fn lifecycle_label(lifecycle: ThreadLifecycle) -> &'static str {
+const fn lifecycle_label(lifecycle: SessionLifecycle) -> &'static str {
     match lifecycle {
-        ThreadLifecycle::Ready => "Ready",
-        ThreadLifecycle::Running => "Running",
-        ThreadLifecycle::WaitingPermission => "Waiting permission",
-        ThreadLifecycle::WaitingInput => "Waiting input",
-        ThreadLifecycle::Interrupted => "Interrupted",
-        ThreadLifecycle::Failed => "Failed",
-        ThreadLifecycle::ReconciliationRequired => "Reconciliation required",
+        SessionLifecycle::Ready => "Ready",
+        SessionLifecycle::Running => "Running",
+        SessionLifecycle::WaitingPermission => "Waiting permission",
+        SessionLifecycle::WaitingInput => "Waiting input",
+        SessionLifecycle::Interrupted => "Interrupted",
+        SessionLifecycle::Failed => "Failed",
+        SessionLifecycle::ReconciliationRequired => "Reconciliation required",
     }
 }
 
-const fn lifecycle_color(lifecycle: ThreadLifecycle) -> Color {
+const fn lifecycle_color(lifecycle: SessionLifecycle) -> Color {
     match lifecycle {
-        ThreadLifecycle::Ready => GREEN,
-        ThreadLifecycle::Running => CYAN,
-        ThreadLifecycle::WaitingPermission
-        | ThreadLifecycle::WaitingInput
-        | ThreadLifecycle::ReconciliationRequired
-        | ThreadLifecycle::Interrupted => AMBER,
-        ThreadLifecycle::Failed => RED,
+        SessionLifecycle::Ready => GREEN,
+        SessionLifecycle::Running => CYAN,
+        SessionLifecycle::WaitingPermission
+        | SessionLifecycle::WaitingInput
+        | SessionLifecycle::ReconciliationRequired
+        | SessionLifecycle::Interrupted => AMBER,
+        SessionLifecycle::Failed => RED,
     }
 }
 
-const fn run_status_color(status: ThreadRunStatus) -> Color {
+const fn turn_status_color(status: SessionTurnStatus) -> Color {
     match status {
-        ThreadRunStatus::Queued | ThreadRunStatus::Running | ThreadRunStatus::Cancelling => CYAN,
-        ThreadRunStatus::WaitingPermission
-        | ThreadRunStatus::WaitingInput
-        | ThreadRunStatus::Interrupted => AMBER,
-        ThreadRunStatus::Failed => RED,
-        ThreadRunStatus::Completed => GREEN,
+        SessionTurnStatus::Queued | SessionTurnStatus::Running | SessionTurnStatus::Cancelling => {
+            CYAN
+        }
+        SessionTurnStatus::WaitingPermission
+        | SessionTurnStatus::WaitingInput
+        | SessionTurnStatus::Interrupted => AMBER,
+        SessionTurnStatus::Failed => RED,
+        SessionTurnStatus::Completed => GREEN,
     }
 }
 
@@ -4445,11 +4457,11 @@ const fn connection_label(connection: ConnectionState) -> &'static str {
     }
 }
 
-fn reconciliation_effect_from_snapshot(thread: &ThreadSnapshot) -> Option<String> {
-    if thread.lifecycle != ThreadLifecycle::ReconciliationRequired {
+fn reconciliation_effect_from_snapshot(session: &SessionSnapshot) -> Option<String> {
+    if session.lifecycle != SessionLifecycle::ReconciliationRequired {
         return None;
     }
-    thread.transcript.entries.iter().rev().find_map(|entry| {
+    session.transcript.entries.iter().rev().find_map(|entry| {
         if entry.kind != TranscriptKind::Failure {
             return None;
         }
@@ -4466,18 +4478,18 @@ fn reconciliation_effect_from_snapshot(thread: &ThreadSnapshot) -> Option<String
     })
 }
 
-fn reconciliation_effect_id(model: &ThreadUiModel, thread: &ThreadSnapshot) -> Option<String> {
+fn reconciliation_effect_id(model: &SessionUiModel, session: &SessionSnapshot) -> Option<String> {
     model
         .reconciliation_hint
         .as_ref()
-        .filter(|(thread_id, _)| *thread_id == thread.thread_id)
+        .filter(|(session_id, _)| *session_id == session.session_id)
         .map(|(_, effect_id)| effect_id.clone())
-        .or_else(|| reconciliation_effect_from_snapshot(thread))
+        .or_else(|| reconciliation_effect_from_snapshot(session))
 }
 
 fn permission_context(description: &str) -> String {
     const CAP: usize = 360;
-    let redacted = latte_core::redact_thread_text(description);
+    let redacted = latte_core::redact_session_text(description);
     let mut output = String::with_capacity(redacted.len().min(CAP));
     for ch in redacted.chars() {
         if ch.is_control() {
@@ -4497,11 +4509,11 @@ fn permission_context(description: &str) -> String {
 }
 
 fn permission_presentation(
-    thread: &ThreadSnapshot,
+    session: &SessionSnapshot,
     request_id: &str,
     description: &str,
 ) -> PermissionPresentation {
-    let descriptor = thread.transcript.entries.iter().rev().find_map(|entry| {
+    let descriptor = session.transcript.entries.iter().rev().find_map(|entry| {
         if entry.kind != TranscriptKind::ToolCall {
             return None;
         }
@@ -4551,15 +4563,15 @@ fn permission_presentation(
     }
 }
 
-fn progress_text(progress: &ThreadTransientProgress) -> String {
+fn progress_text(progress: &SessionTransientProgress) -> String {
     match progress {
-        ThreadTransientProgress::ProviderAttempt { number, .. } => {
+        SessionTransientProgress::ProviderAttempt { number, .. } => {
             format!("… provider attempt {number}")
         }
-        ThreadTransientProgress::AssistantDelta { text, .. } => {
+        SessionTransientProgress::AssistantDelta { text, .. } => {
             format!("… {}", presentation_text(text, 2 * 1024))
         }
-        ThreadTransientProgress::ToolProgress { name, detail, .. } => format!(
+        SessionTransientProgress::ToolProgress { name, detail, .. } => format!(
             "… {}: {}",
             presentation_text(name, 80),
             presentation_text(detail, 360)
@@ -4567,11 +4579,11 @@ fn progress_text(progress: &ThreadTransientProgress) -> String {
     }
 }
 
-const fn progress_run_id(progress: &ThreadTransientProgress) -> RunId {
+const fn progress_turn_id(progress: &SessionTransientProgress) -> TurnId {
     match progress {
-        ThreadTransientProgress::ProviderAttempt { run_id, .. }
-        | ThreadTransientProgress::AssistantDelta { run_id, .. }
-        | ThreadTransientProgress::ToolProgress { run_id, .. } => *run_id,
+        SessionTransientProgress::ProviderAttempt { turn_id, .. }
+        | SessionTransientProgress::AssistantDelta { turn_id, .. }
+        | SessionTransientProgress::ToolProgress { turn_id, .. } => *turn_id,
     }
 }
 
@@ -4590,22 +4602,22 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     .split(vertical[1])[1]
 }
 
-/// Thread terminal loop. Like the v1 loop it only dispatches actions through
+/// Session terminal loop. Like the v1 loop it only dispatches actions through
 /// the supplied callback and never calls an engine directly.
 ///
 /// # Errors
 ///
 /// Returns a typed terminal, projection, or action-dispatch failure.
-fn apply_thread_actions(
-    projection: &mut dyn ThreadProjectionClient,
-    model: &mut ThreadUiModel,
-    sink: &mut impl FnMut(ThreadUiAction) -> Result<(), String>,
-    actions: Vec<ThreadUiAction>,
+fn apply_session_actions(
+    projection: &mut dyn SessionProjectionClient,
+    model: &mut SessionUiModel,
+    sink: &mut impl FnMut(SessionUiAction) -> Result<(), String>,
+    actions: Vec<SessionUiAction>,
 ) -> Result<bool, TuiError> {
     for action in actions {
         match action {
-            ThreadUiAction::Quit => return Ok(true),
-            ThreadUiAction::ShowSessions { query } => {
+            SessionUiAction::Quit => return Ok(true),
+            SessionUiAction::ShowSessions { query } => {
                 if let Some(snapshot) = query
                     .as_deref()
                     .map(|query| projection.exact_session(query))
@@ -4613,8 +4625,8 @@ fn apply_thread_actions(
                     .map_err(TuiError::Action)?
                     .flatten()
                 {
-                    let next = reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)));
-                    if apply_thread_actions(projection, model, sink, next)? {
+                    let next = reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)));
+                    if apply_session_actions(projection, model, sink, next)? {
                         return Ok(true);
                     }
                     continue;
@@ -4628,62 +4640,62 @@ fn apply_thread_actions(
                 };
                 let next = reduce(
                     model,
-                    ThreadUiInput::SessionCatalogReady { sessions, query },
+                    SessionUiInput::SessionCatalogReady { sessions, query },
                 );
-                if apply_thread_actions(projection, model, sink, next)? {
+                if apply_session_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
             }
-            ThreadUiAction::SearchSessions { query } => {
+            SessionUiAction::SearchSessions { query } => {
                 let sessions = projection
                     .search_session_catalog(&query)
                     .map_err(TuiError::Action)?;
                 let next = reduce(
                     model,
-                    ThreadUiInput::SessionCatalogReady {
+                    SessionUiInput::SessionCatalogReady {
                         sessions,
                         query: (!query.is_empty()).then_some(query),
                     },
                 );
-                if apply_thread_actions(projection, model, sink, next)? {
+                if apply_session_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
             }
-            ThreadUiAction::OpenSession { thread_id } => {
-                let snapshot = match projection.session(thread_id) {
+            SessionUiAction::OpenSession { session_id } => {
+                let snapshot = match projection.session(session_id) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        reduce(model, ThreadUiInput::CommandError(error));
+                        reduce(model, SessionUiInput::CommandError(error));
                         continue;
                     }
                 };
-                let next = reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)));
-                if apply_thread_actions(projection, model, sink, next)? {
+                let next = reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)));
+                if apply_session_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
             }
-            ThreadUiAction::RefreshSnapshots => {
+            SessionUiAction::RefreshSnapshots => {
                 // A snapshot refresh is a typed projection operation, not a
                 // runtime effect. Consume it in the terminal adapter so a
                 // production command closure cannot accidentally ignore the
                 // recovery path after a broadcast receiver reports Lagged.
                 let next = match model.active_conversation {
-                    Some(ActiveConversation::Session(thread_id)) => {
-                        let snapshot = projection.session(thread_id).map_err(TuiError::Action)?;
-                        reduce(model, ThreadUiInput::SessionOpened(Box::new(snapshot)))
+                    Some(ActiveConversation::Session(session_id)) => {
+                        let snapshot = projection.session(session_id).map_err(TuiError::Action)?;
+                        reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)))
                     }
                     Some(ActiveConversation::NewSessionDraft)
                         if model.pending_submission.is_none() =>
                     {
                         let sessions = projection.session_catalog().map_err(TuiError::Action)?;
-                        reduce(model, ThreadUiInput::SessionCatalog(sessions))
+                        reduce(model, SessionUiInput::SessionCatalog(sessions))
                     }
                     Some(ActiveConversation::NewSessionDraft) | None => {
                         let snapshots = projection.snapshots().map_err(TuiError::Action)?;
-                        reduce(model, ThreadUiInput::Snapshot(snapshots))
+                        reduce(model, SessionUiInput::Snapshot(snapshots))
                     }
                 };
-                if apply_thread_actions(projection, model, sink, next)? {
+                if apply_session_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
             }
@@ -4694,95 +4706,100 @@ fn apply_thread_actions(
 }
 
 fn drain_runtime_updates(
-    model: &mut ThreadUiModel,
-    feedback: &Receiver<ThreadUiFeedback>,
-    progress: &Receiver<ThreadTransientProgress>,
-) -> (bool, Vec<ThreadUiAction>) {
+    model: &mut SessionUiModel,
+    feedback: &Receiver<SessionUiFeedback>,
+    progress: &Receiver<SessionTransientProgress>,
+) -> (bool, Vec<SessionUiAction>) {
     let mut changed = false;
     let mut actions = Vec::new();
     while let Ok(result) = feedback.try_recv() {
         let next = match result {
-            ThreadUiFeedback::SubmissionAssigned {
+            SessionUiFeedback::SubmissionAssigned {
                 submission_id,
-                thread_id,
+                session_id,
             } => reduce(
                 model,
-                ThreadUiInput::SubmissionAssigned {
+                SessionUiInput::SubmissionAssigned {
                     submission_id,
-                    thread_id,
+                    session_id,
                 },
             ),
-            ThreadUiFeedback::SubmissionResult {
+            SessionUiFeedback::SubmissionResult {
                 submission_id,
                 result: Ok(_),
-            } => reduce(model, ThreadUiInput::SubmissionCompleted { submission_id }),
-            ThreadUiFeedback::SubmissionResult {
+            } => reduce(model, SessionUiInput::SubmissionCompleted { submission_id }),
+            SessionUiFeedback::SubmissionResult {
                 submission_id,
                 result: Err(_),
-            } => reduce(model, ThreadUiInput::SubmissionError { submission_id }),
-            ThreadUiFeedback::InputSubmissionResult {
+            } => reduce(model, SessionUiInput::SubmissionError { submission_id }),
+            SessionUiFeedback::InputSubmissionResult {
                 submission_id,
                 result: Ok(_),
             } => reduce(
                 model,
-                ThreadUiInput::InputSubmissionCompleted { submission_id },
+                SessionUiInput::InputSubmissionCompleted { submission_id },
             ),
-            ThreadUiFeedback::InputSubmissionResult {
+            SessionUiFeedback::InputSubmissionResult {
                 submission_id,
                 result: Err(_),
-            } => reduce(model, ThreadUiInput::InputSubmissionError { submission_id }),
-            ThreadUiFeedback::ModelSwitchResult {
+            } => reduce(
+                model,
+                SessionUiInput::InputSubmissionError { submission_id },
+            ),
+            SessionUiFeedback::ModelSwitchResult {
                 switch_id,
                 result: Ok(_),
-            } => reduce(model, ThreadUiInput::ModelSwitchCompleted { switch_id }),
-            ThreadUiFeedback::ModelSwitchResult {
+            } => reduce(model, SessionUiInput::ModelSwitchCompleted { switch_id }),
+            SessionUiFeedback::ModelSwitchResult {
                 switch_id,
                 result: Err(error),
-            } => reduce(model, ThreadUiInput::ModelSwitchError { switch_id, error }),
-            ThreadUiFeedback::Command(Ok(message)) => {
-                reduce(model, ThreadUiInput::CommandCompleted(message))
+            } => reduce(model, SessionUiInput::ModelSwitchError { switch_id, error }),
+            SessionUiFeedback::Command(Ok(message)) => {
+                reduce(model, SessionUiInput::CommandCompleted(message))
             }
-            ThreadUiFeedback::Command(Err(error))
-            | ThreadUiFeedback::SessionManagement(Err(error)) => {
-                reduce(model, ThreadUiInput::CommandError(error))
+            SessionUiFeedback::Command(Err(error))
+            | SessionUiFeedback::SessionManagement(Err(error)) => {
+                reduce(model, SessionUiInput::CommandError(error))
             }
-            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Updated(message))) => {
-                let mut actions = reduce(model, ThreadUiInput::CommandCompleted(message));
-                actions.push(ThreadUiAction::RefreshSnapshots);
+            SessionUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Updated(
+                message,
+            ))) => {
+                let mut actions = reduce(model, SessionUiInput::CommandCompleted(message));
+                actions.push(SessionUiAction::RefreshSnapshots);
                 actions
             }
-            ThreadUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Forked(
-                thread_id,
+            SessionUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Forked(
+                session_id,
             ))) => {
-                vec![ThreadUiAction::OpenSession { thread_id }]
+                vec![SessionUiAction::OpenSession { session_id }]
             }
         };
         actions.extend(next);
         changed = true;
     }
     while let Ok(update) = progress.try_recv() {
-        reduce(model, ThreadUiInput::Progress(update));
+        reduce(model, SessionUiInput::Progress(update));
         changed = true;
     }
     (changed, actions)
 }
 
 pub fn run_with_feedback_and_progress(
-    projection: &mut dyn ThreadProjectionClient,
-    startup: ThreadStartupPresentation,
-    mut sink: impl FnMut(ThreadUiAction) -> Result<(), String>,
-    feedback: &Receiver<ThreadUiFeedback>,
-    progress: &Receiver<ThreadTransientProgress>,
+    projection: &mut dyn SessionProjectionClient,
+    startup: SessionStartupPresentation,
+    mut sink: impl FnMut(SessionUiAction) -> Result<(), String>,
+    feedback: &Receiver<SessionUiFeedback>,
+    progress: &Receiver<SessionTransientProgress>,
 ) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NonTty);
     }
     let guard = crate::TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut model = ThreadUiModel::with_startup(startup);
+    let mut model = SessionUiModel::with_startup(startup);
     let sessions = projection.session_catalog().map_err(TuiError::Action)?;
-    let initial_actions = reduce(&mut model, ThreadUiInput::SessionCatalog(sessions));
-    if apply_thread_actions(projection, &mut model, &mut sink, initial_actions)? {
+    let initial_actions = reduce(&mut model, SessionUiInput::SessionCatalog(sessions));
+    if apply_session_actions(projection, &mut model, &mut sink, initial_actions)? {
         return Ok(());
     }
     let mut redraw = true;
@@ -4796,51 +4813,51 @@ pub fn run_with_feedback_and_progress(
         }
         if redraw {
             terminal.draw(|frame| render(frame, &model))?;
-            reduce(&mut model, ThreadUiInput::FrameRendered);
+            reduce(&mut model, SessionUiInput::FrameRendered);
             redraw = false;
         }
         if guard.take_interrupted() {
             let actions = reduce(
                 &mut model,
-                ThreadUiInput::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                SessionUiInput::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             );
-            if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+            if apply_session_actions(projection, &mut model, &mut sink, actions)? {
                 return Ok(());
             }
             redraw = true;
         }
         match projection.poll() {
-            ThreadProjectionPoll::Event => {
-                let actions = vec![ThreadUiAction::RefreshSnapshots];
-                if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+            SessionProjectionPoll::Event => {
+                let actions = vec![SessionUiAction::RefreshSnapshots];
+                if apply_session_actions(projection, &mut model, &mut sink, actions)? {
                     return Ok(());
                 }
                 redraw = true;
             }
-            ThreadProjectionPoll::Lagged(_) => {
-                let actions = reduce(&mut model, ThreadUiInput::Lagged);
-                if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+            SessionProjectionPoll::Lagged(_) => {
+                let actions = reduce(&mut model, SessionUiInput::Lagged);
+                if apply_session_actions(projection, &mut model, &mut sink, actions)? {
                     return Ok(());
                 }
                 redraw = true;
             }
-            ThreadProjectionPoll::Closed => {
+            SessionProjectionPoll::Closed => {
                 if model.connection != ConnectionState::Disconnected {
-                    reduce(&mut model, ThreadUiInput::Disconnected);
+                    reduce(&mut model, SessionUiInput::Disconnected);
                     redraw = true;
                 }
             }
-            ThreadProjectionPoll::Error(error) => {
+            SessionProjectionPoll::Error(error) => {
                 let next = format!("Command rejected: {error}");
                 if model.status != next {
-                    reduce(&mut model, ThreadUiInput::CommandError(error));
+                    reduce(&mut model, SessionUiInput::CommandError(error));
                     redraw = true;
                 }
             }
-            ThreadProjectionPoll::Empty => {}
+            SessionProjectionPoll::Empty => {}
         }
         let (updates_changed, actions) = drain_runtime_updates(&mut model, feedback, progress);
-        if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+        if apply_session_actions(projection, &mut model, &mut sink, actions)? {
             return Ok(());
         }
         if updates_changed {
@@ -4849,22 +4866,22 @@ pub fn run_with_feedback_and_progress(
         if event::poll(Duration::from_millis(80))? {
             match event::read()? {
                 Event::Key(key) => {
-                    let actions = reduce(&mut model, ThreadUiInput::Key(key));
-                    if apply_thread_actions(projection, &mut model, &mut sink, actions)? {
+                    let actions = reduce(&mut model, SessionUiInput::Key(key));
+                    if apply_session_actions(projection, &mut model, &mut sink, actions)? {
                         return Ok(());
                     }
                     redraw = true;
                 }
                 Event::Mouse(mouse) => {
-                    reduce(&mut model, ThreadUiInput::Mouse(mouse));
+                    reduce(&mut model, SessionUiInput::Mouse(mouse));
                     redraw = true;
                 }
                 Event::Resize(width, height) => {
-                    reduce(&mut model, ThreadUiInput::Resize(width, height));
+                    reduce(&mut model, SessionUiInput::Resize(width, height));
                     redraw = true;
                 }
                 Event::Paste(value) => {
-                    reduce(&mut model, ThreadUiInput::Paste(value));
+                    reduce(&mut model, SessionUiInput::Paste(value));
                     redraw = true;
                 }
                 _ => {}
@@ -4877,24 +4894,24 @@ pub fn run_with_feedback_and_progress(
 mod tests {
     use super::*;
     use latte_core::{
-        IdSource, RunId, SystemIdSource, ThreadEvent, ThreadEventEnvelope, ThreadEventId,
-        ThreadProviderBindingV2, TranscriptEntry, TranscriptEntryId,
+        IdSource, SessionEvent, SessionEventEnvelope, SessionEventId, SessionProviderBinding,
+        SystemIdSource, TranscriptEntry, TranscriptEntryId, TurnId,
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::VecDeque;
 
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> ThreadUiInput {
-        ThreadUiInput::Key(KeyEvent::new(code, modifiers))
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> SessionUiInput {
+        SessionUiInput::Key(KeyEvent::new(code, modifiers))
     }
 
-    fn snapshot(lifecycle: ThreadLifecycle) -> ThreadSnapshot {
+    fn snapshot(lifecycle: SessionLifecycle) -> SessionSnapshot {
         let ids = SystemIdSource::default();
-        ThreadSnapshot {
-            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+        SessionSnapshot {
+            session_id: SessionId::from_uuid(ids.next_uuid_v7()),
             revision: 1,
             sequence: 1,
             lifecycle,
-            binding: ThreadProviderBindingV2 {
+            binding: SessionProviderBinding {
                 version: 1,
                 provider_name: "p".into(),
                 provider_type: "t".into(),
@@ -4907,15 +4924,15 @@ mod tests {
                 data_scope_id: "scope".into(),
                 credential_generation: 1,
             },
-            latest_run_id: None,
-            active_run_id: None,
+            latest_turn_id: None,
+            active_turn_id: None,
             pending: None,
-            runs: vec![],
+            turns: vec![],
             transcript: latte_core::TranscriptPage {
                 entries: vec![TranscriptEntry {
                     entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
                     sequence: 1,
-                    run_id: None,
+                    turn_id: None,
                     kind: TranscriptKind::User,
                     text: "hello".into(),
                     payload: None,
@@ -4929,34 +4946,34 @@ mod tests {
         }
     }
 
-    fn running_snapshot() -> ThreadSnapshot {
+    fn running_snapshot() -> SessionSnapshot {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.latest_run_id = Some(run_id);
-        thread.active_run_id = Some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.latest_turn_id = Some(turn_id);
+        session.active_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 0,
-            status: ThreadRunStatus::Running,
-            run_revision: 1,
+            status: SessionTurnStatus::Running,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         });
-        thread
+        session
     }
 
     fn session_summary(
-        snapshot: &ThreadSnapshot,
+        snapshot: &SessionSnapshot,
         title: &str,
         workspace_root: &str,
-    ) -> ThreadSessionSummary {
-        ThreadSessionSummary {
-            thread_id: snapshot.thread_id,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_id: snapshot.session_id,
             title: title.into(),
             workspace_root: workspace_root.into(),
-            parent_thread_id: None,
+            parent_session_id: None,
             lifecycle: snapshot.lifecycle,
             provider_name: snapshot.binding.provider_name.clone(),
             model: snapshot.binding.model.clone(),
@@ -4965,18 +4982,18 @@ mod tests {
         }
     }
 
-    fn assert_terminal_session_switching_available(lifecycle: ThreadLifecycle) {
-        let mut sessions = ThreadUiModel {
+    fn assert_terminal_session_switching_available(lifecycle: SessionLifecycle) {
+        let mut sessions = SessionUiModel {
             sessions: vec![snapshot(lifecycle)],
             composer: "/sessions".into(),
             ..Default::default()
         };
         assert_eq!(
             reduce(&mut sessions, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::ShowSessions { query: None }]
+            vec![SessionUiAction::ShowSessions { query: None }]
         );
 
-        let mut new = ThreadUiModel {
+        let mut new = SessionUiModel {
             sessions: vec![snapshot(lifecycle)],
             composer: "/new".into(),
             ..Default::default()
@@ -4989,18 +5006,18 @@ mod tests {
     }
 
     struct ScriptedProjection {
-        snapshots: VecDeque<Vec<ThreadSnapshot>>,
-        poll: ThreadProjectionPoll,
+        snapshots: VecDeque<Vec<SessionSnapshot>>,
+        poll: SessionProjectionPoll,
     }
 
-    impl ThreadProjectionClient for ScriptedProjection {
-        fn snapshots(&mut self) -> Result<Vec<ThreadSnapshot>, String> {
+    impl SessionProjectionClient for ScriptedProjection {
+        fn snapshots(&mut self) -> Result<Vec<SessionSnapshot>, String> {
             self.snapshots
                 .pop_front()
                 .ok_or_else(|| "no scripted snapshot".into())
         }
 
-        fn poll(&mut self) -> ThreadProjectionPoll {
+        fn poll(&mut self) -> SessionProjectionPoll {
             self.poll.clone()
         }
     }
@@ -5008,93 +5025,96 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn projection_defaults_and_action_adapter_cover_exact_open_and_refresh_paths() {
-        let ready = snapshot(ThreadLifecycle::Ready);
-        let thread_id = ready.thread_id;
+        let ready = snapshot(SessionLifecycle::Ready);
+        let session_id = ready.session_id;
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert_eq!(projection.session_catalog().unwrap()[0].title, "hello");
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        assert_eq!(projection.session(thread_id).unwrap().thread_id, thread_id);
+        assert_eq!(
+            projection.session(session_id).unwrap().session_id,
+            session_id
+        );
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert_eq!(
             projection
                 .exact_session("hello")
                 .unwrap()
                 .unwrap()
-                .thread_id,
-            thread_id
+                .session_id,
+            session_id
         );
 
         let mut sink = |_| Ok(());
-        let mut missing_model = ThreadUiModel::with_startup(test_startup());
+        let mut missing_model = SessionUiModel::with_startup(test_startup());
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut missing_model,
                 &mut sink,
-                vec![ThreadUiAction::ShowSessions {
+                vec![SessionUiAction::ShowSessions {
                     query: Some("missing".into())
                 }]
             )
             .unwrap()
         );
 
-        let mut model = ThreadUiModel::with_startup(test_startup());
+        let mut model = SessionUiModel::with_startup(test_startup());
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::ShowSessions {
+                vec![SessionUiAction::ShowSessions {
                     query: Some("hello".into())
                 }]
             )
             .unwrap()
         );
-        assert_eq!(model.selected_thread().unwrap().thread_id, thread_id);
+        assert_eq!(model.selected_session().unwrap().session_id, session_id);
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::OpenSession { thread_id }]
+                vec![SessionUiAction::OpenSession { session_id }]
             )
             .unwrap()
         );
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::RefreshSnapshots]
+                vec![SessionUiAction::RefreshSnapshots]
             )
             .unwrap()
         );
@@ -5102,14 +5122,14 @@ mod tests {
         model.active_conversation = Some(ActiveConversation::NewSessionDraft);
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::RefreshSnapshots]
+                vec![SessionUiAction::RefreshSnapshots]
             )
             .unwrap()
         );
@@ -5117,14 +5137,14 @@ mod tests {
         model.active_conversation = None;
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::RefreshSnapshots]
+                vec![SessionUiAction::RefreshSnapshots]
             )
             .unwrap()
         );
@@ -5134,147 +5154,147 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn feedback_projection_inputs_and_all_event_variants_preserve_authority() {
         assert_eq!(
-            ThreadUiFeedback::submission(7, Ok("accepted".into())),
-            ThreadUiFeedback::SubmissionResult {
+            SessionUiFeedback::submission(7, Ok("accepted".into())),
+            SessionUiFeedback::SubmissionResult {
                 submission_id: 7,
                 result: Ok("accepted".into())
             }
         );
         assert_eq!(
-            ThreadUiFeedback::command(Err("offline".into())),
-            ThreadUiFeedback::Command(Err("offline".into()))
+            SessionUiFeedback::command(Err("offline".into())),
+            SessionUiFeedback::Command(Err("offline".into()))
         );
         assert_eq!(
-            ThreadUiFeedback::model_switch(9, Ok("accepted".into())),
-            ThreadUiFeedback::ModelSwitchResult {
+            SessionUiFeedback::model_switch(9, Ok("accepted".into())),
+            SessionUiFeedback::ModelSwitchResult {
                 switch_id: 9,
                 result: Ok("accepted".into())
             }
         );
 
         let ids = SystemIdSource::default();
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        let thread_id = thread.thread_id;
+        let mut session = snapshot(SessionLifecycle::Running);
+        let session_id = session.session_id;
         assert_eq!(
-            ThreadUiFeedback::assigned(8, thread_id),
-            ThreadUiFeedback::SubmissionAssigned {
+            SessionUiFeedback::assigned(8, session_id),
+            SessionUiFeedback::SubmissionAssigned {
                 submission_id: 8,
-                thread_id
+                session_id
             }
         );
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut model = ThreadUiModel::default();
-        reduce(&mut model, ThreadUiInput::Resize(99, 31));
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut model = SessionUiModel::default();
+        reduce(&mut model, SessionUiInput::Resize(99, 31));
         assert_eq!(model.size, (99, 31));
-        reduce(&mut model, ThreadUiInput::Disconnected);
+        reduce(&mut model, SessionUiInput::Disconnected);
         assert!(!model.authority_enabled());
         reduce(
             &mut model,
-            ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
-                run_id,
+            SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: "discarded while disconnected".into(),
             }),
         );
         assert!(model.progress.is_empty());
-        reduce(&mut model, ThreadUiInput::Connected);
+        reduce(&mut model, SessionUiInput::Connected);
         assert!(model.authority_enabled());
-        reduce(&mut model, ThreadUiInput::CommandError("stale".into()));
+        reduce(&mut model, SessionUiInput::CommandError("stale".into()));
         assert_eq!(model.status, "Command rejected: stale");
-        reduce(&mut model, ThreadUiInput::CommandCompleted("done".into()));
+        reduce(&mut model, SessionUiInput::CommandCompleted("done".into()));
         assert_eq!(model.status, "done");
-        assert!(reduce(&mut model, ThreadUiInput::Tick).is_empty());
+        assert!(reduce(&mut model, SessionUiInput::Tick).is_empty());
 
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission".into(),
             description: "write".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
         model.command_palette = true;
         model.help = true;
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session.clone()]));
         assert!(!model.command_palette);
         assert!(!model.help);
 
-        let unknown = ThreadEventEnvelope {
-            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
+        let unknown = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+            session_id: SessionId::from_uuid(ids.next_uuid_v7()),
             revision: 2,
             sequence: 2,
-            event: ThreadEvent::LifecycleChanged {
-                lifecycle: ThreadLifecycle::Ready,
-                run_id: None,
+            event: SessionEvent::LifecycleChanged {
+                lifecycle: SessionLifecycle::Ready,
+                turn_id: None,
             },
         };
         assert_eq!(
-            reduce(&mut model, ThreadUiInput::Event(unknown)),
-            vec![ThreadUiAction::RefreshSnapshots]
+            reduce(&mut model, SessionUiInput::Event(unknown)),
+            vec![SessionUiAction::RefreshSnapshots]
         );
 
         model.sessions[0].pending = None;
-        let lifecycle = ThreadEventEnvelope {
-            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-            thread_id,
+        let lifecycle = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+            session_id,
             revision: 2,
             sequence: 2,
-            event: ThreadEvent::LifecycleChanged {
-                lifecycle: ThreadLifecycle::Ready,
-                run_id: None,
+            event: SessionEvent::LifecycleChanged {
+                lifecycle: SessionLifecycle::Ready,
+                turn_id: None,
             },
         };
-        assert!(reduce(&mut model, ThreadUiInput::Event(lifecycle)).is_empty());
-        assert_eq!(model.sessions[0].lifecycle, ThreadLifecycle::Ready);
+        assert!(reduce(&mut model, SessionUiInput::Event(lifecycle)).is_empty());
+        assert_eq!(model.sessions[0].lifecycle, SessionLifecycle::Ready);
 
-        let run = latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let run = latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Running,
-            run_revision: 1,
+            status: SessionTurnStatus::Running,
+            turn_revision: 1,
             completed_at_ms: None,
             failure_code: None,
         };
-        let linked = ThreadEventEnvelope {
-            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-            thread_id,
+        let linked = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+            session_id,
             revision: 3,
             sequence: 3,
-            event: ThreadEvent::RunLinked { run: run.clone() },
+            event: SessionEvent::TurnLinked { turn: run.clone() },
         };
-        assert!(reduce(&mut model, ThreadUiInput::Event(linked)).is_empty());
-        assert_eq!(model.sessions[0].active_run_id, Some(run_id));
-        assert_eq!(model.sessions[0].runs, vec![run]);
+        assert!(reduce(&mut model, SessionUiInput::Event(linked)).is_empty());
+        assert_eq!(model.sessions[0].active_turn_id, Some(turn_id));
+        assert_eq!(model.sessions[0].turns, vec![run]);
 
-        let reconciliation = ThreadEventEnvelope {
-            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-            event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-            thread_id,
+        let reconciliation = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+            session_id,
             revision: 4,
             sequence: 4,
-            event: ThreadEvent::ReconciliationRequired {
-                run_id,
+            event: SessionEvent::ReconciliationRequired {
+                turn_id,
                 effect_id: "effect-1".into(),
             },
         };
-        assert!(reduce(&mut model, ThreadUiInput::Event(reconciliation)).is_empty());
+        assert!(reduce(&mut model, SessionUiInput::Event(reconciliation)).is_empty());
         assert_eq!(
             model.reconciliation_hint,
-            Some((thread_id, "effect-1".into()))
+            Some((session_id, "effect-1".into()))
         );
     }
 
     #[test]
     fn progress_editor_and_submission_boundaries_are_bounded_and_correlated() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let mut model = ThreadUiModel::default();
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let mut model = SessionUiModel::default();
         for text in ["one", " two"] {
             record_progress(
                 &mut model,
-                ThreadTransientProgress::AssistantDelta {
-                    run_id,
+                SessionTransientProgress::AssistantDelta {
+                    turn_id,
                     text: text.into(),
                 },
             );
@@ -5282,14 +5302,14 @@ mod tests {
         for number in [1, 2] {
             record_progress(
                 &mut model,
-                ThreadTransientProgress::ProviderAttempt { run_id, number },
+                SessionTransientProgress::ProviderAttempt { turn_id, number },
             );
         }
         for detail in ["starting", "complete"] {
             record_progress(
                 &mut model,
-                ThreadTransientProgress::ToolProgress {
-                    run_id,
+                SessionTransientProgress::ToolProgress {
+                    turn_id,
                     name: "read_file".into(),
                     detail: detail.into(),
                 },
@@ -5298,15 +5318,15 @@ mod tests {
         assert_eq!(model.progress.len(), 3);
         assert!(matches!(
             &model.progress[0],
-            ThreadTransientProgress::AssistantDelta { text, .. } if text == "one two"
+            SessionTransientProgress::AssistantDelta { text, .. } if text == "one two"
         ));
         assert!(matches!(
             &model.progress[1],
-            ThreadTransientProgress::ProviderAttempt { number: 2, .. }
+            SessionTransientProgress::ProviderAttempt { number: 2, .. }
         ));
         assert!(matches!(
             &model.progress[2],
-            ThreadTransientProgress::ToolProgress { detail, .. } if detail == "complete"
+            SessionTransientProgress::ToolProgress { detail, .. } if detail == "complete"
         ));
 
         let mut editor = String::new();
@@ -5321,30 +5341,30 @@ mod tests {
         model.composer = "first".into();
         assert!(matches!(
             submit_composer(&mut model).as_slice(),
-            [ThreadUiAction::Start { .. }]
+            [SessionUiAction::Start { .. }]
         ));
         let first_id = model.pending_submission.as_ref().unwrap().submission_id;
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionCompleted {
+            SessionUiInput::SubmissionCompleted {
                 submission_id: first_id,
             },
         );
         assert!(model.status.contains("synchronizing"));
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError {
+            SessionUiInput::SubmissionError {
                 submission_id: first_id + 1,
             },
         );
         assert!(model.pending_submission.is_some());
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError {
+            SessionUiInput::SubmissionError {
                 submission_id: first_id,
             },
         );
-        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
+        reduce(&mut model, SessionUiInput::Snapshot(Vec::new()));
         assert_eq!(model.composer, "first");
         assert!(model.pending_submission.is_none());
     }
@@ -5352,14 +5372,14 @@ mod tests {
     #[test]
     fn projection_helpers_reject_private_or_malformed_payloads_and_keep_safe_metadata() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.active_run_id = Some(run_id);
-        thread.transcript.entries = vec![
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.active_turn_id = Some(turn_id);
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "run",
                 Some(serde_json::json!({
@@ -5379,7 +5399,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::System,
                 "started",
                 Some(serde_json::json!({"status":"started","effect_id":"effect-process"})),
@@ -5387,7 +5407,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "orphan failed",
                 Some(serde_json::json!({"tool_call_id":"other","name":"fallback","error":{}})),
@@ -5395,7 +5415,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Completion,
                 "done",
                 Some(serde_json::json!({"handoff":"invalid"})),
@@ -5409,7 +5429,7 @@ mod tests {
                 Some(serde_json::json!({"status":"started","effect_id":"unmatched"})),
             ),
         ];
-        let groups = project_transcript(&thread);
+        let groups = project_transcript(&session);
         assert_eq!(groups.len(), 2);
         let actions = groups
             .iter()
@@ -5417,7 +5437,7 @@ mod tests {
             .filter(|item| matches!(item, PresentationItem::Action { .. }))
             .count();
         assert_eq!(actions, 2);
-        let metadata = tool_metadata(&thread.transcript.entries[0]);
+        let metadata = tool_metadata(&session.transcript.entries[0]);
         assert!(
             metadata
                 .iter()
@@ -5438,7 +5458,7 @@ mod tests {
                 .iter()
                 .any(|(label, value)| label == "Command" && value == "cargo test")
         );
-        assert!(completion_handoff(&thread.transcript.entries[3]).is_none());
+        assert!(completion_handoff(&session.transcript.entries[3]).is_none());
 
         let invalid = transcript_entry(
             &ids,
@@ -5450,8 +5470,8 @@ mod tests {
         );
         assert!(payload_string(&invalid, &["missing"]).is_none());
         assert!(payload_string(&invalid, &["value"]).is_none());
-        assert_eq!(run_heading(&thread, None), "Conversation");
-        assert_eq!(run_heading(&thread, Some(run_id)), "Run activity");
+        assert_eq!(turn_heading(&session, None), "Conversation");
+        assert_eq!(turn_heading(&session, Some(turn_id)), "Turn activity");
     }
 
     #[test]
@@ -5459,36 +5479,36 @@ mod tests {
     fn adapter_helpers_cover_refresh_errors_feedback_and_safe_reconciliation_parsing() {
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         let mut sink = |_| Ok(());
         assert!(matches!(
-            apply_thread_actions(
+            apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::RefreshSnapshots]
+                vec![SessionUiAction::RefreshSnapshots]
             ),
             Err(TuiError::Action(error)) if error == "no scripted snapshot"
         ));
         assert!(
-            apply_thread_actions(
+            apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut sink,
-                vec![ThreadUiAction::Quit]
+                vec![SessionUiAction::Quit]
             )
             .unwrap()
         );
-        let thread_id = snapshot(ThreadLifecycle::Ready).thread_id;
+        let session_id = snapshot(SessionLifecycle::Ready).session_id;
         let mut failing_sink = |_| Err("rejected".into());
         assert!(matches!(
-            apply_thread_actions(
+            apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut failing_sink,
-                vec![ThreadUiAction::Cancel { thread_id }]
+                vec![SessionUiAction::Cancel { session_id }]
             ),
             Err(TuiError::Action(error)) if error == "rejected"
         ));
@@ -5498,58 +5518,61 @@ mod tests {
         model.pending_submission = Some(PendingSubmission {
             submission_id: 7,
             prompt: "restore this prompt".into(),
-            thread_id: None,
+            session_id: None,
             after_sequence: 0,
         });
         let ids = SystemIdSource::default();
         model.pending_input_submission = Some(PendingInputSubmission {
             submission_id: 8,
-            thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
-            run_id: RunId::from_uuid(ids.next_uuid_v7()),
+            session_id: SessionId::from_uuid(ids.next_uuid_v7()),
+            turn_id: TurnId::from_uuid(ids.next_uuid_v7()),
             request_id: "input-1".into(),
             value: "restore this input".into(),
             after_sequence: 0,
         });
-        let switch_thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
+        let switch_session_id = SessionId::from_uuid(ids.next_uuid_v7());
         model.pending_model_switch = Some(PendingModelSwitch {
             switch_id: 9,
-            thread_id: switch_thread_id,
+            session_id: switch_session_id,
             provider_name: "p".into(),
             model: "next".into(),
         });
         feedback_tx
-            .send(ThreadUiFeedback::assigned(7, switch_thread_id))
+            .send(SessionUiFeedback::assigned(7, switch_session_id))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::submission(7, Ok("accepted".into())))
+            .send(SessionUiFeedback::submission(7, Ok("accepted".into())))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::submission(7, Err("rejected".into())))
+            .send(SessionUiFeedback::submission(7, Err("rejected".into())))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::input_submission(8, Ok("accepted".into())))
+            .send(SessionUiFeedback::input_submission(
+                8,
+                Ok("accepted".into()),
+            ))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::input_submission(
+            .send(SessionUiFeedback::input_submission(
                 8,
                 Err("rejected".into()),
             ))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::command(Ok("command done".into())))
+            .send(SessionUiFeedback::command(Ok("command done".into())))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::command(Err("command failed".into())))
+            .send(SessionUiFeedback::command(Err("command failed".into())))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::model_switch(9, Ok("accepted".into())))
+            .send(SessionUiFeedback::model_switch(9, Ok("accepted".into())))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::model_switch(99, Err("stale".into())))
+            .send(SessionUiFeedback::model_switch(99, Err("stale".into())))
             .unwrap();
         progress_tx
-            .send(ThreadTransientProgress::ProviderAttempt {
-                run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            .send(SessionTransientProgress::ProviderAttempt {
+                turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 number: 1,
             })
             .unwrap();
@@ -5558,14 +5581,14 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                ThreadUiAction::RefreshSnapshots,
-                ThreadUiAction::RefreshSnapshots,
-                ThreadUiAction::RefreshSnapshots
+                SessionUiAction::RefreshSnapshots,
+                SessionUiAction::RefreshSnapshots,
+                SessionUiAction::RefreshSnapshots
             ]
         );
         assert_eq!(model.status, "Model switch accepted; synchronizing session");
         assert!(model.pending_submission.is_some());
-        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
+        reduce(&mut model, SessionUiInput::Snapshot(Vec::new()));
         assert!(model.pending_submission.is_none());
         assert_eq!(model.composer, "restore this prompt");
         assert!(model.progress.is_empty());
@@ -5574,7 +5597,7 @@ mod tests {
             (false, Vec::new())
         );
 
-        let mut safe = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut safe = snapshot(SessionLifecycle::ReconciliationRequired);
         safe.transcript.entries.push(transcript_entry(
             &SystemIdSource::default(),
             2,
@@ -5590,7 +5613,7 @@ mod tests {
         safe.transcript.entries.last_mut().unwrap().payload =
             Some(serde_json::json!({"status":"unknown","effect_id":"bad\neffect"}));
         assert!(reconciliation_effect_from_snapshot(&safe).is_none());
-        safe.lifecycle = ThreadLifecycle::Ready;
+        safe.lifecycle = SessionLifecycle::Ready;
         assert!(reconciliation_effect_from_snapshot(&safe).is_none());
         assert_eq!(
             permission_context("\n\r"),
@@ -5610,16 +5633,16 @@ mod tests {
 
     #[test]
     fn lagged_projection_refreshes_current_snapshot_without_command_sink_help() {
-        let mut stale = snapshot(ThreadLifecycle::Running);
+        let mut stale = snapshot(SessionLifecycle::Running);
         stale.transcript.entries[0].text = "stale card".into();
         let mut current = stale.clone();
         current.revision = 2;
         current.sequence = 2;
-        current.lifecycle = ThreadLifecycle::Ready;
+        current.lifecycle = SessionLifecycle::Ready;
         current.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Completion,
             text: "current card after event gap".into(),
             payload: None,
@@ -5628,23 +5651,23 @@ mod tests {
         });
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![current]]),
-            poll: ThreadProjectionPoll::Lagged(3),
+            poll: SessionProjectionPoll::Lagged(3),
         };
-        let mut model = ThreadUiModel::default();
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![stale]));
+        let mut model = SessionUiModel::default();
+        reduce(&mut model, SessionUiInput::Snapshot(vec![stale]));
         model
             .progress
-            .push(ThreadTransientProgress::AssistantDelta {
-                run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            .push(SessionTransientProgress::AssistantDelta {
+                turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 text: "non-durable delta".into(),
             });
         let actions = match projection.poll() {
-            ThreadProjectionPoll::Lagged(_) => reduce(&mut model, ThreadUiInput::Lagged),
+            SessionProjectionPoll::Lagged(_) => reduce(&mut model, SessionUiInput::Lagged),
             other => panic!("expected lagged projection, got {other:?}"),
         };
         let mut dispatched = Vec::new();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut projection,
                 &mut model,
                 &mut |action| {
@@ -5657,7 +5680,7 @@ mod tests {
         );
         assert_eq!(model.connection, ConnectionState::Connected);
         assert!(model.progress.is_empty());
-        assert_eq!(model.sessions[0].lifecycle, ThreadLifecycle::Ready);
+        assert_eq!(model.sessions[0].lifecycle, SessionLifecycle::Ready);
         assert!(
             model.sessions[0]
                 .transcript
@@ -5673,27 +5696,27 @@ mod tests {
 
     #[test]
     fn snapshot_focus_uses_projection_order_and_preserves_identity() {
-        let mut first = snapshot(ThreadLifecycle::Ready);
+        let mut first = snapshot(SessionLifecycle::Ready);
         first.sequence = 1;
-        let mut second = snapshot(ThreadLifecycle::Running);
+        let mut second = snapshot(SessionLifecycle::Running);
         second.sequence = 99;
-        let first_id = first.thread_id;
-        let second_id = second.thread_id;
-        let mut model = ThreadUiModel::default();
+        let first_id = first.session_id;
+        let second_id = second.session_id;
+        let mut model = SessionUiModel::default();
 
         reduce(
             &mut model,
-            ThreadUiInput::Snapshot(vec![first.clone(), second.clone()]),
+            SessionUiInput::Snapshot(vec![first.clone(), second.clone()]),
         );
         assert_eq!(
-            model.selected_thread().map(|thread| thread.thread_id),
+            model.selected_session().map(|session| session.session_id),
             Some(first_id)
         );
 
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![second, first]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![second, first]));
         assert_eq!(model.selected, 1);
         assert_eq!(
-            model.selected_thread().map(|thread| thread.thread_id),
+            model.selected_session().map(|session| session.session_id),
             Some(first_id)
         );
         assert_ne!(first_id, second_id);
@@ -5701,12 +5724,12 @@ mod tests {
 
     #[test]
     fn reconciliation_requires_ctrl_r_then_ctrl_a_and_enter_is_inert() {
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
-        let effect_id = "thread-effect-safe-42";
-        thread.transcript.entries.push(TranscriptEntry {
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
+        let effect_id = "session-effect-safe-42";
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -5716,9 +5739,9 @@ mod tests {
             source_key: "unknown-effect".into(),
             created_at_ms: 2,
         });
-        let thread_id = thread.thread_id;
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        let session_id = session.session_id;
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
@@ -5726,15 +5749,15 @@ mod tests {
         assert!(reduce(&mut model, key(KeyCode::Char('r'), KeyModifiers::CONTROL)).is_empty());
         assert_eq!(
             model.reconciliation_confirmation,
-            Some((thread_id, effect_id.into()))
+            Some((session_id, effect_id.into()))
         );
         let composer_before = model.composer.clone();
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert_eq!(model.composer, composer_before);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::ReconcileUnknown {
-                thread_id,
+            vec![SessionUiAction::ReconcileUnknown {
+                session_id,
                 effect_id: effect_id.into(),
             }]
         );
@@ -5742,12 +5765,12 @@ mod tests {
 
     #[test]
     fn test_backend_renders_reconciliation_as_a_scoped_attention_card() {
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
         let effect_id = "authoritative-reconciliation-effect-43";
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -5757,8 +5780,8 @@ mod tests {
             source_key: "unknown-effect-render".into(),
             created_at_ms: 2,
         });
-        let model = ThreadUiModel {
-            sessions: vec![thread],
+        let model = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
 
@@ -5773,34 +5796,34 @@ mod tests {
 
     #[test]
     fn enter_sends_shift_enter_inserts_newline_and_permission_enter_is_inert() {
-        let mut model = ThreadUiModel {
-            sessions: vec![snapshot(ThreadLifecycle::Ready)],
+        let mut model = SessionUiModel {
+            sessions: vec![snapshot(SessionLifecycle::Ready)],
             ..Default::default()
         };
         reduce(
             &mut model,
-            ThreadUiInput::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            SessionUiInput::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
         );
         reduce(
             &mut model,
-            ThreadUiInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            SessionUiInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
         );
         assert_eq!(model.composer, "x\n");
         assert!(matches!(
             reduce(
                 &mut model,
-                ThreadUiInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                SessionUiInput::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             )
             .as_slice(),
-            [ThreadUiAction::FollowUp { prompt, .. }] if prompt == "x\n"
+            [SessionUiAction::FollowUp { prompt, .. }] if prompt == "x\n"
         ));
         assert!(model.composer.is_empty());
-        let run = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        model.sessions[0].pending = Some(ThreadPendingRequest::Permission {
-            run_id: run,
+        let run = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        model.sessions[0].pending = Some(SessionPendingRequest::Permission {
+            turn_id: run,
             request_id: "p".into(),
             description: "write".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         model.composer = "kept".into();
         model.input = "also kept".into();
@@ -5808,7 +5831,7 @@ mod tests {
             assert!(
                 reduce(
                     &mut model,
-                    ThreadUiInput::Key(KeyEvent::new(KeyCode::Enter, modifiers))
+                    SessionUiInput::Key(KeyEvent::new(KeyCode::Enter, modifiers))
                 )
                 .is_empty()
             );
@@ -5817,29 +5840,31 @@ mod tests {
         assert_eq!(model.input, "also kept");
 
         let ids = SystemIdSource::default();
-        let failed_run = RunId::from_uuid(ids.next_uuid_v7());
-        let mut retryable_failure = snapshot(ThreadLifecycle::Ready);
-        retryable_failure.latest_run_id = Some(failed_run);
-        retryable_failure.runs.push(latte_core::ThreadRunSummary {
-            run_id: failed_run,
-            parent_run_id: None,
-            ordinal: 0,
-            status: ThreadRunStatus::Failed,
-            run_revision: 2,
-            completed_at_ms: Some(2),
-            failure_code: None,
-        });
+        let failed_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut retryable_failure = snapshot(SessionLifecycle::Ready);
+        retryable_failure.latest_turn_id = Some(failed_turn);
+        retryable_failure
+            .turns
+            .push(latte_core::SessionTurnSummary {
+                turn_id: failed_turn,
+                parent_turn_id: None,
+                ordinal: 0,
+                status: SessionTurnStatus::Failed,
+                turn_revision: 2,
+                completed_at_ms: Some(2),
+                failure_code: None,
+            });
         retryable_failure.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(failed_run),
+            turn_id: Some(failed_turn),
             kind: TranscriptKind::Failure,
             text: "provider configuration failed".into(),
             payload: None,
             source_key: "provider-failure".into(),
             created_at_ms: 2,
         });
-        let mut after_error = ThreadUiModel {
+        let mut after_error = SessionUiModel {
             sessions: vec![retryable_failure],
             ..Default::default()
         };
@@ -5864,17 +5889,17 @@ mod tests {
 
     #[test]
     fn permission_allow_requires_exact_ctrl_a() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-exact-chord".into(),
             description: "write".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        let thread_id = thread.thread_id;
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        let session_id = session.session_id;
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             composer: "kept".into(),
             input: "also kept".into(),
             ..Default::default()
@@ -5892,11 +5917,11 @@ mod tests {
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)).is_empty(),
             "a buffered denial must not resolve an unseen permission request"
         );
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::ResolvePermission {
-                thread_id,
+            vec![SessionUiAction::ResolvePermission {
+                session_id,
                 request_id: "permission-exact-chord".into(),
                 allow: true,
             }]
@@ -5905,12 +5930,12 @@ mod tests {
 
     #[test]
     fn reconciliation_confirm_requires_exact_ctrl_a() {
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
         let effect_id = "effect-exact-confirm";
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -5920,10 +5945,10 @@ mod tests {
             source_key: "unknown-effect-exact-confirm".into(),
             created_at_ms: 2,
         });
-        let thread_id = thread.thread_id;
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
-            reconciliation_confirmation: Some((thread_id, effect_id.into())),
+        let session_id = session.session_id;
+        let mut model = SessionUiModel {
+            sessions: vec![session],
+            reconciliation_confirmation: Some((session_id, effect_id.into())),
             composer: "kept".into(),
             input: "also kept".into(),
             ..Default::default()
@@ -5940,8 +5965,8 @@ mod tests {
         assert_eq!(model.input, "also kept");
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::ReconcileUnknown {
-                thread_id,
+            vec![SessionUiAction::ReconcileUnknown {
+                session_id,
                 effect_id: effect_id.into(),
             }]
         );
@@ -5950,7 +5975,7 @@ mod tests {
 
     #[test]
     fn empty_enter_is_inert_and_plain_enter_dispatches_exactly_one_start() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
 
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         model.composer = "  \t".into();
@@ -5960,7 +5985,7 @@ mod tests {
         model.composer = "inspect this repository".into();
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::Start {
+            vec![SessionUiAction::Start {
                 submission_id: 1,
                 prompt: "inspect this repository".into(),
             }]
@@ -5971,7 +5996,7 @@ mod tests {
         assert!(
             reduce(
                 &mut model,
-                ThreadUiInput::Key(KeyEvent::new_with_kind(
+                SessionUiInput::Key(KeyEvent::new_with_kind(
                     KeyCode::Enter,
                     KeyModifiers::NONE,
                     KeyEventKind::Release,
@@ -5981,7 +6006,7 @@ mod tests {
         );
         assert_eq!(model.composer, "release must not submit");
 
-        let mut compatibility = ThreadUiModel {
+        let mut compatibility = SessionUiModel {
             composer: "submit with the advertised idle chord".into(),
             ..Default::default()
         };
@@ -5990,7 +6015,7 @@ mod tests {
                 &mut compatibility,
                 key(KeyCode::Enter, KeyModifiers::CONTROL)
             ),
-            vec![ThreadUiAction::Start {
+            vec![SessionUiAction::Start {
                 submission_id: 1,
                 prompt: "submit with the advertised idle chord".into(),
             }]
@@ -5999,14 +6024,14 @@ mod tests {
 
     #[test]
     fn submission_is_immediately_visible_and_duplicate_enter_is_inert() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             composer: "optimistic-sentinel".into(),
             ..Default::default()
         };
 
         assert!(matches!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
-            [ThreadUiAction::Start {
+            [SessionUiAction::Start {
                 submission_id: 1,
                 prompt
             }] if prompt == "optimistic-sentinel"
@@ -6027,34 +6052,34 @@ mod tests {
     #[test]
     fn matching_durable_user_entry_replaces_optimistic_card_exactly_once() {
         let ids = SystemIdSource::default();
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             composer: "durable-sentinel".into(),
             ..Default::default()
         };
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
-        let mut thread = snapshot(ThreadLifecycle::Running);
+        let mut session = snapshot(SessionLifecycle::Running);
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 1,
-                thread_id: thread.thread_id,
+                session_id: session.session_id,
             },
         );
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session.clone()]));
         assert!(model.pending_submission.is_some());
         assert!(rendered(&model, 120, 40).contains("durable-sentinel"));
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::User,
             text: "durable-sentinel".into(),
             payload: None,
-            source_key: "thread:create:user".into(),
+            source_key: "session:create:user".into(),
             created_at_ms: 2,
         });
 
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
 
         assert!(model.pending_submission.is_none());
         assert_eq!(
@@ -6068,13 +6093,13 @@ mod tests {
     #[test]
     fn failed_submission_restoration_defers_and_then_restores_the_next_draft() {
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let mut model = ThreadUiModel {
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let mut model = SessionUiModel {
             composer: "next draft\nsecond line".into(),
             pending_submission: Some(PendingSubmission {
                 submission_id: 1,
                 prompt: "retry me".into(),
-                thread_id: Some(thread_id),
+                session_id: Some(session_id),
                 after_sequence: 0,
             }),
             ..Default::default()
@@ -6091,23 +6116,23 @@ mod tests {
         model.pending_submission = Some(PendingSubmission {
             submission_id: 2,
             prompt: "retry me".into(),
-            thread_id: Some(thread_id),
+            session_id: Some(session_id),
             after_sequence: 0,
         });
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.thread_id = thread_id;
-        thread.transcript.entries.push(TranscriptEntry {
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.session_id = session_id;
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 1,
-            run_id: thread.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
             text: "retry me".into(),
             payload: None,
-            source_key: "thread:create:user".into(),
+            source_key: "session:create:user".into(),
             created_at_ms: 1,
         });
 
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
         assert!(model.pending_submission.is_none());
         assert!(model.deferred_composer_draft.is_none());
         assert_eq!(model.composer, "next draft\nsecond line");
@@ -6117,53 +6142,53 @@ mod tests {
     fn submission_reconciliation_uses_redacted_text_and_submission_source_identity() {
         let ids = SystemIdSource::default();
         let secret_prompt = "token=provider-secret";
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             composer: secret_prompt.into(),
             ..Default::default()
         };
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
-        let mut thread = running_snapshot();
+        let mut session = running_snapshot();
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 1,
-                thread_id: thread.thread_id,
+                session_id: session.session_id,
             },
         );
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: thread.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
-            text: redact_thread_text(secret_prompt),
+            text: redact_session_text(secret_prompt),
             payload: None,
             source_key: format!(
                 "{}:input:answer:card",
-                thread.active_run_id.expect("running fixture")
+                session.active_turn_id.expect("running fixture")
             ),
             created_at_ms: 2,
         });
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session.clone()]));
         assert!(model.pending_submission.is_some());
 
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 3,
-            run_id: thread.active_run_id,
+            turn_id: session.active_turn_id,
             kind: TranscriptKind::User,
-            text: redact_thread_text(secret_prompt),
+            text: redact_session_text(secret_prompt),
             payload: None,
-            source_key: "thread:create:user".into(),
+            source_key: "session:create:user".into(),
             created_at_ms: 3,
         });
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
         assert!(model.pending_submission.is_none());
     }
 
     #[test]
     fn terminal_session_rejects_new_prompt_and_restores_a_rejected_mailbox_submission() {
-        let mut terminal = snapshot(ThreadLifecycle::Failed);
-        let mut model = ThreadUiModel {
+        let mut terminal = snapshot(SessionLifecycle::Failed);
+        let mut model = SessionUiModel {
             sessions: vec![terminal.clone()],
             composer: "keep me".into(),
             ..Default::default()
@@ -6173,21 +6198,24 @@ mod tests {
         assert!(model.pending_submission.is_none());
 
         let running = running_snapshot();
-        let thread_id = running.thread_id;
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![running]));
+        let session_id = running.session_id;
+        reduce(&mut model, SessionUiInput::Snapshot(vec![running]));
         model.composer = "queued once".into();
         let actions = submit_composer(&mut model);
         assert!(matches!(
             actions.as_slice(),
-            [ThreadUiAction::QueueFollowUp { thread_id: observed, prompt, .. }]
-                if *observed == thread_id && prompt == "queued once"
+            [SessionUiAction::QueueFollowUp { session_id: observed, prompt, .. }]
+                if *observed == session_id && prompt == "queued once"
         ));
         let submission_id = model.pending_submission.as_ref().unwrap().submission_id;
-        reduce(&mut model, ThreadUiInput::SubmissionError { submission_id });
-        terminal.thread_id = thread_id;
-        terminal.active_run_id = None;
+        reduce(
+            &mut model,
+            SessionUiInput::SubmissionError { submission_id },
+        );
+        terminal.session_id = session_id;
+        terminal.active_turn_id = None;
         terminal.pending = None;
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![terminal]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![terminal]));
         assert_eq!(model.composer, "queued once");
         assert!(model.pending_submission.is_none());
         assert!(session_switch_available(&model));
@@ -6196,66 +6224,66 @@ mod tests {
     #[test]
     fn input_submission_restores_only_after_exact_snapshot_reconciliation() {
         let ids = SystemIdSource::default();
-        let mut thread = running_snapshot();
-        let run_id = thread.active_run_id.expect("running fixture");
-        thread.lifecycle = ThreadLifecycle::WaitingInput;
-        thread.pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        let mut session = running_snapshot();
+        let turn_id = session.active_turn_id.expect("running fixture");
+        session.lifecycle = SessionLifecycle::WaitingInput;
+        session.pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "request-1".into(),
             prompt: "value".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
-        let thread_id = thread.thread_id;
-        let mut model = ThreadUiModel::default();
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        let session_id = session.session_id;
+        let mut model = SessionUiModel::default();
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session.clone()]));
         reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::NONE));
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::SHIFT));
         reduce(&mut model, key(KeyCode::Char('b'), KeyModifiers::NONE));
         assert!(matches!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
-            [ThreadUiAction::ProvideInput { value, .. }] if value == "a\nb"
+            [SessionUiAction::ProvideInput { value, .. }] if value == "a\nb"
         ));
         assert!(model.input.is_empty());
         assert_eq!(
             reduce(
                 &mut model,
-                ThreadUiInput::InputSubmissionError { submission_id: 1 }
+                SessionUiInput::InputSubmissionError { submission_id: 1 }
             ),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
         assert!(model.input.is_empty());
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread.clone()]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session.clone()]));
         assert_eq!(model.input, "a\nb");
 
         model.input.clear();
         reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(matches!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
-            [ThreadUiAction::ProvideInput { .. }]
+            [SessionUiAction::ProvideInput { .. }]
         ));
-        thread.sequence = 2;
-        thread.lifecycle = ThreadLifecycle::Running;
-        thread.pending = None;
-        thread.transcript.entries.push(TranscriptEntry {
+        session.sequence = 2;
+        session.lifecycle = SessionLifecycle::Running;
+        session.pending = None;
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: "x".into(),
             payload: None,
-            source_key: format!("{run_id}:input:request-1:card"),
+            source_key: format!("{turn_id}:input:request-1:card"),
             created_at_ms: 2,
         });
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
         assert!(model.pending_input_submission.is_none());
         assert!(model.input.is_empty());
-        assert_eq!(model.sessions[0].thread_id, thread_id);
+        assert_eq!(model.sessions[0].session_id, session_id);
     }
 
     #[test]
     fn correlated_failure_restores_exact_prompt_and_stale_feedback_is_ignored() {
         let exact = "retry this\nwithout losing whitespace  ";
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             composer: exact.into(),
             ..Default::default()
         };
@@ -6263,16 +6291,16 @@ mod tests {
 
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError { submission_id: 99 },
+            SessionUiInput::SubmissionError { submission_id: 99 },
         );
         assert!(model.composer.is_empty());
         assert!(model.pending_submission.is_some());
 
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError { submission_id: 1 },
+            SessionUiInput::SubmissionError { submission_id: 1 },
         );
-        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
+        reduce(&mut model, SessionUiInput::Snapshot(Vec::new()));
         assert_eq!(model.composer, exact);
         assert!(model.pending_submission.is_none());
         let screen = rendered(&model, 120, 40);
@@ -6283,14 +6311,14 @@ mod tests {
         let retry = reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             retry.as_slice(),
-            [ThreadUiAction::Start {
+            [SessionUiAction::Start {
                 submission_id: 2,
                 prompt
             }] if prompt == exact
         ));
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError { submission_id: 1 },
+            SessionUiInput::SubmissionError { submission_id: 1 },
         );
         assert!(model.composer.is_empty());
         assert_eq!(
@@ -6302,18 +6330,18 @@ mod tests {
         );
     }
 
-    fn reduce_paste_for_test(model: &mut ThreadUiModel, value: &str) -> Vec<ThreadUiAction> {
-        reduce(model, ThreadUiInput::Paste(value.into()))
+    fn reduce_paste_for_test(model: &mut SessionUiModel, value: &str) -> Vec<SessionUiAction> {
+        reduce(model, SessionUiInput::Paste(value.into()))
     }
 
     #[test]
     fn reconciliation_consumes_plain_and_shift_enter_without_mutation() {
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
         let ids = SystemIdSource::default();
-        thread.transcript.entries.push(TranscriptEntry {
+        session.transcript.entries.push(TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: None,
+            turn_id: None,
             kind: TranscriptKind::Failure,
             text: "effect outcome unknown; reconciliation required".into(),
             payload: Some(serde_json::json!({
@@ -6323,10 +6351,10 @@ mod tests {
             source_key: "unknown-effect-shift-enter".into(),
             created_at_ms: 2,
         });
-        let thread_revision = thread.revision;
-        let pending_before = thread.pending.clone();
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        let session_revision = session.revision;
+        let pending_before = session.pending.clone();
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             composer: "kept".into(),
             input: "also kept".into(),
             ..Default::default()
@@ -6337,7 +6365,7 @@ mod tests {
         }
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
-        assert_eq!(model.sessions[0].revision, thread_revision);
+        assert_eq!(model.sessions[0].revision, session_revision);
         assert_eq!(model.sessions[0].pending, pending_before);
         assert!(model.reconciliation_confirmation.is_none());
     }
@@ -6345,25 +6373,25 @@ mod tests {
     #[test]
     fn permission_card_shows_redacted_bounded_operation_context_before_ctrl_a() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-card".into(),
             description: "Write src/generated.rs (create or replace; 43 bytes of content) api_key=live-secret-value\n\u{1b}[31m".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        let mut model = ThreadUiModel {
-            sessions: vec![thread.clone()],
+        let mut model = SessionUiModel {
+            sessions: vec![session.clone()],
             size: (100, 20),
             ..Default::default()
         };
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::ResolvePermission {
-                thread_id: thread.thread_id,
+            vec![SessionUiAction::ResolvePermission {
+                session_id: session.session_id,
                 request_id: "permission-card".into(),
                 allow: true,
             }]
@@ -6391,19 +6419,19 @@ mod tests {
     #[test]
     fn process_permission_card_is_pinned_at_the_active_waterfall_tail() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let request_id = "process-permission-card";
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: request_id.into(),
             description: "Run argv: git status (cwd: .)".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Run argv: git status (cwd: .)",
             Some(serde_json::json!({
@@ -6418,8 +6446,8 @@ mod tests {
             })),
         ));
         let buffer = rendered_buffer(
-            &ThreadUiModel {
-                sessions: vec![thread],
+            &SessionUiModel {
+                sessions: vec![session],
                 ..Default::default()
             },
             120,
@@ -6443,71 +6471,71 @@ mod tests {
 
     #[test]
     fn gap_clears_progress_after_mailbox_submission() {
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
-        let mut model = ThreadUiModel {
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let mut model = SessionUiModel {
             sessions: vec![running_snapshot()],
             composer: "later".into(),
             ..Default::default()
         };
         reduce(
             &mut model,
-            ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
-                run_id,
+            SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: "partial".into(),
             }),
         );
         reduce(
             &mut model,
-            ThreadUiInput::Progress(ThreadTransientProgress::AssistantDelta {
-                run_id,
+            SessionUiInput::Progress(SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: " delta".into(),
             }),
         );
         assert!(matches!(
             model.progress.as_slice(),
-            [ThreadTransientProgress::AssistantDelta { text, .. }] if text == "partial delta"
+            [SessionTransientProgress::AssistantDelta { text, .. }] if text == "partial delta"
         ));
         assert!(!model.progress.is_empty());
         assert!(matches!(
             reduce(
                 &mut model,
-                ThreadUiInput::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+                SessionUiInput::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             )
             .as_slice(),
-            [ThreadUiAction::QueueFollowUp { prompt, .. }] if prompt == "later"
+            [SessionUiAction::QueueFollowUp { prompt, .. }] if prompt == "later"
         ));
         assert_eq!(
-            reduce(&mut model, ThreadUiInput::Lagged),
-            vec![ThreadUiAction::RefreshSnapshots]
+            reduce(&mut model, SessionUiInput::Lagged),
+            vec![SessionUiAction::RefreshSnapshots]
         );
         assert!(model.progress.is_empty());
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn reducer_dispatches_only_typed_thread_actions_for_all_active_states() {
+    fn reducer_dispatches_only_typed_session_actions_for_all_active_states() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut ready = snapshot(ThreadLifecycle::Ready);
-        ready.latest_run_id = Some(run_id);
-        ready.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut ready = snapshot(SessionLifecycle::Ready);
+        ready.latest_turn_id = Some(turn_id);
+        ready.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: latte_core::ThreadRunStatus::Completed,
-            run_revision: 3,
+            status: latte_core::SessionTurnStatus::Completed,
+            turn_revision: 3,
             completed_at_ms: Some(3),
             failure_code: None,
         });
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('h'), KeyModifiers::NONE)),
-            Vec::<ThreadUiAction>::new()
+            Vec::<SessionUiAction>::new()
         );
         assert_eq!(model.composer, "h");
         assert_eq!(
             reduce(&mut model, key(KeyCode::F(5), KeyModifiers::NONE)),
-            vec![ThreadUiAction::Start {
+            vec![SessionUiAction::Start {
                 submission_id: 1,
                 prompt: "h".into()
             }]
@@ -6515,39 +6543,39 @@ mod tests {
 
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionError { submission_id: 1 },
+            SessionUiInput::SubmissionError { submission_id: 1 },
         );
-        reduce(&mut model, ThreadUiInput::Snapshot(Vec::new()));
+        reduce(&mut model, SessionUiInput::Snapshot(Vec::new()));
         model.composer.clear();
 
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![ready.clone()]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![ready.clone()]));
         reduce(&mut model, key(KeyCode::Char('f'), KeyModifiers::NONE));
         assert!(matches!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::CONTROL)).as_slice(),
-            [ThreadUiAction::FollowUp { thread_id, expected_thread_revision: 1, prompt, .. }]
-                if *thread_id == ready.thread_id && prompt == "f"
+            [SessionUiAction::FollowUp { session_id, expected_session_revision: 1, prompt, .. }]
+                if *session_id == ready.session_id && prompt == "f"
         ));
 
         let entry = TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence: 2,
-            run_id: Some(run_id),
+            turn_id: Some(turn_id),
             kind: TranscriptKind::User,
             text: "f".into(),
             payload: None,
-            source_key: format!("follow-up:{run_id}:user"),
+            source_key: format!("follow-up:{turn_id}:user"),
             created_at_ms: 2,
         };
         assert!(
             reduce(
                 &mut model,
-                ThreadUiInput::Event(ThreadEventEnvelope {
-                    protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-                    event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-                    thread_id: ready.thread_id,
+                SessionUiInput::Event(SessionEventEnvelope {
+                    protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+                    event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+                    session_id: ready.session_id,
                     revision: 2,
                     sequence: 2,
-                    event: ThreadEvent::TranscriptAppended {
+                    event: SessionEvent::TranscriptAppended {
                         entry: entry.clone()
                     },
                 }),
@@ -6558,61 +6586,61 @@ mod tests {
         assert_eq!(
             reduce(
                 &mut model,
-                ThreadUiInput::Event(ThreadEventEnvelope {
-                    protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-                    event_id: ThreadEventId::from_uuid(ids.next_uuid_v7()),
-                    thread_id: ready.thread_id,
+                SessionUiInput::Event(SessionEventEnvelope {
+                    protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+                    event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
+                    session_id: ready.session_id,
                     revision: 4,
                     sequence: 3,
-                    event: ThreadEvent::LifecycleChanged {
-                        lifecycle: ThreadLifecycle::Ready,
-                        run_id: Some(run_id),
+                    event: SessionEvent::LifecycleChanged {
+                        lifecycle: SessionLifecycle::Ready,
+                        turn_id: Some(turn_id),
                     },
                 }),
             ),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
         assert_eq!(model.connection, ConnectionState::SnapshotRequired);
 
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![ready.clone()]));
-        model.sessions[0].lifecycle = ThreadLifecycle::WaitingPermission;
-        model.sessions[0].pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        reduce(&mut model, SessionUiInput::Snapshot(vec![ready.clone()]));
+        model.sessions[0].lifecycle = SessionLifecycle::WaitingPermission;
+        model.sessions[0].pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-1".into(),
             description: "write file".into(),
-            expected_run_revision: 4,
+            expected_turn_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
-            vec![ThreadUiAction::ResolvePermission {
-                thread_id: ready.thread_id,
+            vec![SessionUiAction::ResolvePermission {
+                session_id: ready.session_id,
                 request_id: "permission-1".into(),
                 allow: false,
             }]
         );
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::ResolvePermission {
-                thread_id: ready.thread_id,
+            vec![SessionUiAction::ResolvePermission {
+                session_id: ready.session_id,
                 request_id: "permission-1".into(),
                 allow: true,
             }]
         );
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::Cancel {
-                thread_id: ready.thread_id
+            vec![SessionUiAction::Cancel {
+                session_id: ready.session_id
             }]
         );
 
-        model.sessions[0].lifecycle = ThreadLifecycle::WaitingInput;
-        model.sessions[0].pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        model.sessions[0].lifecycle = SessionLifecycle::WaitingInput;
+        model.sessions[0].pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "input-1".into(),
             prompt: "need value".into(),
-            expected_run_revision: 4,
+            expected_turn_revision: 4,
         });
         assert!(reduce(&mut model, key(KeyCode::Char('é'), KeyModifiers::NONE)).is_empty());
         assert_eq!(model.input, "é");
@@ -6622,64 +6650,64 @@ mod tests {
         let input_submission_id = model.next_submission_id;
         assert_eq!(
             reduce(&mut model, key(KeyCode::F(5), KeyModifiers::NONE)),
-            vec![ThreadUiAction::ProvideInput {
+            vec![SessionUiAction::ProvideInput {
                 submission_id: input_submission_id,
-                thread_id: ready.thread_id,
+                session_id: ready.session_id,
                 request_id: "input-1".into(),
                 value: "v".into(),
             }]
         );
 
-        reduce(&mut model, ThreadUiInput::Disconnected);
+        reduce(&mut model, SessionUiInput::Disconnected);
         assert!(reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
         assert!(model.input.is_empty());
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
-        reduce(&mut model, ThreadUiInput::Connected);
-        reduce(&mut model, ThreadUiInput::Resize(120, 40));
-        model.sessions[0].lifecycle = ThreadLifecycle::Ready;
+        reduce(&mut model, SessionUiInput::Connected);
+        reduce(&mut model, SessionUiInput::Resize(120, 40));
+        model.sessions[0].lifecycle = SessionLifecycle::Ready;
         model.sessions[0].pending = None;
-        assert_eq!(model.focus, ThreadFocus::Composer);
+        assert_eq!(model.focus, SessionFocus::Composer);
         assert!(reduce(&mut model, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
-        assert_eq!(model.focus, ThreadFocus::Navigation);
+        assert_eq!(model.focus, SessionFocus::Navigation);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('q'), KeyModifiers::NONE)),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
     }
 
     #[test]
     fn composer_owns_reserved_printables_until_navigation_is_explicit() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         for value in ['q', 's', 'j', 'k', '?'] {
             assert!(reduce(&mut model, key(KeyCode::Char(value), KeyModifiers::NONE)).is_empty());
         }
-        reduce(&mut model, ThreadUiInput::Paste("\n粘贴\u{1b}[31m".into()));
+        reduce(&mut model, SessionUiInput::Paste("\n粘贴\u{1b}[31m".into()));
         assert_eq!(model.composer, "qsjk?\n粘贴");
         assert!(!model.help);
 
         assert!(reduce(&mut model, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
-        assert_eq!(model.focus, ThreadFocus::Navigation);
+        assert_eq!(model.focus, SessionFocus::Navigation);
         assert!(reduce(&mut model, key(KeyCode::Char('?'), KeyModifiers::NONE)).is_empty());
         assert!(model.help);
         assert_eq!(model.composer, "qsjk?\n粘贴");
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('q'), KeyModifiers::NONE)),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
 
-        model.focus = ThreadFocus::Composer;
+        model.focus = SessionFocus::Composer;
         assert_eq!(
             reduce(&mut model, key(KeyCode::F(10), KeyModifiers::NONE)),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
     }
 
     #[test]
     fn ctrl_p_command_palette_executes_every_advertised_command() {
-        let mut model = ThreadUiModel::with_startup(test_startup());
+        let mut model = SessionUiModel::with_startup(test_startup());
         let ctrl_p = || key(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
         assert!(reduce(&mut model, ctrl_p()).is_empty());
@@ -6724,7 +6752,7 @@ mod tests {
             reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
         }
         reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(model.focus, ThreadFocus::Navigation);
+        assert_eq!(model.focus, SessionFocus::Navigation);
 
         reduce(&mut model, ctrl_p());
         for _ in 0..BUILTINS
@@ -6736,7 +6764,7 @@ mod tests {
         }
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
 
         reduce(&mut model, ctrl_p());
@@ -6749,7 +6777,7 @@ mod tests {
         }
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
 
         let mut blocked = permission_model();
@@ -6760,7 +6788,7 @@ mod tests {
 
     #[test]
     fn model_picker_groups_filters_and_switches_draft_or_ready_session() {
-        let mut draft = ThreadUiModel::with_startup(test_startup());
+        let mut draft = SessionUiModel::with_startup(test_startup());
         draft.composer = "/model".into();
         assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         let screen = rendered(&draft, 100, 32);
@@ -6791,7 +6819,7 @@ mod tests {
         draft.composer = "use selected model".into();
         assert!(matches!(
             reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
-            [ThreadUiAction::StartWithModel {
+            [SessionUiAction::StartWithModel {
                 provider_name,
                 model,
                 prompt,
@@ -6801,13 +6829,13 @@ mod tests {
                 && prompt == "use selected model"
         ));
 
-        let mut ready = snapshot(ThreadLifecycle::Ready);
+        let mut ready = snapshot(SessionLifecycle::Ready);
         ready.binding.provider_name = "runtime-provider".into();
         ready.binding.model = "runtime-model".into();
-        let thread_id = ready.thread_id;
+        let session_id = ready.session_id;
         let revision = ready.revision;
-        let mut session = ThreadUiModel::with_startup(test_startup());
-        reduce(&mut session, ThreadUiInput::SessionOpened(Box::new(ready)));
+        let mut session = SessionUiModel::with_startup(test_startup());
+        reduce(&mut session, SessionUiInput::SessionOpened(Box::new(ready)));
         session.composer = "/model".into();
         reduce(&mut session, key(KeyCode::Enter, KeyModifiers::NONE));
         for value in "fast".chars() {
@@ -6815,10 +6843,10 @@ mod tests {
         }
         assert_eq!(
             reduce(&mut session, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::SwitchModel {
+            vec![SessionUiAction::SwitchModel {
                 switch_id: 1,
-                thread_id,
-                expected_thread_revision: revision,
+                session_id,
+                expected_session_revision: revision,
                 provider_name: "runtime-provider".into(),
                 model: "runtime-model-fast".into(),
             }]
@@ -6833,14 +6861,14 @@ mod tests {
         assert_eq!(
             reduce(
                 &mut session,
-                ThreadUiInput::ModelSwitchCompleted { switch_id: 1 }
+                SessionUiInput::ModelSwitchCompleted { switch_id: 1 }
             ),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
         assert!(session.pending_model_switch.is_some());
         session.sessions[0].binding.model = "runtime-model-fast".into();
         let refreshed = session.sessions.clone();
-        assert!(reduce(&mut session, ThreadUiInput::Snapshot(refreshed)).is_empty());
+        assert!(reduce(&mut session, SessionUiInput::Snapshot(refreshed)).is_empty());
         assert!(session.pending_model_switch.is_none());
         assert_eq!(
             session.status,
@@ -6851,7 +6879,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn model_picker_navigation_empty_current_active_and_failed_states_are_total() {
-        let mut draft = ThreadUiModel::with_startup(test_startup());
+        let mut draft = SessionUiModel::with_startup(test_startup());
         open_model_picker(&mut draft);
         assert!(reduce(&mut draft, key(KeyCode::Down, KeyModifiers::NONE)).is_empty());
         assert!(reduce(&mut draft, key(KeyCode::Up, KeyModifiers::NONE)).is_empty());
@@ -6865,11 +6893,11 @@ mod tests {
         reduce(&mut draft, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(draft.model_picker.is_none());
 
-        let mut ready = snapshot(ThreadLifecycle::Ready);
+        let mut ready = snapshot(SessionLifecycle::Ready);
         ready.binding.provider_name = "runtime-provider".into();
         ready.binding.model = "runtime-model".into();
-        let mut current = ThreadUiModel::with_startup(test_startup());
-        reduce(&mut current, ThreadUiInput::SessionOpened(Box::new(ready)));
+        let mut current = SessionUiModel::with_startup(test_startup());
+        reduce(&mut current, SessionUiInput::SessionOpened(Box::new(ready)));
         open_model_picker(&mut current);
         assert!(reduce(&mut current, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert_eq!(
@@ -6877,10 +6905,10 @@ mod tests {
             "Model already selected: runtime-provider/runtime-model"
         );
 
-        let mut active = ThreadUiModel::with_startup(test_startup());
+        let mut active = SessionUiModel::with_startup(test_startup());
         reduce(
             &mut active,
-            ThreadUiInput::SessionOpened(Box::new(running_snapshot())),
+            SessionUiInput::SessionOpened(Box::new(running_snapshot())),
         );
         open_model_picker(&mut active);
         for value in "fast".chars() {
@@ -6892,16 +6920,16 @@ mod tests {
             "Model switching is disabled while work or a request is active"
         );
 
-        let thread_id = current.selected_thread().unwrap().thread_id;
+        let session_id = current.selected_session().unwrap().session_id;
         current.pending_model_switch = Some(PendingModelSwitch {
             switch_id: 4,
-            thread_id,
+            session_id,
             provider_name: "other-provider".into(),
             model: "other-model".into(),
         });
         reduce(
             &mut current,
-            ThreadUiInput::ModelSwitchError {
+            SessionUiInput::ModelSwitchError {
                 switch_id: 3,
                 error: "stale".into(),
             },
@@ -6909,7 +6937,7 @@ mod tests {
         assert!(current.pending_model_switch.is_some());
         reduce(
             &mut current,
-            ThreadUiInput::ModelSwitchError {
+            SessionUiInput::ModelSwitchError {
                 switch_id: 4,
                 error: "lease lost".into(),
             },
@@ -6917,7 +6945,7 @@ mod tests {
         assert!(current.pending_model_switch.is_none());
         assert_eq!(current.status, "Model switch rejected: lease lost");
 
-        let mut empty = ThreadUiModel::default();
+        let mut empty = SessionUiModel::default();
         open_model_picker(&mut empty);
         assert_eq!(empty.status, PROVIDER_SETUP_GUIDANCE);
         assert!(filtered_model_options(&empty).is_empty());
@@ -6926,43 +6954,43 @@ mod tests {
                 .is_empty()
         );
 
-        let assigned = snapshot(ThreadLifecycle::Ready);
-        let assigned_id = assigned.thread_id;
-        let mut materializing = ThreadUiModel::with_startup(test_startup());
+        let assigned = snapshot(SessionLifecycle::Ready);
+        let assigned_id = assigned.session_id;
+        let mut materializing = SessionUiModel::with_startup(test_startup());
         materializing.pending_submission = Some(PendingSubmission {
             submission_id: 12,
             prompt: "materialize".into(),
-            thread_id: Some(assigned_id),
+            session_id: Some(assigned_id),
             after_sequence: 0,
         });
         reduce(
             &mut materializing,
-            ThreadUiInput::Snapshot(vec![assigned.clone()]),
+            SessionUiInput::Snapshot(vec![assigned.clone()]),
         );
         assert_eq!(
             materializing.active_conversation,
             Some(ActiveConversation::Session(assigned_id))
         );
-        let event = ThreadEventEnvelope {
-            protocol_version: latte_core::THREAD_PROTOCOL_VERSION,
-            event_id: ThreadEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            thread_id: assigned_id,
+        let event = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+            session_id: assigned_id,
             revision: assigned.revision + 1,
             sequence: assigned.sequence + 1,
-            event: ThreadEvent::BindingChanged {
+            event: SessionEvent::BindingChanged {
                 provider_name: "other".into(),
                 model: "other-model".into(),
             },
         };
         assert_eq!(
-            reduce(&mut materializing, ThreadUiInput::Event(event)),
-            vec![ThreadUiAction::RefreshSnapshots]
+            reduce(&mut materializing, SessionUiInput::Event(event)),
+            vec![SessionUiAction::RefreshSnapshots]
         );
 
-        let mut blocked = ThreadUiModel::with_startup(test_startup());
+        let mut blocked = SessionUiModel::with_startup(test_startup());
         blocked.pending_model_switch = Some(PendingModelSwitch {
             switch_id: 1,
-            thread_id: assigned_id,
+            session_id: assigned_id,
             provider_name: "other".into(),
             model: "other-model".into(),
         });
@@ -6978,10 +7006,10 @@ mod tests {
         append_editor_text(&mut editor, "a\u{1b}[31mb\u{7}c", 2);
         assert_eq!(editor, "ab");
 
-        let mut slash_blocked = ThreadUiModel::with_startup(test_startup());
+        let mut slash_blocked = SessionUiModel::with_startup(test_startup());
         reduce(
             &mut slash_blocked,
-            ThreadUiInput::SessionOpened(Box::new(running_snapshot())),
+            SessionUiInput::SessionOpened(Box::new(running_snapshot())),
         );
         slash_blocked.composer = "/model".into();
         assert!(submit_composer(&mut slash_blocked).is_empty());
@@ -6991,7 +7019,7 @@ mod tests {
             "Session switching is disabled while work or a request is active"
         );
 
-        let mut slash_popup = ThreadUiModel {
+        let mut slash_popup = SessionUiModel {
             composer: "/".into(),
             ..Default::default()
         };
@@ -7009,20 +7037,20 @@ mod tests {
         );
         assert!(
             reduce_composer_key(
-                &mut ThreadUiModel::default(),
+                &mut SessionUiModel::default(),
                 KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)
             )
             .is_empty()
         );
         assert_eq!(presentation_text("abcd", 2), "ab…");
-        let mut metadata_snapshot = snapshot(ThreadLifecycle::Ready);
+        let mut metadata_snapshot = snapshot(SessionLifecycle::Ready);
         let entry = metadata_snapshot.transcript.entries.remove(0);
         assert!(tool_metadata(&entry).is_empty());
     }
 
     #[test]
     fn slash_popup_filters_navigates_executes_and_preserves_composer_ownership() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         assert!(reduce(&mut model, key(KeyCode::Char('/'), KeyModifiers::NONE)).is_empty());
         let all = rendered(&model, 100, 32);
         assert!(all.contains("Suggestions"));
@@ -7033,24 +7061,24 @@ mod tests {
         reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::ShowSessions { query: None }]
+            vec![SessionUiAction::ShowSessions { query: None }]
         );
         assert!(model.composer.is_empty());
 
         model.composer = "/ref".into();
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
         model.composer = "/resu".into();
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::ShowSessions { query: None }]
+            vec![SessionUiAction::ShowSessions { query: None }]
         );
 
         model.composer = "/h".into();
         assert!(reduce(&mut model, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
-        assert_eq!(model.focus, ThreadFocus::Composer);
+        assert_eq!(model.focus, SessionFocus::Composer);
         assert_eq!(model.composer, "/h");
         assert!(!rendered(&model, 100, 32).contains("Suggestions"));
         reduce(&mut model, key(KeyCode::Char('e'), KeyModifiers::NONE));
@@ -7066,14 +7094,14 @@ mod tests {
 
     #[test]
     fn slash_popup_stays_hidden_for_unknown_prompts_and_blocking_requests() {
-        let mut prompt = ThreadUiModel {
+        let mut prompt = SessionUiModel {
             composer: "/tmp/file".into(),
             ..Default::default()
         };
         assert!(!rendered(&prompt, 100, 32).contains("Suggestions"));
         assert_eq!(
             reduce(&mut prompt, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::Start {
+            vec![SessionUiAction::Start {
                 submission_id: 1,
                 prompt: "/tmp/file".into(),
             }]
@@ -7088,24 +7116,24 @@ mod tests {
 
     #[test]
     fn startup_catalog_keeps_a_fresh_draft_until_resume_is_explicit() {
-        let existing = snapshot(ThreadLifecycle::Ready);
-        let summary = ThreadSessionSummary {
-            thread_id: existing.thread_id,
+        let existing = snapshot(SessionLifecycle::Ready);
+        let summary = SessionSummary {
+            session_id: existing.session_id,
             title: "Saved session".into(),
             workspace_root: "/workspace".into(),
-            parent_thread_id: None,
-            lifecycle: ThreadLifecycle::Ready,
+            parent_session_id: None,
+            lifecycle: SessionLifecycle::Ready,
             provider_name: "provider".into(),
             model: "model".into(),
             created_at_ms: 1,
             updated_at_ms: 2,
         };
 
-        let mut startup = ThreadUiModel::with_startup(test_startup());
+        let mut startup = SessionUiModel::with_startup(test_startup());
         assert!(
             reduce(
                 &mut startup,
-                ThreadUiInput::SessionCatalog(vec![summary.clone()])
+                SessionUiInput::SessionCatalog(vec![summary.clone()])
             )
             .is_empty()
         );
@@ -7115,13 +7143,13 @@ mod tests {
         );
         assert!(startup.sessions.is_empty());
 
-        let mut explicit_new = ThreadUiModel::with_startup(test_startup());
+        let mut explicit_new = SessionUiModel::with_startup(test_startup());
         explicit_new.composer = "/new".into();
         assert!(reduce(&mut explicit_new, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert!(
             reduce(
                 &mut explicit_new,
-                ThreadUiInput::SessionCatalog(vec![summary])
+                SessionUiInput::SessionCatalog(vec![summary])
             )
             .is_empty()
         );
@@ -7133,9 +7161,9 @@ mod tests {
 
     #[test]
     fn mouse_wheel_scrolls_transcript_in_every_focus_mode_and_saturates() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         let mouse = |kind| {
-            ThreadUiInput::Mouse(MouseEvent {
+            SessionUiInput::Mouse(MouseEvent {
                 kind,
                 column: 10,
                 row: 10,
@@ -7145,7 +7173,7 @@ mod tests {
 
         assert!(reduce(&mut model, mouse(MouseEventKind::ScrollUp)).is_empty());
         assert_eq!(model.scroll, 3);
-        model.focus = ThreadFocus::Navigation;
+        model.focus = SessionFocus::Navigation;
         reduce(&mut model, mouse(MouseEventKind::ScrollUp));
         assert_eq!(model.scroll, 6);
         reduce(&mut model, mouse(MouseEventKind::ScrollDown));
@@ -7158,14 +7186,14 @@ mod tests {
 
     #[test]
     fn slash_commands_keep_local_session_typed_and_prompt_paths_distinct() {
-        let mut model = ThreadUiModel::with_startup(test_startup());
-        let existing = snapshot(ThreadLifecycle::Ready);
-        let summary = ThreadSessionSummary {
-            thread_id: existing.thread_id,
+        let mut model = SessionUiModel::with_startup(test_startup());
+        let existing = snapshot(SessionLifecycle::Ready);
+        let summary = SessionSummary {
+            session_id: existing.session_id,
             title: "Resume me".into(),
             workspace_root: "/workspace".into(),
-            parent_thread_id: None,
-            lifecycle: ThreadLifecycle::Ready,
+            parent_session_id: None,
+            lifecycle: SessionLifecycle::Ready,
             provider_name: "p".into(),
             model: "m".into(),
             created_at_ms: 1,
@@ -7180,36 +7208,36 @@ mod tests {
         );
         assert!(model.sessions.is_empty());
 
-        model.composer = format!("/resume {}", summary.thread_id);
+        model.composer = format!("/resume {}", summary.session_id);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::ShowSessions {
-                query: Some(summary.thread_id.to_string()),
+            vec![SessionUiAction::ShowSessions {
+                query: Some(summary.session_id.to_string()),
             }]
         );
         assert!(model.composer.is_empty());
         assert_eq!(
             reduce(
                 &mut model,
-                ThreadUiInput::SessionCatalogReady {
+                SessionUiInput::SessionCatalogReady {
                     sessions: vec![summary],
-                    query: Some(existing.thread_id.to_string()),
+                    query: Some(existing.session_id.to_string()),
                 }
             ),
-            vec![ThreadUiAction::OpenSession {
-                thread_id: existing.thread_id,
+            vec![SessionUiAction::OpenSession {
+                session_id: existing.session_id,
             }]
         );
         assert!(
             reduce(
                 &mut model,
-                ThreadUiInput::SessionOpened(Box::new(existing.clone()))
+                SessionUiInput::SessionOpened(Box::new(existing.clone()))
             )
             .is_empty()
         );
         assert_eq!(
             model.active_conversation,
-            Some(ActiveConversation::Session(existing.thread_id))
+            Some(ActiveConversation::Session(existing.session_id))
         );
 
         model.active_conversation = Some(ActiveConversation::NewSessionDraft);
@@ -7217,27 +7245,27 @@ mod tests {
         model.composer = "/tmp/file".into();
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::Start {
+            vec![SessionUiAction::Start {
                 submission_id: 1,
                 prompt: "/tmp/file".into(),
             }]
         );
 
-        let mut running = snapshot(ThreadLifecycle::Running);
-        running.active_run_id = Some(RunId::from_uuid(SystemIdSource::default().next_uuid_v7()));
-        let mut blocked = ThreadUiModel::default();
-        reduce(&mut blocked, ThreadUiInput::Snapshot(vec![running]));
+        let mut running = snapshot(SessionLifecycle::Running);
+        running.active_turn_id = Some(TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()));
+        let mut blocked = SessionUiModel::default();
+        reduce(&mut blocked, SessionUiInput::Snapshot(vec![running]));
         blocked.composer = "/new".into();
         assert!(reduce(&mut blocked, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
         assert_eq!(blocked.composer, "/new");
         assert!(blocked.status.contains("Session switching is disabled"));
 
-        for lifecycle in [ThreadLifecycle::Failed, ThreadLifecycle::Interrupted] {
+        for lifecycle in [SessionLifecycle::Failed, SessionLifecycle::Interrupted] {
             assert_terminal_session_switching_available(lifecycle);
         }
 
-        let mut reconciliation = ThreadUiModel {
-            sessions: vec![snapshot(ThreadLifecycle::ReconciliationRequired)],
+        let mut reconciliation = SessionUiModel {
+            sessions: vec![snapshot(SessionLifecycle::ReconciliationRequired)],
             ..Default::default()
         };
         assert!(
@@ -7253,27 +7281,27 @@ mod tests {
 
     #[test]
     fn session_management_commands_are_typed_and_workspace_scoped() {
-        let mut model = ThreadUiModel::with_startup(test_startup());
-        let current = snapshot(ThreadLifecycle::Ready);
-        let thread_id = current.thread_id;
-        reduce(&mut model, ThreadUiInput::SessionOpened(Box::new(current)));
+        let mut model = SessionUiModel::with_startup(test_startup());
+        let current = snapshot(SessionLifecycle::Ready);
+        let session_id = current.session_id;
+        reduce(&mut model, SessionUiInput::SessionOpened(Box::new(current)));
         assert_eq!(
             dispatch_builtin(&mut model, BuiltinCommand::Rename, "new title".into()),
-            vec![ThreadUiAction::RenameSession {
-                thread_id,
+            vec![SessionUiAction::RenameSession {
+                session_id,
                 title: "new title".into(),
             }]
         );
         assert_eq!(
             dispatch_builtin(&mut model, BuiltinCommand::Fork, "branch title".into()),
-            vec![ThreadUiAction::ForkSession {
-                thread_id,
+            vec![SessionUiAction::ForkSession {
+                session_id,
                 title: Some("branch title".into()),
             }]
         );
         assert_eq!(
             dispatch_builtin(&mut model, BuiltinCommand::Sessions, "durable".into()),
-            vec![ThreadUiAction::SearchSessions {
+            vec![SessionUiAction::SearchSessions {
                 query: "durable".into(),
             }]
         );
@@ -7287,31 +7315,33 @@ mod tests {
     #[test]
     fn session_management_feedback_refreshes_and_opens_forks() {
         let ids = SystemIdSource::default();
-        let current = ThreadId::from_uuid(ids.next_uuid_v7());
-        let fork = ThreadId::from_uuid(ids.next_uuid_v7());
+        let current = SessionId::from_uuid(ids.next_uuid_v7());
+        let fork = SessionId::from_uuid(ids.next_uuid_v7());
         let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             active_conversation: Some(ActiveConversation::Session(current)),
-            ..ThreadUiModel::default()
+            ..SessionUiModel::default()
         };
 
         feedback_tx
-            .send(ThreadUiFeedback::session_management(Ok(
+            .send(SessionUiFeedback::session_management(Ok(
                 SessionManagementOutcome::Updated("renamed".into()),
             )))
             .unwrap();
         feedback_tx
-            .send(ThreadUiFeedback::session_management(Ok(
+            .send(SessionUiFeedback::session_management(Ok(
                 SessionManagementOutcome::Forked(fork),
             )))
             .unwrap();
         let (changed, actions) = drain_runtime_updates(&mut model, &feedback_rx, &progress_rx);
         assert!(changed);
-        assert!(actions.contains(&ThreadUiAction::RefreshSnapshots));
-        assert!(actions.contains(&ThreadUiAction::OpenSession { thread_id: fork }));
+        assert!(actions.contains(&SessionUiAction::RefreshSnapshots));
+        assert!(actions.contains(&SessionUiAction::OpenSession { session_id: fork }));
         feedback_tx
-            .send(ThreadUiFeedback::session_management(Err("rejected".into())))
+            .send(SessionUiFeedback::session_management(
+                Err("rejected".into()),
+            ))
             .unwrap();
         let (changed, actions) = drain_runtime_updates(&mut model, &feedback_rx, &progress_rx);
         assert!(changed);
@@ -7322,13 +7352,13 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn projection_defaults_and_action_adapter_cover_session_discovery_and_refresh() {
-        let saved = snapshot(ThreadLifecycle::Ready);
-        let mut untitled = snapshot(ThreadLifecycle::Ready);
+        let saved = snapshot(SessionLifecycle::Ready);
+        let mut untitled = snapshot(SessionLifecycle::Ready);
         untitled.transcript.entries.clear();
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone(), untitled.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         let catalog = projection.session_catalog().unwrap();
         assert_eq!(catalog.len(), 2);
@@ -7344,10 +7374,10 @@ mod tests {
                 .all(|session| session.workspace_root.is_empty())
         );
 
-        let missing = snapshot(ThreadLifecycle::Ready).thread_id;
+        let missing = snapshot(SessionLifecycle::Ready).session_id;
         let mut missing_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert_eq!(
             missing_projection.session(missing).unwrap_err(),
@@ -7356,20 +7386,20 @@ mod tests {
 
         let mut exact_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()], vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut exact_model = ThreadUiModel::default();
+        let mut exact_model = SessionUiModel::default();
         let mut dispatched = Vec::new();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut exact_projection,
                 &mut exact_model,
                 &mut |action| {
                     dispatched.push(action);
                     Ok(())
                 },
-                vec![ThreadUiAction::ShowSessions {
-                    query: Some(saved.thread_id.to_string()),
+                vec![SessionUiAction::ShowSessions {
+                    query: Some(saved.session_id.to_string()),
                 }],
             )
             .unwrap()
@@ -7377,20 +7407,20 @@ mod tests {
         assert!(dispatched.is_empty());
         assert_eq!(
             exact_model.active_conversation,
-            Some(ActiveConversation::Session(saved.thread_id))
+            Some(ActiveConversation::Session(saved.session_id))
         );
 
         let mut picker_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut picker_model = ThreadUiModel::default();
+        let mut picker_model = SessionUiModel::default();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut picker_projection,
                 &mut picker_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::ShowSessions { query: None }],
+                vec![SessionUiAction::ShowSessions { query: None }],
             )
             .unwrap()
         );
@@ -7403,7 +7433,7 @@ mod tests {
                 vec![saved.clone()],
                 vec![saved.clone()],
             ]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert_eq!(
             search_projection
@@ -7416,31 +7446,33 @@ mod tests {
             search_projection.search_session_catalog("").unwrap().len(),
             1
         );
-        let mut search_model = ThreadUiModel::default();
+        let mut search_model = SessionUiModel::default();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut search_projection,
                 &mut search_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::SearchSessions {
+                vec![SessionUiAction::SearchSessions {
                     query: "hello".into(),
                 }],
             )
             .unwrap()
         );
-        assert_eq!(search_model.session_catalog[0].thread_id, saved.thread_id);
+        assert_eq!(search_model.session_catalog[0].session_id, saved.session_id);
 
         let mut missing_open_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut missing_open_model = ThreadUiModel::default();
+        let mut missing_open_model = SessionUiModel::default();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut missing_open_projection,
                 &mut missing_open_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::OpenSession { thread_id: missing }],
+                vec![SessionUiAction::OpenSession {
+                    session_id: missing
+                }],
             )
             .unwrap()
         );
@@ -7448,68 +7480,68 @@ mod tests {
 
         let mut active_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut active_projection,
                 &mut exact_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::RefreshSnapshots],
+                vec![SessionUiAction::RefreshSnapshots],
             )
             .unwrap()
         );
-        assert_eq!(exact_model.sessions[0].thread_id, saved.thread_id);
+        assert_eq!(exact_model.sessions[0].session_id, saved.session_id);
 
         let mut draft_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut draft_model = ThreadUiModel {
+        let mut draft_model = SessionUiModel {
             active_conversation: Some(ActiveConversation::NewSessionDraft),
             ..Default::default()
         };
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut draft_projection,
                 &mut draft_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::RefreshSnapshots],
+                vec![SessionUiAction::RefreshSnapshots],
             )
             .unwrap()
         );
-        assert_eq!(draft_model.session_catalog[0].thread_id, saved.thread_id);
+        assert_eq!(draft_model.session_catalog[0].session_id, saved.session_id);
 
         let mut snapshot_projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![saved.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut snapshot_model = ThreadUiModel::default();
+        let mut snapshot_model = SessionUiModel::default();
         assert!(
-            !apply_thread_actions(
+            !apply_session_actions(
                 &mut snapshot_projection,
                 &mut snapshot_model,
                 &mut |_| Ok(()),
-                vec![ThreadUiAction::RefreshSnapshots],
+                vec![SessionUiAction::RefreshSnapshots],
             )
             .unwrap()
         );
-        assert_eq!(snapshot_model.sessions[0].thread_id, saved.thread_id);
+        assert_eq!(snapshot_model.sessions[0].session_id, saved.session_id);
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
     fn session_catalog_resolution_picker_keys_and_draft_materialization_are_total() {
-        let mut first = snapshot(ThreadLifecycle::Ready);
-        let second = snapshot(ThreadLifecycle::Ready);
+        let mut first = snapshot(SessionLifecycle::Ready);
+        let second = snapshot(SessionLifecycle::Ready);
         let first_summary = session_summary(&first, "same title", "/workspace/one");
         let second_summary = session_summary(&second, "same title", "/workspace/two");
 
-        let mut startup_empty = ThreadUiModel::with_startup(test_startup());
+        let mut startup_empty = SessionUiModel::with_startup(test_startup());
         assert!(
             reduce(
                 &mut startup_empty,
-                ThreadUiInput::SessionCatalog(Vec::new())
+                SessionUiInput::SessionCatalog(Vec::new())
             )
             .is_empty()
         );
@@ -7518,11 +7550,11 @@ mod tests {
             Some(ActiveConversation::NewSessionDraft)
         );
 
-        let mut empty = ThreadUiModel::default();
+        let mut empty = SessionUiModel::default();
         assert!(
             reduce(
                 &mut empty,
-                ThreadUiInput::SessionCatalogReady {
+                SessionUiInput::SessionCatalogReady {
                     sessions: Vec::new(),
                     query: Some(String::new()),
                 },
@@ -7532,11 +7564,11 @@ mod tests {
         assert!(empty.session_picker);
         assert_eq!(empty.status, "No saved sessions");
 
-        let mut missing = ThreadUiModel::default();
+        let mut missing = SessionUiModel::default();
         assert!(
             reduce(
                 &mut missing,
-                ThreadUiInput::SessionCatalogReady {
+                SessionUiInput::SessionCatalogReady {
                     sessions: Vec::new(),
                     query: Some("missing".into()),
                 },
@@ -7545,11 +7577,11 @@ mod tests {
         );
         assert!(missing.status.contains("No exact session match"));
 
-        let mut ambiguous = ThreadUiModel::default();
+        let mut ambiguous = SessionUiModel::default();
         assert!(
             reduce(
                 &mut ambiguous,
-                ThreadUiInput::SessionCatalogReady {
+                SessionUiInput::SessionCatalogReady {
                     sessions: vec![first_summary.clone(), second_summary.clone()],
                     query: Some("same title".into()),
                 },
@@ -7571,31 +7603,31 @@ mod tests {
         assert!(reduce(&mut ambiguous, key(KeyCode::Char('x'), KeyModifiers::NONE)).is_empty());
         assert_eq!(
             reduce(&mut ambiguous, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::OpenSession {
-                thread_id: first.thread_id,
+            vec![SessionUiAction::OpenSession {
+                session_id: first.session_id,
             }]
         );
         assert!(reduce(&mut ambiguous, key(KeyCode::Esc, KeyModifiers::NONE)).is_empty());
         assert!(!ambiguous.session_picker);
 
-        let mut no_rows = ThreadUiModel {
+        let mut no_rows = SessionUiModel {
             session_picker: true,
             ..Default::default()
         };
         assert!(reduce(&mut no_rows, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
 
-        let mut materializing = ThreadUiModel::with_startup(test_startup());
-        first.transcript.entries[0].source_key = "thread:create:user".into();
+        let mut materializing = SessionUiModel::with_startup(test_startup());
+        first.transcript.entries[0].source_key = "session:create:user".into();
         materializing.pending_submission = Some(PendingSubmission {
             submission_id: 9,
             prompt: "hello".into(),
-            thread_id: None,
+            session_id: None,
             after_sequence: 0,
         });
         assert!(
             reduce(
                 &mut materializing,
-                ThreadUiInput::Snapshot(vec![first.clone()]),
+                SessionUiInput::Snapshot(vec![first.clone()]),
             )
             .is_empty()
         );
@@ -7605,36 +7637,36 @@ mod tests {
         );
         reduce(
             &mut materializing,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 9,
-                thread_id: first.thread_id,
+                session_id: first.session_id,
             },
         );
         assert_eq!(
             materializing.active_conversation,
-            Some(ActiveConversation::Session(first.thread_id))
+            Some(ActiveConversation::Session(first.session_id))
         );
         assert!(materializing.pending_submission.is_none());
         assert!(
             reduce(
                 &mut materializing,
-                ThreadUiInput::Snapshot(vec![first.clone(), second]),
+                SessionUiInput::Snapshot(vec![first.clone(), second]),
             )
             .is_empty()
         );
         assert_eq!(
-            materializing.selected_thread().unwrap().thread_id,
-            first.thread_id
+            materializing.selected_session().unwrap().session_id,
+            first.session_id
         );
     }
 
     #[test]
     fn command_failure_and_non_tty_adapter_boundaries_are_explicit() {
-        let mut disabled = ThreadUiModel {
+        let mut disabled = SessionUiModel {
             pending_submission: Some(PendingSubmission {
                 submission_id: 1,
                 prompt: "busy".into(),
-                thread_id: None,
+                session_id: None,
                 after_sequence: 0,
             }),
             ..Default::default()
@@ -7642,7 +7674,7 @@ mod tests {
         assert!(dispatch_builtin(&mut disabled, BuiltinCommand::New, String::new()).is_empty());
         assert!(disabled.status.contains("Session switching is disabled"));
 
-        let mut invalid = ThreadUiModel {
+        let mut invalid = SessionUiModel {
             composer: "/help unexpected".into(),
             ..Default::default()
         };
@@ -7650,10 +7682,10 @@ mod tests {
         assert_eq!(invalid.composer, "/help unexpected");
         assert!(invalid.status.contains("does not accept arguments"));
 
-        let mut queued = ThreadUiModel::default();
+        let mut queued = SessionUiModel::default();
         reduce(
             &mut queued,
-            ThreadUiInput::Snapshot(vec![running_snapshot()]),
+            SessionUiInput::Snapshot(vec![running_snapshot()]),
         );
         queued.queued_follow_up = Some("first".into());
         queued.composer = "second".into();
@@ -7664,7 +7696,7 @@ mod tests {
 
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         let (_feedback_tx, feedback_rx) = std::sync::mpsc::channel();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -7682,9 +7714,9 @@ mod tests {
 
     #[test]
     fn session_picker_rendering_covers_populated_and_empty_catalogs() {
-        let first = snapshot(ThreadLifecycle::Ready);
-        let second = snapshot(ThreadLifecycle::Failed);
-        let populated = ThreadUiModel {
+        let first = snapshot(SessionLifecycle::Ready);
+        let second = snapshot(SessionLifecycle::Failed);
+        let populated = SessionUiModel {
             session_picker: true,
             session_index: 1,
             session_catalog: vec![
@@ -7700,7 +7732,7 @@ mod tests {
         assert!(screen.contains("/workspace/one"));
         assert!(screen.contains("Enter resume"));
 
-        let empty = ThreadUiModel {
+        let empty = SessionUiModel {
             session_picker: true,
             ..Default::default()
         };
@@ -7719,7 +7751,7 @@ mod tests {
         );
         assert_eq!(wrapped_line_count(&"界".repeat(34), 66), 2);
 
-        let model = ThreadUiModel {
+        let model = SessionUiModel {
             startup: Some(test_startup()),
             composer: "a界👩‍💻e\u{301}".into(),
             ..Default::default()
@@ -7754,7 +7786,7 @@ mod tests {
             assert!(layout.rows[1].is_empty(), "{name}");
             assert_eq!((layout.caret_row, layout.caret_column), (1, 0), "{name}");
 
-            let model = ThreadUiModel {
+            let model = SessionUiModel {
                 startup: Some(test_startup()),
                 composer: text,
                 ..Default::default()
@@ -7768,11 +7800,11 @@ mod tests {
             assert_eq!((cursor.x, cursor.y), (4, 20), "{name}");
         }
 
-        let mut pasted = ThreadUiModel {
+        let mut pasted = SessionUiModel {
             startup: Some(test_startup()),
             ..Default::default()
         };
-        reduce(&mut pasted, ThreadUiInput::Paste(ascii.clone()));
+        reduce(&mut pasted, SessionUiInput::Paste(ascii.clone()));
         assert_eq!(pasted.composer, ascii);
         let backend = TestBackend::new(72, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -7793,17 +7825,17 @@ mod tests {
     #[test]
     fn pending_input_uses_the_same_exact_boundary_layout_and_caret() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingInput);
-        thread.pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingInput);
+        session.pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "boundary-input".into(),
             prompt: "value".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        let model = ThreadUiModel {
+        let model = SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![thread],
+            sessions: vec![session],
             input: "界".repeat(33),
             composer: "composer must not drive input layout".into(),
             ..Default::default()
@@ -7821,10 +7853,10 @@ mod tests {
 
     #[test]
     fn ctrl_c_requires_a_second_press_and_first_press_cancels_active_work() {
-        let thread = snapshot(ThreadLifecycle::Running);
-        let thread_id = thread.thread_id;
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        let session = snapshot(SessionLifecycle::Running);
+        let session_id = session.session_id;
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
         let now = Instant::now();
@@ -7835,7 +7867,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 now,
             ),
-            vec![ThreadUiAction::Cancel { thread_id }]
+            vec![SessionUiAction::Cancel { session_id }]
         );
         assert_eq!(status_line(&model), "Ctrl+C again to exit");
         assert!(
@@ -7852,14 +7884,14 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 now + Duration::from_millis(250),
             ),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
         assert!(model.ctrl_c_exit_armed_until.is_none());
     }
 
     #[test]
     fn ctrl_c_exit_confirmation_expires_and_other_input_disarms_it() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         let now = Instant::now();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
@@ -7896,15 +7928,15 @@ mod tests {
     #[test]
     fn permission_and_input_branches_consume_the_whole_key_event() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut permission = snapshot(ThreadLifecycle::WaitingPermission);
-        permission.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut permission = snapshot(SessionLifecycle::WaitingPermission);
+        permission.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "exact-permission".into(),
             description: "write one file".into(),
-            expected_run_revision: 7,
+            expected_turn_revision: 7,
         });
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             sessions: vec![permission],
             composer: "kept".into(),
             input: "also kept".into(),
@@ -7918,26 +7950,26 @@ mod tests {
         ] {
             assert!(reduce(&mut model, key(code, KeyModifiers::NONE)).is_empty());
         }
-        reduce(&mut model, ThreadUiInput::Paste("blocked paste".into()));
+        reduce(&mut model, SessionUiInput::Paste("blocked paste".into()));
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
-        assert_eq!(model.focus, ThreadFocus::Composer);
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        assert_eq!(model.focus, SessionFocus::Composer);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert_eq!(
             reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE)),
-            vec![ThreadUiAction::ResolvePermission {
-                thread_id: model.sessions[0].thread_id,
+            vec![SessionUiAction::ResolvePermission {
+                session_id: model.sessions[0].session_id,
                 request_id: "exact-permission".into(),
                 allow: false,
             }]
         );
 
-        model.sessions[0].lifecycle = ThreadLifecycle::WaitingInput;
-        model.sessions[0].pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        model.sessions[0].lifecycle = SessionLifecycle::WaitingInput;
+        model.sessions[0].pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "exact-input".into(),
             prompt: "value".into(),
-            expected_run_revision: 8,
+            expected_turn_revision: 8,
         });
         model.input.clear();
         reduce(&mut model, key(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -7947,9 +7979,9 @@ mod tests {
         let input_submission_id = model.next_submission_id;
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
-            vec![ThreadUiAction::ProvideInput {
+            vec![SessionUiAction::ProvideInput {
                 submission_id: input_submission_id,
-                thread_id: model.sessions[0].thread_id,
+                session_id: model.sessions[0].session_id,
                 request_id: "exact-input".into(),
                 value: "j\n".into(),
             }]
@@ -7959,23 +7991,23 @@ mod tests {
     #[test]
     fn presentation_groups_runs_and_pairs_tool_results_without_private_payloads() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.latest_run_id = Some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 3,
-            status: ThreadRunStatus::Completed,
-            run_revision: 4,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 4,
             completed_at_ms: Some(4),
             failure_code: None,
         });
-        thread.transcript.entries = vec![
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "检查输入",
                 None,
@@ -7983,9 +8015,9 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
-                "Read crates/latte-tui/src/thread.rs",
+                "Read crates/latte-tui/src/session.rs",
                 Some(serde_json::json!({
                     "descriptor": {
                         "tool_call_id": "call_read",
@@ -7998,7 +8030,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "1,900 lines inspected",
                 Some(serde_json::json!({
@@ -8010,16 +8042,16 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "orphan result remains readable",
                 Some(serde_json::json!({"unexpected": [1, 2, 3]})),
             ),
         ];
 
-        let projection = project_transcript(&thread);
+        let projection = project_transcript(&session);
         assert_eq!(projection.len(), 1);
-        assert_eq!(projection[0].heading, "Run 3 · Completed");
+        assert_eq!(projection[0].heading, "Turn 3 · Completed");
         assert!(matches!(
             &projection[0].items[1],
             PresentationItem::Action {
@@ -8039,24 +8071,24 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn render_is_single_transcript_with_nested_activity_and_bounded_disclosure() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.active_run_id = Some(run_id);
-        thread.latest_run_id = Some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.active_turn_id = Some(turn_id);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Running,
-            run_revision: 2,
+            status: SessionTurnStatus::Running,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
-        thread.transcript.entries = vec![
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "修复按键输入",
                 None,
@@ -8064,7 +8096,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "Search reduce_key in crates/latte-tui",
                 Some(serde_json::json!({
@@ -8079,7 +8111,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "18 matches",
                 Some(serde_json::json!({
@@ -8091,21 +8123,21 @@ mod tests {
             transcript_entry(
                 &ids,
                 4,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Assistant,
                 "Input path located.",
                 Some(serde_json::json!({"private_checkpoint": "never render this"})),
             ),
         ];
-        thread.transcript.has_more = true;
-        let action_key = action_keys(Some(&thread))[0].clone();
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        session.transcript.has_more = true;
+        let action_key = action_keys(Some(&session))[0].clone();
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             size: (100, 30),
-            focus: ThreadFocus::Navigation,
+            focus: SessionFocus::Navigation,
             expanded_actions: BTreeSet::from([action_key]),
-            progress: vec![ThreadTransientProgress::AssistantDelta {
-                run_id,
+            progress: vec![SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: "Running tests...".into(),
             }],
             ..Default::default()
@@ -8114,7 +8146,7 @@ mod tests {
         assert!(screen.contains("Latte Code"));
         assert!(screen.contains("·  Running"));
         assert!(screen.contains("▎  ›"), "{screen}");
-        assert!(screen.contains("Run 1 · Running"));
+        assert!(screen.contains("Turn 1 · Running"));
         assert!(screen.contains("search  Search reduce_key"));
         assert!(screen.contains("18 matches"));
         assert!(screen.contains("Input path located"));
@@ -8234,16 +8266,16 @@ mod tests {
         assert!(!idle.contains("Composer ·"));
 
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut permission = snapshot(ThreadLifecycle::WaitingPermission);
-        permission.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut permission = snapshot(SessionLifecycle::WaitingPermission);
+        permission.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-state".into(),
             description: "Edit one file".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let permission_screen = rendered(
-            &ThreadUiModel {
+            &SessionUiModel {
                 sessions: vec![permission],
                 ..Default::default()
             },
@@ -8257,26 +8289,26 @@ mod tests {
         assert!(!permission_screen.contains("Transcript ·"));
         assert!(!permission_screen.contains("Composer ·"));
 
-        let mut complete = snapshot(ThreadLifecycle::Ready);
+        let mut complete = snapshot(SessionLifecycle::Ready);
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "Composer input handling fixed.",
             None,
         ));
-        complete.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        complete.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
         let complete_screen = rendered(
-            &ThreadUiModel {
+            &SessionUiModel {
                 sessions: vec![complete],
                 ..Default::default()
             },
@@ -8292,11 +8324,11 @@ mod tests {
         assert!(!complete_screen.contains("Verified"));
 
         for lifecycle in [
-            ThreadLifecycle::Running,
-            ThreadLifecycle::WaitingInput,
-            ThreadLifecycle::Interrupted,
-            ThreadLifecycle::Failed,
-            ThreadLifecycle::ReconciliationRequired,
+            SessionLifecycle::Running,
+            SessionLifecycle::WaitingInput,
+            SessionLifecycle::Interrupted,
+            SessionLifecycle::Failed,
+            SessionLifecycle::ReconciliationRequired,
         ] {
             assert!(!lifecycle_label(lifecycle).is_empty());
             assert_ne!(lifecycle_color(lifecycle), Color::Reset);
@@ -8410,19 +8442,19 @@ mod tests {
     fn scrolling_only_changes_the_transcript_band() {
         let mut model = working_model();
         let ids = SystemIdSource::default();
-        let run_id = model.sessions[0].active_run_id.unwrap();
+        let turn_id = model.sessions[0].active_turn_id.unwrap();
         for sequence in 4..=48 {
             model.sessions[0].transcript.entries.push(transcript_entry(
                 &ids,
                 sequence,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::Assistant,
                 &format!("scroll fixture row {sequence}"),
                 None,
             ));
         }
         let before = rendered_buffer(&model, 120, 40);
-        let after = rendered_buffer(&ThreadUiModel { scroll: 8, ..model }, 120, 40);
+        let after = rendered_buffer(&SessionUiModel { scroll: 8, ..model }, 120, 40);
         for y in 0..3 {
             for x in 0..120 {
                 assert_eq!(before[(x, y)], after[(x, y)], "header ({x},{y})");
@@ -8599,16 +8631,16 @@ mod tests {
     #[test]
     fn permission_reconciliation_and_completion_keep_distinct_hierarchy() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut permission = snapshot(ThreadLifecycle::WaitingPermission);
-        permission.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut permission = snapshot(SessionLifecycle::WaitingPermission);
+        permission.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-geometry".into(),
             description: "Edit src/lib.rs".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         let permission_buffer = rendered_buffer(
-            &ThreadUiModel {
+            &SessionUiModel {
                 sessions: vec![permission],
                 ..Default::default()
             },
@@ -8626,7 +8658,7 @@ mod tests {
         assert_eq!(permission_buffer[(permission_x, permission_y)].bg, SURFACE);
 
         let effect_id = "effect-authoritative-7";
-        let mut reconciliation = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut reconciliation = snapshot(SessionLifecycle::ReconciliationRequired);
         reconciliation.transcript.entries.push(transcript_entry(
             &ids,
             2,
@@ -8636,7 +8668,7 @@ mod tests {
             Some(serde_json::json!({"effect_id": effect_id, "status": "unknown"})),
         ));
         let reconciliation_buffer = rendered_buffer(
-            &ThreadUiModel {
+            &SessionUiModel {
                 sessions: vec![reconciliation],
                 ..Default::default()
             },
@@ -8651,27 +8683,27 @@ mod tests {
             "┐"
         );
 
-        let mut complete = snapshot(ThreadLifecycle::Ready);
-        complete.latest_run_id = Some(run_id);
-        complete.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let mut complete = snapshot(SessionLifecycle::Ready);
+        complete.latest_turn_id = Some(turn_id);
+        complete.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "The change is complete.",
             None,
         ));
         let complete_buffer = rendered_buffer(
-            &ThreadUiModel {
+            &SessionUiModel {
                 sessions: vec![complete],
                 ..Default::default()
             },
@@ -8701,7 +8733,7 @@ mod tests {
 
         let complete = rendered(&complete_model(), 120, 40);
         assert!(complete.contains("CHANGED"));
-        assert!(complete.contains("crates/latte-tui/src/thread.rs"));
+        assert!(complete.contains("crates/latte-tui/src/session.rs"));
         assert!(complete.contains("VERIFIED"));
         assert!(complete.contains("cargo test -p latte-tui"));
         assert!(complete.contains("all focused tests passed"));
@@ -8867,7 +8899,7 @@ mod tests {
             for (width, height) in [(120, 40), (100, 30), (72, 24)] {
                 let before = rendered_buffer(&model, width, height);
                 let after = rendered_buffer(
-                    &ThreadUiModel {
+                    &SessionUiModel {
                         scroll: u16::MAX,
                         ..model.clone()
                     },
@@ -8917,13 +8949,13 @@ mod tests {
     #[test]
     fn rendered_status_roles_use_only_the_prototype_rgb_palette() {
         for (lifecycle, expected) in [
-            (ThreadLifecycle::Ready, GREEN),
-            (ThreadLifecycle::Running, CYAN),
-            (ThreadLifecycle::WaitingPermission, AMBER),
-            (ThreadLifecycle::WaitingInput, AMBER),
-            (ThreadLifecycle::Interrupted, AMBER),
-            (ThreadLifecycle::Failed, RED),
-            (ThreadLifecycle::ReconciliationRequired, AMBER),
+            (SessionLifecycle::Ready, GREEN),
+            (SessionLifecycle::Running, CYAN),
+            (SessionLifecycle::WaitingPermission, AMBER),
+            (SessionLifecycle::WaitingInput, AMBER),
+            (SessionLifecycle::Interrupted, AMBER),
+            (SessionLifecycle::Failed, RED),
+            (SessionLifecycle::ReconciliationRequired, AMBER),
         ] {
             let model = lifecycle_model(lifecycle);
             let buffer = rendered_buffer(&model, 120, 40);
@@ -8932,14 +8964,14 @@ mod tests {
         }
 
         for (status, expected) in [
-            (ThreadRunStatus::Queued, CYAN),
-            (ThreadRunStatus::Running, CYAN),
-            (ThreadRunStatus::Cancelling, CYAN),
-            (ThreadRunStatus::WaitingPermission, AMBER),
-            (ThreadRunStatus::WaitingInput, AMBER),
-            (ThreadRunStatus::Interrupted, AMBER),
-            (ThreadRunStatus::Failed, RED),
-            (ThreadRunStatus::Completed, GREEN),
+            (SessionTurnStatus::Queued, CYAN),
+            (SessionTurnStatus::Running, CYAN),
+            (SessionTurnStatus::Cancelling, CYAN),
+            (SessionTurnStatus::WaitingPermission, AMBER),
+            (SessionTurnStatus::WaitingInput, AMBER),
+            (SessionTurnStatus::Interrupted, AMBER),
+            (SessionTurnStatus::Failed, RED),
+            (SessionTurnStatus::Completed, GREEN),
         ] {
             let model = run_status_model(status);
             let buffer = rendered_buffer(&model, 120, 40);
@@ -8974,35 +9006,35 @@ mod tests {
 
     #[test]
     fn snapshot_refresh_invalidates_stale_reconciliation_and_dispatches_one_queued_follow_up() {
-        let mut model = ThreadUiModel::default();
-        let mut ready = snapshot(ThreadLifecycle::Ready);
+        let mut model = SessionUiModel::default();
+        let mut ready = snapshot(SessionLifecycle::Ready);
         ready.revision = 9;
-        let thread_id = ready.thread_id;
-        model.sessions = vec![snapshot(ThreadLifecycle::ReconciliationRequired)];
-        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "stale".into()));
+        let session_id = ready.session_id;
+        model.sessions = vec![snapshot(SessionLifecycle::ReconciliationRequired)];
+        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "stale".into()));
         model.queued_follow_up = Some("continue from durable state".into());
         model.pending_submission = Some(PendingSubmission {
             submission_id: 41,
             prompt: "continue from durable state".into(),
-            thread_id: Some(thread_id),
+            session_id: Some(session_id),
             after_sequence: u64::MAX,
         });
 
-        let actions = reduce(&mut model, ThreadUiInput::Snapshot(vec![ready]));
+        let actions = reduce(&mut model, SessionUiInput::Snapshot(vec![ready]));
         assert_eq!(
             actions,
-            vec![ThreadUiAction::FollowUp {
+            vec![SessionUiAction::FollowUp {
                 submission_id: 41,
-                thread_id,
-                expected_thread_revision: 9,
+                session_id,
+                expected_session_revision: 9,
                 prompt: "continue from durable state".into(),
             }]
         );
         assert!(model.reconciliation_confirmation.is_none());
         assert!(model.queued_follow_up.is_none());
-        assert_eq!(model.selected_thread().unwrap().thread_id, thread_id);
+        assert_eq!(model.selected_session().unwrap().session_id, session_id);
 
-        let mut reconciling = snapshot(ThreadLifecycle::ReconciliationRequired);
+        let mut reconciling = snapshot(SessionLifecycle::ReconciliationRequired);
         reconciling.transcript.entries.push(transcript_entry(
             &SystemIdSource::default(),
             2,
@@ -9011,9 +9043,9 @@ mod tests {
             "unknown",
             Some(serde_json::json!({"status":"unknown","effect_id":"effect-current"})),
         ));
-        let reconciling_id = reconciling.thread_id;
+        let reconciling_id = reconciling.session_id;
         model.reconciliation_confirmation = Some((reconciling_id, "effect-current".into()));
-        assert!(reduce(&mut model, ThreadUiInput::Snapshot(vec![reconciling])).is_empty());
+        assert!(reduce(&mut model, SessionUiInput::Snapshot(vec![reconciling])).is_empty());
         assert_eq!(
             model.reconciliation_confirmation,
             Some((reconciling_id, "effect-current".into()))
@@ -9024,10 +9056,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn reducer_key_matrix_keeps_every_mode_scoped_and_non_authoritative_keys_inert() {
         let now = Instant::now();
-        let mut model = ThreadUiModel {
-            sessions: vec![snapshot(ThreadLifecycle::Running)],
+        let mut model = SessionUiModel {
+            sessions: vec![snapshot(SessionLifecycle::Running)],
             connection: ConnectionState::Disconnected,
-            ..ThreadUiModel::default()
+            ..SessionUiModel::default()
         };
         assert!(
             reduce_key_at(
@@ -9043,7 +9075,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
                 now + Duration::from_secs(1),
             ),
-            vec![ThreadUiAction::RefreshSnapshots]
+            vec![SessionUiAction::RefreshSnapshots]
         );
         assert_eq!(
             reduce_key_at(
@@ -9051,7 +9083,7 @@ mod tests {
                 KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
                 now + Duration::from_secs(2),
             ),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
         assert!(
             reduce_key_at(
@@ -9067,7 +9099,7 @@ mod tests {
         );
 
         model.connection = ConnectionState::Connected;
-        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "effect".into()));
+        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "effect".into()));
         assert!(
             reduce_key_at(
                 &mut model,
@@ -9078,7 +9110,7 @@ mod tests {
         );
         assert!(model.reconciliation_confirmation.is_none());
         assert!(model.status.contains("cancelled"));
-        model.reconciliation_confirmation = Some((model.sessions[0].thread_id, "effect".into()));
+        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "effect".into()));
         assert!(
             reduce_key_at(
                 &mut model,
@@ -9089,16 +9121,16 @@ mod tests {
         );
         assert!(model.reconciliation_confirmation.is_none());
 
-        let mut waiting = snapshot(ThreadLifecycle::WaitingInput);
-        waiting.pending = Some(ThreadPendingRequest::Input {
-            run_id: RunId::from_uuid(SystemIdSource::default().next_uuid_v7()),
+        let mut waiting = snapshot(SessionLifecycle::WaitingInput);
+        waiting.pending = Some(SessionPendingRequest::Input {
+            turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             request_id: "input-matrix".into(),
             prompt: "value?".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
         model.sessions = vec![waiting];
         model.input.clear();
-        assert!(reduce(&mut model, ThreadUiInput::Paste("pasted\nvalue".into())).is_empty());
+        assert!(reduce(&mut model, SessionUiInput::Paste("pasted\nvalue".into())).is_empty());
         assert_eq!(model.input, "pasted\nvalue");
         model.input = "é".into();
         assert!(
@@ -9160,13 +9192,13 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
 
         model.pending_submission = Some(PendingSubmission {
             submission_id: 1,
             prompt: "locked".into(),
-            thread_id: None,
+            session_id: None,
             after_sequence: 0,
         });
         model.composer = "locked".into();
@@ -9193,10 +9225,10 @@ mod tests {
         );
         assert_eq!(model.composer, "lockedx");
         let _ = reduce_composer_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(model.focus, ThreadFocus::Navigation);
+        assert_eq!(model.focus, SessionFocus::Navigation);
 
-        model.sessions = vec![snapshot(ThreadLifecycle::Ready)];
-        model.focus = ThreadFocus::Navigation;
+        model.sessions = vec![snapshot(SessionLifecycle::Ready)];
+        model.focus = SessionFocus::Navigation;
         for code in [
             KeyCode::Up,
             KeyCode::Down,
@@ -9213,9 +9245,9 @@ mod tests {
             let _ = reduce_navigation_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE));
         }
         let mut actionable = working_model();
-        actionable.focus = ThreadFocus::Navigation;
+        actionable.focus = SessionFocus::Navigation;
         actionable.expanded_actions.clear();
-        let action_key = action_keys(actionable.selected_thread())[0].clone();
+        let action_key = action_keys(actionable.selected_session())[0].clone();
         let _ = reduce_navigation_key(
             &mut actionable,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -9241,24 +9273,24 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
             ),
-            vec![ThreadUiAction::Quit]
+            vec![SessionUiAction::Quit]
         );
         let _ = reduce_navigation_key(
             &mut model,
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
         );
-        assert_eq!(model.focus, ThreadFocus::Composer);
+        assert_eq!(model.focus, SessionFocus::Composer);
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
     fn layout_state_and_text_helpers_are_total_at_zero_narrow_and_unicode_boundaries() {
-        assert_eq!(ThreadPermissionMode::Ask.label(), "Ask");
-        assert_eq!(ThreadPermissionMode::Ask.card_label(), "Ask mode");
+        assert_eq!(SessionPermissionMode::Ask.label(), "Ask");
+        assert_eq!(SessionPermissionMode::Ask.card_label(), "Ask mode");
         let startup = test_startup();
-        let model = ThreadUiModel::with_startup(startup.clone());
+        let model = SessionUiModel::with_startup(startup.clone());
         assert_eq!(model.startup.as_ref(), Some(&startup));
-        assert!(model.selected_thread().is_none());
+        assert!(model.selected_session().is_none());
         assert!(model.authority_enabled());
 
         assert_eq!(app_rect(Rect::new(10, 2, 200, 5)), Rect::new(30, 2, 160, 5));
@@ -9334,26 +9366,26 @@ mod tests {
         assert_eq!(composer_text_layout("1234", 4).caret_row, 1);
 
         for (status, label) in [
-            (ThreadRunStatus::Queued, "Queued"),
-            (ThreadRunStatus::Running, "Running"),
-            (ThreadRunStatus::Cancelling, "Cancelling"),
-            (ThreadRunStatus::WaitingPermission, "Waiting permission"),
-            (ThreadRunStatus::WaitingInput, "Waiting input"),
-            (ThreadRunStatus::Interrupted, "Interrupted"),
-            (ThreadRunStatus::Failed, "Failed"),
-            (ThreadRunStatus::Completed, "Completed"),
+            (SessionTurnStatus::Queued, "Queued"),
+            (SessionTurnStatus::Running, "Running"),
+            (SessionTurnStatus::Cancelling, "Cancelling"),
+            (SessionTurnStatus::WaitingPermission, "Waiting permission"),
+            (SessionTurnStatus::WaitingInput, "Waiting input"),
+            (SessionTurnStatus::Interrupted, "Interrupted"),
+            (SessionTurnStatus::Failed, "Failed"),
+            (SessionTurnStatus::Completed, "Completed"),
         ] {
-            assert_eq!(run_status_label(status), label);
-            let _ = run_status_color(status);
+            assert_eq!(turn_status_label(status), label);
+            let _ = turn_status_color(status);
         }
         for lifecycle in [
-            ThreadLifecycle::Ready,
-            ThreadLifecycle::Running,
-            ThreadLifecycle::WaitingPermission,
-            ThreadLifecycle::WaitingInput,
-            ThreadLifecycle::Interrupted,
-            ThreadLifecycle::Failed,
-            ThreadLifecycle::ReconciliationRequired,
+            SessionLifecycle::Ready,
+            SessionLifecycle::Running,
+            SessionLifecycle::WaitingPermission,
+            SessionLifecycle::WaitingInput,
+            SessionLifecycle::Interrupted,
+            SessionLifecycle::Failed,
+            SessionLifecycle::ReconciliationRequired,
         ] {
             assert!(!lifecycle_label(lifecycle).is_empty());
             let _ = lifecycle_color(lifecycle);
@@ -9380,7 +9412,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn permission_progress_visual_state_and_tiny_rendering_matrix_remains_secret_safe() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         for (name, input, operation, target) in [
             (
                 "write_file",
@@ -9426,11 +9458,11 @@ mod tests {
             ),
         ] {
             let request_id = format!("request-{name}");
-            let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-            thread.transcript.entries.push(transcript_entry(
+            let mut session = snapshot(SessionLifecycle::WaitingPermission);
+            session.transcript.entries.push(transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "operation",
                 Some(serde_json::json!({"descriptor":{
@@ -9438,7 +9470,7 @@ mod tests {
                 }})),
             ));
             let presentation = permission_presentation(
-                &thread,
+                &session,
                 &format!("request-{name}"),
                 "scope\napi_key=live-secret-value",
             );
@@ -9449,58 +9481,58 @@ mod tests {
         }
 
         for progress in [
-            ThreadTransientProgress::ProviderAttempt { run_id, number: 3 },
-            ThreadTransientProgress::AssistantDelta {
-                run_id,
+            SessionTransientProgress::ProviderAttempt { turn_id, number: 3 },
+            SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: "answer".into(),
             },
-            ThreadTransientProgress::ToolProgress {
-                run_id,
+            SessionTransientProgress::ToolProgress {
+                turn_id,
                 name: "read_file".into(),
                 detail: "reading".into(),
             },
         ] {
-            assert_eq!(progress_run_id(&progress), run_id);
+            assert_eq!(progress_turn_id(&progress), turn_id);
             assert!(progress_text(&progress).starts_with('…'));
         }
 
-        let mut idle = ThreadUiModel::default();
+        let mut idle = SessionUiModel::default();
         assert_eq!(visual_state(&idle), VisualState::Idle);
         idle.pending_submission = Some(PendingSubmission {
             submission_id: 1,
             prompt: "pending".into(),
-            thread_id: None,
+            session_id: None,
             after_sequence: 0,
         });
         assert_eq!(visual_state(&idle), VisualState::Active);
         for (lifecycle, expected) in [
-            (ThreadLifecycle::Running, VisualState::Active),
-            (ThreadLifecycle::WaitingPermission, VisualState::Permission),
+            (SessionLifecycle::Running, VisualState::Active),
+            (SessionLifecycle::WaitingPermission, VisualState::Permission),
             (
-                ThreadLifecycle::ReconciliationRequired,
+                SessionLifecycle::ReconciliationRequired,
                 VisualState::Reconciliation,
             ),
         ] {
-            let model = ThreadUiModel {
+            let model = SessionUiModel {
                 sessions: vec![snapshot(lifecycle)],
-                ..ThreadUiModel::default()
+                ..SessionUiModel::default()
             };
             assert_eq!(visual_state(&model), expected);
         }
-        let mut complete = snapshot(ThreadLifecycle::Ready);
+        let mut complete = snapshot(SessionLifecycle::Ready);
         complete.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "done",
             None,
         ));
-        let complete_model = ThreadUiModel {
+        let complete_model = SessionUiModel {
             sessions: vec![complete],
             help: true,
             command_palette: true,
-            ..ThreadUiModel::default()
+            ..SessionUiModel::default()
         };
         assert_eq!(visual_state(&complete_model), VisualState::Complete);
         for (width, height) in [(1, 1), (2, 2), (8, 3), (40, 8)] {
@@ -9509,7 +9541,7 @@ mod tests {
             assert_eq!(buffer.area.height, height);
         }
         let none =
-            permission_presentation(&snapshot(ThreadLifecycle::WaitingPermission), "none", "");
+            permission_presentation(&snapshot(SessionLifecycle::WaitingPermission), "none", "");
         assert_eq!(none.operation, "Repository operation");
         assert_eq!(none.target, "Not exposed by runtime");
         assert_eq!(none.scope, "[operation summary unavailable]");
@@ -9586,10 +9618,10 @@ mod tests {
         assert!(evidence.contains("· cargo clippy · blocked"));
 
         lines.clear();
-        let run_id = RunId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         render_progress(
             &mut lines,
-            &ThreadTransientProgress::ProviderAttempt { run_id, number: 2 },
+            &SessionTransientProgress::ProviderAttempt { turn_id, number: 2 },
         );
         assert!(lines_text(&lines).contains("provider attempt 2"));
         assert_eq!(surface_line("x", 4, TERMINAL, None).spans[0].content, " ");
@@ -9609,7 +9641,7 @@ mod tests {
         );
         let mut reconciliation = reconciliation_model();
         reconciliation.reconciliation_confirmation = Some((
-            reconciliation.sessions[0].thread_id,
+            reconciliation.sessions[0].session_id,
             "effect-authoritative-matrix".into(),
         ));
         assert!(
@@ -9623,8 +9655,8 @@ mod tests {
     fn projection_boundaries_reject_malformed_reconciliation_and_keep_editors_scoped() {
         let ids = SystemIdSource::default();
         let malformed_effect = |payload| {
-            let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
-            thread.transcript.entries.push(transcript_entry(
+            let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
+            session.transcript.entries.push(transcript_entry(
                 &ids,
                 1,
                 None,
@@ -9632,7 +9664,7 @@ mod tests {
                 "unknown outcome",
                 payload,
             ));
-            reconciliation_effect_from_snapshot(&thread)
+            reconciliation_effect_from_snapshot(&session)
         };
         assert!(malformed_effect(None).is_none());
         assert!(
@@ -9644,7 +9676,7 @@ mod tests {
         );
         assert!(malformed_effect(Some(serde_json::json!({"status": "unknown"}))).is_none());
 
-        let mut permission = snapshot(ThreadLifecycle::WaitingPermission);
+        let mut permission = snapshot(SessionLifecycle::WaitingPermission);
         permission.transcript.entries.push(transcript_entry(
             &ids,
             2,
@@ -9659,40 +9691,40 @@ mod tests {
 
         let mut reconciliation = reconciliation_model();
         reconciliation.reconciliation_confirmation = Some((
-            reconciliation.sessions[0].thread_id,
+            reconciliation.sessions[0].session_id,
             "effect-authoritative-matrix".into(),
         ));
         assert!(rendered(&reconciliation, 120, 40).contains("Ctrl+A confirm failed"));
 
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut waiting = snapshot(ThreadLifecycle::WaitingInput);
-        waiting.pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut waiting = snapshot(SessionLifecycle::WaitingInput);
+        waiting.pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "input-prompt".into(),
             prompt: "enter the durable value".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        let input_model = ThreadUiModel {
+        let input_model = SessionUiModel {
             startup: Some(test_startup()),
             sessions: vec![waiting],
             ..Default::default()
         };
         assert!(rendered(&input_model, 120, 40).contains("enter the durable value"));
 
-        let active = ThreadUiModel {
+        let active = SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![snapshot(ThreadLifecycle::Running)],
+            sessions: vec![snapshot(SessionLifecycle::Running)],
             composer: "scoped follow-up draft".into(),
             ..Default::default()
         };
         assert!(rendered(&active, 120, 40).contains("scoped follow-up draft"));
         assert_eq!(wrap_text("ab界", 3), ["ab", "界"]);
 
-        let mut submitting = ThreadUiModel {
+        let mut submitting = SessionUiModel {
             pending_submission: Some(PendingSubmission {
                 submission_id: 9,
                 prompt: "pending".into(),
-                thread_id: None,
+                session_id: None,
                 after_sequence: 0,
             }),
             ..Default::default()
@@ -9700,7 +9732,7 @@ mod tests {
         assert!(
             reduce(
                 &mut submitting,
-                ThreadUiInput::SubmissionCompleted { submission_id: 9 }
+                SessionUiInput::SubmissionCompleted { submission_id: 9 }
             )
             .is_empty()
         );
@@ -9710,20 +9742,20 @@ mod tests {
         );
     }
 
-    fn permission_model() -> ThreadUiModel {
+    fn permission_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "permission-matrix".into(),
             description: "Edit src/lib.rs".into(),
-            expected_run_revision: 2,
+            expected_turn_revision: 2,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Edit src/lib.rs",
             Some(serde_json::json!({
@@ -9735,17 +9767,17 @@ mod tests {
                 }
             })),
         ));
-        ThreadUiModel {
+        SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![thread],
+            sessions: vec![session],
             ..Default::default()
         }
     }
 
-    fn reconciliation_model() -> ThreadUiModel {
+    fn reconciliation_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
-        thread.transcript.entries.push(transcript_entry(
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
+        session.transcript.entries.push(transcript_entry(
             &ids,
             1,
             None,
@@ -9756,37 +9788,37 @@ mod tests {
                 "status": "unknown"
             })),
         ));
-        ThreadUiModel {
+        SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![thread],
+            sessions: vec![session],
             ..Default::default()
         }
     }
 
-    fn complete_model() -> ThreadUiModel {
+    fn complete_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.latest_run_id = Some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Completed,
-            run_revision: 2,
+            status: SessionTurnStatus::Completed,
+            turn_revision: 2,
             completed_at_ms: Some(2),
             failure_code: None,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "The requested repository change is complete.",
             Some(serde_json::json!({
                 "handoff": {
                     "summary": "The requested repository change is complete.",
-                    "files_changed": ["crates/latte-tui/src/thread.rs"],
+                    "files_changed": ["crates/latte-tui/src/session.rs"],
                     "evidence": [{
                         "name": "cargo test -p latte-tui",
                         "status": "passed",
@@ -9795,76 +9827,76 @@ mod tests {
                 }
             })),
         ));
-        ThreadUiModel {
+        SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![thread],
+            sessions: vec![session],
             ..Default::default()
         }
     }
 
-    fn lifecycle_model(lifecycle: ThreadLifecycle) -> ThreadUiModel {
-        ThreadUiModel {
+    fn lifecycle_model(lifecycle: SessionLifecycle) -> SessionUiModel {
+        SessionUiModel {
             sessions: vec![snapshot(lifecycle)],
             ..Default::default()
         }
     }
 
-    fn run_status_model(status: ThreadRunStatus) -> ThreadUiModel {
+    fn run_status_model(status: SessionTurnStatus) -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
             status,
-            run_revision: 2,
-            completed_at_ms: (status == ThreadRunStatus::Completed).then_some(2),
+            turn_revision: 2,
+            completed_at_ms: (status == SessionTurnStatus::Completed).then_some(2),
             failure_code: None,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Inspect the repository",
             Some(serde_json::json!({
                 "descriptor": {"tool_call_id": "run-status-call", "name": "Inspect"}
             })),
         ));
-        ThreadUiModel {
-            sessions: vec![thread],
+        SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         }
     }
 
-    fn activity_model(state: ActivityState) -> ThreadUiModel {
+    fn activity_model(state: ActivityState) -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let lifecycle = if state == ActivityState::Waiting {
-            ThreadLifecycle::WaitingPermission
+            SessionLifecycle::WaitingPermission
         } else {
-            ThreadLifecycle::Running
+            SessionLifecycle::Running
         };
-        let mut thread = snapshot(lifecycle);
-        thread.active_run_id = (state != ActivityState::Recorded).then_some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let mut session = snapshot(lifecycle);
+        session.active_turn_id = (state != ActivityState::Recorded).then_some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
             status: if state == ActivityState::Waiting {
-                ThreadRunStatus::WaitingPermission
+                SessionTurnStatus::WaitingPermission
             } else {
-                ThreadRunStatus::Running
+                SessionTurnStatus::Running
             },
-            run_revision: 2,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "Inspect the repository",
             Some(serde_json::json!({
@@ -9872,10 +9904,10 @@ mod tests {
             })),
         ));
         if matches!(state, ActivityState::Succeeded | ActivityState::Failed) {
-            thread.transcript.entries.push(transcript_entry(
+            session.transcript.entries.push(transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 if state == ActivityState::Failed {
                     "Inspection failed"
@@ -9889,34 +9921,34 @@ mod tests {
                 }),
             ));
         }
-        ThreadUiModel {
-            sessions: vec![thread],
+        SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         }
     }
 
-    fn idle_model() -> ThreadUiModel {
-        ThreadUiModel::with_startup(test_startup())
+    fn idle_model() -> SessionUiModel {
+        SessionUiModel::with_startup(test_startup())
     }
 
-    fn test_startup() -> ThreadStartupPresentation {
-        ThreadStartupPresentation {
+    fn test_startup() -> SessionStartupPresentation {
+        SessionStartupPresentation {
             default_provider: "runtime-provider".into(),
             default_model: "runtime-model".into(),
             model_catalog: vec![
-                ThreadModelOption {
+                SessionModelOption {
                     provider_name: "runtime-provider".into(),
                     model: "runtime-model".into(),
                     name: Some("Runtime Stable".into()),
                     is_default: true,
                 },
-                ThreadModelOption {
+                SessionModelOption {
                     provider_name: "runtime-provider".into(),
                     model: "runtime-model-fast".into(),
                     name: Some("Runtime Fast".into()),
                     is_default: false,
                 },
-                ThreadModelOption {
+                SessionModelOption {
                     provider_name: "other-provider".into(),
                     model: "other-model".into(),
                     name: None,
@@ -9924,20 +9956,20 @@ mod tests {
                 },
             ],
             workspace_display: "~/projects/latte-code".into(),
-            permission_mode: ThreadPermissionMode::Ask,
+            permission_mode: SessionPermissionMode::Ask,
         }
     }
 
     #[test]
     fn missing_provider_keeps_tui_usable_and_prompt_local_until_configured() {
-        let startup = ThreadStartupPresentation {
+        let startup = SessionStartupPresentation {
             default_provider: String::new(),
             default_model: String::new(),
             model_catalog: Vec::new(),
             workspace_display: "~/projects/latte-code".into(),
-            permission_mode: ThreadPermissionMode::Ask,
+            permission_mode: SessionPermissionMode::Ask,
         };
-        let mut model = ThreadUiModel::with_startup(startup);
+        let mut model = SessionUiModel::with_startup(startup);
 
         assert!(model.draft_model.is_none());
         assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
@@ -9958,26 +9990,26 @@ mod tests {
         assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
     }
 
-    fn working_model() -> ThreadUiModel {
+    fn working_model() -> SessionUiModel {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.active_run_id = Some(run_id);
-        thread.latest_run_id = Some(run_id);
-        thread.runs.push(latte_core::ThreadRunSummary {
-            run_id,
-            parent_run_id: None,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.active_turn_id = Some(turn_id);
+        session.latest_turn_id = Some(turn_id);
+        session.turns.push(latte_core::SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
             ordinal: 1,
-            status: ThreadRunStatus::Running,
-            run_revision: 2,
+            status: SessionTurnStatus::Running,
+            turn_revision: 2,
             completed_at_ms: None,
             failure_code: None,
         });
-        thread.transcript.entries = vec![
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::User,
                 "Fix the composer input path.",
                 None,
@@ -9985,7 +10017,7 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "Search reducer input handling",
                 Some(serde_json::json!({
@@ -9999,16 +10031,16 @@ mod tests {
             transcript_entry(
                 &ids,
                 3,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "Located the reducer.",
                 Some(serde_json::json!({"tool_call_id": "call-search"})),
             ),
         ];
-        let action_key = action_keys(Some(&thread))[0].clone();
-        ThreadUiModel {
+        let action_key = action_keys(Some(&session))[0].clone();
+        SessionUiModel {
             startup: Some(test_startup()),
-            sessions: vec![thread],
+            sessions: vec![session],
             expanded_actions: BTreeSet::from([action_key]),
             ..Default::default()
         }
@@ -10017,7 +10049,7 @@ mod tests {
     fn transcript_entry(
         ids: &SystemIdSource,
         sequence: u64,
-        run_id: Option<RunId>,
+        turn_id: Option<TurnId>,
         kind: TranscriptKind,
         text: &str,
         payload: Option<serde_json::Value>,
@@ -10025,7 +10057,7 @@ mod tests {
         TranscriptEntry {
             entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
             sequence,
-            run_id,
+            turn_id,
             kind,
             text: text.into(),
             payload,
@@ -10034,11 +10066,11 @@ mod tests {
         }
     }
 
-    fn rendered(model: &ThreadUiModel, width: u16, height: u16) -> String {
+    fn rendered(model: &SessionUiModel, width: u16, height: u16) -> String {
         buffer_text(&rendered_buffer(model, width, height))
     }
 
-    fn rendered_buffer(model: &ThreadUiModel, width: u16, height: u16) -> Buffer {
+    fn rendered_buffer(model: &SessionUiModel, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, model)).unwrap();
@@ -10090,10 +10122,10 @@ mod tests {
 
     #[test]
     fn exact_session_and_search_cover_default_projection_filters() {
-        let ready = snapshot(ThreadLifecycle::Ready);
+        let ready = snapshot(SessionLifecycle::Ready);
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()], vec![ready.clone()]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
         assert!(
             projection
@@ -10101,38 +10133,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let id = ready.thread_id.to_string();
+        let id = ready.session_id.to_string();
         let found = projection.search_session_catalog(&id).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].thread_id, ready.thread_id);
+        assert_eq!(found[0].session_id, ready.session_id);
     }
 
     #[test]
     fn frame_rendered_without_a_permission_request_leaves_no_rendered_request() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingInput);
-        thread.pending = Some(ThreadPendingRequest::Input {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingInput);
+        session.pending = Some(SessionPendingRequest::Input {
+            turn_id,
             request_id: "request-1".into(),
             prompt: "answer".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
-        let mut model = ThreadUiModel {
-            sessions: vec![thread],
+        let mut model = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert!(model.rendered_permission_request.is_none());
     }
 
     #[test]
     fn session_catalog_ready_with_partial_matches_offers_a_picker() {
-        let summary = session_summary(&snapshot(ThreadLifecycle::Ready), "my title", "ws");
-        let mut model = ThreadUiModel::default();
+        let summary = session_summary(&snapshot(SessionLifecycle::Ready), "my title", "ws");
+        let mut model = SessionUiModel::default();
         let actions = reduce(
             &mut model,
-            ThreadUiInput::SessionCatalogReady {
+            SessionUiInput::SessionCatalogReady {
                 sessions: vec![summary],
                 query: Some("no-match".into()),
             },
@@ -10145,8 +10177,8 @@ mod tests {
     #[test]
     fn session_opened_tracks_reconciliation_effects() {
         let ids = SystemIdSource::default();
-        let mut thread = snapshot(ThreadLifecycle::ReconciliationRequired);
-        thread.transcript.entries.push(transcript_entry(
+        let mut session = snapshot(SessionLifecycle::ReconciliationRequired);
+        session.transcript.entries.push(transcript_entry(
             &ids,
             2,
             None,
@@ -10157,55 +10189,55 @@ mod tests {
                 "effect_id": "effect-1"
             })),
         ));
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         reduce(
             &mut model,
-            ThreadUiInput::SessionOpened(Box::new(thread.clone())),
+            SessionUiInput::SessionOpened(Box::new(session.clone())),
         );
         assert_eq!(
             model.reconciliation_hint,
-            Some((thread.thread_id, "effect-1".to_owned()))
+            Some((session.session_id, "effect-1".to_owned()))
         );
     }
 
     #[test]
     fn stale_submission_and_switch_feedback_is_ignored() {
         let ids = SystemIdSource::default();
-        let thread_id = ThreadId::from_uuid(ids.next_uuid_v7());
-        let mut model = ThreadUiModel::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let mut model = SessionUiModel::default();
         reduce(
             &mut model,
-            ThreadUiInput::ModelSwitchCompleted { switch_id: 99 },
+            SessionUiInput::ModelSwitchCompleted { switch_id: 99 },
         );
         assert!(model.pending_model_switch.is_none());
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionAssigned {
+            SessionUiInput::SubmissionAssigned {
                 submission_id: 99,
-                thread_id,
+                session_id,
             },
         );
         assert!(model.pending_submission.is_none());
         reduce(
             &mut model,
-            ThreadUiInput::SubmissionCompleted { submission_id: 99 },
+            SessionUiInput::SubmissionCompleted { submission_id: 99 },
         );
         assert!(model.pending_submission.is_none());
         reduce(
             &mut model,
-            ThreadUiInput::InputSubmissionError { submission_id: 99 },
+            SessionUiInput::InputSubmissionError { submission_id: 99 },
         );
         assert!(model.pending_input_submission.is_none());
         reduce(
             &mut model,
-            ThreadUiInput::InputSubmissionCompleted { submission_id: 99 },
+            SessionUiInput::InputSubmissionCompleted { submission_id: 99 },
         );
         assert!(model.pending_input_submission.is_none());
     }
 
     #[test]
     fn ctrl_c_cancels_active_work_when_authority_is_connected() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             sessions: vec![running_snapshot()],
             connection: ConnectionState::Connected,
             ..Default::default()
@@ -10213,15 +10245,15 @@ mod tests {
         let actions = reduce(&mut model, key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(
             actions,
-            vec![ThreadUiAction::Cancel {
-                thread_id: model.sessions[0].thread_id
+            vec![SessionUiAction::Cancel {
+                session_id: model.sessions[0].session_id
             }]
         );
     }
 
     #[test]
     fn slash_popup_accepts_ctrl_enter_as_a_submit() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             connection: ConnectionState::Connected,
             composer: "/help".into(),
             ..Default::default()
@@ -10233,7 +10265,7 @@ mod tests {
 
     #[test]
     fn model_picker_ignores_control_characters() {
-        let mut model = ThreadUiModel::with_startup(test_startup());
+        let mut model = SessionUiModel::with_startup(test_startup());
         open_model_picker(&mut model);
         assert!(model.model_picker.is_some());
         reduce(&mut model, key(KeyCode::Char('\u{1}'), KeyModifiers::NONE));
@@ -10242,7 +10274,7 @@ mod tests {
 
     #[test]
     fn session_commands_without_an_open_session_explain_the_requirement() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         let actions = dispatch_builtin(&mut model, BuiltinCommand::Rename, "new title".into());
         assert!(actions.is_empty());
         assert_eq!(model.status, "This command requires an open saved session");
@@ -10253,45 +10285,45 @@ mod tests {
 
     #[test]
     fn paste_in_navigation_focus_does_not_edit_the_composer() {
-        let mut model = ThreadUiModel {
-            focus: ThreadFocus::Navigation,
+        let mut model = SessionUiModel {
+            focus: SessionFocus::Navigation,
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::Paste("text".into()));
+        reduce(&mut model, SessionUiInput::Paste("text".into()));
         assert!(model.composer.is_empty());
     }
 
     #[test]
     fn progress_buffer_caps_at_sixty_four_entries() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             connection: ConnectionState::Connected,
             ..Default::default()
         };
         let ids = SystemIdSource::default();
         for _ in 0..64 {
-            let run_id = RunId::from_uuid(ids.next_uuid_v7());
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
             record_progress(
                 &mut model,
-                ThreadTransientProgress::ProviderAttempt { run_id, number: 1 },
+                SessionTransientProgress::ProviderAttempt { turn_id, number: 1 },
             );
         }
         assert_eq!(model.progress.len(), 64);
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         record_progress(
             &mut model,
-            ThreadTransientProgress::AssistantDelta {
-                run_id,
+            SessionTransientProgress::AssistantDelta {
+                turn_id,
                 text: "overflow".into(),
             },
         );
         record_progress(
             &mut model,
-            ThreadTransientProgress::ProviderAttempt { run_id, number: 2 },
+            SessionTransientProgress::ProviderAttempt { turn_id, number: 2 },
         );
         record_progress(
             &mut model,
-            ThreadTransientProgress::ToolProgress {
-                run_id,
+            SessionTransientProgress::ToolProgress {
+                turn_id,
                 name: "tool".into(),
                 detail: "complete".into(),
             },
@@ -10301,25 +10333,25 @@ mod tests {
 
     #[test]
     fn paste_strips_ansi_escape_sequences() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         reduce(
             &mut model,
-            ThreadUiInput::Paste("\u{1b}[31mred\u{1b}x".into()),
+            SessionUiInput::Paste("\u{1b}[31mred\u{1b}x".into()),
         );
         // The CSI sequence is consumed entirely; a lone ESC is skipped while
         // the following character is kept.
         assert_eq!(model.composer, "redx");
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         reduce(
             &mut model,
-            ThreadUiInput::Paste("\u{1b}[31mred\u{1b}[0m".into()),
+            SessionUiInput::Paste("\u{1b}[31mred\u{1b}[0m".into()),
         );
         assert_eq!(model.composer, "red");
     }
 
     #[test]
     fn slash_candidate_is_blocked_while_session_switch_is_unavailable() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             sessions: vec![running_snapshot()],
             ..Default::default()
         };
@@ -10335,21 +10367,21 @@ mod tests {
     #[test]
     fn stranded_follow_up_is_restored_after_snapshot() {
         let _ids = SystemIdSource::default();
-        let mut thread = snapshot(ThreadLifecycle::Running);
-        thread.active_run_id = None;
-        let mut model = ThreadUiModel {
+        let mut session = snapshot(SessionLifecycle::Running);
+        session.active_turn_id = None;
+        let mut model = SessionUiModel {
             sessions: Vec::new(),
-            active_conversation: Some(ActiveConversation::Session(thread.thread_id)),
+            active_conversation: Some(ActiveConversation::Session(session.session_id)),
             pending_submission: Some(PendingSubmission {
                 submission_id: 1,
                 prompt: "queued prompt".into(),
-                thread_id: Some(thread.thread_id),
+                session_id: Some(session.session_id),
                 after_sequence: 0,
             }),
             queued_follow_up: Some("follow".into()),
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![thread]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
         assert!(model.pending_submission.is_none());
         assert_eq!(model.composer, "queued prompt");
         assert!(model.status.contains("Queued follow-up was not submitted"));
@@ -10358,24 +10390,24 @@ mod tests {
     #[test]
     fn snapshot_with_pending_input_submission_skips_input_target_sync() {
         let ids = SystemIdSource::default();
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             pending_input_submission: Some(PendingInputSubmission {
                 submission_id: 1,
-                thread_id: ThreadId::from_uuid(ids.next_uuid_v7()),
-                run_id: RunId::from_uuid(ids.next_uuid_v7()),
+                session_id: SessionId::from_uuid(ids.next_uuid_v7()),
+                turn_id: TurnId::from_uuid(ids.next_uuid_v7()),
                 request_id: "request-1".into(),
                 value: "answer".into(),
                 after_sequence: 0,
             }),
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::Snapshot(vec![]));
+        reduce(&mut model, SessionUiInput::Snapshot(vec![]));
         assert!(model.pending_input_submission.is_some());
     }
 
     #[test]
     fn backspace_on_empty_composer_is_a_noop() {
-        let mut model = ThreadUiModel::default();
+        let mut model = SessionUiModel::default();
         let actions = reduce(&mut model, key(KeyCode::Backspace, KeyModifiers::NONE));
         assert!(actions.is_empty());
         assert!(model.composer.is_empty());
@@ -10384,14 +10416,14 @@ mod tests {
     #[test]
     fn projection_falls_back_for_tool_names_and_skips_empty_text() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.active_run_id = Some(run_id);
-        thread.transcript.entries = vec![
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.active_turn_id = Some(turn_id);
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "named",
                 Some(serde_json::json!({"name": "custom_tool"})),
@@ -10399,14 +10431,14 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "anonymous",
                 None,
             ),
-            transcript_entry(&ids, 3, Some(run_id), TranscriptKind::User, "", None),
+            transcript_entry(&ids, 3, Some(turn_id), TranscriptKind::User, "", None),
         ];
-        let groups = project_transcript(&thread);
+        let groups = project_transcript(&session);
         assert_eq!(groups.len(), 1);
         let items = &groups[0].items;
         assert_eq!(items.len(), 2);
@@ -10466,54 +10498,54 @@ mod tests {
     #[test]
     fn render_is_total_at_zero_and_tiny_geometries() {
         // Zero-area frame returns before touching the layout.
-        let _ = rendered_buffer(&ThreadUiModel::default(), 0, 0);
+        let _ = rendered_buffer(&SessionUiModel::default(), 0, 0);
 
-        // Active state without a selected thread renders a one-row header.
-        let active_no_thread = ThreadUiModel {
+        // Active state without a selected session renders a one-row header.
+        let active_no_session = SessionUiModel {
             pending_submission: Some(PendingSubmission {
                 submission_id: 1,
                 prompt: "prompt".into(),
-                thread_id: None,
+                session_id: None,
                 after_sequence: 0,
             }),
             ..Default::default()
         };
-        let _ = rendered_buffer(&active_no_thread, 20, 3);
+        let _ = rendered_buffer(&active_no_session, 20, 3);
 
         // Idle constrained header with an unconfigured provider.
-        let unconfigured = ThreadStartupPresentation {
+        let unconfigured = SessionStartupPresentation {
             default_provider: String::new(),
             default_model: String::new(),
             model_catalog: Vec::new(),
             workspace_display: "~/projects/latte-code".into(),
-            permission_mode: ThreadPermissionMode::Ask,
+            permission_mode: SessionPermissionMode::Ask,
         };
-        let _ = rendered_buffer(&ThreadUiModel::with_startup(unconfigured), 20, 5);
+        let _ = rendered_buffer(&SessionUiModel::with_startup(unconfigured), 20, 5);
 
         // Idle constrained header with a model but no provider draft.
-        let model_only = ThreadStartupPresentation {
+        let model_only = SessionStartupPresentation {
             default_provider: String::new(),
             default_model: "runtime-model".into(),
             model_catalog: Vec::new(),
             workspace_display: "~/projects/latte-code".into(),
-            permission_mode: ThreadPermissionMode::Ask,
+            permission_mode: SessionPermissionMode::Ask,
         };
-        let _ = rendered_buffer(&ThreadUiModel::with_startup(model_only.clone()), 20, 5);
-        let _ = rendered_buffer(&ThreadUiModel::with_startup(model_only), 20, 6);
+        let _ = rendered_buffer(&SessionUiModel::with_startup(model_only.clone()), 20, 5);
+        let _ = rendered_buffer(&SessionUiModel::with_startup(model_only), 20, 6);
 
         // Idle constrained header without startup metadata.
-        let _ = rendered_buffer(&ThreadUiModel::default(), 20, 5);
+        let _ = rendered_buffer(&SessionUiModel::default(), 20, 5);
 
         // Idle layout with a zero-height transcript band.
-        let _ = rendered_buffer(&ThreadUiModel::with_startup(test_startup()), 20, 2);
+        let _ = rendered_buffer(&SessionUiModel::with_startup(test_startup()), 20, 2);
 
         // Wide graphemes at one-column transcript width stay within the
         // wrapping contract (app width 5 minus two-column insets leaves 1).
         // Assistant text is wrapped (not clipped like user cards), so the
         // wide grapheme reaches the line-height state machine.
         let ids = SystemIdSource::default();
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.transcript.entries = vec![transcript_entry(
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.transcript.entries = vec![transcript_entry(
             &ids,
             1,
             None,
@@ -10521,8 +10553,8 @@ mod tests {
             "界",
             None,
         )];
-        let wide = ThreadUiModel {
-            sessions: vec![thread],
+        let wide = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
         let _ = rendered_buffer(&wide, 5, 10);
@@ -10533,23 +10565,23 @@ mod tests {
     #[test]
     fn permission_presentation_falls_back_without_a_tool_descriptor() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "effect-1".into(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "tool",
             None,
         ));
-        let presentation = permission_presentation(&thread, "effect-1", "do thing");
+        let presentation = permission_presentation(&session, "effect-1", "do thing");
         assert_eq!(presentation.operation, "Repository operation");
     }
 
@@ -10560,30 +10592,30 @@ mod tests {
         // Exact session lookup fails.
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let mut model = ThreadUiModel::default();
-        let result = apply_thread_actions(
+        let mut model = SessionUiModel::default();
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::ShowSessions {
+            vec![SessionUiAction::ShowSessions {
                 query: Some("q".into()),
             }],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
 
         // Exact lookup misses, then the catalog lookup fails.
-        let ready = snapshot(ThreadLifecycle::Ready);
+        let ready = snapshot(SessionLifecycle::Ready);
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready]]),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let result = apply_thread_actions(
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::ShowSessions {
+            vec![SessionUiAction::ShowSessions {
                 query: Some("q".into()),
             }],
         );
@@ -10592,69 +10624,69 @@ mod tests {
         // Unfiltered catalog lookup fails.
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let result = apply_thread_actions(
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::ShowSessions { query: None }],
+            vec![SessionUiAction::ShowSessions { query: None }],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
 
         // Search catalog lookup fails.
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let result = apply_thread_actions(
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::SearchSessions { query: "q".into() }],
+            vec![SessionUiAction::SearchSessions { query: "q".into() }],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
 
         // Refresh of an active session fails.
-        let ready = snapshot(ThreadLifecycle::Ready);
-        let mut model = ThreadUiModel {
+        let ready = snapshot(SessionLifecycle::Ready);
+        let mut model = SessionUiModel {
             sessions: vec![ready.clone()],
-            active_conversation: Some(ActiveConversation::Session(ready.thread_id)),
+            active_conversation: Some(ActiveConversation::Session(ready.session_id)),
             ..Default::default()
         };
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let result = apply_thread_actions(
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::RefreshSnapshots],
+            vec![SessionUiAction::RefreshSnapshots],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
 
         // Refresh of a fresh draft without pending work fails.
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             active_conversation: Some(ActiveConversation::NewSessionDraft),
             ..Default::default()
         };
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::new(),
-            poll: ThreadProjectionPoll::Empty,
+            poll: SessionProjectionPoll::Empty,
         };
-        let result = apply_thread_actions(
+        let result = apply_session_actions(
             &mut projection,
             &mut model,
             &mut sink,
-            vec![ThreadUiAction::RefreshSnapshots],
+            vec![SessionUiAction::RefreshSnapshots],
         );
         assert!(matches!(result, Err(TuiError::Action(_))));
     }
 
     #[test]
     fn buffer_search_helpers_report_missing_matches() {
-        let buffer = rendered_buffer(&ThreadUiModel::default(), 20, 20);
+        let buffer = rendered_buffer(&SessionUiModel::default(), 20, 20);
         assert!(find_symbol(&buffer, "⟡").is_none());
         assert!(find_symbol_from_row(&buffer, "⟡", 0).is_none());
         assert!(find_text_row(&buffer, "definitely-not-rendered").is_none());
@@ -10662,8 +10694,8 @@ mod tests {
 
     #[test]
     fn ctrl_c_without_active_work_does_not_cancel() {
-        let ready = snapshot(ThreadLifecycle::Ready);
-        let mut model = ThreadUiModel {
+        let ready = snapshot(SessionLifecycle::Ready);
+        let mut model = SessionUiModel {
             sessions: vec![ready],
             connection: ConnectionState::Connected,
             ..Default::default()
@@ -10674,7 +10706,7 @@ mod tests {
 
     #[test]
     fn slash_help_is_not_blocked_by_session_switch_guard() {
-        let mut model = ThreadUiModel {
+        let mut model = SessionUiModel {
             sessions: vec![running_snapshot()],
             ..Default::default()
         };
@@ -10687,46 +10719,46 @@ mod tests {
     #[test]
     fn frame_rendered_tracks_permission_requests_and_handles_missing_pending() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let request_id = "request-1".to_owned();
 
         // Permission pending is recorded.
-        let mut permission_thread = snapshot(ThreadLifecycle::WaitingPermission);
-        permission_thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let mut permission_session = snapshot(SessionLifecycle::WaitingPermission);
+        permission_session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: request_id.clone(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
-        let mut model = ThreadUiModel {
-            sessions: vec![permission_thread],
+        let mut model = SessionUiModel {
+            sessions: vec![permission_session],
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert_eq!(
             model.rendered_permission_request,
-            Some((model.sessions[0].thread_id, request_id))
+            Some((model.sessions[0].session_id, request_id))
         );
 
         // Missing pending leaves no recorded request.
-        let mut model = ThreadUiModel {
-            sessions: vec![snapshot(ThreadLifecycle::Ready)],
+        let mut model = SessionUiModel {
+            sessions: vec![snapshot(SessionLifecycle::Ready)],
             ..Default::default()
         };
-        reduce(&mut model, ThreadUiInput::FrameRendered);
+        reduce(&mut model, SessionUiInput::FrameRendered);
         assert!(model.rendered_permission_request.is_none());
     }
 
     #[test]
     fn multiple_actions_branch_with_tee_and_ell() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.transcript.entries = vec![
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "first",
                 Some(serde_json::json!({"name": "first_tool"})),
@@ -10734,15 +10766,15 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "second",
                 Some(serde_json::json!({"name": "second_tool"})),
             ),
         ];
-        let model = ThreadUiModel {
-            sessions: vec![thread],
-            focus: ThreadFocus::Navigation,
+        let model = SessionUiModel {
+            sessions: vec![session],
+            focus: SessionFocus::Navigation,
             ..Default::default()
         };
         let screen = rendered(&model, 100, 30);
@@ -10753,13 +10785,13 @@ mod tests {
     #[test]
     fn expanded_failed_result_renders_in_red() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.transcript.entries = vec![
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.transcript.entries = vec![
             transcript_entry(
                 &ids,
                 1,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolCall,
                 "call",
                 Some(serde_json::json!({
@@ -10769,15 +10801,15 @@ mod tests {
             transcript_entry(
                 &ids,
                 2,
-                Some(run_id),
+                Some(turn_id),
                 TranscriptKind::ToolResult,
                 "it failed",
                 Some(serde_json::json!({"tool_call_id": "call-1", "error": "denied"})),
             ),
         ];
-        let action_key = action_keys(Some(&thread))[0].clone();
-        let model = ThreadUiModel {
-            sessions: vec![thread],
+        let action_key = action_keys(Some(&session))[0].clone();
+        let model = SessionUiModel {
+            sessions: vec![session],
             expanded_actions: BTreeSet::from([action_key]),
             ..Default::default()
         };
@@ -10796,11 +10828,11 @@ mod tests {
     fn progress_for_other_runs_is_skipped() {
         let ids = SystemIdSource::default();
         let mut model = working_model();
-        let other_run = RunId::from_uuid(ids.next_uuid_v7());
+        let other_turn = TurnId::from_uuid(ids.next_uuid_v7());
         model
             .progress
-            .push(ThreadTransientProgress::AssistantDelta {
-                run_id: other_run,
+            .push(SessionTransientProgress::AssistantDelta {
+                turn_id: other_turn,
                 text: "unrelated".into(),
             });
         // Rendering must not panic and the unrelated progress is skipped.
@@ -10810,12 +10842,12 @@ mod tests {
     #[test]
     fn completion_handoff_with_files_but_no_evidence_renders() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::Ready);
-        thread.transcript.entries = vec![transcript_entry(
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::Ready);
+        session.transcript.entries = vec![transcript_entry(
             &ids,
             1,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::Completion,
             "done",
             Some(serde_json::json!({
@@ -10826,8 +10858,8 @@ mod tests {
                 }
             })),
         )];
-        let model = ThreadUiModel {
-            sessions: vec![thread],
+        let model = SessionUiModel {
+            sessions: vec![session],
             ..Default::default()
         };
         let screen = rendered(&model, 100, 30);
@@ -10838,23 +10870,23 @@ mod tests {
     #[test]
     fn permission_presentation_falls_back_when_descriptor_is_absent() {
         let ids = SystemIdSource::default();
-        let run_id = RunId::from_uuid(ids.next_uuid_v7());
-        let mut thread = snapshot(ThreadLifecycle::WaitingPermission);
-        thread.pending = Some(ThreadPendingRequest::Permission {
-            run_id,
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut session = snapshot(SessionLifecycle::WaitingPermission);
+        session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
             request_id: "effect-1".into(),
             description: "do thing".into(),
-            expected_run_revision: 1,
+            expected_turn_revision: 1,
         });
-        thread.transcript.entries.push(transcript_entry(
+        session.transcript.entries.push(transcript_entry(
             &ids,
             2,
-            Some(run_id),
+            Some(turn_id),
             TranscriptKind::ToolCall,
             "tool",
             Some(serde_json::json!({})),
         ));
-        let presentation = permission_presentation(&thread, "effect-1", "do thing");
+        let presentation = permission_presentation(&session, "effect-1", "do thing");
         assert_eq!(presentation.operation, "Repository operation");
     }
 }

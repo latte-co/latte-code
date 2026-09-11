@@ -14,8 +14,8 @@ use axum::{
     routing::{get, patch, post},
 };
 use futures::stream::Stream;
-use latte_core::{ThreadId, ThreadProviderBindingV2, ThreadSnapshot};
-use latte_headless::thread::ThreadRuntimeError;
+use latte_core::{SessionId, SessionProviderBinding, SessionSnapshot};
+use latte_headless::session::SessionRuntimeError;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -151,13 +151,13 @@ impl ServerState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
-    ThreadChanged {
+    SessionChanged {
         session_id: String,
         revision: u64,
     },
     Progress {
         session_id: String,
-        run_id: String,
+        turn_id: String,
         progress: serde_json::Value,
     },
     ResyncRequired,
@@ -262,12 +262,12 @@ pub struct WorkspaceResponse {
 pub struct CreateSessionRequest {
     /// Client-generated stable session ID (UUID v7). Required for crash-safe
     /// idempotent creation and zero-latency assigned feedback.
-    pub thread_id: latte_core::ThreadId,
+    pub session_id: latte_core::SessionId,
     /// Client-generated stable command ID (UUID v7). Must equal the
     /// `Idempotency-Key` header; drives durable dedup.
-    pub command_id: latte_core::ThreadCommandId,
+    pub command_id: latte_core::SessionCommandId,
     pub prompt: String,
-    pub binding: ThreadProviderBindingV2,
+    pub binding: SessionProviderBinding,
     #[serde(default)]
     pub focus: Option<String>,
 }
@@ -281,7 +281,7 @@ pub struct SessionCreatedResponse {
 /// Typed body of every endpoint that returns the session's current snapshot.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionResponse {
-    pub snapshot: ThreadSnapshot,
+    pub snapshot: SessionSnapshot,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -289,9 +289,9 @@ pub struct FollowUpRequest {
     /// Stable client-generated command identity. The `Idempotency-Key`
     /// header must equal this value: one identity source for both the
     /// in-memory ledger and the durable dedup record.
-    pub command_id: latte_core::ThreadCommandId,
+    pub command_id: latte_core::SessionCommandId,
     pub prompt: String,
-    pub expected_thread_revision: u64,
+    pub expected_session_revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -304,14 +304,14 @@ pub struct FollowUpResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SwitchModelRequest {
-    pub binding: ThreadProviderBindingV2,
-    pub expected_thread_revision: u64,
+    pub binding: SessionProviderBinding,
+    pub expected_session_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CancelRequest {
-    pub expected_thread_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_session_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -322,16 +322,16 @@ pub struct QueueFollowUpRequest {
 #[derive(Debug, Deserialize)]
 pub struct ResolvePermissionRequest {
     pub allow: bool,
-    pub expected_thread_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_session_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ProvideInputRequest {
     pub request_id: String,
     pub value: String,
-    pub expected_thread_revision: u64,
-    pub expected_run_revision: u64,
+    pub expected_session_revision: u64,
+    pub expected_turn_revision: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -454,7 +454,7 @@ async fn create_workspace(
 /// only after durable acceptance (completion/error is observed through the
 /// workspace SSE stream). A crash-safe retry with the same `command_id` +
 /// payload replays the original acceptance as 200; a same-`command_id`
-/// different-payload retry or a non-replay create for an existing thread is
+/// different-payload retry or a non-replay create for an existing session is
 /// 409.
 async fn create_session(
     State(state): State<Arc<ServerState>>,
@@ -476,7 +476,7 @@ async fn create_session(
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
     let payload_digest = canonical_digest(&serde_json::json!({
-        "thread_id": req.thread_id.to_string(),
+        "session_id": req.session_id.to_string(),
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "binding": serde_json::to_value(&req.binding).unwrap_or(serde_json::Value::Null),
@@ -537,7 +537,7 @@ async fn create_session_owned(
         .validate()
         .map_err(|e| bad_request(&format!("invalid binding: {e}")))?;
 
-    let thread_id = req.thread_id;
+    let session_id = req.session_id;
     let command_id = req.command_id;
     let runtime = workspace.runtime.clone();
     let prompt = req.prompt;
@@ -550,7 +550,7 @@ async fn create_session_owned(
     tokio::spawn(async move {
         if let Err(error) = runtime
             .start_accepted(
-                thread_id,
+                session_id,
                 command_id,
                 prompt,
                 binding,
@@ -559,7 +559,7 @@ async fn create_session_owned(
             )
             .await
         {
-            warn!("session {thread_id} background turn failed: {error}");
+            warn!("session {session_id} background turn failed: {error}");
         }
     });
 
@@ -576,17 +576,17 @@ async fn create_session_owned(
     // Register the session for O(1) routing now that it is durable.
     state
         .workspaces
-        .register_session(thread_id, workspace.path.clone())
+        .register_session(session_id, workspace.path.clone())
         .await;
 
     // Wake subscribers so they fetch the new session snapshot.
-    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
-        session_id: thread_id.to_string(),
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
+        session_id: session_id.to_string(),
         revision: outcome.revision,
     });
 
     let body = SessionCreatedResponse {
-        session_id: thread_id.to_string(),
+        session_id: session_id.to_string(),
         accepted_revision: outcome.revision,
     };
     Ok((status, body))
@@ -596,7 +596,7 @@ async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     Query(pagination): Query<PaginationQuery>,
-) -> Result<Json<SessionListResponse<ThreadSnapshot>>, HandlerError> {
+) -> Result<Json<SessionListResponse<SessionSnapshot>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
@@ -617,7 +617,7 @@ async fn search_sessions(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<SessionListResponse<latte_core::ThreadSessionSummary>>, HandlerError> {
+) -> Result<Json<SessionListResponse<latte_core::SessionSummary>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
@@ -641,7 +641,7 @@ async fn find_sessions_by_exact_title(
     State(state): State<Arc<ServerState>>,
     Path(workspace_id): Path<String>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<SessionListResponse<latte_core::ThreadSessionSummary>>, HandlerError> {
+) -> Result<Json<SessionListResponse<latte_core::SessionSummary>>, HandlerError> {
     let workspace = state
         .workspaces
         .get_by_id(&workspace_id)
@@ -675,10 +675,10 @@ async fn get_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
     let snapshot = workspace
-        .snapshot(thread_id)
+        .snapshot(session_id)
         .map_err(|_| not_found("session not found"))?;
     Ok(Json(SessionResponse { snapshot }))
 }
@@ -709,7 +709,7 @@ async fn follow_up(
     let payload_digest = canonical_digest(&serde_json::json!({
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
-        "expected_thread_revision": req.expected_thread_revision,
+        "expected_session_revision": req.expected_session_revision,
     }));
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key, &payload_digest) {
@@ -748,20 +748,20 @@ async fn follow_up_owned(
     id: &str,
     req: FollowUpRequest,
 ) -> Result<(StatusCode, FollowUpResponse), HandlerError> {
-    let thread_id = parse_thread_id(id)?;
-    let workspace = lookup_workspace(state, thread_id).await?;
+    let session_id = parse_session_id(id)?;
+    let workspace = lookup_workspace(state, session_id).await?;
     let runtime = workspace.runtime.clone();
     let command_id = req.command_id;
     let prompt = req.prompt;
-    let expected = req.expected_thread_revision;
+    let expected = req.expected_session_revision;
 
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .follow_up_accepted(thread_id, command_id, expected, prompt, accept_tx)
+            .follow_up_accepted(session_id, command_id, expected, prompt, accept_tx)
             .await
         {
-            warn!("session {thread_id} background follow-up failed: {error}");
+            warn!("session {session_id} background follow-up failed: {error}");
         }
     });
 
@@ -775,8 +775,8 @@ async fn follow_up_owned(
         latte_core::CreateOutcome::Replayed(snapshot) => (snapshot, StatusCode::OK),
     };
 
-    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
-        session_id: thread_id.to_string(),
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
+        session_id: session_id.to_string(),
         revision: outcome.revision,
     });
 
@@ -792,17 +792,17 @@ async fn switch_model(
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<SwitchModelRequest>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
     // The revision fence is validated atomically inside the engine operation;
     // no TOCTOU precheck here.
     match workspace
         .runtime
-        .switch_model(thread_id, req.expected_thread_revision, &req.binding)
+        .switch_model(session_id, req.expected_session_revision, &req.binding)
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -810,26 +810,26 @@ async fn switch_model(
 
 /// Cancels an active session. Both revision fences are validated atomically
 /// inside the engine authority operation (not a TOCTOU precheck here), so a
-/// stale client cannot cancel a newer run; a mismatch returns 409 with the
+/// stale client cannot cancel a newer turn; a mismatch returns 409 with the
 /// current revision.
 async fn cancel_session(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<CancelRequest>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
 
     match workspace.runtime.cancel_durable(
-        thread_id,
-        req.expected_thread_revision,
-        req.expected_run_revision,
+        session_id,
+        req.expected_session_revision,
+        req.expected_turn_revision,
     ) {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
             // On a fence/state rejection, surface the current revision so the
             // client can re-fetch and retry.
-            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -840,16 +840,16 @@ async fn queue_follow_up(
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<QueueFollowUpRequest>,
 ) -> Result<(StatusCode, Json<QueueResponse>), HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
 
-    match workspace.runtime.queue_follow_up(thread_id, req.prompt) {
+    match workspace.runtime.queue_follow_up(session_id, req.prompt) {
         Ok(position) => {
             let position =
                 u64::try_from(position).map_err(|_| failed("queue position exceeds u64"))?;
             Ok((StatusCode::ACCEPTED, Json(QueueResponse { position })))
         }
-        Err(ThreadRuntimeError::MailboxFull) => Err((
+        Err(SessionRuntimeError::MailboxFull) => Err((
             StatusCode::CONFLICT,
             Json(ErrorResponse {
                 error: ErrorBody {
@@ -863,24 +863,24 @@ async fn queue_follow_up(
     }
 }
 
-/// Resolves a permission request. Both thread and run revision fences are
+/// Resolves a permission request. Both session and turn revision fences are
 /// validated before the authority-changing operation proceeds.
 async fn resolve_permission(
     State(state): State<Arc<ServerState>>,
     Path((id, request_id)): Path<(String, String)>,
     ValidatedJson(req): ValidatedJson<ResolvePermissionRequest>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
 
-    // The run revision fence is now validated atomically inside the runtime
-    // method alongside the thread revision fence.
+    // The turn revision fence is now validated atomically inside the runtime
+    // method alongside the session revision fence.
     match workspace
         .runtime
         .resolve_permission(
-            thread_id,
-            req.expected_thread_revision,
-            req.expected_run_revision,
+            session_id,
+            req.expected_session_revision,
+            req.expected_turn_revision,
             request_id,
             req.allow,
         )
@@ -888,30 +888,30 @@ async fn resolve_permission(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
 }
 
-/// Provides a requested non-secret input value. Both thread and run revision
+/// Provides a requested non-secret input value. Both session and turn revision
 /// fences are validated before the authority-changing operation proceeds.
 async fn provide_input(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<ProvideInputRequest>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
 
-    // The run revision fence is now validated atomically inside the runtime
-    // method alongside the thread revision fence.
+    // The turn revision fence is now validated atomically inside the runtime
+    // method alongside the session revision fence.
     match workspace
         .runtime
         .provide_input(
-            thread_id,
-            req.expected_thread_revision,
-            req.expected_run_revision,
+            session_id,
+            req.expected_session_revision,
+            req.expected_turn_revision,
             req.request_id,
             req.value,
         )
@@ -919,7 +919,7 @@ async fn provide_input(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(thread_id).ok().map(|s| s.revision);
+            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -929,12 +929,12 @@ async fn reconcile_effect(
     State(state): State<Arc<ServerState>>,
     Path((id, effect_id)): Path<(String, String)>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
 
     match workspace
         .runtime
-        .reconcile_unknown_effect(thread_id, &effect_id)
+        .reconcile_unknown_effect(session_id, &effect_id)
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(_) => Err(not_found("session not found")),
@@ -947,21 +947,21 @@ async fn rename_session(
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<serde_json::Value>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
+    let session_id = parse_session_id(&id)?;
     let title = req
         .get("title")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request("missing title"))?;
-    let workspace = lookup_workspace(&state, thread_id).await?;
+    let workspace = lookup_workspace(&state, session_id).await?;
     workspace
         .engine
-        .rename_thread_session_v2(thread_id, title)
+        .rename_session_v2(session_id, title)
         .map_err(|error| failed(&format!("rename failed: {error}")))?;
     let snapshot = workspace
-        .snapshot(thread_id)
+        .snapshot(session_id)
         .map_err(|error| failed(&format!("snapshot failed: {error}")))?;
-    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
-        session_id: thread_id.to_string(),
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
+        session_id: session_id.to_string(),
         revision: snapshot.revision,
     });
     Ok(Json(SessionResponse { snapshot }))
@@ -973,22 +973,22 @@ async fn fork_session(
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<serde_json::Value>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
-    let thread_id = parse_thread_id(&id)?;
+    let session_id = parse_session_id(&id)?;
     let title = req
         .get("title")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
-    let workspace = lookup_workspace(&state, thread_id).await?;
-    let fork_id = ThreadId::from_uuid(uuid::Uuid::now_v7());
+    let workspace = lookup_workspace(&state, session_id).await?;
+    let fork_id = SessionId::from_uuid(uuid::Uuid::now_v7());
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
         .unwrap_or(0);
     let snapshot = workspace
         .engine
-        .fork_thread_session_v2(thread_id, fork_id, title.as_deref(), now_ms)
+        .fork_session_v2(session_id, fork_id, title.as_deref(), now_ms)
         .map_err(|error| failed(&format!("fork failed: {error}")))?;
-    let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: fork_id.to_string(),
         revision: snapshot.revision,
     });
@@ -1000,11 +1000,11 @@ async fn fork_session(
 /// Resolves the workspace that durably owns a session, or a 404.
 async fn lookup_workspace(
     state: &ServerState,
-    thread_id: ThreadId,
+    session_id: SessionId,
 ) -> Result<Arc<WorkspaceInstance>, HandlerError> {
     let workspace_path = state
         .workspaces
-        .get_session_workspace(&thread_id)
+        .get_session_workspace(&session_id)
         .await
         .ok_or_else(|| not_found("session not found"))?;
     state
@@ -1034,12 +1034,12 @@ fn scoped_idempotency_key(
 /// Maps a runtime error to an HTTP response. State/revision conflicts and
 /// lease/storage races become 409 with the current revision so clients can
 /// retry after a refetch; other failures become 500.
-fn map_runtime_error(error: &ThreadRuntimeError, current_revision: u64) -> HandlerError {
+fn map_runtime_error(error: &SessionRuntimeError, current_revision: u64) -> HandlerError {
     match error {
-        ThreadRuntimeError::InvalidState => {
+        SessionRuntimeError::InvalidState => {
             conflict("session state changed", Some(current_revision))
         }
-        ThreadRuntimeError::Storage(storage_err) if is_retryable_storage(storage_err) => {
+        SessionRuntimeError::Storage(storage_err) if is_retryable_storage(storage_err) => {
             conflict(&format!("{storage_err}"), Some(current_revision))
         }
         other => failed(&format!("operation failed: {other}")),
@@ -1052,13 +1052,13 @@ fn is_retryable_storage(err: &latte_engine::StorageError) -> bool {
         latte_engine::StorageError::EngineUnavailable
             | latte_engine::StorageError::LeaseLost
             | latte_engine::StorageError::StaleRevision { .. }
-            | latte_engine::StorageError::StaleThreadRevision { .. }
+            | latte_engine::StorageError::StaleSessionRevision { .. }
     )
 }
 
-fn parse_thread_id(id: &str) -> Result<ThreadId, HandlerError> {
+fn parse_session_id(id: &str) -> Result<SessionId, HandlerError> {
     let uuid = uuid::Uuid::parse_str(id).map_err(|_| bad_request("invalid session id"))?;
-    Ok(ThreadId::from_uuid(uuid))
+    Ok(SessionId::from_uuid(uuid))
 }
 
 /// Builds a typed error response with an optional current revision.
@@ -1098,7 +1098,7 @@ fn failed(message: &str) -> HandlerError {
 
 /// Maps a session-create/follow-up acceptance error to an HTTP response. A
 /// durable command-id reuse with a different payload is a 422 idempotency
-/// mismatch; a revision conflict or existing-thread error is 409; other
+/// mismatch; a revision conflict or existing-session error is 409; other
 /// failures are 500.
 fn map_create_error(error: &latte_core::CreateAcceptError) -> HandlerError {
     match error {
@@ -1209,7 +1209,7 @@ async fn workspace_events(
         match result {
             Ok(event) => {
                 let event_type = match &event {
-                    ServerEvent::ThreadChanged { .. } => "thread_changed",
+                    ServerEvent::SessionChanged { .. } => "session_changed",
                     ServerEvent::Progress { .. } => "progress",
                     ServerEvent::ResyncRequired => "resync_required",
                 };
@@ -1349,11 +1349,11 @@ mod tests {
     }
 
     /// Builds durable server state whose per-workspace runtimes all use the
-    /// given thread provider factory (each workspace still gets its own engine
+    /// given session provider factory (each workspace still gets its own engine
     /// under a temp dir). The session locator is a no-op; tests drive the
     /// in-memory index via `register_session`/create.
     fn state_with_factory(
-        factory: latte_headless::thread::ThreadProviderFactory,
+        factory: latte_headless::session::SessionProviderFactory,
     ) -> Arc<ServerState> {
         let builder: crate::workspace::WorkspaceRuntimeBuilder = std::sync::Arc::new(
             move |root: &std::path::Path| {
@@ -1365,7 +1365,7 @@ mod tests {
                     .conversation_root(root.join(".latte/sessions"))
                     .build()
                     .map_err(|e| e.to_string())?;
-                let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                let runtime = latte_headless::session::SessionRuntimeService::new(
                     engine.clone(),
                     root,
                     Default::default(),
@@ -1399,8 +1399,8 @@ mod tests {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([ProviderResponse {
                     message: Some("done".into()),
                     tool_calls: Vec::new(),
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     /// Creates a session and blocks until it is durably idle (accepts a
-    /// follow-up), returning the session id and its current thread revision.
+    /// follow-up), returning the session id and its current session revision.
     async fn completed_session(state: &Arc<ServerState>, workspace_id: &str) -> (String, u64) {
         let (_, created) = create_call(
             state,
@@ -1455,8 +1455,8 @@ mod tests {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
                         message: Some("writing".into()),
@@ -1501,7 +1501,7 @@ mod tests {
     }
 
     /// Creates a session that parks at `WaitingPermission`, returning its id,
-    /// current thread revision, pending request id, and expected run revision.
+    /// current session revision, pending request id, and expected run revision.
     async fn waiting_permission_session(
         state: &Arc<ServerState>,
         workspace_id: &str,
@@ -1525,10 +1525,10 @@ mod tests {
                     .as_str()
                     .expect("pending permission request id")
                     .to_string();
-                let run_revision = pending["expected_run_revision"]
+                let turn_revision = pending["expected_turn_revision"]
                     .as_u64()
                     .expect("pending expected run revision");
-                return (session_id, revision, request_id, run_revision);
+                return (session_id, revision, request_id, turn_revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1543,8 +1543,8 @@ mod tests {
         };
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
                         message: None,
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     /// Creates a session that parks at `WaitingInput`, returning its id,
-    /// current thread revision, pending request id, and expected run revision.
+    /// current session revision, pending request id, and expected run revision.
     async fn waiting_input_session(
         state: &Arc<ServerState>,
         workspace_id: &str,
@@ -1606,8 +1606,8 @@ mod tests {
                 let revision = body["snapshot"]["revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"].as_str().unwrap().to_string();
-                let run_revision = pending["expected_run_revision"].as_u64().unwrap();
-                return (session_id, revision, request_id, run_revision);
+                let turn_revision = pending["expected_turn_revision"].as_u64().unwrap();
+                return (session_id, revision, request_id, turn_revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1619,7 +1619,7 @@ mod tests {
         let state = input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, _revision, request_id, run_revision) =
+        let (session_id, _revision, request_id, turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -1629,8 +1629,8 @@ mod tests {
             Some(serde_json::json!({
                 "request_id": request_id,
                 "value": "the answer",
-                "expected_thread_revision": 999,
-                "expected_run_revision": run_revision
+                "expected_session_revision": 999,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -1791,7 +1791,7 @@ mod tests {
         // accepted_revision is the real durable revision after acceptance.
         assert!(body["accepted_revision"].is_u64());
 
-        // The durable thread is created even though the test provider fails,
+        // The durable session is created even though the test provider fails,
         // so the read route resolves it once the background turn persists it.
         let mut found = false;
         for _ in 0..50 {
@@ -1808,7 +1808,7 @@ mod tests {
                 .unwrap();
             if response.status() == StatusCode::OK {
                 let snapshot = json_body(response).await;
-                assert_eq!(snapshot["snapshot"]["thread_id"], session_id);
+                assert_eq!(snapshot["snapshot"]["session_id"], session_id);
                 found = true;
                 break;
             }
@@ -1819,7 +1819,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_replays_idempotent_key() {
-        // A crash-safe replay is keyed on a stable client command_id + thread_id
+        // A crash-safe replay is keyed on a stable client command_id + session_id
         // and identical payload. The first create is a fresh 202. To reach the
         // durable dedup 200 (rather than the in-memory ledger's verbatim replay
         // of the 202), the retry must come from a *fresh* server process — a
@@ -1830,10 +1830,10 @@ mod tests {
         let state = completing_state();
         let workspace_id = create_workspace_id(&state, &workspace_path).await;
 
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let body = serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": "hello",
             "binding": valid_binding(),
@@ -1842,7 +1842,7 @@ mod tests {
         let (first_status, first_body) = create_call(&state, &workspace_id, body.clone()).await;
         assert_eq!(first_status, StatusCode::ACCEPTED);
         let first_id = first_body["session_id"].as_str().unwrap().to_string();
-        assert_eq!(first_id, thread_id, "create honors the client thread_id");
+        assert_eq!(first_id, session_id, "create honors the client session_id");
 
         // The first create's background turn must reach durable persistence
         // before the replay lookup can hit the dedup record.
@@ -1873,7 +1873,10 @@ mod tests {
             first_id, second_id,
             "retry must replay the original session"
         );
-        assert_eq!(second_id, thread_id, "replay returns the client thread_id");
+        assert_eq!(
+            second_id, session_id,
+            "replay returns the client session_id"
+        );
     }
 
     #[tokio::test]
@@ -1888,13 +1891,13 @@ mod tests {
         let state = completing_state();
         let workspace_id = create_workspace_id(&state, &workspace_path).await;
 
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
 
         let (first_status, first_body) = create_call(
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "session_id": latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string(),
                 "command_id": command_id,
                 "prompt": "original",
                 "binding": valid_binding(),
@@ -1913,7 +1916,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // Fresh process, same DB: a *new* thread_id but the *same* command_id
+        // Fresh process, same DB: a *new* session_id but the *same* command_id
         // with a different payload is a durable command-id reuse → 422
         // idempotency mismatch (not 409, so the client doesn't retry as a
         // revision conflict).
@@ -1923,7 +1926,7 @@ mod tests {
             &restarted,
             &restarted_id,
             serde_json::json!({
-                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "session_id": latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string(),
                 "command_id": command_id,
                 "prompt": "changed prompt",
                 "binding": valid_binding(),
@@ -1946,8 +1949,8 @@ mod tests {
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
-                "command_id": latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "session_id": latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
                 "prompt": "hello",
                 "binding": valid_binding(),
             }),
@@ -1959,7 +1962,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_requires_client_ids() {
-        // The contract requires client-supplied thread_id and command_id; a
+        // The contract requires client-supplied session_id and command_id; a
         // body omitting them is rejected by the ValidatedJson extractor (400).
         let state = state();
         let workspace = tempfile::tempdir().unwrap();
@@ -2105,7 +2108,7 @@ mod tests {
         let mut listed: std::collections::HashSet<String> = sessions1
             .iter()
             .chain(sessions2.iter())
-            .map(|session| session["thread_id"].as_str().unwrap().to_string())
+            .map(|session| session["session_id"].as_str().unwrap().to_string())
             .collect();
         for id in &created {
             assert!(listed.remove(id), "session {id} missing from pages");
@@ -2197,7 +2200,7 @@ mod tests {
         let session_id = created["session_id"].as_str().unwrap().to_string();
 
         // Wait until the durable session is readable, then cancel with a
-        // deliberately stale thread revision.
+        // deliberately stale session revision.
         let mut conflicted = false;
         for _ in 0..50 {
             let response = router(state.clone())
@@ -2209,8 +2212,8 @@ mod tests {
                         .header("authorization", "Bearer test-token")
                         .body(axum::body::Body::from(
                             serde_json::json!({
-                                "expected_thread_revision": 999,
-                                "expected_run_revision": 999
+                                "expected_session_revision": 999,
+                                "expected_turn_revision": 999
                             })
                             .to_string(),
                         ))
@@ -2247,8 +2250,8 @@ mod tests {
                     .header("authorization", "Bearer test-token")
                     .body(axum::body::Body::from(
                         serde_json::json!({
-                            "expected_thread_revision": 0,
-                            "expected_run_revision": 0
+                            "expected_session_revision": 0,
+                            "expected_turn_revision": 0
                         })
                         .to_string(),
                     ))
@@ -2263,13 +2266,13 @@ mod tests {
     #[test]
     fn map_runtime_error_classifies_conflict_and_failure() {
         // InvalidState is a revision/state conflict carrying the current revision.
-        let (status, body) = map_runtime_error(&ThreadRuntimeError::InvalidState, 12);
+        let (status, body) = map_runtime_error(&SessionRuntimeError::InvalidState, 12);
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.0.error.error_type, "conflict");
         assert_eq!(body.0.error.current_revision, Some(12));
 
         // Any other runtime error becomes an opaque 500 without a revision.
-        let (status, body) = map_runtime_error(&ThreadRuntimeError::Effect("boom".into()), 12);
+        let (status, body) = map_runtime_error(&SessionRuntimeError::Effect("boom".into()), 12);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.error.error_type, "failed");
         assert!(body.0.error.current_revision.is_none());
@@ -2280,7 +2283,7 @@ mod tests {
     fn map_runtime_error_classifies_storage_lease_and_revision_as_conflict() {
         // EngineUnavailable (lease held by another owner) becomes 409.
         let (status, body) = map_runtime_error(
-            &ThreadRuntimeError::Storage(latte_engine::StorageError::EngineUnavailable),
+            &SessionRuntimeError::Storage(latte_engine::StorageError::EngineUnavailable),
             5,
         );
         assert_eq!(status, StatusCode::CONFLICT);
@@ -2288,14 +2291,14 @@ mod tests {
 
         // LeaseLost becomes 409.
         let (status, _) = map_runtime_error(
-            &ThreadRuntimeError::Storage(latte_engine::StorageError::LeaseLost),
+            &SessionRuntimeError::Storage(latte_engine::StorageError::LeaseLost),
             7,
         );
         assert_eq!(status, StatusCode::CONFLICT);
 
         // StaleRevision becomes 409.
         let (status, _) = map_runtime_error(
-            &ThreadRuntimeError::Storage(latte_engine::StorageError::StaleRevision {
+            &SessionRuntimeError::Storage(latte_engine::StorageError::StaleRevision {
                 expected: 1,
                 actual: 2,
             }),
@@ -2303,9 +2306,9 @@ mod tests {
         );
         assert_eq!(status, StatusCode::CONFLICT);
 
-        // StaleThreadRevision becomes 409.
+        // StaleSessionRevision becomes 409.
         let (status, _) = map_runtime_error(
-            &ThreadRuntimeError::Storage(latte_engine::StorageError::StaleThreadRevision {
+            &SessionRuntimeError::Storage(latte_engine::StorageError::StaleSessionRevision {
                 expected: 1,
                 actual: 2,
             }),
@@ -2428,7 +2431,7 @@ mod tests {
         (status, json_body(response).await)
     }
 
-    /// Creates a session with fresh client-generated `thread_id` and
+    /// Creates a session with fresh client-generated `session_id` and
     /// `command_id`, and the matching `Idempotency-Key` header. The body may
     /// override either field (e.g. to test replay with a fixed command id);
     /// the `Idempotency-Key` is always derived from the effective `command_id`
@@ -2438,10 +2441,12 @@ mod tests {
         workspace_id: &str,
         mut body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7());
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7());
         if let Some(obj) = body.as_object_mut() {
-            obj.entry("thread_id").or_insert_with(|| {
-                serde_json::json!(latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string())
+            obj.entry("session_id").or_insert_with(|| {
+                serde_json::json!(
+                    latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string()
+                )
             });
             obj.entry("command_id")
                 .or_insert_with(|| serde_json::json!(command_id.to_string()));
@@ -2500,12 +2505,12 @@ mod tests {
             (
                 "POST",
                 format!("/v1/sessions/{missing}/follow-up"),
-                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000008", "prompt": "x", "expected_thread_revision": 0 }),
+                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000008", "prompt": "x", "expected_session_revision": 0 }),
             ),
             (
                 "POST",
                 format!("/v1/sessions/{missing}/model"),
-                serde_json::json!({ "binding": valid_binding(), "expected_thread_revision": 0 }),
+                serde_json::json!({ "binding": valid_binding(), "expected_session_revision": 0 }),
             ),
             (
                 "POST",
@@ -2517,8 +2522,8 @@ mod tests {
                 format!("/v1/sessions/{missing}/permissions/req-1"),
                 serde_json::json!({
                     "allow": true,
-                    "expected_thread_revision": 0,
-                    "expected_run_revision": 0
+                    "expected_session_revision": 0,
+                    "expected_turn_revision": 0
                 }),
             ),
             (
@@ -2527,8 +2532,8 @@ mod tests {
                 serde_json::json!({
                     "request_id": "req-1",
                     "value": "v",
-                    "expected_thread_revision": 0,
-                    "expected_run_revision": 0
+                    "expected_session_revision": 0,
+                    "expected_turn_revision": 0
                 }),
             ),
             (
@@ -2562,7 +2567,7 @@ mod tests {
             &state,
             "POST",
             "/v1/sessions/not-a-uuid/follow-up",
-            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
+            Some(serde_json::json!({ "prompt": "x", "expected_session_revision": 0 })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2644,7 +2649,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let sessions = body["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "exact-title must return only 'foo'");
-        assert_eq!(sessions[0]["thread_id"].as_str(), Some(foo_id.as_str()));
+        assert_eq!(sessions[0]["session_id"].as_str(), Some(foo_id.as_str()));
         assert_eq!(sessions[0]["title"].as_str(), Some("foo"));
 
         let (status, body) = call(
@@ -2657,7 +2662,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let sessions = body["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "exact-title must return only 'foobar'");
-        assert_eq!(sessions[0]["thread_id"].as_str(), Some(foobar_id.as_str()));
+        assert_eq!(sessions[0]["session_id"].as_str(), Some(foobar_id.as_str()));
 
         // A missing exact title returns an empty array, not an error.
         let (status, body) = call(
@@ -2696,7 +2701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_events_emits_thread_changed_frame() {
+    async fn workspace_events_emits_session_changed_frame() {
         use tokio_stream::StreamExt as _;
 
         let state = state();
@@ -2718,13 +2723,13 @@ mod tests {
 
         // Publish one of each event variant, then confirm the SSE body maps
         // every server event type to its named frame.
-        let _ = workspace.event_tx.send(ServerEvent::ThreadChanged {
+        let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
             session_id: "abc".into(),
             revision: 7,
         });
         let _ = workspace.event_tx.send(ServerEvent::Progress {
             session_id: "abc".into(),
-            run_id: "run-1".into(),
+            turn_id: "run-1".into(),
             progress: serde_json::json!({ "step": 1 }),
         });
         let _ = workspace.event_tx.send(ServerEvent::ResyncRequired);
@@ -2735,7 +2740,7 @@ mod tests {
             match tokio::time::timeout(Duration::from_millis(200), body.next()).await {
                 Ok(Some(Ok(chunk))) => {
                     seen.push_str(&String::from_utf8_lossy(&chunk));
-                    if seen.contains("thread_changed")
+                    if seen.contains("session_changed")
                         && seen.contains("progress")
                         && seen.contains("resync_required")
                     {
@@ -2746,8 +2751,8 @@ mod tests {
             }
         }
         assert!(
-            seen.contains("thread_changed"),
-            "SSE stream did not carry the thread_changed frame: {seen:?}"
+            seen.contains("session_changed"),
+            "SSE stream did not carry the session_changed frame: {seen:?}"
         );
         assert!(
             seen.contains("progress"),
@@ -2809,12 +2814,12 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_session_revision": revision })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000001")],
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "follow-up returned {body:?}");
-        // The follow-up creates a new child, advancing the thread revision past
+        // The follow-up creates a new child, advancing the session revision past
         // the value the client fenced against.
         let accepted = body["accepted_revision"].as_u64().unwrap();
         assert!(accepted >= revision);
@@ -2824,7 +2829,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000001", "prompt": "again", "expected_session_revision": revision })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000001")],
         )
         .await;
@@ -2843,7 +2848,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000002", "prompt": "again", "expected_thread_revision": 999 })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000002", "prompt": "again", "expected_session_revision": 999 })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000002")],
         )
         .await;
@@ -2864,7 +2869,7 @@ mod tests {
             &format!("/v1/sessions/{session_id}/model"),
             Some(serde_json::json!({
                 "binding": valid_binding(),
-                "expected_thread_revision": 999
+                "expected_session_revision": 999
             })),
         )
         .await;
@@ -2885,7 +2890,7 @@ mod tests {
             &format!("/v1/sessions/{session_id}/model"),
             Some(serde_json::json!({
                 "binding": { "version": 1 },
-                "expected_thread_revision": revision
+                "expected_session_revision": revision
             })),
         )
         .await;
@@ -2909,7 +2914,7 @@ mod tests {
             &format!("/v1/sessions/{session_id}/model"),
             Some(serde_json::json!({
                 "binding": binding,
-                "expected_thread_revision": revision
+                "expected_session_revision": revision
             })),
         )
         .await;
@@ -2926,7 +2931,7 @@ mod tests {
 
         let (status, body) = call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["snapshot"]["thread_id"].as_str().unwrap(), session_id);
+        assert_eq!(body["snapshot"]["session_id"].as_str().unwrap(), session_id);
         assert_eq!(body["snapshot"]["lifecycle"], "ready");
     }
 
@@ -2954,7 +2959,7 @@ mod tests {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         // Denial consumes the prepared permission without running the tool, so
@@ -2965,8 +2970,8 @@ mod tests {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(serde_json::json!({
                 "allow": false,
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -2979,11 +2984,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_permission_stale_thread_revision_conflicts() {
+    async fn resolve_permission_stale_session_revision_conflicts() {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, _revision, request_id, run_revision) =
+        let (session_id, _revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -2992,8 +2997,8 @@ mod tests {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(serde_json::json!({
                 "allow": true,
-                "expected_thread_revision": 999,
-                "expected_run_revision": run_revision
+                "expected_session_revision": 999,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3009,7 +3014,7 @@ mod tests {
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, _request_id, run_revision) =
+        let (session_id, revision, _request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, _) = call(
@@ -3019,8 +3024,8 @@ mod tests {
             Some(serde_json::json!({
                 "request_id": "whatever",
                 "value": "v",
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3028,13 +3033,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_permission_stale_run_revision_conflicts() {
-        // A stale expected_run_revision is rejected with 409 even when the
-        // thread revision is correct.
+    async fn resolve_permission_stale_turn_revision_conflicts() {
+        // A stale expected_turn_revision is rejected with 409 even when the
+        // session revision is correct.
         let state = permission_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, _run_revision) =
+        let (session_id, revision, request_id, _turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3043,8 +3048,8 @@ mod tests {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(serde_json::json!({
                 "allow": true,
-                "expected_thread_revision": revision,
-                "expected_run_revision": 999
+                "expected_session_revision": revision,
+                "expected_turn_revision": 999
             })),
         )
         .await;
@@ -3053,12 +3058,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provide_input_stale_run_revision_conflicts() {
-        // A stale expected_run_revision on provide_input is rejected with 409.
+    async fn provide_input_stale_turn_revision_conflicts() {
+        // A stale expected_turn_revision on provide_input is rejected with 409.
         let state = input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, _run_revision) =
+        let (session_id, revision, request_id, _turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3068,8 +3073,8 @@ mod tests {
             Some(serde_json::json!({
                 "request_id": request_id,
                 "value": "the answer",
-                "expected_thread_revision": revision,
-                "expected_run_revision": 999
+                "expected_session_revision": revision,
+                "expected_turn_revision": 999
             })),
         )
         .await;
@@ -3091,7 +3096,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "original", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "original", "expected_session_revision": revision })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000003")],
         )
         .await;
@@ -3103,7 +3108,7 @@ mod tests {
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
             Some(
-                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "DIFFERENT", "expected_thread_revision": revision }),
+                serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000003", "prompt": "DIFFERENT", "expected_session_revision": revision }),
             ),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000003")],
         )
@@ -3232,11 +3237,11 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         // The Idempotency-Key is the client command_id; the ledger digest binds
-        // the complete command identity (thread_id + command_id + payload).
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        // the complete command identity (session_id + command_id + payload).
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let payload_digest = canonical_digest(&serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": "x",
             "binding": valid_binding(),
@@ -3251,7 +3256,7 @@ mod tests {
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": thread_id,
+                "session_id": session_id,
                 "command_id": command_id,
                 "prompt": "x",
                 "binding": valid_binding(),
@@ -3270,16 +3275,16 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        // A stable client command_id + thread_id so both attempts share the
+        // A stable client command_id + session_id so both attempts share the
         // ledger key; the first fails validation and releases it.
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
 
         let (bad_status, _) = create_call(
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": thread_id,
+                "session_id": session_id,
                 "command_id": command_id,
                 "prompt": "x",
                 "binding": { "version": 1 },
@@ -3293,7 +3298,7 @@ mod tests {
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": thread_id,
+                "session_id": session_id,
                 "command_id": command_id,
                 "prompt": "x",
                 "binding": valid_binding(),
@@ -3333,7 +3338,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{missing}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_thread_revision": 0 })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_session_revision": 0 })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000004")],
         )
         .await;
@@ -3343,7 +3348,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{missing}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_thread_revision": 0 })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000004", "prompt": "x", "expected_session_revision": 0 })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000004")],
         )
         .await;
@@ -3404,8 +3409,8 @@ mod tests {
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string(),
-                "command_id": latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "session_id": latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string(),
+                "command_id": latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string(),
                 "prompt": "no key",
                 "binding": valid_binding(),
             }),
@@ -3430,7 +3435,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000005", "prompt": "no key", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000005", "prompt": "no key", "expected_session_revision": revision })),
             &[],
         )
         .await;
@@ -3448,7 +3453,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000006", "prompt": "mismatch", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000006", "prompt": "mismatch", "expected_session_revision": revision })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000099")],
         )
         .await;
@@ -3476,7 +3481,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/model"),
-            Some(serde_json::json!({ "binding": {"not": "a valid binding"}, "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "binding": {"not": "a valid binding"}, "expected_session_revision": revision })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3498,15 +3503,15 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
 
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
 
         // First request succeeds (202).
         let (first, _) = create_call(
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": thread_id,
+                "session_id": session_id,
                 "command_id": command_id,
                 "prompt": "original",
                 "binding": valid_binding(),
@@ -3520,7 +3525,7 @@ mod tests {
             &state,
             &workspace_id,
             serde_json::json!({
-                "thread_id": thread_id,
+                "session_id": session_id,
                 "command_id": command_id,
                 "prompt": "CHANGED",
                 "binding": valid_binding(),
@@ -3575,8 +3580,8 @@ mod tests {
     fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(move |binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(Blocking(gate.clone())),
                     binding: ProviderBinding {
@@ -3598,7 +3603,7 @@ mod tests {
     /// engine does not expose, so the binding catalog fails closed and the
     /// `list_bindings` error branch is reachable.
     fn broken_registry_state() -> Arc<ServerState> {
-        let factory: latte_headless::thread::ThreadProviderFactory =
+        let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|_| Err("unused in this test".to_string()));
         let builder: crate::workspace::WorkspaceRuntimeBuilder = std::sync::Arc::new(
             move |root: &std::path::Path| {
@@ -3610,7 +3615,7 @@ mod tests {
                     .conversation_root(root.join(".latte/sessions"))
                     .build()
                     .map_err(|e| e.to_string())?;
-                let runtime = latte_headless::thread::ThreadRuntimeService::new(
+                let runtime = latte_headless::session::SessionRuntimeService::new(
                     engine.clone(),
                     root,
                     Default::default(),
@@ -3707,7 +3712,7 @@ mod tests {
         let payload_digest = canonical_digest(&serde_json::json!({
             "command_id": "01900000-0000-7000-8000-000000000007",
             "prompt": "again",
-            "expected_thread_revision": revision,
+            "expected_session_revision": revision,
         }));
         state.idempotency_claim(
             &format!("test-token:follow-up:{session_id}:01900000-0000-7000-8000-000000000007"),
@@ -3718,7 +3723,7 @@ mod tests {
             &state,
             "POST",
             &format!("/v1/sessions/{session_id}/follow-up"),
-            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000007", "prompt": "again", "expected_thread_revision": revision })),
+            Some(serde_json::json!({ "command_id": "01900000-0000-7000-8000-000000000007", "prompt": "again", "expected_session_revision": revision })),
             &[("idempotency-key", "01900000-0000-7000-8000-000000000007")],
         )
         .await;
@@ -3759,8 +3764,8 @@ mod tests {
                 provider_state: None,
             },
         ]));
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(move |binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
                     binding: ProviderBinding {
@@ -3785,7 +3790,7 @@ mod tests {
         let state = shared_input_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_input_session(&state, &workspace_id).await;
 
         let (status, body) = call(
@@ -3795,8 +3800,8 @@ mod tests {
             Some(serde_json::json!({
                 "request_id": request_id,
                 "value": "the answer",
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3820,29 +3825,29 @@ mod tests {
         .await;
         let session_id = created["session_id"].as_str().unwrap().to_string();
 
-        // Wait until the session has an active run, then read the authoritative
-        // thread and run revisions for a correct-fence cancel.
-        let (revision, run_revision) = 'wait: {
+        // Wait until the session has an active turn, then read the authoritative
+        // session and run revisions for a correct-fence cancel.
+        let (revision, turn_revision) = 'wait: {
             for _ in 0..200 {
                 let (status, body) =
                     call(&state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
                 if status == StatusCode::OK {
                     let snapshot = &body["snapshot"];
-                    if let Some(active_run_id) = snapshot["active_run_id"].as_str() {
+                    if let Some(active_turn_id) = snapshot["active_turn_id"].as_str() {
                         let revision = snapshot["revision"].as_u64().unwrap();
-                        let run_revision = snapshot["runs"]
+                        let turn_revision = snapshot["turns"]
                             .as_array()
                             .unwrap()
                             .iter()
-                            .find(|run| run["run_id"].as_str() == Some(active_run_id))
-                            .and_then(|run| run["run_revision"].as_u64())
+                            .find(|run| run["turn_id"].as_str() == Some(active_turn_id))
+                            .and_then(|run| run["turn_revision"].as_u64())
                             .unwrap();
-                        break 'wait (revision, run_revision);
+                        break 'wait (revision, turn_revision);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            panic!("session never started an active run");
+            panic!("session never started an active turn");
         };
 
         let (status, body) = call(
@@ -3850,8 +3855,8 @@ mod tests {
             "POST",
             &format!("/v1/sessions/{session_id}/cancel"),
             Some(serde_json::json!({
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -3870,8 +3875,8 @@ mod tests {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
         use latte_headless::registry::{ProviderBinding, ResolvedProvider};
 
-        let factory: latte_headless::thread::ThreadProviderFactory =
-            std::sync::Arc::new(|binding: &latte_core::ThreadProviderBindingV2| {
+        let factory: latte_headless::session::SessionProviderFactory =
+            std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
                         message: Some("attempting failed process".into()),
@@ -3922,7 +3927,7 @@ mod tests {
         let state = process_reconciliation_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let (session_id, revision, request_id, run_revision) =
+        let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
 
         // Grant permission; the launch fails and the session enters
@@ -3933,8 +3938,8 @@ mod tests {
             &format!("/v1/sessions/{session_id}/permissions/{request_id}"),
             Some(serde_json::json!({
                 "allow": true,
-                "expected_thread_revision": revision,
-                "expected_run_revision": run_revision
+                "expected_session_revision": revision,
+                "expected_turn_revision": turn_revision
             })),
         )
         .await;
@@ -4095,9 +4100,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_session_updates_title_and_broadcasts_thread_changed() {
+    async fn rename_session_updates_title_and_broadcasts_session_changed() {
         // PATCH /v1/sessions/{id} renames a durable session, returns the fresh
-        // snapshot, and broadcasts a ThreadChanged event so live SSE clients
+        // snapshot, and broadcasts a SessionChanged event so live SSE clients
         // observe the new title. Covers the rename_session handler end to end.
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
@@ -4118,7 +4123,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            body["snapshot"]["thread_id"].as_str(),
+            body["snapshot"]["session_id"].as_str(),
             Some(session_id.as_str()),
             "rename returns the same session's snapshot"
         );
@@ -4137,7 +4142,7 @@ mod tests {
             .as_array()
             .expect("sessions must be an array")
             .iter()
-            .find(|s| s["thread_id"].as_str() == Some(session_id.as_str()))
+            .find(|s| s["session_id"].as_str() == Some(session_id.as_str()))
             .expect("renamed session must appear in the catalog search");
         assert_eq!(
             renamed["title"].as_str(),
@@ -4145,13 +4150,13 @@ mod tests {
             "catalog title reflects the rename"
         );
 
-        // A ThreadChanged event for this session is broadcast to SSE clients.
+        // A SessionChanged event for this session is broadcast to SSE clients.
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
-            .expect("no ThreadChanged event after rename")
+            .expect("no SessionChanged event after rename")
             .expect("event channel closed");
         match event {
-            ServerEvent::ThreadChanged { session_id: id, .. } => {
+            ServerEvent::SessionChanged { session_id: id, .. } => {
                 assert_eq!(id, session_id);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -4179,8 +4184,8 @@ mod tests {
 
     #[tokio::test]
     async fn fork_session_creates_a_new_session_and_broadcasts() {
-        // POST /v1/sessions/{id}/fork forks a durable session into a new thread
-        // id, returns the fork's snapshot, and broadcasts a ThreadChanged event
+        // POST /v1/sessions/{id}/fork forks a durable session into a new session
+        // id, returns the fork's snapshot, and broadcasts a SessionChanged event
         // keyed by the fork id. Covers the fork_session handler.
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
@@ -4200,17 +4205,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let fork_id = body["snapshot"]["thread_id"]
+        let fork_id = body["snapshot"]["session_id"]
             .as_str()
-            .expect("fork snapshot missing thread_id");
-        assert_ne!(fork_id, session_id, "fork must mint a distinct thread id");
+            .expect("fork snapshot missing session_id");
+        assert_ne!(fork_id, session_id, "fork must mint a distinct session id");
 
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
-            .expect("no ThreadChanged event after fork")
+            .expect("no SessionChanged event after fork")
             .expect("event channel closed");
         match event {
-            ServerEvent::ThreadChanged { session_id: id, .. } => {
+            ServerEvent::SessionChanged { session_id: id, .. } => {
                 assert_eq!(id, fork_id, "fork event must key on the fork id");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -4263,7 +4268,7 @@ mod tests {
         // clamp / default branches directly without racing on process env by
         // asserting the default in the common (unset) case.
         //
-        // SAFETY: single-threaded #[test]; we set and immediately clear the var
+        // SAFETY: single-sessioned #[test]; we set and immediately clear the var
         // within this test's own scope. No other test reads this variable.
         let key = "LATTE_RECOVERY_SWEEP_MS";
         let saved = std::env::var(key).ok();
@@ -4377,10 +4382,10 @@ mod tests {
         let state = completing_state();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
-        let thread_id = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7()).to_string();
-        let command_id = latte_core::ThreadCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
         let body = serde_json::json!({
-            "thread_id": thread_id,
+            "session_id": session_id,
             "command_id": command_id,
             "prompt": "hello",
             "binding": valid_binding(),
@@ -4393,7 +4398,7 @@ mod tests {
         assert_eq!(second, StatusCode::OK);
         assert_eq!(
             second_body["session_id"].as_str(),
-            Some(thread_id.as_str()),
+            Some(session_id.as_str()),
             "in-memory replay returns the original session"
         );
     }
@@ -4478,7 +4483,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
-        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let ghost = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         state
             .workspaces
             .register_session(ghost, ws.path.clone())
@@ -4491,14 +4496,14 @@ mod tests {
     #[tokio::test]
     async fn follow_up_with_invalid_session_id_and_key_is_bad_request() {
         // The Idempotency-Key header is present (so the key-required check
-        // passes) but the session id is not a UUID: parse_thread_id in
+        // passes) but the session id is not a UUID: parse_session_id in
         // follow_up_owned rejects it as 400.
         let state = state();
         let (status, body) = call_with_headers(
             &state,
             "POST",
             "/v1/sessions/not-a-uuid/follow-up",
-            Some(serde_json::json!({ "prompt": "x", "expected_thread_revision": 0 })),
+            Some(serde_json::json!({ "prompt": "x", "expected_session_revision": 0 })),
             &[("idempotency-key", "follow-invalid-id")],
         )
         .await;
@@ -4515,12 +4520,12 @@ mod tests {
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/model",
-                serde_json::json!({ "binding": valid_binding(), "expected_thread_revision": 0 }),
+                serde_json::json!({ "binding": valid_binding(), "expected_session_revision": 0 }),
             ),
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/cancel",
-                serde_json::json!({ "expected_thread_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",
@@ -4530,12 +4535,12 @@ mod tests {
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/permissions/req-1",
-                serde_json::json!({ "allow": true, "expected_thread_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "allow": true, "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",
                 "/v1/sessions/not-a-uuid/input",
-                serde_json::json!({ "request_id": "req-1", "value": "v", "expected_thread_revision": 0, "expected_run_revision": 0 }),
+                serde_json::json!({ "request_id": "req-1", "value": "v", "expected_session_revision": 0, "expected_turn_revision": 0 }),
             ),
             (
                 "POST",
@@ -4569,7 +4574,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
-        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let ghost = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         state
             .workspaces
             .register_session(ghost, ws.path.clone())
@@ -4594,7 +4599,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let ws = state.workspaces.get_by_id(&workspace_id).await.unwrap();
-        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let ghost = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         state
             .workspaces
             .register_session(ghost, ws.path.clone())
@@ -4617,7 +4622,7 @@ mod tests {
         // and the handler returns 404 (covers the lookup_workspace error arm in
         // get_session, rename_session, and fork_session).
         let state = state();
-        let ghost = latte_core::ThreadId::from_uuid(uuid::Uuid::now_v7());
+        let ghost = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         state
             .workspaces
             .register_session(

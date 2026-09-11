@@ -39,9 +39,9 @@ Clients (CLI / TUI / external)
 │         ▼                       │
 │  WorkspaceManager               │
 │    ├─ Workspace A               │
-│    │   └─ ThreadRuntimeService  │
+│    │   └─ SessionRuntimeService  │
 │    └─ Workspace B               │
-│        └─ ThreadRuntimeService  │
+│        └─ SessionRuntimeService  │
 └─────────────────────────────────┘
 ```
 
@@ -81,17 +81,17 @@ Server 会规范化路径并返回稳定的 `workspace_id`。后续请求使用�
 ```
 POST /v1/workspaces/{workspace_id}/sessions
 Headers: Idempotency-Key: <uuid>
-Body: { "thread_id": "<uuid>", "command_id": "<uuid>", "prompt": "...", "binding": {...} }
+Body: { "session_id": "<uuid>", "command_id": "<uuid>", "prompt": "...", "binding": {...} }
 Response: 202 { "session_id": "...", "accepted_revision": 42 }
 ```
 
-`thread_id` 和 `command_id` 由客户端生成（UUID v7）。`Idempotency-Key` 头必须等于 `command_id`。返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复创建。
+`session_id` 和 `command_id` 由客户端生成（UUID v7）。`Idempotency-Key` 头必须等于 `command_id`。返回 202 Accepted。Session 已创建，首个 turn 已入队。客户端通过 SSE 观察完成状态。同一 `command_id` + 相同 payload 的重试返回 200（replay），不重复创建。
 
 **Follow Up**
 ```
 POST /v1/sessions/{id}/follow-up
 Headers: Idempotency-Key: <uuid>
-Body: { "command_id": "<uuid>", "prompt": "...", "expected_thread_revision": 42 }
+Body: { "command_id": "<uuid>", "prompt": "...", "expected_session_revision": 42 }
 Response: 202 { "accepted_revision": 43, "workspace_id": "ws_..." }
 ```
 
@@ -100,14 +100,14 @@ Response: 202 { "accepted_revision": 43, "workspace_id": "ws_..." }
 **切换模型**
 ```
 POST /v1/sessions/{id}/model
-Body: { "binding": {...}, "expected_thread_revision": 42 }
+Body: { "binding": {...}, "expected_session_revision": 42 }
 Response: 200 { "snapshot": {...} }
 ```
 
 **取消**
 ```
 POST /v1/sessions/{id}/cancel
-Body: { "expected_thread_revision": 42, "expected_run_revision": 10 }
+Body: { "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
@@ -121,14 +121,14 @@ Response: 202 { "position": 0 }
 **解析权限请求**
 ```
 POST /v1/sessions/{id}/permissions/{request_id}
-Body: { "allow": true, "expected_thread_revision": 42, "expected_run_revision": 10 }
+Body: { "allow": true, "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
 **提供输入**
 ```
 POST /v1/sessions/{id}/input
-Body: { "request_id": "...", "value": "...", "expected_thread_revision": 42, "expected_run_revision": 10 }
+Body: { "request_id": "...", "value": "...", "expected_session_revision": 42, "expected_turn_revision": 10 }
 Response: 200 { "snapshot": {...} }
 ```
 
@@ -166,11 +166,11 @@ Accept: text/event-stream
 按 workspace 的事件流。事件包含 `session_id` 用于路由。
 
 ```
-event: thread_changed
+event: session_changed
 data: {"session_id": "...", "revision": 42}
 
 event: progress
-data: {"session_id": "...", "run_id": "...", "progress": {...}}
+data: {"session_id": "...", "turn_id": "...", "progress": {...}}
 
 event: resync_required
 data: {}
@@ -184,7 +184,7 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 断线期间的事件补发。
 
 **事件类型**：
-- `thread_changed`：持久化唤醒信号。客户端应拉取 session 快照。
+- `session_changed`：持久化唤醒信号。客户端应拉取 session 快照。
 - `progress`：瞬态流式进度通知，丢失只影响 UI 流畅度，不影响正确性。
 - `resync_required`：客户端必须重新拉取全部状态。
 - 未知 event type：客户端必须忽略（不报错、不断开），以便 v1 内新增事件类型。
@@ -235,7 +235,7 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 - **标识**：Server 生成稳定的 `workspace_id`（如 `ws_<hash>`）。
 - **解析**：`POST /v1/workspaces` 规范化路径并返回 ID。
 - **生命周期**：首次请求时创建，缓存，空闲时卸载（v2）。
-- **隔离**：每个 workspace 有自己的 `ThreadRuntimeService`、配置和 provider 绑定。
+- **隔离**：每个 workspace 有自己的 `SessionRuntimeService`、配置和 provider 绑定。
 - **Session 绑定**：Session 持久化绑定到 `workspace_id`。所有 session 操作验证归属权。
 
 ## 7. 并发
@@ -249,7 +249,7 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 
 - **v1**：强制 Bearer token。仅本地（127.0.0.1）。token 存储在 0600 文件中。
 - **v2**：远程访问，使用 OAuth/JWT。
-- **Effect 权限**：HTTP 层只做认证、workspace/session 校验、DTO 解码，然后调用 `ThreadRuntimeService`。Engine 仍然是唯一的 effect 权威。
+- **Effect 权限**：HTTP 层只做认证、workspace/session 校验、DTO 解码，然后调用 `SessionRuntimeService`。Engine 仍然是唯一的 effect 权威。
 - **资源限制**：请求体（最大 64 MiB）、并发请求数、SSE 连接数、分页上限。
 - **CORS**：默认禁用。Host/Origin 校验。
 
@@ -269,13 +269,13 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 - [x] 所有 session 端点（create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile）
 - [x] 异步 create/follow-up：持久化 + 注册后返回 202，turn 后台执行，通过 SSE 观察完成
 - [x] `Idempotency-Key` 持久化变更去重，按 `(token, key)` 索引
-- [x] 版本栅栏：cancel/permission/input 校验 thread 和 run 版本，不匹配时返回 409 + 当前版本
+- [x] 版本栅栏：cancel/permission/input 校验 session 和 turn 版本，不匹配时返回 409 + 当前版本
 - [x] list/search/get 返回 workspace engine 的真实持久化快照
 - [x] Server 模式接入 `latte-code` 二进制（`latte-code serve [--port N]`），0600 token 文件，优雅关闭
 - [x] 单元测试和最终二进制 E2E（portable），覆盖 HTTP 接口和 session 生命周期
 
 ### 待办
-- [ ] Binding 发现端点，让远程（非 co-located）客户端能获取有效的 `ThreadProviderBindingV2`
+- [ ] Binding 发现端点，让远程（非 co-located）客户端能获取有效的 `SessionProviderBinding`
 - [ ] 性能测试
 - [ ] 远程访问认证（v2）
 

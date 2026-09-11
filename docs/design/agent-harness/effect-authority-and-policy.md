@@ -9,7 +9,7 @@
 
 ## 2. Effect 协议
 
-每个 effect 绑定 `thread_id`、`run_id`、精确 Run revision、lease fencing token、输入 digest 和单次 approval。状态机固定：
+每个 effect 绑定 `session_id`、`turn_id`、精确 turn revision、lease fencing token、输入 digest 和单次 approval。状态机固定：
 
 ```text
 Declared -> Prepared -> Started -> ObservedSuccess | ObservedFailed | Unknown

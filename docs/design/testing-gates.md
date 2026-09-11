@@ -108,7 +108,7 @@ E2E 必须满足：
 - Provider 必须使用本机 `127.0.0.1` 上的 deterministic harness：行为场景默认使用 scripted server，协议保真场景可以使用脱敏后的 cassette replay server；
 - TUI 场景使用真实 PTY 和最终二进制；
 - 断言优先使用 stdout/stderr、退出码、CLI JSON、公开 Engine projection 和工作区最终状态；
-- 不直接写 SQLite 私有表来制造成功结果；只读探针仅用于当前 CLI 尚未暴露的 thread 投影证据；
+- 不直接写 SQLite 私有表来制造成功结果；只读探针仅用于当前 CLI 尚未暴露的 session 投影证据；
 - 每个场景独立 HOME、workspace、database、port 和 secret sentinel。
 
 Provider E2E 的判定标准是生产 Provider adapter、序列化、HTTP/SSE parser、agent loop 和最终二进制都运行到本地网络边界，而不是必须访问真实远端。真实 Provider canary 只能是手工或定时非阻断任务，不能代替 deterministic merge gate。
@@ -194,7 +194,7 @@ crates/latte-code/tests/
 
 | ID | 所属 crate | 必测规则 | 断言重点 |
 | --- | --- | --- | --- |
-| UT-COR-001 | `latte-core` | run/thread 状态迁移表 | 每个状态的合法/非法迁移、revision 单调、completed immutable |
+| UT-COR-001 | `latte-core` | turn/session 状态迁移表 | 每个状态的合法/非法迁移、revision 单调、completed immutable |
 | UT-COR-002 | `latte-core` | v1/v2 protocol serialization | version、字段名、未知/非法输入关闭失败、字节兼容 |
 | UT-COR-003 | `latte-core` | redaction 和边界 | secret/control 不保留，安全结构不被误删，文本有界 |
 | UT-ENG-001 | `latte-engine` | policy/classification | argv-first、shell/high-risk、deny 优先、无隐式 allow |
@@ -233,7 +233,7 @@ UT 卡点除行覆盖率外还要求：
 | E2E-H-008 | P0 | 子进程 timeout/cancel | 整个进程组退出、单一 terminal observation、无孤儿 | 已有 |
 | E2E-H-009 | P0 | `Started` 时 kill，重启进入 Unknown，再 reconcile | 不猜成功、不自动重试、只终结精确 child/effect | 部分：公开恢复语义已有，真实 kill barrier 缺失 |
 | E2E-H-010 | P1 | Provider malformed/timeout/retry matrix | retry 有界、非法 success 不重试、错误 typed | 已有 |
-| E2E-H-011 | P1 | legacy v1 `show/list/resume` | 兼容 envelope、退出码、不会回填成 thread | 已有 |
+| E2E-H-011 | P1 | legacy v1 `show/list/resume` | 兼容 envelope、退出码、不会回填成 session | 已有 |
 | E2E-H-012 | P1 | 每种受支持 wire protocol 的 cassette replay tool loop | 录制请求逐步精确消费、tool result 回传、最终 answer、无公网访问 | 缺失 |
 
 ### 6.2 TUI / real PTY
@@ -243,7 +243,7 @@ UT 卡点除行覆盖率外还要求：
 | E2E-T-001 | P0 | 启动与显式退出 | raw/alternate/keyboard/paste 模式成对恢复 | 已有 |
 | E2E-T-002 | P0 | Shift+Enter 多行，Enter 单次提交 | durable user card 恰好一条，内容精确 | 已有 |
 | E2E-T-003 | P0 | permission card | Enter/Shift+Enter 惰性；仅精确 Ctrl+A 或 deny key 生效 | 已有 |
-| E2E-T-004 | P0 | active run Ctrl+C，再次 Ctrl+C 退出 | 先取消任务、再确认退出，终端恢复 | 已有 |
+| E2E-T-004 | P0 | active turn Ctrl+C，再次 Ctrl+C 退出 | 先取消任务、再确认退出，终端恢复 | 已有 |
 | E2E-T-005 | P0 | Unknown reconciliation | Ctrl+R 打开，Enter 惰性，Ctrl+A 只确认精确 effect | 已有 |
 | E2E-T-006 | P1 | input request | 输入持久化且只恢复一次，不混入 permission | 已有 |
 | E2E-T-007 | P1 | resize、窄终端、Unicode、bracketed paste | 不 panic、不丢输入、布局仍保留 blocking surface | 已有 |

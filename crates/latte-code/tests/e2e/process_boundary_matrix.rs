@@ -1,5 +1,5 @@
 use super::support::Scenario;
-use latte_core::{RunId, RunStatus, Transition, VerificationStatus};
+use latte_core::{Transition, TurnId, TurnStatus, VerificationStatus};
 use latte_engine::{
     CancellationToken, EffectStatus, EngineHandle, Lease, ProcessError, ProcessInvocation,
     ProcessTermination,
@@ -41,7 +41,7 @@ fn invocation<'a>(
         grace_ms: 50,
         stdout_cap: 1_024,
         stderr_cap: 1_024,
-        run_revision: 0,
+        turn_revision: 0,
         effect_id,
         attempt: 1,
         approval_digest: None,
@@ -58,8 +58,8 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     std::fs::write(scenario.root().join("not-a-directory"), "sentinel").unwrap();
     let engine = fixture_engine(&scenario);
     let now = wall_now_ms();
-    let run_id = RunId::from_uuid(uuid::Uuid::now_v7());
-    engine.create_run(run_id, now).unwrap();
+    let turn_id = TurnId::from_uuid(uuid::Uuid::now_v7());
+    engine.create_turn(turn_id, now).unwrap();
     let lease = engine
         .acquire_lease("process-boundary", now + 1, 120_000)
         .unwrap();
@@ -70,14 +70,14 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     let both = invocation(&pwd, Some("pwd"), "invalid-both", &env, &lease);
     assert!(matches!(
         engine
-            .execute_process(run_id, &lease, now + 2, &both, &CancellationToken::new())
+            .execute_process(turn_id, &lease, now + 2, &both, &CancellationToken::new())
             .await,
         Err(ProcessError::Invalid(message)) if message.contains("exactly one")
     ));
     let neither = invocation(&empty, None, "invalid-neither", &env, &lease);
     assert!(matches!(
         engine
-            .execute_process(run_id, &lease, now + 3, &neither, &CancellationToken::new())
+            .execute_process(turn_id, &lease, now + 3, &neither, &CancellationToken::new())
             .await,
         Err(ProcessError::Invalid(message)) if message.contains("exactly one")
     ));
@@ -88,7 +88,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine
             .execute_process(
-                run_id,
+                turn_id,
                 &lease,
                 now + 4,
                 &zero_cap,
@@ -104,7 +104,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine
             .execute_process(
-                run_id,
+                turn_id,
                 &lease,
                 now + 5,
                 &wrong_owner,
@@ -120,7 +120,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine
             .execute_process(
-                run_id,
+                turn_id,
                 &lease,
                 now + 6,
                 &file_cwd,
@@ -139,7 +139,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine
             .execute_process(
-                run_id,
+                turn_id,
                 &lease,
                 now + 7,
                 &dangerous,
@@ -161,7 +161,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine
             .execute_process(
-                run_id,
+                turn_id,
                 &lease,
                 now + 8,
                 &wrong_digest,
@@ -184,9 +184,9 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
             "rejected request {effect_id} created durable authority"
         );
     }
-    let unchanged = engine.show(run_id).unwrap();
+    let unchanged = engine.show(turn_id).unwrap();
     assert_eq!(unchanged.revision, 0);
-    assert_eq!(unchanged.status, RunStatus::Queued);
+    assert_eq!(unchanged.status, TurnStatus::Queued);
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("not-a-directory")).unwrap(),
         "sentinel"
@@ -200,7 +200,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     };
     let prepared_digest = match engine
         .execute_process(
-            run_id,
+            turn_id,
             &lease,
             now + 9,
             &prepared,
@@ -220,7 +220,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     assert!(matches!(
         engine.reissue_process_permission(
             "prepared-process",
-            run_id,
+            turn_id,
             &lease,
             now + 10,
             &allow_reissue,
@@ -233,7 +233,7 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     };
     let output = engine
         .execute_process(
-            run_id,
+            turn_id,
             &lease,
             now + 11,
             &approved,
@@ -251,16 +251,16 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
     );
 
     let running = engine
-        .apply_transition(run_id, 0, Transition::Start, now + 12, &lease)
+        .apply_transition(turn_id, 0, Transition::Start, now + 12, &lease)
         .unwrap();
     let verification = ProcessInvocation {
-        run_revision: running.revision,
+        turn_revision: running.revision,
         effect_id: "final-verification",
         ..invocation(&pwd, None, "unused", &env, &lease)
     };
     let verification_output = engine
         .execute_verification(
-            run_id,
+            turn_id,
             running.revision,
             &lease,
             now + 13,
@@ -271,16 +271,16 @@ async fn public_process_safety_and_authority_matrix_is_durable_in_final_cli() {
         .unwrap();
     assert!(verification_output.command_succeeded());
     engine
-        .complete_verified_run(
-            run_id,
+        .complete_verified_turn(
+            turn_id,
             running.revision,
             &lease,
             "process boundary verified".into(),
             now + 14,
         )
         .unwrap();
-    let completed = engine.show(run_id).unwrap();
-    assert_eq!(completed.status, RunStatus::Completed);
+    let completed = engine.show(turn_id).unwrap();
+    assert_eq!(completed.status, TurnStatus::Completed);
     let handoff = completed.handoff.expect("completed run must have handoff");
     assert_eq!(handoff.summary, "process boundary verified");
     assert_eq!(handoff.evidence[0].status, VerificationStatus::Passed);

@@ -1,8 +1,8 @@
 use crate::provider::{
     Message, OpenAiProvider, Provider, ProviderCapabilities, ProviderContext, ProviderError,
-    ProviderFuture, ProviderRequest,
+    ProviderFuture, ProviderRequest, RESERVED_HEADERS, SESSION_ID_PLACEHOLDER,
 };
-use latte_core::ThreadProviderBindingV2;
+use latte_core::SessionProviderBinding;
 use latte_engine::ToolDescriptor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,9 +51,63 @@ pub enum ProviderDefinition {
         compatibility_input_request: bool,
         #[serde(default)]
         streaming: bool,
+        /// Extra request headers this Provider requires beyond the Chat
+        /// Completions protocol. `${session_id}` in a value expands to an
+        /// opaque per-Session identifier; other `${...}` names are rejected at
+        /// load time. Reserved headers cannot be set here.
+        // Empty maps are omitted from serialization so the config fingerprint of
+        // a headerless provider is byte-identical to bindings persisted before
+        // the `headers` field existed (upgrade compatibility). Configured
+        // (non-empty) headers still serialize and bind.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
     },
+}
+
+/// Validates one provider's configured headers before any request is built.
+/// Failing at load time keeps a typo from silently dropping the header a
+/// Provider requires — some reject the whole request without it.
+fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), RegistryError> {
+    for (name, value) in headers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(RegistryError::Invalid(format!(
+                "header name {name:?} must be non-empty and use only ASCII letters, digits, `-`, or `_`"
+            )));
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(RegistryError::Invalid(format!(
+                "header {name:?} is derived by the provider and cannot be configured"
+            )));
+        }
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(RegistryError::Invalid(format!(
+                "header {name:?} value must not contain control characters"
+            )));
+        }
+        let mut rest = value.as_str();
+        while let Some(start) = rest.find("${") {
+            let end = rest[start..].find('}').map(|offset| start + offset + 1);
+            let Some(end) = end else {
+                return Err(RegistryError::Invalid(format!(
+                    "header {name:?} has an unterminated placeholder"
+                )));
+            };
+            let placeholder = &rest[start..end];
+            if placeholder != SESSION_ID_PLACEHOLDER {
+                return Err(RegistryError::Invalid(format!(
+                    "header {name:?} uses unknown placeholder {placeholder}; only {SESSION_ID_PLACEHOLDER} is supported"
+                )));
+            }
+            rest = &rest[end..];
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -212,13 +266,13 @@ impl ProviderBinding {
 
     /// Builds the additive v2 binding without exposing any credential value.
     #[must_use]
-    pub fn with_thread_scope(
+    pub fn with_session_scope(
         &self,
         credential_ref_id: String,
         data_scope_id: String,
         credential_generation: u64,
-    ) -> ThreadProviderBindingV2 {
-        ThreadProviderBindingV2 {
+    ) -> SessionProviderBinding {
+        SessionProviderBinding {
             version: self.version,
             provider_name: self.provider_name.clone(),
             provider_type: self.provider_type.clone(),
@@ -269,7 +323,7 @@ pub struct BindingCatalogEntry {
     pub model: String,
     pub name: Option<String>,
     pub is_default: bool,
-    pub binding: ThreadProviderBindingV2,
+    pub binding: SessionProviderBinding,
 }
 
 #[derive(Clone, Debug)]
@@ -288,7 +342,7 @@ impl ProviderRegistry {
             // `latte_code::AppConfig`; they are not provider semantics. Keep
             // the provider schema strict after removing every documented
             // application-owned top-level section.
-            object.remove("thread");
+            object.remove("session");
         }
         let config: ProviderFile =
             serde_json::from_value(value).map_err(|e| RegistryError::Invalid(e.to_string()))?;
@@ -374,22 +428,22 @@ impl ProviderRegistry {
         Ok(resolved)
     }
 
-    /// Computes the complete Thread v2 binding for the single global default.
-    pub fn thread_binding_for_default(
+    /// Computes the complete Session v2 binding for the single global default.
+    pub fn session_binding_for_default(
         &self,
         tools: &[ToolDescriptor],
-    ) -> Result<ThreadProviderBindingV2, RegistryError> {
+    ) -> Result<SessionProviderBinding, RegistryError> {
         let (provider, model) = self.default_selection()?;
-        self.thread_binding_for_model(provider, model, tools)
+        self.session_binding_for_model(provider, model, tools)
     }
 
     /// Computes a complete v2 binding for one explicit catalog selection.
-    pub fn thread_binding_for_model(
+    pub fn session_binding_for_model(
         &self,
         name: &str,
         model: &str,
         tools: &[ToolDescriptor],
-    ) -> Result<ThreadProviderBindingV2, RegistryError> {
+    ) -> Result<SessionProviderBinding, RegistryError> {
         let definition = self
             .config
             .providers
@@ -399,7 +453,7 @@ impl ProviderRegistry {
         let binding = Self::binding_for_model(name, definition, model, tools)?;
         let ProviderDefinition::OpenaiChat { api_key, .. } = definition;
         let result =
-            binding.with_thread_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
+            binding.with_session_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
     }
@@ -408,7 +462,7 @@ impl ProviderRegistry {
     /// a model whose binding cannot be constructed is an error, not a silently
     /// dropped entry, so a broken configuration is visible to the client
     /// instead of producing a partial catalog.
-    pub fn thread_binding_catalog(
+    pub fn session_binding_catalog(
         &self,
         tools: &[ToolDescriptor],
     ) -> Result<Vec<BindingCatalogEntry>, RegistryError> {
@@ -416,7 +470,7 @@ impl ProviderRegistry {
             .into_iter()
             .map(|entry| {
                 let binding =
-                    self.thread_binding_for_model(&entry.provider_name, &entry.model, tools)?;
+                    self.session_binding_for_model(&entry.provider_name, &entry.model, tools)?;
                 Ok(BindingCatalogEntry {
                     provider_name: entry.provider_name,
                     model: entry.model,
@@ -429,9 +483,9 @@ impl ProviderRegistry {
     }
 
     /// Validates a persisted v2 binding before resolving the configured secret.
-    pub fn resolve_thread_bound(
+    pub fn resolve_session_bound(
         &self,
-        binding: &ThreadProviderBindingV2,
+        binding: &SessionProviderBinding,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
         let definition = self
@@ -450,14 +504,35 @@ impl ProviderRegistry {
             ));
         }
         let proposed =
-            self.thread_binding_for_model(&binding.provider_name, &binding.model, tools)?;
-        if &proposed != binding {
+            self.session_binding_for_model(&binding.provider_name, &binding.model, tools)?;
+        // Upgrade compatibility: accept a pre-upgrade binding whose only drift
+        // is the built-in tool description prose (the security-identity fields,
+        // including tool effects/schemas via the legacy recomputation, still
+        // match). See `legacy_placeholder_tools_fingerprint`.
+        let legacy_tools_fingerprint =
+            legacy_placeholder_tools_fingerprint(tools, &proposed.aliases)?;
+        if !binding_matches_with_legacy_tools(binding, &proposed, &legacy_tools_fingerprint) {
             return Err(RegistryError::BindingMismatch(
                 "provider binding, aliases, credential reference/generation, or data scope changed"
                     .into(),
             ));
         }
         self.resolve_model(&binding.provider_name, &binding.model, tools)
+    }
+
+    /// `#[doc(hidden)]` upgrade-compat helper for integration fixtures:
+    /// reproduces the pre-upgrade `tools_fingerprint` (legacy placeholder tool
+    /// documentation) for a configured model against the current tool set, so a
+    /// fixture can persist real base-version binding bytes.
+    #[doc(hidden)]
+    pub fn legacy_tools_fingerprint_for_model(
+        &self,
+        name: &str,
+        model: &str,
+        tools: &[ToolDescriptor],
+    ) -> Result<String, RegistryError> {
+        let proposed = self.session_binding_for_model(name, model, tools)?;
+        legacy_placeholder_tools_fingerprint(tools, &proposed.aliases)
     }
 
     /// Resolves one explicit configured provider/model pair.
@@ -485,6 +560,7 @@ impl ProviderRegistry {
                 max_tokens,
                 compatibility_input_request,
                 streaming,
+                headers,
                 ..
             } => {
                 let model_options = definition.model_options(selected_model).ok_or_else(|| {
@@ -512,6 +588,7 @@ impl ProviderRegistry {
                     )
                 });
                 let binding = Self::binding_for_model(name, definition, selected_model, tools)?;
+                validate_headers(headers)?;
                 let provider = OpenAiProvider::new(
                     endpoint,
                     selected_model,
@@ -525,7 +602,8 @@ impl ProviderRegistry {
                 )
                 .with_reasoning_effort(model_options.reasoning_effort)
                 .with_compatibility_input_request(*compatibility_input_request)
-                .with_streaming(*streaming);
+                .with_streaming(*streaming)
+                .with_headers(headers.clone());
                 let reverse = binding
                     .aliases
                     .iter()
@@ -852,6 +930,55 @@ fn canonical_tools(
         .map_err(|e| RegistryError::Invalid(e.to_string()))
 }
 
+/// The tools fingerprint a pre-upgrade binary computed, reproduced over the
+/// *current* built-in tool set but with the legacy placeholder descriptions.
+///
+/// This is an upgrade-compat shim, not a relaxation: it recomputes the hash
+/// from the current tools, so any change to tool names, `input_schema`,
+/// `effect`, or `version` makes it differ and the stored binding is rejected.
+/// The only drift it accepts is the human-facing description prose moving from
+/// the `"Engine-owned <name> operation"` placeholder to real documentation — a
+/// model-guidance field, never a permission boundary (`effect`/`input_schema`
+/// remain authoritative and are still compared).
+fn legacy_placeholder_tools_fingerprint(
+    tools: &[ToolDescriptor],
+    aliases: &BTreeMap<String, String>,
+) -> Result<String, RegistryError> {
+    let legacy: Vec<ToolDescriptor> = tools
+        .iter()
+        .map(|tool| ToolDescriptor {
+            description: format!("Engine-owned {} operation", tool.name.replace('_', " ")),
+            ..tool.clone()
+        })
+        .collect();
+    Ok(fingerprint(&canonical_tools(&legacy, aliases)?))
+}
+
+/// Whether a persisted (pre-upgrade) binding is still valid against the binding
+/// the current binary would mint. Every security-identity field must match
+/// exactly; only `tools_fingerprint` is allowed to be the legacy placeholder
+/// description hash for the identical tool set (see
+/// [`legacy_placeholder_tools_fingerprint`]).
+fn binding_matches_with_legacy_tools(
+    stored: &SessionProviderBinding,
+    proposed: &SessionProviderBinding,
+    legacy_tools_fingerprint: &str,
+) -> bool {
+    let identity_matches = stored.version == proposed.version
+        && stored.provider_name == proposed.provider_name
+        && stored.provider_type == proposed.provider_type
+        && stored.protocol == proposed.protocol
+        && stored.model == proposed.model
+        && stored.config_fingerprint == proposed.config_fingerprint
+        && stored.credential_ref_id == proposed.credential_ref_id
+        && stored.data_scope_id == proposed.data_scope_id
+        && stored.credential_generation == proposed.credential_generation
+        && stored.aliases == proposed.aliases;
+    let tools_matches = stored.tools_fingerprint == proposed.tools_fingerprint
+        || stored.tools_fingerprint == legacy_tools_fingerprint;
+    identity_matches && tools_matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,7 +1033,7 @@ mod tests {
         )
         .unwrap();
         assert!(inline.resolve_default(&[]).is_ok());
-        let inline_binding = inline.thread_binding_for_default(&[]).unwrap();
+        let inline_binding = inline.session_binding_for_default(&[]).unwrap();
         assert_eq!(inline_binding.credential_ref_id, "config:main/api_key");
         assert_eq!(inline_binding.data_scope_id, "workspace");
         assert_eq!(inline_binding.credential_generation, 1);
@@ -973,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_bindings_are_scoped_pinned_and_validated_before_secret_lookup() {
+    fn session_bindings_are_scoped_pinned_and_validated_before_secret_lookup() {
         let tools = vec![tool("read_file"), tool("search")];
         let registry = ProviderRegistry::parse_jsonc(
             r"{
@@ -991,26 +1118,103 @@ mod tests {
             }",
         )
         .unwrap();
-        let binding = registry.thread_binding_for_default(&tools).unwrap();
+        let binding = registry.session_binding_for_default(&tools).unwrap();
         assert_eq!(binding.provider_name, "main");
         assert_eq!(binding.aliases["read_file"], "rf");
         assert_eq!(binding.credential_ref_id, "env:NEVER_LOOK_UP_THIS_KEY");
         assert_eq!(binding.data_scope_id, "workspace");
         assert_eq!(binding.credential_generation, 1);
         assert!(matches!(
-            registry.resolve_thread_bound(&binding, &tools),
+            registry.resolve_session_bound(&binding, &tools),
             Err(RegistryError::MissingSecret(name)) if name == "NEVER_LOOK_UP_THIS_KEY"
         ));
 
         let mut changed = binding.clone();
         changed.credential_generation += 1;
         assert!(matches!(
-            registry.resolve_thread_bound(&changed, &tools),
+            registry.resolve_session_bound(&changed, &tools),
             Err(RegistryError::BindingMismatch(_))
         ));
         assert!(matches!(
-            registry.thread_binding_for_model("unknown", "gpt-test", &tools),
+            registry.session_binding_for_model("unknown", "gpt-test", &tools),
             Err(RegistryError::Invalid(message)) if message.contains("unknown provider")
+        ));
+    }
+
+    #[test]
+    fn empty_headers_are_absent_from_the_config_fingerprint_payload() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+        )
+        .unwrap();
+        let definition = registry
+            .config
+            .providers
+            .get("main")
+            .expect("provider exists");
+        let semantic = semantic_definition_for_model(definition, "m").unwrap();
+        // A headerless provider must not carry a `headers` key at all: its
+        // config fingerprint must be byte-identical to a binding persisted
+        // before the `headers` field existed (upgrade compatibility).
+        assert!(
+            semantic["provider"].get("headers").is_none(),
+            "empty headers must be omitted from the fingerprint payload: {semantic}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_a_pre_upgrade_binding_with_placeholder_tool_docs() {
+        // Current tools carry real documentation rather than the legacy
+        // placeholder text.
+        let tools = {
+            let mut read = tool("read_file");
+            read.description =
+                "Reads a UTF-8 file under the workspace root with a bounded size.".into();
+            vec![read]
+        };
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'K'}}}}",
+        )
+        .unwrap();
+        let proposed = registry.session_binding_for_default(&tools).unwrap();
+        let legacy_fp = legacy_placeholder_tools_fingerprint(&tools, &proposed.aliases).unwrap();
+        // The real-doc fingerprint genuinely differs from the placeholder one,
+        // otherwise this test would not be exercising the compat shim.
+        assert_ne!(legacy_fp, proposed.tools_fingerprint);
+
+        // A binding persisted by the pre-upgrade binary (placeholder tool docs)
+        // still resolves. Passing the binding check proceeds to secret lookup,
+        // which fails with MissingSecret — the sentinel that the binding was
+        // accepted rather than rejected as BindingMismatch.
+        let mut legacy = proposed.clone();
+        legacy.tools_fingerprint = legacy_fp;
+        assert!(matches!(
+            registry.resolve_session_bound(&legacy, &tools),
+            Err(RegistryError::MissingSecret(name)) if name == "K"
+        ));
+
+        // The shim is description-only. A real tool-effect change must still be
+        // rejected even when the stored binding carries a placeholder hash: the
+        // legacy value is recomputed over the *current* tool set.
+        let changed_tools = {
+            let mut modified = tools[0].clone();
+            modified.effect = "modify".into();
+            vec![modified]
+        };
+        // `legacy` holds the placeholder hash of the ORIGINAL read tool; against
+        // the changed tool set neither the current nor the recomputed legacy
+        // hash matches, so it must fail closed.
+        assert!(matches!(
+            registry.resolve_session_bound(&legacy, &changed_tools),
+            Err(RegistryError::BindingMismatch(_))
+        ));
+
+        // Any other security-identity drift is still a hard mismatch.
+        let mut rebind = proposed;
+        rebind.model = "other".into();
+        assert!(matches!(
+            registry.resolve_session_bound(&rebind, &tools),
+            Err(RegistryError::BindingMismatch(_))
         ));
     }
 
@@ -1055,6 +1259,7 @@ mod tests {
             max_tokens: None,
             compatibility_input_request: false,
             streaming: false,
+            headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
         };
         let forward = ProviderRegistry::binding_for_model(
@@ -1150,25 +1355,25 @@ mod tests {
         .unwrap();
         assert!(!semantic.to_string().contains("Alpha Default"));
         let selected = registry
-            .thread_binding_for_model("beta", "b-reasoning", &[])
+            .session_binding_for_model("beta", "b-reasoning", &[])
             .unwrap();
         assert_eq!(selected.provider_name, "beta");
         assert_eq!(selected.model, "b-reasoning");
-        assert!(registry.resolve_thread_bound(&selected, &[]).is_ok());
+        assert!(registry.resolve_session_bound(&selected, &[]).is_ok());
         assert!(matches!(
-            registry.thread_binding_for_model("beta", "missing", &[]),
+            registry.session_binding_for_model("beta", "missing", &[]),
             Err(RegistryError::Invalid(message)) if message.contains("unknown model")
         ));
         let mut missing_provider = selected.clone();
         missing_provider.provider_name = "missing".into();
         assert!(matches!(
-            registry.resolve_thread_bound(&missing_provider, &[]),
+            registry.resolve_session_bound(&missing_provider, &[]),
             Err(RegistryError::BindingMismatch(message)) if message.contains("provider")
         ));
         let mut missing_model = selected;
         missing_model.model = "missing".into();
         assert!(matches!(
-            registry.resolve_thread_bound(&missing_model, &[]),
+            registry.resolve_session_bound(&missing_model, &[]),
             Err(RegistryError::BindingMismatch(message)) if message.contains("model")
         ));
 
@@ -1207,6 +1412,7 @@ mod tests {
             events: None,
         };
         let tool_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![tool("read_file")],
         };
@@ -1215,6 +1421,7 @@ mod tests {
             Err(ProviderError::Malformed(message)) if message.contains("declaration")
         ));
         let assistant_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Assistant {
                 content: None,
                 tool_calls: vec![crate::provider::ToolCall {
@@ -1230,6 +1437,7 @@ mod tests {
             Err(ProviderError::Malformed(message)) if message.contains("historical tool call")
         ));
         let tool_result_request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Tool {
                 tool_call_id: "call".into(),
                 name: Some("read_file".into()),
@@ -1256,6 +1464,7 @@ mod tests {
             provider
                 .complete(
                     ProviderRequest {
+                        session_ref: "session-ref".into(),
                         messages: vec![],
                         tools: vec![],
                     },
@@ -1294,6 +1503,7 @@ mod tests {
         let outcome = provider
             .complete(
                 ProviderRequest {
+                    session_ref: "session-ref".into(),
                     messages: vec![Message::Assistant {
                         content: None,
                         tool_calls: vec![crate::provider::ToolCall {
@@ -1324,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_binding_catalog_returns_every_configured_model() {
+    fn session_binding_catalog_returns_every_configured_model() {
         // The happy path: a well-formed config produces a complete catalog with
         // one entry per configured model, default flagged.
         let registry = ProviderRegistry::parse_jsonc(
@@ -1335,7 +1545,7 @@ mod tests {
         )
         .unwrap();
         let catalog = registry
-            .thread_binding_catalog(&[tool("read_file")])
+            .session_binding_catalog(&[tool("read_file")])
             .unwrap();
         assert_eq!(
             catalog
@@ -1357,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_binding_catalog_fails_closed_on_a_broken_model() {
+    fn session_binding_catalog_fails_closed_on_a_broken_model() {
         // A model whose binding cannot be constructed (here: an alias that
         // references a tool absent from the descriptor set) must surface as an
         // error, not be silently dropped from the catalog. A client that asked
@@ -1374,7 +1584,7 @@ mod tests {
         // ...but its binding cannot be built with these tools, so the catalog
         // fails closed instead of returning an empty (silently partial) list.
         assert!(matches!(
-            registry.thread_binding_catalog(&[tool("read_file")]),
+            registry.session_binding_catalog(&[tool("read_file")]),
             Err(RegistryError::Invalid(message)) if message.contains("unknown canonical tool")
         ));
     }
@@ -1386,13 +1596,13 @@ mod tests {
         let registry = ProviderRegistry::parse_jsonc(r"{version:1,providers:{}}").unwrap();
         assert!(registry.default_name().is_none());
         assert!(registry.resolve_default(&[]).is_err());
-        assert!(registry.thread_binding_for_default(&[]).is_err());
+        assert!(registry.session_binding_for_default(&[]).is_err());
     }
 
     #[test]
-    fn parse_jsonc_strips_owned_thread_section() {
+    fn parse_jsonc_strips_owned_session_section() {
         let registry = ProviderRegistry::parse_jsonc(
-            r"{version:1,default_model:'main/m',thread:{max_request_bytes:4096},providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
+            r"{version:1,default_model:'main/m',session:{max_request_bytes:4096},providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:{source:'env',name:'PATH'}}}}",
         )
         .unwrap();
         assert_eq!(registry.default_name(), Some("main"));
@@ -1424,6 +1634,7 @@ mod tests {
             max_tokens: None,
             compatibility_input_request: false,
             streaming: false,
+            headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
         };
         assert_eq!(definition.model_name("m"), Some("Display"));
@@ -1447,6 +1658,77 @@ mod tests {
         )
         .unwrap();
         assert!(registry.resolve_model("main", "m", &[]).is_err());
+    }
+
+    #[test]
+    fn configured_headers_are_accepted_and_reach_the_resolved_provider() {
+        let registry = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-session-id':'${session_id}','x-tenant':'acme'}}}}",
+        )
+        .unwrap();
+        assert!(registry.resolve_model("main", "m", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_header_typo_is_rejected_at_load_rather_than_silently_dropped() {
+        // A Provider that requires the header rejects the whole request without
+        // it. Failing here names the offending header; failing at request time
+        // would surface as an opaque 400 from the Provider.
+        for (headers, expected) in [
+            (r"{'x-session':'${sesion_id}'}", "unknown placeholder"),
+            (r"{'x-session':'${session_id'}", "unterminated placeholder"),
+            (r"{'x session':'v'}", "must be non-empty"),
+            (r"{'':'v'}", "must be non-empty"),
+            (r"{'authorization':'Bearer x'}", "cannot be configured"),
+            (r"{'Content-Type':'text/plain'}", "cannot be configured"),
+        ] {
+            let registry = ProviderRegistry::parse_jsonc(&format!(
+                r"{{version:1,default_model:'main/m',providers:{{main:{{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{headers}}}}}}}"
+            ))
+            .unwrap();
+            let Err(error) = registry.resolve_model("main", "m", &[]) else {
+                panic!("headers {headers} must be rejected");
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "{headers} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_value_carrying_a_control_character_is_rejected() {
+        let registry = ProviderRegistry::parse_jsonc(
+            "{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-a':'a\\nb'}}}}",
+        )
+        .unwrap();
+        let Err(error) = registry.resolve_model("main", "m", &[]) else {
+            panic!("a control character in a header value must be rejected");
+        };
+        assert!(error.to_string().contains("control characters"), "{error}");
+    }
+
+    #[test]
+    fn headers_take_part_in_the_configuration_fingerprint() {
+        // Two deployments that differ only by a required header are not the
+        // same configuration: a binding pinned under one must not be reused
+        // under the other.
+        let without = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k'}}}",
+        )
+        .unwrap()
+        .resolve_model("main", "m", &[])
+        .unwrap();
+        let with = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'main/m',providers:{main:{type:'openai-chat',models:['m'],endpoint:'https://x',api_key:'k',headers:{'x-session-id':'${session_id}'}}}}",
+        )
+        .unwrap()
+        .resolve_model("main", "m", &[])
+        .unwrap();
+        assert_ne!(
+            without.binding.config_fingerprint,
+            with.binding.config_fingerprint
+        );
     }
 
     #[test]
@@ -1476,6 +1758,7 @@ mod tests {
             .unwrap();
         // A Tool message whose name is not in the forward alias map.
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![Message::Tool {
                 tool_call_id: "t1".into(),
                 name: Some("unknown".into()),
@@ -1505,6 +1788,7 @@ mod tests {
             .resolve_model("main", "m", &[tool("read_file")])
             .unwrap();
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![],
         };
@@ -1531,6 +1815,7 @@ mod tests {
             .resolve_model("main", "m", &[tool("read_file")])
             .unwrap();
         let request = ProviderRequest {
+            session_ref: "session-ref".into(),
             messages: vec![],
             tools: vec![],
         };

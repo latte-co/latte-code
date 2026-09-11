@@ -182,15 +182,15 @@ fn final_tui_executes_every_read_only_tool_and_persists_the_ordered_round() {
         .database_path(scenario.database_path())
         .build()
         .unwrap();
-    let threads = engine.list_threads_v2().unwrap();
-    assert_eq!(threads.len(), 1);
-    assert_eq!(threads[0].lifecycle, latte_core::ThreadLifecycle::Ready);
-    assert!(threads[0].transcript.entries.iter().any(|entry| {
+    let sessions = engine.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].lifecycle, latte_core::SessionLifecycle::Ready);
+    assert!(sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Assistant
             && entry.text == "read-only inspection complete"
     }));
     assert_eq!(
-        threads[0]
+        sessions[0]
             .transcript
             .entries
             .iter()
@@ -332,7 +332,7 @@ fn typed_read_only_tool_failures_are_bounded_and_do_not_reenter_provider() {
             .unwrap();
         let runs = engine.list().unwrap();
         assert_eq!(runs.len(), 1);
-        assert_ne!(runs[0].status, latte_core::RunStatus::Completed);
+        assert_ne!(runs[0].status, latte_core::TurnStatus::Completed);
     }
 }
 
@@ -615,10 +615,10 @@ fn edit_file_allow_uses_a_fresh_read_then_verifies_the_durable_change() {
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].runs[0].status == latte_core::ThreadRunStatus::Completed
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Completed
             })
         }),
         "edit/verification did not complete: {}",
@@ -640,8 +640,8 @@ fn edit_file_allow_uses_a_fresh_read_then_verifies_the_durable_change() {
     assert_eq!(tool_results.len(), 2);
     assert_eq!(tool_results[0]["tool_call_id"], "edit-read");
     assert_eq!(tool_results[1]["tool_call_id"], "edit-apply");
-    let threads = engine.list_threads_v2().unwrap();
-    assert!(threads[0].transcript.entries.iter().any(|entry| {
+    let sessions = engine.list_sessions().unwrap();
+    assert!(sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Completion
             && entry
                 .payload
@@ -695,8 +695,8 @@ fn process_argv_allow_returns_bounded_output_and_completes_once() {
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1 && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
         })
     }));
     provider.assert_consumed();
@@ -760,10 +760,10 @@ fn process_shell_deny_never_spawns_or_reenters_provider() {
         .build()
         .unwrap();
     assert!(wait_until(Duration::from_secs(5), || {
-        engine.list_threads_v2().is_ok_and(|threads| {
-            threads.len() == 1
-                && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                && threads[0].pending.is_none()
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].pending.is_none()
         })
     }));
     assert!(!scenario.root().join("denied-process.txt").exists());
@@ -848,13 +848,13 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
         .build()
         .unwrap();
     let pending_request = || {
-        engine.list_threads_v2().ok().and_then(|threads| {
-            let thread = threads.first()?;
-            match thread.pending.as_ref()? {
-                latte_core::ThreadPendingRequest::Permission { request_id, .. } => {
+        engine.list_sessions().ok().and_then(|sessions| {
+            let session = sessions.first()?;
+            match session.pending.as_ref()? {
+                latte_core::SessionPendingRequest::Permission { request_id, .. } => {
                     Some(request_id.clone())
                 }
-                latte_core::ThreadPendingRequest::Input { .. } => None,
+                latte_core::SessionPendingRequest::Input { .. } => None,
             }
         })
     };
@@ -875,11 +875,11 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
             pending_request().is_some_and(|request_id| request_id.ends_with(":queued-write-1"))
         }),
         "unexpected first permission projection: {:?}",
-        engine.list_threads_v2()
+        engine.list_sessions()
     );
     assert!(!scenario.root().join("first-created.txt").exists());
     assert!(!scenario.root().join("second-created.txt").exists());
-    let thread_id = engine.list_threads_v2().unwrap()[0].thread_id;
+    let session_id = engine.list_sessions().unwrap()[0].session_id;
     first.write(b"\x1b[21~");
     assert!(first.finish(Duration::from_secs(5)).0.success());
 
@@ -887,7 +887,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     second_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut second = PtySession::spawn(second_command);
     assert!(second.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
-    second.write(format!("/resume {thread_id}\r").as_bytes());
+    second.write(format!("/resume {session_id}\r").as_bytes());
     assert!(second.wait_for_output(b"Permission required", Duration::from_secs(5)));
     assert_eq!(provider.requests().len(), 1);
     second.write(b"\x1b[97;5u");
@@ -907,21 +907,21 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     third_command.env("TEST_OPENAI_KEY", "queue-secret");
     let mut third = PtySession::spawn(third_command);
     assert!(third.wait_for_output(b"\x1b[>3u", Duration::from_secs(5)));
-    third.write(format!("/resume {thread_id}\r").as_bytes());
+    third.write(format!("/resume {session_id}\r").as_bytes());
     assert!(third.wait_for_output(b"Permission required", Duration::from_secs(5)));
     third.write(b"\x1b[97;5u");
     assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
     assert!(
         wait_until(Duration::from_secs(5), || {
-            engine.list_threads_v2().is_ok_and(|threads| {
-                threads.len() == 1
-                    && threads[0].lifecycle == latte_core::ThreadLifecycle::Ready
-                    && threads[0].pending.is_none()
-                    && threads[0].runs[0].status == latte_core::ThreadRunStatus::Completed
+            engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                    && sessions[0].pending.is_none()
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Completed
             })
         }),
         "queued writes did not complete: {:?}; terminal={}",
-        engine.list_threads_v2(),
+        engine.list_sessions(),
         String::from_utf8_lossy(&third.output())
     );
     assert_eq!(
@@ -939,8 +939,8 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
     assert_eq!(tool_results.len(), 2);
     assert_eq!(tool_results[0]["tool_call_id"], "queued-write-1");
     assert_eq!(tool_results[1]["tool_call_id"], "queued-write-2");
-    let threads = engine.list_threads_v2().unwrap();
-    assert!(threads[0].transcript.entries.iter().any(|entry| {
+    let sessions = engine.list_sessions().unwrap();
+    assert!(sessions[0].transcript.entries.iter().any(|entry| {
         entry.kind == latte_core::TranscriptKind::Assistant
             && entry.text == "both queued writes verified"
     }));

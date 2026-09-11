@@ -36,7 +36,7 @@ pub struct ToolOutput {
 pub struct ToolInvocation<'a> {
     pub name: &'a str,
     pub input: &'a Value,
-    pub run_revision: u64,
+    pub turn_revision: u64,
     pub effect_id: &'a str,
     pub attempt: u64,
     pub precondition: Option<&'a str>,
@@ -138,7 +138,7 @@ impl Tool for Builtin {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: self.name.into(),
-            description: format!("Engine-owned {} operation", self.name.replace('_', " ")),
+            description: tool_description(self.name).into(),
             input_schema: tool_schema(self.name),
             version: 1,
             effect: format!("{:?}", self.effect).to_lowercase(),
@@ -223,6 +223,72 @@ impl Tool for Builtin {
             action,
             expected_hash: None,
         })
+    }
+}
+
+/// Model-visible tool documentation. The schema constrains shape; this states
+/// the contracts a schema cannot express, above all that `edit_file` and
+/// `write_file` need the `sha256` a prior `read_file` returned. A model that
+/// cannot see that link omits `precondition` and every mutation is rejected.
+pub(crate) fn tool_description(name: &str) -> &'static str {
+    match name {
+        "read_file" => {
+            "Read a UTF-8 text file inside the workspace. Returns \
+             {content, sha256, size, modified_ns}, where `sha256` is the digest of the \
+             file as read. Keep that value: editing or overwriting this path requires \
+             passing it back as `precondition`. Long files are truncated to `max_output` \
+             bytes; a truncated read still reports the digest of the whole file."
+        }
+        "list_directory" => {
+            "List the immediate entry names of one workspace directory, sorted, without \
+             recursing. Returns {entries}. Use `search` to find content across the tree."
+        }
+        "search" => {
+            "Search workspace file contents line by line, honouring .gitignore. Returns \
+             {matches} as `path:line:text` strings. `query` is a literal substring unless \
+             `regex` is true, in which case it is a Rust regular expression. Results stop \
+             at `max_results` or `max_output` bytes, whichever comes first."
+        }
+        "read_project_manifest" => {
+            "Read the workspace's dependency manifests (Cargo.toml, package.json, \
+             pyproject.toml, go.mod) that exist at its root. Returns one entry per file \
+             found. Use this to learn the language, dependencies, and toolchain before \
+             proposing changes."
+        }
+        "git_diff" => {
+            "Show the workspace's uncommitted changes as a unified diff against the Git \
+             index. Returns an empty result when nothing is modified. Use it to review \
+             your own edits before reporting them as complete."
+        }
+        "edit_file" => {
+            "Replace one exact span of an existing file. Call `read_file` on the same path \
+             first and pass the `sha256` it returned as `precondition`; the edit is \
+             rejected as stale if the file changed since that read. `before` must match \
+             the current contents verbatim, including whitespace and indentation, and must \
+             occur exactly once — the edit is rejected when it matches zero times or more \
+             than once, so widen `before` with surrounding lines until it is unique. \
+             `after` replaces it and may be empty to delete the span. Prefer this over \
+             `write_file` for changing part of a file: it cannot silently discard content \
+             you did not read."
+        }
+        "write_file" => {
+            "Write a file's complete contents, replacing anything already there. To create \
+             a new file, set `create_intent` to true and omit `precondition`; this fails if \
+             the path already exists. To overwrite an existing file, leave `create_intent` \
+             false and pass the `sha256` from a prior `read_file` as `precondition`. \
+             `content` becomes the entire file, so an overwrite drops every line you did \
+             not include — use `edit_file` for partial changes."
+        }
+        "process" => {
+            "Run a command inside the workspace under engine supervision. Prefer `argv`, \
+             an argument vector executed directly with no shell, so no quoting or \
+             expansion applies. `shell` runs a shell command line instead and is \
+             high-risk: it needs explicit policy approval and should be reserved for \
+             pipelines and redirection that `argv` cannot express. Output is captured up \
+             to `stdout_cap`/`stderr_cap` bytes and the process group is terminated at \
+             `timeout_ms`. Returns the exit status with the captured streams."
+        }
+        _ => "Engine-owned workspace operation.",
     }
 }
 
@@ -571,7 +637,7 @@ impl ToolRegistry {
         prepared.expected_hash = invocation.precondition.map(str::to_owned);
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
-            run_revision: invocation.run_revision,
+            turn_revision: invocation.turn_revision,
             effect_id: invocation.effect_id,
             attempt: invocation.attempt,
             tool: invocation.name,
@@ -604,7 +670,7 @@ impl ToolRegistry {
         )?;
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
-            run_revision: invocation.run_revision,
+            turn_revision: invocation.turn_revision,
             effect_id: invocation.effect_id,
             attempt: invocation.attempt,
             tool: invocation.name,
@@ -872,6 +938,72 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    /// The description is the only place a model learns that a mutation's
+    /// `precondition` is the digest `read_file` returned. A schema cannot say
+    /// it, so losing it here silently breaks every edit against a real model.
+    #[test]
+    fn mutation_descriptions_state_the_read_before_write_digest_contract() {
+        for name in ["edit_file", "write_file"] {
+            let text = tool_description(name);
+            assert!(
+                text.contains("read_file"),
+                "{name} must name the tool supplying the digest"
+            );
+            assert!(
+                text.contains("precondition"),
+                "{name} must name the argument carrying the digest"
+            );
+            assert!(
+                text.contains("sha256"),
+                "{name} must name the field read_file returns"
+            );
+        }
+        let read = tool_description("read_file");
+        assert!(read.contains("sha256") && read.contains("precondition"));
+    }
+
+    /// Rejections a model must be able to avoid rather than retry blindly.
+    #[test]
+    fn descriptions_state_the_contracts_that_reject_a_call() {
+        let edit = tool_description("edit_file");
+        assert!(edit.contains("exactly once"), "unique-match rule missing");
+        assert!(edit.contains("verbatim"), "exact-match rule missing");
+        let write = tool_description("write_file");
+        assert!(
+            write.contains("create_intent"),
+            "create/overwrite split missing"
+        );
+        assert!(
+            tool_description("process").contains("argv"),
+            "argv-first rule missing"
+        );
+    }
+
+    #[test]
+    fn every_advertised_tool_has_a_description_beyond_its_name() {
+        let fallback = tool_description("");
+        for name in [
+            "read_file",
+            "list_directory",
+            "search",
+            "read_project_manifest",
+            "edit_file",
+            "write_file",
+            "git_diff",
+            "process",
+        ] {
+            let text = tool_description(name);
+            assert_ne!(
+                text, fallback,
+                "{name} still falls back to the generic text"
+            );
+            assert!(
+                text.len() > 80,
+                "{name} description is too thin to state a contract"
+            );
+        }
+    }
+
     fn setup() -> (TempDir, ToolRegistry) {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "one\ntwo\none\n").unwrap();
@@ -883,7 +1015,7 @@ mod tests {
         ToolInvocation {
             name,
             input,
-            run_revision: 4,
+            turn_revision: 4,
             effect_id: "effect-1",
             attempt: 1,
             precondition: None,
