@@ -483,6 +483,19 @@ impl ProviderRegistry {
     }
 
     /// Validates a persisted v2 binding before resolving the configured secret.
+    /// Returns the declared context window (in tokens) of one configured
+    /// model, when the configuration declares one. Profile resolution uses
+    /// this to tighten per-model context budgets; the value never widens a
+    /// configured bound.
+    #[must_use]
+    pub fn model_context_window(&self, provider: &str, model: &str) -> Option<u32> {
+        match self.config.providers.get(provider)? {
+            ProviderDefinition::OpenaiChat { models, .. } => models
+                .options(model)
+                .and_then(|options| options.context_window),
+        }
+    }
+
     pub fn resolve_session_bound(
         &self,
         binding: &SessionProviderBinding,
