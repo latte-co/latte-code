@@ -6394,7 +6394,15 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
+        // An invalid policy surfaces at profile resolution, before any
+        // history is built: the typed error is ProviderConfiguration, not a
+        // late History failure. Production never reaches this path (the
+        // config loader validates the session section at startup); this is
+        // the service's defensive contract.
+        assert!(
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -6577,7 +6585,12 @@ mod tests {
             .follow_up(session_id, ready.revision, "second".into())
             .await
             .unwrap_err();
-        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
+        // Same defensive contract as start: the invalid policy fails at
+        // profile resolution with ProviderConfiguration.
+        assert!(
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
     }
 
     // -- switch_model / resolve_permission / cancel_durable -----------------

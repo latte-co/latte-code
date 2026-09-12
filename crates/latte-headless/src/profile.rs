@@ -8,8 +8,9 @@
 //!
 //! 1. the built-in profile for the binding's provider type — the historical
 //!    `SessionHistoryPolicy` defaults and system prompt, moved verbatim;
-//! 2. the application `session` configuration section, applied when the
-//!    catalog is constructed (the binary passes it in as the base);
+//! 2. the application `session` configuration section, which overrides a
+//!    builtin budget only where it differs from the config-layer default
+//!    ([`layer_budget`]); untouched fields keep following the builtin;
 //! 3. the model's declared `context_window`, which can only *tighten* the
 //!    repository-context cap.
 //!
@@ -46,9 +47,18 @@ pub enum ProfileError {
 const AGENT_SYSTEM_PROMPT_TEMPLATE: &str = "You are Latte Code, a coding agent making scoped changes to the repository described below. Work only within it: paths outside the workspace are rejected, and you cannot reach the network.\n\nRead before you write. To change an existing file, first call `read_file` on it and pass the `sha256` it returns as `precondition` to `edit_file` or `write_file`. A mutation without the digest of the version you actually read is rejected, and this holds again for every later edit to the same file: re-read to get the new digest. Prefer `edit_file`, whose `before` must match the file verbatim and occur exactly once; reach for `write_file` only to create a file or to rewrite one whole.\n\nUnderstand before you change. Locate the relevant code with `search` and `list_directory`, and read enough of it that your edit follows what is already there. `read_project_manifest` shows the language and dependencies. Do not invent APIs, dependencies, or file paths you have not observed.\n\nFinish what you start. After editing, check your own work with `git_diff`. When a verification command is configured it must pass before the task is complete; a failing, missing, or unrun verification means the work is unfinished. Report plainly what you changed and what you verified. If a tool call is rejected, read the error and correct the call rather than repeating it unchanged. If the task is ambiguous or you lack the means to finish it, say so instead of guessing.\n{repository_context}";
 
 /// Provider types recognized by the built-in catalog. `embedded` covers the
-/// in-process test fixture binding; every production HTTP binding today is
-/// OpenAI-chat-compatible.
-const BUILTIN_PROVIDER_TYPES: [&str; 2] = ["openai-chat", "embedded"];
+/// in-process test fixture binding and `test` covers the crate-local session
+/// fixtures — both are fixture identities, not production protocols. The
+/// whitelist is also the upgrade-compat boundary: bindings are persisted
+/// verbatim (including `provider_type`), so every type that could have been
+/// persisted by any previous release must resolve here or old sessions fail
+/// to reopen.
+const BUILTIN_PROVIDER_TYPES: [&str; 3] = ["openai-chat", "embedded", "test"];
+
+/// The provider type used for eager, binding-free pre-checks (prompt budget
+/// validation before enqueue). Every built-in profile shares the same prompt
+/// catalog today, so the concrete value only names the builtin family.
+const DEFAULT_BUILTIN_PROVIDER_TYPE: &str = "openai-chat";
 
 fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> {
     if !BUILTIN_PROVIDER_TYPES.contains(&provider_type) {
@@ -79,6 +89,57 @@ fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> 
         context,
         prompts,
     })
+}
+
+/// Layers the application `session` configuration over one builtin profile's
+/// budgets: a configured field overrides the builtin only when it differs
+/// from the historical default (the config layer's own fallback). Fields the
+/// user never touched keep following the builtin profile, so a builtin
+/// budget change takes effect for default configurations instead of being
+/// silently replaced by config defaults.
+///
+/// The known edge: a user who explicitly sets a field *to the default value*
+/// also tracks future builtin changes. Distinguishing that needs per-field
+/// presence tracking in the config layer, which v1 does not have; documented
+/// in the design doc instead.
+#[must_use]
+fn layer_budget(builtin: &ContextPolicy, base: &ContextPolicy) -> ContextPolicy {
+    let config_default = ContextPolicy::from(SessionHistoryPolicy::default());
+    ContextPolicy {
+        max_request_bytes: if base.max_request_bytes == config_default.max_request_bytes {
+            builtin.max_request_bytes
+        } else {
+            base.max_request_bytes
+        },
+        max_input_bytes: if base.max_input_bytes == config_default.max_input_bytes {
+            builtin.max_input_bytes
+        } else {
+            base.max_input_bytes
+        },
+        reserved_output_bytes: if base.reserved_output_bytes == config_default.reserved_output_bytes
+        {
+            builtin.reserved_output_bytes
+        } else {
+            base.reserved_output_bytes
+        },
+        context_cap_bytes: if base.context_cap_bytes == config_default.context_cap_bytes {
+            builtin.context_cap_bytes
+        } else {
+            base.context_cap_bytes
+        },
+        max_tool_rounds: if base.max_tool_rounds == config_default.max_tool_rounds {
+            builtin.max_tool_rounds
+        } else {
+            base.max_tool_rounds
+        },
+        provider_timeout_ms: if base.provider_timeout_ms == config_default.provider_timeout_ms {
+            builtin.provider_timeout_ms
+        } else {
+            base.provider_timeout_ms
+        },
+        compaction: builtin.compaction.clone(),
+        token_estimate: builtin.token_estimate.clone(),
+    }
 }
 
 impl From<SessionHistoryPolicy> for ContextPolicy {
@@ -148,7 +209,7 @@ impl ProfileCatalog {
     /// Returns [`ProfileError::Invalid`] when the base policy is
     /// inconsistent.
     pub fn resolve_base(&self) -> Result<ResolvedProfile, ProfileError> {
-        let builtin = builtin_profile("openai-chat")?;
+        let builtin = builtin_profile(DEFAULT_BUILTIN_PROVIDER_TYPE)?;
         let context = self.base.clone();
         context.validate().map_err(|reason| ProfileError::Invalid {
             profile_id: builtin.profile_id.clone(),
@@ -175,7 +236,11 @@ impl ProfileCatalog {
         binding: &SessionProviderBinding,
     ) -> Result<ResolvedProfile, ProfileError> {
         let builtin = builtin_profile(&binding.provider_type)?;
-        let mut context = self.base.clone();
+        // Three-layer merge: the builtin profile provides the budget
+        // baseline, the application `session` configuration overrides fields
+        // it explicitly sets, and a declared context window (below) can only
+        // tighten the repository-context cap.
+        let mut context = layer_budget(&builtin.context, &self.base);
         // A declared context window may only tighten the repository-context
         // cap; a larger window never widens the configured budget.
         if let Some(window) = self.registry.as_ref().and_then(|registry| {
@@ -359,6 +424,63 @@ mod tests {
         let policy = resolved.history_policy();
         assert_eq!(policy.max_request_bytes, 256 * 1024);
         assert_eq!(policy.provider_timeout_ms, 30_000);
+    }
+
+    /// The builtin profile's budgets are live, not dead code: a budget the
+    /// config layer never touched follows the builtin value even when it
+    /// drifts from the historical default. Without this guarantee a future
+    /// builtin budget change would silently do nothing — the exact
+    /// global-one-size-fits-all behavior the profile abstraction exists to
+    /// remove.
+    #[test]
+    fn builtin_budget_changes_take_effect_for_untouched_config_fields() {
+        let builtin = builtin_profile("openai-chat").expect("builtin");
+        let drifted = ContextPolicy {
+            max_request_bytes: 1024 * 1024,
+            context_cap_bytes: 32 * 1024,
+            ..builtin.context.clone()
+        };
+        let layered = layer_budget(&drifted, &ContextPolicy::default());
+        assert_eq!(layered.max_request_bytes, 1024 * 1024);
+        assert_eq!(layered.context_cap_bytes, 32 * 1024);
+        // Untouched builtin fields flow through unchanged.
+        assert_eq!(layered.max_input_bytes, builtin.context.max_input_bytes);
+        assert_eq!(
+            layered.provider_timeout_ms,
+            builtin.context.provider_timeout_ms
+        );
+    }
+
+    /// Explicit config overrides win over the builtin even when the builtin
+    /// drifts: only fields equal to the config-layer default fall back to
+    /// the builtin.
+    #[test]
+    fn explicit_config_override_wins_over_drifted_builtin() {
+        let builtin = builtin_profile("openai-chat").expect("builtin");
+        let drifted = ContextPolicy {
+            max_request_bytes: 1024 * 1024,
+            ..builtin.context.clone()
+        };
+        let base = ContextPolicy {
+            max_request_bytes: 256 * 1024,
+            ..ContextPolicy::default()
+        };
+        assert_eq!(layer_budget(&drifted, &base).max_request_bytes, 256 * 1024);
+    }
+
+    /// Fixture bindings with `provider_type = "test"` are part of the
+    /// persisted-binding compat surface: the crate-local session fixtures
+    /// and any historical binary that persisted such a binding must keep
+    /// resolving.
+    #[test]
+    fn test_fixture_provider_type_resolves() {
+        let resolved = catalog(ContextPolicy::default(), minimal_registry())
+            .resolve(&binding("test", "m"))
+            .expect("fixture provider type must resolve");
+        assert_eq!(
+            resolved.profile().profile_id,
+            GENERIC_OPENAI_CHAT_PROFILE_ID
+        );
     }
 
     #[test]

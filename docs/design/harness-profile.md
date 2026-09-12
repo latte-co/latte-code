@@ -1,9 +1,11 @@
 # Harness Profile 抽象设计（v1 薄切片）
 
-状态：**设计中，未实现。**
+状态：**v1 已实现**（类型 + 解析管道 + loop 接线 + 权限天花板，随本 PR 落地）；
+批次 2 未实现：compaction 本体、`/compact`、预算可见性、binding 快照三字段
+（schema 迁移）、config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
 日期：2026-09-12
 范围：定义 `HarnessProfile` 的概念位置、核心类型、解析管道、约束边界与首个消费者
-（context compaction）的集成点。工具呈现与 stop 语义只声明形状，不在 v1 实现。
+（context compaction）的集成点。工具呈现与 stop 语义是 v2 扩展方向，v1 不含。
 
 调查范围：`crates/` 全部 crate 中与模型行为相关的硬编码点、provider 配置结构、
 session 存储与 binding 持久化链路。所有结论附 `file:line` 证据（基于 `3fd8521`）。
@@ -73,9 +75,6 @@ pub struct HarnessProfile {
     pub context: ContextPolicy,
     /// v1 实现维度。
     pub prompts: SystemPromptSpec,
-    /// 以下两维 v1 仅占位（reserved），字段存在但值为 None 时不得影响行为。
-    pub tools: Option<ToolPresentation>,
-    pub semantics: Option<StopSemantics>,
 }
 
 pub struct ProfileVersion { pub major: u32, pub minor: u32 }
@@ -89,7 +88,7 @@ pub struct ContextPolicy {
     pub context_cap_bytes: usize,
     pub max_tool_rounds: Option<u32>,
     pub provider_timeout_ms: u64,
-    // 新增：compaction 配置（v1 的新行为面）
+    // 新增：compaction 配置（v1 声明，行为面随批次 2 落地）
     pub compaction: CompactionPolicy,
     // 新增：token 估算参数（见 §3.1 字节/token 取舍）
     pub token_estimate: TokenEstimateParams,
@@ -100,7 +99,7 @@ pub struct CompactionPolicy {
     /// 触发阈值：估算上下文占 context_cap_bytes 的比例。
     pub trigger_ratio: u8,            // 例：80
     /// 摘要请求使用的 prompt 槽（见 SystemPromptSpec）。
-    pub summary_prompt_id: PromptId,
+    pub summary_prompt_id: String,
     /// 单次摘要最多覆盖的历史范围（字节），防摘要请求自身超限。
     pub max_summary_source_bytes: usize,
 }
@@ -110,13 +109,14 @@ pub struct SystemPromptSpec {
     ///   "agent.system"   —— 主 system prompt
     ///   "agent.summarize" —— compaction 摘要指令
     /// 槽位内容 = 内置模板 + 每模型覆盖（config 提供）。
-    pub slots: BTreeMap<PromptId, String>,
+    pub slots: BTreeMap<String, String>,
 }
 ```
 
 `ToolPresentation`（工具 schema 呈现/命名规则）与 `StopSemantics`（stop reason 到
-完成/继续的映射）在 v1 只定义字段名与 None 语义，具体形状待第二个真实消费者
-（多 provider 时期）再定，避免投机设计。
+完成/继续的映射）是 v2 扩展方向：v1 的 `HarnessProfile` **不含**这两个字段，
+等第二个真实消费者（多 provider 时期）出现时再以新字段加入（minor 版本演进），
+避免投机设计与死字段。
 
 ### 3.1 字节预算与 token 估算的取舍
 
@@ -135,35 +135,49 @@ v1 决策：
 ## 4. 解析管道
 
 ```rust
-/// crates/latte-headless/src/profile.rs（新；紧邻 registry.rs）
-pub fn resolve_profile(binding: &SessionProviderBinding,
-                       registry: &ProviderRegistry)
-    -> Result<HarnessProfile, ProfileError>;
+/// crates/latte-headless/src/profile.rs（已实现）
+impl ProfileCatalog {
+    pub fn resolve(&self, binding: &SessionProviderBinding)
+        -> Result<ResolvedProfile, ProfileError>;
+}
 ```
 
 ### 4.1 来源与优先级
 
-解析输入是 `(provider_type, model)`，来源三层，后者覆盖前者，逐字段合并：
+解析输入是 `SessionProviderBinding`，来源三层，后者覆盖前者，逐字段合并：
 
 1. **内置 catalog**（代码内常量表）。v1 只有一条：`generic-openai-chat`——
    即当前 `SessionHistoryPolicy::default()` + 现行 `system_prompt()` 的值原样搬家，
    保证行为零变化迁移。
-2. **provider config 的 model options**。`context_window` / `max_tokens`
-   （`registry.rs:130-140`）映射为 ContextPolicy 的输入：由 context_window 按比例
-   推导 `context_cap_bytes` 等（推导系数属于内置 profile 的职责）。
-3. **用户覆盖**。config 顶层新增可选 `profiles` 段，按 `(provider, model)` 或
-   `profile_id` 覆盖 ContextPolicy / prompt 槽位。`deny_unknown_fields`。
+2. **应用 config 的 `session` 段**（`ProfileCatalog` 构造时传入的 base）。
+   覆盖规则（`layer_budget`）：base 中**等于历史默认值**的字段不覆盖内置——
+   继续跟随内置 profile 的值；只有用户显式改动的字段才覆盖内置。这样内置
+   profile 的预算是"活"的：未来调整内置预算时，未做覆盖的配置自动跟随，
+   而不是被 config 默认值静默替代（后者会让内置层沦为死代码，v2 的
+   per-profile 预算也会被全局一刀切吞掉）。
+   已知边界：把字段**显式设成默认值**的用户同样会跟随未来内置变化；区分
+   两者需要 config 层按字段记录"是否显式设置"，v1 不做，留待 `profiles`
+   覆盖段（第 3 层）一并解决。
+3. **provider config 的 model options**。`context_window` 映射为
+   `context_cap_bytes` 的收紧上限（token × bytes_per_token，只紧不松；
+   推导系数属于内置 profile 的职责）。
 
-### 4.2 fail-closed 规则
+config 顶层可选 `profiles` 段（按 `(provider, model)` 或 `profile_id` 覆盖
+ContextPolicy / prompt 槽位，`deny_unknown_fields`）属于 v2；届时按字段
+presence 语义取代第 2 层的"等于默认值"启发式。
 
-- 已知 `provider_type`（v1 仅 `openai-chat`）总能解析到内置 profile——**fail-closed
-  不等于把现有配置挡在门外**，迁移负担为零。
+### 4.2 fail-closed 与已持久化 binding 的兼容
+
+- 已知 `provider_type`（v1：`openai-chat`、`embedded`、`test`）总能解析到内置
+  profile——**fail-closed 不等于把现有配置挡在门外**，迁移负担为零。
+  白名单同时是**升级兼容边界**：binding 原样落库（含 `provider_type`，
+  `SessionProviderBinding::validate()` 不约束取值），历史上任何 release 可能
+  持久化过的取值都必须继续可解析，否则老 session 升级后无法恢复。`test`
+  就是为此保留的夹具类型；新增 provider adapter 时必须同步扩展白名单并
+  带升级回归测试。
 - 未知 `provider_type`（未来 adapter）且用户未显式提供 profile：解析报错，session
   创建被拒绝。绝不静默套用 `generic-openai-chat`。
-- 用户覆盖值必须通过 `ContextPolicy` 既有 `validate()`（`session.rs:138-145`），
-  不合法即拒绝，无部分生效。
-- `ToolPresentation` / `StopSemantics` 为 `None` 时，loop 行为与现状完全一致；
-  profile 不得因这两维缺失而改变任何现有路径。
+- 用户覆盖值必须通过 `ContextPolicy` 的 `validate()`，不合法即拒绝，无部分生效。
 
 ### 4.3 解析时机
 

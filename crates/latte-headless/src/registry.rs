@@ -482,7 +482,6 @@ impl ProviderRegistry {
             .collect()
     }
 
-    /// Validates a persisted v2 binding before resolving the configured secret.
     /// Returns the declared context window (in tokens) of one configured
     /// model, when the configuration declares one. Profile resolution uses
     /// this to tighten per-model context budgets; the value never widens a
@@ -496,6 +495,7 @@ impl ProviderRegistry {
         }
     }
 
+    /// Validates a persisted v2 binding before resolving the configured secret.
     pub fn resolve_session_bound(
         &self,
         binding: &SessionProviderBinding,
