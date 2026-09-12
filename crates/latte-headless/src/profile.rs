@@ -10,7 +10,7 @@
 //!    `SessionHistoryPolicy` defaults and system prompt, moved verbatim;
 //! 2. the application `session` configuration section, which overrides a
 //!    builtin budget only where it differs from the config-layer default
-//!    ([`layer_budget`]); untouched fields keep following the builtin;
+//!    (`layer_budget`); untouched fields keep following the builtin;
 //! 3. the model's declared `context_window`, which can only *tighten* the
 //!    repository-context cap.
 //!
