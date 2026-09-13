@@ -2806,13 +2806,29 @@ impl Storage {
             )
             && lifecycle == "reconciliation_required"
             && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
+        // The queue-audit card (issue #22) is appended after a turn has
+        // terminalized and the active row was deliberately cleared: queued
+        // prompts that can no longer execute must still leave a durable
+        // trace. The append stays fenced by the exact session revision, the
+        // lease, and the just-terminalized `latest_turn_id`, so only the
+        // latest turn of a terminal session can ever be appended this way.
+        let terminal_queue_audit = active.is_none()
+            && matches!(
+                &request.update,
+                CommitSessionTurnUpdate::AppendTranscript { .. }
+            )
+            && matches!(
+                lifecycle.as_str(),
+                "failed" | "interrupted" | "reconciliation_required"
+            )
+            && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
         if let Some((active_turn, active_token)) = active {
             if active_turn != request.turn_id.to_string()
                 || from_i64(active_token)? > lease.fencing_token
             {
                 return Err(StorageError::SessionActiveTurnMismatch);
             }
-        } else if !recovered_reconciliation {
+        } else if !recovered_reconciliation && !terminal_queue_audit {
             return Err(StorageError::SessionActiveTurnMismatch);
         }
         let (state_json, turn_seq, turn_token): (String, i64, i64) = tx.query_row(
@@ -8615,6 +8631,153 @@ mod tests {
                 now_ms,
             )
             .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queue_audit_append_is_exempt_only_for_the_latest_terminal_turn() {
+        let (_dir, path) = db();
+        let ids = SystemIdSource::default();
+        let store = Storage::open(&path).unwrap();
+        // A failed turn clears its active row; the queue-audit exemption must
+        // let exactly one AppendTranscript class land on that just-terminalized
+        // latest turn — and nothing else, nowhere else (issue #22).
+        let (session_id, turn_id, queued) = create_linked_fixture(&store, &ids, "queue audit", 10);
+        let lease = store.acquire_session_lease(session_id, 11, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            turn_id,
+            CommitSessionTurnUpdate::Start {
+                source_key: "audit:start".into(),
+            },
+            12,
+        )
+        .snapshot;
+        let failed = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            turn_id,
+            CommitSessionTurnUpdate::Fail {
+                source_key: "audit:fail".into(),
+                failure: TurnFailure {
+                    code: FailureCode::RuntimeFailed,
+                    message: "provider failed".into(),
+                    retryability: Retryability::Terminal,
+                },
+            },
+            13,
+        )
+        .snapshot;
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        let audited = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &failed,
+            turn_id,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:queue-audit"),
+                kind: TranscriptKind::System,
+                text: "1 queued follow-up prompt(s) were discarded".into(),
+                payload: None,
+            },
+            14,
+        );
+        assert_eq!(audited.snapshot.lifecycle, SessionLifecycle::Failed);
+        assert!(
+            audited
+                .snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::System)
+        );
+        // The exemption stays fenced by the session revision: an append at
+        // the stale pre-audit revision is rejected like any other commit.
+        assert!(matches!(
+            store.commit_session_turn_update(
+                &SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: failed.revision,
+                    expected_turn_revision: failed.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:queue-audit-2"),
+                        kind: TranscriptKind::System,
+                        text: "stale".into(),
+                        payload: None,
+                    },
+                },
+                &lease,
+                15,
+            ),
+            Err(StorageError::StaleSessionRevision { .. })
+        ));
+        // A ready session's completed turn also cleared the active row, but
+        // "ready" is not a terminal lifecycle: the exemption must not leak.
+        let (ready_session, ready_turn, ready_queued) =
+            create_linked_fixture(&store, &ids, "ready audit negative", 20);
+        let ready_lease = store.acquire_session_lease(ready_session, 21, 100).unwrap();
+        let ready_running = commit_linked(
+            &store,
+            &ids,
+            &ready_lease,
+            &ready_queued,
+            ready_turn,
+            CommitSessionTurnUpdate::Start {
+                source_key: "audit2:start".into(),
+            },
+            22,
+        )
+        .snapshot;
+        let completed = commit_linked(
+            &store,
+            &ids,
+            &ready_lease,
+            &ready_running,
+            ready_turn,
+            CommitSessionTurnUpdate::Complete {
+                source_key: "audit2:complete".into(),
+                handoff: latte_core::Handoff {
+                    summary: "done".into(),
+                    files_changed: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+            23,
+        )
+        .snapshot;
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        assert!(matches!(
+            store.commit_session_turn_update(
+                &SessionCommitRequest {
+                    session_id: ready_session,
+                    turn_id: ready_turn,
+                    expected_session_revision: completed.revision,
+                    expected_turn_revision: completed.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{ready_turn}:queue-audit"),
+                        kind: TranscriptKind::System,
+                        text: "must not land on a ready session".into(),
+                        payload: None,
+                    },
+                },
+                &ready_lease,
+                24,
+            ),
+            Err(StorageError::SessionActiveTurnMismatch)
+        ));
     }
 
     #[test]

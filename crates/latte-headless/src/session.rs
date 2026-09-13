@@ -914,6 +914,22 @@ impl SessionRuntimeService {
             .resolve_base()
             .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))?;
         let _ = self.initial_messages(&profile, &prompt, None)?;
+        // Issue #22: a 202 must mean "will run". Queue only against a turn
+        // that can still reach the queue drain — an active run or a parked
+        // wait. A finished session takes follow-ups instead; a terminal one
+        // takes nothing.
+        let tail = self
+            .engine
+            .session_snapshot_tail_v2(session_id, 1)
+            .map_err(|_| SessionRuntimeError::InvalidState)?;
+        if !matches!(
+            tail.lifecycle,
+            SessionLifecycle::Running
+                | SessionLifecycle::WaitingInput
+                | SessionLifecycle::WaitingPermission
+        ) {
+            return Err(SessionRuntimeError::InvalidState);
+        }
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
         let mailbox = mailboxes
             .get_mut(&session_id)
@@ -984,48 +1000,173 @@ impl SessionRuntimeService {
         }
     }
 
+    /// Adopt-or-create the queue intake for a resuming turn (issue #22): a
+    /// parked session kept its entry, so adopting it preserves the prompts
+    /// queued while the session waited; after a restart there is nothing to
+    /// adopt and a fresh entry is inserted. Callers hold the session lease
+    /// across this call and place it before the resuming commit, so the
+    /// lease — not the later CAS — is what excludes a concurrent resume.
+    /// On any early failure after this point the guard must be marked
+    /// closed, never dropped open: a bare drop removes the entry and wipes
+    /// the parked queue.
+    fn ensure_runner(&self, session_id: SessionId) -> SessionRunnerGuard {
+        let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+        mailboxes.entry(session_id).or_default();
+        SessionRunnerGuard {
+            session_id,
+            mailboxes: Arc::clone(&self.mailboxes),
+            closed: false,
+        }
+    }
+
     async fn drain_mailbox(
         &self,
         mut snapshot: SessionSnapshot,
         mut runner: SessionRunnerGuard,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        enum DrainOutcome {
+            Prompt(String),
+            Done,
+            TerminalDiscard(Option<VecDeque<String>>),
+        }
         loop {
-            let prompt = {
+            // A parked turn (issue #22) keeps its mailbox entry: the queue
+            // intake stays open so prompts queued while the session waits
+            // run after the pending request resolves. The guard detaches —
+            // closed without removing — and no live guard remains across the
+            // park, so the entry's meaning is exactly "intake open".
+            // `ReconciliationRequired` joins this branch deliberately: it is
+            // a pending-recovery state, not a terminal one — an in-flight
+            // recovery run may still re-enter the provider, and any write
+            // here (audit card, revision bump, entry removal) would fence
+            // that recovery out with a stale-revision error.
+            if matches!(
+                snapshot.lifecycle,
+                SessionLifecycle::WaitingInput
+                    | SessionLifecycle::WaitingPermission
+                    | SessionLifecycle::ReconciliationRequired
+            ) {
+                runner.mark_closed();
+                return Ok(snapshot);
+            }
+            let outcome = {
                 let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
                 let mailbox = mailboxes
                     .get_mut(&snapshot.session_id)
                     .ok_or(SessionRuntimeError::InvalidState)?;
-                let prompt = snapshot
+                if let Some(prompt) = snapshot
                     .lifecycle
                     .accepts_follow_up()
                     .then(|| mailbox.pop_front())
-                    .flatten();
-                if prompt.is_none() {
+                    .flatten()
+                {
+                    DrainOutcome::Prompt(prompt)
+                } else if snapshot.lifecycle.accepts_follow_up() {
                     mailboxes.remove(&snapshot.session_id);
                     runner.mark_closed();
+                    DrainOutcome::Done
+                } else {
+                    // A terminal finish can no longer execute the queued
+                    // prompts. Take the whole entry out under the lock —
+                    // pushes racing the removal then fail on the missing
+                    // entry instead of being wiped unaudited — and leave the
+                    // durable audit trace to the helper below.
+                    runner.mark_closed();
+                    DrainOutcome::TerminalDiscard(mailboxes.remove(&snapshot.session_id))
                 }
-                prompt
             };
-            let Some(prompt) = prompt else {
-                return Ok(snapshot);
-            };
-            // Queued mailbox turns are process-local by design; mint a fresh
-            // command id so the durable dedup record is still written.
-            let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
-            snapshot = match self
-                .follow_up_one(
-                    snapshot.session_id,
-                    snapshot.revision,
-                    prompt,
-                    Some(command_id),
-                    None,
-                )
-                .await?
-            {
-                latte_core::CreateOutcome::Created(snapshot)
-                | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
-            };
+            match outcome {
+                DrainOutcome::Prompt(prompt) => {
+                    // Queued mailbox turns are process-local by design; mint
+                    // a fresh command id so the durable dedup record is
+                    // still written.
+                    let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
+                    snapshot = match self
+                        .follow_up_one(
+                            snapshot.session_id,
+                            snapshot.revision,
+                            prompt,
+                            Some(command_id),
+                            None,
+                        )
+                        .await?
+                    {
+                        latte_core::CreateOutcome::Created(snapshot)
+                        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+                    };
+                }
+                DrainOutcome::Done => return Ok(snapshot),
+                DrainOutcome::TerminalDiscard(discarded) => {
+                    // Only a non-empty discard produces an audit card; an
+                    // empty or absent queue needs no lease at all.
+                    let has_discard = discarded.as_ref().is_some_and(|queue| !queue.is_empty());
+                    if !has_discard {
+                        return Ok(snapshot);
+                    }
+                    // No live lease exists at drain time (the turn's lease
+                    // was consumed by run_provider_turn), so the audit can
+                    // acquire its own; losing that acquisition only costs
+                    // the audit line.
+                    match self.acquire(snapshot.session_id) {
+                        Ok(lease) => {
+                            return Ok(self.audit_discarded_queue(&snapshot, discarded, &lease));
+                        }
+                        Err(_) => return Ok(snapshot),
+                    }
+                }
+            }
         }
+    }
+
+    /// Durable trace for queued prompts a terminal finish can no longer run
+    /// (issue #22): the queue is process-local, the entry is already taken
+    /// out, and the card records only the count and the terminal lifecycle —
+    /// never prompt content, which stays behind the redaction boundary.
+    /// Best-effort by the same contract as the compaction summary card: a
+    /// storage failure here must not fail the already terminal turn, it only
+    /// costs the audit line, and the transcript remains authoritative. The
+    /// caller supplies its live lease — acquiring a second lease for a
+    /// session that already holds one would fail.
+    fn audit_discarded_queue(
+        &self,
+        snapshot: &SessionSnapshot,
+        discarded: Option<VecDeque<String>>,
+        lease: &SessionLeaseGuard,
+    ) -> SessionSnapshot {
+        let Some(discarded) = discarded.filter(|queue| !queue.is_empty()) else {
+            return snapshot.clone();
+        };
+        let Some(turn) = snapshot.turns.last() else {
+            return snapshot.clone();
+        };
+        let lifecycle = match snapshot.lifecycle {
+            SessionLifecycle::Failed => "failed",
+            SessionLifecycle::Interrupted => "interrupted",
+            SessionLifecycle::ReconciliationRequired => "reconciliation_required",
+            _ => "terminal",
+        };
+        self.commit(
+            snapshot.session_id,
+            turn.turn_id,
+            snapshot.revision,
+            turn.turn_revision,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{0}:queue-audit", turn.turn_id),
+                kind: TranscriptKind::System,
+                text: format!(
+                    "{} queued follow-up prompt(s) were discarded: the turn finished in the {lifecycle} state and can no longer execute them",
+                    discarded.len()
+                ),
+                payload: Some(serde_json::json!({
+                    "discarded_queue_len": discarded.len(),
+                    "terminal_lifecycle": lifecycle,
+                })),
+            },
+            &lease.lease,
+        )
+        // The turn is already terminal; losing the audit line must not
+        // surface as a failed request.
+        .unwrap_or_else(|_| snapshot.clone())
     }
 
     /// Persists an explicit provider/model selection for subsequent children.
@@ -1094,7 +1235,11 @@ impl SessionRuntimeService {
         let provider = (self.provider)(&snapshot.binding)
             .map_err(SessionRuntimeError::ProviderConfiguration)?;
         let lease = self.acquire(session_id)?;
-        let running = self.commit(
+        // Adopt-or-create the queue intake under the lease (issue #22): the
+        // prompts queued while this turn was parked survive the resume and
+        // run when this turn's own drain reaches them.
+        let mut runner = self.ensure_runner(session_id);
+        let running = match self.commit(
             session_id,
             turn_id,
             snapshot.revision,
@@ -1105,7 +1250,13 @@ impl SessionRuntimeService {
                 value,
             },
             &lease,
-        )?;
+        ) {
+            Ok(running) => running,
+            Err(error) => {
+                runner.mark_closed();
+                return Err(error);
+            }
+        };
         // Same compaction contract as a new child: persist the summary (or
         // its failure audit) before the provider sees the request. The
         // ProvideInput commit advanced both the session revision and the
@@ -1156,14 +1307,25 @@ impl SessionRuntimeService {
                 .unwrap_or(running),
             PreparedHistory::Complete(_) => running,
         };
-        self.run_provider_turn(running, messages, provider.provider, lease)
+        let done = match self
+            .run_provider_turn(running, messages, provider.provider, lease)
             .await
+        {
+            Ok(done) => done,
+            Err(error) => {
+                runner.mark_closed();
+                return Err(error);
+            }
+        };
+        runner.mark_closed();
+        self.drain_mailbox(done, runner).await
     }
 
     /// Resolves a durable v2 effect permission. Allow consumes the exact
     /// prepared approval through the engine Started transaction before any
     /// external operation is invoked; denial terminalizes the prepared effect
     /// without executing it.
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_permission(
         &self,
         session_id: SessionId,
@@ -1203,79 +1365,99 @@ impl SessionRuntimeService {
             None
         };
         let lease = self.acquire(session_id)?;
-        let resolved = self.engine.resolve_session_effect_permission(
-            session_id,
-            turn_id,
-            snapshot.revision,
-            turn_revision,
-            request_id.clone(),
-            format!(
-                "{turn_id}:permission:{request_id}:{}",
-                if allow { "allow" } else { "deny" }
-            ),
-            allow,
-            SessionCommandId::from_uuid(Uuid::now_v7()),
-            &lease,
-            now_ms(),
-        )?;
-        if !allow {
-            return Ok(resolved);
-        }
-        // The assistant card is the durable, ordered queue for the complete
-        // provider tool round.  Do not reconstruct a new provider turn after
-        // this one approved call: OpenAI-compatible history requires a tool
-        // result for every call in the original assistant message, in order.
-        let started = self.engine.start_session_effect(
-            session_effect_start_request(
-                &resolved,
+        // Adopt-or-create the queue intake under the lease (issue #22), the
+        // same contract as provide_input.
+        let mut runner = self.ensure_runner(session_id);
+        let resumed = async {
+            let resolved = self.engine.resolve_session_effect_permission(
+                session_id,
+                turn_id,
+                snapshot.revision,
+                turn_revision,
                 request_id.clone(),
-                format!("{turn_id}:effect:{request_id}:start"),
-            )?,
-            self.engine.session_effect_digest(&request_id)?,
-            &lease,
-            now_ms(),
-        )?;
-        let presentation = started.presentation.clone();
-        // The assistant card is the durable, ordered queue for the complete
-        // provider tool round. The presentation is redacted, but its call ID
-        // is enough to find that queue; executable input remains engine-only.
-        let continuation = (!verification)
-            .then(|| tool_round_for_call(&resolved, &presentation.tool_call_id))
-            .transpose()?;
-        let after_effect = self.execute_and_observe_effect(started, &lease).await?;
-        if after_effect.lifecycle != SessionLifecycle::Running {
-            return Ok(after_effect);
-        }
-        if verification {
-            return self.finish_verification(&after_effect, &presentation, &lease);
-        }
-        let (round_sequence, calls, ordinal) = continuation.ok_or_else(|| {
-            SessionRuntimeError::Effect("provider tool continuation is missing".into())
-        })?;
-        let provider = provider.ok_or_else(|| {
-            SessionRuntimeError::ProviderConfiguration(
-                "provider was not resolved before effect approval".into(),
-            )
-        })?;
-        let messages = self.history_from_snapshot(&after_effect)?;
-        // Finish the remaining calls of this approved batch, then re-enter the
-        // iterative turn loop. The loop re-reads the persisted round counter
-        // itself, so approval/restart resumptions never reset the budget.
-        let outcome = self
-            .execute_tool_batch(
-                after_effect,
-                messages,
-                calls,
-                ordinal.saturating_add(1),
-                round_sequence,
+                format!(
+                    "{turn_id}:permission:{request_id}:{}",
+                    if allow { "allow" } else { "deny" }
+                ),
+                allow,
+                SessionCommandId::from_uuid(Uuid::now_v7()),
                 &lease,
-            )
-            .await?;
-        match outcome {
-            ToolBatchOutcome::Parked(parked) => Ok(parked),
-            ToolBatchOutcome::Completed { snapshot, messages } => {
-                self.run_provider_turn(snapshot, messages, provider.provider, lease)
-                    .await
+                now_ms(),
+            )?;
+            if !allow {
+                // A denial makes the session Ready again: prompts queued
+                // while the turn was parked or running can now run as turns
+                // of their own, so return the post-denial snapshot to the
+                // caller's drain (issue #22).
+                return Ok(resolved);
+            }
+            // The assistant card is the durable, ordered queue for the complete
+            // provider tool round.  Do not reconstruct a new provider turn after
+            // this one approved call: OpenAI-compatible history requires a tool
+            // result for every call in the original assistant message, in order.
+            let started = self.engine.start_session_effect(
+                session_effect_start_request(
+                    &resolved,
+                    request_id.clone(),
+                    format!("{turn_id}:effect:{request_id}:start"),
+                )?,
+                self.engine.session_effect_digest(&request_id)?,
+                &lease,
+                now_ms(),
+            )?;
+            let presentation = started.presentation.clone();
+            // The assistant card is the durable, ordered queue for the complete
+            // provider tool round. The presentation is redacted, but its call ID
+            // is enough to find that queue; executable input remains engine-only.
+            let continuation = (!verification)
+                .then(|| tool_round_for_call(&resolved, &presentation.tool_call_id))
+                .transpose()?;
+            let after_effect = self.execute_and_observe_effect(started, &lease).await?;
+            if after_effect.lifecycle != SessionLifecycle::Running {
+                return Ok(after_effect);
+            }
+            if verification {
+                return self.finish_verification(&after_effect, &presentation, &lease);
+            }
+            let (round_sequence, calls, ordinal) = continuation.ok_or_else(|| {
+                SessionRuntimeError::Effect("provider tool continuation is missing".into())
+            })?;
+            let provider = provider.ok_or_else(|| {
+                SessionRuntimeError::ProviderConfiguration(
+                    "provider was not resolved before effect approval".into(),
+                )
+            })?;
+            let messages = self.history_from_snapshot(&after_effect)?;
+            // Finish the remaining calls of this approved batch, then re-enter the
+            // iterative turn loop. The loop re-reads the persisted round counter
+            // itself, so approval/restart resumptions never reset the budget.
+            let outcome = self
+                .execute_tool_batch(
+                    after_effect,
+                    messages,
+                    calls,
+                    ordinal.saturating_add(1),
+                    round_sequence,
+                    &lease,
+                )
+                .await?;
+            match outcome {
+                ToolBatchOutcome::Parked(parked) => Ok(parked),
+                ToolBatchOutcome::Completed { snapshot, messages } => {
+                    self.run_provider_turn(snapshot, messages, provider.provider, lease)
+                        .await
+                }
+            }
+        }
+        .await;
+        match resumed {
+            Ok(snapshot) => self.drain_mailbox(snapshot, runner).await,
+            Err(error) => {
+                // Keep the queue intake: the durable session state owns the
+                // truth about this turn, and a parked queue must survive a
+                // transient resume failure.
+                runner.mark_closed();
+                Err(error)
             }
         }
     }
@@ -1304,7 +1486,8 @@ impl SessionRuntimeService {
         // sub-second turn TTL) to avoid a spurious `LeaseLost` if the acquire →
         // in-transaction recheck window stalls under load.
         let lease = self.acquire_with_ttl(session_id, self.management_ttl())?;
-        self.engine
+        let terminal = self
+            .engine
             .reconcile_session_effect_unknown(
                 session_id,
                 turn_id,
@@ -1316,7 +1499,22 @@ impl SessionRuntimeService {
                 &lease,
                 now_ms(),
             )
-            .map_err(Into::into)
+            .map_err(SessionRuntimeError::from)?;
+        // Drain's pending-recovery detach keeps a parked queue alive across
+        // the reconciliation window; once the reconcile lands the turn in a
+        // terminal state those prompts can no longer execute, and this path
+        // bypasses drain — so the intake is taken out here with the same
+        // durable audit trace the terminal drain leaves (issue #22). Reuses
+        // the reconcile lease: acquiring a second lease while this one is
+        // held would fail.
+        Ok(self.audit_discarded_queue(
+            &terminal,
+            {
+                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+                mailboxes.remove(&session_id)
+            },
+            &lease,
+        ))
     }
 
     /// Cancellation is explicit. No composer input has a turn ID before start,
@@ -1373,7 +1571,7 @@ impl SessionRuntimeService {
             }
         }
         let lease = self.acquire(session_id)?;
-        self.commit(
+        let snapshot = self.commit(
             session_id,
             turn_id,
             snapshot.revision,
@@ -1383,7 +1581,20 @@ impl SessionRuntimeService {
                 reconciliation_effect_id: None,
             },
             &lease,
-        )
+        )?;
+        // The cancelled turn can no longer execute prompts queued while it
+        // was parked or running — and this path bypasses drain, so the
+        // intake is taken out here with the same durable audit trace the
+        // terminal drain leaves (issue #22). Reuses the cancellation lease:
+        // acquiring a second lease while this one is held would fail.
+        Ok(self.audit_discarded_queue(
+            &snapshot,
+            {
+                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+                mailboxes.remove(&session_id)
+            },
+            &lease,
+        ))
     }
 
     /// Validates the binding, resolves its harness profile, and builds the
@@ -8110,6 +8321,423 @@ mod tests {
                 .any(|entry| entry.kind == TranscriptKind::CompactSummary),
             "a failed summary is never persisted"
         );
+    }
+
+    /// Issue #22 C1: a prompt queued while the turn is parked at an input
+    /// request survives the resume and runs as a turn of its own once the
+    /// answer completes. Mutation anchors: removing the park branch in
+    /// `drain_mailbox` makes the queue call fail (the entry is gone), and
+    /// removing `ensure_runner` from `provide_input` makes the resume fail
+    /// when its drain finds no entry.
+    #[tokio::test]
+    async fn queued_prompt_while_parked_runs_after_input() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some("first done"), vec![]),
+            ProviderResponse {
+                message: None,
+                tool_calls: vec![],
+                input_request: Some(InputRequest {
+                    id: "shape".into(),
+                    prompt: "Which shape?".into(),
+                    secret: false,
+                }),
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+            response(Some("answer done"), vec![]),
+            response(Some("queued done"), vec![]),
+        ]));
+        let service = recording_service(root.path(), engine, provider.clone());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let waiting = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
+        // The park keeps the intake open: the prompt is accepted, not 409ed.
+        let depth = service
+            .queue_follow_up(session_id, "queued while parked".into())
+            .unwrap();
+        assert_eq!(depth, 1);
+        let done = service
+            .provide_input(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                "shape".into(),
+                "the answer".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.lifecycle, SessionLifecycle::Ready);
+        assert!(
+            done.transcript
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("queued done")),
+            "the queued prompt must run as its own turn after the answer"
+        );
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            4,
+            "first turn + parked request + answer + queued turn"
+        );
+    }
+
+    /// Cancelling a parked session bypasses drain, so the cancellation path
+    /// itself must take the intake out and leave the durable audit trace.
+    /// Mutation anchor: removing the audit call from `cancel_durable` fails
+    /// the transcript assertion.
+    #[tokio::test]
+    async fn cancelling_a_parked_session_audits_the_discarded_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some("first done"), vec![]),
+            ProviderResponse {
+                message: None,
+                tool_calls: vec![],
+                input_request: Some(InputRequest {
+                    id: "shape".into(),
+                    prompt: "Which shape?".into(),
+                    secret: false,
+                }),
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+        ]));
+        let service = recording_service(root.path(), engine, provider);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let waiting = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        service
+            .queue_follow_up(session_id, "queued while parked".into())
+            .unwrap();
+        let cancelled = service
+            .cancel_durable(session_id, waiting.revision, test_turn_revision(&waiting))
+            .unwrap();
+        assert_eq!(cancelled.lifecycle, SessionLifecycle::Failed);
+        assert!(
+            cancelled.transcript.entries.iter().any(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("queued follow-up prompt")
+                    && entry.text.contains("failed")
+            }),
+            "the discarded queue must leave a durable audit card"
+        );
+        // The intake is closed and the terminal gate keeps it closed.
+        assert!(
+            service
+                .queue_follow_up(session_id, "after cancel".into())
+                .is_err()
+        );
+        assert!(service.mailboxes.lock().unwrap().get(&session_id).is_none());
+    }
+
+    /// The drain-side twin: when a resumed turn finishes terminally (here a
+    /// provider failure), the queued prompts cannot run and the terminal
+    /// finish must leave the same audit card. Mutation anchor: removing the
+    /// take-and-audit branch from `drain_mailbox` fails the transcript
+    /// assertion.
+    #[tokio::test]
+    async fn terminal_input_finish_audits_the_discarded_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some("first done"), vec![]),
+            ProviderResponse {
+                message: None,
+                tool_calls: vec![],
+                input_request: Some(InputRequest {
+                    id: "shape".into(),
+                    prompt: "Which shape?".into(),
+                    secret: false,
+                }),
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+            // The resumed turn's request asks for a secret input, which the
+            // contract terminalizes (Retryability::Terminal → Failed).
+            ProviderResponse {
+                message: None,
+                tool_calls: vec![],
+                input_request: Some(InputRequest {
+                    id: "secret-ask".into(),
+                    prompt: "secret value".into(),
+                    secret: true,
+                }),
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+        ]));
+        let service = recording_service(root.path(), engine, provider);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let waiting = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        service
+            .queue_follow_up(session_id, "queued while parked".into())
+            .unwrap();
+        let failed = service
+            .provide_input(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                "shape".into(),
+                "the answer".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        assert!(
+            failed.transcript.entries.iter().any(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("queued follow-up prompt")
+            }),
+            "the terminal finish must audit the discarded queue"
+        );
+        assert!(service.mailboxes.lock().unwrap().get(&session_id).is_none());
+    }
+
+    /// The entry gate: a finished session has no turn for a queue to attach
+    /// to — follow-ups are the front door there — so queueing is rejected
+    /// even though a stale entry may exist. Mutation anchor: removing the
+    /// lifecycle gate from `queue_follow_up` makes the residue scenario
+    /// accept (202) a prompt nobody will ever run.
+    #[tokio::test]
+    async fn queue_rejects_a_terminal_session_even_with_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([ProviderResponse {
+            message: None,
+            tool_calls: vec![],
+            // A secret input request terminalizes the first turn.
+            input_request: Some(InputRequest {
+                id: "secret-ask".into(),
+                prompt: "secret value".into(),
+                secret: true,
+            }),
+            usage: crate::provider::ProviderUsage::default(),
+            finish_reason: None,
+            provider_state: None,
+        }]));
+        let service = recording_service(root.path(), engine, provider);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let failed = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        // Residue: an intake entry outliving the terminal turn.
+        service
+            .mailboxes
+            .lock()
+            .unwrap()
+            .insert(session_id, VecDeque::new());
+        assert!(
+            service
+                .queue_follow_up(session_id, "onto a dead session".into())
+                .is_err(),
+            "a terminal session must not accept queued prompts"
+        );
+    }
+
+    /// Drain's pending-recovery detach: a queue parked before a turn enters
+    /// `ReconciliationRequired` must survive the drain untouched — no audit
+    /// card, no entry removal — because the state is pending-recovery, not
+    /// terminal, and an in-flight recovery may still re-enter the provider.
+    /// Regression anchor for the macOS-only reconciliation regression
+    /// (d397c41): on Linux no test walked this path with a non-empty queue,
+    /// so reverting the classification was silently green. Mutation anchor:
+    /// removing `ReconciliationRequired` from the drain keep branch makes
+    /// the audit card appear in the returned snapshot and the entry vanish.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciliation_drain_keeps_the_parked_queue_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(
+                    Some("attempting failed process"),
+                    vec![crate::provider::ToolCall {
+                        id: "failed-process".into(),
+                        name: "process".into(),
+                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                    }],
+                ),
+                response(Some("must not be reached"), vec![]),
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let waiting = service
+            .start(session_id, "run a failed process".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        let depth = service
+            .queue_follow_up(session_id, "queued before reconciliation".into())
+            .unwrap();
+        assert_eq!(depth, 1);
+        let terminal = service
+            .resolve_permission(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
+        assert!(
+            !terminal
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("queued follow-up prompt")),
+            "the pending-recovery drain must not write an audit card"
+        );
+        let parked = service.mailboxes.lock().unwrap().get(&session_id).cloned();
+        assert_eq!(
+            parked.as_ref().map(VecDeque::len),
+            Some(1),
+            "the parked queue must survive the reconciliation drain"
+        );
+    }
+
+    /// Reconciling an unknown effect lands the turn in a terminal state
+    /// (`Failed`) and bypasses drain, so the reconcile path itself must take
+    /// the parked intake out and leave the same durable audit trace (issue
+    /// #22). Mutation anchor: removing the take-and-audit tail from
+    /// `reconcile_unknown_effect` fails both the transcript assertion and
+    /// the entry-absence assertion.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciling_to_failed_discards_and_audits_the_parked_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(
+                    Some("attempting failed process"),
+                    vec![crate::provider::ToolCall {
+                        id: "failed-process".into(),
+                        name: "process".into(),
+                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                    }],
+                ),
+                response(Some("must not be reached"), vec![]),
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let waiting = service
+            .start(session_id, "run a failed process".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        service
+            .queue_follow_up(session_id, "queued before reconciliation".into())
+            .unwrap();
+        let terminal = service
+            .resolve_permission(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
+        let parked = service.mailboxes.lock().unwrap().get(&session_id).cloned();
+        assert_eq!(
+            parked.as_ref().map(VecDeque::len),
+            Some(1),
+            "the parked queue must reach the reconcile alive"
+        );
+        let effect_id = terminal
+            .transcript
+            .entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .payload
+                    .as_ref()?
+                    .get("descriptor")?
+                    .get("effect_id")?
+                    .as_str()
+            })
+            .unwrap()
+            .to_owned();
+        let failed = service
+            .reconcile_unknown_effect(session_id, &effect_id)
+            .unwrap();
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        let card = failed
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("queued follow-up prompt")
+            })
+            .expect("the reconcile discard must leave a durable audit card");
+        let payload = card.payload.as_ref().unwrap();
+        assert_eq!(payload["terminal_lifecycle"].as_str(), Some("failed"));
+        assert_eq!(payload["discarded_queue_len"].as_u64(), Some(1));
+        assert!(service.mailboxes.lock().unwrap().get(&session_id).is_none());
     }
 
     /// The input path compacts on the same contract as a new child: the
