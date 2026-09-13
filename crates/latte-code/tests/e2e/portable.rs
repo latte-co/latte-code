@@ -216,6 +216,360 @@ fn final_binary_compacts_discarded_history_into_a_durable_summary_card() {
     );
 }
 
+/// An input answer compacts on the same contract as a new child: when the
+/// answer makes the history window overflow, the superseded range is
+/// summarized by a dedicated provider request and the fresh `compact_summary`
+/// card is durably persisted from the input commit — on the CAS coordinates
+/// the commit returns — before the turn continues with the generated summary.
+/// The failure twin proves a failed summary degrades instead of failing the
+/// turn: the provider rejects the second summary request, the session still
+/// completes from the un-compacted window, and only an audit card (never a
+/// second `compact_summary` record) reaches the session JSONL.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_summary_fails() {
+    // -- Success: the input path persists its own summary card. --
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion(&"A".repeat(2_000)),
+        // The follow-up compaction summary. Intentionally large: the input
+        // window must overflow again, or the input-path compaction (the
+        // surface under test) never triggers.
+        ProviderReply::completion(&"B".repeat(3_000)),
+        ProviderReply::input_request("shape", "Which shape?", false),
+        ProviderReply::completion("INPUT-PATH-SUMMARY-MARKER"),
+        ProviderReply::completion("input done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, &"x".repeat(3_000), &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    // Queue the second turn while the first is still running: the runner
+    // drains it after completion. If the first turn already finished and
+    // tore its mailbox down, fall back to an explicit follow-up — both
+    // branches converge on the same second turn without racing the runner
+    // teardown (the ready-lifecycle polling window tracked separately).
+    let command_id = "01900000-0000-7000-8000-0000000000c3".to_string();
+    let (queue_status, queue_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "second" })),
+        &[],
+    );
+    if queue_status != 202 {
+        assert_eq!(queue_status, 409, "queue returned {queue_body:?}");
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (f_status, f_body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "second",
+                "expected_session_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up returned {f_body:?}");
+    }
+
+    // The second turn runs its own compaction and parks at the input request.
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_turn_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, turn_revision) =
+        pending.expect("session never reached WaitingInput over HTTP");
+
+    // The oversized answer forces the input window to discard the first
+    // compaction card: the input path summarizes it before continuing.
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "y".repeat(2_000),
+            "expected_session_revision": revision,
+            "expected_turn_revision": turn_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        provider.wait_for_calls(5, std::time::Duration::from_secs(30)),
+        "expected turn1 + follow-up summary + input park + input summary + continuation"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5, "input path must compact exactly once");
+    let followup_summary = serde_json::to_string(&requests[1].body).expect("body serializes");
+    assert!(
+        followup_summary.contains("compacting the earlier history")
+            && followup_summary.contains("xxx"),
+        "the follow-up summary request carries the instructions and the discarded turn"
+    );
+    let input_summary = serde_json::to_string(&requests[3].body).expect("body serializes");
+    assert!(
+        input_summary.contains("compacting the earlier history")
+            && input_summary.contains("BBB")
+            && input_summary.contains("yyy"),
+        "the input summary request covers the prior card and the current answer"
+    );
+    let continuation = serde_json::to_string(&requests[4].body).expect("body serializes");
+    assert!(
+        continuation.contains("INPUT-PATH-SUMMARY-MARKER"),
+        "the input continuation carries the freshly generated summary"
+    );
+    assert!(
+        !continuation.contains("xxx"),
+        "the superseded turn must not re-enter the input continuation"
+    );
+    let mut transcript = String::new();
+    for path in scenario.session_files() {
+        transcript.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    }
+    assert!(
+        transcript.matches("compact_summary").count() >= 2,
+        "both compaction points must persist durable cards"
+    );
+    assert!(
+        transcript.contains("INPUT-PATH-SUMMARY-MARKER"),
+        "the input-path summary text must be durable"
+    );
+    assert!(
+        transcript.contains("superseded_through_sequence"),
+        "each card records the superseded watermark for audit"
+    );
+
+    // -- Failure twin: a rejected summary degrades instead of failing. --
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion(&"A".repeat(2_000)),
+        ProviderReply::completion(&"B".repeat(3_000)),
+        ProviderReply::input_request("color", "Which color?", false),
+        ProviderReply::error(500, "summary backend unavailable"),
+        ProviderReply::completion("degraded done"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) =
+        server.create_session(&workspace_id, &"x".repeat(3_000), &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+    let command_id = "01900000-0000-7000-8000-0000000000d4".to_string();
+    let (queue_status, queue_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "second" })),
+        &[],
+    );
+    if queue_status != 202 {
+        assert_eq!(queue_status, 409, "queue returned {queue_body:?}");
+        let revision = loop {
+            let (_, body) = server.request(
+                "GET",
+                &format!("/v1/sessions/{session_id}"),
+                Some(&server.token),
+                None,
+                &[],
+            );
+            if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+                break body["snapshot"]["revision"].as_u64().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (f_status, f_body) = server.request(
+            "POST",
+            &format!("/v1/sessions/{session_id}/follow-up"),
+            Some(&server.token),
+            Some(&serde_json::json!({
+                "command_id": command_id,
+                "prompt": "second",
+                "expected_session_revision": revision,
+            })),
+            &[("Idempotency-Key", &command_id)],
+        );
+        assert_eq!(f_status, 202, "follow-up returned {f_body:?}");
+    }
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_turn_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, turn_revision) =
+        pending.expect("session never reached WaitingInput over HTTP");
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "z".repeat(2_000),
+            "expected_session_revision": revision,
+            "expected_turn_revision": turn_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        provider.wait_for_calls(5, std::time::Duration::from_secs(30)),
+        "expected turn1 + follow-up summary + input park + failed summary + continuation"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5, "the failed summary must not be retried");
+    let failed_summary = serde_json::to_string(&requests[3].body).expect("body serializes");
+    assert!(
+        failed_summary.contains("compacting the earlier history")
+            && failed_summary.contains("BBB")
+            && failed_summary.contains("zzz"),
+        "the rejected request was the input-path summary attempt"
+    );
+    let continuation = serde_json::to_string(&requests[4].body).expect("body serializes");
+    assert!(
+        continuation.contains("zzz"),
+        "the degraded continuation carries the un-compacted window including the answer"
+    );
+    assert!(
+        !continuation.contains("BBB") && !continuation.contains("xxx"),
+        "the degraded continuation carries neither the discarded card nor the superseded turn"
+    );
+    let mut transcript = String::new();
+    for path in scenario.session_files() {
+        transcript.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    }
+    assert!(
+        transcript.contains("degraded done"),
+        "the degraded turn still completes and its reply is durable"
+    );
+    assert_eq!(
+        transcript.matches("compact_summary").count(),
+        1,
+        "a failed input summary never persists a second card"
+    );
+    assert!(
+        transcript.contains("context compaction failed"),
+        "the failed summary leaves a durable audit card"
+    );
+}
+
 /// Upgrading must not require hand-editing a shipped-old configuration: a user
 /// level `~/.latte/latte-code.jsonc` written by an earlier release still uses
 /// the `thread` settings block. That file is parsed *before* the engine or the
