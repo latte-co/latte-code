@@ -1486,7 +1486,8 @@ impl SessionRuntimeService {
         // sub-second turn TTL) to avoid a spurious `LeaseLost` if the acquire →
         // in-transaction recheck window stalls under load.
         let lease = self.acquire_with_ttl(session_id, self.management_ttl())?;
-        self.engine
+        let terminal = self
+            .engine
             .reconcile_session_effect_unknown(
                 session_id,
                 turn_id,
@@ -1498,7 +1499,22 @@ impl SessionRuntimeService {
                 &lease,
                 now_ms(),
             )
-            .map_err(Into::into)
+            .map_err(SessionRuntimeError::from)?;
+        // Drain's pending-recovery detach keeps a parked queue alive across
+        // the reconciliation window; once the reconcile lands the turn in a
+        // terminal state those prompts can no longer execute, and this path
+        // bypasses drain — so the intake is taken out here with the same
+        // durable audit trace the terminal drain leaves (issue #22). Reuses
+        // the reconcile lease: acquiring a second lease while this one is
+        // held would fail.
+        Ok(self.audit_discarded_queue(
+            &terminal,
+            {
+                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+                mailboxes.remove(&session_id)
+            },
+            &lease,
+        ))
     }
 
     /// Cancellation is explicit. No composer input has a turn ID before start,
@@ -8557,6 +8573,169 @@ mod tests {
                 .is_err(),
             "a terminal session must not accept queued prompts"
         );
+    }
+
+    /// Drain's pending-recovery detach: a queue parked before a turn enters
+    /// `ReconciliationRequired` must survive the drain untouched — no audit
+    /// card, no entry removal — because the state is pending-recovery, not
+    /// terminal, and an in-flight recovery may still re-enter the provider.
+    /// Regression anchor for the macOS-only reconciliation regression
+    /// (d397c41): on Linux no test walked this path with a non-empty queue,
+    /// so reverting the classification was silently green. Mutation anchor:
+    /// removing `ReconciliationRequired` from the drain keep branch makes
+    /// the audit card appear in the returned snapshot and the entry vanish.
+    #[tokio::test]
+    async fn reconciliation_drain_keeps_the_parked_queue_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(
+                    Some("attempting failed process"),
+                    vec![crate::provider::ToolCall {
+                        id: "failed-process".into(),
+                        name: "process".into(),
+                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                    }],
+                ),
+                response(Some("must not be reached"), vec![]),
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let waiting = service
+            .start(session_id, "run a failed process".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        let depth = service
+            .queue_follow_up(session_id, "queued before reconciliation".into())
+            .unwrap();
+        assert_eq!(depth, 1);
+        let terminal = service
+            .resolve_permission(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
+        assert!(
+            !terminal
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("queued follow-up prompt")),
+            "the pending-recovery drain must not write an audit card"
+        );
+        let parked = service.mailboxes.lock().unwrap().get(&session_id).cloned();
+        assert_eq!(
+            parked.as_ref().map(VecDeque::len),
+            Some(1),
+            "the parked queue must survive the reconciliation drain"
+        );
+    }
+
+    /// Reconciling an unknown effect lands the turn in a terminal state
+    /// (`Failed`) and bypasses drain, so the reconcile path itself must take
+    /// the parked intake out and leave the same durable audit trace (issue
+    /// #22). Mutation anchor: removing the take-and-audit tail from
+    /// `reconcile_unknown_effect` fails both the transcript assertion and
+    /// the entry-absence assertion.
+    #[tokio::test]
+    async fn reconciling_to_failed_discards_and_audits_the_parked_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(
+                    Some("attempting failed process"),
+                    vec![crate::provider::ToolCall {
+                        id: "failed-process".into(),
+                        name: "process".into(),
+                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                    }],
+                ),
+                response(Some("must not be reached"), vec![]),
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let waiting = service
+            .start(session_id, "run a failed process".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingPermission);
+        let request_id = match waiting.pending.as_ref().unwrap() {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
+        };
+        service
+            .queue_follow_up(session_id, "queued before reconciliation".into())
+            .unwrap();
+        let terminal = service
+            .resolve_permission(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.lifecycle, SessionLifecycle::ReconciliationRequired);
+        let parked = service.mailboxes.lock().unwrap().get(&session_id).cloned();
+        assert_eq!(
+            parked.as_ref().map(VecDeque::len),
+            Some(1),
+            "the parked queue must reach the reconcile alive"
+        );
+        let effect_id = terminal
+            .transcript
+            .entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .payload
+                    .as_ref()?
+                    .get("descriptor")?
+                    .get("effect_id")?
+                    .as_str()
+            })
+            .unwrap()
+            .to_owned();
+        let failed = service
+            .reconcile_unknown_effect(session_id, &effect_id)
+            .unwrap();
+        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        let card = failed
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("queued follow-up prompt")
+            })
+            .expect("the reconcile discard must leave a durable audit card");
+        let payload = card.payload.as_ref().unwrap();
+        assert_eq!(payload["terminal_lifecycle"].as_str(), Some("failed"));
+        assert_eq!(payload["discarded_queue_len"].as_u64(), Some(1));
+        assert!(service.mailboxes.lock().unwrap().get(&session_id).is_none());
     }
 
     /// The input path compacts on the same contract as a new child: the
