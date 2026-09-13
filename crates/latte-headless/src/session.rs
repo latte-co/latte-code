@@ -1011,7 +1011,7 @@ impl SessionRuntimeService {
     /// the parked queue.
     fn ensure_runner(&self, session_id: SessionId) -> SessionRunnerGuard {
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
-        mailboxes.entry(session_id).or_insert_with(VecDeque::new);
+        mailboxes.entry(session_id).or_default();
         SessionRunnerGuard {
             session_id,
             mailboxes: Arc::clone(&self.mailboxes),
@@ -1096,7 +1096,7 @@ impl SessionRuntimeService {
                     // the audit line.
                     match self.acquire(snapshot.session_id) {
                         Ok(lease) => {
-                            return self.audit_discarded_queue(&snapshot, discarded, &lease);
+                            return Ok(self.audit_discarded_queue(&snapshot, discarded, &lease));
                         }
                         Err(_) => return Ok(snapshot),
                     }
@@ -1119,12 +1119,12 @@ impl SessionRuntimeService {
         snapshot: &SessionSnapshot,
         discarded: Option<VecDeque<String>>,
         lease: &SessionLeaseGuard,
-    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+    ) -> SessionSnapshot {
         let Some(discarded) = discarded.filter(|queue| !queue.is_empty()) else {
-            return Ok(snapshot.clone());
+            return snapshot.clone();
         };
         let Some(turn) = snapshot.turns.last() else {
-            return Ok(snapshot.clone());
+            return snapshot.clone();
         };
         let lifecycle = match snapshot.lifecycle {
             SessionLifecycle::Failed => "failed",
@@ -1132,8 +1132,7 @@ impl SessionRuntimeService {
             SessionLifecycle::ReconciliationRequired => "reconciliation_required",
             _ => "terminal",
         };
-        let audited = self
-            .commit(
+        self.commit(
             snapshot.session_id,
             turn.turn_id,
             snapshot.revision,
@@ -1154,8 +1153,7 @@ impl SessionRuntimeService {
         )
         // The turn is already terminal; losing the audit line must not
         // surface as a failed request.
-        .unwrap_or_else(|_| snapshot.clone());
-        Ok(audited)
+        .unwrap_or_else(|_| snapshot.clone())
     }
 
     /// Persists an explicit provider/model selection for subsequent children.
@@ -1314,6 +1312,7 @@ impl SessionRuntimeService {
     /// prepared approval through the engine Started transaction before any
     /// external operation is invoked; denial terminalizes the prepared effect
     /// without executing it.
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_permission(
         &self,
         session_id: SessionId,
@@ -1559,14 +1558,14 @@ impl SessionRuntimeService {
         // intake is taken out here with the same durable audit trace the
         // terminal drain leaves (issue #22). Reuses the cancellation lease:
         // acquiring a second lease while this one is held would fail.
-        self.audit_discarded_queue(
+        Ok(self.audit_discarded_queue(
             &snapshot,
             {
                 let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
                 mailboxes.remove(&session_id)
             },
             &lease,
-        )
+        ))
     }
 
     /// Validates the binding, resolves its harness profile, and builds the

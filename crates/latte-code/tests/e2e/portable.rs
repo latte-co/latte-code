@@ -3960,9 +3960,10 @@ fn final_binary_server_provides_input_through_http() {
     let (revision, request_id, turn_revision) =
         pending.expect("session never reached WaitingInput over HTTP");
 
-    // Queueing against a session parked on input is timing-dependent (the
-    // runner window may or may not still be open), but must never be a server
-    // error or a 404 (the session IS known and durable at this point).
+    // Issue #22 C1: a parked session keeps its queue intake open, so the
+    // queued prompt is accepted deterministically and runs as its own turn
+    // once the answer completes ("drained the queue" is the third scripted
+    // reply).
     let (queue_status, queue_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/queue"),
@@ -3970,10 +3971,7 @@ fn final_binary_server_provides_input_through_http() {
         Some(&serde_json::json!({ "prompt": "queued while waiting" })),
         &[],
     );
-    assert!(
-        matches!(queue_status, 202 | 409),
-        "unexpected queue status {queue_status}: {queue_body:?}"
-    );
+    assert_eq!(queue_status, 202, "queue returned {queue_body:?}");
 
     // Providing the requested value over HTTP continues the turn to completion.
     let (input_status, input_body) = server.request(
@@ -3991,10 +3989,12 @@ fn final_binary_server_provides_input_through_http() {
     assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
     assert!(input_body["snapshot"].is_object());
 
-    // After input, the session completes. Verify a follow-up without an
+    // After input, the session completes and the queued prompt drains as a
+    // further completion. Verify a follow-up without an
     // Idempotency-Key header succeeds (covers the None idempotency branch
     // in the E2E final binary).
     let mut input_ready = false;
+    let mut drained_text = String::new();
     for _ in 0..200 {
         let (s, b) = server.request(
             "GET",
@@ -4003,12 +4003,21 @@ fn final_binary_server_provides_input_through_http() {
             None,
             &[],
         );
+        drained_text = serde_json::to_string(&b).unwrap_or_default();
         if s == 200 && b["snapshot"]["lifecycle"].as_str() == Some("ready") {
             input_ready = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(
+        input_ready,
+        "the session must finish ready with the queued turn drained: {drained_text}"
+    );
+    assert!(
+        drained_text.contains("drained the queue"),
+        "the prompt queued while parked must have run as its own turn"
+    );
     if input_ready {
         let final_rev = {
             let (_, b) = server.request(
@@ -4037,6 +4046,145 @@ fn final_binary_server_provides_input_through_http() {
             "cancel: {cancel_status}"
         );
     }
+}
+
+/// A terminal finish cannot execute prompts queued while the turn was
+/// parked or running — but the loss must not be silent (issue #22): the
+/// session JSONL carries a durable audit card, the intake closes so later
+/// queue attempts get 409, and the final-binary journey parks at a real
+/// input request, accepts a queue entry, and terminalizes on the provider's
+/// secret input request.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_terminal_finish_audits_the_discarded_queue() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::input_request("input-1", "what value?", false),
+        // The resumed request demands a secret input, which the contract
+        // terminalizes — no retry, no further provider traffic.
+        ProviderReply::input_request("secret-1", "secret value", true),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (create_status, create_body) = server.create_session(&workspace_id, "need input", &binding);
+    assert_eq!(create_status, 202);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+
+    let mut pending = None;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
+            pending = Some((
+                body["snapshot"]["revision"].as_u64().unwrap(),
+                body["snapshot"]["pending"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                body["snapshot"]["pending"]["expected_turn_revision"]
+                    .as_u64()
+                    .unwrap(),
+            ));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (revision, request_id, turn_revision) =
+        pending.expect("session never reached WaitingInput over HTTP");
+
+    // C1: the parked intake is open, so the prompt is accepted.
+    let (queue_status, queue_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "queued while parked" })),
+        &[],
+    );
+    assert_eq!(queue_status, 202, "queue returned {queue_body:?}");
+
+    // The answer resumes the turn, whose next provider request demands a
+    // secret input — a terminal finish that can no longer run the queued
+    // prompt.
+    let (input_status, input_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/input"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "request_id": request_id,
+            "value": "the answer",
+            "expected_session_revision": revision,
+            "expected_turn_revision": turn_revision
+        })),
+        &[],
+    );
+    assert_eq!(input_status, 200, "provide_input returned {input_body:?}");
+
+    let mut failed_body = String::new();
+    let mut failed = false;
+    for _ in 0..200 {
+        let (status, body) = server.request(
+            "GET",
+            &format!("/v1/sessions/{session_id}"),
+            Some(&server.token),
+            None,
+            &[],
+        );
+        if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("failed") {
+            failed = true;
+            failed_body = serde_json::to_string(&body).unwrap_or_default();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(failed, "the session must terminalize: {failed_body}");
+    assert!(
+        failed_body.contains("queued follow-up prompt"),
+        "the discarded queue must leave a durable audit card: {failed_body}"
+    );
+
+    // The intake is closed: a terminal session takes nothing further.
+    let (queue_status, queue_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/queue"),
+        Some(&server.token),
+        Some(&serde_json::json!({ "prompt": "onto a dead session" })),
+        &[],
+    );
+    assert_eq!(queue_status, 409, "queue returned {queue_body:?}");
+
+    // The audit card is durable in the session JSONL, not just in RAM.
+    let mut transcript = String::new();
+    for path in scenario.session_files() {
+        transcript.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    }
+    assert!(
+        transcript.contains("queued follow-up prompt"),
+        "the audit card must be durable in the session JSONL"
+    );
 }
 
 #[test]

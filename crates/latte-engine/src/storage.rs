@@ -8634,8 +8634,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queue_audit_append_is_exempt_only_for_the_latest_terminal_turn() {
-        let (dir, path) = db();
+        let (_dir, path) = db();
         let ids = SystemIdSource::default();
         let store = Storage::open(&path).unwrap();
         // A failed turn clears its active row; the queue-audit exemption must
