@@ -7904,7 +7904,7 @@ mod tests {
     }
 
     /// The input path compacts on the same contract as a new child: the
-    /// ProvideInput commit advances both revisions, so the summary card
+    /// `ProvideInput` commit advances both revisions, so the summary card
     /// CASes on the fresh values and the turn continues from the commit's
     /// returned snapshot. This is the regression test for the review
     /// finding that the append used stale CAS coordinates and silently
@@ -7951,13 +7951,8 @@ mod tests {
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
-        let service = SessionRuntimeService::new(
-            engine,
-            root.path(),
-            tight_policy(),
-            factory,
-        )
-        .with_profile_catalog(compacting_catalog());
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
         let session_id = SessionId::from_uuid(Uuid::now_v7());
         let ready = service
             .start(session_id, "x".repeat(3_000), binding(), None)
@@ -7989,12 +7984,10 @@ mod tests {
         );
         // The input path's summary request carries the card from the new
         // child path plus the superseded prompt text.
-        assert!(
-            matches!(
-                &requests[3][0],
-                Message::System { content } if content.contains("compacting the earlier history")
-            )
-        );
+        assert!(matches!(
+            &requests[3][0],
+            Message::System { content } if content.contains("compacting the earlier history")
+        ));
         assert!(matches!(
             &requests[3][1],
             Message::User { content }
