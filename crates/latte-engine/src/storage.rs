@@ -5229,6 +5229,7 @@ fn transcript_kind_name(kind: TranscriptKind) -> &'static str {
         TranscriptKind::Failure => "failure",
         TranscriptKind::Completion => "completion",
         TranscriptKind::System => "system",
+        TranscriptKind::CompactSummary => "compact_summary",
     }
 }
 

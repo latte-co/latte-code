@@ -1,8 +1,11 @@
 # Harness Profile 抽象设计（v1 薄切片）
 
-状态：**v1 已实现**（类型 + 解析管道 + loop 接线 + 权限天花板，随本 PR 落地）；
-批次 2 未实现：compaction 本体、`/compact`、预算可见性、binding 快照三字段
-（schema 迁移）、config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
+状态：**v1 已实现**（类型 + 解析管道 + loop 接线 + 权限天花板，#18）；
+上下文分层与压缩策略的架构见 [Context 架构](context-design.md)；
+**批次 2 部分实现**（#19 后续切片）：compaction 本体（摘要 turn 替代静默丢弃、
+失败降级审计、JSONL 持久化、`session.compaction.enabled` 配置面）已落地；
+未实现：`/compact` 手动命令、预算可见性、binding 快照三字段（schema 迁移）、
+config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
 日期：2026-09-12
 范围：定义 `HarnessProfile` 的概念位置、核心类型、解析管道、约束边界与首个消费者
 （context compaction）的集成点。工具呈现与 stop 语义是 v2 扩展方向，v1 不含。
@@ -88,14 +91,14 @@ pub struct ContextPolicy {
     pub context_cap_bytes: usize,
     pub max_tool_rounds: Option<u32>,
     pub provider_timeout_ms: u64,
-    // 新增：compaction 配置（v1 声明，行为面随批次 2 落地）
+    // 新增：compaction 配置（策略选择器 + 参数，见 context-design.md §3.3）
     pub compaction: CompactionPolicy,
     // 新增：token 估算参数（见 §3.1 字节/token 取舍）
     pub token_estimate: TokenEstimateParams,
 }
 
 pub struct CompactionPolicy {
-    pub enabled: bool,
+    pub strategy: CompactionStrategy,
     /// 触发阈值：估算上下文占 context_cap_bytes 的比例。
     pub trigger_ratio: u8,            // 例：80
     /// 摘要请求使用的 prompt 槽（见 SystemPromptSpec）。
@@ -165,6 +168,13 @@ impl ProfileCatalog {
 config 顶层可选 `profiles` 段（按 `(provider, model)` 或 `profile_id` 覆盖
 ContextPolicy / prompt 槽位，`deny_unknown_fields`）属于 v2；届时按字段
 presence 语义取代第 2 层的"等于默认值"启发式。
+
+**两套合并口径并存**：预算字段用"config 等于历史默认值则跟随 builtin"，
+compaction 用"config 策略非 Off 则整体取 config、否则取 builtin"。后者避免
+builtin 层死代码且 config 激活即生效；前者保证未触碰字段跟随 builtin 演进。
+新增字段时二选一并在此处记录口径。另：`CompactionPolicy.trigger_ratio` 与
+`summary_prompt_id` 尚无配置面（profile 内部值），但 `validate()` 对非 Off
+策略校验它们——v1 默认值安全；配置面随第二个策略一起补。
 
 ### 4.2 fail-closed 与已持久化 binding 的兼容
 
@@ -239,7 +249,7 @@ profile 的价值由真实消费者逼出形状；v1 的唯一消费者是 compa
    `SessionHistoryPolicy` 的位置改为从 resolved profile 取；config `session` 段
    语义并入 `profiles` 覆盖层（保留一段废弃期，读旧段时 warning）。
 2. **摘要 turn 替代静默丢弃**。窗口构建（`session.rs:1236-1252`）在 break 处记录
-   被丢弃的 segment 范围；当 `compaction.enabled` 且触发条件满足：
+   被丢弃的 segment 范围；当策略为 `SummarizeOnDiscard` 且触发条件满足：
    - 以 `agent.summarize` 槽位 prompt + 被丢弃范围发起一次受限 provider 请求
      （受 `max_summary_source_bytes` 与既有请求超时约束）；
    - 摘要结果写入一条新的 transcript record（新 `TranscriptKind`，JSONL 权威，
