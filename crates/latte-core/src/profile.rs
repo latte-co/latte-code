@@ -49,17 +49,30 @@ impl ProfileVersion {
     pub const V1_0: Self = Self { major: 1, minor: 0 };
 }
 
+/// Data-shaped compaction strategy selector. The loop `match`es this value
+/// and runs the corresponding algorithm; the strategy implementation never
+/// lives in the profile, so profiles stay snapshotable, versionable data.
+/// See `docs/design/context-design.md` §3.3 for the evolution contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    /// History a request window discards is silently superseded — the
+    /// pre-compaction behavior.
+    #[default]
+    Off,
+    /// When the window discards older history, summarize it through the
+    /// `agent.summarize` prompt slot and persist a durable
+    /// `compact_summary` card that supersedes the discarded range.
+    SummarizeOnDiscard,
+}
+
 /// Compaction configuration for one profile.
-///
-/// Declared as part of the v1 profile surface but not yet consumed: the
-/// `enabled` flag is `false` in every shipped profile and the agent loop
-/// keeps its current newest-first window behavior until compaction lands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionPolicy {
-    pub enabled: bool,
-    /// Compaction trigger as a percentage of the context cap estimate.
-    /// Must be in `1..=100` when compaction is enabled.
+    pub strategy: CompactionStrategy,
+    /// Proactive trigger as a percentage of the estimated context-cap use.
+    /// Declared for the v2 proactive policy; not consumed yet.
     pub trigger_ratio: u8,
     /// Prompt slot used for the summarization request.
     pub summary_prompt_id: String,
@@ -70,7 +83,7 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            strategy: CompactionStrategy::Off,
             trigger_ratio: 80,
             summary_prompt_id: AGENT_SUMMARIZE_PROMPT_SLOT.to_owned(),
             max_summary_source_bytes: 32 * 1024,
@@ -162,7 +175,7 @@ impl ContextPolicy {
         if self.token_estimate.bytes_per_token == 0 {
             return Err("bytes_per_token must be nonzero".into());
         }
-        if self.compaction.enabled {
+        if self.compaction.strategy != CompactionStrategy::Off {
             if self.compaction.trigger_ratio == 0 || self.compaction.trigger_ratio > 100 {
                 return Err("compaction trigger_ratio must be in 1..=100 when enabled".into());
             }
@@ -281,23 +294,39 @@ mod tests {
     }
 
     #[test]
-    fn compaction_invariants_only_apply_when_enabled() {
+    fn compaction_invariants_only_apply_to_active_strategies() {
         let mut policy = valid_context();
         policy.compaction.trigger_ratio = 0;
         assert!(
             policy.validate().is_ok(),
-            "disabled compaction is not validated"
+            "an Off strategy is not validated"
         );
-        policy.compaction.enabled = true;
+        policy.compaction.strategy = CompactionStrategy::SummarizeOnDiscard;
         assert!(policy.validate().is_err());
     }
 
     #[test]
-    fn compaction_rejects_enabled_with_empty_summary_slot() {
+    fn compaction_rejects_active_strategy_with_empty_summary_slot() {
         let mut policy = valid_context();
-        policy.compaction.enabled = true;
+        policy.compaction.strategy = CompactionStrategy::SummarizeOnDiscard;
         policy.compaction.summary_prompt_id = "  ".into();
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn compaction_strategy_round_trips_through_serde() {
+        for strategy in [
+            CompactionStrategy::Off,
+            CompactionStrategy::SummarizeOnDiscard,
+        ] {
+            let json = serde_json::to_string(&strategy).expect("serializable");
+            let parsed: CompactionStrategy = serde_json::from_str(&json).expect("parses");
+            assert_eq!(strategy, parsed);
+        }
+        assert!(
+            serde_json::from_str::<CompactionStrategy>("\"elide_everything\"").is_err(),
+            "unknown strategies are rejected at the schema boundary"
+        );
     }
 
     #[test]

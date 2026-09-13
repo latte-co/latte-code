@@ -128,6 +128,94 @@ fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Val
     (body, command_id)
 }
 
+/// With `session.compaction.enabled`, history a follow-up window must
+/// discard is summarized by a dedicated provider request and the summary
+/// persists as a durable `compact_summary` transcript card. The final
+/// binary journey: the first turn's long history falls out of the tight
+/// follow-up window, the second turn carries a summary request followed by
+/// a continuation request holding the generated summary, and the session
+/// JSONL records the compaction card.
+#[test]
+fn final_binary_compacts_discarded_history_into_a_durable_summary_card() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion(&"A".repeat(2_000)),
+        ProviderReply::completion("E2E-COMPACT-SUMMARY-MARKER"),
+        ProviderReply::completion("second answer"),
+    ]);
+    // Tight request budget: the first turn (long prompt + long answer) does
+    // not fit next to the follow-up prompt, forcing a discard — and with
+    // compaction enabled, a summary request.
+    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let first = scenario.output(&["--json", "run", &"x".repeat(3_000)], |command| {
+        command.env("TEST_OPENAI_KEY", "compaction-e2e-key");
+    });
+    assert!(
+        first.status.success(),
+        "first turn failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let session = session_id(&first);
+
+    let second = scenario.output(&["--json", "resume", &session, "second"], |command| {
+        command.env("TEST_OPENAI_KEY", "compaction-e2e-key");
+    });
+    assert!(
+        second.status.success(),
+        "compacted follow-up failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "first turn + summary request + continuation request"
+    );
+    let summary_request = serde_json::to_string(&requests[1].body).expect("body serializes");
+    assert!(
+        summary_request.contains("compacting the earlier history"),
+        "the summary request carries the profile summarize instructions"
+    );
+    assert!(
+        summary_request.contains("xxx"),
+        "the summary request carries the discarded history text"
+    );
+    let continuation = serde_json::to_string(&requests[2].body).expect("body serializes");
+    assert!(
+        continuation.contains("E2E-COMPACT-SUMMARY-MARKER"),
+        "the continuation request carries the generated summary"
+    );
+    assert!(
+        !continuation.contains("xxx"),
+        "the discarded history must not re-enter the continuation request"
+    );
+    let mut transcript = String::new();
+    for path in scenario.session_files() {
+        transcript.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+    }
+    assert!(
+        transcript.contains("\"kind\":\"compact_summary\"")
+            || transcript.contains("\"kind\": \"compact_summary\""),
+        "the compaction card must be durable in the session JSONL"
+    );
+    assert!(
+        transcript.contains("E2E-COMPACT-SUMMARY-MARKER"),
+        "the generated summary text must be durable"
+    );
+}
+
 /// Upgrading must not require hand-editing a shipped-old configuration: a user
 /// level `~/.latte/latte-code.jsonc` written by an earlier release still uses
 /// the `thread` settings block. That file is parsed *before* the engine or the

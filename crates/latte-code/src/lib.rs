@@ -72,6 +72,36 @@ pub struct SessionConfig {
     /// is unrelated to `verification.timeout_ms`, which bounds the verification
     /// command instead.
     pub provider_timeout_ms: u64,
+    /// Context compaction. Disabled by default: when enabled, history a
+    /// request window must discard is summarized by a dedicated bounded
+    /// provider request and the summary persists as a durable
+    /// `compact_summary` transcript card that supersedes the discarded
+    /// entries; a failed summary request degrades to the plain discard and
+    /// records a `system` audit card.
+    #[serde(default)]
+    pub compaction: SessionCompactionConfig,
+}
+
+/// User-facing compaction knobs. Remaining `CompactionPolicy` fields
+/// (`trigger_ratio`, `summary_prompt_id`) are profile-internal in this slice
+/// and have no configuration surface yet.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionCompactionConfig {
+    pub enabled: bool,
+    /// Byte bound on the discarded history one summary request may read.
+    pub max_summary_source_bytes: usize,
+}
+
+impl SessionCompactionConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.max_summary_source_bytes == 0 {
+            return Err(
+                "session.compaction.max_summary_source_bytes must be nonzero when enabled".into(),
+            );
+        }
+        Ok(())
+    }
 }
 impl Default for SessionConfig {
     fn default() -> Self {
@@ -83,6 +113,7 @@ impl Default for SessionConfig {
             context_cap_bytes: defaults.context_cap_bytes,
             max_tool_rounds: defaults.max_tool_rounds,
             provider_timeout_ms: defaults.provider_timeout_ms,
+            compaction: SessionCompactionConfig::default(),
         }
     }
 }
@@ -156,6 +187,11 @@ impl AppConfig {
         }
         .validate()
         .map_err(|error| format!("invalid session configuration: {error}"))?;
+        config
+            .session
+            .compaction
+            .validate()
+            .map_err(|error| format!("invalid session configuration: {error}"))?;
         let merged_text = serde_json::to_string(&merged)
             .map_err(|error| format!("cannot serialize merged configuration: {error}"))?;
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
@@ -1424,9 +1460,24 @@ fn prepare_server(
                         .map_err(|error| error.to_string())
                 });
             let registry = std::sync::Arc::new(registry);
+            let mut base_policy = latte_core::ContextPolicy::from(config.session_policy());
+            // The config surface stays boolean; `enabled` selects the v1
+            // strategy. A dedicated config enum arrives with the second
+            // strategy (see docs/design/context-design.md §3.3).
+            base_policy.compaction.strategy = if config.session.compaction.enabled {
+                latte_core::CompactionStrategy::SummarizeOnDiscard
+            } else {
+                latte_core::CompactionStrategy::Off
+            };
+            base_policy.compaction.max_summary_source_bytes =
+                if config.session.compaction.max_summary_source_bytes == 0 {
+                    base_policy.compaction.max_summary_source_bytes
+                } else {
+                    config.session.compaction.max_summary_source_bytes
+                };
             let profile_catalog = std::sync::Arc::new(
                 latte_headless::profile::ProfileCatalog::new(
-                    latte_core::ContextPolicy::from(config.session_policy()),
+                    base_policy,
                     std::sync::Arc::clone(&registry),
                 )
                 .map_err(|error| error.to_string())?,

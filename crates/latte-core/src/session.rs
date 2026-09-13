@@ -208,6 +208,12 @@ pub enum TranscriptKind {
     Failure,
     Completion,
     System,
+    /// Durable compaction marker: `text` is the provider-generated summary of
+    /// every older transcript entry, which the summary supersedes. Window
+    /// construction treats this card as a boundary — entries older than the
+    /// newest `CompactSummary` never re-enter a provider request, and the
+    /// summary itself travels as an ordinary user-segment message.
+    CompactSummary,
 }
 
 /// A redacted durable transcript card. `payload` is useful for structured

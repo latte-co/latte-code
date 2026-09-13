@@ -245,6 +245,88 @@ struct SessionRunnerGuard {
     closed: bool,
 }
 
+/// One user-segment of the provider history: the messages the request
+/// replays, the bounded plain text a compaction summary is generated from,
+/// and the highest durable sequence folded into the segment.
+struct HistorySegment {
+    messages: Vec<Message>,
+    text: String,
+    max_sequence: u64,
+}
+
+impl HistorySegment {
+    fn new(max_sequence: u64, messages: Vec<Message>, text: String) -> Self {
+        Self {
+            messages,
+            text,
+            max_sequence,
+        }
+    }
+
+    fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
+    fn push_text(&mut self, text: &str, sequence: u64) {
+        self.text.push_str(text);
+        self.max_sequence = self.max_sequence.max(sequence);
+    }
+}
+
+/// The history a request window had to discard: the plain text a compaction
+/// summary is generated from (newest-first, byte-bounded by the profile's
+/// `max_summary_source_bytes`) and the newest durable sequence the summary
+/// supersedes.
+#[derive(Clone)]
+struct SupersededHistory {
+    text: String,
+    through_sequence: u64,
+}
+
+/// A selected request window: the system message, the kept segment messages,
+/// the resolved history policy, and — when the window dropped older history —
+/// what was dropped. `assemble` produces the final provider messages,
+/// optionally prefixing a compaction summary ahead of the kept segments.
+struct HistoryWindow {
+    system: Message,
+    kept: Vec<Message>,
+    policy: SessionHistoryPolicy,
+    superseded: Option<SupersededHistory>,
+}
+
+impl HistoryWindow {
+    fn assemble(&self, summary: Option<&str>) -> Vec<Message> {
+        let mut messages = vec![self.system.clone()];
+        if let Some(summary) = summary {
+            messages.push(Message::User {
+                content: format!(
+                    "Earlier conversation, automatically compacted to this summary:\n\n{summary}"
+                ),
+            });
+        }
+        messages.extend(self.kept.iter().cloned());
+        messages
+    }
+}
+
+/// The outcome of history preparation for one new child.
+enum PreparedHistory {
+    /// Nothing was discarded, or compaction is disabled — the historical
+    /// silent-discard behavior.
+    Complete(Vec<Message>),
+    /// Older history was summarized; the caller persists the durable
+    /// `CompactSummary` card and runs the turn with these messages.
+    Summarized {
+        messages: Vec<Message>,
+        superseded: SupersededHistory,
+        summary: String,
+    },
+    /// Compaction is enabled but the summary request failed (or overflowed
+    /// the budget): degrade to the silent-discard behavior, with a durable
+    /// failure audit card.
+    Degraded(Vec<Message>),
+}
+
 impl SessionRunnerGuard {
     fn mark_closed(&mut self) {
         self.closed = true;
@@ -687,12 +769,17 @@ impl SessionRuntimeService {
             );
             return Err(SessionRuntimeError::InvalidState);
         }
-        let messages = match self.history_with_prompt(&snapshot, &prompt) {
-            Ok(messages) => messages,
+        let prepared = match self.prepare_history(&snapshot, &prompt).await {
+            Ok(prepared) => prepared,
             Err(error) => {
                 signal_accept(accept, Err(classify_create_error(&error)));
                 return Err(error);
             }
+        };
+        let messages = match &prepared {
+            PreparedHistory::Complete(messages)
+            | PreparedHistory::Degraded(messages)
+            | PreparedHistory::Summarized { messages, .. } => messages.clone(),
         };
         let turn_id = new_turn_id();
         let lease = match self.acquire(session_id) {
@@ -736,6 +823,53 @@ impl SessionRuntimeService {
             accept,
             Ok(latte_core::CreateOutcome::Created(started.clone())),
         );
+        // Persist the compaction record before the provider turn runs so a
+        // restart sees the summary (or its failure audit) the in-flight
+        // request was built from. The commit returns the post-append
+        // snapshot and the turn continues from it — the append bumps the
+        // session revision and every later commit CASes on it. A storage
+        // failure here is not fatal: the transcript remains authoritative
+        // and the next turn regenerates the summary deterministically from
+        // it.
+        let started = match &prepared {
+            PreparedHistory::Summarized {
+                superseded,
+                summary,
+                ..
+            } => self
+                .commit(
+                    session_id,
+                    turn_id,
+                    started.revision,
+                    active_turn_revision(&started)?,
+                    CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:compact-summary"),
+                        kind: TranscriptKind::CompactSummary,
+                        text: summary.clone(),
+                        payload: Some(serde_json::json!({
+                            "superseded_through_sequence": superseded.through_sequence,
+                        })),
+                    },
+                    &lease,
+                )
+                .unwrap_or(started),
+            PreparedHistory::Degraded(_) => self
+                .commit(
+                    session_id,
+                    turn_id,
+                    started.revision,
+                    active_turn_revision(&started)?,
+                    CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:compact-summary-failed"),
+                        kind: TranscriptKind::System,
+                        text: "context compaction failed; continuing without a summary".to_owned(),
+                        payload: None,
+                    },
+                    &lease,
+                )
+                .unwrap_or(started),
+            PreparedHistory::Complete(_) => started,
+        };
         let Ok(provider) = (self.provider)(&started.binding) else {
             return self
                 .fail_retryable(
@@ -899,7 +1033,12 @@ impl SessionRuntimeService {
         {
             return Err(SessionRuntimeError::InvalidState);
         }
-        let messages = self.history_with_prompt(&snapshot, &value)?;
+        let prepared = self.prepare_history(&snapshot, &value).await?;
+        let messages = match &prepared {
+            PreparedHistory::Complete(messages)
+            | PreparedHistory::Degraded(messages)
+            | PreparedHistory::Summarized { messages, .. } => messages.clone(),
+        };
         let provider = (self.provider)(&snapshot.binding)
             .map_err(SessionRuntimeError::ProviderConfiguration)?;
         let lease = self.acquire(session_id)?;
@@ -915,6 +1054,48 @@ impl SessionRuntimeService {
             },
             &lease,
         )?;
+        // Same compaction contract as a new child: persist the summary (or
+        // its failure audit) before the provider sees the request. A storage
+        // failure degrades gracefully — the transcript stays authoritative.
+        match &prepared {
+            PreparedHistory::Summarized {
+                superseded,
+                summary,
+                ..
+            } => {
+                let _ = self.commit(
+                    session_id,
+                    turn_id,
+                    running.revision,
+                    turn.turn_revision,
+                    CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:compact-summary"),
+                        kind: TranscriptKind::CompactSummary,
+                        text: summary.clone(),
+                        payload: Some(serde_json::json!({
+                            "superseded_through_sequence": superseded.through_sequence,
+                        })),
+                    },
+                    &lease,
+                );
+            }
+            PreparedHistory::Degraded(_) => {
+                let _ = self.commit(
+                    session_id,
+                    turn_id,
+                    running.revision,
+                    turn.turn_revision,
+                    CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:compact-summary-failed"),
+                        kind: TranscriptKind::System,
+                        text: "context compaction failed; continuing without a summary".to_owned(),
+                        payload: None,
+                    },
+                    &lease,
+                );
+            }
+            PreparedHistory::Complete(_) => {}
+        }
         self.run_provider_turn(running, messages, provider.provider, lease)
             .await
     }
@@ -1192,22 +1373,133 @@ impl SessionRuntimeService {
         prompt: &str,
     ) -> Result<Vec<Message>, SessionRuntimeError> {
         let profile = self.resolved_profile(&snapshot.binding)?;
-        let policy = profile.history_policy();
-        let focus = snapshot.focus.as_deref().map(Path::new);
-        let context = context::build(&self.root, focus, policy.context_cap_bytes)
-            .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
-        let system =
-            Message::System {
-                content: redact_session_text(&profile.system_prompt(&context.text).map_err(
-                    |error| SessionRuntimeError::ProviderConfiguration(error.to_string()),
-                )?),
-            };
-        let mut segments: Vec<Vec<Message>> = Vec::new();
+        let segments = Self::scan_history_segments(snapshot);
+        let window = self.select_history_window(&profile, snapshot, segments, prompt)?;
+        Ok(window.assemble(None))
+    }
+
+    /// Builds the next child's provider history with context compaction:
+    /// when the newest-first window would discard older history and the
+    /// profile enables compaction, the discarded range is summarized by a
+    /// dedicated bounded provider request and travels as one summary user
+    /// message instead of being silently dropped.
+    ///
+    /// The returned [`PreparedHistory`] tells the caller which durable
+    /// compaction record to append once the turn exists: a
+    /// [`TranscriptKind::CompactSummary`] card on success, a failure audit
+    /// card on degradation. Degradation never blocks the turn — it falls
+    /// back to the exact pre-compaction behavior.
+    async fn prepare_history(
+        &self,
+        snapshot: &SessionSnapshot,
+        prompt: &str,
+    ) -> Result<PreparedHistory, SessionRuntimeError> {
+        let profile = self.resolved_profile(&snapshot.binding)?;
+        let segments = Self::scan_history_segments(snapshot);
+        let window = self.select_history_window(&profile, snapshot, segments, prompt)?;
+        let Some(superseded) = window.superseded.as_ref() else {
+            return Ok(PreparedHistory::Complete(window.assemble(None)));
+        };
+        if profile.compaction().strategy == latte_core::CompactionStrategy::Off {
+            // Pre-compaction behavior: silent discard.
+            return Ok(PreparedHistory::Complete(window.assemble(None)));
+        }
+        let Some(summary) = self.summarize_history(snapshot, &superseded.text).await else {
+            return Ok(PreparedHistory::Degraded(window.assemble(None)));
+        };
+        let messages = window.assemble(Some(&summary));
+        // A large summary can overflow the exact budget; compaction must
+        // never make a request less sendable than the plain window, so an
+        // overflowing summary degrades exactly like a failed one.
+        if Self::enforce_budget(messages.clone(), &window.policy).is_err() {
+            return Ok(PreparedHistory::Degraded(window.assemble(None)));
+        }
+        Ok(PreparedHistory::Summarized {
+            messages,
+            superseded: superseded.clone(),
+            summary,
+        })
+    }
+
+    /// Runs the dedicated bounded summary request for context compaction:
+    /// the profile's `agent.summarize` system prompt plus the byte-bounded
+    /// plain text of the discarded history. Any failure — provider error,
+    /// timeout, empty reply — yields `None` and the caller degrades.
+    async fn summarize_history(
+        &self,
+        snapshot: &SessionSnapshot,
+        source_text: &str,
+    ) -> Option<String> {
+        let profile = self.resolved_profile(&snapshot.binding).ok()?;
+        let instructions = profile.summarize_prompt().ok()?;
+        let Ok(provider) = (self.provider)(&snapshot.binding) else {
+            return None;
+        };
+        let cancellation = CancellationToken::new();
+        self.active
+            .lock()
+            .expect("active mutex poisoned")
+            .insert(snapshot.session_id, cancellation.clone());
+        let completed = provider
+            .provider
+            .complete(
+                ProviderRequest {
+                    messages: vec![
+                        Message::System {
+                            content: instructions,
+                        },
+                        Message::User {
+                            content: source_text.to_owned(),
+                        },
+                    ],
+                    tools: Vec::new(),
+                    session_ref: crate::provider::session_ref_for(snapshot.session_id),
+                },
+                ProviderContext {
+                    deadline: Instant::now()
+                        + Duration::from_millis(profile.history_policy().provider_timeout_ms),
+                    cancellation,
+                    events: None,
+                },
+            )
+            .await;
+        self.active
+            .lock()
+            .expect("active mutex poisoned")
+            .remove(&snapshot.session_id);
+        let message = completed.ok()?.message?;
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(redact_session_text(trimmed))
+        }
+    }
+
+    fn scan_history_segments(snapshot: &SessionSnapshot) -> Vec<HistorySegment> {
+        let mut segments: Vec<HistorySegment> = Vec::new();
         for entry in &snapshot.transcript.entries {
             match entry.kind {
-                TranscriptKind::User => segments.push(vec![Message::User {
-                    content: entry.text.clone(),
-                }]),
+                TranscriptKind::User => segments.push(HistorySegment::new(
+                    entry.sequence,
+                    vec![Message::User {
+                        content: entry.text.clone(),
+                    }],
+                    format!("[user]\n{}\n", entry.text),
+                )),
+                TranscriptKind::CompactSummary => {
+                    // The summary supersedes every older entry: window
+                    // construction never re-enters them. The summary itself
+                    // travels as an ordinary user-segment message.
+                    segments.clear();
+                    segments.push(HistorySegment::new(
+                        entry.sequence,
+                        vec![Message::User {
+                            content: entry.text.clone(),
+                        }],
+                        format!("[compacted summary]\n{}\n", entry.text),
+                    ));
+                }
                 TranscriptKind::Assistant => {
                     if let Some(segment) = segments.last_mut() {
                         let tool_calls = entry
@@ -1216,10 +1508,12 @@ impl SessionRuntimeService {
                             .and_then(|payload| payload.get("tool_calls"))
                             .and_then(|calls| serde_json::from_value(calls.clone()).ok())
                             .unwrap_or_default();
-                        segment.push(Message::Assistant {
+                        segment.push_message(Message::Assistant {
                             content: Some(entry.text.clone()),
                             tool_calls,
                         });
+                        segment
+                            .push_text(&format!("[assistant]\n{}\n", entry.text), entry.sequence);
                     }
                 }
                 TranscriptKind::ToolResult => {
@@ -1240,9 +1534,9 @@ impl SessionRuntimeService {
                         // never declared; replaying one makes every later turn
                         // of the Session a protocol violation the Provider
                         // rejects outright.
-                        && declared_tool_call(segment, tool_call_id)
+                        && declared_tool_call(&segment.messages, tool_call_id)
                     {
-                        segment.push(Message::Tool {
+                        segment.push_message(Message::Tool {
                             tool_call_id: tool_call_id.into(),
                             name: payload
                                 .get("name")
@@ -1250,6 +1544,7 @@ impl SessionRuntimeService {
                                 .map(str::to_owned),
                             content: content.into(),
                         });
+                        segment.push_text(&format!("[tool]\n{content}\n"), entry.sequence);
                     }
                 }
                 TranscriptKind::Failure
@@ -1266,7 +1561,7 @@ impl SessionRuntimeService {
                     // bounded non-execution results for every unobserved call
                     // when constructing the next child's provider history.
                     if let Some(segment) = segments.last_mut() {
-                        append_denied_tool_results(segment);
+                        append_denied_tool_results(&mut segment.messages);
                     }
                 }
                 // ToolCall cards describe the engine ledger rather than a
@@ -1280,15 +1575,40 @@ impl SessionRuntimeService {
                 | TranscriptKind::System => {}
             }
         }
-        segments.push(vec![Message::User {
-            content: redact_session_text(prompt),
-        }]);
+        segments
+    }
+
+    fn select_history_window(
+        &self,
+        profile: &ResolvedProfile,
+        snapshot: &SessionSnapshot,
+        mut segments: Vec<HistorySegment>,
+        prompt: &str,
+    ) -> Result<HistoryWindow, SessionRuntimeError> {
+        let policy = profile.history_policy();
+        let focus = snapshot.focus.as_deref().map(Path::new);
+        let context = context::build(&self.root, focus, policy.context_cap_bytes)
+            .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
+        let system =
+            Message::System {
+                content: redact_session_text(&profile.system_prompt(&context.text).map_err(
+                    |error| SessionRuntimeError::ProviderConfiguration(error.to_string()),
+                )?),
+            };
+        segments.push(HistorySegment::new(
+            u64::MAX,
+            vec![Message::User {
+                content: redact_session_text(prompt),
+            }],
+            String::new(),
+        ));
         let budget = policy.budget()?;
-        let mut selected = Vec::new();
-        for segment in segments.into_iter().rev() {
-            let mut candidate = Vec::with_capacity(selected.len() + segment.len() + 1);
+        let mut selected: Vec<Message> = Vec::new();
+        let mut kept = 0usize;
+        for segment in segments.iter().rev() {
+            let mut candidate = Vec::with_capacity(selected.len() + segment.messages.len() + 1);
             candidate.push(system.clone());
-            candidate.extend(segment.iter().cloned());
+            candidate.extend(segment.messages.iter().cloned());
             candidate.extend(selected.iter().cloned());
             if wire_bytes(&candidate)? > budget {
                 if selected.is_empty() {
@@ -1298,13 +1618,48 @@ impl SessionRuntimeService {
                 }
                 break;
             }
-            let mut next = segment;
+            let mut next = segment.messages.clone();
             next.extend(selected);
             selected = next;
+            kept += 1;
         }
-        let mut messages = vec![system];
-        messages.extend(selected);
-        Self::enforce_budget(messages, &policy)
+        let superseded = (kept < segments.len()).then(|| {
+            // The discarded range is the contiguous older prefix of the
+            // chronological segments (the loop drops from the oldest side).
+            let discarded = &segments[..segments.len() - kept];
+            let through_sequence = discarded
+                .last()
+                .map(|segment| segment.max_sequence)
+                .unwrap_or_default();
+            let mut bound = profile.compaction().max_summary_source_bytes;
+            let mut parts: Vec<&str> = Vec::new();
+            for segment in discarded.iter().rev() {
+                if bound == 0 {
+                    break;
+                }
+                let take = segment.text.len().min(bound);
+                let mut text = segment.text.as_str();
+                if take < text.len() {
+                    let mut cut = take;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text = &text[..cut];
+                }
+                bound -= text.len();
+                parts.push(text);
+            }
+            SupersededHistory {
+                text: parts.concat(),
+                through_sequence,
+            }
+        });
+        Ok(HistoryWindow {
+            system,
+            kept: selected,
+            policy,
+            superseded,
+        })
     }
 
     fn enforce_budget(
@@ -2510,6 +2865,10 @@ mod tests {
     struct RecordingProvider {
         responses: Mutex<std::collections::VecDeque<ProviderResponse>>,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        /// When set, the Nth request (zero-based) fails with a transport
+        /// error instead of consuming a scripted response — used to force
+        /// summary-request failures in the compaction tests.
+        fail_request_index: Mutex<Option<usize>>,
     }
 
     impl RecordingProvider {
@@ -2517,7 +2876,12 @@ mod tests {
             Self {
                 responses: Mutex::new(values.into_iter().collect()),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                fail_request_index: Mutex::new(None),
             }
+        }
+
+        fn fail_request(&self, index: usize) {
+            *self.fail_request_index.lock().unwrap() = Some(index);
         }
     }
 
@@ -2527,8 +2891,17 @@ mod tests {
             request: ProviderRequest,
             _: ProviderContext,
         ) -> crate::provider::ProviderFuture<'_> {
-            self.requests.lock().unwrap().push(request.messages);
-            let response = self.responses.lock().unwrap().pop_front();
+            let index = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.messages);
+                requests.len() - 1
+            };
+            let forced_failure = *self.fail_request_index.lock().unwrap() == Some(index);
+            let response = if forced_failure {
+                None
+            } else {
+                self.responses.lock().unwrap().pop_front()
+            };
             Box::pin(async move {
                 response
                     .ok_or_else(|| ProviderError::Malformed("recording provider exhausted".into()))
@@ -2589,9 +2962,10 @@ mod tests {
                     .map(|index| (Duration::ZERO, simple_response(&format!("answer-{index}")))),
             ),
         ));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -2663,9 +3037,10 @@ mod tests {
             (Duration::ZERO, simple_response("three")),
             (Duration::ZERO, simple_response("four")),
         ]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -2997,9 +3372,10 @@ mod tests {
         policy: SessionHistoryPolicy,
     ) -> SessionRuntimeService {
         let provider = Arc::new(FakeProvider::scripted(responses));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -3101,9 +3477,10 @@ mod tests {
         responses: impl IntoIterator<Item = (Duration, ProviderResponse)>,
     ) -> SessionRuntimeService {
         let provider = Arc::new(DelayedProvider::scripted(responses));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6378,9 +6755,10 @@ mod tests {
             ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6420,9 +6798,10 @@ mod tests {
             ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6466,9 +6845,10 @@ mod tests {
             ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6536,9 +6916,10 @@ mod tests {
             ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6574,9 +6955,10 @@ mod tests {
             ..SessionHistoryPolicy::default()
         };
         let provider = Arc::new(FakeProvider::scripted([response(Some("x"), vec![])]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -6727,9 +7109,10 @@ mod tests {
             finish_reason: None,
             provider_state: None,
         }]));
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -7020,9 +7403,10 @@ mod tests {
             Arc::new(move |_session_id, progress| observed.lock().unwrap().push(progress))
         };
         let provider = Arc::new(EventProvider);
+        let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
-                provider: provider.clone(),
+                provider: factory_provider.clone(),
                 binding: crate::registry::ProviderBinding::direct(&[]),
             })
         });
@@ -7223,5 +7607,335 @@ mod tests {
         // A snapshot without any active run also fails.
         snapshot.active_turn_id = None;
         assert!(session_effect_request(&snapshot, descriptor, "k".into()).is_err());
+    }
+
+    /// A catalog whose profile enables compaction with a tight request
+    /// budget, so a long first turn is forced out of the follow-up window.
+    fn compacting_catalog() -> Arc<ProfileCatalog> {
+        Arc::new(ProfileCatalog::without_registry(ContextPolicy {
+            max_request_bytes: 5_600,
+            max_input_bytes: 5_600,
+            reserved_output_bytes: 1,
+            context_cap_bytes: 64 * 1024,
+            max_tool_rounds: None,
+            provider_timeout_ms: 60_000,
+            compaction: latte_core::CompactionPolicy {
+                strategy: latte_core::CompactionStrategy::SummarizeOnDiscard,
+                ..latte_core::CompactionPolicy::default()
+            },
+            token_estimate: latte_core::TokenEstimateParams::default(),
+        }))
+    }
+
+    fn tight_policy() -> SessionHistoryPolicy {
+        SessionHistoryPolicy {
+            max_request_bytes: 5_600,
+            max_input_bytes: 5_600,
+            reserved_output_bytes: 1,
+            context_cap_bytes: 64 * 1024,
+            ..SessionHistoryPolicy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_enabled_follow_up_summarizes_discarded_history() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"A".repeat(2_000)), vec![]),
+            response(Some("COMPACT-SUMMARY-MARKER"), vec![]),
+            response(Some("second done"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let snapshot = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3, "start + summarize + continuation");
+        // The summarize request: profile summarize instructions plus the
+        // bounded plain text of the discarded first segment.
+        assert!(
+            matches!(
+                &requests[1][0],
+                Message::System { content } if content.contains("compacting the earlier history")
+            ),
+            "summarize request must carry the profile summarize slot"
+        );
+        assert!(
+            matches!(
+                &requests[1][1],
+                Message::User { content } if content.contains("xxx") && content.contains("AAA")
+            ),
+            "summarize request must carry the discarded history text"
+        );
+        // The continuation request carries the durable summary instead of the
+        // discarded segment.
+        assert!(
+            requests[2].iter().any(|message| matches!(
+                message,
+                Message::User { content } if content.contains("COMPACT-SUMMARY-MARKER")
+            )),
+            "continuation must carry the generated summary"
+        );
+        assert!(
+            !requests[2].iter().any(
+                |message| matches!(message, Message::User { content } if content.contains("xxx"))
+            ),
+            "discarded history must not re-enter the continuation request"
+        );
+        // The durable compaction card records the summary and the superseded
+        // sequence watermark.
+        let card = snapshot
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.kind == TranscriptKind::CompactSummary)
+            .expect("compact summary card must be durable");
+        assert_eq!(card.text, "COMPACT-SUMMARY-MARKER");
+        assert!(
+            card.payload
+                .as_ref()
+                .and_then(|payload| payload.get("superseded_through_sequence"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|sequence| sequence >= 1),
+            "superseded watermark must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_disabled_keeps_the_silent_discard_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"A".repeat(2_000)), vec![]),
+            response(Some("second done"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        // No profile catalog: the base policy keeps compaction disabled —
+        // the exact pre-compaction behavior.
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let snapshot = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            2,
+            "no summary request without compaction"
+        );
+        assert!(
+            !snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "no compaction card without compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_overflow_degrades_with_a_durable_audit() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"A".repeat(2_000)), vec![]),
+            response(Some(&"X".repeat(6_000)), vec![]),
+            response(Some("second done"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let snapshot = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            3,
+            "the summary request is still attempted"
+        );
+        assert!(
+            !snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "an overflowing summary is never persisted"
+        );
+        assert!(
+            snapshot.transcript.entries.iter().any(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("context compaction failed")
+            }),
+            "degradation must leave a durable audit card"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_failure_degrades_with_a_durable_audit() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"A".repeat(2_000)), vec![]),
+            response(Some("second done"), vec![]),
+        ]));
+        // The summarize request (index 1, right after the first turn)
+        // fails; the continuation request (index 2) consumes the scripted
+        // response.
+        provider.fail_request(1);
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let snapshot = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert!(
+            snapshot.transcript.entries.iter().any(|entry| {
+                entry.kind == TranscriptKind::System
+                    && entry.text.contains("context compaction failed")
+            }),
+            "a failed summary must degrade with a durable audit card"
+        );
+        assert!(
+            !snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "a failed summary is never persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_summary_card_supersedes_older_history_in_later_windows() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"A".repeat(2_000)), vec![]),
+            response(Some("COMPACT-SUMMARY-MARKER"), vec![]),
+            response(Some("second done"), vec![]),
+            response(Some("third done"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let second = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        service
+            .follow_up(session_id, second.revision, "third".into())
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            4,
+            "no new summary request: nothing discarded"
+        );
+        let continuation = &requests[3];
+        assert!(
+            continuation.iter().any(|message| matches!(
+                message,
+                Message::User { content } if content.contains("COMPACT-SUMMARY-MARKER")
+            )),
+            "the summary travels into every later window"
+        );
+        assert!(
+            continuation.iter().any(|message| matches!(
+                message,
+                Message::Assistant { content: Some(text), .. } if text.contains("second done")
+            )),
+            "post-card history stays in the window"
+        );
+        assert!(
+            !continuation.iter().any(|message| matches!(
+                message,
+                Message::User { content } if content.trim() == "second"
+            )),
+            "the superseded prompt travels only inside the summary"
+        );
+        assert!(
+            !continuation.iter().any(|message| matches!(
+                message,
+                Message::User { content } if content.contains("xxx")
+            )),
+            "pre-summary history is permanently superseded"
+        );
     }
 }

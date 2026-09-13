@@ -22,8 +22,9 @@
 use std::sync::Arc;
 
 use latte_core::{
-    AGENT_SYSTEM_PROMPT_SLOT, CompactionPolicy, ContextPolicy, GENERIC_OPENAI_CHAT_PROFILE_ID,
-    HarnessProfile, ProfileVersion, SessionProviderBinding, SystemPromptSpec, TokenEstimateParams,
+    AGENT_SUMMARIZE_PROMPT_SLOT, AGENT_SYSTEM_PROMPT_SLOT, CompactionPolicy, CompactionStrategy,
+    ContextPolicy, GENERIC_OPENAI_CHAT_PROFILE_ID, HarnessProfile, ProfileVersion,
+    SessionProviderBinding, SystemPromptSpec, TokenEstimateParams,
 };
 use sha2::{Digest, Sha256};
 
@@ -60,6 +61,12 @@ const BUILTIN_PROVIDER_TYPES: [&str; 3] = ["openai-chat", "embedded", "test"];
 /// catalog today, so the concrete value only names the builtin family.
 const DEFAULT_BUILTIN_PROVIDER_TYPE: &str = "openai-chat";
 
+/// The builtin summarization instruction used when context compaction
+/// replaces discarded history with a durable summary. It travels as the
+/// system message of a dedicated provider request whose user message is the
+/// discarded transcript plain text.
+const AGENT_SUMMARIZE_PROMPT_TEMPLATE: &str = "You are compacting the earlier history of a coding-agent conversation that no longer fits its request budget. Produce a terse factual summary of the transcript below so a fresh model instance can continue the work without the original turns.\n\nPreserve, in this priority order: the user's goal and any corrections to it; every decision made and its reason; every file path, command, and verification result that is still relevant; open questions and unfinished work. Omit small talk, retries, and superseded attempts. Do not invent anything that is not in the transcript. Reply with the summary only.\n\nTranscript:\n";
+
 fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> {
     if !BUILTIN_PROVIDER_TYPES.contains(&provider_type) {
         return Err(ProfileError::UnknownProviderType {
@@ -76,10 +83,16 @@ fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> 
         ..ContextPolicy::default()
     };
     let prompts = SystemPromptSpec {
-        slots: [(
-            AGENT_SYSTEM_PROMPT_SLOT.to_owned(),
-            AGENT_SYSTEM_PROMPT_TEMPLATE.to_owned(),
-        )]
+        slots: [
+            (
+                AGENT_SYSTEM_PROMPT_SLOT.to_owned(),
+                AGENT_SYSTEM_PROMPT_TEMPLATE.to_owned(),
+            ),
+            (
+                AGENT_SUMMARIZE_PROMPT_SLOT.to_owned(),
+                AGENT_SUMMARIZE_PROMPT_TEMPLATE.to_owned(),
+            ),
+        ]
         .into_iter()
         .collect(),
     };
@@ -137,7 +150,14 @@ fn layer_budget(builtin: &ContextPolicy, base: &ContextPolicy) -> ContextPolicy 
         } else {
             base.provider_timeout_ms
         },
-        compaction: builtin.compaction.clone(),
+        // Compaction: a non-Off config strategy wins (and brings its own
+        // bounds); an Off config keeps the builtin strategy. The token
+        // estimate has no configuration surface and stays a builtin concern.
+        compaction: if matches!(base.compaction.strategy, CompactionStrategy::Off) {
+            builtin.compaction.clone()
+        } else {
+            base.compaction.clone()
+        },
         token_estimate: builtin.token_estimate.clone(),
     }
 }
@@ -308,6 +328,28 @@ impl ResolvedProfile {
             })
     }
 
+    /// The profile's compaction policy.
+    #[must_use]
+    pub fn compaction(&self) -> &CompactionPolicy {
+        &self.profile.context.compaction
+    }
+
+    /// Renders the `agent.summarize` prompt slot used as the system message
+    /// of a compaction summary request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Invalid`] when the profile lacks the slot.
+    pub fn summarize_prompt(&self) -> Result<String, ProfileError> {
+        self.profile
+            .prompts
+            .render(AGENT_SUMMARIZE_PROMPT_SLOT, "")
+            .ok_or_else(|| ProfileError::Invalid {
+                profile_id: self.profile.profile_id.clone(),
+                reason: format!("missing prompt slot `{AGENT_SUMMARIZE_PROMPT_SLOT}`"),
+            })
+    }
+
     /// Stable content fingerprint of the resolved profile data. Equal
     /// fingerprints guarantee equal behavioral parameters.
     #[must_use]
@@ -466,6 +508,48 @@ mod tests {
             ..ContextPolicy::default()
         };
         assert_eq!(layer_budget(&drifted, &base).max_request_bytes, 256 * 1024);
+    }
+
+    /// The builtin profile carries both prompt slots; the summarize slot is
+    /// the system message of compaction summary requests.
+    #[test]
+    fn builtin_profile_defines_the_summarize_slot() {
+        let resolved = catalog(ContextPolicy::default(), minimal_registry())
+            .resolve(&binding("openai-chat", "m"))
+            .expect("resolves");
+        let prompt = resolved.summarize_prompt().expect("slot exists");
+        assert!(prompt.contains("compacting the earlier history"));
+        assert_eq!(
+            resolved.compaction().strategy,
+            CompactionStrategy::Off,
+            "builtin compaction is off"
+        );
+        assert!(resolved.compaction().max_summary_source_bytes > 0);
+    }
+
+    /// The config layer can activate a compaction strategy; the layering
+    /// must not drop an active strategy the way it drops untouched budget
+    /// overrides.
+    #[test]
+    fn layer_budget_carries_an_active_compaction_strategy() {
+        let builtin = builtin_profile("openai-chat").expect("builtin");
+        let base = ContextPolicy {
+            compaction: CompactionPolicy {
+                strategy: CompactionStrategy::SummarizeOnDiscard,
+                max_summary_source_bytes: 4_096,
+                ..CompactionPolicy::default()
+            },
+            ..ContextPolicy::default()
+        };
+        let layered = layer_budget(&builtin.context, &base);
+        assert_eq!(
+            layered.compaction.strategy,
+            CompactionStrategy::SummarizeOnDiscard
+        );
+        assert_eq!(layered.compaction.max_summary_source_bytes, 4_096);
+        // An Off base keeps the builtin policy (which is also Off).
+        let layered_default = layer_budget(&builtin.context, &ContextPolicy::default());
+        assert_eq!(layered_default.compaction.strategy, CompactionStrategy::Off);
     }
 
     /// Fixture bindings with `provider_type = "test"` are part of the
