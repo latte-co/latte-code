@@ -39,6 +39,79 @@ fn verification_fragment() -> &'static str {
     }
 }
 
+fn session_id(output: &std::process::Output) -> String {
+    json(output)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A model's declared `context_window` must tighten the repository context
+/// the final binary actually sends: with a tiny window the workspace context
+/// (here: an `AGENTS.md` marker) is truncated out of the provider request,
+/// while the same workspace without the declaration sends it in full. This
+/// is the user-observable surface of harness profile resolution.
+#[test]
+fn declared_context_window_tightens_repository_context_in_final_binary() {
+    let marker = "profile-e2e-context-marker-0123456789".repeat(8);
+    // Control: the default configuration sends the bounded workspace
+    // context (marker included) to the provider.
+    let control = Scenario::new();
+    std::fs::write(control.root().join("AGENTS.md"), &marker).unwrap();
+    let control_provider = ScriptedProvider::start([ProviderReply::completion("control done")]);
+    control.write_config(
+        control_provider.endpoint(),
+        r#"["verification-must-not-run"]"#,
+    );
+    let control_run = control.output(&["--json", "run", "control turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "profile-e2e-key");
+    });
+    assert!(
+        control_run.status.success(),
+        "control run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&control_run.stdout),
+        String::from_utf8_lossy(&control_run.stderr)
+    );
+    let control_body =
+        serde_json::to_string(&control_provider.requests()[0].body).expect("body serializes");
+    assert!(
+        control_body.contains(&marker),
+        "without a declared window the workspace context must reach the provider"
+    );
+
+    // Treatment: declaring `context_window: 1` derives a byte cap of
+    // `1 token * 4 bytes/token` which truncates the repository context
+    // before egress; the marker can no longer appear in the request.
+    let treated = Scenario::new();
+    std::fs::write(treated.root().join("AGENTS.md"), &marker).unwrap();
+    let treated_provider = ScriptedProvider::start([ProviderReply::completion("treated done")]);
+    std::fs::create_dir_all(treated.root().join(".latte")).unwrap();
+    std::fs::write(
+        treated.root().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:{{mock:{{options:{{context_window:1}}}}}},endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#,
+            treated_provider.endpoint()
+        ),
+    )
+    .unwrap();
+    let treated_run = treated.output(&["--json", "run", "treated turn"], |command| {
+        command.env("TEST_OPENAI_KEY", "profile-e2e-key");
+    });
+    assert!(
+        treated_run.status.success(),
+        "run with a declared context window failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&treated_run.stdout),
+        String::from_utf8_lossy(&treated_run.stderr)
+    );
+    assert_eq!(treated_provider.requests().len(), 1);
+    let treated_body =
+        serde_json::to_string(&treated_provider.requests()[0].body).expect("body serializes");
+    assert!(
+        !treated_body.contains(&marker),
+        "a declared context_window must tighten the repository context before egress"
+    );
+}
+
 /// A create-session request body carrying the client-generated `session_id`
 /// and `command_id` the crash-safe contract now requires, plus the matching
 /// `Idempotency-Key` header value. `prompt`/`binding` are the only per-test
@@ -53,13 +126,6 @@ fn create_request(prompt: &str, binding: &serde_json::Value) -> (serde_json::Val
         "binding": binding,
     });
     (body, command_id)
-}
-
-fn session_id(output: &std::process::Output) -> String {
-    json(output)["data"]["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned()
 }
 
 /// Upgrading must not require hand-editing a shipped-old configuration: a user

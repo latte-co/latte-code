@@ -1423,12 +1423,21 @@ fn prepare_server(
                         .resolve_session_bound(binding, &factory_engine.tool_descriptors())
                         .map_err(|error| error.to_string())
                 });
+            let registry = std::sync::Arc::new(registry);
+            let profile_catalog = std::sync::Arc::new(
+                latte_headless::profile::ProfileCatalog::new(
+                    latte_core::ContextPolicy::from(config.session_policy()),
+                    std::sync::Arc::clone(&registry),
+                )
+                .map_err(|error| error.to_string())?,
+            );
             let runtime = latte_headless::session::SessionRuntimeService::new(
                 engine.clone(),
                 workspace_root,
                 config.session_policy(),
                 factory,
             )
+            .with_profile_catalog(profile_catalog)
             .with_verification(config.plan());
             let runtime = match server_lease_ttl_ms() {
                 Some(ttl_ms) => runtime.with_lease_ttl_ms(ttl_ms),
@@ -1437,7 +1446,7 @@ fn prepare_server(
             Ok(latte_server::BuiltWorkspace {
                 engine,
                 runtime,
-                registry: std::sync::Arc::new(registry),
+                registry,
             })
         });
 

@@ -6,6 +6,7 @@
 
 use crate::{
     context,
+    profile::{ProfileCatalog, ResolvedProfile},
     provider::{
         Message, Provider, ProviderContext, ProviderError, ProviderEvent, ProviderEventSink,
         ProviderRequest, valid_tool_call_id,
@@ -14,7 +15,7 @@ use crate::{
     runtime::VerificationPlan,
 };
 use latte_core::{
-    FailureCode, Retryability, SessionCommandId, SessionId, SessionLifecycle,
+    ContextPolicy, FailureCode, Retryability, SessionCommandId, SessionId, SessionLifecycle,
     SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptKind, TurnFailure,
     TurnId, redact_session_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
 };
@@ -224,7 +225,7 @@ pub enum SessionRuntimeError {
 pub struct SessionRuntimeService {
     engine: EngineHandle,
     root: PathBuf,
-    policy: SessionHistoryPolicy,
+    profiles: Arc<ProfileCatalog>,
     provider: SessionProviderFactory,
     active: Arc<Mutex<HashMap<SessionId, CancellationToken>>>,
     mailboxes: Arc<Mutex<HashMap<SessionId, VecDeque<String>>>>,
@@ -286,7 +287,9 @@ impl SessionRuntimeService {
         Self {
             engine,
             root: root.as_ref().to_owned(),
-            policy,
+            profiles: Arc::new(ProfileCatalog::without_registry(ContextPolicy::from(
+                policy,
+            ))),
             provider,
             active: Arc::new(Mutex::new(HashMap::new())),
             mailboxes: Arc::new(Mutex::new(HashMap::new())),
@@ -294,6 +297,29 @@ impl SessionRuntimeService {
             verification: None,
             lease_ttl_ms: 60_000,
         }
+    }
+
+    /// Attaches a registry-backed harness profile catalog. Without one the
+    /// service resolves the built-in profile over the constructor's base
+    /// policy and per-model `context_window` tightening is unavailable;
+    /// production composition roots pass the catalog built from the same
+    /// registry that resolves providers.
+    #[must_use]
+    pub fn with_profile_catalog(mut self, catalog: Arc<ProfileCatalog>) -> Self {
+        self.profiles = catalog;
+        self
+    }
+
+    /// Resolves the harness profile for one binding. Fail-closed: an
+    /// unresolvable provider type is a typed error, never a silent
+    /// fallback to defaults.
+    fn resolved_profile(
+        &self,
+        binding: &SessionProviderBinding,
+    ) -> Result<ResolvedProfile, SessionRuntimeError> {
+        self.profiles
+            .resolve(binding)
+            .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))
     }
 
     /// Connects typed transient provider progress to an interactive frontend.
@@ -430,17 +456,7 @@ impl SessionRuntimeService {
             >,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
-        if let Err(error) = binding
-            .validate()
-            .map_err(SessionRuntimeError::ProviderConfiguration)
-        {
-            signal_accept(
-                accept,
-                Err(latte_core::CreateAcceptError::Failed(error.to_string())),
-            );
-            return Err(error);
-        }
-        let messages = match self.initial_messages(&prompt, focus) {
+        let messages = match self.preflight_messages(&binding, &prompt, focus) {
             Ok(messages) => messages,
             Err(error) => {
                 signal_accept(
@@ -747,7 +763,14 @@ impl SessionRuntimeService {
         session_id: SessionId,
         prompt: String,
     ) -> Result<usize, SessionRuntimeError> {
-        let _ = self.initial_messages(&prompt, None)?;
+        // Eager pre-validation against the base policy only; the
+        // authoritative binding-aware budget check happens when the runner
+        // reaches the next child boundary.
+        let profile = self
+            .profiles
+            .resolve_base()
+            .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))?;
+        let _ = self.initial_messages(&profile, &prompt, None)?;
         let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
         let mailbox = mailboxes
             .get_mut(&session_id)
@@ -1122,21 +1145,45 @@ impl SessionRuntimeService {
         )
     }
 
-    fn initial_messages(
+    /// Validates the binding, resolves its harness profile, and builds the
+    /// first request messages. Shared preflight for session creation; any
+    /// failure is durable-safe (nothing has been persisted yet).
+    fn preflight_messages(
         &self,
+        binding: &SessionProviderBinding,
         prompt: &str,
         focus: Option<&Path>,
     ) -> Result<Vec<Message>, SessionRuntimeError> {
-        let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
+        binding
+            .validate()
+            .map_err(SessionRuntimeError::ProviderConfiguration)?;
+        let profile = self.resolved_profile(binding)?;
+        self.initial_messages(&profile, prompt, focus)
+    }
+
+    fn initial_messages(
+        &self,
+        profile: &ResolvedProfile,
+        prompt: &str,
+        focus: Option<&Path>,
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
+        let policy = profile.history_policy();
+        let context = context::build(&self.root, focus, policy.context_cap_bytes)
             .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
-        self.enforce_budget(vec![
-            Message::System {
-                content: redact_session_text(&system_prompt(&context.text)),
-            },
-            Message::User {
-                content: redact_session_text(prompt),
-            },
-        ])
+        let system = profile
+            .system_prompt(&context.text)
+            .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))?;
+        Self::enforce_budget(
+            vec![
+                Message::System {
+                    content: redact_session_text(&system),
+                },
+                Message::User {
+                    content: redact_session_text(prompt),
+                },
+            ],
+            &policy,
+        )
     }
 
     fn history_with_prompt(
@@ -1144,12 +1191,17 @@ impl SessionRuntimeService {
         snapshot: &SessionSnapshot,
         prompt: &str,
     ) -> Result<Vec<Message>, SessionRuntimeError> {
+        let profile = self.resolved_profile(&snapshot.binding)?;
+        let policy = profile.history_policy();
         let focus = snapshot.focus.as_deref().map(Path::new);
-        let context = context::build(&self.root, focus, self.policy.context_cap_bytes)
+        let context = context::build(&self.root, focus, policy.context_cap_bytes)
             .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
-        let system = Message::System {
-            content: redact_session_text(&system_prompt(&context.text)),
-        };
+        let system =
+            Message::System {
+                content: redact_session_text(&profile.system_prompt(&context.text).map_err(
+                    |error| SessionRuntimeError::ProviderConfiguration(error.to_string()),
+                )?),
+            };
         let mut segments: Vec<Vec<Message>> = Vec::new();
         for entry in &snapshot.transcript.entries {
             match entry.kind {
@@ -1231,7 +1283,7 @@ impl SessionRuntimeService {
         segments.push(vec![Message::User {
             content: redact_session_text(prompt),
         }]);
-        let budget = self.policy.budget()?;
+        let budget = policy.budget()?;
         let mut selected = Vec::new();
         for segment in segments.into_iter().rev() {
             let mut candidate = Vec::with_capacity(selected.len() + segment.len() + 1);
@@ -1252,12 +1304,15 @@ impl SessionRuntimeService {
         }
         let mut messages = vec![system];
         messages.extend(selected);
-        self.enforce_budget(messages)
+        Self::enforce_budget(messages, &policy)
     }
 
-    fn enforce_budget(&self, messages: Vec<Message>) -> Result<Vec<Message>, SessionRuntimeError> {
+    fn enforce_budget(
+        messages: Vec<Message>,
+        policy: &SessionHistoryPolicy,
+    ) -> Result<Vec<Message>, SessionRuntimeError> {
         let bytes = wire_bytes(&messages)?;
-        if bytes > self.policy.budget()? {
+        if bytes > policy.budget()? {
             return Err(SessionRuntimeError::History(format!(
                 "request is {bytes} bytes and exceeds the exact budget"
             )));
@@ -1770,6 +1825,7 @@ impl SessionRuntimeService {
             .find(|turn| turn.turn_id == turn_id)
             .ok_or(SessionRuntimeError::InvalidState)?
             .turn_revision;
+        let policy = self.resolved_profile(&snapshot.binding)?.history_policy();
         let cancellation = CancellationToken::new();
         self.active
             .lock()
@@ -1789,8 +1845,7 @@ impl SessionRuntimeService {
                     session_ref: crate::provider::session_ref_for(session_id),
                 },
                 ProviderContext {
-                    deadline: Instant::now()
-                        + Duration::from_millis(self.policy.provider_timeout_ms),
+                    deadline: Instant::now() + Duration::from_millis(policy.provider_timeout_ms),
                     cancellation: cancellation.clone(),
                     events: self.progress.as_ref().map(|sink| {
                         Arc::new(ProviderProgress {
@@ -1896,7 +1951,7 @@ impl SessionRuntimeService {
                 // read the last batch's results; only continuing to call
                 // tools is stopped, so a model that converges on its
                 // bound-reaching round finishes normally.
-                if self.policy.max_tool_rounds.is_some_and(|max| round >= max) {
+                if policy.max_tool_rounds.is_some_and(|max| round >= max) {
                     let stopped = self.fail_retryable(
                         session_id,
                         turn_id,
@@ -1904,7 +1959,7 @@ impl SessionRuntimeService {
                         turn_revision,
                         format!(
                             "turn stopped after {} tool rounds without completing;                              raise or remove session.max_tool_rounds, or narrow the task",
-                            self.policy.max_tool_rounds.expect("checked some")
+                            policy.max_tool_rounds.expect("checked some")
                         ),
                         lease,
                     )?;
@@ -2272,41 +2327,6 @@ impl ProviderEventSink for ProviderProgress {
     }
 }
 
-/// Builds the system message for one provider request.
-///
-/// The tool schemas state each argument's shape, and `tool_description` states
-/// each tool's own contract. Neither can express how the tools compose, so the
-/// read-before-mutate rule and the completion bar live here. Without the first
-/// rule a model omits `precondition` and every mutation is rejected as stale.
-fn system_prompt(repository_context: &str) -> String {
-    format!(
-        "You are Latte Code, a coding agent making scoped changes to the repository \
-         described below. Work only within it: paths outside the workspace are rejected, \
-         and you cannot reach the network.\n\
-         \n\
-         Read before you write. To change an existing file, first call `read_file` on it \
-         and pass the `sha256` it returns as `precondition` to `edit_file` or \
-         `write_file`. A mutation without the digest of the version you actually read is \
-         rejected, and this holds again for every later edit to the same file: re-read to \
-         get the new digest. Prefer `edit_file`, whose `before` must match the file \
-         verbatim and occur exactly once; reach for `write_file` only to create a file or \
-         to rewrite one whole.\n\
-         \n\
-         Understand before you change. Locate the relevant code with `search` and \
-         `list_directory`, and read enough of it that your edit follows what is already \
-         there. `read_project_manifest` shows the language and dependencies. Do not \
-         invent APIs, dependencies, or file paths you have not observed.\n\
-         \n\
-         Finish what you start. After editing, check your own work with `git_diff`. When \
-         a verification command is configured it must pass before the task is complete; a \
-         failing, missing, or unrun verification means the work is unfinished. Report \
-         plainly what you changed and what you verified. If a tool call is rejected, read \
-         the error and correct the call rather than repeating it unchanged. If the task \
-         is ambiguous or you lack the means to finish it, say so instead of guessing.\n\
-         {repository_context}"
-    )
-}
-
 fn wire_bytes(messages: &[Message]) -> Result<usize, SessionRuntimeError> {
     serde_json::to_vec(messages)
         .map(|bytes| bytes.len())
@@ -2453,46 +2473,6 @@ mod tests {
     use super::*;
     use crate::provider::{FakeProvider, InputRequest, ProviderResponse};
     use latte_engine::EngineBuilder;
-
-    /// The read-before-mutate rule spans two tools, so no single tool
-    /// description can carry it. Losing it here makes a real model omit
-    /// `precondition` and every mutation is rejected as stale.
-    #[test]
-    fn system_prompt_states_the_read_before_mutate_rule() {
-        let prompt = system_prompt("");
-        for needle in [
-            "read_file",
-            "sha256",
-            "precondition",
-            "edit_file",
-            "write_file",
-        ] {
-            assert!(prompt.contains(needle), "system prompt lost `{needle}`");
-        }
-        assert!(
-            prompt.contains("re-read"),
-            "a second edit to the same file needs the fresh digest"
-        );
-    }
-
-    /// Verification is a completion bar, not a suggestion; the engine rejects
-    /// completion without it, so the model must know before it claims success.
-    #[test]
-    fn system_prompt_states_the_completion_bar() {
-        let prompt = system_prompt("");
-        assert!(prompt.contains("verification"));
-        assert!(prompt.contains("unfinished"));
-    }
-
-    /// Repository context is appended verbatim: the caller already bounded and
-    /// redacted it, and a prompt that dropped it would strand the model.
-    #[test]
-    fn system_prompt_appends_repository_context_verbatim() {
-        let context = "\n--- AGENTS.md ---\nproject specific rules\n";
-        let prompt = system_prompt(context);
-        assert!(prompt.ends_with(context));
-        assert!(system_prompt("").len() < prompt.len());
-    }
 
     struct DelayedProvider {
         responses: Mutex<std::collections::VecDeque<(Duration, ProviderResponse)>>,
@@ -4548,7 +4528,13 @@ mod tests {
         );
         let mut bounded = completed.clone(); bounded.transcript.entries.iter_mut().find(|entry| entry.kind == TranscriptKind::User).unwrap().text = "word ".repeat(1_000);
         assert!(constrained.history_with_prompt(&bounded, "small").unwrap().iter().any(|message| matches!(message, Message::User { content } if content == "small")));
-        assert!(constrained.enforce_budget(vec![Message::User { content: "word ".repeat(1_000) }]).is_err());
+        assert!(SessionRuntimeService::enforce_budget(vec![Message::User { content: "word ".repeat(1_000) }], &SessionHistoryPolicy {
+                max_request_bytes: 4096,
+                max_input_bytes: 4096,
+                reserved_output_bytes: 1,
+                context_cap_bytes: 1,
+                ..SessionHistoryPolicy::default()
+            }).is_err());
         let mut orphan = completed.clone(); orphan.transcript.entries.retain(|entry| entry.kind != TranscriptKind::User); assert!(constrained.history_with_prompt(&orphan, "small").is_ok());
         let error = constrained
             .history_with_prompt(&completed, &"word ".repeat(1_000))
@@ -6408,7 +6394,15 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
+        // An invalid policy surfaces at profile resolution, before any
+        // history is built: the typed error is ProviderConfiguration, not a
+        // late History failure. Production never reaches this path (the
+        // config loader validates the session section at startup); this is
+        // the service's defensive contract.
+        assert!(
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -6591,7 +6585,12 @@ mod tests {
             .follow_up(session_id, ready.revision, "second".into())
             .await
             .unwrap_err();
-        assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
+        // Same defensive contract as start: the invalid policy fails at
+        // profile resolution with ProviderConfiguration.
+        assert!(
+            matches!(err, SessionRuntimeError::ProviderConfiguration(_)),
+            "{err:?}"
+        );
     }
 
     // -- switch_model / resolve_permission / cancel_durable -----------------

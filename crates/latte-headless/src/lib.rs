@@ -6,6 +6,7 @@
     clippy::semicolon_if_nothing_returned
 )]
 pub mod context;
+pub mod profile;
 pub mod provider;
 pub mod registry;
 pub mod runtime;
