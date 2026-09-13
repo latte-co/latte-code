@@ -42,6 +42,13 @@ const SESSION_VERIFICATION_EFFECT_PREFIX: &str = "session-verification:";
 /// than a normal provider tool continuation.
 const LEGACY_THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
 const SESSION_MAILBOX_CAPACITY: usize = 8;
+/// Poll interval while waiting out a dying runner's mailbox teardown residue
+/// (issue #21).
+const RESIDUE_SETTLE_INTERVAL_MS: u64 = 5;
+/// Total budget for that wait. The teardown is one mutex acquisition on the
+/// dying runner's side, so this covers extreme scheduling delays many times
+/// over while keeping a misbehaving-residue worst case bounded.
+const RESIDUE_SETTLE_BUDGET_MS: u64 = 100;
 
 /// Identifies a verification effect whether it was minted by a current binary
 /// (`session-verification:`) or persisted before the Thread→Session rename
@@ -647,7 +654,7 @@ impl SessionRuntimeService {
         expected_session_revision: u64,
         prompt: String,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
-        let runner = self.begin_runner(session_id)?;
+        let runner = self.begin_runner_when_settled(session_id).await?;
         // The legacy in-process path mints a fresh command id so the durable
         // dedup record is still written (it will never replay, but the
         // follow-up contract is uniform).
@@ -683,7 +690,7 @@ impl SessionRuntimeService {
             Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
-        let runner = match self.begin_runner(session_id) {
+        let runner = match self.begin_runner_when_settled(session_id).await {
             Ok(runner) => runner,
             Err(error) => {
                 let _ = accept.send(Err(classify_create_error(&error)));
@@ -932,6 +939,46 @@ impl SessionRuntimeService {
             mailboxes: Arc::clone(&self.mailboxes),
             closed: false,
         })
+    }
+
+    /// Like [`Self::begin_runner`], but tolerates the teardown residue of a
+    /// just-finished turn. The lifecycle `Ready` commit happens inside
+    /// `run_provider_turn`, and the runner's `drain_mailbox` removes its
+    /// process-local mailbox entry only afterwards — so a follow-up that
+    /// observes `Ready` through a snapshot can legitimately race that window
+    /// and hit the strict `contains_key` rejection (issue #21). When the
+    /// durable snapshot shows an idle `Ready` session, the residue belongs to
+    /// a runner that is about to remove it: wait out the teardown instead of
+    /// failing the request. Every other state rejects immediately — a live
+    /// runner must keep excluding concurrent follow-ups, a non-idle
+    /// lifecycle must keep its current error, and residue never belongs to
+    /// us, so it is waited out, never taken over.
+    async fn begin_runner_when_settled(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionRunnerGuard, SessionRuntimeError> {
+        let mut waited_ms = 0_u64;
+        loop {
+            match self.begin_runner(session_id) {
+                Ok(runner) => return Ok(runner),
+                Err(SessionRuntimeError::InvalidState) if waited_ms < RESIDUE_SETTLE_BUDGET_MS => {
+                    let Ok(snapshot) = self.load_full(session_id) else {
+                        return Err(SessionRuntimeError::InvalidState);
+                    };
+                    if snapshot.lifecycle != SessionLifecycle::Ready
+                        || snapshot.active_turn_id.is_some()
+                    {
+                        return Err(SessionRuntimeError::InvalidState);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        RESIDUE_SETTLE_INTERVAL_MS,
+                    ))
+                    .await;
+                    waited_ms += RESIDUE_SETTLE_INTERVAL_MS;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn drain_mailbox(
@@ -6894,6 +6941,100 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
+    }
+
+    /// The issue-#21 window: the `Ready` commit is durable while the dying
+    /// runner's mailbox entry is still present, so a follow-up that raced the
+    /// teardown hits the strict `contains_key` rejection. When the residue is
+    /// removed shortly after — exactly what the dying `drain_mailbox` does —
+    /// the follow-up must succeed instead of surfacing the transient 409.
+    #[tokio::test]
+    async fn follow_up_waits_out_the_runner_teardown_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first done"), vec![]),
+                response(Some("second done"), vec![]),
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
+
+        // Re-install the residue the dying runner has not removed yet, then
+        // simulate its teardown: the entry disappears mid-wait.
+        let residue = Arc::clone(&service.mailboxes);
+        residue.lock().unwrap().insert(session_id, VecDeque::new());
+        let sweeper_session_id = session_id;
+        let sweeper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            residue.lock().unwrap().remove(&sweeper_session_id);
+        });
+
+        let second = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(second.lifecycle, SessionLifecycle::Ready);
+        sweeper.await.unwrap();
+    }
+
+    /// Residue is never taken over: a mailbox entry that carries queued work
+    /// (or any residue nobody drains) keeps excluding follow-ups. The wait is
+    /// bounded, and the elapsed check pins that the bounded wait actually
+    /// ran — a mutation back to the plain `begin_runner` fails it instantly.
+    #[tokio::test]
+    async fn follow_up_residue_is_waited_out_never_taken_over() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![response(Some("first done"), vec![])],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+
+        // Persistent residue with queued work inside: nobody will drain it.
+        service.mailboxes.lock().unwrap().insert(
+            session_id,
+            VecDeque::from(["queued while dying".to_owned()]),
+        );
+
+        let started = std::time::Instant::now();
+        let error = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SessionRuntimeError::InvalidState),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS),
+            "the bounded wait must have run before rejecting"
+        );
+        let residue = service.mailboxes.lock().unwrap().get(&session_id).cloned();
+        assert_eq!(
+            residue,
+            Some(VecDeque::from(["queued while dying".to_owned()])),
+            "waiting must never steal or wipe the residue"
+        );
     }
 
     #[tokio::test]
