@@ -962,7 +962,10 @@ impl SessionRuntimeService {
             match self.begin_runner(session_id) {
                 Ok(runner) => return Ok(runner),
                 Err(SessionRuntimeError::InvalidState) if waited_ms < RESIDUE_SETTLE_BUDGET_MS => {
-                    let Ok(snapshot) = self.load_full(session_id) else {
+                    // Only `lifecycle` and `active_turn_id` are needed here;
+                    // read them through the tail-bounded snapshot instead of
+                    // paging the whole transcript on every poll.
+                    let Ok(snapshot) = self.engine.session_snapshot_tail_v2(session_id, 1) else {
                         return Err(SessionRuntimeError::InvalidState);
                     };
                     if snapshot.lifecycle != SessionLifecycle::Ready
@@ -7034,6 +7037,71 @@ mod tests {
             residue,
             Some(VecDeque::from(["queued while dying".to_owned()])),
             "waiting must never steal or wipe the residue"
+        );
+    }
+
+    /// The immediate-reject guard: a non-idle lifecycle (here
+    /// `WaitingInput`) is not teardown residue, so the follow-up must fail
+    /// right away instead of waiting out the settle budget. Both paths
+    /// surface the same `InvalidState`, so only the elapsed check separates
+    /// them — deleting the guard makes this test fail on the elapsed assert,
+    /// mirroring the review probe that found the gap.
+    #[tokio::test]
+    async fn follow_up_rejects_immediately_when_the_session_is_not_idle() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine,
+            vec![
+                response(Some("first done"), vec![]),
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(InputRequest {
+                        id: "shape".into(),
+                        prompt: "Which shape?".into(),
+                        secret: false,
+                    }),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ],
+        );
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        let waiting = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
+
+        // Residue from the parked turn's runner teardown window.
+        service
+            .mailboxes
+            .lock()
+            .unwrap()
+            .insert(session_id, VecDeque::new());
+
+        let started = std::time::Instant::now();
+        let error = service
+            .follow_up(session_id, waiting.revision, "third".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SessionRuntimeError::InvalidState),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS),
+            "a non-idle lifecycle must reject immediately, not wait out the budget"
         );
     }
 
