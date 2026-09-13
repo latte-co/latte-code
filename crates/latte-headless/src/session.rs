@@ -1035,9 +1035,16 @@ impl SessionRuntimeService {
             // run after the pending request resolves. The guard detaches —
             // closed without removing — and no live guard remains across the
             // park, so the entry's meaning is exactly "intake open".
+            // `ReconciliationRequired` joins this branch deliberately: it is
+            // a pending-recovery state, not a terminal one — an in-flight
+            // recovery run may still re-enter the provider, and any write
+            // here (audit card, revision bump, entry removal) would fence
+            // that recovery out with a stale-revision error.
             if matches!(
                 snapshot.lifecycle,
-                SessionLifecycle::WaitingInput | SessionLifecycle::WaitingPermission
+                SessionLifecycle::WaitingInput
+                    | SessionLifecycle::WaitingPermission
+                    | SessionLifecycle::ReconciliationRequired
             ) {
                 runner.mark_closed();
                 return Ok(snapshot);
