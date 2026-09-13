@@ -1097,6 +1097,12 @@ impl SessionRuntimeService {
                 }
                 DrainOutcome::Done => return Ok(snapshot),
                 DrainOutcome::TerminalDiscard(discarded) => {
+                    // Only a non-empty discard produces an audit card; an
+                    // empty or absent queue needs no lease at all.
+                    let has_discard = discarded.as_ref().is_some_and(|queue| !queue.is_empty());
+                    if !has_discard {
+                        return Ok(snapshot);
+                    }
                     // No live lease exists at drain time (the turn's lease
                     // was consumed by run_provider_turn), so the audit can
                     // acquire its own; losing that acquisition only costs
