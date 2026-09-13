@@ -247,15 +247,17 @@ struct SessionRunnerGuard {
 
 /// One user-segment of the provider history: the messages the request
 /// replays, the bounded plain text a compaction summary is generated from,
-/// and the highest durable sequence folded into the segment.
+/// and the highest durable sequence folded into the segment. The sequence is
+/// `None` for the synthetic current-prompt segment, which has no durable
+/// card of its own.
 struct HistorySegment {
     messages: Vec<Message>,
     text: String,
-    max_sequence: u64,
+    max_sequence: Option<u64>,
 }
 
 impl HistorySegment {
-    fn new(max_sequence: u64, messages: Vec<Message>, text: String) -> Self {
+    fn new(max_sequence: Option<u64>, messages: Vec<Message>, text: String) -> Self {
         Self {
             messages,
             text,
@@ -269,7 +271,7 @@ impl HistorySegment {
 
     fn push_text(&mut self, text: &str, sequence: u64) {
         self.text.push_str(text);
-        self.max_sequence = self.max_sequence.max(sequence);
+        self.max_sequence = self.max_sequence.max(Some(sequence));
     }
 }
 
@@ -1055,21 +1057,29 @@ impl SessionRuntimeService {
             &lease,
         )?;
         // Same compaction contract as a new child: persist the summary (or
-        // its failure audit) before the provider sees the request. A storage
-        // failure degrades gracefully — the transcript stays authoritative.
-        match &prepared {
+        // its failure audit) before the provider sees the request. The
+        // ProvideInput commit advanced both the session revision and the
+        // turn revision, so the append CASes on `running`'s fresh values and
+        // the turn continues from the commit's returned snapshot — same
+        // mechanism as the tool-round appends. A storage failure here is
+        // not fatal: the transcript remains authoritative and the next turn
+        // regenerates the summary deterministically from it.
+        let running = match &prepared {
             PreparedHistory::Summarized {
                 superseded,
                 summary,
                 ..
-            } => {
-                let _ = self.commit(
+            } => self
+                .commit(
                     session_id,
                     turn_id,
                     running.revision,
-                    turn.turn_revision,
+                    active_turn_revision(&running)?,
                     CommitSessionTurnUpdate::AppendTranscript {
-                        source_key: format!("{turn_id}:compact-summary"),
+                        // Distinct from the new-child key: one turn can
+                        // compact twice (its own start, then an input
+                        // answer), and source keys dedup within a turn.
+                        source_key: format!("{turn_id}:compact-summary:input"),
                         kind: TranscriptKind::CompactSummary,
                         text: summary.clone(),
                         payload: Some(serde_json::json!({
@@ -1077,25 +1087,25 @@ impl SessionRuntimeService {
                         })),
                     },
                     &lease,
-                );
-            }
-            PreparedHistory::Degraded(_) => {
-                let _ = self.commit(
+                )
+                .unwrap_or(running),
+            PreparedHistory::Degraded(_) => self
+                .commit(
                     session_id,
                     turn_id,
                     running.revision,
-                    turn.turn_revision,
+                    active_turn_revision(&running)?,
                     CommitSessionTurnUpdate::AppendTranscript {
-                        source_key: format!("{turn_id}:compact-summary-failed"),
+                        source_key: format!("{turn_id}:compact-summary-failed:input"),
                         kind: TranscriptKind::System,
                         text: "context compaction failed; continuing without a summary".to_owned(),
                         payload: None,
                     },
                     &lease,
-                );
-            }
-            PreparedHistory::Complete(_) => {}
-        }
+                )
+                .unwrap_or(running),
+            PreparedHistory::Complete(_) => running,
+        };
         self.run_provider_turn(running, messages, provider.provider, lease)
             .await
     }
@@ -1404,7 +1414,24 @@ impl SessionRuntimeService {
             // Pre-compaction behavior: silent discard.
             return Ok(PreparedHistory::Complete(window.assemble(None)));
         }
-        let Some(summary) = self.summarize_history(snapshot, &superseded.text).await else {
+        // The durable card is appended after this turn's user entry, so by
+        // position it supersedes the prompt too (context-design §3.2): the
+        // summary source must therefore include it, or the prompt's exact
+        // words would drop out of every later window.
+        let mut source = format!(
+            "{}\n[user]\n{}\n",
+            superseded.text,
+            redact_session_text(prompt)
+        );
+        let source_bound = profile.compaction().max_summary_source_bytes;
+        if source.len() > source_bound {
+            let mut cut = source_bound;
+            while !source.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            source.truncate(cut);
+        }
+        let Some(summary) = self.summarize_history(snapshot, &source).await else {
             return Ok(PreparedHistory::Degraded(window.assemble(None)));
         };
         let messages = window.assemble(Some(&summary));
@@ -1436,6 +1463,11 @@ impl SessionRuntimeService {
             return None;
         };
         let cancellation = CancellationToken::new();
+        // Reuses the per-session active-cancellation slot: preparation is
+        // strictly serial (prepare_history completes before any main request
+        // of the same session starts), so the insert/remove cannot race a
+        // main request's token. If preparation ever becomes concurrent with
+        // a main request, this must move to a distinct key.
         self.active
             .lock()
             .expect("active mutex poisoned")
@@ -1481,7 +1513,7 @@ impl SessionRuntimeService {
         for entry in &snapshot.transcript.entries {
             match entry.kind {
                 TranscriptKind::User => segments.push(HistorySegment::new(
-                    entry.sequence,
+                    Some(entry.sequence),
                     vec![Message::User {
                         content: entry.text.clone(),
                     }],
@@ -1493,7 +1525,7 @@ impl SessionRuntimeService {
                     // travels as an ordinary user-segment message.
                     segments.clear();
                     segments.push(HistorySegment::new(
-                        entry.sequence,
+                        Some(entry.sequence),
                         vec![Message::User {
                             content: entry.text.clone(),
                         }],
@@ -1595,12 +1627,15 @@ impl SessionRuntimeService {
                     |error| SessionRuntimeError::ProviderConfiguration(error.to_string()),
                 )?),
             };
+        // The current prompt has no durable card yet — hence no sequence.
+        // It is never part of a discarded range: a window that cannot fit
+        // it fails with the hard budget error instead.
         segments.push(HistorySegment::new(
-            u64::MAX,
+            None,
             vec![Message::User {
                 content: redact_session_text(prompt),
             }],
-            String::new(),
+            format!("[user]\n{}\n", redact_session_text(prompt)),
         ));
         let budget = policy.budget()?;
         let mut selected: Vec<Message> = Vec::new();
@@ -1628,8 +1663,9 @@ impl SessionRuntimeService {
             // chronological segments (the loop drops from the oldest side).
             let discarded = &segments[..segments.len() - kept];
             let through_sequence = discarded
-                .last()
-                .map(|segment| segment.max_sequence)
+                .iter()
+                .filter_map(|segment| segment.max_sequence)
+                .max()
                 .unwrap_or_default();
             let mut bound = profile.compaction().max_summary_source_bytes;
             let mut parts: Vec<&str> = Vec::new();
@@ -7865,6 +7901,123 @@ mod tests {
                 .any(|entry| entry.kind == TranscriptKind::CompactSummary),
             "a failed summary is never persisted"
         );
+    }
+
+    /// The input path compacts on the same contract as a new child: the
+    /// ProvideInput commit advances both revisions, so the summary card
+    /// CASes on the fresh values and the turn continues from the commit's
+    /// returned snapshot. This is the regression test for the review
+    /// finding that the append used stale CAS coordinates and silently
+    /// discarded its own result — compaction burned a summary request
+    /// without ever persisting the card on this path.
+    #[tokio::test]
+    async fn compaction_on_the_input_path_persists_the_summary_card() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            // Turn 1: long content that the follow-up window must discard.
+            response(Some(&"A".repeat(2_000)), vec![]),
+            // Follow-up compaction summary for the discarded turn 1. It is
+            // intentionally large: the input window must overflow again, or
+            // the second compaction never triggers.
+            response(Some(&"B".repeat(3_000)), vec![]),
+            // Turn 2 continuation parks at an input request.
+            ProviderResponse {
+                message: None,
+                tool_calls: vec![],
+                input_request: Some(InputRequest {
+                    id: "shape".into(),
+                    prompt: "Which shape?".into(),
+                    secret: false,
+                }),
+                usage: crate::provider::ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            },
+            // The large input value forces another discard: the window loses
+            // the summary card and the second prompt, so a fresh summary is
+            // requested before the input continuation.
+            response(Some("INPUT-PATH-SUMMARY-MARKER"), vec![]),
+            // The input continuation completes the turn.
+            response(Some("input done"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            tight_policy(),
+            factory,
+        )
+        .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "x".repeat(3_000), binding(), None)
+            .await
+            .unwrap();
+        let waiting = service
+            .follow_up(session_id, ready.revision, "second".into())
+            .await
+            .unwrap();
+        assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
+
+        let completed = service
+            .provide_input(
+                session_id,
+                waiting.revision,
+                test_turn_revision(&waiting),
+                "shape".into(),
+                "y".repeat(2_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            5,
+            "turn1 + input park + input summary + input continuation"
+        );
+        // The input path's summary request carries the card from the new
+        // child path plus the superseded prompt text.
+        assert!(
+            matches!(
+                &requests[3][0],
+                Message::System { content } if content.contains("compacting the earlier history")
+            )
+        );
+        assert!(matches!(
+            &requests[3][1],
+            Message::User { content }
+                if content.contains("BBB")
+                    // The current input value must be part of the summary
+                    // source: the fresh card lands after the input entry.
+                    && content.contains("yyy")
+        ));
+        // The input continuation carries the fresh summary instead of the
+        // superseded range.
+        assert!(requests[4].iter().any(|message| matches!(
+            message,
+            Message::User { content } if content.contains("INPUT-PATH-SUMMARY-MARKER")
+        )));
+        // Two durable cards: one from the new child, one from the input
+        // path — both on fresh CAS coordinates.
+        let cards: Vec<_> = completed
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::CompactSummary)
+            .collect();
+        assert_eq!(cards.len(), 2, "both compaction points persist their card");
     }
 
     #[tokio::test]

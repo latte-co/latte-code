@@ -169,6 +169,13 @@ config 顶层可选 `profiles` 段（按 `(provider, model)` 或 `profile_id` �
 ContextPolicy / prompt 槽位，`deny_unknown_fields`）属于 v2；届时按字段
 presence 语义取代第 2 层的"等于默认值"启发式。
 
+**两套合并口径并存**：预算字段用"config 等于历史默认值则跟随 builtin"，
+compaction 用"config 策略非 Off 则整体取 config、否则取 builtin"。后者避免
+builtin 层死代码且 config 激活即生效；前者保证未触碰字段跟随 builtin 演进。
+新增字段时二选一并在此处记录口径。另：`CompactionPolicy.trigger_ratio` 与
+`summary_prompt_id` 尚无配置面（profile 内部值），但 `validate()` 对非 Off
+策略校验它们——v1 默认值安全；配置面随第二个策略一起补。
+
 ### 4.2 fail-closed 与已持久化 binding 的兼容
 
 - 已知 `provider_type`（v1：`openai-chat`、`embedded`、`test`）总能解析到内置

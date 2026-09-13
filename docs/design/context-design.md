@@ -66,7 +66,10 @@ User 卡开启一个段；Assistant/ToolResult 追加到当前段；ToolCall/Per
 Input/Failure/Completion/System 卡不产生 provider 消息（除
 `provider_tool_round_aborted=permission_denied` 的 Failure 合成拒绝结果）；
 **CompactSummary 卡是边界**：它按位置 supersede 之前的所有段，自身作为一个
-user 段参与后续窗口。因此摘要源必须包含"卡片落点之前的全部被更替文本"——
+user 段参与后续窗口。执行依据是**位置**，不是 payload：卡片 payload 里的
+`superseded_through_sequence` 是生成时刻的审计水位（记录当时已知的最晚被
+更替序号），窗口裁剪不读它——两者口径的差异是有意的，避免"以为按水位裁剪、
+实际按位置裁剪"的二义性。因此摘要源必须包含"卡片落点之前的全部被更替文本"——
 包括触发本次请求的 prompt（卡片在 turn 启动事务后落盘，落点在当前 user 卡之后）。
 
 ### 3.3 策略选择器：数据，不是行为
