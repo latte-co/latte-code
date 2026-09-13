@@ -6656,7 +6656,15 @@ mod tests {
         let (run, event) = ids();
         let q = TurnState::queued(run);
         first.create_turn(&q, now).unwrap();
-        let lease = first.acquire_lease("live", now, 10_000).unwrap();
+        // The TTL must outlast any scheduling starvation of this test thread:
+        // `Storage::open` below runs an orphan sweep at the real wall clock,
+        // and under a fully loaded test binary (180+ cases in parallel) a
+        // short TTL has repeatedly expired before `open`, flipping the turn
+        // to `Interrupted` and failing the read-only assertion. Recovery is
+        // driven deterministically via `recover_at`, so a long TTL here does
+        // not weaken any assertion — it only decouples the test from
+        // wall-clock starvation.
+        let lease = first.acquire_lease("live", now, 3_600_000).unwrap();
         let running = q.transition(0, Transition::Start).unwrap();
         first
             .append_event(
