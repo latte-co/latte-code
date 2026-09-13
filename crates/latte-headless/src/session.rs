@@ -8584,6 +8584,7 @@ mod tests {
     /// so reverting the classification was silently green. Mutation anchor:
     /// removing `ReconciliationRequired` from the drain keep branch makes
     /// the audit card appear in the returned snapshot and the entry vanish.
+    #[cfg(unix)]
     #[tokio::test]
     async fn reconciliation_drain_keeps_the_parked_queue_untouched() {
         let root = tempfile::tempdir().unwrap();
@@ -8653,6 +8654,7 @@ mod tests {
     /// #22). Mutation anchor: removing the take-and-audit tail from
     /// `reconcile_unknown_effect` fails both the transcript assertion and
     /// the entry-absence assertion.
+    #[cfg(unix)]
     #[tokio::test]
     async fn reconciling_to_failed_discards_and_audits_the_parked_queue() {
         let root = tempfile::tempdir().unwrap();
