@@ -169,20 +169,6 @@ impl AppConfig {
         Self::load_with_home_inner(root, home, true)
     }
 
-    /// Loads a workspace the operator explicitly registered with the server
-    /// (via the authenticated workspace API or startup configuration), whose
-    /// per-workspace provider credentials are therefore operator-vouched.
-    /// Unlike [`Self::load`], this skips the workspace endpoint trust gate:
-    /// registration is itself the explicit consent the gate exists to force.
-    /// The ambient CLI/TUI path must keep using [`Self::load`].
-    #[doc(hidden)]
-    pub fn load_workspace_trusted(
-        root: &Path,
-        home: Option<&Path>,
-    ) -> Result<(Self, ProviderRegistry), String> {
-        Self::load_with_home_inner(root, home, false)
-    }
-
     fn load_with_home_inner(
         root: &Path,
         home: Option<&Path>,
@@ -2047,8 +2033,10 @@ mod tests {
     /// by the workspace itself is stripped unheard-of before the merge (the
     /// serde layer's `deny_unknown_fields` would reject it if it leaked).
     /// Mutation anchors: removing the gate call from `load_with_home` fails
-    /// the rejection assertions; removing either strip makes the flag leak
-    /// into the merge and fail the Ok assertions with an unknown-field error.
+    /// the rejection assertions; redirecting the WORKSPACE strip's discarded
+    /// flags into the trusted set fails the self-vouch rejection; leaking
+    /// either strip into the merge fails the Ok assertions with an
+    /// unknown-field error.
     #[test]
     fn workspace_endpoint_override_is_gated_on_the_trust_boundary() {
         let root = tempfile::tempdir().unwrap();
@@ -2070,6 +2058,26 @@ mod tests {
         assert!(
             error.contains("providers.primary.base_url") && error.contains("trust_repo_endpoint"),
             "the rejection must name the override and the remedy: {error}"
+        );
+
+        // The linchpin of "a workspace cannot vouch for itself": with the home
+        // layer NOT consenting, a `trust_repo_endpoint: true` sitting in the
+        // WORKSPACE layer must be inert. This is deliberately un-symmetric
+        // with the Ok case below — the strip discards the workspace layer's
+        // flags on purpose, and if anyone ever "fixes" that unused-looking
+        // return value into a collection, this assertion is what turns red.
+        std::fs::write(
+            &config_path,
+            r#"{ providers: { primary: {
+                base_url: "http://attacker.example/v1",
+                trust_repo_endpoint: true
+            } } }"#,
+        )
+        .unwrap();
+        let error = AppConfig::load_with_home(root.path(), Some(home.path())).unwrap_err();
+        assert!(
+            error.contains("never the workspace layer"),
+            "a workspace-declared flag must not self-trust: {error}"
         );
 
         // The HOME layer's explicit consent lets this exact configuration

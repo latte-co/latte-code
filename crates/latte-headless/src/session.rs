@@ -1324,6 +1324,14 @@ impl SessionRuntimeService {
         // Marking it closed here would leak the entry instead — and a leaked
         // entry fails `begin_runner` forever, permanently locking the
         // session behind `InvalidState` with no in-process recovery.
+        //
+        // Coverage note: this call site is NOT covered by automation — the
+        // escape window between the turn's lease release and the queued
+        // follow-up's own acquire is race-only and cannot be reached
+        // deterministically through `provide_input` (provider failures are
+        // swallowed by `fail_retryable`, never `?`). The drain ownership
+        // tests pin the contract at the drain unit; this open-guard handoff
+        // is review-enforced.
         self.drain_mailbox(done, runner).await
     }
 
@@ -8329,15 +8337,19 @@ mod tests {
         );
     }
 
-    /// Drain's ownership contract: an OPEN guard handed to `drain_mailbox`
-    /// reclaims the entry when a mid-drain `?` escape unwinds. The queued
-    /// follow-up's revision race (a stale snapshot revision against the
-    /// stored one) is the deterministic stand-in for the real race window;
-    /// after the escape the session must remain reusable — the next
-    /// follow-up succeeds instead of hitting `begin_runner`'s residue
-    /// rejection forever. Mutation anchor: closing the guard before drain
-    /// (the misplaced `mark_closed` this pins) fails both the
-    /// entry-reclaimed and the follow-up-succeeds assertions.
+    /// Drain's ownership contract, pinned at the drain unit: an OPEN guard
+    /// handed to `drain_mailbox` reclaims the entry when a mid-drain `?`
+    /// escape unwinds. The queued follow-up's revision race (a stale
+    /// snapshot revision against the stored one) is the deterministic
+    /// stand-in for the real race window; after the escape the session must
+    /// remain reusable — the next follow-up succeeds instead of hitting
+    /// `begin_runner`'s residue rejection forever.
+    ///
+    /// Scope note: these assertions hold for any caller that hands drain an
+    /// open guard. They deliberately do NOT go through `provide_input` —
+    /// its call site is race-only (see the coverage note there), so a
+    /// regression at the call site itself is review-enforced, not
+    /// test-enforced.
     #[tokio::test]
     async fn drain_failure_with_an_open_guard_reclaims_the_entry() {
         let root = tempfile::tempdir().unwrap();
