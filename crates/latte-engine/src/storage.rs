@@ -5230,8 +5230,12 @@ fn validate_catalog_key(value: &str, name: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Durable display cap for session titles. Module-level so the tests can
+/// derive their offsets from it: the order-sensitivity guard below is only
+/// meaningful at offsets that move with this cap.
+const SESSION_TITLE_LIMIT: usize = 120;
+
 fn session_title(prompt: &str) -> String {
-    const LIMIT: usize = 120;
     // Redact before the length cap: truncating first could split a secret
     // across the boundary and leave a partial credential in the visible
     // title. Redaction here covers every title source — create prompts are
@@ -5243,9 +5247,9 @@ fn session_title(prompt: &str) -> String {
     // is greedy enough to hide the difference.
     let redacted = redact_session_text(prompt);
     let first_line = redacted.lines().next().unwrap_or_default().trim();
-    let mut title = String::with_capacity(first_line.len().min(LIMIT));
+    let mut title = String::with_capacity(first_line.len().min(SESSION_TITLE_LIMIT));
     for value in first_line.chars().filter(|value| !value.is_control()) {
-        if title.len() + value.len_utf8() > LIMIT {
+        if title.len() + value.len_utf8() > SESSION_TITLE_LIMIT {
             title.push('…');
             break;
         }
@@ -10976,7 +10980,7 @@ mod tests {
         let long = "a".repeat(200);
         let title = session_title(&long);
         assert!(title.ends_with('…'));
-        assert!(title.len() <= 120 + 3);
+        assert!(title.len() <= SESSION_TITLE_LIMIT + 3);
         // Titles are user-visible durable records and rename/fork titles are
         // user-supplied raw, so redaction happens inside session_title —
         // before the length cap, so truncation can never split a secret
@@ -10991,19 +10995,20 @@ mod tests {
         let long_value = format!("api_key={}{}", "a".repeat(110), secret);
         assert_eq!(session_title(&long_value), "api_key=[REDACTED]");
         // Order sensitivity is observable only through a length-sensitive
-        // channel at a discriminating offset. The named-assignment case
-        // above hides the order (its value class is greedy either way).
-        // This case pins the discriminating window for the `sk-` channel:
-        // with 111 pad chars plus a space the secret starts at byte 112,
-        // so the 120-byte cut truncates it to `sk-live-` — only 5 chars
-        // after `sk-`, below the `{6,}` gate of the OPENAI_KEY pattern, so
-        // truncate-then-redact cannot rescue the residue and the visible
-        // prefix leaks. Redact-first collapses the secret to the marker
-        // before the cut. (At smaller pads ≥16 secret bytes survive the
-        // cut, the residue still matches `{6,}` and gets redacted anyway —
-        // the guard is deliberately pinned to the offset where the orders
-        // actually diverge.)
-        let straddling = format!("{} {secret}", "x".repeat(111));
+        // channel at a discriminating offset, and the offset moves with the
+        // cap: with the secret starting at byte pad+1, the cut keeps
+        // LIMIT-pad-1 bytes of it. At pad = LIMIT-9 exactly `sk-live-`
+        // survives — 5 chars after `sk-`, below the `{6,}` gate of the
+        // OPENAI_KEY pattern, so truncate-then-redact cannot rescue the
+        // residue and the visible prefix leaks; redact-first collapses the
+        // secret to the marker before the cut. Deriving pad from the const
+        // keeps this assertion on the divergence window if the cap is ever
+        // retuned — a hardcoded 111 would silently fall out of it the
+        // moment someone changes the limit (the length assertion above
+        // would be the only thing to go red, and hand-fixing it would
+        // strand this guard outside the window).
+        let pad = SESSION_TITLE_LIMIT - 9;
+        let straddling = format!("{} {secret}", "x".repeat(pad));
         let ordered = session_title(&straddling);
         assert!(!ordered.contains("sk-live"), "{ordered}");
         assert!(ordered.contains("[REDACTE"), "{ordered}");
