@@ -1317,7 +1317,13 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        runner.mark_closed();
+        // The guard MUST reach drain open (same contract as
+        // `resolve_permission`): every `?` escape inside drain then reclaims
+        // the mailbox entry via `Drop`, so a mid-drain failure (e.g. the
+        // follow-up revision/lease races) leaves the session reusable.
+        // Marking it closed here would leak the entry instead — and a leaked
+        // entry fails `begin_runner` forever, permanently locking the
+        // session behind `InvalidState` with no in-process recovery.
         self.drain_mailbox(done, runner).await
     }
 
@@ -8320,6 +8326,92 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == TranscriptKind::CompactSummary),
             "a failed summary is never persisted"
+        );
+    }
+
+    /// Drain's ownership contract: an OPEN guard handed to `drain_mailbox`
+    /// reclaims the entry when a mid-drain `?` escape unwinds. The queued
+    /// follow-up's revision race (a stale snapshot revision against the
+    /// stored one) is the deterministic stand-in for the real race window;
+    /// after the escape the session must remain reusable — the next
+    /// follow-up succeeds instead of hitting `begin_runner`'s residue
+    /// rejection forever. Mutation anchor: closing the guard before drain
+    /// (the misplaced `mark_closed` this pins) fails both the
+    /// entry-reclaimed and the follow-up-succeeds assertions.
+    #[tokio::test]
+    async fn drain_failure_with_an_open_guard_reclaims_the_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some("first done"), vec![]),
+            response(Some("after failure"), vec![]),
+        ]));
+        let service = recording_service(root.path(), engine, provider);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        service.mailboxes.lock().unwrap().insert(
+            session_id,
+            VecDeque::from(["queued while parked".to_owned()]),
+        );
+        let mut stale = ready.clone();
+        stale.revision = ready.revision.wrapping_sub(1);
+        let runner = service.ensure_runner(session_id);
+        let outcome = service.drain_mailbox(stale, runner).await;
+        assert!(
+            outcome.is_err(),
+            "the stale-revision follow-up must escape the drain"
+        );
+        assert!(
+            service.mailboxes.lock().unwrap().get(&session_id).is_none(),
+            "the open guard's Drop must reclaim the entry on the escape"
+        );
+        let next = service
+            .follow_up(session_id, ready.revision, "after failure".into())
+            .await
+            .unwrap();
+        assert_eq!(next.lifecycle, SessionLifecycle::Ready);
+    }
+
+    /// The mirror regime, pinned so both sides of the ownership contract are
+    /// explicit: a CLOSED guard escaping drain keeps the residue — which is
+    /// exactly why callers must never hand drain a closed guard. A leaked
+    /// entry fails `begin_runner` with no in-process recovery.
+    #[tokio::test]
+    async fn drain_failure_with_a_closed_guard_keeps_the_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([response(
+            Some("first done"),
+            vec![],
+        )]));
+        let service = recording_service(root.path(), engine, provider);
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let ready = service
+            .start(session_id, "first".into(), binding(), None)
+            .await
+            .unwrap();
+        service.mailboxes.lock().unwrap().insert(
+            session_id,
+            VecDeque::from(["queued while parked".to_owned()]),
+        );
+        let mut stale = ready.clone();
+        stale.revision = ready.revision.wrapping_sub(1);
+        let mut runner = service.ensure_runner(session_id);
+        runner.mark_closed();
+        let outcome = service.drain_mailbox(stale, runner).await;
+        assert!(outcome.is_err());
+        assert!(
+            service.mailboxes.lock().unwrap().get(&session_id).is_some(),
+            "a closed guard cannot reclaim the entry"
         );
     }
 
