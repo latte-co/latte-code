@@ -10990,13 +10990,19 @@ mod tests {
         // even a truncated prefix of the value — survives the boundary.
         let long_value = format!("api_key={}{}", "a".repeat(110), secret);
         assert_eq!(session_title(&long_value), "api_key=[REDACTED]");
-        // Order sensitivity needs a length-sensitive channel: the
-        // named-assignment class above is greedy enough that
-        // truncate-then-redact would swallow the same run and look
-        // identical. The `sk-` channel is not — with the secret starting
-        // inside the cap, redact-first leaves only the marker (possibly
-        // truncated by the cap itself), while truncate-first would leak the
-        // secret's visible prefix past the boundary.
+        // Order sensitivity is observable only through a length-sensitive
+        // channel at a discriminating offset. The named-assignment case
+        // above hides the order (its value class is greedy either way).
+        // This case pins the discriminating window for the `sk-` channel:
+        // with 111 pad chars plus a space the secret starts at byte 112,
+        // so the 120-byte cut truncates it to `sk-live-` — only 5 chars
+        // after `sk-`, below the `{6,}` gate of the OPENAI_KEY pattern, so
+        // truncate-then-redact cannot rescue the residue and the visible
+        // prefix leaks. Redact-first collapses the secret to the marker
+        // before the cut. (At smaller pads ≥16 secret bytes survive the
+        // cut, the residue still matches `{6,}` and gets redacted anyway —
+        // the guard is deliberately pinned to the offset where the orders
+        // actually diverge.)
         let straddling = format!("{} {secret}", "x".repeat(111));
         let ordered = session_title(&straddling);
         assert!(!ordered.contains("sk-live"), "{ordered}");
