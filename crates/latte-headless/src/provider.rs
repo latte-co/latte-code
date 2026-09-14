@@ -648,10 +648,15 @@ fn apply_headers(
     builder
 }
 
-/// The one source of truth for "an HTTP status is transient". The retry
-/// loop, both `ProviderError::Http` construction sites, and the session's
-/// retryability classification all consume this verdict — 401/403 and other
-/// non-transient statuses must never be classified retryable anywhere.
+/// The one source of truth for "an HTTP status is transient" at the
+/// transport layer: the retry loop and both `ProviderError::Http`
+/// construction sites consume this verdict. The session's failure
+/// classification deliberately does NOT read it — that classification
+/// answers "can the user make progress in this conversation", not "would an
+/// identical request succeed" (a 400 for an unavailable model carries
+/// `retryable: false`, yet an in-session model switch makes a retry
+/// meaningful; only 401/403 terminalize — see the `Err` arm in
+/// `session.rs`).
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 502 | 503 | 504)
 }

@@ -1163,6 +1163,21 @@ impl Storage {
                 self.recover_at(now_ms)?;
                 Ok(value)
             }
+            // Coverage note: neither combined arm is reachable through
+            // unmodified code paths. The import transaction is owned by the
+            // closure and always rolls back (or commits) before the detach,
+            // and DETACH ignores other connections' file locks — probed
+            // empirically with EXCLUSIVE, IMMEDIATE, and DEFERRED+write
+            // lockers on the legacy file: the import failed busy every
+            // time, the detach always succeeded. Reaching `(Err, Err)`
+            // needs a fault that leaves the connection's transaction open
+            // across the detach (e.g. rollback itself failing on an I/O
+            // fault — rusqlite's Drop swallows that error, so the tx
+            // lingers); `(Ok, Err)` needs the commit to land while the
+            // subsequent detach fails, also an I/O-fault shape. The arms
+            // exist so such faults still report both facts honestly; they
+            // are review-enforced, like the P0-b call-site note.
+            //
             // Both failing at once is the poison case: the import error is
             // primary, but the alias is still attached and would break every
             // later import at ATTACH — the caller must see both facts (a
@@ -5222,9 +5237,12 @@ fn session_title(prompt: &str) -> String {
     // title. Redaction here covers every title source — create prompts are
     // redacted by the caller too (harmless, redaction is idempotent), but
     // rename and fork titles are user-supplied raw and reach the durable
-    // record through this one function.
-    let prompt = redact_session_text(prompt);
-    let first_line = prompt.lines().next().unwrap_or_default().trim();
+    // record through this one function. The order matters on
+    // length-sensitive channels only (see the `sk-` case in
+    // `session_title_truncates_and_falls_back`): the named-assignment class
+    // is greedy enough to hide the difference.
+    let redacted = redact_session_text(prompt);
+    let first_line = redacted.lines().next().unwrap_or_default().trim();
     let mut title = String::with_capacity(first_line.len().min(LIMIT));
     for value in first_line.chars().filter(|value| !value.is_control()) {
         if title.len() + value.len_utf8() > LIMIT {
@@ -10972,6 +10990,17 @@ mod tests {
         // even a truncated prefix of the value — survives the boundary.
         let long_value = format!("api_key={}{}", "a".repeat(110), secret);
         assert_eq!(session_title(&long_value), "api_key=[REDACTED]");
+        // Order sensitivity needs a length-sensitive channel: the
+        // named-assignment class above is greedy enough that
+        // truncate-then-redact would swallow the same run and look
+        // identical. The `sk-` channel is not — with the secret starting
+        // inside the cap, redact-first leaves only the marker (possibly
+        // truncated by the cap itself), while truncate-first would leak the
+        // secret's visible prefix past the boundary.
+        let straddling = format!("{} {secret}", "x".repeat(111));
+        let ordered = session_title(&straddling);
+        assert!(!ordered.contains("sk-live"), "{ordered}");
+        assert!(ordered.contains("[REDACTE"), "{ordered}");
     }
 
     #[test]
