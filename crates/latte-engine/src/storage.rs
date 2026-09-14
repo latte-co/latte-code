@@ -937,6 +937,12 @@ impl Storage {
         if previous.as_deref() == Some(fingerprint) {
             return Ok(false);
         }
+        // A failed DETACH after a previous import leaves `legacy_import`
+        // attached to this shared connection, and every later import would
+        // fail at ATTACH with "already in use". The best-effort detach here
+        // makes a retry after such a failure self-heal; it is allowed to
+        // fail because with no stale alias attached it is a harmless no-op.
+        let _ = conn.execute_batch("DETACH DATABASE legacy_import;");
         conn.execute(
             "ATTACH DATABASE ?1 AS legacy_import",
             [path.to_string_lossy().as_ref()],
@@ -1157,8 +1163,22 @@ impl Storage {
                 self.recover_at(now_ms)?;
                 Ok(value)
             }
+            // Both failing at once is the poison case: the import error is
+            // primary, but the alias is still attached and would break every
+            // later import at ATTACH — the caller must see both facts (a
+            // later import's pre-attach detach also self-heals this).
+            (Err(error), Err(detach)) => Err(StorageError::InvalidData(format!(
+                "legacy import failed ({error}); detaching legacy_import also failed \
+                 ({detach}), so the alias stays attached until a later import's retry"
+            ))),
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
+            // The import committed before the detach failed: the caller must
+            // not conclude the import can simply be retried — the fingerprint
+            // row committed too, so a retry reports "already imported".
+            (Ok(_), Err(detach)) => Err(StorageError::InvalidData(format!(
+                "legacy import committed, but detaching legacy_import failed ({detach}); \
+                 the import is durable and a retry will report it as already imported"
+            ))),
         }
     }
 
@@ -2668,6 +2688,13 @@ impl Storage {
             entry.entry_id = TranscriptEntryId::from_uuid(Uuid::now_v7());
             entry.turn_id = None;
             entry.source_key = format!("fork:{source_session_id}:{}", source.sequence);
+            // The fork replays this history to the provider, so redaction is
+            // re-applied at copy time: entries written by older binaries —
+            // before any redaction hardening — must not survive into the new
+            // session unredacted. Redaction is a fixed point over
+            // already-redacted text, so this never corrupts current entries.
+            entry.text = redact_session_text(&entry.text);
+            entry.payload = entry.payload.map(redact_session_value);
             tx.execute(
                 "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
                  VALUES(?1,?2,?3,NULL,?4,?5,?6,?7)",
@@ -5190,6 +5217,13 @@ fn validate_catalog_key(value: &str, name: &str) -> Result<(), StorageError> {
 
 fn session_title(prompt: &str) -> String {
     const LIMIT: usize = 120;
+    // Redact before the length cap: truncating first could split a secret
+    // across the boundary and leave a partial credential in the visible
+    // title. Redaction here covers every title source — create prompts are
+    // redacted by the caller too (harmless, redaction is idempotent), but
+    // rename and fork titles are user-supplied raw and reach the durable
+    // record through this one function.
+    let prompt = redact_session_text(prompt);
     let first_line = prompt.lines().next().unwrap_or_default().trim();
     let mut title = String::with_capacity(first_line.len().min(LIMIT));
     for value in first_line.chars().filter(|value| !value.is_control()) {
@@ -6275,6 +6309,70 @@ mod tests {
             Err(StorageError::InvalidData(message))
                 if message.contains("another workspace")
         ));
+    }
+
+    /// A failed DETACH leaves `legacy_import` attached to the shared
+    /// connection, and every later import would then fail at ATTACH with
+    /// "already in use" — one unlucky detach permanently breaking imports.
+    /// The pre-attach best-effort detach makes such a retry self-heal: the
+    /// stale alias is dropped and the import proceeds. Mutation anchor:
+    /// deleting the pre-attach detach fails this test inside
+    /// `import_legacy_database` with "already in use".
+    #[test]
+    fn import_legacy_database_self_heals_a_stale_alias_attachment() {
+        use latte_core::{SessionId, SystemIdSource, TurnId};
+
+        let (source_dir, source_path) = db();
+        let source = Storage::open(&source_path).unwrap();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        source
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &session_binding(),
+                source_dir.path().to_str().unwrap(),
+                "imported conversation",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        drop(source);
+        {
+            let connection = Connection::open(&source_path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "{REVERSE_SCHEMA_15}{REVERSE_SCHEMA_13} PRAGMA user_version=12;"
+                ))
+                .unwrap();
+        }
+
+        let destination = Storage::memory().unwrap();
+        // Poison the shared connection the way a failed DETACH would: leave
+        // the reserved alias attached, pointing at the same file.
+        {
+            let conn = destination.connection.lock().unwrap();
+            conn.execute(
+                "ATTACH DATABASE ?1 AS legacy_import",
+                [source_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+        assert!(
+            destination
+                .import_legacy_database(
+                    &source_path,
+                    source_path.to_str().unwrap(),
+                    "sha256-selfheal",
+                    source_dir.path().to_str().unwrap(),
+                    2,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            destination.list_sessions().unwrap()[0].session_id,
+            session_id
+        );
     }
 
     #[test]
@@ -7973,6 +8071,91 @@ mod tests {
         assert!(store.rename_session(session_id, "  ").is_err());
         let missing = SessionId::from_uuid(ids.next_uuid_v7());
         assert!(store.rename_session(missing, "missing").is_err());
+    }
+
+    /// The rename title is user-supplied and reaches the durable record
+    /// raw — unlike the create prompt, which the caller redacts before the
+    /// title is derived. Mutation anchor: removing the redaction folded
+    /// into `session_title` leaves the secret readable in the stored title.
+    #[test]
+    fn rename_session_redacts_the_durable_title() {
+        use latte_core::{SessionId, SystemIdSource, TurnId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        store
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &session_binding(),
+                "/workspace/rename",
+                "first prompt",
+                &std::collections::BTreeMap::new(),
+                42,
+            )
+            .unwrap();
+        let secret = "sk-live-fedcba9876543210";
+        store
+            .rename_session(session_id, &format!("investigate {secret} leak"))
+            .unwrap();
+        let title = store.session_v2(session_id).unwrap().unwrap().title;
+        assert!(!title.contains(secret), "{title}");
+        assert!(title.contains("[REDACTED]"), "{title}");
+    }
+
+    /// Forked history is replayed to the provider, so the copy re-applies
+    /// redaction to text and payload: entries persisted by older binaries —
+    /// before any redaction hardening — must not survive into the new
+    /// session unredacted. Mutation anchor: deleting the copy-time
+    /// redaction leaves the secret readable in both fields of the forked
+    /// entry.
+    #[test]
+    fn create_session_fork_redacts_copied_history() {
+        use latte_core::{SessionId, SystemIdSource, TurnId};
+
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let source = SessionId::from_uuid(ids.next_uuid_v7());
+        store
+            .create_session_v2(
+                source,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &session_binding(),
+                "/workspace/fork",
+                "first prompt",
+                &std::collections::BTreeMap::new(),
+                42,
+            )
+            .unwrap();
+        let secret = "sk-live-9988776655443322";
+        let history = vec![TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+            sequence: 1,
+            turn_id: None,
+            kind: TranscriptKind::Assistant,
+            text: format!("summary with api_key={secret} inside"),
+            payload: Some(serde_json::json!({"note": format!("bearer {secret}")})),
+            source_key: "assistant-final".into(),
+            created_at_ms: 42,
+        }];
+        let fork = SessionId::from_uuid(ids.next_uuid_v7());
+        store
+            .create_session_fork(source, fork, &history, None, 43)
+            .unwrap();
+        let forked = store
+            .list_sessions_for_workspace("/workspace/fork")
+            .unwrap();
+        let summary = forked
+            .iter()
+            .find(|session| session.session_id == fork)
+            .expect("the fork is listed under the source workspace");
+        let entry = &summary.transcript.entries[0];
+        assert!(!entry.text.contains(secret), "{}", entry.text);
+        assert!(entry.text.contains("[REDACTED]"), "{}", entry.text);
+        let payload = serde_json::to_string(entry.payload.as_ref().unwrap()).unwrap();
+        assert!(!payload.contains(secret), "{payload}");
+        assert!(payload.contains("[REDACTED]"), "{payload}");
     }
 
     #[test]
@@ -10776,6 +10959,19 @@ mod tests {
         let title = session_title(&long);
         assert!(title.ends_with('…'));
         assert!(title.len() <= 120 + 3);
+        // Titles are user-visible durable records and rename/fork titles are
+        // user-supplied raw, so redaction happens inside session_title —
+        // before the length cap, so truncation can never split a secret
+        // across the boundary and leak its visible half.
+        let secret = "sk-live-0123456789abcdef";
+        let titled = session_title(&format!("work with api_key={secret} please"));
+        assert!(!titled.contains(secret), "{titled}");
+        assert!(titled.contains("[REDACTED]"), "{titled}");
+        // Redaction runs before the cap, so a long value containing the
+        // secret is collapsed to the redacted assignment and nothing — not
+        // even a truncated prefix of the value — survives the boundary.
+        let long_value = format!("api_key={}{}", "a".repeat(110), secret);
+        assert_eq!(session_title(&long_value), "api_key=[REDACTED]");
     }
 
     #[test]
