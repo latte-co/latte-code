@@ -341,9 +341,9 @@ fn tui_model_picker_switches_provider_and_model_for_the_next_child() {
     let scenario = Scenario::new();
     let alpha = ScriptedProvider::start([ProviderReply::completion("alpha completed")]);
     let beta = ScriptedProvider::start([ProviderReply::completion("beta completed")]);
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "version": 1,
             "default_model": "alpha/alpha-default",

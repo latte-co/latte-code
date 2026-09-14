@@ -163,7 +163,8 @@ impl Drop for ServeChild {
 /// Computes the exact v2 provider binding the server will accept.
 fn server_binding(scenario: &Scenario) -> serde_json::Value {
     let (_config, registry) =
-        latte_code::AppConfig::load(scenario.root()).expect("config loads for binding");
+        latte_code::AppConfig::load_with_home(scenario.root(), Some(&scenario.home()))
+            .expect("config loads for binding");
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
         .build()

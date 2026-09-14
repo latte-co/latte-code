@@ -162,13 +162,16 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
             r#"{default_model:" "}"#,
             "default_model must use provider/model",
         ),
+        // Endpoint overrides on a home-credentialed provider are rejected by
+        // the workspace trust gate BEFORE deep provider validation — the
+        // trust boundary is the earlier, louder failure.
         (
             r#"{providers:{primary:{endpoint:"http://127.0.0.1:9"}}}"#,
-            "requires exactly one of base_url or endpoint",
+            "trust_repo_endpoint",
         ),
         (
             r"{providers:{primary:{base_url:null,endpoint:null}}}",
-            "requires exactly one of base_url or endpoint",
+            "trust_repo_endpoint",
         ),
         (
             r"{providers:{primary:{timeout_ms:0}}}",
@@ -253,10 +256,13 @@ fn final_cli_rejects_invalid_application_registry_and_alias_contracts() {
     for (aliases, expected) in alias_cases {
         let scenario = Scenario::new();
         write_home_provider_config(&scenario);
+        // The workspace layer carries its OWN literal key with the endpoint,
+        // so the trust gate stays silent and the alias contract is what the
+        // case actually exercises.
         write_workspace_config(
             &scenario,
             &format!(
-                r#"{{providers:{{primary:{{base_url:null,endpoint:"http://127.0.0.1:9",aliases:{aliases}}}}}}}"#
+                r#"{{providers:{{primary:{{base_url:null,endpoint:"http://127.0.0.1:9",aliases:{aliases},api_key:"workspace-own-key"}}}}}}"#
             ),
         );
         let output = scenario.output(

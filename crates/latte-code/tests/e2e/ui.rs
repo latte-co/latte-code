@@ -199,7 +199,7 @@ fn final_tui_exercises_escape_reverse_navigation_and_empty_picker_boundaries() {
     let scenario = Scenario::new();
     std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         r#"{
             version: 1,
             default_model: "primary/model-a",
