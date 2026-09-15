@@ -10,7 +10,8 @@ fn server_binding(scenario: &Scenario) -> serde_json::Value {
 /// Like [`server_binding`], but for an explicit provider model when given.
 fn server_binding_for_model(scenario: &Scenario, model: Option<&str>) -> serde_json::Value {
     let (_config, registry) =
-        latte_code::AppConfig::load(scenario.root()).expect("config loads for binding");
+        latte_code::AppConfig::load_with_home(scenario.root(), Some(&scenario.home()))
+            .expect("config loads for binding");
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(scenario.root())
         .build()
@@ -85,9 +86,9 @@ fn declared_context_window_tightens_repository_context_in_final_binary() {
     let treated = Scenario::new();
     std::fs::write(treated.root().join("AGENTS.md"), &marker).unwrap();
     let treated_provider = ScriptedProvider::start([ProviderReply::completion("treated done")]);
-    std::fs::create_dir_all(treated.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(treated.home().join(".latte")).unwrap();
     std::fs::write(
-        treated.root().join(".latte/latte-code.jsonc"),
+        treated.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:{{mock:{{options:{{context_window:1}}}}}},endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#,
             treated_provider.endpoint()
@@ -146,9 +147,9 @@ fn final_binary_compacts_discarded_history_into_a_durable_summary_card() {
     // Tight request budget: the first turn (long prompt + long answer) does
     // not fit next to the follow-up prompt, forcing a discard — and with
     // compaction enabled, a summary request.
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#,
             provider.endpoint()
@@ -241,9 +242,9 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
         ProviderReply::completion("input done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#
         ),
@@ -418,9 +419,9 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
         ProviderReply::completion("degraded done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#
         ),
@@ -635,9 +636,9 @@ fn final_binary_accepts_a_legacy_thread_block_in_user_config_and_resumes_a_sessi
 #[test]
 fn final_binary_rejects_thread_and_session_blocks_together() {
     let scenario = Scenario::new();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         r#"{version:1,providers:{},verification:{argv:["true"]},
             thread:{provider_timeout_ms:7000},session:{provider_timeout_ms:9000}}"#,
     )
@@ -860,9 +861,9 @@ fn final_binary_uses_inline_provider_secret_without_environment_inheritance() {
         false,
     )]);
     let secret = "latte-inline-portable-e2e-secret";
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{secret:?},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#,
             provider.endpoint()
@@ -1199,9 +1200,9 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
         ProviderReply::completion("second answer"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -1389,7 +1390,7 @@ fn final_binary_stops_a_turn_that_never_stops_calling_tools() {
     );
     // Narrow the budget so the test is fast; the mechanism is the same at the
     // default of 48.
-    let config = scenario.root().join(".latte/latte-code.jsonc");
+    let config = scenario.home().join(".latte/latte-code.jsonc");
     let text = std::fs::read_to_string(&config).unwrap();
     std::fs::write(
         &config,
@@ -1489,9 +1490,9 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
     }
     let provider = ScriptedProvider::start(replies);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:3}}{verification}}}"#,
             verification = verification_fragment(),
@@ -1675,9 +1676,9 @@ fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
         ProviderReply::completion("second turn done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -1855,9 +1856,9 @@ fn final_binary_resumes_a_pre_upgrade_binding_after_schema_13() {
         ProviderReply::completion("resumed after upgrade"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}}}"#
         ),
@@ -1878,7 +1879,8 @@ fn final_binary_resumes_a_pre_upgrade_binding_after_schema_13() {
     // tool documentation), recomputed over the identical current tool set.
     let legacy_tools_fp = {
         let (_config, registry) =
-            latte_code::AppConfig::load(scenario.root()).expect("config loads");
+            latte_code::AppConfig::load_with_home(scenario.root(), Some(&scenario.home()))
+                .expect("config loads");
         let engine = latte_engine::EngineBuilder::new()
             .workspace_root(scenario.root())
             .build()
@@ -1985,9 +1987,9 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
         ProviderReply::completion("changed files, now verify"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -2206,9 +2208,9 @@ fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
     }
     let provider = ScriptedProvider::start(replies);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:3}}{verification}}}"#,
             verification = verification_fragment(),
@@ -2319,9 +2321,9 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
     ];
     let provider = ScriptedProvider::start(replies);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:2}}}}"#
         ),
@@ -2504,9 +2506,9 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
     replies.push(tool_batch("r48-blocked"));
     let provider = ScriptedProvider::start(replies);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},session:{{max_tool_rounds:48}}}}"#
         ),
@@ -2886,9 +2888,9 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
     ]);
     // Two configured models let the switch-model success path run end to end.
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -3393,9 +3395,9 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         ProviderReply::completion("wrote the file"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -3526,9 +3528,9 @@ fn final_binary_server_denies_a_permission_request_through_http() {
         ProviderReply::completion("permission denied, moving on"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -3636,9 +3638,9 @@ fn final_binary_server_rejects_secret_input_request_from_provider() {
         true,
     )]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -3709,9 +3711,9 @@ fn final_binary_server_rejects_stale_turn_revision_on_permission() {
         ProviderReply::completion("done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -3806,9 +3808,9 @@ fn final_binary_server_rejects_stale_turn_revision_on_input() {
         ProviderReply::completion("got it"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -3907,9 +3909,9 @@ fn final_binary_server_provides_input_through_http() {
         ProviderReply::completion("drained the queue"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4065,9 +4067,9 @@ fn final_binary_terminal_finish_audits_the_discarded_queue() {
         ProviderReply::input_request("secret-1", "secret value", true),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}}}}"#
         ),
@@ -4197,9 +4199,9 @@ fn final_binary_server_queues_follow_up_during_an_active_turn() {
         ProviderReply::completion("drained the queue"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4278,9 +4280,9 @@ fn final_binary_serve_rejects_invalid_configuration() {
     let scenario = Scenario::new();
     // An empty verification.argv is a documented configuration error; serve
     // surfaces it as a usage failure before binding a socket.
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         "{ verification: { argv: [] } }",
     )
     .unwrap();
@@ -4316,9 +4318,9 @@ fn final_binary_server_reports_a_full_mailbox_as_conflict() {
         ProviderReply::completion("drain 8"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4388,9 +4390,9 @@ fn final_binary_server_marks_a_failed_background_turn() {
     // fails and the durable projection settles at the failed lifecycle.
     let provider = ScriptedProvider::start([ProviderReply::error(400, "provider rejected")]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},max_attempts:1}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4449,9 +4451,9 @@ fn final_binary_server_persists_sessions_across_restart() {
         ProviderReply::completion("done again"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4546,9 +4548,9 @@ fn final_binary_recovery_sweeper_wakes_live_sse_after_a_crash() {
         ProviderReply::completion("unused"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4702,9 +4704,9 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         ProviderReply::completion("after follow-up"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4804,9 +4806,9 @@ fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
         ProviderReply::completion("follow-up done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -4941,9 +4943,9 @@ fn final_binary_follow_up_durable_mismatch_after_restart_returns_422() {
         ProviderReply::completion("follow-up done"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -5053,9 +5055,9 @@ fn final_binary_server_renames_forks_and_lists_bindings() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::completion("first")]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock","mock-2"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -5253,9 +5255,9 @@ fn final_binary_server_exact_title_lookup_returns_only_exact_matches() {
         ProviderReply::completion("second"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}}{verification}}}"#,
             verification = verification_fragment(),
@@ -5769,9 +5771,9 @@ fn final_binary_cli_text_mode_resume() {
 fn final_binary_cli_run_without_providers() {
     let scenario = Scenario::new();
     // Write a config with no providers at all.
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         r#"{version:1,default_model:"",providers:{},database:{path:".latte/latte-code.db"},verification:{argv:["true"]}}"#,
     )
     .unwrap();
@@ -5901,9 +5903,9 @@ fn final_binary_cli_show_denied_session_in_text_mode() {
         ProviderReply::completion("permission denied, moving on"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -6252,9 +6254,9 @@ fn final_binary_cli_show_waiting_permission_session() {
         ProviderReply::completion("after permission"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -6336,9 +6338,9 @@ fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
         ProviderReply::completion("after cancel"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -6443,9 +6445,9 @@ fn final_binary_cli_show_waiting_input_session() {
         ProviderReply::completion("got it"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},compatibility_input_request:true}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -8528,9 +8530,9 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         ProviderReply::completion("wrote and verified"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["false"]}}}}"#
         ),
@@ -8689,9 +8691,9 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         ProviderReply::completion("wrote and verified"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -9717,9 +9719,9 @@ fn final_binary_server_catalog_error_paths() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::completion("done")]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -9822,9 +9824,9 @@ fn final_binary_cli_list_without_json_emits_text() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::completion("listed")]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -9874,9 +9876,9 @@ fn final_binary_cli_show_without_json_emits_text() {
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::completion("shown")]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),
@@ -9955,9 +9957,9 @@ fn final_binary_cli_resume_without_json_emits_text() {
         ProviderReply::completion("resumed turn"),
     ]);
     let endpoint = provider.endpoint();
-    std::fs::create_dir_all(scenario.root().join(".latte")).unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
-        scenario.root().join(".latte/latte-code.jsonc"),
+        scenario.home().join(".latte/latte-code.jsonc"),
         format!(
             r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["true"]}}}}"#
         ),

@@ -123,9 +123,13 @@ impl Scenario {
     }
 
     pub fn write_config_with_base_url(&self, base_url: &str, verification: &str) {
-        std::fs::create_dir_all(self.root.path().join(".latte")).unwrap();
+        // Provider configuration is user-level (trusted) configuration: it
+        // lives in the HOME layer. The workspace layer is untrusted — a
+        // workspace endpoint override combined with an outside credential
+        // is rejected at load (see `enforce_workspace_endpoint_trust`).
+        std::fs::create_dir_all(self.home().join(".latte")).unwrap();
         std::fs::write(
-            self.root.path().join(".latte/latte-code.jsonc"),
+            self.home().join(".latte/latte-code.jsonc"),
             format!(
                 r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],base_url:{base_url:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:{verification}}}}}"#
             ),
@@ -157,9 +161,11 @@ impl Scenario {
         model: &str,
         provider_fields: &str,
     ) {
-        std::fs::create_dir_all(self.root.path().join(".latte")).unwrap();
+        // Provider configuration is user-level (trusted) configuration: it
+        // lives in the HOME layer. See `write_config_with_base_url`.
+        std::fs::create_dir_all(self.home().join(".latte")).unwrap();
         std::fs::write(
-            self.root.path().join(".latte/latte-code.jsonc"),
+            self.home().join(".latte/latte-code.jsonc"),
             format!(
                 r#"{{version:1,default_model:"main/{model}",providers:{{main:{{type:"openai-chat",models:[{model:?}],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}{provider_fields}}}}},database:{{path:{database_path:?}}},verification:{{argv:{verification}}}}}"#
             ),
