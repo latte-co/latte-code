@@ -3798,8 +3798,12 @@ mod tests {
     /// A provider whose every call fails with the given `ProviderError`.
     // Unix-gated with its only consumers (the Http verdict tests); on
     // Windows those vanish and an ungated copy here would be dead code.
+    // Both the struct and its impl must carry the gate: a half-gated pair
+    // compiles on Unix and breaks Windows with E0425 (the impl outliving
+    // its type).
     #[cfg(unix)]
     struct ErrorProvider(std::sync::Mutex<Option<ProviderError>>);
+    #[cfg(unix)]
     impl Provider for ErrorProvider {
         fn complete(
             &self,
