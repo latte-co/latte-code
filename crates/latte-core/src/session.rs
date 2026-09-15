@@ -520,7 +520,22 @@ fn redact_token_like_values(value: &str) -> String {
     // key/shape so the surrounding tool output stays intelligible.
     static NAMED_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"(?ix)\b(?P<name>(?:[a-z][a-z0-9_-]*?)?(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|token|password|credential)[a-z0-9_-]*)\s*(?P<separator>[:=])\s*(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^\s,;\)\}\]]+)"#,
+            // The `[REDACTED]` alternative keeps repeated passes idempotent:
+            // the generic value class stops before `]`, so without it a
+            // second pass matched `[REDACTED` and appended one `]` per pass
+            // (redaction must never corrupt on re-application, or any
+            // defense-in-depth double-redaction becomes data damage). Two
+            // details are load-bearing and independently failable:
+            // - the alternative must sit BEFORE the generic class: regex
+            //   alternation is leftmost-first, so a later branch is never
+            //   reached once the generic class bites off `[REDACTED`;
+            // - the trailing `[^\s,;\)\}]*` tail-eater must stay: a bare
+            //   literal match stops after the marker and would leave a
+            //   secret glued to it (`api_key=[REDACTED]<real-secret>`)
+            //   verbatim in the output. The tail class deliberately still
+            //   allows `]` so glued residue is swallowed into the
+            //   replacement.
+            r#"(?ix)\b(?P<name>(?:[a-z][a-z0-9_-]*?)?(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|token|password|credential)[a-z0-9_-]*)\s*(?P<separator>[:=])\s*(?:\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|\[REDACTED\][^\s,;\)\}]*|[^\s,;\)\}\]]+)"#,
         )
         .expect("named secret assignment regex is valid")
     });
@@ -584,6 +599,62 @@ mod tests {
         assert!(!control.contains('\u{1b}'));
         assert!(!control.contains('\u{7}'));
         assert!(!control.contains(secret));
+    }
+
+    /// Redaction must be idempotent: re-running it over already-redacted
+    /// text must be a fixed point. The generic value class stops before `]`,
+    /// so without the explicit `[REDACTED]` alternative each pass consumed
+    /// `[REDACTED` and appended one `]` — every defense-in-depth
+    /// double-redaction would then corrupt the transcript. The alternative
+    /// is `\[REDACTED\][^\s,;\)\}]*`, and both of its parts are
+    /// independently failable (mutation anchors below):
+    /// - dropping the tail-eater (bare `\[REDACTED\]`) reopens a bypass:
+    ///   `api_key=[REDACTED]<secret>` keeps the glued secret verbatim while
+    ///   looking redacted — killed by the glued-residue case, which uses a
+    ///   deliberately non-`sk-` shape so only the named-assignment net can
+    ///   catch it;
+    /// - moving the alternative after the generic class reintroduces the
+    ///   `]` growth (leftmost-first alternation lets the generic class win
+    ///   the race) — killed by the bare-marker cases above.
+    #[test]
+    fn redaction_is_idempotent_over_already_redacted_text() {
+        let cases = [
+            // Review repro: a named assignment whose value is the marker.
+            "config loaded: api_key=sk-live-9f8e7d6c5b4a3210 endpoint=https://x",
+            "token: [REDACTED]",
+            "Authorization: Bearer [REDACTED]",
+            "password = [REDACTED] ;",
+        ];
+        for case in cases {
+            let once = redact_session_text(case);
+            let twice = redact_session_text(&once);
+            assert_eq!(twice, once, "second pass diverged for {case:?}");
+            let thrice = redact_session_text(&twice);
+            assert_eq!(thrice, twice, "third pass diverged for {case:?}");
+        }
+
+        // A secret survives pass one and the result is a fixed point.
+        let secret = "sk-live-9f8e7d6c5b4a3210";
+        let once = redact_session_text(&format!(
+            "config loaded: api_key={secret} endpoint=https://x"
+        ));
+        assert!(!once.contains(secret), "{once}");
+        assert_eq!(redact_session_text(&once), once);
+
+        // Glued-residue bypass: residue pasted straight after the marker
+        // must be swallowed by the same match, not left behind intact.
+        let glued_secret = "ghp_0123456789abcdefgh";
+        let glued = redact_session_text(&format!("api_key=[REDACTED]{glued_secret}"));
+        assert!(!glued.contains(glued_secret), "{glued}");
+        assert_eq!(redact_session_text(&glued), glued);
+
+        // Quoted marker form converges, and a marker next to a fresh
+        // secret leaves the fresh secret redacted.
+        let quoted = redact_session_text(r#"api_key="[REDACTED]""#);
+        assert_eq!(redact_session_text(&quoted), quoted);
+        let fresh = redact_session_text("token=[REDACTED]\napi_key=sk-live-9f8e7d6c5b4a3210");
+        assert!(!fresh.contains("sk-live-9f8e7d6c5b4a3210"), "{fresh}");
+        assert_eq!(redact_session_text(&fresh), fresh);
     }
 
     #[test]

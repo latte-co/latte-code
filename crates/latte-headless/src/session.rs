@@ -2188,7 +2188,11 @@ impl SessionRuntimeService {
                 // durable ordered continuation queue.  A restart while an
                 // Ask call waits for approval reloads this exact assistant
                 // envelope and completes the remaining calls before another
-                // provider request can be made.
+                // provider request can be made. A `length`-cut response
+                // never reaches this envelope: the truncated arm above
+                // fails the turn before any tool call can execute, because
+                // a cut call's arguments can be truncated at a syntacti-
+                // cally valid boundary and still pass schema validation.
                 payload: Some(serde_json::json!({"tool_calls":tool_calls.clone()})),
             },
             lease,
@@ -2565,14 +2569,129 @@ impl SessionRuntimeService {
                 },
                 lease,
             )?,
-            Err(error) => self.fail_retryable(
-                session_id,
-                turn_id,
-                snapshot.revision,
-                turn_revision,
-                format!("provider: {error}"),
-                lease,
-            )?,
+            Err(error) => {
+                // Session-level retryability answers "can the user make
+                // progress in this conversation", not "would an identical
+                // request succeed" — that narrower transport question is
+                // what `Http.retryable` (via `is_retryable_status`) and the
+                // provider retry loop answer, and it deliberately does not
+                // decide this classification: a 400 for an unavailable
+                // model carries `retryable: false`, yet switching the model
+                // in-session and retrying is a supported flow (the TUI
+                // wrong-model e2e pins it). A rejected credential is the
+                // one Http class where no in-session action restores
+                // authority — every queued prompt would march into the same
+                // wall — so 401/403 end the conversation's session (forking
+                // with full history remains the escape). Transient
+                // statuses, request defects, and non-Http transport
+                // failures all stay retryable.
+                if matches!(
+                    &error,
+                    ProviderError::Http {
+                        status: 401 | 403,
+                        ..
+                    }
+                ) {
+                    let stopped = self.fail(
+                        session_id,
+                        turn_id,
+                        snapshot.revision,
+                        turn_revision,
+                        format!("provider: {error}"),
+                        lease,
+                    )?;
+                    return Ok(RoundFlow::Done(stopped));
+                }
+                self.fail_retryable(
+                    session_id,
+                    turn_id,
+                    snapshot.revision,
+                    turn_revision,
+                    format!("provider: {error}"),
+                    lease,
+                )?
+            }
+            Ok(response)
+                if matches!(
+                    response.finish_reason,
+                    Some(
+                        crate::provider::FinishReason::Length
+                            | crate::provider::FinishReason::ContentFilter
+                    )
+                ) =>
+            {
+                // A `length` finish means the provider stopped at its output
+                // cap mid-stream; a `content_filter` finish means the
+                // provider withheld or cut the output. Neither response can
+                // be trusted complete — least of all tool calls: a cut
+                // call's arguments can truncate at a syntactically valid
+                // boundary (`{"path":"a.rs","content":""}` parses, passes
+                // schema validation, and a side-effect tool still runs), and
+                // a filtered response may be missing exactly the withheld
+                // part. Persist the partial text for the user, then fail
+                // retryably — the tool-call shape gets the same treatment as
+                // the final-text shape by hoisting this arm above the
+                // tool-call arm, so no call of a cut or filtered response
+                // even reaches its permission gate. The calls are
+                // deliberately not persisted as a continuation envelope:
+                // resume would complete exactly the calls this arm refuses
+                // to trust. A follow-up continues the work.
+                //
+                // An empty message under these finishes stays retryable on
+                // purpose (a deliberate change from the final-text arm,
+                // where an empty outcome is a terminal contract violation):
+                // the finish reason explains the emptiness — the cap or the
+                // filter consumed the whole output — so a follow-up with a
+                // fresh budget can genuinely succeed, and nothing is
+                // persisted (no empty card). Without the finish reason the
+                // same emptiness means a broken provider and stays
+                // terminal.
+                let (source_suffix, payload, reason) = match response.finish_reason {
+                    Some(crate::provider::FinishReason::Length) => (
+                        "truncated",
+                        serde_json::json!({"truncated":"length"}),
+                        "provider stopped at its output limit before completing the response",
+                    ),
+                    _ => (
+                        "filtered",
+                        serde_json::json!({"filtered":"content_filter"}),
+                        "provider blocked the response before it completed: content was filtered",
+                    ),
+                };
+                if let Some(message) = response.message.filter(|value| !value.trim().is_empty()) {
+                    let appended = self.commit(
+                        session_id,
+                        turn_id,
+                        snapshot.revision,
+                        turn_revision,
+                        CommitSessionTurnUpdate::AppendTranscript {
+                            source_key: format!("{turn_id}:assistant-{source_suffix}"),
+                            kind: TranscriptKind::Assistant,
+                            text: message,
+                            payload: Some(payload),
+                        },
+                        lease,
+                    )?;
+                    let stopped = self.fail_retryable(
+                        session_id,
+                        turn_id,
+                        appended.revision,
+                        turn_revision,
+                        reason.into(),
+                        lease,
+                    )?;
+                    return Ok(RoundFlow::Done(stopped));
+                }
+                let stopped = self.fail_retryable(
+                    session_id,
+                    turn_id,
+                    snapshot.revision,
+                    turn_revision,
+                    reason.into(),
+                    lease,
+                )?;
+                return Ok(RoundFlow::Done(stopped));
+            }
             Ok(response) if response.input_request.is_some() => {
                 let input = response.input_request.expect("checked is some");
                 // The provider controls this value, but it becomes part of a
@@ -2649,10 +2768,10 @@ impl SessionRuntimeService {
                 }
             }
             Ok(response) => {
-                let truncated = matches!(
-                    response.finish_reason,
-                    Some(crate::provider::FinishReason::Length)
-                );
+                // `length` finishes never reach this arm: the hoisted
+                // truncated arm above fails the turn first, for the
+                // final-text shape and the tool-call shape alike. What
+                // remains is a complete outcome.
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
                     let failed = self.fail(
@@ -2674,27 +2793,10 @@ impl SessionRuntimeService {
                         source_key: format!("{turn_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
-                        payload: truncated.then(|| serde_json::json!({"truncated":"length"})),
+                        payload: None,
                     },
                     lease,
                 )?;
-                // A `length` finish means the model stopped at its output cap
-                // mid-answer. Persist what arrived, then fail retryably: the
-                // partial text is not a completed turn, and treating it as one
-                // would record an unfinished answer as success. Retryable keeps
-                // the session usable so a follow-up can continue the work.
-                if truncated {
-                    let stopped = self.fail_retryable(
-                        session_id,
-                        turn_id,
-                        appended.revision,
-                        turn_revision,
-                        "provider stopped at its output limit before completing the response"
-                            .into(),
-                        lease,
-                    )?;
-                    return Ok(RoundFlow::Done(stopped));
-                }
                 let changed = self.engine.session_turn_changed_files(turn_id)?;
                 if !changed.is_empty() {
                     if self.verification.is_none() {
@@ -3693,6 +3795,53 @@ mod tests {
         SessionRuntimeService::new(engine, root, policy, factory)
     }
 
+    /// A provider whose every call fails with the given `ProviderError`.
+    // Unix-gated with its only consumers (the Http verdict tests); on
+    // Windows those vanish and an ungated copy here would be dead code.
+    // Both the struct and its impl must carry the gate: a half-gated pair
+    // compiles on Unix and breaks Windows with E0425 (the impl outliving
+    // its type).
+    #[cfg(unix)]
+    struct ErrorProvider(std::sync::Mutex<Option<ProviderError>>);
+    #[cfg(unix)]
+    impl Provider for ErrorProvider {
+        fn complete(
+            &self,
+            _: ProviderRequest,
+            _: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            let error = self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| ProviderError::Transport("error provider exhausted".into()));
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    #[cfg(unix)]
+    fn http_error_service(
+        root: &std::path::Path,
+        engine: EngineHandle,
+        status: u16,
+        retryable: bool,
+    ) -> SessionRuntimeService {
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: Arc::new(ErrorProvider(std::sync::Mutex::new(Some(
+                    ProviderError::Http {
+                        status,
+                        request_id: String::new(),
+                        retryable,
+                    },
+                )))),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
+    }
+
     /// A `length` finish is a mid-answer stop at the model's output cap. The
     /// partial text must survive for the user to read, but the turn must not
     /// be recorded as completed, or an unfinished answer counts as success.
@@ -3742,7 +3891,359 @@ mod tests {
         );
     }
 
-    /// Every other finish reason completes normally; only `length` is a stop.
+    /// A `length` finish with tool calls is the dangerous shape: the cut can
+    /// land on a syntactically valid argument boundary — the scripted call
+    /// is that shape, a `write_file` whose content was cut mid-sentence but
+    /// still parses and passes input validation (an empty content would be
+    /// rejected by the tool itself, so the truncated remnant must look
+    /// legitimate) — and a semantically truncated call of a side-effect tool
+    /// must never reach execution. The truncated arm is hoisted above the
+    /// tool-call arm: the turn fails before any call is prepared, so no
+    /// permission is solicited (the execution path's first observable choke
+    /// point), no durable tool-round envelope exists (resume would complete
+    /// exactly the calls this path refuses to trust), and the file is never
+    /// written. Mutation anchor: deleting the hoisted arm lets the batch
+    /// park at the Ask gate — the pending-permission assertion goes red,
+    /// proving the cut response entered the execution path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn length_cut_tool_calls_never_reach_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut cut = response(
+            Some("writing"),
+            vec![write_call("call-cut", "victim.txt", "half of an int")],
+        );
+        cut.finish_reason = Some(crate::provider::FinishReason::Length);
+        let provider = Arc::new(RecordingProvider::scripted([
+            cut,
+            response(Some("must not be reached"), vec![]),
+        ]));
+        let service = recording_service(root.path(), engine, provider.clone());
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "cut tool round".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Retryable, not terminal: a follow-up can continue with a fresh
+        // output budget.
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        // The execution path was never entered: the permission gate is its
+        // first choke point, and nothing may be solicited from a cut
+        // response.
+        assert!(
+            snapshot.pending.is_none(),
+            "a cut response's tool call must not reach its permission gate: {snapshot:?}"
+        );
+        assert!(
+            !snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.source_key.contains("assistant-tool-round")),
+            "no continuation envelope may exist for calls that were never executed"
+        );
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            1,
+            "the turn must not reenter the provider after a cut"
+        );
+        // The side effect did not happen: the semantically truncated write
+        // must not have created the file.
+        assert!(
+            !root.path().join("victim.txt").exists(),
+            "the truncated write must not have executed"
+        );
+        // The partial text survives with the truncation marker, and the
+        // user sees why the turn stopped.
+        let assistant = snapshot
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.kind == TranscriptKind::Assistant)
+            .expect("the partial text is persisted");
+        assert_eq!(assistant.text, "writing");
+        assert_eq!(
+            assistant.payload.as_ref().and_then(|p| p.get("truncated")),
+            Some(&serde_json::json!("length"))
+        );
+        assert!(
+            snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::Failure
+                    && entry.text.contains("output limit"))
+        );
+    }
+
+    /// A length cut that produced no text at all stays retryable — the
+    /// finish reason explains the emptiness (the cap consumed the whole
+    /// output), unlike an unexplained empty outcome which is a terminal
+    /// contract violation. Nothing is persisted: no empty assistant card.
+    /// Mutation anchor: rerouting this shape to the final-text arm's
+    /// terminal `fail` (or completing it) flips the failure text or the
+    /// retryability this test pins.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn length_cut_with_an_empty_message_stays_retryable_and_persists_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut cut = response(None, vec![]);
+        cut.finish_reason = Some(crate::provider::FinishReason::Length);
+        let service = scripted_service(root.path(), engine, vec![cut]);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "empty cut".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert!(snapshot.lifecycle.accepts_follow_up());
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        assert!(
+            !snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::Assistant),
+            "an empty cut must not persist an empty card"
+        );
+        let failure = snapshot
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::Failure)
+            .map(|entry| entry.text.as_str())
+            .next_back()
+            .unwrap_or("");
+        assert!(
+            failure.contains("output limit") && !failure.contains("empty assistant outcome"),
+            "the failure must carry the cap explanation, not the terminal empty-outcome verdict: {failure}"
+        );
+    }
+
+    /// A `content_filter` finish is the "withheld" sibling of `length`: the
+    /// provider blocked the output, and recording the half-answer as a
+    /// completed turn would be worse than the length case — the transcript
+    /// would claim success over exactly the part that was suppressed. The
+    /// partial text is persisted with a `filtered` marker and the turn
+    /// fails retryably (the user can rephrase in a follow-up). Mutation
+    /// anchor: dropping `ContentFilter` from the hoisted arm's guard lets
+    /// the final-text arm complete the turn — the `Failed` assertion below
+    /// is what goes red.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn content_filter_finish_is_recorded_and_fails_retryably() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let mut blocked = response(Some("here is what I can say"), vec![]);
+        blocked.finish_reason = Some(crate::provider::FinishReason::ContentFilter);
+        let service = scripted_service(root.path(), engine, vec![blocked]);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "blocked question".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Not a completed turn: this is the assertion the mutation kills.
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert!(snapshot.lifecycle.accepts_follow_up());
+        let assistant = snapshot
+            .transcript
+            .entries
+            .iter()
+            .find(|entry| entry.kind == TranscriptKind::Assistant)
+            .expect("the surviving text is persisted");
+        assert_eq!(assistant.text, "here is what I can say");
+        assert_eq!(
+            assistant.payload.as_ref().and_then(|p| p.get("filtered")),
+            Some(&serde_json::json!("content_filter")),
+            "the card must say the output was filtered"
+        );
+        assert!(
+            snapshot
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::Failure
+                    && entry.text.contains("filtered"))
+        );
+    }
+
+    /// A rejected credential (401) is terminal: no in-session action
+    /// restores authority, and leaving the session ready would feed queued
+    /// prompts into the same wall. Forking with full history remains the
+    /// escape. Mutation anchor: widening the session's terminal check to
+    /// unconditional `fail_retryable` turns this lifecycle `Failed` into
+    /// `Ready`, which is what the first assertion pins.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_auth_rejection_is_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = http_error_service(root.path(), engine, 401, false);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "ask".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            SessionLifecycle::Failed,
+            "a rejected credential must not leave the session ready to retry"
+        );
+        assert!(!snapshot.lifecycle.accepts_follow_up());
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        let failure = snapshot
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::Failure)
+            .map(|entry| entry.text.as_str())
+            .next_back()
+            .unwrap_or("");
+        assert!(failure.contains("http 401"), "{failure}");
+    }
+
+    /// 403 is the same auth class as 401: the credential is valid-shaped
+    /// but rejected, so the session ends (fork is the escape).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_forbidden_rejection_is_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = http_error_service(root.path(), engine, 403, false);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "ask".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Failed);
+        assert!(!snapshot.lifecycle.accepts_follow_up());
+    }
+
+    /// The mirror contract: a transient status keeps the session ready — a
+    /// follow-up after the outage is meaningful. This is also the guard
+    /// against over-correction: making every Http failure terminal would
+    /// strand sessions on a 503.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_error_with_a_retryable_verdict_keeps_the_session_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = http_error_service(root.path(), engine, 503, true);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "ask".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
+        assert!(snapshot.lifecycle.accepts_follow_up());
+        assert_eq!(
+            snapshot.turns.last().unwrap().status,
+            latte_core::SessionTurnStatus::Failed
+        );
+        let failure = snapshot
+            .transcript
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::Failure)
+            .map(|entry| entry.text.as_str())
+            .next_back()
+            .unwrap_or("");
+        assert!(failure.contains("http 503"), "{failure}");
+    }
+
+    /// A request defect (400) stays retryable even though the transport
+    /// verdict says `retryable: false`: the flag answers "would an
+    /// identical request succeed", while the session answers "can the user
+    /// make progress here" — switching the model in-session after a
+    /// wrong-model 400 is a supported flow (the TUI wrong-model e2e pins
+    /// it end to end).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_request_defect_stays_retryable_for_an_in_session_fix() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = http_error_service(root.path(), engine, 400, false);
+        let snapshot = service
+            .start(
+                SessionId::from_uuid(Uuid::now_v7()),
+                "ask".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            SessionLifecycle::Ready,
+            "a fixable-in-session defect must not terminalize the session"
+        );
+        assert!(snapshot.lifecycle.accepts_follow_up());
+    }
+
+    /// Every other finish reason completes normally; `length` and
+    /// `content_filter` stop the turn (covered above).
     #[tokio::test]
     async fn non_length_finish_reasons_complete_the_turn() {
         for reason in [

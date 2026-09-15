@@ -9411,14 +9411,16 @@ fn final_binary_cli_run_with_provider_error_fails() {
     provider.assert_consumed();
 }
 
-/// Provider responses with non-terminal finish reasons (`content_filter`,
-/// unknown) still complete the session, covering the `finish_reason` mapping
-/// branches in the provider. `length` is deliberately excluded: it means the
-/// model stopped mid-answer, and
-/// `final_binary_reports_a_length_truncated_answer_as_unfinished` covers it.
+/// Unknown finish reasons carry no stop semantics, so the turn still
+/// completes; `content_filter` blocks the answer — the surviving text is
+/// persisted with a `filtered` marker and the turn fails retryably instead
+/// of recording success over exactly the suppressed part (same contract as
+/// `length`, which
+/// `final_binary_reports_a_length_truncated_answer_as_unfinished` covers).
 #[test]
-fn final_binary_cli_run_with_variant_finish_reasons_completes() {
-    for reason in ["content_filter", "custom_reason"] {
+fn final_binary_cli_run_with_variant_finish_reasons_matches_stop_semantics() {
+    {
+        let reason = "custom_reason";
         let scenario = Scenario::new();
         let reply = ProviderReply::json(
             200,
@@ -9446,6 +9448,46 @@ fn final_binary_cli_run_with_variant_finish_reasons_completes() {
         );
         let body = json(&output);
         assert_eq!(body["status"], "completed", "finish_reason={reason}");
+        provider.assert_consumed();
+    }
+    {
+        let reason = "content_filter";
+        let scenario = Scenario::new();
+        let reply = ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "choices": [{
+                    "message": {"content": format!("done with {reason}"), "tool_calls": []},
+                    "finish_reason": reason
+                }]
+            }),
+        );
+        let provider = ScriptedProvider::start([reply]);
+        scenario.write_config(provider.endpoint(), r#"["true"]"#);
+
+        let output = scenario.output(
+            &["--json", "run", &format!("finish reason {reason}")],
+            |command| {
+                command.env("TEST_OPENAI_KEY", "finish-reason-secret");
+            },
+        );
+        assert!(
+            !output.status.success(),
+            "a filtered answer must not exit as success: stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let body = json(&output);
+        assert_eq!(body["status"], "failed", "finish_reason={reason}");
+        let failure = body["data"]["session"]["transcript"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "failure")
+            .expect("a filtered turn records a failure card");
+        assert!(
+            failure["text"].as_str().unwrap().contains("filtered"),
+            "{failure}"
+        );
         provider.assert_consumed();
     }
 }

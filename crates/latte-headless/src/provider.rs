@@ -546,7 +546,7 @@ impl Provider for OpenAiProvider {
                 };
                 let status = response.status().as_u16();
                 if !response.status().is_success()
-                    && matches!(status, 408 | 429 | 502 | 503 | 504)
+                    && is_retryable_status(status)
                     && attempt < this.max_attempts
                 {
                     let retry_after = response
@@ -594,7 +594,7 @@ impl Provider for OpenAiProvider {
                 return Err(ProviderError::Http {
                     status,
                     request_id,
-                    retryable: matches!(status, 408 | 429 | 502 | 503 | 504),
+                    retryable: is_retryable_status(status),
                 });
             }
             let content_type = response
@@ -648,6 +648,19 @@ fn apply_headers(
     builder
 }
 
+/// The one source of truth for "an HTTP status is transient" at the
+/// transport layer: the retry loop and both `ProviderError::Http`
+/// construction sites consume this verdict. The session's failure
+/// classification deliberately does NOT read it — that classification
+/// answers "can the user make progress in this conversation", not "would an
+/// identical request succeed" (a 400 for an unavailable model carries
+/// `retryable: false`, yet an in-session model switch makes a retry
+/// meaningful; only 401/403 terminalize — see the `Err` arm in
+/// `session.rs`).
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
 fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
     // Rendering observers are intentionally outside the provider critical
     // path. A slow terminal reducer cannot hold the network response open.
@@ -699,7 +712,12 @@ async fn complete_inline_once(
                 .and_then(|value| value.to_str().ok())
                 .map(|value| format!(" (request {value})"))
                 .unwrap_or_default(),
-            retryable: false,
+            // Same verdict as the streaming path — a transient status on
+            // the inline retry is still transient. (This used to be a
+            // hardcoded `false`, which would have misclassified a 503 on
+            // the fallback as final once the session started honoring the
+            // flag.)
+            retryable: is_retryable_status(status),
         });
     }
     let wire = response

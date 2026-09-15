@@ -77,7 +77,9 @@ pub fn build(
     for name in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
         let path = root.join(name);
         if path.is_file() {
-            paths.push(path)
+            // Same containment as AGENTS.md: a root manifest that is a
+            // symlink pointing outside the workspace must not be read.
+            paths.push(contained_canonical(&root, &path)?)
         }
     }
     let mut text = String::new();
@@ -192,6 +194,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.md"), &[0xFF, 0xFE, 0xFD][..]).unwrap();
         assert!(build(dir.path(), None, 1024).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_external_symlinked_manifests() {
+        use std::os::unix::fs::symlink;
+
+        for name in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            fs::write(external.path().join(name), "external secret").unwrap();
+            symlink(external.path().join(name), workspace.path().join(name)).unwrap();
+            assert_eq!(
+                build(workspace.path(), None, 1024).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{name} symlinked out of the workspace must be rejected"
+            );
+        }
     }
 
     #[cfg(unix)]
