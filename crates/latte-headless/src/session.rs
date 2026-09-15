@@ -3796,6 +3796,9 @@ mod tests {
     }
 
     /// A provider whose every call fails with the given `ProviderError`.
+    // Unix-gated with its only consumers (the Http verdict tests); on
+    // Windows those vanish and an ungated copy here would be dead code.
+    #[cfg(unix)]
     struct ErrorProvider(std::sync::Mutex<Option<ProviderError>>);
     impl Provider for ErrorProvider {
         fn complete(
@@ -3813,6 +3816,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn http_error_service(
         root: &std::path::Path,
         engine: EngineHandle,
