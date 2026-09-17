@@ -11087,22 +11087,26 @@ fn final_binary_cli_run_with_list_directory_tool_completes() {
 #[test]
 fn final_binary_cli_run_with_git_diff_tool_completes() {
     let scenario = Scenario::new();
-    // Initialize a git repo so git_diff works.
-    let status = std::process::Command::new("git")
-        .args(["init"])
+    // Initialize a hermetic git repo (explicit identity; the runner has no
+    // global git identity, so relying on ambient config would make the initial
+    // commit silently fail and exercise only the no-HEAD branch).
+    scenario.init_git();
+    std::fs::write(scenario.root().join("tracked.txt"), "content\n").unwrap();
+    let added = std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
         .current_dir(scenario.root())
         .status()
         .unwrap();
-    assert!(status.success());
-    std::fs::write(scenario.root().join("tracked.txt"), "content\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["add", "tracked.txt"])
-        .current_dir(scenario.root())
-        .status();
-    let _ = std::process::Command::new("git")
+    assert!(added.success());
+    let committed = std::process::Command::new("git")
         .args(["commit", "-m", "initial"])
         .current_dir(scenario.root())
-        .status();
+        .status()
+        .unwrap();
+    assert!(
+        committed.success(),
+        "the fixture's initial commit must succeed so git_diff has a real HEAD"
+    );
     // Modify the file so git_diff has something to report.
     std::fs::write(scenario.root().join("tracked.txt"), "modified content\n").unwrap();
 

@@ -5134,6 +5134,9 @@ mod tests {
             *self.fail_request_index.lock().unwrap() = Some(index);
         }
 
+        // Only the unix PTY/process overflow journeys script a one-shot
+        // overflow index, so the helper is dead on Windows's test build.
+        #[cfg(unix)]
         fn overflow_at(&self, index: usize) {
             self.overflow_indices.lock().unwrap().insert(index);
         }
