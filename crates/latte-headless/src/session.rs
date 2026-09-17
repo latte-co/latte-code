@@ -744,6 +744,35 @@ impl SessionRuntimeService {
         else {
             return Ok(Self::manual_idle(snapshot, Reason::NothingToCompress));
         };
+        // Idempotent repeat (§4.7). The projection carries at most one
+        // summary segment — the newest card — and scan places it at the
+        // oldest position. When the movable prefix holds ONLY that segment,
+        // no raw history newer than the existing card is being superseded:
+        // re-running would just re-summarize the existing summary while
+        // keeping the identical raw suffix (the retain floor cannot move
+        // past the first raw segment after the card). This is true even when
+        // a new turn landed AFTER the card but stayed entirely inside the
+        // retained suffix. Return the empty state BEFORE acquiring the lease
+        // or spending a summarizer call, and keep the append off any earlier
+        // card's source key. New raw history only reaches this prefix once it
+        // is large enough to cross the retain boundary, and that is a
+        // genuinely productive re-compaction (unique `:manual:N` key below).
+        if segments[..boundary]
+            .iter()
+            .all(|segment| segment.from_summary)
+        {
+            return Ok(Self::manual_idle(snapshot, Reason::NothingToCompress));
+        }
+        // Manual cards may legitimately repeat on the same latest turn (each
+        // productive run absorbs new raw history). The durable source key is
+        // `{turn_id}:…{suffix}` and commit sources are unique per
+        // `(session, source_key)`, so the suffix must be unique per run while
+        // staying scoped to the turn. The turn's current revision advances on
+        // every successful card append, so it is exactly that per-run,
+        // per-turn discriminator — no transcript scan and no kind-specific
+        // counter needed. Both tiers of one invocation share it; a single
+        // invocation appends at most one of the two cards.
+        let manual_suffix = format!(":manual:{}", turn.turn_revision);
         let lease = self.acquire(session_id)?;
         let mut fitting = segments;
         // Tier 1: deterministic elision. A successful manual elision needs no
@@ -767,7 +796,7 @@ impl SessionRuntimeService {
                         turn.turn_revision,
                         &prepared,
                         &lease,
-                        ":manual",
+                        &manual_suffix,
                     )?;
                     return Ok(Self::manual_compacted(committed, Tier::Elided));
                 }
@@ -829,7 +858,7 @@ impl SessionRuntimeService {
             turn.turn_revision,
             &prepared,
             &lease,
-            ":manual",
+            &manual_suffix,
         )?;
         Ok(Self::manual_compacted(committed, Tier::Summarized))
     }
@@ -12015,10 +12044,201 @@ mod tests {
         );
     }
 
+    /// Strict-shrink guard, ELISION tier (mutation anchor A2a). The end-to-end
+    /// negative branch is not naturally reachable: every engine tool result
+    /// is a JSON envelope larger than the deterministic skeleton, and the
+    /// pre-turn/mid-turn cure shares the forced recovery's budget, so a
+    /// within-budget forced rebuild is normally strictly smaller. The guard is
+    /// defense-in-depth for the case where the provider-rejected request
+    /// already excluded older history (a smaller rejected set than the
+    /// forced rebuild re-admits), so it is pinned at the
+    /// `maybe_compact_mid_turn` decision boundary: a forced elision rebuild
+    /// that fits the exact budget but is NOT strictly shorter than the
+    /// rejected request must neither append an elision card nor advance the
+    /// revision (it defers to the summary tier). Removing only the
+    /// strict-shorten term here (keeping the budget check) makes this test go
+    /// red; the summary-tier shrink term is never reached (the summarizer
+    /// fails before its own shrink check), so this stays green under A2b.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn forced_elision_rebuild_that_is_not_shorter_never_retries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("big.txt"), "b".repeat(1_800)).unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(None, vec![read_call("read-big", "big.txt")]),
+            response(Some("turn one done"), vec![]),
+            // Turn 2 opens a write, which parks at a permission gate and
+            // leaves an active in-progress turn holding a durable tool call.
+            response(None, vec![write_call("write-out", "out.txt", "data")]),
+        ]));
+        // The fall-through summary attempt fails without consuming a scripted
+        // response, so the summary-tier shrink check (A2b) is never evaluated.
+        provider.set_fail_summaries(true);
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(eliding_catalog_with_trigger(100));
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        // Turn 1 is a completed, movable turn with a durable (large) tool
+        // result.
+        let ready = service
+            .start(session_id, "u".repeat(1_500), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
+        // Turn 2 parks mid-flight at the write-permission gate, giving a
+        // snapshot with an active turn without an owned runner lease.
+        let parked = service
+            .follow_up(session_id, ready.revision, "second turn please".into())
+            .await
+            .unwrap();
+        assert_eq!(parked.lifecycle, SessionLifecycle::WaitingPermission);
+        let revision_before = parked.revision;
+
+        let lease = service.acquire(session_id).unwrap();
+        // The provider rejected a request that had already shed the older
+        // turn: it is smaller than the forced rebuild, which re-admits the
+        // skeletonized older history. Both fit the local budget, but the
+        // forced rebuild is not strictly shorter.
+        let rejected_current = vec![Message::User {
+            content: "smaller rejected request".into(),
+        }];
+        let empty_volatile = VolatileTurnContext {
+            repository: None,
+            reminder: None,
+        };
+        let (post, rebuilt) = service
+            .maybe_compact_mid_turn(
+                parked,
+                rejected_current.clone(),
+                &lease,
+                true,
+                &empty_volatile,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            post.revision, revision_before,
+            "a within-budget but non-shrinking forced elision must not commit/retry"
+        );
+        assert_eq!(
+            rebuilt.len(),
+            rejected_current.len(),
+            "the unchanged rejected request is handed back, no rebuild is retried"
+        );
+        assert!(
+            !post
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::ToolResultElision),
+            "no elision card is appended for a non-shrinking forced rebuild"
+        );
+        assert!(
+            !post
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "the failed fall-through summary is not persisted either"
+        );
+    }
+
+    /// Strict-shrink guard, SUMMARY tier (mutation anchor A2b): forced
+    /// recovery reaches the model summary (pure `SummarizeOnDiscard`, so the
+    /// elision tier is absent), and the summarizer returns an answer that
+    /// still fits the exact budget but does NOT make the rebuild shorter than
+    /// the rejected request. Such a rebuild is not retried and its summary is
+    /// never persisted. Removing the strict-shorten term in the summary tier
+    /// alone must make this test go red; the elision tier is not in this
+    /// strategy, so the A2a mutation cannot affect it.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn forced_summary_rebuild_within_budget_but_not_shorter_never_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"a".repeat(1_000)), vec![]),
+            response(Some(&"b".repeat(100)), vec![]),
+            // Large enough to replace MORE than the prefix it supersedes, so
+            // the rebuild is within the exact 5,599-byte budget yet not
+            // strictly shorter than the rejected request — but well under the
+            // budget (the over-budget case is a separate test).
+            response(Some(&"S".repeat(2_600)), vec![]),
+        ]));
+        provider.overflow_at(2);
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        // Pure SummarizeOnDiscard: no deterministic elision tier in the path.
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let first = service
+            .start(session_id, "u".repeat(1_000), binding(), None)
+            .await
+            .unwrap();
+        let second = service
+            .follow_up(session_id, first.revision, "v".repeat(100))
+            .await
+            .unwrap();
+        let done = service
+            .follow_up(session_id, second.revision, "w".repeat(100))
+            .await
+            .unwrap();
+        assert_eq!(done.lifecycle, SessionLifecycle::Ready);
+
+        let requests = provider.requests.lock().unwrap().clone();
+        // turn 1, turn 2, rejected turn 3, one forced summarizer — no fifth
+        // (rebuilt main) request.
+        assert_eq!(
+            requests.len(),
+            4,
+            "a within-budget but non-shrinking summary rebuild must not be retried"
+        );
+        assert!(
+            matches!(requests[3].first(), Some(Message::System { content })
+            if content.contains("compacting the earlier history"))
+        );
+        assert!(
+            !done
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "a rebuild that is not strictly shorter must never persist the summary"
+        );
+        let failure = done
+            .transcript
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TranscriptKind::Failure)
+            .expect("the non-productive forced recovery fails the child retryably");
+        assert!(failure.text.contains("over its context window"));
+    }
+
     /// #7(c) pure tier: when deterministic elision DID skeletonize old tool
     /// results but the cured window still cannot fit every mandatory segment
-    /// (a separate oversized text segment remains), the tier hands back
-    /// `(None, elided_view)` so the caller proceeds to the model-summary tier
     /// instead of shipping an over-budget "cured" request.
     #[test]
     fn reactive_elision_that_still_does_not_fit_falls_through_to_summary_tier() {
@@ -13145,8 +13365,8 @@ mod tests {
             .find(|entry| entry.kind == TranscriptKind::CompactSummary)
             .expect("manual compact appends a summary card");
         assert!(
-            card.source_key.ends_with(":manual"),
-            "the manual source key stays distinct from automatic compactions: {}",
+            card.source_key.contains(":manual:"),
+            "the manual source key carries its per-run ordinal and stays distinct: {}",
             card.source_key
         );
         assert!(
@@ -13182,6 +13402,107 @@ mod tests {
         assert!(third_request.contains("MANUAL-SUMMARY-MARKER"));
         assert!(third_request.contains("MANUAL-T2") && third_request.contains("MANUAL-T3"));
         assert!(!third_request.contains("MANUAL-T1"));
+    }
+
+    /// The §4.7 idempotency contract after a SUCCESSFUL compaction: a second
+    /// (and third) `/compact` on the same session is an explicit empty-state —
+    /// revision unchanged, still exactly one summary card, and crucially NO
+    /// additional provider (summarizer) request. This is the regression anchor
+    /// for the earlier behavior where the fixed `:manual` source key collided
+    /// on the second call, surfacing a 500 after already burning a paid summary.
+    #[tokio::test]
+    async fn repeated_manual_compact_after_a_summary_is_idle_without_another_request() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            response(Some(&"y".repeat(700)), vec![]),
+            response(Some(&"z".repeat(700)), vec![]),
+            // Exactly ONE summarizer answer; a wasted second compaction would
+            // pop a response here and starve the later follow-up.
+            response(Some("REPEAT-MANUAL-SUMMARY-MARKER"), vec![]),
+            response(Some("after the idle compacts"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
+            .with_profile_catalog(compacting_catalog());
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let first = service
+            .start(
+                session_id,
+                format!("REPEAT-MANUAL-T1-{}", "x".repeat(700)),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        let ready = service
+            .follow_up(session_id, first.revision, "REPEAT-MANUAL-T2".into())
+            .await
+            .unwrap();
+        assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
+
+        let compacted = service.compact_session(session_id).await.unwrap();
+        let compacted_revision = match compacted.state {
+            latte_core::ManualCompactionState::Compacted {
+                tier: latte_core::ManualCompactionTier::Summarized,
+                revision,
+            } => revision,
+            other => panic!("first manual compact must summarize, got {other:?}"),
+        };
+        assert_eq!(compacted_revision, ready.revision + 1);
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            3,
+            "turn 1, turn 2, and the one forced summary"
+        );
+
+        for _ in 0..2 {
+            let again = service.compact_session(session_id).await.unwrap();
+            assert_eq!(
+                again.state,
+                latte_core::ManualCompactionState::NothingToCompact {
+                    reason: latte_core::ManualCompactionIdleReason::NothingToCompress
+                },
+                "repeating compact on the same floor is the documented empty-state"
+            );
+            assert_eq!(
+                again.snapshot.revision, compacted_revision,
+                "the idle repeat must not advance the revision"
+            );
+        }
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            3,
+            "the idle repeats must not burn another summarizer request"
+        );
+        let full = service.load_full(session_id).unwrap();
+        assert_eq!(
+            full.transcript
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == TranscriptKind::CompactSummary)
+                .count(),
+            1,
+            "no duplicate summary card is appended by the idle repeats"
+        );
+
+        // A later turn still runs on the scripted (fourth) response, proving
+        // the wasted-call guard left it available.
+        let after = service
+            .follow_up(session_id, compacted_revision, "REPEAT-MANUAL-T3".into())
+            .await
+            .unwrap();
+        assert_eq!(after.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(provider.requests.lock().unwrap().len(), 4);
     }
 
     /// A single small turn has no compressible boundary (the newest segment
@@ -13404,7 +13725,7 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == TranscriptKind::ToolResultElision)
             .expect("manual elision card");
-        assert!(card.source_key.ends_with(":manual"));
+        assert!(card.source_key.contains(":manual:"), "{}", card.source_key);
         assert_eq!(
             card.payload
                 .as_ref()

@@ -254,13 +254,21 @@ JSONL**，省略只发生在模型可见投影层。
   模型请求；否则进入摘要层。
 - **空态即成功（200 `nothing_to_compact`，不是错误）**：无历史（`empty`）、
   策略 `Off`（`disabled`）、熔断中（`breaker_tripped`）、只有一个不可压缩
-  段（`nothing_to_compress`）。幂等：对已压缩到最小的会话重复调用仍是
-  空态，revision 不变。
+  段（`nothing_to_compress`）。**幂等：对已压缩到最小的会话重复调用，在获取租约
+  与发起摘要请求之前就判定为空态**——当可移动前缀只剩最新摘要段（即没有任何比
+  现有 retain 边界更新的原始历史可被更替）时直接返回 `nothing_to_compress`，
+  revision 不变，**也不花一次付费摘要请求**。
+- **每次成功压缩的 source key 唯一**：手动卡 source key 为
+  `{turn_id}:compact-summary:manual:{turn_revision}`（省略卡同理），其中
+  `turn_revision` 是该 latest turn 当前的 turn revision——每次成功 append 都会
+  推进它，故同一 turn 上连续多次有产出的手动压缩也不会撞
+  `(session, source_key)` 唯一约束而报 `SessionCommandReplayMismatch`。它是幂等
+  空态判断之后的第二道纵深防御：正常旅程里重复调用在空态就返回、走不到 append。
+  即便如此，HTTP 层仍把 `SessionCommandReplayMismatch` 归入 409（客户端 refetch
+  后按最新快照重试），作为并发竞争的兜底，而非 500。
 - **失败语义不同**：自动路径摘要失败会降级并继续当前 turn；手动压缩没有
   in-flight turn 可续，摘要失败/摘要超预算直接报错（仍计入熔断），不写降级
   审计卡。
-- 卡片 source key 与自动路径区分：`:manual` 后缀
-  （`{turn_id}:compact-summary:manual` / `…:tool-result-elision:manual`）。
 
 ## 4.8 前缀稳定性契约与非持久 reminder 槽（已实现）
 
@@ -339,10 +347,17 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
   完整原文仍在 JSONL、审计卡携带 `tool_result_sequences`（final-binary E2E）。
 - provider-overflow：结构化 code 与纯文本标记的分类矩阵（UT）；一次性恢复
   成功（省略 → 严格缩短 → 重试，UT + final-binary E2E）；恢复权用尽后第二次
-  overflow 以 retryable 失败收尾、会话保持可用（UT）。
+  overflow 以 retryable 失败收尾、会话保持可用（UT）。**严格缩短守卫分两层各自
+  独立固化**：强制恢复的重建只有在"过精确预算 **且** 严格短于被拒请求"时才允许
+  重试——省略层、摘要层各一个 UT（A2a 在 `maybe_compact_mid_turn` 方法边界直接
+  构造"过预算但不更短"的重建，A2b 用纯摘要策略的真实旅程），两层变异分别单独
+  注入、各自只打红自己的用例（A2a 用例在 A2b 变异下保持绿，反之亦然）；摘要
+  "过预算"与"未变短"是两条不同分支，分别有用例。
 - 手动压缩：水位以下强制摘要/省略（UT + final-binary E2E，含跨进程边界重放）；
   空态（单段 / Off / 熔断）返回 `nothing_to_compact` 且 revision 不变
-  （UT + E2E；`empty` 为无 turn 的防御分支，正常建会话流程不可达）；非 Ready
+  （UT + E2E；`empty` 为无 turn 的防御分支，正常建会话流程不可达）；**压缩成功后
+  重复调用幂等返回空态、revision 不变、且 provider 请求数不增（headless UT +
+  final-binary E2E；移除"租约前空态"变异会使该 E2E 变红）**；非 Ready
   会话 409（UT + E2E）；存储闸门白名单只允许两种压缩卡写最新 turn，其他 kind
   在 ready 会话被拒（engine UT）。
 - 前缀稳定性：同一 binding 的 system 头在 AGENTS.md 编辑前后、跨进程逐字节一致
@@ -368,7 +383,11 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
 - 语义投影窗口：存在 summary 卡时按 `retain_from_sequence`（截断到卡自身序号）
   重放逐字后缀，而非物理最新 500 页；超过 500 张卡、保留后缀跨越物理页边界时仍被
   完整加载（engine 存储 UT），第二次压缩保留物理上早于首张卡的原文这一跨卡场景由
-  headless 扫描 UT 固化；跨进程单卡边界重放由 final-binary E2E 覆盖。
+  headless 扫描 UT 固化；跨进程单卡边界重放由 final-binary E2E 覆盖。注意
+  `retain_ratio` 是用户可配项（`session.compaction.retain_ratio`，1..=80）且手动
+  压缩不受 trigger 约束，因此"后一张卡 retain 物理上早于前一张卡"是**真实可达**
+  的旅程（retain=50 的 start→follow_up→compact→follow_up→compact 已复现），并非
+  死分支——这两条 UT 是该语义不变量的实际守护，不可因其表面罕见而删除。
 - overflow 无收缩对象：首条 text-only turn 即被 overflow、且无任何 tool result
   时，不发重建请求、不写摘要卡，仅一次 provider 调用并以 retryable 失败收尾、会话
   仍可 resume（headless UT + final-binary E2E）；强制恢复的摘要重建若仍超预算/未

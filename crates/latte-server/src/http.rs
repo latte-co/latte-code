@@ -772,7 +772,10 @@ async fn compact_session(
         .await
         .map_err(|error| {
             // Not-idle and revision/lease races are client-visible conflicts:
-            // refetch and retry once the runner is done.
+            // refetch and retry once the runner is done. A command/source-key
+            // replay mismatch is a conflict too: the snapshot the client based
+            // the call on moved (or a concurrent compaction landed first), so
+            // refetching and re-evaluating the idle state is the right move.
             let retryable = matches!(
                 &error,
                 SessionRuntimeError::InvalidState
@@ -781,6 +784,7 @@ async fn compact_session(
                             | latte_engine::StorageError::StaleSessionRevision { .. }
                             | latte_engine::StorageError::SessionActiveTurnMismatch
                             | latte_engine::StorageError::LeaseLost
+                            | latte_engine::StorageError::SessionCommandReplayMismatch
                     )
             );
             if retryable {

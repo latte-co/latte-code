@@ -1269,6 +1269,128 @@ fn final_binary_manual_compact_rejects_a_parked_session_with_409() {
     );
 }
 
+/// Manual-compact idempotency through the FINAL binary + server: after a
+/// productive `/compact` writes a summary card, repeating the call is the
+/// documented empty-state (`nothing_to_compress`) with an unchanged revision
+/// and — critically — must NOT spend another (paid) summarizer request. This
+/// is the regression for the earlier fixed `:manual` source-key collision,
+/// which surfaced a 500 only after burning a second summary.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_manual_compact_repeated_is_idle_without_another_summary_request() {
+    let scenario = Scenario::new();
+    // Two completed turns, then exactly one forced summarizer answer. A
+    // wasted second compaction would consume a request here (or exhaust the
+    // script), which the request-count assertion catches.
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion(&"y".repeat(700)),
+        ProviderReply::completion(&"z".repeat(700)),
+        ProviderReply::completion("REPEAT-COMPACT-E2E-SUMMARY"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let workspace_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+    let (_status, create_body) =
+        server.create_session(&workspace_id, "REPEAT-COMPACT-T1 base", &binding);
+    let session_id = create_body["session_id"].as_str().unwrap().to_string();
+    let mut revision = wait_session_idle(&server, &session_id)["snapshot"]["revision"]
+        .as_u64()
+        .unwrap();
+
+    // A second turn so the forced compact has a movable older boundary.
+    let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (status, body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": command_id,
+            "prompt": "REPEAT-COMPACT-T2 second",
+            "expected_session_revision": revision,
+        })),
+        &[("Idempotency-Key", &command_id)],
+    );
+    assert_eq!(status, 202, "follow-up: {body:?}");
+    revision = wait_session_idle(&server, &session_id)["snapshot"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "both turns fit under trigger_ratio 100 — no automatic summarizer yet"
+    );
+
+    // First manual compact: productive, advances the revision, one summary.
+    let (first_status, first_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/compact"),
+        Some(&server.token),
+        Some(&serde_json::json!({})),
+        &[],
+    );
+    assert_eq!(first_status, 200, "first compact: {first_body}");
+    assert_eq!(first_body["state"]["compacted"]["tier"], "summarized");
+    let compacted_revision = first_body["state"]["compacted"]["revision"]
+        .as_u64()
+        .expect("compacted revision");
+    assert_eq!(compacted_revision, revision + 1);
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "the first forced compact spends exactly one summarizer request"
+    );
+
+    // Second manual compact: idempotent empty-state, revision unchanged.
+    let (second_status, second_body) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/compact"),
+        Some(&server.token),
+        Some(&serde_json::json!({})),
+        &[],
+    );
+    assert_eq!(second_status, 200, "second compact: {second_body}");
+    assert_eq!(
+        second_body["state"]["nothing_to_compact"]["reason"], "nothing_to_compress",
+        "repeating compact on the same floor is the documented empty-state: {second_body}"
+    );
+    assert_eq!(
+        second_body["snapshot"]["revision"].as_u64(),
+        Some(compacted_revision),
+        "the idle repeat must not advance the revision"
+    );
+    // A third call is just as idle and equally free.
+    let (third_status, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{session_id}/compact"),
+        Some(&server.token),
+        Some(&serde_json::json!({})),
+        &[],
+    );
+    assert_eq!(third_status, 200);
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "the idle repeats must not burn another summarizer request"
+    );
+}
+
 /// Fail-closed tail fit through the FINAL binary + server: with compaction
 /// off, a near-budget prompt is the mandatory core and BOTH non-persistent
 /// volatile tails (repository snapshot + armed reminder) are dropped as slack.
