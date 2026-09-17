@@ -266,6 +266,13 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         latte_core::SessionLifecycle::Ready
     );
 
+    // The verified parent Complete released `success_lease` in its terminal
+    // commit; the follow-up turn runs under its own fresh coordinator lease.
+    engine.release_lease(&success_lease).unwrap();
+    let success_lease = engine
+        .acquire_session_lease(success_session_id, now + 8, 120_000)
+        .unwrap();
+
     let follow_up_id = turn_id();
     let follow_up = engine
         .create_session_follow_up_v2(

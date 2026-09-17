@@ -1647,6 +1647,14 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         },
         now + 5,
     );
+    // The Complete released the turn lease in its terminal commit; these idle
+    // binding-switch checks and the follow-up accept below run under a fresh
+    // coordinator lease so they exercise the revision/validation gates rather
+    // than the lease fence.
+    engine.release_lease(&lease).unwrap();
+    let lease = engine
+        .acquire_session_lease(session_id, now + 6, 60_000)
+        .unwrap();
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
@@ -2390,6 +2398,13 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         now + 9,
     );
     assert_eq!(parent.lifecycle, SessionLifecycle::Ready);
+    // The parent turn's Complete released `tree_lease` in its terminal commit;
+    // the follow-up child is a new turn running under its own fresh coordinator
+    // lease (which the headless follow-up path acquires on accept).
+    engine.release_lease(&tree_lease).unwrap();
+    let tree_lease = engine
+        .acquire_session_lease(tree_session_id, now + 10, 120_000)
+        .unwrap();
     let immutable_parent = parent.turns[0].clone();
     let interrupted_turn_id = turn_id();
     let child = engine
@@ -3114,6 +3129,13 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         now + 4,
     );
     assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+    // The parent Complete released the turn lease in its terminal commit; the
+    // binding-switch fences and the follow-up accept below run under a fresh
+    // coordinator lease.
+    engine.release_lease(&lease).unwrap();
+    let lease = engine
+        .acquire_session_lease(session_id, now + 5, 60_000)
+        .unwrap();
     assert!(
         engine
             .switch_session_binding_v2(session_id, completed.revision, &binding(), &lease, now + 5,)
@@ -3557,6 +3579,14 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         ),
         Err(StorageError::LeaseLost)
     ));
+    // Marking the effect unknown terminalized and released the turn lease in
+    // the same commit; reconcile is a separate recovery command that acquires
+    // its own fresh coordinator lease (so the stale-revision fence, not the
+    // lease fence, is what rejects the next call).
+    engine.release_lease(&lease).unwrap();
+    let lease = engine
+        .acquire_session_lease(session_id, now + 7, 120_000)
+        .unwrap();
     assert!(matches!(
         engine.reconcile_session_effect_unknown(
             session_id,

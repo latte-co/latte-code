@@ -322,6 +322,47 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
   更新只能附加在尾部。压缩是唯一允许的边界替换，且压缩后开启新的缓存序列
   （摘要消息改变形状，不属于本节约束的稳定前缀）。
 
+## 4.9 协调器租约的终态释放（已实现）
+
+会话协调器租约（`runtime_lease`，scope=`session:{id}`，fencing token 单调递增）
+保证同一时刻只有一个写者。问题在于它原本只靠 `SessionLeaseGuard` 的 RAII Drop
+（`DELETE runtime_lease`）释放：而 CLI 宿主在观察到终态/失败结果后会调用
+`std::process::exit` 立即退出，多线程 runtime 下终态提交与进程退出跨线程竞争，
+Drop 可能被跳过。被跳过的析构会让一行**仍未过期**的租约残留在磁盘 SQLite 里，
+直到整个 TTL（默认 60s）才失效——于是失败后立刻拉起的 resume 在触达 provider
+之前就被 `EngineUnavailable`（"runtime lease is held by another owner"）拒绝。
+
+**不变量：turn 进入终态（`Complete` / `CompleteVerified` / `Fail` /
+`Interrupt` / 未知 effect 的 `ReconcileUnknownEffect`）时，终态状态与"本会话已无
+协调器"必须在同一个事务、且在终态事件广播之前同时生效。** `commit_session_turn_update`
+的终态分支在删除 `session_active_turns` 的同一事务里，把该 scope 租约行的
+`expires_at_ms` 置 0（仍由 owner + fencing token 围栏，作用行数不为 1 即
+`LeaseLost`）。
+
+为什么是**置 0 而不是删除该行**：
+
+- 所有归属/fencing 判定都是 `expires_at_ms > now`，置 0 后该 scope 立即可被接管
+  （acquire 对 `expires<=now` 走 epoch 自增并 `UPSERT` 覆写，token 严格变大），
+  同时这行是惰性的——旧 owner 即使此后才跑到析构也只是删掉一行惰性记录；析构被
+  跳过则留下惰性行，下一个 acquire 直接覆写，**无需等 TTL**。
+- owner/token 仍可归因：旧 owner 自己的 `release_lease`（其 `DELETE` 不带
+  expires 谓词）仍恰好匹配一次并返回 `Ok`，所以"终态后正常释放"的既有语义不变；
+  对同一租约二次释放依旧是 `LeaseLost`（编程错误绊索保留）。
+- 若新 owner 已先接管（行被 epoch 覆写），旧 owner 的 release 匹配 0 行、返回
+  `LeaseLost`（被 Drop 忽略），**绝不会误删新 owner 的活租约**。
+
+**终态之后的持久写入一律重新获取新租约，不再复用已终态化的 turn 租约。** 终态
+提交会让旧租约立即失效，因此：失败/中断后的 queue-audit 卡（headless
+`audit_terminal_discard`）、手动 `/compact` 的压缩卡、未知 effect 的 reconcile、
+Ready 会话的 binding 切换，都在空闲会话上各自 `acquire` 一把新协调器租约后再写；
+audit 类仍为尽力而为，拿不到租约只丢审计行、不影响已终态结果。
+
+**accept/HTTP 分类统一**：`EngineUnavailable`（他人持活租约）、`LeaseLost`（持有
+的租约被 fence）、`StaleRevision` / `StaleSessionRevision`（revision 被移动）都是
+调用方刷新后可重试的瞬时冲突，统一返回 409，绝不映射成 500。判定集中在
+`StorageError::is_coordinator_conflict`，headless 的 accept 分类与 HTTP 错误映射
+共用这一事实源。
+
 ## 5. v2 方向（声明，未实现——本文不因本节改变 checklist 状态）
 
 - **压缩请求复用对话前缀**：今天摘要请求是独立 system + 纯文本（deepseek-harness
@@ -395,6 +436,17 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
 - 压缩期间的租约：手动/轮间摘要在持有会话租约期间按 ttl/3 心跳续约——健康的长摘要
   （长于 TTL）仍成功落卡（UT）；摘要期间租约被 fence 时心跳检测到丢失、取消调用并
   返回类型化错误，绝不返回假 `Compacted`、不追加摘要卡（UT）。
+- 终态即释放租约：终态提交在同一事务把 `runtime_lease.expires_at_ms` 置 0——engine
+  存储 UT 断言"终态后**不调用** release（模拟进程退出跳过析构），另一 owner 在 TTL
+  内同刻立即接管成功、token 严格变大、旧 owner release 被 fence"（把 `SET
+  expires_at_ms=0` 变异为 no-op 会确定性打红为 `EngineUnavailable`），另一 UT 断言
+  owner 终态后释放恰好一次成功、二次释放仍 `LeaseLost`；终态后复用旧租约的写入
+  （queue-audit / compact / reconcile / binding）在 engine 与进程内矩阵用例中均改为
+  重新 acquire，使各自原本针对的 revision/白名单闸门被独立验证；accept 路径四类协调器
+  冲突映射为 `Conflict`（headless UT），HTTP 409 映射复用同一判定（HTTP UT）。
+  final-binary E2E（overflow 失败非零退出后）直接读 `state.db` 断言该 session 无
+  `expires_at_ms>0` 的活租约，且**首次**立即 resume 即成功、stdout 不含
+  "held by another owner"（已移除此前的 60×50ms 轮询重试，无 TTL 等待）。
 - TUI 状态栏：打开会话才出现 meter；显示精确字节百分比与估算 token，due 时
   琥珀色"compaction due"、有丢弃段时"omitted"提示（reducer/render UT：渲染、
   他会话迟到投影不串台、窄头部隐藏）；真实 PTY final-binary E2E 断言紧预算下

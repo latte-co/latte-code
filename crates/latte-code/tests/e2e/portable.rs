@@ -1551,55 +1551,49 @@ fn final_binary_context_overflow_with_no_shrinkable_history_fails_without_a_retr
         "a first-turn overflow has no older history to rebuild from"
     );
 
-    // The conversation stays Ready: a fresh process resumes successfully.
+    // The conversation stays Ready: a fresh process resumes successfully —
+    // on the FIRST immediate attempt, with no TTL wait.
     //
-    // Why only this run→resume test needs the bounded retry below. The
-    // failed `run` above exits non-zero via `std::process::exit`, which
-    // bypasses the SessionLeaseGuard Drop; the durable `runtime_lease` row
-    // (it carries `expires_at_ms` and is not reclaimed by the OS when the
-    // process dies) is cleared only when the brief-lived runner releases it
-    // or the TTL/fence lapses. An immediately spawned resume can therefore
-    // race that handoff and be rejected BEFORE touching the provider, with
-    // the transient EngineUnavailable body
-    // "runtime lease is held by another owner". The existing run→resume
-    // cases don't hit it: successful runs release the lease at turn
-    // completion, and the one base case that resumes after a non-zero exit
-    // is pure argument validation (`resume not-a-uuid`, dead endpoint) that
-    // never creates a session or acquires a lease. This journey is the first
-    // to resume a REAL session immediately after a non-zero, lease-holding
-    // exit. Bounded-retry ONLY that exact accept-state string at a fixed
-    // interval: widening tolerance to any resume failure would mask the very
-    // "conversation stays usable" guarantee this test guards, so every other
-    // (deterministic) failure breaks out immediately and is judged by the
-    // success assertion below.
-    let resume = {
-        let args = ["--json", "resume", &session, "OVERFLOW-NEG-SECOND-PROMPT"];
-        let mut output = None;
-        let mut lease_pending = false;
-        for _ in 0..60 {
-            let candidate = scenario.output(&args, env);
-            lease_pending = !candidate.status.success()
-                && String::from_utf8_lossy(&candidate.stdout)
-                    .contains("runtime lease is held by another owner");
-            output = Some(candidate);
-            if !lease_pending {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(
-            !lease_pending,
-            "resume never acquired the session lease within the bounded window:\n{:?}",
-            output
-                .as_ref()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    // The failed `run` above exits non-zero via `std::process::exit`, which
+    // bypasses the SessionLeaseGuard Drop. The terminal commit must therefore
+    // release the lease itself, in the same transaction that marks the turn
+    // terminal: it zeroes `runtime_lease.expires_at_ms` before the terminal
+    // event is ever broadcast. Assert that durable invariant directly (it
+    // holds whether or not the destructor later ran — the row is absent when
+    // the Drop did run, inert/expired when exit skipped it), then prove an
+    // immediately spawned resume acquires the lease without touching the
+    // provider, with no bounded retry.
+    let db_path = scenario.home().join(".latte/latte-code/state.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let live_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_lease \
+                 WHERE scope=?1 AND expires_at_ms>0",
+                [format!("session:{session}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live_lease, 0,
+            "the failed run's terminal commit must not leave a live lease \
+             that pins the session for its TTL"
         );
-        output.unwrap()
-    };
+    }
+
+    let resume = scenario.output(
+        &["--json", "resume", &session, "OVERFLOW-NEG-SECOND-PROMPT"],
+        env,
+    );
+    let resume_stdout = String::from_utf8_lossy(&resume.stdout);
+    assert!(
+        !resume_stdout.contains("runtime lease is held by another owner"),
+        "an immediate resume must acquire the terminal-released lease, not be \
+         rejected as EngineUnavailable:\n{resume_stdout}"
+    );
     assert!(
         resume.status.success(),
-        "the conversation is still usable after the retryable failure:\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&resume.stdout),
+        "the conversation is still usable after the retryable failure:\nstdout={resume_stdout}\nstderr={}",
         String::from_utf8_lossy(&resume.stderr)
     );
     let requests = provider.requests();

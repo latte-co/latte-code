@@ -1675,16 +1675,11 @@ impl SessionRuntimeService {
                     if !has_discard {
                         return Ok(snapshot);
                     }
-                    // No live lease exists at drain time (the turn's lease
-                    // was consumed by run_provider_turn), so the audit can
-                    // acquire its own; losing that acquisition only costs
+                    // No live lease exists at drain time (the turn's lease was
+                    // released atomically by its terminal commit), so the audit
+                    // acquires a fresh one; losing that acquisition only costs
                     // the audit line.
-                    match self.acquire(snapshot.session_id) {
-                        Ok(lease) => {
-                            return Ok(self.audit_discarded_queue(&snapshot, discarded, &lease));
-                        }
-                        Err(_) => return Ok(snapshot),
-                    }
+                    return Ok(self.audit_terminal_discard(&snapshot, discarded));
                 }
             }
         }
@@ -1739,6 +1734,23 @@ impl SessionRuntimeService {
         // The turn is already terminal; losing the audit line must not
         // surface as a failed request.
         .unwrap_or_else(|_| snapshot.clone())
+    }
+
+    /// Best-effort durable trace for prompts a terminal finish can no longer
+    /// run, used once the turn's own coordinator lease has been released by
+    /// the terminal commit. That transaction zeroed the prior lease, so a
+    /// fresh acquire succeeds immediately instead of reusing the dead guard.
+    /// Any acquisition failure only costs the audit line, never the terminal
+    /// result — the same contract as the in-turn audit above.
+    fn audit_terminal_discard(
+        &self,
+        snapshot: &SessionSnapshot,
+        discarded: Option<VecDeque<String>>,
+    ) -> SessionSnapshot {
+        match self.acquire(snapshot.session_id) {
+            Ok(lease) => self.audit_discarded_queue(snapshot, discarded, &lease),
+            Err(_) => snapshot.clone(),
+        }
     }
 
     /// Persists an explicit provider/model selection for subsequent children.
@@ -2107,17 +2119,14 @@ impl SessionRuntimeService {
         // the reconciliation window; once the reconcile lands the turn in a
         // terminal state those prompts can no longer execute, and this path
         // bypasses drain — so the intake is taken out here with the same
-        // durable audit trace the terminal drain leaves (issue #22). Reuses
-        // the reconcile lease: acquiring a second lease while this one is
-        // held would fail.
-        Ok(self.audit_discarded_queue(
-            &terminal,
-            {
-                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
-                mailboxes.remove(&session_id)
-            },
-            &lease,
-        ))
+        // durable audit trace the terminal drain leaves (issue #22). The
+        // terminal commit released the reconcile lease, so drop its inert
+        // guard first and let the audit acquire a fresh lease of its own.
+        drop(lease);
+        Ok(self.audit_terminal_discard(&terminal, {
+            let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+            mailboxes.remove(&session_id)
+        }))
     }
 
     /// Cancellation is explicit. No composer input has a turn ID before start,
@@ -2188,16 +2197,14 @@ impl SessionRuntimeService {
         // The cancelled turn can no longer execute prompts queued while it
         // was parked or running — and this path bypasses drain, so the
         // intake is taken out here with the same durable audit trace the
-        // terminal drain leaves (issue #22). Reuses the cancellation lease:
-        // acquiring a second lease while this one is held would fail.
-        Ok(self.audit_discarded_queue(
-            &snapshot,
-            {
-                let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
-                mailboxes.remove(&session_id)
-            },
-            &lease,
-        ))
+        // terminal drain leaves (issue #22). The interrupt commit released
+        // the cancellation lease, so drop its inert guard first and let the
+        // audit acquire a fresh lease of its own.
+        drop(lease);
+        Ok(self.audit_terminal_discard(&snapshot, {
+            let mut mailboxes = self.mailboxes.lock().expect("mailbox mutex poisoned");
+            mailboxes.remove(&session_id)
+        }))
     }
 
     /// Durable-safe preflight for session creation: validates the binding,
@@ -4935,6 +4942,12 @@ fn classify_create_error(error: &SessionRuntimeError) -> latte_core::CreateAccep
     match error {
         SessionRuntimeError::Storage(latte_engine::StorageError::SessionCommandReplayMismatch) => {
             latte_core::CreateAcceptError::IdempotencyMismatch(error.to_string())
+        }
+        // A live coordinator still holds the session lease, the held lease was
+        // fenced, or a revision moved under us. These are transient conflicts
+        // the caller retries after a refetch — never a 500 internal failure.
+        SessionRuntimeError::Storage(storage) if storage.is_coordinator_conflict() => {
+            latte_core::CreateAcceptError::Conflict(error.to_string())
         }
         SessionRuntimeError::Storage(latte_engine::StorageError::SessionAlreadyExists(_))
         | SessionRuntimeError::InvalidState => {
@@ -9139,6 +9152,25 @@ mod tests {
             classify_create_error(&invalid_state),
             latte_core::CreateAcceptError::Conflict(_)
         ));
+        // A live coordinator still holding the lease, a fenced lease, or a
+        // moved revision are transient retryable conflicts — 409, never 500.
+        for storage in [
+            latte_engine::StorageError::EngineUnavailable,
+            latte_engine::StorageError::LeaseLost,
+            latte_engine::StorageError::StaleRevision {
+                expected: 1,
+                actual: 2,
+            },
+            latte_engine::StorageError::StaleSessionRevision {
+                expected: 1,
+                actual: 2,
+            },
+        ] {
+            assert!(matches!(
+                classify_create_error(&SessionRuntimeError::Storage(storage)),
+                latte_core::CreateAcceptError::Conflict(_)
+            ));
+        }
         let failed = SessionRuntimeError::MailboxFull;
         assert!(matches!(
             classify_create_error(&failed),

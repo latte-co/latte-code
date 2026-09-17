@@ -53,6 +53,25 @@ pub enum StorageError {
     SessionActiveTurnMismatch,
 }
 
+impl StorageError {
+    /// A coordinator-conflict storage condition: another live owner holds the
+    /// session lease, the held lease was lost, or a revision fence moved.
+    /// Every one of these is transient from the caller's perspective — the
+    /// right response is `409`/retryable with a refetch, never a `500`
+    /// internal error. This is the single source of truth shared by the
+    /// accept path (headless) and every HTTP error mapper.
+    #[must_use]
+    pub fn is_coordinator_conflict(&self) -> bool {
+        matches!(
+            self,
+            StorageError::EngineUnavailable
+                | StorageError::LeaseLost
+                | StorageError::StaleRevision { .. }
+                | StorageError::StaleSessionRevision { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredEvent {
     pub sequence: u64,
@@ -3728,6 +3747,41 @@ impl Storage {
                 "DELETE FROM session_active_turns WHERE session_id=?1 AND turn_id=?2",
                 params![request.session_id.to_string(), request.turn_id.to_string()],
             )?;
+            // Release the coordinator lease in the SAME transaction that
+            // terminalizes the turn. The terminal state and "no coordinator
+            // owns this session" must become observable together, before the
+            // terminal event is broadcast: a CLI host exits the process as
+            // soon as it observes the terminal/failure result, and
+            // `std::process::exit` does not run the `SessionLeaseGuard`
+            // destructor that would otherwise delete this row. A skipped
+            // destructor used to leave a live lease pinned for its whole TTL,
+            // so an immediate resume was rejected with `EngineUnavailable`.
+            //
+            // We zero `expires_at_ms` rather than deleting the row: every
+            // ownership/fence test is `expires_at_ms > now`, so the scope is
+            // immediately acquirable (a later acquire overwrites the row with
+            // a strictly larger epoch token), while the owner/token pair stays
+            // attributable long enough for the owner's own `release_lease`
+            // (whose DELETE does not filter on expiry) to still match exactly
+            // once. A destructor that then runs deletes an inert row; a
+            // skipped destructor leaves an inert row the next acquire reclaims
+            // without waiting out the TTL.
+            let freed = tx.execute(
+                "UPDATE runtime_lease SET expires_at_ms=0 \
+                 WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4",
+                params![
+                    expected_scope,
+                    lease.owner,
+                    to_i64(lease.fencing_token)?,
+                    to_i64(now_ms)?
+                ],
+            )?;
+            if freed != 1 {
+                // The lease was verified live for this exact owner/token at
+                // the top of this transaction (which has held the write lock
+                // since BEGIN IMMEDIATE); losing it here is a real fence break.
+                return Err(StorageError::LeaseLost);
+            }
         } else {
             tx.execute(
                 "UPDATE session_active_turns SET lease_token=?1 WHERE session_id=?2 AND turn_id=?3",
@@ -7272,6 +7326,11 @@ mod tests {
         .snapshot;
         assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
 
+        // The retryable Fail terminalized and released the turn's lease in the
+        // same commit; an idle binding switch acquires its own fresh
+        // coordinator lease, exactly as the headless `switch_model` does.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 14, 100).unwrap();
         let mut next = session_binding();
         next.provider_name = "other-provider".into();
         next.model = "other-model".into();
@@ -7979,6 +8038,181 @@ mod tests {
         assert_eq!(followup.turns.len(), 2);
         assert_eq!(followup.turns[1].parent_turn_id, Some(first));
         assert_eq!(store.load_turn(first).unwrap(), parent);
+    }
+
+    #[test]
+    fn terminal_commit_frees_session_lease_before_ttl_without_destructor() {
+        // Regression: a CLI host calls `std::process::exit` as soon as it sees
+        // the terminal/failure result, which skips the `SessionLeaseGuard`
+        // destructor that deletes the lease row. The terminal commit must
+        // therefore release the lease itself, atomically, so an immediate
+        // resume by a different owner acquires within the old TTL instead of
+        // being rejected with `EngineUnavailable`.
+        use latte_core::{SessionCommandId, SessionId, SessionProviderBinding};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let binding = SessionProviderBinding {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        store
+            .create_session_v2(
+                session,
+                turn,
+                &binding,
+                "/workspace",
+                "prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        // TTL 100: the live lease runs from now=2 to expires=102.
+        let lease_a = store.acquire_session_lease(session, 2, 100).unwrap();
+        let start = SessionCommitRequest {
+            session_id: session,
+            turn_id: turn,
+            expected_session_revision: 0,
+            expected_turn_revision: 0,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitSessionTurnUpdate::Start {
+                source_key: "start".into(),
+            },
+        };
+        store
+            .commit_session_turn_update(&start, &lease_a, 3)
+            .unwrap();
+        // While the turn runs, a second owner inside the TTL is rejected.
+        assert!(matches!(
+            store.acquire_session_lease(session, 4, 100),
+            Err(StorageError::EngineUnavailable)
+        ));
+        // Terminal commit at now=6 — far inside the original TTL. The lease is
+        // released in the same transaction; no destructor runs in this test.
+        let complete = SessionCommitRequest {
+            expected_session_revision: 1,
+            expected_turn_revision: 1,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            update: CommitSessionTurnUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec![],
+                    evidence: vec![],
+                },
+            },
+            ..start
+        };
+        let completed = store
+            .commit_session_turn_update(&complete, &lease_a, 6)
+            .unwrap();
+        assert_eq!(completed.snapshot.lifecycle, SessionLifecycle::Ready);
+        // A different owner takes over immediately at the same instant, with a
+        // strictly larger epoch token. This returned `EngineUnavailable` before
+        // the terminal commit released the lease.
+        let lease_b = store.acquire_session_lease(session, 6, 100).unwrap();
+        assert_ne!(lease_b.owner, lease_a.owner);
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        // The displaced old owner must not be able to delete the new owner's
+        // lease: its release is fenced.
+        assert!(matches!(
+            store.release_lease(&lease_a),
+            Err(StorageError::LeaseLost)
+        ));
+        // And the new owner's lease is genuinely live.
+        assert!(
+            store
+                .acquire_session_lease(session, 7, 100)
+                .is_err_and(|error| matches!(error, StorageError::EngineUnavailable))
+        );
+        store.release_lease(&lease_b).unwrap();
+    }
+
+    #[test]
+    fn terminal_commit_lets_owner_release_once_and_still_rejects_double_release() {
+        // Zeroing the expiry keeps the owner/token attributable: the owner's
+        // own release after a terminal commit still matches exactly once (Ok),
+        // while releasing that consumed lease a second time stays a
+        // `LeaseLost` tripwire.
+        use latte_core::{SessionCommandId, SessionId, SessionProviderBinding};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let binding = SessionProviderBinding {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        store
+            .create_session_v2(
+                session,
+                turn,
+                &binding,
+                "/workspace",
+                "prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        let lease = store.acquire_session_lease(session, 2, 100).unwrap();
+        let start = SessionCommitRequest {
+            session_id: session,
+            turn_id: turn,
+            expected_session_revision: 0,
+            expected_turn_revision: 0,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitSessionTurnUpdate::Start {
+                source_key: "start".into(),
+            },
+        };
+        store.commit_session_turn_update(&start, &lease, 3).unwrap();
+        let complete = SessionCommitRequest {
+            expected_session_revision: 1,
+            expected_turn_revision: 1,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            update: CommitSessionTurnUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec![],
+                    evidence: vec![],
+                },
+            },
+            ..start
+        };
+        store
+            .commit_session_turn_update(&complete, &lease, 6)
+            .unwrap();
+        // First release of the terminally-released lease matches its inert row.
+        store.release_lease(&lease).unwrap();
+        // A second release has no row to match and stays an error.
+        assert!(matches!(
+            store.release_lease(&lease),
+            Err(StorageError::LeaseLost)
+        ));
     }
 
     #[test]
@@ -8977,6 +9211,10 @@ mod tests {
         )
         .snapshot;
         assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        // The terminal Fail released the turn lease in its commit; the
+        // post-terminal audit acquires a fresh coordinator lease.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 14, 100).unwrap();
         let audited = commit_linked(
             &store,
             &ids,
@@ -9059,6 +9297,10 @@ mod tests {
         )
         .snapshot;
         assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        // Re-acquire so a live lease is held: the assertion targets the
+        // lifecycle whitelist (ready is not a terminal-audit state), not the
+        // lease fence that the Complete just released.
+        let ready_lease = store.acquire_session_lease(ready_session, 24, 100).unwrap();
         assert!(matches!(
             store.commit_session_turn_update(
                 &SessionCommitRequest {
@@ -9128,6 +9370,13 @@ mod tests {
         .snapshot;
         assert_eq!(current.lifecycle, SessionLifecycle::Ready);
         let base_revision = current.revision;
+
+        // The Complete released the turn lease in its commit. A manual
+        // `/compact` is a separate command on the idle session and acquires
+        // its own fresh coordinator lease (heartbeat-kept alive) for its card
+        // appends.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 34, 100).unwrap();
 
         // Tier 1 card: deterministic elision.
         current = commit_linked(
@@ -9861,6 +10110,14 @@ mod tests {
             store.unknown_effects_for_turn(turn_id).unwrap(),
             vec![effect_id.to_owned()]
         );
+        // The interrupt terminalized and released the turn's lease; a
+        // reconcile is a separate recovery command that acquires its own fresh
+        // coordinator lease (the headless reconcile path re-acquires with a
+        // management TTL).
+        store.release_lease(&lease).unwrap();
+        let lease = store
+            .acquire_session_lease(session_id, 106, 10_000)
+            .unwrap();
         let reconciled = commit_linked(
             &store,
             &ids,

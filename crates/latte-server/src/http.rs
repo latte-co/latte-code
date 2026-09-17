@@ -1205,13 +1205,9 @@ fn map_runtime_error(error: &SessionRuntimeError, current_revision: u64) -> Hand
 }
 
 fn is_retryable_storage(err: &latte_engine::StorageError) -> bool {
-    matches!(
-        err,
-        latte_engine::StorageError::EngineUnavailable
-            | latte_engine::StorageError::LeaseLost
-            | latte_engine::StorageError::StaleRevision { .. }
-            | latte_engine::StorageError::StaleSessionRevision { .. }
-    )
+    // Single source of truth lives on the storage error; this thin wrapper is
+    // kept so the HTTP mapper reads with the other local classification helpers.
+    err.is_coordinator_conflict()
 }
 
 fn parse_session_id(id: &str) -> Result<SessionId, HandlerError> {
