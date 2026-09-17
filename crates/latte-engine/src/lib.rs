@@ -11,7 +11,7 @@ mod workspace;
 pub(crate) use latte_core::wall_time_ms as wall_now_ms;
 use latte_core::{
     EventEnvelope, SessionEventEnvelope, SessionId, SessionProviderBinding, SessionSnapshot,
-    TranscriptPage, Transition, TurnId, TurnState,
+    TranscriptEntry, TranscriptKind, TranscriptPage, Transition, TurnId, TurnState,
 };
 pub use process::{
     CancellationToken, ProcessDecision, ProcessError, ProcessInvocation, ProcessOutput,
@@ -277,6 +277,46 @@ fn turn_revision(snapshot: &SessionSnapshot, _effect_id: &str) -> Option<u64> {
             .find(|turn| turn.turn_id == turn_id)
             .map(|turn| turn.turn_revision)
     })
+}
+
+/// Projects a full chronological transcript down to the provider-request
+/// window: the newest `compact_summary` card plus every entry at or after the
+/// card's semantic retain floor (`retain_from_sequence`, capped at the card's
+/// own sequence). Entries below the floor are superseded by the summary.
+/// Without a summary card the newest `fallback_limit` entries are returned.
+fn projection_window(mut entries: Vec<TranscriptEntry>, fallback_limit: usize) -> TranscriptPage {
+    let Some((_index, card)) = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.kind == TranscriptKind::CompactSummary)
+    else {
+        let start = entries.len().saturating_sub(fallback_limit.clamp(1, 500));
+        let has_more = start > 0;
+        entries = entries.split_off(start);
+        let next_after = entries.last().map(|entry| entry.sequence);
+        return TranscriptPage {
+            entries,
+            next_after,
+            has_more,
+        };
+    };
+    let card_sequence = card.sequence;
+    let retain_floor = card
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("retain_from_sequence"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(card_sequence, |retain| retain.min(card_sequence));
+    entries.retain(|entry| entry.sequence >= retain_floor);
+    let next_after = entries.last().map(|entry| entry.sequence);
+    TranscriptPage {
+        entries,
+        next_after,
+        // Complete by definition: older entries are covered by the summary,
+        // not truncated.
+        has_more: false,
+    }
 }
 #[cfg(test)]
 type CompletionHook = Arc<std::sync::Mutex<Option<Arc<dyn Fn(u8) + Send + Sync>>>>;
@@ -729,7 +769,8 @@ impl EngineHandle {
         mut response: SessionCommitResponse,
     ) -> Result<SessionCommitResponse, StorageError> {
         self.sync_session_conversation(response.snapshot.session_id)?;
-        response.snapshot = self.session_snapshot_tail_v2(response.snapshot.session_id, 500)?;
+        response.snapshot =
+            self.session_snapshot_projection_v2(response.snapshot.session_id, 500)?;
         let _ = self
             .session_events
             .send(response.session_event.envelope.clone());
@@ -1261,6 +1302,29 @@ impl EngineHandle {
         let mut snapshot = self.storage.session_snapshot_tail_v2(session_id, limit)?;
         if let Some(page) = self.conversation_page(session_id, None, limit, true)? {
             snapshot.transcript = page;
+        }
+        Ok(snapshot)
+    }
+
+    /// Reads one session's complete projection window: the newest
+    /// `compact_summary` card and every entry at or after its semantic retain
+    /// floor (the verbatim suffix the summary promised to replay). Provider
+    /// request construction, the read-only context projection, and commit
+    /// responses use this so a retained suffix can never be silently eaten by
+    /// a raw newest-N page. Falls back to the bounded tail when no summary
+    /// exists.
+    pub fn session_snapshot_projection_v2(
+        &self,
+        session_id: SessionId,
+        fallback_limit: usize,
+    ) -> Result<SessionSnapshot, StorageError> {
+        let mut snapshot = self
+            .storage
+            .session_snapshot_projection_v2(session_id, fallback_limit)?;
+        if let Some(store) = self.conversation_store.as_ref() {
+            self.sync_session_conversation(session_id)?;
+            let entries = store.read(session_id).map_err(StorageError::InvalidData)?;
+            snapshot.transcript = projection_window(entries, fallback_limit);
         }
         Ok(snapshot)
     }

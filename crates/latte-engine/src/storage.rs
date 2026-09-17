@@ -2111,6 +2111,23 @@ impl Storage {
         current_session_snapshot(&conn, session_id, limit)
     }
 
+    /// Snapshot whose transcript is the complete *projection window* rather
+    /// than a raw newest-N page: when a `compact_summary` card exists, every
+    /// entry at or after the card's semantic retain floor
+    /// (`retain_from_sequence`, capped at the card's own sequence) is loaded,
+    /// so the verbatim suffix the summary promised to keep survives page
+    /// boundaries. Entries below the floor are superseded by the summary by
+    /// construction and never re-enter a provider request. Without a summary
+    /// card this is the ordinary tail page.
+    pub(crate) fn session_snapshot_projection_v2(
+        &self,
+        session_id: latte_core::SessionId,
+        fallback_limit: usize,
+    ) -> Result<SessionSnapshot, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        current_projection_snapshot(&conn, session_id, fallback_limit)
+    }
+
     /// Reads the authoritative persisted tool-round count for one run. Unlike a
     /// tail transcript projection this never undercounts long runs and stays
     /// correct after the conversation outbox is drained.
@@ -5471,6 +5488,71 @@ fn current_session_snapshot(
     let mut snapshot = session_snapshot(connection, session_id, None, 1)?;
     snapshot.transcript = session_transcript_tail(connection, session_id, transcript_limit)?;
     Ok(snapshot)
+}
+
+/// Builds the semantic projection snapshot used by provider-request
+/// construction and read-only projections. See
+/// [`Storage::session_snapshot_projection_v2`].
+fn current_projection_snapshot(
+    connection: &Connection,
+    session_id: latte_core::SessionId,
+    fallback_limit: usize,
+) -> Result<SessionSnapshot, StorageError> {
+    let mut snapshot = session_snapshot(connection, session_id, None, 1)?;
+    snapshot.transcript = session_transcript_projection(connection, session_id, fallback_limit)?;
+    Ok(snapshot)
+}
+
+/// Loads the verbatim projection window of one conversation: the newest
+/// `compact_summary` card plus every entry at or after its semantic retain
+/// floor. Falls back to the bounded newest-N tail when no summary exists.
+fn session_transcript_projection(
+    connection: &Connection,
+    session_id: latte_core::SessionId,
+    fallback_limit: usize,
+) -> Result<TranscriptPage, StorageError> {
+    let thread_id = session_id.to_string();
+    let newest_summary: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT seq, entry_json FROM conversation_outbox \
+             WHERE session_id=?1 AND kind='compact_summary' ORDER BY seq DESC LIMIT 1",
+            [&thread_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((card_seq, card_json)) = newest_summary else {
+        return session_transcript_tail(connection, session_id, fallback_limit);
+    };
+    let retain_floor = serde_json::from_str::<TranscriptEntry>(&card_json)
+        .map_err(invalid_json)?
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("retain_from_sequence"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(card_seq, |retain| {
+            i64::try_from(retain).unwrap_or(card_seq).min(card_seq)
+        });
+    let entries = connection
+        .prepare(
+            "SELECT entry_json FROM conversation_outbox \
+             WHERE session_id=?1 AND seq>=?2 ORDER BY seq ASC",
+        )?
+        .query_map(params![thread_id, retain_floor], |row| {
+            row.get::<_, String>(0)
+        })?
+        .map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(|json| serde_json::from_str(&json).map_err(invalid_json))
+        })
+        .collect::<Result<Vec<TranscriptEntry>, StorageError>>()?;
+    let next_after = entries.last().map(|entry| entry.sequence);
+    Ok(TranscriptPage {
+        entries,
+        next_after,
+        // The projection window is complete by definition: older entries are
+        // covered by the summary, not truncated.
+        has_more: false,
+    })
 }
 
 /// Loads the newest bounded transcript page for a presentation projection.
@@ -12465,5 +12547,134 @@ mod tests {
         let snapshot = reopened.session_snapshot_tail_v2(session_id, 10).unwrap();
         assert!(snapshot.turns.iter().any(|turn| turn.turn_id == turn_id));
         drop(dir);
+    }
+
+    /// #3: once a summary records a semantic `retain_from_sequence`, the
+    /// projection window must replay that verbatim suffix even when it starts
+    /// well before the newest-500 physical tail page. A raw tail would drop
+    /// those rows and silently undercount the next request's bytes.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn projection_window_replays_retained_suffix_across_the_tail_boundary() {
+        use latte_core::{SessionId, SystemIdSource, TurnId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        // A real session row satisfies the conversation_outbox foreign key.
+        store
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &session_binding(),
+                dir.path().to_str().unwrap(),
+                "seed prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        let connection = store.connection.lock().unwrap();
+        // Drop the create's seed card so the sequence space is fully ours.
+        connection
+            .execute(
+                "DELETE FROM conversation_outbox WHERE session_id=?1",
+                params![session_id.to_string()],
+            )
+            .unwrap();
+        // 600 ordinary durable entries.
+        for seq in 1u64..=600 {
+            let entry = TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: seq,
+                turn_id: None,
+                kind: TranscriptKind::User,
+                text: format!("message-{seq}"),
+                payload: None,
+                source_key: format!("key-{seq}"),
+                created_at_ms: seq,
+            };
+            connection
+                .execute(
+                    "INSERT INTO conversation_outbox(\
+                     session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
+                     ) VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
+                    params![
+                        session_id.to_string(),
+                        i64::try_from(seq).unwrap(),
+                        entry.entry_id.to_string(),
+                        entry.source_key,
+                        serde_json::to_string(&entry).unwrap(),
+                        i64::try_from(seq).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        // Summary card appended at seq 601, semantically retaining verbatim
+        // entries from seq 50 — far older than the newest-500 physical page.
+        let card = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 601,
+            turn_id: None,
+            kind: TranscriptKind::CompactSummary,
+            text: "summary of seq 1..49".into(),
+            payload: Some(serde_json::json!({ "retain_from_sequence": 50 })),
+            source_key: "compact-summary:manual".into(),
+            created_at_ms: 601,
+        };
+        connection
+            .execute(
+                "INSERT INTO conversation_outbox(\
+                 session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
+                 ) VALUES(?1,601,?2,NULL,'compact_summary',?3,?4,601)",
+                params![
+                    session_id.to_string(),
+                    card.entry_id.to_string(),
+                    card.source_key,
+                    serde_json::to_string(&card).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let tail = session_transcript_tail(&connection, session_id, 500).unwrap();
+        assert_eq!(tail.entries.first().unwrap().sequence, 102);
+        assert_eq!(tail.entries.len(), 500);
+        assert!(
+            tail.has_more,
+            "the raw newest-500 page truncates older rows"
+        );
+        assert!(
+            tail.entries.iter().all(|entry| entry.sequence != 50),
+            "the raw physical tail already lost the retained seq-50 suffix"
+        );
+
+        let projection = session_transcript_projection(&connection, session_id, 500).unwrap();
+        assert_eq!(
+            projection.entries.first().unwrap().sequence,
+            50,
+            "the semantic retain floor starts the window despite crossing 500 rows"
+        );
+        assert!(
+            projection
+                .entries
+                .iter()
+                .any(|entry| entry.sequence == 50 && entry.text == "message-50")
+        );
+        assert!(
+            projection.entries.iter().all(|entry| entry.sequence >= 50),
+            "nothing older than the retain floor is replayed raw"
+        );
+        assert_eq!(projection.entries.len(), 552, "seq 50..=601 inclusive");
+        assert!(
+            projection
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "the summary card heads the projected window"
+        );
+        assert!(
+            !projection.has_more,
+            "the projection is semantically complete, not a truncated page"
+        );
     }
 }

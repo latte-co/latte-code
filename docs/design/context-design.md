@@ -221,9 +221,20 @@ JSONL**，省略只发生在模型可见投影层。
 3. 重试后再次 overflow（或收缩无收益）→ 走通用错误路径，turn 以 retryable
    失败收尾、会话保持可用。
 
-已知限制：开放 turn 内部不做省略（会拆散进行中的 tool-call/result 语法配对）；
-若 overflow 发生在历史可更替范围为空（例如首条 prompt 自身超限），恢复无收缩
-对象，按失败处理。
+已知限制与轮间边界：
+
+- **摘要层绝不更替开放 turn**：模型摘要只摘要"已完成"历史；当唯一可移动的是
+  正在进行的 turn 时，`retain_from` 为 `None`（开放 prompt 折叠进摘要源的
+  pre-turn 路径另算），mid-turn 摘要层直接返回"无收缩"，绝不 orphan 正在
+  进行的 tool 循环。
+- **确定性省略在轮间可以作用于活跃 turn 刚完成的批次**：两次 provider 请求之间，
+  把"本轮刚完成、已拿到 result"的那批 tool 结果骨架化是合法治愈，也是 overflow
+  强制恢复在没有更老内容时唯一的收缩对象。assistant tool call 与 result 的语法
+  配对保持完整（消息不删、id/name 保留），完整原文仍只在 JSONL，投影层骨架化；
+  该边界同样落 `:round:N` 审计卡。仍不做的是：在一个尚未闭合的 tool 批次内部
+  省略（那才会拆散进行中的配对）。
+- 若 overflow 发生在历史可更替范围为空（例如首条 prompt 自身超限、无任何 tool
+  result），恢复无收缩对象，不发重建请求，按 retryable 失败处理、会话保持可用。
 
 ## 4.7 手动 `/compact`（idle-only，已实现）
 
@@ -273,18 +284,32 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
   非持久（重启即失，JSONL 中永不出现）。装填仅允许 `Ready` 会话；非 idle 一律
   409。文本在写入边界先过 `redact_session_text`（token/密钥脱敏），trim 后为空
   或超过 `REMINDER_CAP_BYTES = 4096` 字节返回 400；响应回显脱敏后字节数。
-- **框架防伪造**：框架正文内出现的同名开/闭标签（ASCII 大小写不敏感）一律替换
-  为方括号形态（`[tag]` / `[/tag]`），工作区文本无法提前关闭框架或冒充嵌套块。
+- **框架防伪造**：框架正文内出现的**两种** volatile 标签（`repository-context`
+  与 `system-reminder`）的开/闭 token 一律中和为方括号形态（`[tag]` /
+  `[/tag]`）。匹配按 ASCII 大小写不敏感、容忍标签名与终止 `>` 之间的 ASCII
+  空白（如 `</repository-context\t >`、`<Repository-Context\n >`），并输出
+  规范化小写形。因此 repo 正文既不能提前关闭自己的框架，也不能伪造一个
+  `<system-reminder>` 块；形如带属性/畸形的 token（标签后不是纯空白接 `>`）
+  原样保留，不做猜测式替换。扫描按字符边界进行，非 ASCII 内容逐字节保持。
 - **wire 顺序**：
   `[system 头] [summary?] [持久历史…] [repository-context?] [system-reminder?] [当前 prompt]`。
   tool 轮内重建（mid-turn rebuild）以活跃 turn 的第一段为界：volatile 块整块
   重新插在该边界之前，已完成历史在前、开放 turn（prompt、assistant 批次、tool
   result）原文在后——同一 turn 内只重建一次 volatile 并全程复用，轮内前缀也保持
   稳定。审批恢复路径重建 repo tail，但不补发已消费的 reminder。
-- **预算紧张时的丢弃顺序（newest-first 精确字节拟合）**：reminder（最新、可丢）
-  → repository 快照（可丢）→ 持久历史整段 → prompt（强制；放不下即 fail-closed）。
-  存活集合天然嵌套：预算收缩时 reminder 先消失，然后是 repo，然后是历史；
-  prompt 与 head 永不因可丢尾部被静默删掉。
+- **预算紧张时的两阶段拟合（exact-byte，fail-closed）**：拟合分两阶段而不是一条
+  newest-first 单走，避免可丢尾部把强制历史"挤"出预算：
+  1. **阶段一·强制核心**：`[持久历史…, 当前 prompt]` 作为强制单元，在**全部**
+     精确预算上 newest-first 拟合；某个强制单元放不下即终止并丢弃比它更老的单元，
+     prompt 始终强制——连 head+prompt 都超预算时 fail-closed 报错，绝不发一个
+     缺了用户原话的请求。
+  2. **阶段二·尾部填松弛**：核心占完后剩余的 slack，才按**一条有序 wire 前缀**
+     `[repository, reminder]` 依次填：两个都放得下就都带，只放得下 repo 就只带
+     repo，否则都不带。reminder 永远不会在 repo 被丢时单独存活。
+  因此尾部只是"松弛填充"，**永不顶替、永不挤占持久历史**；存活集合天然嵌套：
+  预算收缩时先退 reminder（前缀末端）、再退 repo，强制历史与 prompt 的存活只由
+  阶段一决定。拟合结果即最终装配内容（装配器不得再把全量尾部加回去），并在真正
+  发起 provider 调用前再做一次精确预算闸门兜底。
 - **不可变承诺不变**：持久层依旧只 append；模型可见层从不重写 system 头，易变
   更新只能附加在尾部。压缩是唯一允许的边界替换，且压缩后开启新的缓存序列
   （摘要消息改变形状，不属于本节约束的稳定前缀）。
@@ -329,11 +354,28 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
   （headless UT + HTTP UT + final-binary E2E）；下一次请求携带且仅携带一次
   `<system-reminder>`（位置在 prompt 之前）、再下一次请求消失、transcript 与
   JSONL 中均不存在（UT + E2E）；未知 session 404、坏 id/坏 body 400（HTTP UT）。
-- 框架转义：正文内伪造的开/闭标签按 ASCII 大小写不敏感降级为方括号，包装层自身
-  标签恰好出现一次（UT）。
-- 丢弃顺序：reminder → repo → history 的嵌套阈值（各层独立变异点）由
-  newest-first fitter UT 固化；mid-turn 重建时 volatile 块精确插在活跃 turn
-  边界之前、summary 位于头下第一位（UT）。
+- 框架转义：正文内伪造的**两种**标签开/闭 token 按 ASCII 大小写不敏感、容忍标签
+  名与 `>` 间空白地降级为方括号（含跨标签伪造：repo 正文内的
+  `<system-reminder>` 同样被中和），包装层自身标签恰好出现一次、非 ASCII 逐字节
+  保持（UT + final-binary E2E）。
+- 两阶段丢弃顺序：阶段一强制核心（history + prompt）在全部精确预算上拟合，阶段二
+  尾部仅以有序前缀 `[repo, reminder]` 填松弛、永不顶替历史；阈值矩阵（仅 prompt、
+  历史保但无尾、仅 repo、双尾、全量）由 fitter UT 逐层固化，近预算 prompt 下尾部
+  被丢且请求不超预算由 headless UT + final-binary E2E 固化；装配器必须使用拟合后
+  的 volatile 集合（注入"重新加回全量尾部"变异会使该 UT 变红），provider 调用前
+  另有精确预算闸门兜底。mid-turn 重建时 volatile 块精确插在活跃 turn 边界之前、
+  summary 位于头下第一位（UT）。
+- 语义投影窗口：存在 summary 卡时按 `retain_from_sequence`（截断到卡自身序号）
+  重放逐字后缀，而非物理最新 500 页；超过 500 张卡、保留后缀跨越物理页边界时仍被
+  完整加载（engine 存储 UT），第二次压缩保留物理上早于首张卡的原文这一跨卡场景由
+  headless 扫描 UT 固化；跨进程单卡边界重放由 final-binary E2E 覆盖。
+- overflow 无收缩对象：首条 text-only turn 即被 overflow、且无任何 tool result
+  时，不发重建请求、不写摘要卡，仅一次 provider 调用并以 retryable 失败收尾、会话
+  仍可 resume（headless UT + final-binary E2E）；强制恢复的摘要重建若仍超预算/未
+  严格缩短，同样不重试、不落 `compact_summary` 卡（UT）。
+- 压缩期间的租约：手动/轮间摘要在持有会话租约期间按 ttl/3 心跳续约——健康的长摘要
+  （长于 TTL）仍成功落卡（UT）；摘要期间租约被 fence 时心跳检测到丢失、取消调用并
+  返回类型化错误，绝不返回假 `Compacted`、不追加摘要卡（UT）。
 - TUI 状态栏：打开会话才出现 meter；显示精确字节百分比与估算 token，due 时
   琥珀色"compaction due"、有丢弃段时"omitted"提示（reducer/render UT：渲染、
   他会话迟到投影不串台、窄头部隐藏）；真实 PTY final-binary E2E 断言紧预算下
