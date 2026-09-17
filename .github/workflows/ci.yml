@@ -242,6 +242,33 @@ jobs:
       # instrumented artifacts that shift the attributed line denominator.
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: make coverage-e2e
+      # TEMPORARY DIAGNOSTIC — remove once the CI-vs-local E2E line-region
+      # delta is identified. Reads the profraw produced above (no rebuild /
+      # rerun) and prints build environment plus the zero-hit line numbers for
+      # the files whose line/region denominator differs on CI.
+      - name: Diagnose E2E coverage zero-hit lines (TEMPORARY)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "===== BUILD ENV ====="
+          rustc -Vv
+          cargo llvm-cov --version || true
+          echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
+          echo "RUSTDOCFLAGS=${RUSTDOCFLAGS:-<unset>}"
+          env | grep -E '^(CARGO|RUST|LLVM)' | sort || true
+          nproc
+          cargo llvm-cov report --workspace --all-features --lcov --output-path cov.info
+          for f in crates/latte-tui/src/session.rs crates/latte-headless/src/provider.rs crates/latte-tui/src/lib.rs crates/latte-engine/src/storage.rs; do
+            echo "===== ZERO-HIT $f ====="
+            awk -v F="/$f" '
+              index($0, F) == length($0) - length(F) + 1 && $0 ~ /^SF:/ {insf=1; next}
+              insf && /^end_of_record/ {exit}
+              insf && /^DA:/ {split($0,a,":"); split(a[2],b,","); if(b[2]==0) print b[1]}
+            ' cov.info > /tmp/zero.txt
+            echo "zero-hit line count: $(wc -l < /tmp/zero.txt)"
+            while read -r n; do printf '%s | %s\n' "$n" "$(sed -n "${n}p" "$f")"; done < /tmp/zero.txt
+          done
 
   coverage-total:
     name: Coverage - total (90%)
