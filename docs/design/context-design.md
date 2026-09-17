@@ -1,9 +1,9 @@
 # Context 架构与上下文管理策略
 
 状态：**v1 已实现**（分层模型、SummarizeOnDiscard 策略、策略选择器数据化、
-主动水位、确定性省略层、token 估算与只读用量投影）；文中标注 v2 的条目
-（TUI 预算展示、跨模型 handoff）未实现。
-日期：2026-09-13（2026-09-16 增补用量投影）
+主动水位、确定性省略层、token 估算、只读用量投影与 TUI 状态栏 meter）；
+文中标注 v2 的条目（摘要请求复用对话前缀、跨模型 handoff）未实现。
+日期：2026-09-13（2026-09-17 增补 TUI 状态栏）
 关联：[Harness Profile 抽象设计](harness-profile.md)——策略选择器是 profile 的组成部分
 
 ---
@@ -169,6 +169,15 @@ replay 确定性不受影响（同一卡片字节重放）；语义保真度取�
 provider I/O、不改变任何状态。用量不进权威 `SessionSnapshot`：它是 profile 与
 快照的派生值，随 profile 解析而变化，不属于 JSONL 权威状态。
 
+**TUI 状态栏消费（已实现）。** 打开会话时，终端在权威 snapshot 重载的同一拍
+best-effort 拉取该投影（`SessionProjectionClient::context_usage`，随
+`SessionOpened`/`RefreshSnapshots` 刷新，错误静默保留旧值），在会话头部第二行
+渲染只读 meter：精确字节填充百分比、估算 `used/budget tokens`；
+`discarded_segments > 0` 时琥珀色提示"older segment(s) omitted"，
+`proactive_compaction_due` 时加粗琥珀色提示"compaction due"。meter 以
+session id 键控，迟到的他会话投影不会画错；窄终端（两行头部）与 idle 欢迎屏
+不渲染。TUI 不因此产生新的写路径，投影永远不是权威来源。
+
 ## 4.6 确定性省略层与 provider-overflow 恢复（ElideToolResultsThenSummarize，已实现）
 
 **第一层：确定性骨架（无 provider 调用）。** 被更替前缀里的每条旧 tool
@@ -282,9 +291,6 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
 
 ## 5. v2 方向（声明，未实现——本文不因本节改变 checklist 状态）
 
-- **TUI 预算展示**：§4.5 的只读用量投影尚未接入终端状态栏；目标形状是打开会话
-  时按 session id best-effort 拉取，在头部第二行渲染填充百分比、估算 token 与
-  `discarded_segments`/due 琥珀提示，不产生新的写路径。
 - **压缩请求复用对话前缀**：今天摘要请求是独立 system + 纯文本（deepseek-harness
   的做法是重放原对话 system+tools+messages、只在末尾加压缩指令，使辅助请求成为
   上一次请求的真前缀以命中 provider 缓存）；受限于当前摘要卡模型，记入后续项。
@@ -328,6 +334,10 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
 - 丢弃顺序：reminder → repo → history 的嵌套阈值（各层独立变异点）由
   newest-first fitter UT 固化；mid-turn 重建时 volatile 块精确插在活跃 turn
   边界之前、summary 位于头下第一位（UT）。
+- TUI 状态栏：打开会话才出现 meter；显示精确字节百分比与估算 token，due 时
+  琥珀色"compaction due"、有丢弃段时"omitted"提示（reducer/render UT：渲染、
+  他会话迟到投影不串台、窄头部隐藏）；真实 PTY final-binary E2E 断言紧预算下
+  非零填充与 due 提示出现在头部第二行。
 - 轮间压缩与挥发性尾部并存（final-binary E2E）：开放 turn 的第二个 tool 轮超
   预算时，轮间摘要请求之后的重建形状为
   `[头, 摘要, 已完成历史, repo tail, 开放 turn 原文]`——活跃 turn 的完整 tool

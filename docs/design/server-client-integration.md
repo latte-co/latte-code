@@ -340,13 +340,14 @@ TUI Reducer（不变）
 
 ### 5.2 HttpProjectionClient
 
-`SessionProjectionClient` trait 有 7 个方法（2 个必须实现，5 个有默认实现）。`HttpProjectionClient` 覆写全部 7 个：
+`SessionProjectionClient` trait 有 8 个方法（2 个必须实现，6 个有默认实现）。`HttpProjectionClient` 覆写全部生产路径（`context_usage` 的默认实现返回不可用，供测试 double 不实现时状态栏隐藏 meter）：
 
 | 方法 | HTTP 映射 |
 |---|---|
 | `snapshots()` | `GET /v1/workspaces/{ws}/sessions` |
 | `session_catalog()` | `GET /v1/workspaces/{ws}/sessions`（客户端转 summary） |
 | `session(id)` | `GET /v1/sessions/{id}` |
+| `context_usage(id)` | `GET /v1/sessions/{id}/context`（只读状态栏 meter，见 [context-design.md](context-design.md) §4.5） |
 | `exact_session_catalog(query)` | `GET /v1/workspaces/{ws}/sessions/search?q={query}` + 客户端精确过滤（UUID 精确 + title 精确） |
 | `exact_session(query)` | `exact_session_catalog` + `session` |
 | `search_session_catalog(query)` | `GET /v1/workspaces/{ws}/sessions/search?q={query}`（模糊） |

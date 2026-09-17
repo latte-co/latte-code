@@ -8,8 +8,10 @@
 （`session.compaction.mode:"elide_then_summarize"`，先骨架化旧 tool result、
 不足再摘要）已落地，并承接 provider context-overflow 的每 turn 一次强制恢复
 （见 context-design.md §4/§4.6）；idle-only 手动 `/compact`（HTTP + CLI，
-水位以下强制、明确空态、409 非空闲）已落地（§4.7）；
-未实现：预算可见性 TUI 状态栏、binding 快照三字段（schema 迁移）、
+水位以下强制、明确空态、409 非空闲）已落地（§4.7）；预算可见性 TUI 状态栏
+（头部第二行 meter：填充百分比、估算 token、omitted/compaction due 提示）已落地
+（context-design.md §4.5）；
+未实现：binding 快照三字段（schema 迁移）、
 config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
 日期：2026-09-12
 范围：定义 `HarnessProfile` 的概念位置、核心类型、解析管道、约束边界与首个消费者

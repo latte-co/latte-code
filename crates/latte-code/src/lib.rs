@@ -692,6 +692,10 @@ impl latte_tui::session::SessionProjectionClient for HttpProjectionClient {
         self.block_on(self.handle.snapshot(&session_id))
     }
 
+    fn context_usage(&mut self, session_id: SessionId) -> Result<latte_core::ContextUsage, String> {
+        self.block_on(self.handle.context_usage(&session_id))
+    }
+
     fn poll(&mut self) -> latte_tui::session::SessionProjectionPoll {
         match self.event_rx.try_recv() {
             Ok(ProjectionEvent::SessionChanged) => latte_tui::session::SessionProjectionPoll::Event,
