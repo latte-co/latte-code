@@ -1552,10 +1552,50 @@ fn final_binary_context_overflow_with_no_shrinkable_history_fails_without_a_retr
     );
 
     // The conversation stays Ready: a fresh process resumes successfully.
-    let resume = scenario.output(
-        &["--json", "resume", &session, "OVERFLOW-NEG-SECOND-PROMPT"],
-        env,
-    );
+    //
+    // Why only this run→resume test needs the bounded retry below. The
+    // failed `run` above exits non-zero via `std::process::exit`, which
+    // bypasses the SessionLeaseGuard Drop; the durable `runtime_lease` row
+    // (it carries `expires_at_ms` and is not reclaimed by the OS when the
+    // process dies) is cleared only when the brief-lived runner releases it
+    // or the TTL/fence lapses. An immediately spawned resume can therefore
+    // race that handoff and be rejected BEFORE touching the provider, with
+    // the transient EngineUnavailable body
+    // "runtime lease is held by another owner". The existing run→resume
+    // cases don't hit it: successful runs release the lease at turn
+    // completion, and the one base case that resumes after a non-zero exit
+    // is pure argument validation (`resume not-a-uuid`, dead endpoint) that
+    // never creates a session or acquires a lease. This journey is the first
+    // to resume a REAL session immediately after a non-zero, lease-holding
+    // exit. Bounded-retry ONLY that exact accept-state string at a fixed
+    // interval: widening tolerance to any resume failure would mask the very
+    // "conversation stays usable" guarantee this test guards, so every other
+    // (deterministic) failure breaks out immediately and is judged by the
+    // success assertion below.
+    let resume = {
+        let args = ["--json", "resume", &session, "OVERFLOW-NEG-SECOND-PROMPT"];
+        let mut output = None;
+        let mut lease_pending = false;
+        for _ in 0..60 {
+            let candidate = scenario.output(&args, env);
+            lease_pending = !candidate.status.success()
+                && String::from_utf8_lossy(&candidate.stdout)
+                    .contains("runtime lease is held by another owner");
+            output = Some(candidate);
+            if !lease_pending {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !lease_pending,
+            "resume never acquired the session lease within the bounded window:\n{:?}",
+            output
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        );
+        output.unwrap()
+    };
     assert!(
         resume.status.success(),
         "the conversation is still usable after the retryable failure:\nstdout={}\nstderr={}",
