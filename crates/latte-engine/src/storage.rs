@@ -2864,13 +2864,28 @@ impl Storage {
                 "failed" | "interrupted" | "reconciliation_required"
             )
             && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
+        // Manual `/compact` appends its durable card while the session is
+        // idle (Ready, active row cleared). The gate is deliberately narrow:
+        // the two compaction card kinds only, on the latest turn only, and
+        // fenced by the exact session revision CAS and the lease — no
+        // arbitrary transcript write is ever admitted to a completed turn.
+        let idle_compaction_append = active.is_none()
+            && lifecycle.as_str() == "ready"
+            && matches!(
+                &request.update,
+                CommitSessionTurnUpdate::AppendTranscript {
+                    kind: TranscriptKind::CompactSummary | TranscriptKind::ToolResultElision,
+                    ..
+                }
+            )
+            && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
         if let Some((active_turn, active_token)) = active {
             if active_turn != request.turn_id.to_string()
                 || from_i64(active_token)? > lease.fencing_token
             {
                 return Err(StorageError::SessionActiveTurnMismatch);
             }
-        } else if !recovered_reconciliation && !terminal_queue_audit {
+        } else if !recovered_reconciliation && !terminal_queue_audit && !idle_compaction_append {
             return Err(StorageError::SessionActiveTurnMismatch);
         }
         let (state_json, turn_seq, turn_token): (String, i64, i64) = tx.query_row(
@@ -5302,6 +5317,7 @@ fn transcript_kind_name(kind: TranscriptKind) -> &'static str {
         TranscriptKind::Completion => "completion",
         TranscriptKind::System => "system",
         TranscriptKind::CompactSummary => "compact_summary",
+        TranscriptKind::ToolResultElision => "tool_result_elision",
     }
 }
 
@@ -8980,6 +8996,132 @@ mod tests {
                 },
                 &ready_lease,
                 24,
+            ),
+            Err(StorageError::SessionActiveTurnMismatch)
+        ));
+    }
+
+    /// Manual `/compact` appends its durable card to a Ready session whose
+    /// active row is cleared. The idle exemption is a strict whitelist:
+    /// `CompactSummary` and `ToolResultElision` land on the latest turn
+    /// (keeping the session Ready), every other card kind is rejected as an
+    /// active-turn mismatch.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn idle_compaction_append_is_whitelisted_to_compaction_card_kinds() {
+        let (_dir, path) = db();
+        let ids = SystemIdSource::default();
+        let store = Storage::open(&path).unwrap();
+        let (session_id, turn_id, queued) =
+            create_linked_fixture(&store, &ids, "manual compact", 30);
+        let lease = store.acquire_session_lease(session_id, 31, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            turn_id,
+            CommitSessionTurnUpdate::Start {
+                source_key: "compact:start".into(),
+            },
+            32,
+        )
+        .snapshot;
+        let mut current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            turn_id,
+            CommitSessionTurnUpdate::Complete {
+                source_key: "compact:complete".into(),
+                handoff: latte_core::Handoff {
+                    summary: "done".into(),
+                    files_changed: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+            33,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        let base_revision = current.revision;
+
+        // Tier 1 card: deterministic elision.
+        current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &current,
+            turn_id,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:tool-result-elision:manual"),
+                kind: TranscriptKind::ToolResultElision,
+                text: "1 older tool result(s) elided into deterministic skeletons".into(),
+                payload: Some(serde_json::json!({ "tool_result_sequences": [7] })),
+            },
+            34,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(current.revision, base_revision + 1);
+        assert!(
+            current
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::ToolResultElision)
+        );
+
+        // Tier 2 card: model summary, on the same ready session.
+        current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &current,
+            turn_id,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:compact-summary:manual"),
+                kind: TranscriptKind::CompactSummary,
+                text: "summary of older history".into(),
+                payload: Some(serde_json::json!({
+                    "superseded_through_sequence": 7,
+                    "retain_from_sequence": 8,
+                })),
+            },
+            35,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(current.revision, base_revision + 2);
+        assert!(
+            current
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary)
+        );
+
+        // Any other card kind on a ready session stays rejected.
+        assert!(matches!(
+            store.commit_session_turn_update(
+                &SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: current.revision,
+                    expected_turn_revision: current.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:not-compaction"),
+                        kind: TranscriptKind::System,
+                        text: "must not land on a ready session".into(),
+                        payload: None,
+                    },
+                },
+                &lease,
+                36,
             ),
             Err(StorageError::SessionActiveTurnMismatch)
         ));

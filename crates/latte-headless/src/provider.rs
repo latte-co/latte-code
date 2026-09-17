@@ -178,6 +178,14 @@ pub enum ProviderError {
         request_id: String,
         retryable: bool,
     },
+    /// The provider rejected the request because its context window was
+    /// exceeded. Classified from the HTTP error body (400/413 plus a
+    /// context-length marker), which the byte budget cannot foresee: the
+    /// local budget is an estimate and providers tokenize differently. The
+    /// session loop reacts with one deterministic-elision/compaction
+    /// recovery attempt rather than failing the turn.
+    #[error("provider rejected request: context length exceeded{request_id}")]
+    ContextOverflow { request_id: String },
     #[error("provider timeout")]
     Timeout,
     #[error("provider transport: {0}")]
@@ -568,34 +576,36 @@ impl Provider for OpenAiProvider {
                     .and_then(|v| v.to_str().ok())
                     .map(|v| format!(" (request {v})"))
                     .unwrap_or_default();
-                if this.streaming && matches!(status, 400 | 404 | 415 | 422) {
+                // Buffer the (bounded) error body once: the empty-body case
+                // may still fall back to an inline request, while every other
+                // rejection is classified from its body (context-overflow in
+                // particular drives deterministic recovery in the session).
+                let error_body = response
+                    .bytes()
+                    .await
+                    .map_err(|error| ProviderError::Transport(error.to_string()))?;
+                let error_body = &error_body;
+                if this.streaming
+                    && matches!(status, 400 | 404 | 415 | 422)
+                    && error_body.is_empty()
+                {
                     // A fallback is allowed only when the stream request was
                     // rejected before it produced *any* response body bytes.
-                    let error_body = response
-                        .bytes()
-                        .await
-                        .map_err(|error| ProviderError::Transport(error.to_string()))?;
-                    if error_body.is_empty() {
-                        let mut inline_body = serde_json::to_value(&body)
-                            .map_err(|error| ProviderError::Malformed(error.to_string()))?;
-                        inline_body
-                            .as_object_mut()
-                            .expect("request serializes to object")
-                            .remove("stream");
-                        return complete_inline_once(
-                            &this,
-                            inline_body,
-                            &request.session_ref,
-                            &context,
-                        )
-                        .await;
-                    }
+                    let mut inline_body = serde_json::to_value(&body)
+                        .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+                    inline_body
+                        .as_object_mut()
+                        .expect("request serializes to object")
+                        .remove("stream");
+                    return complete_inline_once(
+                        &this,
+                        inline_body,
+                        &request.session_ref,
+                        &context,
+                    )
+                    .await;
                 }
-                return Err(ProviderError::Http {
-                    status,
-                    request_id,
-                    retryable: is_retryable_status(status),
-                });
+                return Err(classify_http_error(status, request_id, error_body));
             }
             let content_type = response
                 .headers()
@@ -661,6 +671,70 @@ fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 502 | 503 | 504)
 }
 
+/// Maps one non-success HTTP response to the session-facing error. A
+/// context-window rejection gets its own variant so the session loop can
+/// react with one deterministic elision/compaction recovery attempt; the
+/// local byte budget is only an estimate, so this provider-side signal is
+/// the authoritative "the request really did not fit".
+fn classify_http_error(status: u16, request_id: String, body: &[u8]) -> ProviderError {
+    if matches!(status, 400 | 413) && body_signals_context_overflow(body) {
+        return ProviderError::ContextOverflow { request_id };
+    }
+    ProviderError::Http {
+        status,
+        request_id,
+        retryable: is_retryable_status(status),
+    }
+}
+
+/// Exact provider error codes that unambiguously mean "input exceeded the
+/// context window". OpenAI-family and several OpenAI-compatible servers
+/// (`Azure`, `DeepSeek`, `Together`) emit one of these on
+/// `error.code`/`error.type`.
+const CONTEXT_OVERFLOW_CODES: &[&str] = &[
+    "context_length_exceeded",
+    "string_above_max_length",
+    "invalid_request_error.context_length_exceeded",
+];
+
+/// Message substrings used only when no structured code is present
+/// (proxies and non-OpenAI-compatible error envelopes).
+const CONTEXT_OVERFLOW_MESSAGE_MARKERS: &[&str] = &[
+    "maximum context length",
+    "context length",
+    "context window",
+    "too many tokens",
+];
+
+fn body_signals_context_overflow(body: &[u8]) -> bool {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        let error = value.get("error").unwrap_or(&value);
+        let code = error
+            .get("code")
+            .or_else(|| error.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if CONTEXT_OVERFLOW_CODES.contains(&code.as_str()) {
+            return true;
+        }
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return CONTEXT_OVERFLOW_MESSAGE_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker));
+    }
+    // Plain-text/HTML error pages: match the same markers lossily, capped to
+    // the buffered prefix.
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    CONTEXT_OVERFLOW_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
     // Rendering observers are intentionally outside the provider critical
     // path. A slow terminal reducer cannot hold the network response open.
@@ -704,21 +778,17 @@ async fn complete_inline_once(
     .map_err(|error| ProviderError::Transport(error.to_string()))?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        return Err(ProviderError::Http {
-            status,
-            request_id: response
-                .headers()
-                .get("x-request-id")
-                .and_then(|value| value.to_str().ok())
-                .map(|value| format!(" (request {value})"))
-                .unwrap_or_default(),
-            // Same verdict as the streaming path — a transient status on
-            // the inline retry is still transient. (This used to be a
-            // hardcoded `false`, which would have misclassified a 503 on
-            // the fallback as final once the session started honoring the
-            // flag.)
-            retryable: is_retryable_status(status),
-        });
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| format!(" (request {value})"))
+            .unwrap_or_default();
+        let error_body = response
+            .bytes()
+            .await
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        return Err(classify_http_error(status, request_id, &error_body));
     }
     let wire = response
         .json()
@@ -1163,6 +1233,54 @@ mod tests {
             socket.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), rx)
+    }
+
+    #[test]
+    fn context_overflow_classification_covers_codes_messages_and_plain_text() {
+        let rid = String::new();
+        // Structured code variants emitted by OpenAI-family servers.
+        for body in [
+            r#"{"error":{"code":"context_length_exceeded","message":"bad"}}"#,
+            r#"{"error":{"type":"string_above_max_length","message":"x"}}"#,
+        ] {
+            assert!(matches!(
+                classify_http_error(400, rid.clone(), body.as_bytes()),
+                ProviderError::ContextOverflow { .. }
+            ));
+        }
+        // Code absent, message carries the marker (proxies, DeepSeek-style).
+        let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens."}}"#;
+        assert!(matches!(
+            classify_http_error(400, rid.clone(), body.as_bytes()),
+            ProviderError::ContextOverflow { .. }
+        ));
+        // 413 with a plain-text marker still classifies.
+        let body = "error: request exceeds the context window";
+        assert!(matches!(
+            classify_http_error(413, rid.clone(), body.as_bytes()),
+            ProviderError::ContextOverflow { .. }
+        ));
+        // A generic bad request stays a plain HTTP error.
+        let body = r#"{"error":{"code":"invalid_request","message":"model not found"}}"#;
+        assert!(matches!(
+            classify_http_error(400, rid.clone(), body.as_bytes()),
+            ProviderError::Http { status: 400, .. }
+        ));
+        // Overflow-shaped body on an unrelated status is never reclassified.
+        let body = r#"{"error":{"code":"context_length_exceeded"}}"#;
+        assert!(matches!(
+            classify_http_error(500, rid.clone(), body.as_bytes()),
+            ProviderError::Http { status: 500, .. }
+        ));
+        // Transient statuses keep their retryability verdict.
+        assert!(matches!(
+            classify_http_error(503, rid, b"busy"),
+            ProviderError::Http {
+                status: 503,
+                retryable: true,
+                ..
+            }
+        ));
     }
     fn sequence_server(responses: Vec<(&str, &str)>) -> (String, mpsc::Receiver<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

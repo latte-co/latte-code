@@ -642,11 +642,19 @@ latte-code run [--focus <path>] [--json] [--server url] [--token token] <prompt>
 
 `focus` 路径通过 `CreateSessionRequest.focus` 传给 server。Server 侧持久化到 session 记录，后续 follow-up 自动恢复（§4.2）。
 
-### 6.6 `resume` / `show` / `list`
+### 6.6 `resume` / `show` / `context` / `compact` / `list`
 
 - `list` → `GET /v1/workspaces/{ws}/sessions`，格式化输出 session 列表。
 - `show <session-id>` → `GET /v1/sessions/{id}`，格式化输出 session snapshot。
+- `context <session-id>` → `GET /v1/sessions/{id}/context`，格式化输出只读上下文用量投影（精确字节、估算 token、可丢弃段数、压缩触发状态；详见 [context-design.md](context-design.md) §4.5）。
+- `compact <session-id>` → `POST /v1/sessions/{id}/compact`，在水位以下强制压缩空闲会话；空态（无历史 / 策略关闭 / 熔断 / 无可压缩边界）返回 `noop` 而非错误，非空闲返回 409（详见 [context-design.md](context-design.md) §4.7）。
 - `resume <session-id> <prompt>` → `POST /v1/sessions/{id}/follow-up`，然后流式观察（同 `run` 的 SSE 流程）。
+
+### 6.7 `reminder`（server-only API，无 CLI 命令）
+
+- `POST /v1/sessions/{id}/reminder`，body `{"text": "..."}` → `{session_id, bytes}`，为空闲会话的**下一次** turn 装填一次性 `<system-reminder>` 上下文（详见 [context-design.md](context-design.md) §4.8）。
+- 非持久：只存进程内存，被下一次 turn 构建消费一次即清除，重启丢失，永不写入 transcript / JSONL；文本在写入边界脱敏（token/密钥），空文本或超 4096 字节为 400，非空闲（`running`/`waiting_permission`/`waiting_input` 等）为 409 并回带 `current_revision`，未知 session 为 404。
+- CLI 不暴露此命令；面向 TUI / 外部客户端（如在下一轮临时注入注意事项）。当前版本 CLI 的 `run`/`resume` 路径不调用该端点。
 
 ## 7. TUI 语义等价性契约
 

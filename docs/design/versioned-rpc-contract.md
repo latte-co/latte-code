@@ -104,6 +104,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 （非 breaking，因为 JSON 结构不变）：
 
 - `GET /v1/sessions/{id}` → `SessionResponse { snapshot: SessionSnapshot }`
+- `GET /v1/sessions/{id}/context` → `SessionContextResponse { session_id: String, usage: ContextUsage }`（只读用量投影，见 [context-design.md](context-design.md) §4.5；`ContextUsage` 为类型化 DTO，精确字节 + 估算 token + 丢弃段数 + 压缩策略状态，未知 session 返回 404）
 - `POST /v1/sessions/{id}/follow-up` → `FollowUpResponse { accepted_revision: u64, workspace_id: String }`（`workspace_id` 是客户端订阅正确事件流的必需字段，当前实现已返回）
 - `POST /v1/sessions/{id}/cancel` → `SessionResponse`
 - `POST /v1/sessions/{id}/model` → `SessionResponse`
@@ -116,6 +117,11 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 - `GET /v1/workspaces/{ws}/sessions` → `SessionListResponse { sessions, next_cursor }`
 - `GET /v1/workspaces/{ws}/sessions/search` → `SessionListResponse`
 - `GET /v1/workspaces/{ws}/bindings` → `BindingsResponse { bindings: Vec<BindingCatalogEntry> }`
+
+新增端点直接按类型化 DTO 落地：
+
+- `POST /v1/sessions/{id}/compact` → `CompactSessionResponse { snapshot: SessionSnapshot, state: ManualCompactionState }`（空闲手动压缩，见 [context-design.md](context-design.md) §4.7；`state` 为 `compacted { tier, revision }` 或 `nothing_to_compact { reason }`，空态是 200 而非错误；非空闲/版本冲突返回 409，未知 session 返回 404）
+- `POST /v1/sessions/{id}/reminder`，请求体 `ArmReminderRequest { text: String }` → `ReminderResponse { session_id: String, bytes: u64 }`（装填一次性、非持久的 `<system-reminder>` 槽，见 [context-design.md](context-design.md) §4.8；`bytes` 为脱敏后 UTF-8 字节数。仅 `Ready` 会话可装填：非空闲返回 409 并回带 `current_revision`；空文本/超 4096 字节/坏 body 返回 400 `rejected`；未知 session 返回 404。装填值只保存在进程内存中，被下一次 turn 构建消费一次，不进 transcript，重启即失；无对应 CLI 命令）
 
 ## 4. 错误契约
 

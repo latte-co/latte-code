@@ -26,13 +26,15 @@ latte-code tui
 latte-code run --focus crates/latte-core "add the requested validation"
 latte-code resume <session-id> "continue with the next step"
 latte-code show <session-id>
+latte-code context <session-id>
 latte-code list
 latte-code --json show <session-id>
+latte-code --json context <session-id>
 latte-code --json list
 latte-code serve --port 4096
 ```
 
-`run`/`list`/`show`/`resume` are session commands served over HTTP+SSE: by default the server is embedded in the process (random loopback port, token kept in memory); `--server <url>` connects to a standalone server, reading its token from `$LATTE_CODE_HOME/server.token` or `--token`. `serve` starts a standalone server on 127.0.0.1 (default port 4096) and writes its Bearer token to `$LATTE_CODE_HOME/server.token` with owner-only permissions.
+`run`/`list`/`show`/`context`/`compact`/`resume` are session commands served over HTTP+SSE: by default the server is embedded in the process (random loopback port, token kept in memory); `--server <url>` connects to a standalone server, reading its token from `$LATTE_CODE_HOME/server.token` or `--token`. `serve` starts a standalone server on 127.0.0.1 (default port 4096) and writes its Bearer token to `$LATTE_CODE_HOME/server.token` with owner-only permissions. `context <session-id>` prints the read-only context-usage projection (exact used/remaining bytes, estimated tokens, discardable segments, compaction trigger state). `compact <session-id>` forces context compaction on an idle session even below the trigger watermark (deterministic tool-result elision first, then a model summary); an already-small session reports `nothing_to_compact` instead of failing, and a session with an active turn is rejected with a conflict.
 
 With no arguments Latte Code opens the TUI when stdin/stdout are terminals. Latte Code starts from built-in application defaults, recursively overlays `$HOME/.latte/latte-code.jsonc`, and then overlays `<workspace>/.latte/latte-code.jsonc`. Provider/model configuration is explicit: TUI and Provider-backed operations require the merged configuration to define `default_model` and at least one matching Provider model, while read-only state commands remain available with an empty Provider catalog. For the same key, the workspace value wins; arrays, scalar values, and each Provider's complete `models` catalog replace the earlier value.
 

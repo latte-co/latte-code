@@ -3709,6 +3709,7 @@ fn render_message_lines(
         TranscriptKind::Failure => (" ! Failed · ", RED, true),
         TranscriptKind::System => (" · ", MUTED, false),
         TranscriptKind::CompactSummary => (" ◇ Compacted · ", MUTED, false),
+        TranscriptKind::ToolResultElision => (" ◇ Elided tool results · ", MUTED, false),
         TranscriptKind::ToolCall | TranscriptKind::ToolResult => (" · ", TEXT_SOFT, false),
     };
     let mut style = Style::default().fg(color);

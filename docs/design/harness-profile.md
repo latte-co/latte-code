@@ -4,7 +4,12 @@
 上下文分层与压缩策略的架构见 [Context 架构](context-design.md)；
 **批次 2 部分实现**（#19 后续切片）：compaction 本体（摘要 turn 替代静默丢弃、
 失败降级审计、JSONL 持久化、`session.compaction.enabled` 配置面）已落地；
-未实现：`/compact` 手动命令、预算可见性、binding 快照三字段（schema 迁移）、
+主动水位（`trigger_ratio`/`retain_ratio`）与确定性省略层
+（`session.compaction.mode:"elide_then_summarize"`，先骨架化旧 tool result、
+不足再摘要）已落地，并承接 provider context-overflow 的每 turn 一次强制恢复
+（见 context-design.md §4/§4.6）；idle-only 手动 `/compact`（HTTP + CLI，
+水位以下强制、明确空态、409 非空闲）已落地（§4.7）；
+未实现：预算可见性 TUI 状态栏、binding 快照三字段（schema 迁移）、
 config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
 日期：2026-09-12
 范围：定义 `HarnessProfile` 的概念位置、核心类型、解析管道、约束边界与首个消费者
@@ -99,8 +104,11 @@ pub struct ContextPolicy {
 
 pub struct CompactionPolicy {
     pub strategy: CompactionStrategy,
-    /// 触发阈值：估算上下文占 context_cap_bytes 的比例。
-    pub trigger_ratio: u8,            // 例：80
+    /// 主动触发阈值：估算用量占请求预算的比例（1..=100，默认 90）。
+    pub trigger_ratio: u8,
+    /// 压缩后逐字保留的近期后缀占请求预算的比例（1..=80，默认 20，
+    /// 按整段累加，见 context-design.md §4）。
+    pub retain_ratio: u8,
     /// 摘要请求使用的 prompt 槽（见 SystemPromptSpec）。
     pub summary_prompt_id: String,
     /// 单次摘要最多覆盖的历史范围（字节），防摘要请求自身超限。
@@ -109,9 +117,14 @@ pub struct CompactionPolicy {
 
 pub struct SystemPromptSpec {
     /// prompt 槽位集合。v1 两个槽：
-    ///   "agent.system"   —— 主 system prompt
+    ///   "agent.system"   —— 主 system prompt（稳定头）
     ///   "agent.summarize" —— compaction 摘要指令
     /// 槽位内容 = 内置模板 + 每模型覆盖（config 提供）。
+    ///
+    /// "agent.system" 中的 `{repository_context}` 注入点恒以空串渲染：
+    /// 工作区快照（AGENTS.md / 根清单）改走非持久的 `<repository-context>`
+    /// 尾部 user 消息，保证同一 binding 的 system 头跨 turn、跨进程逐字节
+    /// 稳定（前缀缓存契约见 context-design.md §4.8）。
     pub slots: BTreeMap<String, String>,
 }
 ```
@@ -173,8 +186,9 @@ presence 语义取代第 2 层的"等于默认值"启发式。
 compaction 用"config 策略非 Off 则整体取 config、否则取 builtin"。后者避免
 builtin 层死代码且 config 激活即生效；前者保证未触碰字段跟随 builtin 演进。
 新增字段时二选一并在此处记录口径。另：`CompactionPolicy.trigger_ratio` 与
-`summary_prompt_id` 尚无配置面（profile 内部值），但 `validate()` 对非 Off
-策略校验它们——v1 默认值安全；配置面随第二个策略一起补。
+`retain_ratio` 的配置面是 `session.compaction.trigger_ratio` /
+`retain_ratio`（0 = 跟随 profile 默认）；`summary_prompt_id` 仍是 profile
+内部值，`validate()` 对非 Off 策略统一校验——v1 默认值安全。
 
 ### 4.2 fail-closed 与已持久化 binding 的兼容
 

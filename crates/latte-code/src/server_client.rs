@@ -8,8 +8,8 @@
 use crate::prepare_server;
 use futures::StreamExt;
 use latte_core::{
-    FailureCode, SessionCommandId, SessionId, SessionLifecycle, SessionSnapshot, SessionSummary,
-    SessionTransientProgress, SessionTurnStatus, TranscriptKind,
+    ContextUsage, FailureCode, SessionCommandId, SessionId, SessionLifecycle, SessionSnapshot,
+    SessionSummary, SessionTransientProgress, SessionTurnStatus, TranscriptKind,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -139,6 +139,10 @@ pub enum SessionCommand {
     List,
     /// Show one session snapshot.
     Show { session_id: String },
+    /// Show one session's read-only context-usage projection.
+    Context { session_id: String },
+    /// Force compaction of an idle session's history.
+    Compact { session_id: String },
     /// Append a follow-up turn to an existing session.
     Resume { session_id: String, prompt: String },
 }
@@ -160,9 +164,9 @@ pub struct ParsedSessionCommand {
 /// Returns a usage message for unknown commands/options, missing values, wrong
 /// arity, or malformed session ids.
 pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, String> {
-    let (name, rest) = args
-        .split_first()
-        .ok_or_else(|| "expected a command: run | list | show | resume".to_string())?;
+    let (name, rest) = args.split_first().ok_or_else(|| {
+        "expected a command: run | list | show | context | compact | resume".to_string()
+    })?;
     let mut json = false;
     let mut server = None;
     let mut token = None;
@@ -223,6 +227,22 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
             let session_id = positional.remove(0);
             parse_session_id(&session_id).map_err(|error| error.to_string())?;
             SessionCommand::Show { session_id }
+        }
+        "context" => {
+            if positional.len() != 1 {
+                return Err("context requires exactly one session id".to_string());
+            }
+            let session_id = positional.remove(0);
+            parse_session_id(&session_id).map_err(|error| error.to_string())?;
+            SessionCommand::Context { session_id }
+        }
+        "compact" => {
+            if positional.len() != 1 {
+                return Err("compact requires exactly one session id".to_string());
+            }
+            let session_id = positional.remove(0);
+            parse_session_id(&session_id).map_err(|error| error.to_string())?;
+            SessionCommand::Compact { session_id }
         }
         "resume" => {
             if positional.len() < 2 {
@@ -551,6 +571,96 @@ pub fn session_envelope(snapshot: &SessionSnapshot) -> Value {
 }
 
 #[must_use]
+pub fn context_envelope(usage: &ContextUsage) -> Value {
+    json!({
+        "version": 2,
+        "status": "completed",
+        "data": { "context": usage },
+    })
+}
+
+/// Renders the read-only context-usage projection for the non-JSON terminal
+/// surface. Byte figures are exact; token figures are visibly labeled as
+/// estimates so the display never implies they are hard boundaries.
+#[must_use]
+pub fn render_context_usage(usage: &ContextUsage) -> String {
+    let fill_pct = usage
+        .used_bytes
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_div(usage.request_budget_bytes))
+        .unwrap_or(0);
+    let mut lines = vec![
+        format!(
+            "context window: {} / {} bytes used ({}%)",
+            usage.used_bytes, usage.request_budget_bytes, fill_pct
+        ),
+        format!("remaining: {} bytes", usage.remaining_bytes),
+        format!(
+            "estimated tokens: {} used / {} budget / {} remaining (bytes/token estimate, not metered)",
+            usage.estimated_used_tokens,
+            usage.estimated_budget_tokens,
+            usage.estimated_remaining_tokens
+        ),
+        format!("discardable segments: {}", usage.discarded_segments),
+        format!("compaction strategy: {:?}", usage.compaction_strategy),
+    ];
+    if usage.proactive_compaction_due {
+        lines.push(format!(
+            "proactive compaction threshold reached ({}% trigger ratio)",
+            usage.trigger_ratio
+        ));
+    }
+    lines.join("\n")
+}
+
+/// JSON envelope for the idle-only manual compact operation. The empty-state
+/// is reported as `status:"noop"` (not an error) because an explicit compact
+/// against an already-small session is a successful, idempotent call.
+#[must_use]
+pub fn compact_envelope(result: &latte_core::ManualCompactionResult) -> Value {
+    let status = match result.state {
+        latte_core::ManualCompactionState::Compacted { .. } => "completed",
+        latte_core::ManualCompactionState::NothingToCompact { .. } => "noop",
+    };
+    json!({
+        "version": 2,
+        "status": status,
+        "data": { "compact": result.state },
+    })
+}
+
+/// Renders the manual compact result for the non-JSON terminal surface.
+#[must_use]
+pub fn render_compact(result: &latte_core::ManualCompactionResult) -> String {
+    use latte_core::{
+        ManualCompactionIdleReason as Reason, ManualCompactionState, ManualCompactionTier as Tier,
+    };
+    match result.state {
+        ManualCompactionState::Compacted { tier, revision } => {
+            let how = match tier {
+                Tier::Elided => {
+                    "elided older tool results into deterministic skeletons (no model request)"
+                }
+                Tier::Summarized => "summarized older history",
+            };
+            format!("compacted history ({how}); session revision {revision}")
+        }
+        ManualCompactionState::NothingToCompact { reason } => {
+            let why = match reason {
+                Reason::Empty => "session has no conversation history yet",
+                Reason::Disabled => "compaction is disabled in the resolved profile",
+                Reason::BreakerTripped => {
+                    "compaction is temporarily unavailable after repeated \
+                    summary failures (restart resets it)"
+                }
+                Reason::NothingToCompress => "history is below the smallest compaction boundary",
+            };
+            format!("nothing to compact: {why}")
+        }
+    }
+}
+
+#[must_use]
 pub fn error_envelope(error: &ClientError) -> Value {
     json!({
         "version": 2,
@@ -595,6 +705,13 @@ pub trait SessionServer {
     ) -> Result<(u64, String), ClientError>;
     /// Fetches the authoritative session snapshot.
     async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError>;
+    /// Fetches the read-only context-usage projection for one session.
+    async fn context_usage(&mut self, session_id: &SessionId) -> Result<ContextUsage, ClientError>;
+    /// Forces the idle-only manual compaction of one session.
+    async fn compact_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<latte_core::ManualCompactionResult, ClientError>;
     /// Lists the workspace's durable sessions.
     async fn list_sessions(
         &mut self,
@@ -1146,6 +1263,51 @@ impl ServerHandle {
         }
     }
 
+    /// Fetches the read-only context-usage projection for one session: exact
+    /// bytes used/remaining, display token estimates, the discardable segment
+    /// count, and the proactive-compaction flag under the resolved profile.
+    pub async fn context_usage(&self, session_id: &SessionId) -> Result<ContextUsage, ClientError> {
+        let value = self
+            .get(&format!("/v1/sessions/{session_id}/context"))
+            .await?;
+        let usage = value
+            .get("usage")
+            .cloned()
+            .ok_or_else(|| ClientError::Failed("context response missing usage".into()))?;
+        serde_json::from_value(usage)
+            .map_err(|error| ClientError::Failed(format!("invalid context usage: {error}")))
+    }
+
+    /// Drives the idle-only manual compact operation. The endpoint is
+    /// idempotent at the snapshot level: calling it on an already compact
+    /// session returns a `nothing_to_compact` state instead of an error.
+    pub async fn compact_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<latte_core::ManualCompactionResult, ClientError> {
+        let value = self
+            .post(
+                &format!("/v1/sessions/{session_id}/compact"),
+                json!({}),
+                None,
+            )
+            .await?;
+        let snapshot = value
+            .get("snapshot")
+            .cloned()
+            .ok_or_else(|| ClientError::Failed("compact response missing snapshot".into()))?;
+        let state = value
+            .get("state")
+            .cloned()
+            .ok_or_else(|| ClientError::Failed("compact response missing state".into()))?;
+        Ok(latte_core::ManualCompactionResult {
+            snapshot: serde_json::from_value(snapshot)
+                .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))?,
+            state: serde_json::from_value(state)
+                .map_err(|error| ClientError::Failed(format!("invalid compact state: {error}")))?,
+        })
+    }
+
     /// Creates a session and starts its first turn.
     pub async fn create_session(
         &self,
@@ -1600,6 +1762,17 @@ impl SessionServer for ServerClient {
             .ok_or_else(|| ClientError::Failed("snapshot response missing snapshot".into()))?;
         serde_json::from_value(snapshot)
             .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))
+    }
+
+    async fn context_usage(&mut self, session_id: &SessionId) -> Result<ContextUsage, ClientError> {
+        self.handle.context_usage(session_id).await
+    }
+
+    async fn compact_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<latte_core::ManualCompactionResult, ClientError> {
+        self.handle.compact_session(session_id).await
     }
 
     async fn list_sessions(
@@ -2282,6 +2455,24 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Err(ClientError::Failed("snapshot queue empty".into())))
+        }
+
+        async fn context_usage(
+            &mut self,
+            _session_id: &SessionId,
+        ) -> Result<ContextUsage, ClientError> {
+            Err(ClientError::Failed(
+                "context usage is not scripted on the mock server".into(),
+            ))
+        }
+
+        async fn compact_session(
+            &mut self,
+            _session_id: &SessionId,
+        ) -> Result<latte_core::ManualCompactionResult, ClientError> {
+            Err(ClientError::Failed(
+                "manual compaction is not scripted on the mock server".into(),
+            ))
         }
 
         async fn list_sessions(
