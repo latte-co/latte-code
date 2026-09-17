@@ -93,9 +93,20 @@ fn tui_status_bar_renders_the_context_usage_meter() {
     command.env("TEST_OPENAI_KEY", "tui-meter-secret");
     let mut pty = PtySession::spawn(command);
     assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    // TUI_READY (the kitty keyboard sequence) is emitted while terminal setup
+    // is still in progress: alternate-screen/mouse/paste enable and the first
+    // draw happen afterwards, and that setup's termios reconfiguration can
+    // flush bytes already written to the PTY (observed as a lost prompt in the
+    // empty composer on slower macOS runners). Wait for a string that only the
+    // post-setup first frame renders before typing, then submit in a single
+    // write (the established pattern at the other PTY journeys).
+    assert!(
+        pty.wait_for_output(b"Describe an outcome", Duration::from_secs(5)),
+        "idle first frame never rendered: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
 
-    pty.write(b"show me the context meter");
-    pty.write(b"\r");
+    pty.write(b"show me the context meter\r");
     assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
     // The completion card splits words with cursor moves; wait for the
     // contiguous follow-up bar instead, then for the meter itself.
