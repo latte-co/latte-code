@@ -222,7 +222,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: coverage instruments a separate target dir and is
+      # measured from a clean build; a restored cache could carry stale
+      # instrumented artifacts that shift the attributed line denominator.
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: make coverage-unit
 
@@ -235,7 +237,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: coverage instruments a separate target dir and is
+      # measured from a clean build; a restored cache could carry stale
+      # instrumented artifacts that shift the attributed line denominator.
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: make coverage-e2e
 
@@ -248,7 +252,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: coverage instruments a separate target dir and is
+      # measured from a clean build; a restored cache could carry stale
+      # instrumented artifacts that shift the attributed line denominator.
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: make coverage-total
 
