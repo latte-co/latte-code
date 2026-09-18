@@ -9688,6 +9688,609 @@ fn engine_lease_recovery_reclaims_expired_session_lease() {
     assert_eq!(snapshot.session_id, session_id);
 }
 
+/// Deterministic crash-lease recovery for a *linked* session turn. A running
+/// child whose session lease is already expired against the sweeper's wall
+/// clock is interrupted atomically by `recover_expired_leases` (no RAII guard
+/// involved): its v1 run, effect ledger, and active row are cleared together
+/// and the terminal `Interrupted` lifecycle is committed.
+///
+/// Clock injection (`acquire_session_lease(now_ms, ttl_ms)` + the create
+/// `now_ms`) makes the expiry independent of wall-clock sleeps, so the linked
+/// recovery path in storage is covered on every run instead of only when the
+/// server's background sweeper happens to race a test.
+#[test]
+fn engine_recovery_interrupts_running_linked_turn_with_expired_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let conversations = dir.path().join("sessions");
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(&conversations)
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::SessionProviderBinding {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let command_id = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+
+    // The lease is valid at the injected create clock (epoch 2ms) but expires
+    // at 1001ms — ancient history against the real wall clock the sweeper
+    // reads, exactly the state left by a runner that crashed mid-turn.
+    let lease = engine.acquire_session_lease(session_id, 1, 1000).unwrap();
+    let started = match engine
+        .create_started_session_v2(
+            &command_id,
+            session_id,
+            turn_id,
+            binding,
+            "crashed mid-run",
+            &lease,
+            2,
+            None,
+        )
+        .unwrap()
+    {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
+    assert_eq!(started.lifecycle, latte_core::SessionLifecycle::Running);
+    assert_eq!(started.active_turn_id, Some(turn_id));
+
+    engine.recover_expired_leases().unwrap();
+
+    // The linked child is terminal: active row gone, session lifecycle and v1
+    // run status both interrupted in the same commit.
+    let recovered = engine.session_snapshot_v2(session_id, None, 100).unwrap();
+    assert_eq!(
+        recovered.lifecycle,
+        latte_core::SessionLifecycle::Interrupted
+    );
+    assert!(recovered.active_turn_id.is_none());
+    assert_eq!(
+        engine.show(turn_id).unwrap().status,
+        latte_core::TurnStatus::Interrupted
+    );
+
+    // A second sweep is a no-op: the turn no longer matches the recovery scan,
+    // so no duplicate terminal event may be appended.
+    engine.recover_expired_leases().unwrap();
+    let swept_again = engine.session_snapshot_v2(session_id, None, 100).unwrap();
+    assert_eq!(swept_again.sequence, recovered.sequence);
+    assert_eq!(swept_again.revision, recovered.revision);
+}
+
+/// Deterministic crash-lease recovery with effects in flight. The linked
+/// recovery transaction classifies effects by whether they crossed the
+/// external-execution boundary:
+/// - a `started` effect becomes `unknown` and the session lands in
+///   `reconciliation_required` (an external outcome may exist);
+/// - a merely `prepared` effect is terminalized as `observed_failed` /
+///   `not_started`, never labelled unknown, and the session is `interrupted`.
+///
+/// Both branches are exercised through one injected-expired sweep so the
+/// effect-ledger half of `recover_linked_session_turn` is covered on every run.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_recovery_classifies_started_unknown_and_prepared_not_started() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(dir.path().join("sessions"))
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = || latte_core::SessionProviderBinding {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+    let descriptor = |name: &str, input: serde_json::Value| latte_engine::SessionEffectDescriptor {
+        effect_id: format!("effect-{name}"),
+        tool_call_id: format!("call-{name}"),
+        name: name.into(),
+        input,
+        attempt: 1,
+    };
+    std::fs::write(dir.path().join("a.txt"), b"recover me").unwrap();
+    // --- Session A: a read effect has crossed into `started` ---------------
+    let session_a = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+    let turn_a = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let lease_a = engine.acquire_session_lease(session_a, 1, 1000).unwrap();
+    let running_a = match engine
+        .create_started_session_v2(
+            &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            session_a,
+            turn_a,
+            binding(),
+            "crashed after effect start",
+            &lease_a,
+            2,
+            None,
+        )
+        .unwrap()
+    {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
+    let prepared_a = engine
+        .prepare_session_effect(
+            latte_engine::SessionEffectRequest {
+                session_id: session_a,
+                turn_id: turn_a,
+                expected_session_revision: running_a.revision,
+                expected_turn_revision: running_a.turns[0].turn_revision,
+                command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                source_key: "recovery:prepare".into(),
+                descriptor: descriptor("read_file", serde_json::json!({"path":"a.txt"})),
+            },
+            &lease_a,
+            3,
+        )
+        .unwrap();
+    engine
+        .start_session_effect(
+            latte_engine::SessionEffectStartRequest {
+                session_id: session_a,
+                turn_id: turn_a,
+                expected_session_revision: prepared_a.snapshot.revision,
+                expected_turn_revision: prepared_a.snapshot.turns[0].turn_revision,
+                command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                source_key: "recovery:start".into(),
+                effect_id: "effect-read_file".into(),
+            },
+            prepared_a.operation_digest,
+            &lease_a,
+            4,
+        )
+        .unwrap();
+    // Deliberately never execute/observe: the row stays `started`, exactly as
+    // it would after a crash between start and observation.
+
+    // --- Session B: an effect is only `prepared` ---------------------------
+    let session_b = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+    let turn_b = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let lease_b = engine.acquire_session_lease(session_b, 10, 1000).unwrap();
+    let running_b = match engine
+        .create_started_session_v2(
+            &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            session_b,
+            turn_b,
+            binding(),
+            "crashed before effect start",
+            &lease_b,
+            11,
+            None,
+        )
+        .unwrap()
+    {
+        latte_core::CreateOutcome::Created(snapshot)
+        | latte_core::CreateOutcome::Replayed(snapshot) => snapshot,
+    };
+    engine
+        .prepare_session_effect(
+            latte_engine::SessionEffectRequest {
+                session_id: session_b,
+                turn_id: turn_b,
+                expected_session_revision: running_b.revision,
+                expected_turn_revision: running_b.turns[0].turn_revision,
+                command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                source_key: "recovery:prepare".into(),
+                descriptor: descriptor("list_directory", serde_json::json!({"path":"."})),
+            },
+            &lease_b,
+            12,
+        )
+        .unwrap();
+
+    // One wall-clock sweep reclaims both injected-expired crash leases.
+    engine.recover_expired_leases().unwrap();
+
+    let recovered_a = engine.session_snapshot_v2(session_a, None, 100).unwrap();
+    assert_eq!(
+        recovered_a.lifecycle,
+        latte_core::SessionLifecycle::ReconciliationRequired
+    );
+    assert!(recovered_a.active_turn_id.is_none());
+    assert_eq!(
+        engine.show(turn_a).unwrap().status,
+        latte_core::TurnStatus::Interrupted
+    );
+    assert!(matches!(
+        engine.effect_status("effect-read_file").unwrap(),
+        latte_engine::EffectStatus::Unknown
+    ));
+
+    let recovered_b = engine.session_snapshot_v2(session_b, None, 100).unwrap();
+    assert_eq!(
+        recovered_b.lifecycle,
+        latte_core::SessionLifecycle::Interrupted
+    );
+    assert!(recovered_b.active_turn_id.is_none());
+    assert!(matches!(
+        engine.effect_status("effect-list_directory").unwrap(),
+        latte_engine::EffectStatus::ObservedFailed
+    ));
+}
+
+/// Deterministic crash-lease recovery for a *legacy* (v1, unlinked) run.
+/// `recover_at` has a second scan for standalone `turns` rows that have no
+/// `session_turns` link and whose `runtime` lease is expired: it appends one
+/// interrupt event, bumps revision, refreshes the read model, and marks started
+/// effects unknown. Clock injection keeps the expiry wall-clock independent.
+#[test]
+fn engine_recovery_interrupts_legacy_run_with_expired_runtime_lease() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+
+    engine.create_turn(turn_id, 1).unwrap();
+    let lease = engine
+        .acquire_turn_lease(turn_id, "crashed-worker", 2, 1000)
+        .unwrap();
+    engine
+        .apply_transition(turn_id, 0, latte_core::Transition::Start, 3, &lease)
+        .unwrap();
+    assert_eq!(
+        engine.show(turn_id).unwrap().status,
+        latte_core::TurnStatus::Running
+    );
+
+    // Lease expires at 1003ms — ancient against the sweeper's wall clock.
+    engine.recover_expired_leases().unwrap();
+    let recovered = engine.show(turn_id).unwrap();
+    assert_eq!(recovered.status, latte_core::TurnStatus::Interrupted);
+    // Start took revision 0→1; the recovery interrupt adds one more.
+    assert_eq!(recovered.revision, 2);
+
+    // A second sweep must not append another interrupt event.
+    engine.recover_expired_leases().unwrap();
+    assert_eq!(engine.show(turn_id).unwrap().revision, 2);
+}
+
+/// The explicit fence-after-heartbeat-loss API (`interrupt_after_lease_loss`)
+/// has four outcomes, all driven deterministically through injected clocks:
+/// lease still authoritative → error; token valid but revision stale →
+/// `FencedNoop`; already terminal with matching revision → `AlreadyTerminal`;
+/// genuinely expired authority on a running turn → `Interrupted`.
+#[test]
+fn engine_interrupt_after_lease_loss_covers_all_outcomes() {
+    use latte_core::IdSource;
+    use latte_engine::LeaseLossRecovery;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+
+    // --- Turn 1: crashed worker holding an expired runtime lease -----------
+    let turn_1 = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_1, 1).unwrap();
+    let stale = engine
+        .acquire_turn_lease(turn_1, "crashed-worker", 2, 1000)
+        .unwrap();
+    engine
+        .apply_transition(turn_1, 0, latte_core::Transition::Start, 3, &stale)
+        .unwrap();
+
+    // Stale revision guess: the token matches but the run moved on, so the
+    // call must not interrupt — FencedNoop.
+    assert!(matches!(
+        engine
+            .interrupt_after_lease_loss(turn_1, &stale, 99, 1_000_000)
+            .unwrap(),
+        LeaseLossRecovery::FencedNoop
+    ));
+    assert_eq!(
+        engine.show(turn_1).unwrap().status,
+        latte_core::TurnStatus::Running
+    );
+
+    // Correct revision on an expired lease: interrupted.
+    let outcome = engine
+        .interrupt_after_lease_loss(turn_1, &stale, 1, 1_000_000)
+        .unwrap();
+    assert!(matches!(outcome, LeaseLossRecovery::Interrupted(_)));
+    assert_eq!(
+        engine.show(turn_1).unwrap().status,
+        latte_core::TurnStatus::Interrupted
+    );
+
+    // Same stale authority, now-current revision (2 after the bump): the run
+    // is already terminal, so the call returns it instead of rewriting.
+    assert!(matches!(
+        engine
+            .interrupt_after_lease_loss(turn_1, &stale, 2, 1_000_001)
+            .unwrap(),
+        LeaseLossRecovery::AlreadyTerminal(_)
+    ));
+
+    // --- Turn 2: live worker whose lease is still authoritative ------------
+    let turn_2 = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_2, 2_000_000).unwrap();
+    let live = engine
+        .acquire_turn_lease(turn_2, "live-worker", 2_000_001, 10_000)
+        .unwrap();
+    engine
+        .apply_transition(turn_2, 0, latte_core::Transition::Start, 2_000_002, &live)
+        .unwrap();
+    let error = engine
+        .interrupt_after_lease_loss(turn_2, &live, 1, 2_000_003)
+        .unwrap_err();
+    assert!(error.to_string().contains("still authoritative"));
+    assert_eq!(
+        engine.show(turn_2).unwrap().status,
+        latte_core::TurnStatus::Running
+    );
+}
+
+/// Deterministic coverage of the session-coordinator counterpart to
+/// `interrupt_after_lease_loss`: `recover_session_after_lease_loss` fences a
+/// stale v2 coordinator and commits the same conservative recovery state as a
+/// startup sweep. All four outcomes are driven by injected clocks and
+/// revisions: stale revision guess → `FencedNoop`; correct revision on a
+/// running child → `Recovered`; a repeat on the now-terminal child →
+/// `AlreadyTerminal`; a lease that is still authoritative →
+/// `InvalidData`.
+#[test]
+fn engine_recover_session_after_lease_loss_covers_all_outcomes() {
+    use latte_core::IdSource;
+    use latte_engine::SessionLeaseLossRecovery;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .conversation_root(dir.path().join("sessions"))
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+    let binding = latte_core::SessionProviderBinding {
+        version: 1,
+        provider_name: "test".into(),
+        provider_type: "openai-chat".into(),
+        protocol: "chat".into(),
+        model: "test-model".into(),
+        config_fingerprint: "config".into(),
+        tools_fingerprint: "tools".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "env:TEST_KEY".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 1,
+    };
+
+    // Session S: a coordinator whose heartbeat is long dead against the wall
+    // clock.
+    let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+    let turn_id = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let stale = engine.acquire_session_lease(session_id, 1, 1000).unwrap();
+    match engine
+        .create_started_session_v2(
+            &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            session_id,
+            turn_id,
+            binding.clone(),
+            "crashed coordinator",
+            &stale,
+            2,
+            None,
+        )
+        .unwrap()
+    {
+        latte_core::CreateOutcome::Created(_) | latte_core::CreateOutcome::Replayed(_) => {}
+    }
+
+    // A wrong turn revision guess must fence without touching the child.
+    assert!(matches!(
+        engine
+            .recover_session_after_lease_loss(session_id, turn_id, &stale, 99, 1_000_000)
+            .unwrap(),
+        SessionLeaseLossRecovery::FencedNoop
+    ));
+    assert_eq!(
+        engine.show(turn_id).unwrap().status,
+        latte_core::TurnStatus::Running
+    );
+
+    // Correct revision on the expired lease: the child is recovered.
+    assert!(matches!(
+        engine
+            .recover_session_after_lease_loss(session_id, turn_id, &stale, 1, 1_000_000)
+            .unwrap(),
+        SessionLeaseLossRecovery::Recovered(_)
+    ));
+
+    // A repeat returns the terminal snapshot instead of rewriting it.
+    assert!(matches!(
+        engine
+            .recover_session_after_lease_loss(session_id, turn_id, &stale, 1, 1_000_001)
+            .unwrap(),
+        SessionLeaseLossRecovery::AlreadyTerminal(_)
+    ));
+
+    // A live coordinator must not be fenced by a caller that merely claims a
+    // lost heartbeat.
+    let live_session = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+    let live_turn = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    let live = engine
+        .acquire_session_lease(live_session, 2_000_000, 10_000)
+        .unwrap();
+    match engine
+        .create_started_session_v2(
+            &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            live_session,
+            live_turn,
+            latte_core::SessionProviderBinding {
+                credential_generation: 2,
+                ..binding
+            },
+            "live coordinator",
+            &live,
+            2_000_001,
+            None,
+        )
+        .unwrap()
+    {
+        latte_core::CreateOutcome::Created(_) | latte_core::CreateOutcome::Replayed(_) => {}
+    }
+    let error = engine
+        .recover_session_after_lease_loss(live_session, live_turn, &live, 1, 2_000_002)
+        .unwrap_err();
+    assert!(error.to_string().contains("still authoritative"));
+}
+
+/// Deterministic cancellation/denial outcomes for a legacy run waiting on
+/// input: the fenced `cancel_waiting` storage path atomically fails the run
+/// with `Cancelled` and a terminal repeat is a no-op. The error branches
+/// (stale revision, expired lease, denial of a non-permission wait, cancelling
+/// a run that is not waiting) are covered on the same fixture.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_cancel_waiting_input_covers_commit_and_error_branches() {
+    use latte_core::IdSource;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(dir.path())
+        .build()
+        .unwrap();
+    let ids = latte_core::SystemIdSource::default();
+
+    // --- Turn A: Running → WaitingInput, then cancelled -------------------
+    let turn_a = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_a, 1).unwrap();
+    let lease_a = engine
+        .acquire_turn_lease(turn_a, "worker-a", 2, 10_000)
+        .unwrap();
+    engine
+        .apply_transition(turn_a, 0, latte_core::Transition::Start, 3, &lease_a)
+        .unwrap();
+    engine
+        .apply_transition(
+            turn_a,
+            1,
+            latte_core::Transition::RequestInput(latte_core::PendingInput {
+                request_id: "input-1".into(),
+                prompt: "value?".into(),
+            }),
+            4,
+            &lease_a,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.show(turn_a).unwrap().status,
+        latte_core::TurnStatus::WaitingInput
+    );
+
+    // A stale revision guess is rejected before any write.
+    assert!(matches!(
+        engine
+            .cancel_waiting_turn(turn_a, 99, &lease_a, 5)
+            .unwrap_err(),
+        latte_engine::StorageError::StaleRevision { .. }
+    ));
+
+    // The correct revision fails the run durably with Cancelled.
+    let cancelled = engine.cancel_waiting_turn(turn_a, 2, &lease_a, 6).unwrap();
+    assert_eq!(cancelled.status, latte_core::TurnStatus::Failed);
+    assert_eq!(
+        cancelled.failure.as_ref().unwrap().code,
+        latte_core::FailureCode::Cancelled
+    );
+
+    // Repeating against the now-terminal run is an eventless no-op; no second
+    // failure event is appended.
+    let again = engine
+        .cancel_waiting_turn(turn_a, cancelled.revision, &lease_a, 7)
+        .unwrap();
+    assert_eq!(again.revision, cancelled.revision);
+
+    // --- Turn B: waiting on input cannot be "permission denied" -----------
+    let turn_b = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_b, 20_000).unwrap();
+    let lease_b = engine
+        .acquire_turn_lease(turn_b, "worker-b", 20_001, 10_000)
+        .unwrap();
+    engine
+        .apply_transition(turn_b, 0, latte_core::Transition::Start, 20_002, &lease_b)
+        .unwrap();
+    engine
+        .apply_transition(
+            turn_b,
+            1,
+            latte_core::Transition::RequestInput(latte_core::PendingInput {
+                request_id: "input-2".into(),
+                prompt: "again?".into(),
+            }),
+            20_003,
+            &lease_b,
+        )
+        .unwrap();
+    let denied_error = engine
+        .deny_waiting_permission(turn_b, 2, &lease_b, 20_004)
+        .unwrap_err();
+    assert!(
+        denied_error
+            .to_string()
+            .contains("not waiting for permission")
+    );
+
+    // --- Turn C: an expired lease rejects cancellation --------------------
+    let turn_c = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_c, 40_000).unwrap();
+    let lease_c = engine
+        .acquire_turn_lease(turn_c, "worker-c", 40_001, 1000)
+        .unwrap();
+    engine
+        .apply_transition(turn_c, 0, latte_core::Transition::Start, 40_002, &lease_c)
+        .unwrap();
+    assert!(matches!(
+        engine
+            .cancel_waiting_turn(turn_c, 1, &lease_c, 1_000_000)
+            .unwrap_err(),
+        latte_engine::StorageError::LeaseLost
+    ));
+
+    // --- Turn D: a Running (non-waiting) run cannot be cancelled ----------
+    let turn_d = latte_core::TurnId::from_uuid(ids.next_uuid_v7());
+    engine.create_turn(turn_d, 50_000).unwrap();
+    let lease_d = engine
+        .acquire_turn_lease(turn_d, "worker-d", 50_001, 10_000)
+        .unwrap();
+    engine
+        .apply_transition(turn_d, 0, latte_core::Transition::Start, 50_002, &lease_d)
+        .unwrap();
+    let not_waiting = engine
+        .cancel_waiting_turn(turn_d, 1, &lease_d, 50_003)
+        .unwrap_err();
+    assert!(not_waiting.to_string().contains("not waiting"));
+}
+
 /// Engine-level non-atomic follow-up: covers the legacy `create_session_follow_up_v2`
 /// path that queues a follow-up without acquiring a lease.
 #[test]

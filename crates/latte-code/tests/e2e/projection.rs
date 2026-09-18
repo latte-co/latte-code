@@ -543,3 +543,259 @@ impl LifecycleLabelForTest for latte_core::SessionSnapshot {
         }
     }
 }
+
+/// A projection client that implements ONLY the two required methods and
+/// inherits every `SessionProjectionClient` default. Drives the default
+/// catalog/selection/usage contract against real engine-built snapshots,
+/// including every default-method branch (untitled session, missing session,
+/// unique vs ambiguous selection, empty/substring/id search, unavailable
+/// meter). The final binary's `HttpProjectionClient` overrides these methods,
+/// so the defaults are only reachable through a minimal implementer like this.
+struct DefaultProjectionClient {
+    snapshots: Vec<latte_core::SessionSnapshot>,
+}
+
+impl latte_tui::session::SessionProjectionClient for DefaultProjectionClient {
+    fn snapshots(&mut self) -> Result<Vec<latte_core::SessionSnapshot>, String> {
+        Ok(self.snapshots.clone())
+    }
+    fn poll(&mut self) -> latte_tui::session::SessionProjectionPoll {
+        latte_tui::session::SessionProjectionPoll::Empty
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn session_projection_client_defaults_derive_catalog_selection_search_and_meter() {
+    use latte_tui::session::SessionProjectionClient;
+    let scenario = Scenario::new();
+
+    // A normal, titled session seeded with a real user prompt.
+    let (engine, lease, titled) = fixture_engine(&scenario);
+    let titled = start(&engine, &lease, &titled);
+    let titled = commit(
+        &engine,
+        &lease,
+        &titled,
+        CommitSessionTurnUpdate::Complete {
+            source_key: "defaults:complete".into(),
+            handoff: Handoff {
+                summary: "titled done".into(),
+                files_changed: vec![],
+                evidence: vec![],
+            },
+        },
+        2_000,
+    );
+
+    // A second session whose only transcript card is a non-user system note,
+    // so the catalog default must synthesize the "Untitled session" title.
+    let ids = SystemIdSource::default();
+    let untitled_id = SessionId::from_uuid(ids.next_uuid_v7());
+    let untitled_lease = engine
+        .acquire_session_lease(untitled_id, 2_001, 60_000)
+        .unwrap();
+    let mut untitled = engine
+        .create_session_v2(
+            untitled_id,
+            latte_core::TurnId::from_uuid(ids.next_uuid_v7()),
+            binding(),
+            "untitled fixture prompt",
+            2_002,
+        )
+        .unwrap();
+    // Drop the seeded user card's influence by appending a fresh system card
+    // and projecting through a snapshot whose catalog has no user title.
+    untitled = engine
+        .commit_session_turn_update(
+            SessionCommitRequest {
+                session_id: untitled_id,
+                turn_id: untitled.latest_turn_id.unwrap(),
+                expected_session_revision: untitled.revision,
+                expected_turn_revision: untitled.turns[0].turn_revision,
+                command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                request_id: None,
+                effect_id: None,
+                update: CommitSessionTurnUpdate::Start {
+                    source_key: "defaults:untitled:start".into(),
+                },
+            },
+            &untitled_lease,
+            2_003,
+        )
+        .unwrap()
+        .snapshot;
+    // Build a snapshot view that has no User transcript entry at all.
+    untitled
+        .transcript
+        .entries
+        .retain(|entry| entry.kind != TranscriptKind::User);
+    engine.release_lease(&untitled_lease).unwrap();
+    engine.release_lease(&lease).unwrap();
+
+    let mut client = DefaultProjectionClient {
+        snapshots: vec![titled.clone(), untitled.clone()],
+    };
+
+    // Catalog derives titles (real prompt vs synthesized Untitled), binding,
+    // and lifecycle for every snapshot.
+    let catalog = client.session_catalog().unwrap();
+    assert_eq!(catalog.len(), 2);
+    let titled_summary = catalog
+        .iter()
+        .find(|item| item.session_id == titled.session_id)
+        .unwrap();
+    assert_eq!(titled_summary.title, "fixture prompt");
+    assert_eq!(titled_summary.model, "projection-model");
+    assert_eq!(
+        titled_summary.lifecycle,
+        latte_core::SessionLifecycle::Ready
+    );
+    let untitled_summary = catalog
+        .iter()
+        .find(|item| item.session_id == untitled_id)
+        .unwrap();
+    assert_eq!(untitled_summary.title, "Untitled session");
+
+    // Direct selection: present → the snapshot, absent → a typed error.
+    assert_eq!(
+        client.session(titled.session_id).unwrap().session_id,
+        titled.session_id
+    );
+    let missing = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+    assert!(
+        client
+            .session(missing)
+            .unwrap_err()
+            .contains("was not found")
+    );
+
+    // Exact selection by id and by title; a query matching neither yields an
+    // empty catalog (so exact_session resolves None), while the unique id
+    // resolves to Some.
+    assert_eq!(
+        client
+            .exact_session_catalog(&titled.session_id.to_string())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        client.exact_session_catalog("fixture prompt").unwrap()[0].session_id,
+        titled.session_id
+    );
+    assert!(
+        client
+            .exact_session_catalog("does-not-exist")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.exact_session("does-not-exist").unwrap().is_none());
+    assert_eq!(
+        client
+            .exact_session(&titled.session_id.to_string())
+            .unwrap()
+            .unwrap()
+            .session_id,
+        titled.session_id
+    );
+
+    // Search: blank query returns all, a title substring matches
+    // case-insensitively, an id substring matches, an unknown term matches
+    // nothing.
+    assert_eq!(client.search_session_catalog("  ").unwrap().len(), 2);
+    assert_eq!(
+        client.search_session_catalog("FIXTURE").unwrap()[0].session_id,
+        titled.session_id
+    );
+    let id_prefix = titled.session_id.to_string();
+    let id_prefix = &id_prefix[..8];
+    assert_eq!(
+        client.search_session_catalog(id_prefix).unwrap()[0].session_id,
+        titled.session_id
+    );
+    assert!(
+        client
+            .search_session_catalog("zzz-no-match")
+            .unwrap()
+            .is_empty()
+    );
+
+    // The default meter reports unavailable; only an overriding client serves
+    // real usage.
+    assert!(
+        client
+            .context_usage(titled.session_id)
+            .unwrap_err()
+            .contains("unavailable")
+    );
+}
+
+/// A provider that implements only `complete` and inherits the default
+/// `capabilities()`. Production providers all override capabilities, so the
+/// permissive default is reachable solely through such a minimal implementer.
+struct DefaultCapabilitiesProvider;
+
+impl latte_headless::provider::Provider for DefaultCapabilitiesProvider {
+    fn complete(
+        &self,
+        _request: latte_headless::provider::ProviderRequest,
+        _context: latte_headless::provider::ProviderContext,
+    ) -> latte_headless::provider::ProviderFuture<'_> {
+        Box::pin(async {
+            Err(latte_headless::provider::ProviderError::Malformed(
+                "default capabilities provider never completes".into(),
+            ))
+        })
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_default_capabilities_are_permissive_and_fake_provider_push_error_round_trips() {
+    use latte_headless::provider::{
+        Provider, ProviderCapabilities, ProviderContext, ProviderRequest, ProviderResponse,
+    };
+    use std::time::Instant;
+
+    let caps = DefaultCapabilitiesProvider.capabilities();
+    assert_eq!(
+        caps,
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: true,
+        }
+    );
+
+    // The public FakeProvider utility: a scripted success then an injected
+    // transport error round-trip through pop_front in FIFO order.
+    let fake = latte_headless::provider::FakeProvider::scripted([ProviderResponse {
+        message: Some("first".into()),
+        tool_calls: Vec::new(),
+        input_request: None,
+        usage: latte_headless::provider::ProviderUsage::default(),
+        finish_reason: None,
+        provider_state: None,
+    }]);
+    fake.push_error("injected failure");
+    let request = || ProviderRequest {
+        messages: Vec::new(),
+        tools: Vec::new(),
+        session_ref: "test-ref".into(),
+    };
+    let context = || ProviderContext {
+        deadline: Instant::now() + Duration::from_secs(10),
+        cancellation: latte_engine::CancellationToken::new(),
+        events: None,
+    };
+    let first = futures::executor::block_on(fake.complete(request(), context())).unwrap();
+    assert_eq!(first.message.as_deref(), Some("first"));
+    let second = futures::executor::block_on(fake.complete(request(), context()));
+    assert!(matches!(
+        second,
+        Err(latte_headless::provider::ProviderError::Transport(message))
+            if message == "injected failure"
+    ));
+}
