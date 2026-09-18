@@ -9944,8 +9944,10 @@ fn engine_recovery_classifies_started_unknown_and_prepared_not_started() {
 fn engine_recovery_interrupts_legacy_run_with_expired_runtime_lease() {
     use latte_core::IdSource;
     let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
     let engine = latte_engine::EngineBuilder::new()
         .workspace_root(dir.path())
+        .database_path(&database)
         .build()
         .unwrap();
     let ids = latte_core::SystemIdSource::default();
@@ -9963,12 +9965,34 @@ fn engine_recovery_interrupts_legacy_run_with_expired_runtime_lease() {
         latte_core::TurnStatus::Running
     );
 
+    // A crashed worker leaves its external effect mid-flight: the row is
+    // `started` with no observation. No public engine call can park a legacy
+    // effect in that state (every path finishes it before returning), so
+    // reproduce the crash residue directly in durable storage.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "INSERT INTO effects(effect_id,turn_id,status,started_at_ms) \
+             VALUES('effect-legacy-crash',?1,'started',3)",
+            [turn_id.to_string()],
+        )
+        .unwrap();
+
     // Lease expires at 1003ms — ancient against the sweeper's wall clock.
     engine.recover_expired_leases().unwrap();
     let recovered = engine.show(turn_id).unwrap();
     assert_eq!(recovered.status, latte_core::TurnStatus::Interrupted);
     // Start took revision 0→1; the recovery interrupt adds one more.
     assert_eq!(recovered.revision, 2);
+
+    // The in-flight started effect must be conservatively marked unknown: the
+    // run died under an expired lease, so its external outcome is
+    // uncertifiable. This anchors the legacy-scan effect classification (the
+    // linked-turn scan is a separate SQL path).
+    assert!(matches!(
+        engine.effect_status("effect-legacy-crash").unwrap(),
+        latte_engine::EffectStatus::Unknown
+    ));
 
     // A second sweep must not append another interrupt event.
     engine.recover_expired_leases().unwrap();
