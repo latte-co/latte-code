@@ -75,6 +75,80 @@ fn explicit_tui_fails_cleanly_without_a_terminal() {
 }
 
 #[test]
+fn tui_status_bar_renders_the_context_usage_meter() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("meter done")]);
+    // Tight budget with a 1% trigger: once the turn completes the meter must
+    // show a non-zero fill and the amber "compaction due" hint.
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["/usr/bin/true"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:1}}}}}}"#,
+            endpoint = provider.endpoint()
+        ),
+    )
+    .unwrap();
+    let mut command = scenario.command(&["tui"]);
+    command.env("TEST_OPENAI_KEY", "tui-meter-secret");
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    // TUI_READY (the kitty keyboard sequence) is emitted while terminal setup
+    // is still in progress: alternate-screen/mouse/paste enable and the first
+    // draw happen afterwards, and that setup's termios reconfiguration can
+    // flush bytes already written to the PTY (observed as a lost prompt in the
+    // empty composer on slower macOS runners). Wait for a string that only the
+    // post-setup first frame renders before typing, then submit in a single
+    // write (the established pattern at the other PTY journeys).
+    assert!(
+        pty.wait_for_output(b"Describe an outcome", Duration::from_secs(5)),
+        "idle first frame never rendered: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+
+    pty.write(b"show me the context meter\r");
+    assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
+    // The completion card splits words with cursor moves; wait for the
+    // contiguous follow-up bar instead, then for the meter itself.
+    assert!(
+        pty.wait_for_output(b"Ready for follow-up", Duration::from_secs(5)),
+        "session never settled: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    assert!(
+        pty.wait_for_output(b"Context ", Duration::from_secs(5)),
+        "context meter never rendered: {}",
+        String::from_utf8_lossy(&pty.output())
+    );
+    let raw = pty.output();
+    let screen = String::from_utf8_lossy(&raw);
+    let line = screen
+        .lines()
+        .find(|line| line.contains("Context "))
+        .expect("a status line contains the meter");
+    let clean: String = line.chars().filter(|ch| !ch.is_control()).collect();
+    let percent = clean
+        .split("Context ")
+        .nth(1)
+        .and_then(|rest| rest.split('%').next())
+        .and_then(|value| value.parse::<u8>().ok())
+        .expect("a fill percentage follows Context");
+    assert!(percent > 0, "the tight budget makes fill visible: {clean}");
+    assert!(
+        clean.contains("tokens"),
+        "the meter shows token estimates: {clean}"
+    );
+    assert!(
+        clean.contains("compaction due"),
+        "the near-compaction hint is shown at the 1% trigger: {clean}"
+    );
+
+    pty.write(F10);
+    let (status, _) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+}
+
+#[test]
 fn tui_without_provider_opens_and_guides_before_first_submission() {
     let scenario = Scenario::new();
     let mut pty = PtySession::spawn(scenario.command(&["tui"]));

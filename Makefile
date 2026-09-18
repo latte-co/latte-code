@@ -75,14 +75,19 @@ doc: ## Build local API documentation
 coverage: coverage-unit coverage-e2e coverage-total ## Run every required coverage gate
 	rm -rf target/llvm-cov-target coverage lcov.info
 
+# Coverage is always measured from a NON-incremental build. CI's rust-toolchain
+# action exports CARGO_INCREMENTAL=0; pinning it here makes local runs measure
+# the same complete instrumented artifact (incremental compilation folds trait
+# default-method instantiations out of the profile, which shifts the attributed
+# line denominator ~0.3 points and makes the gates non-reproducible).
 coverage-unit: ## Run UT-only coverage with the 95% line gate
-	cargo llvm-cov --workspace --all-features --lib --bins --locked --fail-under-lines 95
+	CARGO_INCREMENTAL=0 cargo llvm-cov --workspace --all-features --lib --bins --locked --fail-under-lines 95
 
 coverage-e2e: ## Run final-binary E2E coverage with the 90% line gate
-	cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 90 -- --test-threads=1
+	CARGO_INCREMENTAL=0 cargo llvm-cov --workspace --all-features --test e2e_portable --test e2e_unix --locked --fail-under-lines 90 -- --test-threads=1
 
 coverage-total: ## Run all-target coverage with the 90% line gate
-	cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90 -- --test-threads=1
+	CARGO_INCREMENTAL=0 cargo llvm-cov --workspace --all-features --all-targets --locked --fail-under-lines 90 -- --test-threads=1
 
 deny: ## Audit advisories, licenses, bans, and sources
 	cargo deny --locked check

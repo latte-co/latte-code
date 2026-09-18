@@ -192,14 +192,31 @@ fn headless_multi_round_read_only_history_converges_in_one_shot() {
         assert_declares_read_only_tools(&request.body);
     }
     assert_eq!(requests.len(), 6);
+    let first_messages = requests[0].body["messages"].as_array().unwrap();
+    // Prefix-stability contract: the stable system head carries no workspace
+    // snapshot; the root manifest rides a framed volatile tail user message,
+    // directly ahead of the prompt.
+    assert_eq!(first_messages[0]["role"], "system");
     assert!(
-        requests[0].body["messages"][0]["content"]
+        !first_messages[0]["content"]
             .as_str()
             .unwrap()
-            .contains("runtime-convergence-fixture")
+            .contains("runtime-convergence-fixture"),
+        "workspace files never enter the stable system head"
     );
+    let tail_at = first_messages
+        .iter()
+        .position(|message| {
+            message["role"] == "user"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.starts_with("<repository-context>")
+                        && content.contains("runtime-convergence-fixture")
+                })
+        })
+        .expect("the root manifest rides the repository-context tail");
+    assert_eq!(tail_at, 1, "the tail is the first message after the head");
     assert_eq!(
-        requests[0].body["messages"][1]["content"],
+        first_messages[tail_at + 1]["content"],
         "inspect the workspace over several durable provider rounds"
     );
 

@@ -14,9 +14,9 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use latte_core::{
-    SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle, SessionPendingRequest,
-    SessionSnapshot, SessionSummary, SessionTransientProgress, SessionTurnStatus, TranscriptEntry,
-    TranscriptKind, TurnId, redact_session_text,
+    ContextUsage, SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle,
+    SessionPendingRequest, SessionSnapshot, SessionSummary, SessionTransientProgress,
+    SessionTurnStatus, TranscriptEntry, TranscriptKind, TurnId, redact_session_text,
 };
 use ratatui::{
     Frame, Terminal,
@@ -111,6 +111,14 @@ pub trait SessionProjectionClient {
         })
     }
     fn poll(&mut self) -> SessionProjectionPoll;
+
+    /// Read-only next-request context usage for one session (exact bytes,
+    /// estimated tokens, discard count, proactive-compaction flag). Defaults
+    /// to unavailable so test doubles do not have to serve it; the status bar
+    /// simply renders without a meter.
+    fn context_usage(&mut self, _session_id: SessionId) -> Result<ContextUsage, String> {
+        Err("context usage projection unavailable".into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +177,13 @@ pub enum SessionUiInput {
         switch_id: u64,
     },
     Tick,
+    /// Read-only next-request context usage refreshed alongside a snapshot
+    /// reload. Carries the session id so a stale fetch for a since-deselected
+    /// session can never paint the wrong meter.
+    ContextUsage {
+        session_id: SessionId,
+        usage: Box<ContextUsage>,
+    },
 }
 
 /// Runtime completion delivered back to the terminal adapter. Submission
@@ -500,6 +515,11 @@ pub struct SessionUiModel {
     /// SIGINT. Debounce those duplicate delivery paths without weakening the
     /// two-press confirmation.
     pub ctrl_c_last_observed_at: Option<Instant>,
+    /// Read-only context-usage projection for the session the meter was last
+    /// fetched for. The status bar renders it only when that session is the
+    /// selected one; refreshes piggyback on authoritative snapshot reloads, so
+    /// it is display-only and never an authority source.
+    pub context_usage: Option<(SessionId, ContextUsage)>,
 }
 
 impl Default for SessionUiModel {
@@ -544,6 +564,7 @@ impl Default for SessionUiModel {
             reconciliation_hint: None,
             ctrl_c_exit_armed_until: None,
             ctrl_c_last_observed_at: None,
+            context_usage: None,
         }
     }
 }
@@ -778,6 +799,9 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             finalize_failed_submissions_after_snapshot(model);
             restore_stranded_follow_up(model);
             synchronize_input_target(model);
+        }
+        SessionUiInput::ContextUsage { session_id, usage } => {
+            model.context_usage = Some((session_id, *usage));
         }
         SessionUiInput::Event(event) => {
             let Some(session) = model
@@ -2948,21 +2972,7 @@ fn render_header(
     let width = layout.app.width.saturating_sub(inset * 2);
     let x = layout.app.x + inset;
     let header = format!("●  Latte Code  v{}  ·  {status}", env!("CARGO_PKG_VERSION"));
-    let repository = if width >= 56 {
-        model.startup.as_ref().map(|startup| {
-            presentation_text(
-                &startup.workspace_display,
-                usize::from(width).saturating_mul(4),
-            )
-        })
-    } else {
-        None
-    };
-    let repository_width = repository.as_ref().map_or(0, |value| {
-        u16::try_from(display_width(value))
-            .unwrap_or(width / 2)
-            .min(width / 2)
-    });
+    let (repository, repository_width) = repository_header(model, width);
     let header_width = if repository_width == 0 {
         width
     } else {
@@ -2990,6 +3000,16 @@ fn render_header(
             ),
         );
     }
+    if layout.header.height >= 3 {
+        render_context_meter(
+            frame,
+            model,
+            session.session_id,
+            x,
+            layout.header.y + 1,
+            width,
+        );
+    }
     if layout.header.height >= 2 {
         render_rule(
             frame,
@@ -2997,6 +3017,79 @@ fn render_header(
             LINE_SOFT,
         );
     }
+}
+
+/// Resolves the right-aligned workspace label shown on an active-session
+/// header: the display string and its measured width (zero when the header
+/// is too narrow to reserve space). The label is presentation-only.
+fn repository_header(model: &SessionUiModel, width: u16) -> (Option<String>, u16) {
+    let Some(startup) = model.startup.as_ref() else {
+        return (None, 0);
+    };
+    if width < 56 {
+        return (None, 0);
+    }
+    let repository = presentation_text(
+        &startup.workspace_display,
+        usize::from(width).saturating_mul(4),
+    );
+    if repository.is_empty() {
+        return (None, 0);
+    }
+    let repository_width = u16::try_from(display_width(&repository))
+        .unwrap_or(width / 2)
+        .min(width / 2);
+    (Some(repository), repository_width)
+}
+
+/// Renders the read-only context-usage meter on the header's second line for
+/// an open session: exact-bytes fill percentage, estimated token usage, and
+/// the near-compaction / discarded-history hints. The projection is
+/// display-only (never an authority), and renders nothing when no fetch has
+/// landed for THIS session yet.
+fn render_context_meter(
+    frame: &mut Frame<'_>,
+    model: &SessionUiModel,
+    session_id: SessionId,
+    x: u16,
+    y: u16,
+    width: u16,
+) {
+    let Some((meter_session, usage)) = model
+        .context_usage
+        .as_ref()
+        .filter(|(meter_session, _)| *meter_session == session_id)
+    else {
+        return;
+    };
+    let _ = meter_session;
+    let budget = usage.request_budget_bytes.max(1);
+    let percent = usage.used_bytes.saturating_mul(100).min(100 * budget) / budget;
+    let mut line = vec![Span::styled(
+        format!("Context {percent}%"),
+        Style::default().fg(TEXT),
+    )];
+    line.push(Span::styled(
+        format!(
+            "  ~{}/{} tokens",
+            usage.estimated_used_tokens, usage.estimated_budget_tokens
+        ),
+        Style::default().fg(FAINT),
+    ));
+    if usage.discarded_segments > 0 {
+        line.push(Span::styled(
+            format!("  · {} older segment(s) omitted", usage.discarded_segments),
+            Style::default().fg(AMBER),
+        ));
+    }
+    if usage.proactive_compaction_due {
+        line.push(Span::styled(
+            "  · compaction due",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let paragraph = Paragraph::new(Line::from(line));
+    frame.render_widget(paragraph, Rect::new(x, y, width, 1));
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3709,6 +3802,7 @@ fn render_message_lines(
         TranscriptKind::Failure => (" ! Failed · ", RED, true),
         TranscriptKind::System => (" · ", MUTED, false),
         TranscriptKind::CompactSummary => (" ◇ Compacted · ", MUTED, false),
+        TranscriptKind::ToolResultElision => (" ◇ Elided tool results · ", MUTED, false),
         TranscriptKind::ToolCall | TranscriptKind::ToolResult => (" · ", TEXT_SOFT, false),
     };
     let mut style = Style::default().fg(color);
@@ -4609,6 +4703,29 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// # Errors
 ///
 /// Returns a typed terminal, projection, or action-dispatch failure.
+/// Applies an authoritative `SessionOpened` projection and, best-effort,
+/// refreshes the read-only context-usage meter for the same session. A usage
+/// fetch failure is invisible (the meter simply keeps its last value): the
+/// snapshot remains the authority and the status bar is display-only.
+fn reduce_session_opened(
+    projection: &mut dyn SessionProjectionClient,
+    model: &mut SessionUiModel,
+    snapshot: SessionSnapshot,
+) -> Vec<SessionUiAction> {
+    let session_id = snapshot.session_id;
+    let actions = reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)));
+    if let Ok(usage) = projection.context_usage(session_id) {
+        reduce(
+            model,
+            SessionUiInput::ContextUsage {
+                session_id,
+                usage: Box::new(usage),
+            },
+        );
+    }
+    actions
+}
+
 fn apply_session_actions(
     projection: &mut dyn SessionProjectionClient,
     model: &mut SessionUiModel,
@@ -4626,7 +4743,7 @@ fn apply_session_actions(
                     .map_err(TuiError::Action)?
                     .flatten()
                 {
-                    let next = reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)));
+                    let next = reduce_session_opened(projection, model, snapshot);
                     if apply_session_actions(projection, model, sink, next)? {
                         return Ok(true);
                     }
@@ -4670,7 +4787,7 @@ fn apply_session_actions(
                         continue;
                     }
                 };
-                let next = reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)));
+                let next = reduce_session_opened(projection, model, snapshot);
                 if apply_session_actions(projection, model, sink, next)? {
                     return Ok(true);
                 }
@@ -4683,7 +4800,7 @@ fn apply_session_actions(
                 let next = match model.active_conversation {
                     Some(ActiveConversation::Session(session_id)) => {
                         let snapshot = projection.session(session_id).map_err(TuiError::Action)?;
-                        reduce(model, SessionUiInput::SessionOpened(Box::new(snapshot)))
+                        reduce_session_opened(projection, model, snapshot)
                     }
                     Some(ActiveConversation::NewSessionDraft)
                         if model.pending_submission.is_none() =>
@@ -4895,8 +5012,9 @@ pub fn run_with_feedback_and_progress(
 mod tests {
     use super::*;
     use latte_core::{
-        IdSource, SessionEvent, SessionEventEnvelope, SessionEventId, SessionProviderBinding,
-        SystemIdSource, TranscriptEntry, TranscriptEntryId, TurnId,
+        CompactionStrategy, ContextUsage, IdSource, SessionEvent, SessionEventEnvelope,
+        SessionEventId, SessionProviderBinding, SystemIdSource, TranscriptEntry, TranscriptEntryId,
+        TurnId,
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::VecDeque;
@@ -10084,6 +10202,113 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    fn usage(used_bytes: usize, budget: usize, discarded: usize, due: bool) -> ContextUsage {
+        ContextUsage {
+            request_budget_bytes: budget,
+            used_bytes,
+            remaining_bytes: budget.saturating_sub(used_bytes),
+            context_cap_bytes: 65_536,
+            estimated_used_tokens: used_bytes / 4,
+            estimated_budget_tokens: budget / 4,
+            estimated_remaining_tokens: budget.saturating_sub(used_bytes) / 4,
+            discarded_segments: discarded,
+            compaction_strategy: CompactionStrategy::SummarizeOnDiscard,
+            trigger_ratio: if due { 1 } else { 90 },
+            proactive_compaction_due: due,
+        }
+    }
+
+    #[test]
+    fn context_meter_renders_fill_percent_and_hints_for_the_open_session() {
+        let session = snapshot(SessionLifecycle::Ready);
+        let mut model = SessionUiModel {
+            sessions: vec![session.clone()],
+            size: (100, 24),
+            ..Default::default()
+        };
+        reduce(
+            &mut model,
+            SessionUiInput::SessionOpened(Box::new(session.clone())),
+        );
+        // No fetch yet: the meter is absent, never fabricated.
+        assert!(!rendered(&model, 100, 24).contains("Context"));
+
+        reduce(
+            &mut model,
+            SessionUiInput::ContextUsage {
+                session_id: session.session_id,
+                usage: Box::new(usage(5_600, 10_000, 0, false)),
+            },
+        );
+        let screen = rendered(&model, 100, 24);
+        assert!(screen.contains("Context 56%"), "screen: {screen}");
+        assert!(screen.contains("~1400/2500 tokens"));
+        assert!(!screen.contains("compaction due"));
+        assert!(!screen.contains("omitted"));
+
+        // Due + discarded state surfaces both hints.
+        reduce(
+            &mut model,
+            SessionUiInput::ContextUsage {
+                session_id: session.session_id,
+                usage: Box::new(usage(9_900, 10_000, 2, true)),
+            },
+        );
+        let screen = rendered(&model, 100, 24);
+        assert!(screen.contains("Context 99%"));
+        assert!(screen.contains("compaction due"));
+        assert!(screen.contains("2 older segment(s) omitted"));
+    }
+
+    #[test]
+    fn context_meter_ignores_a_projection_owned_by_another_session() {
+        let open = snapshot(SessionLifecycle::Ready);
+        let mut model = SessionUiModel {
+            sessions: vec![open.clone()],
+            size: (100, 24),
+            ..Default::default()
+        };
+        reduce(
+            &mut model,
+            SessionUiInput::SessionOpened(Box::new(open.clone())),
+        );
+        // A late fetch for a since-deselected (different) session must not
+        // paint its meter over the current one.
+        let other = snapshot(SessionLifecycle::Ready);
+        reduce(
+            &mut model,
+            SessionUiInput::ContextUsage {
+                session_id: other.session_id,
+                usage: Box::new(usage(9_000, 10_000, 0, true)),
+            },
+        );
+        assert!(!rendered(&model, 100, 24).contains("Context"));
+    }
+
+    #[test]
+    fn context_meter_hidden_when_header_has_no_second_line() {
+        let session = snapshot(SessionLifecycle::Ready);
+        let mut model = SessionUiModel {
+            sessions: vec![session.clone()],
+            size: (30, 24),
+            ..Default::default()
+        };
+        reduce(
+            &mut model,
+            SessionUiInput::SessionOpened(Box::new(session.clone())),
+        );
+        reduce(
+            &mut model,
+            SessionUiInput::ContextUsage {
+                session_id: session.session_id,
+                usage: Box::new(usage(5_000, 10_000, 0, false)),
+            },
+        );
+        // Narrow tier uses a two-row header (status + rule); the meter needs
+        // a free middle row.
+        assert!(!rendered(&model, 30, 24).contains("Context"));
     }
 
     fn assert_mark_cell(buffer: &Buffer, x: u16, y: u16, symbol: &str) {

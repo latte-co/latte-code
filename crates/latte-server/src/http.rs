@@ -186,6 +186,15 @@ pub fn router(state: Arc<ServerState>) -> Router {
         )
         .route("/v1/workspaces/{workspace_id}/bindings", get(list_bindings))
         .route("/v1/sessions/{session_id}", get(get_session))
+        .route(
+            "/v1/sessions/{session_id}/context",
+            get(get_session_context),
+        )
+        .route("/v1/sessions/{session_id}/compact", post(compact_session))
+        .route(
+            "/v1/sessions/{session_id}/reminder",
+            post(arm_session_reminder),
+        )
         .route("/v1/sessions/{session_id}/follow-up", post(follow_up))
         .route("/v1/sessions/{session_id}/model", post(switch_model))
         .route("/v1/sessions/{session_id}/cancel", post(cancel_session))
@@ -282,6 +291,42 @@ pub struct SessionCreatedResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionResponse {
     pub snapshot: SessionSnapshot,
+}
+
+/// Typed body of the read-only context-usage projection. `usage` is computed
+/// for the session's currently resolved profile: exact bytes used/remaining,
+/// display token estimates, discardable-segment count, and the proactive
+/// compaction flag. It carries no prompt and mutates nothing.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionContextResponse {
+    pub session_id: String,
+    pub usage: latte_core::ContextUsage,
+}
+
+/// Typed body of the idle-only manual-compact operation. The snapshot is the
+/// post-append projection when a card was written, or the unchanged snapshot
+/// on a `nothing_to_compact` outcome; `state` distinguishes the two.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactSessionResponse {
+    pub snapshot: latte_core::SessionSnapshot,
+    pub state: latte_core::ManualCompactionState,
+}
+
+/// Request body for arming the non-persistent one-shot reminder slot. The
+/// text is redacted at the write boundary and delivered to the next turn
+/// build only; it is never persisted with the session.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ArmReminderRequest {
+    pub text: String,
+}
+
+/// Confirmation of an armed reminder. `bytes` is the exact UTF-8 length of
+/// the redacted text the next turn build will frame (the server cap is
+/// enforced against this length).
+#[derive(Clone, Debug, Serialize)]
+pub struct ReminderResponse {
+    pub session_id: String,
+    pub bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -683,6 +728,119 @@ async fn get_session(
     Ok(Json(SessionResponse { snapshot }))
 }
 
+/// Read-only context-usage projection for one session: how full the next
+/// request window is under the binding's resolved harness profile, including
+/// the proactive-compaction flag. Performs no provider I/O.
+async fn get_session_context(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionContextResponse>, HandlerError> {
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
+    // Prove session ownership with the same durable read the snapshot
+    // endpoint uses before exposing the profile-derived projection.
+    workspace
+        .snapshot(session_id)
+        .map_err(|_| not_found("session not found"))?;
+    let usage = workspace
+        .runtime
+        .context_usage(session_id)
+        .map_err(|error| failed(&format!("cannot compute session context usage: {error}")))?;
+    Ok(Json(SessionContextResponse {
+        session_id: id,
+        usage,
+    }))
+}
+
+/// Runs the idle-only manual `/compact` operation: forces the compaction
+/// tiers below their watermark and appends one durable card to the latest
+/// completed turn. A session with an active turn is `409`; the empty-state
+/// (no history, strategy off, breaker open, no compressible boundary) is
+/// `200` with a `nothing_to_compact` state, not an error.
+async fn compact_session(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<Json<CompactSessionResponse>, HandlerError> {
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
+    workspace
+        .snapshot(session_id)
+        .map_err(|_| not_found("session not found"))?;
+    let result = workspace
+        .runtime
+        .compact_session(session_id)
+        .await
+        .map_err(|error| {
+            // Not-idle and revision/lease races are client-visible conflicts:
+            // refetch and retry once the runner is done. A command/source-key
+            // replay mismatch is a conflict too: the snapshot the client based
+            // the call on moved (or a concurrent compaction landed first), so
+            // refetching and re-evaluating the idle state is the right move.
+            let retryable = matches!(
+                &error,
+                SessionRuntimeError::InvalidState
+                    | SessionRuntimeError::Storage(
+                        latte_engine::StorageError::StaleRevision { .. }
+                            | latte_engine::StorageError::StaleSessionRevision { .. }
+                            | latte_engine::StorageError::SessionActiveTurnMismatch
+                            | latte_engine::StorageError::LeaseLost
+                            | latte_engine::StorageError::SessionCommandReplayMismatch
+                    )
+            );
+            if retryable {
+                let current = workspace
+                    .snapshot(session_id)
+                    .ok()
+                    .map(|snapshot| snapshot.revision);
+                conflict("session is not idle for manual compaction", current)
+            } else {
+                failed(&format!("manual compaction failed: {error}"))
+            }
+        })?;
+    Ok(Json(CompactSessionResponse {
+        snapshot: result.snapshot,
+        state: result.state,
+    }))
+}
+
+/// Arms the non-persistent one-shot `<system-reminder>` slot for the
+/// session's next turn. The text is redacted at this boundary, validated
+/// (non-empty, capped), held only in server memory, consumed by the next
+/// turn build, and never written to the transcript. Arming is idle-only:
+/// a running or parked session answers `409`; invalid text answers `400`.
+async fn arm_session_reminder(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    ValidatedJson(request): ValidatedJson<ArmReminderRequest>,
+) -> Result<Json<ReminderResponse>, HandlerError> {
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
+    workspace
+        .snapshot(session_id)
+        .map_err(|_| not_found("session not found"))?;
+    let bytes = workspace
+        .runtime
+        .set_reminder(session_id, &request.text)
+        .map_err(|error| match &error {
+            // Idle-only slot: a running/parked session is a conflict, not a
+            // failure — refetch and arm once the runner settles.
+            SessionRuntimeError::InvalidState => {
+                let current = workspace
+                    .snapshot(session_id)
+                    .ok()
+                    .map(|snapshot| snapshot.revision);
+                conflict("session is not idle for arming a reminder", current)
+            }
+            // Empty/oversize/redacted-to-empty text is a client error.
+            SessionRuntimeError::History(_) => bad_request(&error.to_string()),
+            other => failed(&format!("failed to arm reminder: {other}")),
+        })?;
+    Ok(Json(ReminderResponse {
+        session_id: id,
+        bytes,
+    }))
+}
+
 /// Continues a session with a new user turn. Like create, this awaits durable
 /// acceptance before returning 202 and runs the turn in the background; a
 /// crash-safe retry with the same `command_id` + payload replays the original
@@ -1047,13 +1205,9 @@ fn map_runtime_error(error: &SessionRuntimeError, current_revision: u64) -> Hand
 }
 
 fn is_retryable_storage(err: &latte_engine::StorageError) -> bool {
-    matches!(
-        err,
-        latte_engine::StorageError::EngineUnavailable
-            | latte_engine::StorageError::LeaseLost
-            | latte_engine::StorageError::StaleRevision { .. }
-            | latte_engine::StorageError::StaleSessionRevision { .. }
-    )
+    // Single source of truth lives on the storage error; this thin wrapper is
+    // kept so the HTTP mapper reads with the other local classification helpers.
+    err.is_coordinator_conflict()
 }
 
 fn parse_session_id(id: &str) -> Result<SessionId, HandlerError> {
@@ -4805,5 +4959,168 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_session_context_reports_usage_for_a_completed_session() {
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _) = completed_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            &format!("/v1/sessions/{session_id}/context"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_id"], serde_json::json!(session_id));
+        let usage = &body["usage"];
+        let budget = usage["request_budget_bytes"]
+            .as_u64()
+            .expect("budget bytes");
+        let used = usage["used_bytes"].as_u64().expect("used bytes");
+        let remaining = usage["remaining_bytes"].as_u64().expect("remaining bytes");
+        assert!(budget > 0);
+        assert!(used > 0, "system plus the completed turn are used");
+        assert_eq!(remaining, budget - used);
+        assert!(
+            usage["estimated_used_tokens"].as_u64().unwrap() > 0
+                && usage["estimated_budget_tokens"].as_u64().unwrap() > 0
+        );
+        assert_eq!(usage["discarded_segments"], 0);
+        assert_eq!(usage["compaction_strategy"], "off");
+        assert_eq!(usage["proactive_compaction_due"], false);
+    }
+
+    #[tokio::test]
+    async fn get_session_context_returns_404_for_an_unknown_session() {
+        let state = completing_state();
+        // A workspace must exist for the locator/index lookup to run; the
+        // unknown session itself must still be rejected as not found.
+        let workspace = tempfile::tempdir().unwrap();
+        create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let unknown = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+
+        let (status, _) = call(
+            &state,
+            "GET",
+            &format!("/v1/sessions/{unknown}/context"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reminder_arm_on_idle_session_accepts_and_reports_redacted_bytes() {
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _revision) = completed_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/reminder"),
+            Some(serde_json::json!({ "text": "carry REMINDER-HTTP-ACCEPTED into next turn" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["session_id"], session_id);
+        assert_eq!(
+            body["bytes"]
+                .as_u64()
+                .expect("the response reports the redacted byte length"),
+            "carry REMINDER-HTTP-ACCEPTED into next turn".len() as u64
+        );
+
+        // Re-arming replaces the pending one-shot (no accumulation, no 409).
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/reminder"),
+            Some(serde_json::json!({ "text": "token=HTTPSECRETVALUE4242 replaced" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reminder_arm_rejects_empty_oversize_and_malformed_bodies() {
+        let state = completing_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, _revision) = completed_session(&state, &workspace_id).await;
+
+        for bad in [
+            serde_json::json!({ "text": "   " }),
+            serde_json::json!({ "text": "x".repeat(4_097) }),
+            serde_json::json!({}),
+            serde_json::json!({ "text": 123 }),
+        ] {
+            let (status, body) = call(
+                &state,
+                "POST",
+                &format!("/v1/sessions/{session_id}/reminder"),
+                Some(bad),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["type"], "rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn reminder_arm_conflicts_while_session_is_parked() {
+        let state = input_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+        let (session_id, revision, _request_id, _turn_revision) =
+            waiting_input_session(&state, &workspace_id).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/reminder"),
+            Some(serde_json::json!({ "text": "not while parked" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"]["current_revision"].as_u64(),
+            Some(revision),
+            "the conflict carries the current session revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn reminder_arm_unknown_session_is_not_found() {
+        let state = completing_state();
+        let unknown = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{unknown}/reminder"),
+            Some(serde_json::json!({ "text": "nobody home" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn reminder_arm_rejects_invalid_session_id() {
+        let state = state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/sessions/not-a-uuid/reminder",
+            Some(serde_json::json!({ "text": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
     }
 }

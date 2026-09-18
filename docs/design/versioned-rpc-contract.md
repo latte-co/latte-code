@@ -104,6 +104,11 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 （非 breaking，因为 JSON 结构不变）：
 
 - `GET /v1/sessions/{id}` → `SessionResponse { snapshot: SessionSnapshot }`
+- `GET /v1/sessions/{id}/context` → `SessionContextResponse { session_id: String, usage: ContextUsage }`（只读用量投影，见 [context-design.md](context-design.md) §4.5；`ContextUsage` 为类型化 DTO，精确字节 + 估算 token + 丢弃段数 + 压缩策略状态，未知 session 返回 404）。字段契约：
+  - 所有字节/计数字段（`request_budget_bytes`、`used_bytes`、`remaining_bytes`、`context_cap_bytes`、`estimated_*_tokens`、`discarded_segments`）在 Rust 侧均为 **`usize`**（不是 `u64`），wire 上是 JSON 非负整数；客户端按非负整数解析即可，不要假设固定位宽。
+  - **字节权威、token 仅估算**：`*_bytes` 是精确 wire 字节，唯一的硬约束；`estimated_*_tokens` 恒为对应字节数 `div_ceil(bytes_per_token)` 的展示估算，永不作为闸门。
+  - `used_bytes` 计量的是"下一次请求会是什么形状"：system 头 + 拟合后保留的持久历史 **+ 会携带的确定性 `<repository-context>` 尾部**；一次性 `<system-reminder>` 是进程内、只读投影无从得知的量，**不计入**（reminder 装填后的真实请求才含它）。
+  - `compaction_strategy` 为枚举（`off` / `summarize_on_discard` / `elide_tool_results_then_summarize`，snake_case）。新增策略属于 §7.1 的向后兼容枚举扩展，旧客户端必须容忍未知变体（按 `off`/未知降级展示，不得崩溃）。
 - `POST /v1/sessions/{id}/follow-up` → `FollowUpResponse { accepted_revision: u64, workspace_id: String }`（`workspace_id` 是客户端订阅正确事件流的必需字段，当前实现已返回）
 - `POST /v1/sessions/{id}/cancel` → `SessionResponse`
 - `POST /v1/sessions/{id}/model` → `SessionResponse`
@@ -116,6 +121,11 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 - `GET /v1/workspaces/{ws}/sessions` → `SessionListResponse { sessions, next_cursor }`
 - `GET /v1/workspaces/{ws}/sessions/search` → `SessionListResponse`
 - `GET /v1/workspaces/{ws}/bindings` → `BindingsResponse { bindings: Vec<BindingCatalogEntry> }`
+
+新增端点直接按类型化 DTO 落地：
+
+- `POST /v1/sessions/{id}/compact` → `CompactSessionResponse { snapshot: SessionSnapshot, state: ManualCompactionState }`（空闲手动压缩，见 [context-design.md](context-design.md) §4.7；`state` 为 `compacted { tier, revision }` 或 `nothing_to_compact { reason }`，空态是 200 而非错误；非空闲/版本冲突返回 409，未知 session 返回 404）
+- `POST /v1/sessions/{id}/reminder`，请求体 `ArmReminderRequest { text: String }` → `ReminderResponse { session_id: String, bytes: u64 }`（装填一次性、非持久的 `<system-reminder>` 槽，见 [context-design.md](context-design.md) §4.8；`bytes` 为脱敏后 UTF-8 字节数。仅 `Ready` 会话可装填：非空闲返回 409 并回带 `current_revision`；空文本/超 4096 字节/坏 body 返回 400 `rejected`；未知 session 返回 404。装填值只保存在进程内存中，被下一次 turn 构建消费一次，不进 transcript，重启即失；无对应 CLI 命令）
 
 ## 4. 错误契约
 

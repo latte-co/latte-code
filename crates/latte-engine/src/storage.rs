@@ -53,6 +53,25 @@ pub enum StorageError {
     SessionActiveTurnMismatch,
 }
 
+impl StorageError {
+    /// A coordinator-conflict storage condition: another live owner holds the
+    /// session lease, the held lease was lost, or a revision fence moved.
+    /// Every one of these is transient from the caller's perspective — the
+    /// right response is `409`/retryable with a refetch, never a `500`
+    /// internal error. This is the single source of truth shared by the
+    /// accept path (headless) and every HTTP error mapper.
+    #[must_use]
+    pub fn is_coordinator_conflict(&self) -> bool {
+        matches!(
+            self,
+            StorageError::EngineUnavailable
+                | StorageError::LeaseLost
+                | StorageError::StaleRevision { .. }
+                | StorageError::StaleSessionRevision { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredEvent {
     pub sequence: u64,
@@ -2111,6 +2130,23 @@ impl Storage {
         current_session_snapshot(&conn, session_id, limit)
     }
 
+    /// Snapshot whose transcript is the complete *projection window* rather
+    /// than a raw newest-N page: when a `compact_summary` card exists, every
+    /// entry at or after the card's semantic retain floor
+    /// (`retain_from_sequence`, capped at the card's own sequence) is loaded,
+    /// so the verbatim suffix the summary promised to keep survives page
+    /// boundaries. Entries below the floor are superseded by the summary by
+    /// construction and never re-enter a provider request. Without a summary
+    /// card this is the ordinary tail page.
+    pub(crate) fn session_snapshot_projection_v2(
+        &self,
+        session_id: latte_core::SessionId,
+        fallback_limit: usize,
+    ) -> Result<SessionSnapshot, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        current_projection_snapshot(&conn, session_id, fallback_limit)
+    }
+
     /// Reads the authoritative persisted tool-round count for one run. Unlike a
     /// tail transcript projection this never undercounts long runs and stays
     /// correct after the conversation outbox is drained.
@@ -2864,13 +2900,28 @@ impl Storage {
                 "failed" | "interrupted" | "reconciliation_required"
             )
             && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
+        // Manual `/compact` appends its durable card while the session is
+        // idle (Ready, active row cleared). The gate is deliberately narrow:
+        // the two compaction card kinds only, on the latest turn only, and
+        // fenced by the exact session revision CAS and the lease — no
+        // arbitrary transcript write is ever admitted to a completed turn.
+        let idle_compaction_append = active.is_none()
+            && lifecycle.as_str() == "ready"
+            && matches!(
+                &request.update,
+                CommitSessionTurnUpdate::AppendTranscript {
+                    kind: TranscriptKind::CompactSummary | TranscriptKind::ToolResultElision,
+                    ..
+                }
+            )
+            && latest_turn.as_deref() == Some(request.turn_id.to_string().as_str());
         if let Some((active_turn, active_token)) = active {
             if active_turn != request.turn_id.to_string()
                 || from_i64(active_token)? > lease.fencing_token
             {
                 return Err(StorageError::SessionActiveTurnMismatch);
             }
-        } else if !recovered_reconciliation && !terminal_queue_audit {
+        } else if !recovered_reconciliation && !terminal_queue_audit && !idle_compaction_append {
             return Err(StorageError::SessionActiveTurnMismatch);
         }
         let (state_json, turn_seq, turn_token): (String, i64, i64) = tx.query_row(
@@ -3696,6 +3747,41 @@ impl Storage {
                 "DELETE FROM session_active_turns WHERE session_id=?1 AND turn_id=?2",
                 params![request.session_id.to_string(), request.turn_id.to_string()],
             )?;
+            // Release the coordinator lease in the SAME transaction that
+            // terminalizes the turn. The terminal state and "no coordinator
+            // owns this session" must become observable together, before the
+            // terminal event is broadcast: a CLI host exits the process as
+            // soon as it observes the terminal/failure result, and
+            // `std::process::exit` does not run the `SessionLeaseGuard`
+            // destructor that would otherwise delete this row. A skipped
+            // destructor used to leave a live lease pinned for its whole TTL,
+            // so an immediate resume was rejected with `EngineUnavailable`.
+            //
+            // We zero `expires_at_ms` rather than deleting the row: every
+            // ownership/fence test is `expires_at_ms > now`, so the scope is
+            // immediately acquirable (a later acquire overwrites the row with
+            // a strictly larger epoch token), while the owner/token pair stays
+            // attributable long enough for the owner's own `release_lease`
+            // (whose DELETE does not filter on expiry) to still match exactly
+            // once. A destructor that then runs deletes an inert row; a
+            // skipped destructor leaves an inert row the next acquire reclaims
+            // without waiting out the TTL.
+            let freed = tx.execute(
+                "UPDATE runtime_lease SET expires_at_ms=0 \
+                 WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4",
+                params![
+                    expected_scope,
+                    lease.owner,
+                    to_i64(lease.fencing_token)?,
+                    to_i64(now_ms)?
+                ],
+            )?;
+            if freed != 1 {
+                // The lease was verified live for this exact owner/token at
+                // the top of this transaction (which has held the write lock
+                // since BEGIN IMMEDIATE); losing it here is a real fence break.
+                return Err(StorageError::LeaseLost);
+            }
         } else {
             tx.execute(
                 "UPDATE session_active_turns SET lease_token=?1 WHERE session_id=?2 AND turn_id=?3",
@@ -5302,6 +5388,7 @@ fn transcript_kind_name(kind: TranscriptKind) -> &'static str {
         TranscriptKind::Completion => "completion",
         TranscriptKind::System => "system",
         TranscriptKind::CompactSummary => "compact_summary",
+        TranscriptKind::ToolResultElision => "tool_result_elision",
     }
 }
 
@@ -5455,6 +5542,71 @@ fn current_session_snapshot(
     let mut snapshot = session_snapshot(connection, session_id, None, 1)?;
     snapshot.transcript = session_transcript_tail(connection, session_id, transcript_limit)?;
     Ok(snapshot)
+}
+
+/// Builds the semantic projection snapshot used by provider-request
+/// construction and read-only projections. See
+/// [`Storage::session_snapshot_projection_v2`].
+fn current_projection_snapshot(
+    connection: &Connection,
+    session_id: latte_core::SessionId,
+    fallback_limit: usize,
+) -> Result<SessionSnapshot, StorageError> {
+    let mut snapshot = session_snapshot(connection, session_id, None, 1)?;
+    snapshot.transcript = session_transcript_projection(connection, session_id, fallback_limit)?;
+    Ok(snapshot)
+}
+
+/// Loads the verbatim projection window of one conversation: the newest
+/// `compact_summary` card plus every entry at or after its semantic retain
+/// floor. Falls back to the bounded newest-N tail when no summary exists.
+fn session_transcript_projection(
+    connection: &Connection,
+    session_id: latte_core::SessionId,
+    fallback_limit: usize,
+) -> Result<TranscriptPage, StorageError> {
+    let thread_id = session_id.to_string();
+    let newest_summary: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT seq, entry_json FROM conversation_outbox \
+             WHERE session_id=?1 AND kind='compact_summary' ORDER BY seq DESC LIMIT 1",
+            [&thread_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((card_seq, card_json)) = newest_summary else {
+        return session_transcript_tail(connection, session_id, fallback_limit);
+    };
+    let retain_floor = serde_json::from_str::<TranscriptEntry>(&card_json)
+        .map_err(invalid_json)?
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("retain_from_sequence"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(card_seq, |retain| {
+            i64::try_from(retain).unwrap_or(card_seq).min(card_seq)
+        });
+    let entries = connection
+        .prepare(
+            "SELECT entry_json FROM conversation_outbox \
+             WHERE session_id=?1 AND seq>=?2 ORDER BY seq ASC",
+        )?
+        .query_map(params![thread_id, retain_floor], |row| {
+            row.get::<_, String>(0)
+        })?
+        .map(|row| {
+            row.map_err(StorageError::from)
+                .and_then(|json| serde_json::from_str(&json).map_err(invalid_json))
+        })
+        .collect::<Result<Vec<TranscriptEntry>, StorageError>>()?;
+    let next_after = entries.last().map(|entry| entry.sequence);
+    Ok(TranscriptPage {
+        entries,
+        next_after,
+        // The projection window is complete by definition: older entries are
+        // covered by the summary, not truncated.
+        has_more: false,
+    })
 }
 
 /// Loads the newest bounded transcript page for a presentation projection.
@@ -7174,6 +7326,11 @@ mod tests {
         .snapshot;
         assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
 
+        // The retryable Fail terminalized and released the turn's lease in the
+        // same commit; an idle binding switch acquires its own fresh
+        // coordinator lease, exactly as the headless `switch_model` does.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 14, 100).unwrap();
         let mut next = session_binding();
         next.provider_name = "other-provider".into();
         next.model = "other-model".into();
@@ -7881,6 +8038,181 @@ mod tests {
         assert_eq!(followup.turns.len(), 2);
         assert_eq!(followup.turns[1].parent_turn_id, Some(first));
         assert_eq!(store.load_turn(first).unwrap(), parent);
+    }
+
+    #[test]
+    fn terminal_commit_frees_session_lease_before_ttl_without_destructor() {
+        // Regression: a CLI host calls `std::process::exit` as soon as it sees
+        // the terminal/failure result, which skips the `SessionLeaseGuard`
+        // destructor that deletes the lease row. The terminal commit must
+        // therefore release the lease itself, atomically, so an immediate
+        // resume by a different owner acquires within the old TTL instead of
+        // being rejected with `EngineUnavailable`.
+        use latte_core::{SessionCommandId, SessionId, SessionProviderBinding};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let binding = SessionProviderBinding {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        store
+            .create_session_v2(
+                session,
+                turn,
+                &binding,
+                "/workspace",
+                "prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        // TTL 100: the live lease runs from now=2 to expires=102.
+        let lease_a = store.acquire_session_lease(session, 2, 100).unwrap();
+        let start = SessionCommitRequest {
+            session_id: session,
+            turn_id: turn,
+            expected_session_revision: 0,
+            expected_turn_revision: 0,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitSessionTurnUpdate::Start {
+                source_key: "start".into(),
+            },
+        };
+        store
+            .commit_session_turn_update(&start, &lease_a, 3)
+            .unwrap();
+        // While the turn runs, a second owner inside the TTL is rejected.
+        assert!(matches!(
+            store.acquire_session_lease(session, 4, 100),
+            Err(StorageError::EngineUnavailable)
+        ));
+        // Terminal commit at now=6 — far inside the original TTL. The lease is
+        // released in the same transaction; no destructor runs in this test.
+        let complete = SessionCommitRequest {
+            expected_session_revision: 1,
+            expected_turn_revision: 1,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            update: CommitSessionTurnUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec![],
+                    evidence: vec![],
+                },
+            },
+            ..start
+        };
+        let completed = store
+            .commit_session_turn_update(&complete, &lease_a, 6)
+            .unwrap();
+        assert_eq!(completed.snapshot.lifecycle, SessionLifecycle::Ready);
+        // A different owner takes over immediately at the same instant, with a
+        // strictly larger epoch token. This returned `EngineUnavailable` before
+        // the terminal commit released the lease.
+        let lease_b = store.acquire_session_lease(session, 6, 100).unwrap();
+        assert_ne!(lease_b.owner, lease_a.owner);
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        // The displaced old owner must not be able to delete the new owner's
+        // lease: its release is fenced.
+        assert!(matches!(
+            store.release_lease(&lease_a),
+            Err(StorageError::LeaseLost)
+        ));
+        // And the new owner's lease is genuinely live.
+        assert!(
+            store
+                .acquire_session_lease(session, 7, 100)
+                .is_err_and(|error| matches!(error, StorageError::EngineUnavailable))
+        );
+        store.release_lease(&lease_b).unwrap();
+    }
+
+    #[test]
+    fn terminal_commit_lets_owner_release_once_and_still_rejects_double_release() {
+        // Zeroing the expiry keeps the owner/token attributable: the owner's
+        // own release after a terminal commit still matches exactly once (Ok),
+        // while releasing that consumed lease a second time stays a
+        // `LeaseLost` tripwire.
+        use latte_core::{SessionCommandId, SessionId, SessionProviderBinding};
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let binding = SessionProviderBinding {
+            version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: std::collections::BTreeMap::default(),
+            credential_ref_id: "env:KEY".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        store
+            .create_session_v2(
+                session,
+                turn,
+                &binding,
+                "/workspace",
+                "prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        let lease = store.acquire_session_lease(session, 2, 100).unwrap();
+        let start = SessionCommitRequest {
+            session_id: session,
+            turn_id: turn,
+            expected_session_revision: 0,
+            expected_turn_revision: 0,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            request_id: None,
+            effect_id: None,
+            update: CommitSessionTurnUpdate::Start {
+                source_key: "start".into(),
+            },
+        };
+        store.commit_session_turn_update(&start, &lease, 3).unwrap();
+        let complete = SessionCommitRequest {
+            expected_session_revision: 1,
+            expected_turn_revision: 1,
+            command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
+            update: CommitSessionTurnUpdate::Complete {
+                source_key: "complete".into(),
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec![],
+                    evidence: vec![],
+                },
+            },
+            ..start
+        };
+        store
+            .commit_session_turn_update(&complete, &lease, 6)
+            .unwrap();
+        // First release of the terminally-released lease matches its inert row.
+        store.release_lease(&lease).unwrap();
+        // A second release has no row to match and stays an error.
+        assert!(matches!(
+            store.release_lease(&lease),
+            Err(StorageError::LeaseLost)
+        ));
     }
 
     #[test]
@@ -8879,6 +9211,10 @@ mod tests {
         )
         .snapshot;
         assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        // The terminal Fail released the turn lease in its commit; the
+        // post-terminal audit acquires a fresh coordinator lease.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 14, 100).unwrap();
         let audited = commit_linked(
             &store,
             &ids,
@@ -8961,6 +9297,10 @@ mod tests {
         )
         .snapshot;
         assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        // Re-acquire so a live lease is held: the assertion targets the
+        // lifecycle whitelist (ready is not a terminal-audit state), not the
+        // lease fence that the Complete just released.
+        let ready_lease = store.acquire_session_lease(ready_session, 24, 100).unwrap();
         assert!(matches!(
             store.commit_session_turn_update(
                 &SessionCommitRequest {
@@ -8980,6 +9320,139 @@ mod tests {
                 },
                 &ready_lease,
                 24,
+            ),
+            Err(StorageError::SessionActiveTurnMismatch)
+        ));
+    }
+
+    /// Manual `/compact` appends its durable card to a Ready session whose
+    /// active row is cleared. The idle exemption is a strict whitelist:
+    /// `CompactSummary` and `ToolResultElision` land on the latest turn
+    /// (keeping the session Ready), every other card kind is rejected as an
+    /// active-turn mismatch.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn idle_compaction_append_is_whitelisted_to_compaction_card_kinds() {
+        let (_dir, path) = db();
+        let ids = SystemIdSource::default();
+        let store = Storage::open(&path).unwrap();
+        let (session_id, turn_id, queued) =
+            create_linked_fixture(&store, &ids, "manual compact", 30);
+        let lease = store.acquire_session_lease(session_id, 31, 100).unwrap();
+        let running = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &queued,
+            turn_id,
+            CommitSessionTurnUpdate::Start {
+                source_key: "compact:start".into(),
+            },
+            32,
+        )
+        .snapshot;
+        let mut current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &running,
+            turn_id,
+            CommitSessionTurnUpdate::Complete {
+                source_key: "compact:complete".into(),
+                handoff: latte_core::Handoff {
+                    summary: "done".into(),
+                    files_changed: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+            33,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        let base_revision = current.revision;
+
+        // The Complete released the turn lease in its commit. A manual
+        // `/compact` is a separate command on the idle session and acquires
+        // its own fresh coordinator lease (heartbeat-kept alive) for its card
+        // appends.
+        store.release_lease(&lease).unwrap();
+        let lease = store.acquire_session_lease(session_id, 34, 100).unwrap();
+
+        // Tier 1 card: deterministic elision.
+        current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &current,
+            turn_id,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:tool-result-elision:manual"),
+                kind: TranscriptKind::ToolResultElision,
+                text: "1 older tool result(s) elided into deterministic skeletons".into(),
+                payload: Some(serde_json::json!({ "tool_result_sequences": [7] })),
+            },
+            34,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(current.revision, base_revision + 1);
+        assert!(
+            current
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::ToolResultElision)
+        );
+
+        // Tier 2 card: model summary, on the same ready session.
+        current = commit_linked(
+            &store,
+            &ids,
+            &lease,
+            &current,
+            turn_id,
+            CommitSessionTurnUpdate::AppendTranscript {
+                source_key: format!("{turn_id}:compact-summary:manual"),
+                kind: TranscriptKind::CompactSummary,
+                text: "summary of older history".into(),
+                payload: Some(serde_json::json!({
+                    "superseded_through_sequence": 7,
+                    "retain_from_sequence": 8,
+                })),
+            },
+            35,
+        )
+        .snapshot;
+        assert_eq!(current.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(current.revision, base_revision + 2);
+        assert!(
+            current
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary)
+        );
+
+        // Any other card kind on a ready session stays rejected.
+        assert!(matches!(
+            store.commit_session_turn_update(
+                &SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: current.revision,
+                    expected_turn_revision: current.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::AppendTranscript {
+                        source_key: format!("{turn_id}:not-compaction"),
+                        kind: TranscriptKind::System,
+                        text: "must not land on a ready session".into(),
+                        payload: None,
+                    },
+                },
+                &lease,
+                36,
             ),
             Err(StorageError::SessionActiveTurnMismatch)
         ));
@@ -9637,6 +10110,14 @@ mod tests {
             store.unknown_effects_for_turn(turn_id).unwrap(),
             vec![effect_id.to_owned()]
         );
+        // The interrupt terminalized and released the turn's lease; a
+        // reconcile is a separate recovery command that acquires its own fresh
+        // coordinator lease (the headless reconcile path re-acquires with a
+        // management TTL).
+        store.release_lease(&lease).unwrap();
+        let lease = store
+            .acquire_session_lease(session_id, 106, 10_000)
+            .unwrap();
         let reconciled = commit_linked(
             &store,
             &ids,
@@ -12323,5 +12804,134 @@ mod tests {
         let snapshot = reopened.session_snapshot_tail_v2(session_id, 10).unwrap();
         assert!(snapshot.turns.iter().any(|turn| turn.turn_id == turn_id));
         drop(dir);
+    }
+
+    /// #3: once a summary records a semantic `retain_from_sequence`, the
+    /// projection window must replay that verbatim suffix even when it starts
+    /// well before the newest-500 physical tail page. A raw tail would drop
+    /// those rows and silently undercount the next request's bytes.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn projection_window_replays_retained_suffix_across_the_tail_boundary() {
+        use latte_core::{SessionId, SystemIdSource, TurnId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        // A real session row satisfies the conversation_outbox foreign key.
+        store
+            .create_session_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &session_binding(),
+                dir.path().to_str().unwrap(),
+                "seed prompt",
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+        let connection = store.connection.lock().unwrap();
+        // Drop the create's seed card so the sequence space is fully ours.
+        connection
+            .execute(
+                "DELETE FROM conversation_outbox WHERE session_id=?1",
+                params![session_id.to_string()],
+            )
+            .unwrap();
+        // 600 ordinary durable entries.
+        for seq in 1u64..=600 {
+            let entry = TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: seq,
+                turn_id: None,
+                kind: TranscriptKind::User,
+                text: format!("message-{seq}"),
+                payload: None,
+                source_key: format!("key-{seq}"),
+                created_at_ms: seq,
+            };
+            connection
+                .execute(
+                    "INSERT INTO conversation_outbox(\
+                     session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
+                     ) VALUES(?1,?2,?3,NULL,'user',?4,?5,?6)",
+                    params![
+                        session_id.to_string(),
+                        i64::try_from(seq).unwrap(),
+                        entry.entry_id.to_string(),
+                        entry.source_key,
+                        serde_json::to_string(&entry).unwrap(),
+                        i64::try_from(seq).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        // Summary card appended at seq 601, semantically retaining verbatim
+        // entries from seq 50 — far older than the newest-500 physical page.
+        let card = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 601,
+            turn_id: None,
+            kind: TranscriptKind::CompactSummary,
+            text: "summary of seq 1..49".into(),
+            payload: Some(serde_json::json!({ "retain_from_sequence": 50 })),
+            source_key: "compact-summary:manual".into(),
+            created_at_ms: 601,
+        };
+        connection
+            .execute(
+                "INSERT INTO conversation_outbox(\
+                 session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms\
+                 ) VALUES(?1,601,?2,NULL,'compact_summary',?3,?4,601)",
+                params![
+                    session_id.to_string(),
+                    card.entry_id.to_string(),
+                    card.source_key,
+                    serde_json::to_string(&card).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let tail = session_transcript_tail(&connection, session_id, 500).unwrap();
+        assert_eq!(tail.entries.first().unwrap().sequence, 102);
+        assert_eq!(tail.entries.len(), 500);
+        assert!(
+            tail.has_more,
+            "the raw newest-500 page truncates older rows"
+        );
+        assert!(
+            tail.entries.iter().all(|entry| entry.sequence != 50),
+            "the raw physical tail already lost the retained seq-50 suffix"
+        );
+
+        let projection = session_transcript_projection(&connection, session_id, 500).unwrap();
+        assert_eq!(
+            projection.entries.first().unwrap().sequence,
+            50,
+            "the semantic retain floor starts the window despite crossing 500 rows"
+        );
+        assert!(
+            projection
+                .entries
+                .iter()
+                .any(|entry| entry.sequence == 50 && entry.text == "message-50")
+        );
+        assert!(
+            projection.entries.iter().all(|entry| entry.sequence >= 50),
+            "nothing older than the retain floor is replayed raw"
+        );
+        assert_eq!(projection.entries.len(), 552, "seq 50..=601 inclusive");
+        assert!(
+            projection
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary),
+            "the summary card heads the projected window"
+        );
+        assert!(
+            !projection.has_more,
+            "the projection is semantically complete, not a truncated page"
+        );
     }
 }

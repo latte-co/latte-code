@@ -120,10 +120,12 @@ impl WorkspaceInstance {
         &self,
         session_id: latte_core::SessionId,
     ) -> Result<latte_core::SessionSnapshot, latte_engine::StorageError> {
-        // Use the tail (newest 500 entries) to match the TUI's
-        // `session_snapshot_tail_v2` behavior: the TUI shows the latest
-        // transcript page, not the oldest.
-        self.engine.session_snapshot_tail_v2(session_id, 500)
+        // The semantic projection window (newest summary plus its verbatim
+        // retained suffix, then newer cards): the TUI and the read API show
+        // the same shape provider request construction consumes, so a
+        // retained suffix can never be silently hidden by a raw newest-N
+        // page. Sessions without a summary card get the ordinary tail.
+        self.engine.session_snapshot_projection_v2(session_id, 500)
     }
 
     /// Lists the durable sessions bound to this workspace, newest transcript

@@ -454,6 +454,9 @@ fn final_cli_hashes_safe_file_and_directory_symlinks_before_verified_completion(
     provider.assert_consumed();
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
+    // AGENTS.md guidance now rides the non-persistent repository-context tail
+    // user message (the stable system head renders the injection point empty);
+    // root guidance still precedes the focus-nested guidance inside the tail.
     let system = requests[0].body["messages"]
         .as_array()
         .unwrap()
@@ -462,8 +465,25 @@ fn final_cli_hashes_safe_file_and_directory_symlinks_before_verified_completion(
         .unwrap()["content"]
         .as_str()
         .unwrap();
-    let root_guidance = system.find("root safe-symlink guidance").unwrap();
-    let nested_guidance = system.find("nested safe-symlink guidance").unwrap();
+    assert!(
+        !system.contains("safe-symlink guidance"),
+        "workspace guidance never enters the stable system head"
+    );
+    let repository = requests[0].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("<repository-context>"))
+        })
+        .expect("a framed repository-context tail carries the AGENTS guidance")["content"]
+        .as_str()
+        .unwrap();
+    let root_guidance = repository.find("root safe-symlink guidance").unwrap();
+    let nested_guidance = repository.find("nested safe-symlink guidance").unwrap();
     assert!(root_guidance < nested_guidance);
     assert_eq!(
         std::fs::read_link(scenario.root().join("links/file-link")).unwrap(),

@@ -82,16 +82,37 @@ pub struct SessionConfig {
     pub compaction: SessionCompactionConfig,
 }
 
-/// User-facing compaction knobs. Remaining `CompactionPolicy` fields
-/// (`trigger_ratio`, `summary_prompt_id`) are profile-internal in this slice
-/// and have no configuration surface yet.
+/// User-facing compaction knobs. `summary_prompt_id` stays profile-internal
+/// and has no configuration surface.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionCompactionConfig {
     pub enabled: bool,
+    /// Compaction strategy when enabled: `"summarize"` (default; summarize
+    /// discarded/pressured history through the model) or
+    /// `"elide_then_summarize"` (deterministically skeletonize old tool
+    /// results first, only calling the model when elision alone is not
+    /// enough; also enables one-shot provider-overflow recovery).
+    pub mode: Option<String>,
     /// Byte bound on the discarded history one summary request may read.
     pub max_summary_source_bytes: usize,
+    /// Proactive compaction trigger as a percentage (1..=100) of the
+    /// estimated context budget. When compaction is enabled, the loop
+    /// summarizes the oldest segments once the estimated fill reaches this
+    /// ratio, instead of waiting for the hard byte wall. `0` means "use the
+    /// profile default" (90). It is inert while `enabled` is false.
+    pub trigger_ratio: u8,
+    /// Percentage (1..=80) of the request budget kept as verbatim recent
+    /// segments after a summary. Whole user segments are retained
+    /// newest-first, so tool-call/result pairs are never split. `0` means
+    /// "use the profile default" (20).
+    pub retain_ratio: u8,
 }
+
+/// Config-layer name for the summarization-only strategy.
+const COMPACTION_MODE_SUMMARIZE: &str = "summarize";
+/// Config-layer name for deterministic tool-result elision plus summary.
+const COMPACTION_MODE_ELIDE: &str = "elide_then_summarize";
 
 impl SessionCompactionConfig {
     fn validate(&self) -> Result<(), String> {
@@ -99,6 +120,22 @@ impl SessionCompactionConfig {
             return Err(
                 "session.compaction.max_summary_source_bytes must be nonzero when enabled".into(),
             );
+        }
+        if self.enabled && self.trigger_ratio > 100 {
+            return Err("session.compaction.trigger_ratio must be at most 100 when enabled".into());
+        }
+        if self.enabled && self.retain_ratio > 80 {
+            return Err("session.compaction.retain_ratio must be at most 80 when enabled".into());
+        }
+        if let Some(mode) = &self.mode
+            && !matches!(
+                mode.as_str(),
+                COMPACTION_MODE_SUMMARIZE | COMPACTION_MODE_ELIDE
+            )
+        {
+            return Err(format!(
+                "session.compaction.mode must be `{COMPACTION_MODE_SUMMARIZE}` or `{COMPACTION_MODE_ELIDE}`"
+            ));
         }
         Ok(())
     }
@@ -655,6 +692,10 @@ impl latte_tui::session::SessionProjectionClient for HttpProjectionClient {
         self.block_on(self.handle.snapshot(&session_id))
     }
 
+    fn context_usage(&mut self, session_id: SessionId) -> Result<latte_core::ContextUsage, String> {
+        self.block_on(self.handle.context_usage(&session_id))
+    }
+
     fn poll(&mut self) -> latte_tui::session::SessionProjectionPoll {
         match self.event_rx.try_recv() {
             Ok(ProjectionEvent::SessionChanged) => latte_tui::session::SessionProjectionPoll::Event,
@@ -929,7 +970,61 @@ async fn execute_session_command_inner(
             }
             Ok(EXIT_COMPLETED)
         }
+        server_client::SessionCommand::Context { session_id } => {
+            Ok(execute_context(client, &session_id, json, &mut cancel).await?)
+        }
+        server_client::SessionCommand::Compact { session_id } => {
+            Ok(execute_compact(client, &session_id, json, &mut cancel).await?)
+        }
     }
+}
+
+/// Handles the `context` read-only command with the same cancel-select
+/// discipline as the turn commands.
+async fn execute_context<F: std::future::Future<Output = ()>>(
+    client: &mut impl server_client::SessionServer,
+    session_id: &str,
+    json: bool,
+    cancel: &mut std::pin::Pin<&mut F>,
+) -> Result<i32, server_client::ClientError> {
+    let session_id = server_client::parse_session_id(session_id)?;
+    let usage = tokio::select! {
+        result = client.context_usage(&session_id) => result?,
+        () = cancel.as_mut() => return Ok(EXIT_INTERRUPTED),
+    };
+    println!(
+        "{}",
+        if json {
+            server_client::context_envelope(&usage).to_string()
+        } else {
+            server_client::render_context_usage(&usage)
+        }
+    );
+    Ok(EXIT_COMPLETED)
+}
+
+/// Handles the idle-only `compact` command with the same cancel-select
+/// discipline as the turn commands.
+async fn execute_compact<F: std::future::Future<Output = ()>>(
+    client: &mut impl server_client::SessionServer,
+    session_id: &str,
+    json: bool,
+    cancel: &mut std::pin::Pin<&mut F>,
+) -> Result<i32, server_client::ClientError> {
+    let session_id = server_client::parse_session_id(session_id)?;
+    let result = tokio::select! {
+        result = client.compact_session(&session_id) => result?,
+        () = cancel.as_mut() => return Ok(EXIT_INTERRUPTED),
+    };
+    println!(
+        "{}",
+        if json {
+            server_client::compact_envelope(&result).to_string()
+        } else {
+            server_client::render_compact(&result)
+        }
+    );
+    Ok(EXIT_COMPLETED)
 }
 
 /// Emits a v2 error envelope (JSON) or plain stderr line and returns the
@@ -1663,13 +1758,15 @@ fn prepare_server_with_home(
                 });
             let registry = std::sync::Arc::new(registry);
             let mut base_policy = latte_core::ContextPolicy::from(config.session_policy());
-            // The config surface stays boolean; `enabled` selects the v1
-            // strategy. A dedicated config enum arrives with the second
-            // strategy (see docs/design/context-design.md §3.3).
-            base_policy.compaction.strategy = if config.session.compaction.enabled {
-                latte_core::CompactionStrategy::SummarizeOnDiscard
-            } else {
+            // `enabled` turns compaction on; `mode` selects the strategy
+            // (default: summarize-only; see docs/design/context-design.md
+            // §3.3/§4).
+            base_policy.compaction.strategy = if !config.session.compaction.enabled {
                 latte_core::CompactionStrategy::Off
+            } else if config.session.compaction.mode.as_deref() == Some(COMPACTION_MODE_ELIDE) {
+                latte_core::CompactionStrategy::ElideToolResultsThenSummarize
+            } else {
+                latte_core::CompactionStrategy::SummarizeOnDiscard
             };
             base_policy.compaction.max_summary_source_bytes =
                 if config.session.compaction.max_summary_source_bytes == 0 {
@@ -1677,6 +1774,16 @@ fn prepare_server_with_home(
                 } else {
                     config.session.compaction.max_summary_source_bytes
                 };
+            // Zero means "keep the profile default"; a configured value
+            // overrides. Validation already bounded it to 100, and the core
+            // validator rejects 0 on an active strategy, which is why the
+            // override is applied only for a nonzero config value.
+            if config.session.compaction.trigger_ratio != 0 {
+                base_policy.compaction.trigger_ratio = config.session.compaction.trigger_ratio;
+            }
+            if config.session.compaction.retain_ratio != 0 {
+                base_policy.compaction.retain_ratio = config.session.compaction.retain_ratio;
+            }
             let profile_catalog = std::sync::Arc::new(
                 latte_headless::profile::ProfileCatalog::new(
                     base_policy,
@@ -2012,6 +2119,46 @@ mod tests {
                 "scalar":{"now":true}
             })
         );
+    }
+
+    #[test]
+    fn compaction_config_rejects_out_of_range_ratios() {
+        let valid = || crate::SessionCompactionConfig {
+            enabled: true,
+            mode: None,
+            max_summary_source_bytes: 1024,
+            trigger_ratio: 90,
+            retain_ratio: 20,
+        };
+        assert!(valid().validate().is_ok());
+        let mut bad_trigger = valid();
+        bad_trigger.trigger_ratio = 101;
+        assert!(
+            bad_trigger
+                .validate()
+                .is_err_and(|error| error.contains("trigger_ratio"))
+        );
+        let mut bad_retain = valid();
+        bad_retain.retain_ratio = 81;
+        assert!(
+            bad_retain
+                .validate()
+                .is_err_and(|error| error.contains("retain_ratio"))
+        );
+        // Ratios are inert (and unconstrained) while compaction is off.
+        bad_retain.enabled = false;
+        assert!(bad_retain.validate().is_ok());
+        // The elide strategy is opt-in by name; unknown modes are rejected.
+        let mut bad_mode = valid();
+        bad_mode.mode = Some("snip".into());
+        assert!(
+            bad_mode
+                .validate()
+                .is_err_and(|error| error.contains("mode"))
+        );
+        let mut elide_mode = valid();
+        elide_mode.mode = Some("elide_then_summarize".into());
+        assert!(elide_mode.validate().is_ok());
     }
 
     const HOME_PROVIDER_WITH_ENV_KEY: &str = r#"{
@@ -3677,6 +3824,66 @@ mod tests {
             "--unknown".to_string(),
         ];
         assert!(crate::server_client::parse_session_command(&args).is_err());
+    }
+
+    #[test]
+    fn parse_session_command_context_requires_exactly_one_valid_id() {
+        let id = "01900000-0000-7000-8000-000000000001".to_string();
+        let parsed = crate::server_client::parse_session_command(&[
+            "context".to_string(),
+            id.clone(),
+            "--json".to_string(),
+        ])
+        .expect("context parses with one id");
+        assert_eq!(
+            parsed.command,
+            crate::server_client::SessionCommand::Context {
+                session_id: id.clone()
+            }
+        );
+        assert!(parsed.json);
+
+        for args in [
+            vec!["context".to_string()],
+            vec!["context".to_string(), id.clone(), "extra".to_string()],
+            vec!["context".to_string(), "not-a-uuid".to_string()],
+            vec!["context".to_string(), id, "--unknown".to_string()],
+        ] {
+            assert!(
+                crate::server_client::parse_session_command(&args).is_err(),
+                "context must reject {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_session_command_compact_requires_exactly_one_valid_id() {
+        let id = "01900000-0000-7000-8000-000000000001".to_string();
+        let parsed = crate::server_client::parse_session_command(&[
+            "compact".to_string(),
+            id.clone(),
+            "--json".to_string(),
+        ])
+        .expect("compact parses with one id");
+        assert_eq!(
+            parsed.command,
+            crate::server_client::SessionCommand::Compact {
+                session_id: id.clone()
+            }
+        );
+        assert!(parsed.json);
+
+        for args in [
+            vec!["compact".to_string()],
+            vec!["compact".to_string(), id.clone(), "extra".to_string()],
+            vec!["compact".to_string(), "not-a-uuid".to_string()],
+            vec!["compact".to_string(), id, "--unknown".to_string()],
+        ] {
+            assert!(
+                crate::server_client::parse_session_command(&args).is_err(),
+                "compact must reject {args:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

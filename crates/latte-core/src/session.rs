@@ -108,6 +108,54 @@ pub enum CreateAcceptError {
     Failed(String),
 }
 
+/// Tier that performed an idle-only manual compaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualCompactionTier {
+    /// Deterministic tool-result skeletons; no model request was made.
+    Elided,
+    /// Model-generated summary.
+    Summarized,
+}
+
+/// Machine-stable reason a manual compaction had nothing to do. The session
+/// is unchanged in every case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualCompactionIdleReason {
+    /// No durable conversation history exists yet.
+    Empty,
+    /// The resolved compaction strategy is `Off`.
+    Disabled,
+    /// The process-local summarizer-failure breaker is open (clears on
+    /// restart).
+    BreakerTripped,
+    /// The history does not reach a compressible boundary (a single,
+    /// newest-always-retained segment).
+    NothingToCompress,
+}
+
+/// Outcome state of an explicit idle-only manual compaction request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualCompactionState {
+    /// A durable compaction card was appended; later windows project from it.
+    Compacted {
+        tier: ManualCompactionTier,
+        /// Session revision after the card append.
+        revision: u64,
+    },
+    /// Nothing to compact; the session is unchanged.
+    NothingToCompact { reason: ManualCompactionIdleReason },
+}
+
+/// Snapshot plus outcome state returned by the manual-compact surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManualCompactionResult {
+    pub snapshot: SessionSnapshot,
+    pub state: ManualCompactionState,
+}
+
 /// A serializable copy of every semantic provider-binding field.  Credential
 /// *values* are intentionally absent; only the stable non-secret reference
 /// and generation are durable.
@@ -214,6 +262,14 @@ pub enum TranscriptKind {
     /// newest `CompactSummary` never re-enter a provider request, and the
     /// summary itself travels as an ordinary user-segment message.
     CompactSummary,
+    /// Durable deterministic-elision marker for the
+    /// `ElideToolResultsThenSummarize` strategy: the card itself never
+    /// becomes a provider message; its payload `tool_result_sequences` lists
+    /// the `ToolResult` cards whose verbose results window construction
+    /// replaces with a secret-free skeleton (tool name, original byte size,
+    /// status). The full results stay in the transcript — the card only
+    /// records the projection boundary, so elision is append-only.
+    ToolResultElision,
 }
 
 /// A redacted durable transcript card. `payload` is useful for structured
