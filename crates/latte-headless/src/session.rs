@@ -5102,6 +5102,52 @@ mod tests {
         }
     }
 
+    /// Provider whose post-script calls park on a controllable gate instead
+    /// of a wall-clock delay. The first parked call signals `entered` and then
+    /// resolves only when the gate opens OR the provider context is cancelled.
+    /// A fencing test can thereby prove the summarizer call is in flight (so
+    /// the lease it runs under is held) before stealing that lease, with no
+    /// race between "summary finished first" and "heartbeat observed the
+    /// fence" regardless of runner scheduling or timer precision.
+    struct FenceBarrierProvider {
+        immediate: Mutex<std::collections::VecDeque<ProviderResponse>>,
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        gate: Mutex<Option<oneshot::Receiver<()>>>,
+        released_summary: &'static str,
+    }
+
+    impl Provider for FenceBarrierProvider {
+        fn complete(
+            &self,
+            _: ProviderRequest,
+            context: ProviderContext,
+        ) -> crate::provider::ProviderFuture<'_> {
+            if let Some(response) = self.immediate.lock().unwrap().pop_front() {
+                return Box::pin(async move { Ok(response) });
+            }
+            let Some(mut gate) = self.gate.lock().unwrap().take() else {
+                return Box::pin(async {
+                    Err(ProviderError::Malformed(
+                        "fence barrier provider received an unexpected call".into(),
+                    ))
+                });
+            };
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let released_summary = self.released_summary;
+            Box::pin(async move {
+                tokio::select! {
+                    _ = &mut gate => {}
+                    () = context.cancellation.cancelled() => {
+                        return Err(ProviderError::Cancelled);
+                    }
+                }
+                Ok(response(Some(released_summary), vec![]))
+            })
+        }
+    }
+
     struct RecordingProvider {
         responses: Mutex<std::collections::VecDeque<ProviderResponse>>,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -12451,6 +12497,14 @@ mod tests {
     /// summarizer call, the heartbeat detects the loss, cancels the call, and
     /// `compact_session` surfaces the typed lease error — it never returns a
     /// false `Compacted`, and no `compact_summary` card is appended.
+    ///
+    /// Synchronization is by condition, not wall clock: the summarizer call
+    /// parks on an explicit gate and signals that it has entered, so the test
+    /// steals the lease only while the call is provably in flight and keeps
+    /// the gate shut — a successful summary is then structurally impossible.
+    /// It then awaits the typed error, which arrives when the next heartbeat
+    /// tick observes the stolen lease. A slow or jittery runner can only make
+    /// that tick arrive later, never change the outcome.
     #[tokio::test]
     async fn manual_compaction_fenced_during_summarization_surfaces_a_typed_error() {
         let root = tempfile::tempdir().unwrap();
@@ -12460,14 +12514,17 @@ mod tests {
             .database_path(&database)
             .build()
             .unwrap();
-        let provider = Arc::new(DelayedProvider::scripted([
-            (Duration::ZERO, response(Some(&"a".repeat(1_000)), vec![])),
-            (Duration::ZERO, response(Some(&"b".repeat(100)), vec![])),
-            (
-                Duration::from_millis(700),
-                response(Some("FENCED-SUMMARY-MUST-NOT-PERSIST"), vec![]),
-            ),
-        ]));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let provider = Arc::new(FenceBarrierProvider {
+            immediate: Mutex::new(std::collections::VecDeque::from([
+                response(Some(&"a".repeat(1_000)), vec![]),
+                response(Some(&"b".repeat(100)), vec![]),
+            ])),
+            entered: Mutex::new(Some(entered_tx)),
+            gate: Mutex::new(Some(gate_rx)),
+            released_summary: "FENCED-SUMMARY-MUST-NOT-PERSIST",
+        });
         let factory_provider = Arc::clone(&provider);
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
@@ -12491,34 +12548,34 @@ mod tests {
 
         let compactor = service.clone();
         let run = tokio::spawn(async move { compactor.compact_session(session_id).await });
-        // Wait until the manual compaction holds its lease (acquired before
-        // the summarizer starts), then steal it out from under the heartbeat.
-        wait_until(
-            || {
-                rusqlite::Connection::open(&database).is_ok_and(|connection| {
-                    connection
-                        .query_row("SELECT COUNT(*) FROM runtime_lease", [], |row| {
-                            row.get::<_, i64>(0)
-                        })
-                        .is_ok_and(|count| count == 1)
-                })
-            },
-            "manual compaction to acquire its lease",
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // The summarizer call is parked on the gate; the lease is acquired
+        // before the provider call starts, so it is provably held now.
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("summarizer never parked at the fence barrier")
+            .unwrap();
         force_lease_renewal_failure(&database);
 
-        let error = run
+        // Gate stays closed, so the parked call cannot return Ok. The next
+        // heartbeat tick fails its renewal, cancels the call, and the typed
+        // fencing error surfaces. Awaiting the result waits on that condition
+        // rather than guessing a sleep long enough for the heartbeat to run.
+        let outcome = tokio::time::timeout(Duration::from_secs(15), run)
             .await
-            .unwrap()
-            .expect_err("a fenced manual compaction returns its typed error, not Compacted");
+            .expect("heartbeat never observed the stolen lease")
+            .unwrap();
+        let error =
+            outcome.expect_err("a fenced manual compaction returns its typed error, not Compacted");
         assert!(
             error
                 .to_string()
                 .contains("lease heartbeat lost during context summarization"),
             "unexpected manual-compaction lease error: {error}"
         );
+        // The gate was never opened: explicitly drop the opener so a parked
+        // task cannot later unblock and append the fenced summary.
+        drop(gate_tx);
         let full = service.load_full(session_id).unwrap();
         assert!(
             !full
