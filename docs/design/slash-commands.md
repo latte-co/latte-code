@@ -324,9 +324,9 @@ Active Run。
 | `/cancel` | – | `TypedAction` | 对可取消 Active Run 发出 `Cancel { session_id }`。 |
 | `/quit` | `/exit`、`/q` | `TypedAction` | 发出 `Quit`。 |
 
-后续 Built-in 可以增加 `/status`、`/fork`、`/rename`、`/compact`、
-`/permissions` 和 `/diff`，但前提是每个命令都有 Typed Service Contract 与
-Lifecycle Policy。Prompt Expansion 可用后，`/init` 和 `/review` 应作为第一批
+后续 Built-in 中 `/rename` 与 `/fork` 已进入 Catalog（见第 15 节）；`/status`、
+`/compact`、`/permissions` 和 `/diff` 仍为候选，前提是每个命令都有 Typed Service
+Contract 与 Lifecycle Policy。Prompt Expansion 可用后，`/init` 和 `/review` 应作为第一批
 Built-in `PromptTemplate` Command。
 
 这份清单表示交付顺序，不是兼容性承诺。只有完成实现、文档和 Final-Binary E2E
@@ -427,7 +427,7 @@ Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata�
 | `/sessions [query]` | `/resume` | `TypedAction` | 打开当前 Workspace Picker、搜索该 Workspace，或按 ID 精确恢复。 |
 | `/rename <title>` | – | `TypedAction` | 重命名当前已保存 Session。 |
 | `/fork [title]` | `/branch` | `TypedAction` | 把已提交对话历史复制到不携带运行时 Authority 的新 Session。 |
-| `/model` | – | `TypedAction` | 打开可搜索、按 Provider 分组的 Model Picker，并切换下一个 Child 使用的 Binding。 |
+| `/model` | – | `LocalUi` | 打开可搜索、按 Provider 分组的 Model Picker，并切换下一个 Child 使用的 Binding。 |
 | `/help` | – | `LocalUi` | 打开键盘帮助。 |
 | `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
 | `/refresh` | – | `TypedAction` | 重新加载权威 Projection。 |

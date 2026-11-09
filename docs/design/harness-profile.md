@@ -274,11 +274,11 @@ profile 的价值由真实消费者逼出形状；v1 的唯一消费者是 compa
    摘要失败不阻断主循环：降级为现状的静默丢弃，并记录失败事件。
 3. **可见性**。每 turn 结束把"估算 token 余量 / 是否临近 compaction 阈值"写入
    snapshot（进 TUI 状态栏与 server 投影），落实"可解释预算"第一步。
-4. **`/compact` 手动命令**。挂入现有 slash command catalog，复用同一条摘要路径。
+4. **`/compact` 手动命令**。已落地为 idle-only 的 HTTP 端点与 CLI 子命令（`POST /v1/sessions/{id}/compact`、`latte-code compact <session-id>`），复用同一条摘要路径；TUI slash catalog 暂未包含 `/compact`。
 
 ## 9. 测试策略
 
-按仓库门禁（UT 95% / E2E 90%，`docs/design/testing-gates.md`）：
+按仓库门禁（UT 95% / E2E 90%，见 [E2E 编写手册](../testing/e2e-authoring-guide.md)）：
 
 - **resolution 契约测试**：每个内置 profile 的 fixture 断言"同 binding → 同
   fingerprint"（确定性）；三层来源覆盖合并的每个字段一例。
@@ -309,4 +309,4 @@ profile 的价值由真实消费者逼出形状；v1 的唯一消费者是 compa
 
 - [能力 Roadmap](../roadmap.md)——"配置、凭据与模型连接"节的 Harness Profile 条目
 - [全局 Session 与数据存储](data-storage.md)——binding 持久化与 fingerprint 惯例
-- [异步 Turn Runner](agent-harness/asynchronous-turn-runner.md)——loop 消费侧契约
+- [Agent Runtime 运行契约](agent-runtime.md)——loop 消费侧契约
