@@ -62,9 +62,12 @@ Windows 已支持任意外部进程执行。
 - [x] Provider binding、工具别名，以及内部派生凭据/data scope 的 resume 校验。
 - [x] 从已配置 Catalog 显式选择模型/Provider，并通过 TUI model picker 修改每个
   Session 的 binding；切换从下一个不可变 child 生效，并记录在公开 transcript 中。
-- [ ] 版本化的 Harness Profile：按模型/Provider 成组解析 context strategy、
-  system/developer prompt、工具 schema/命名、Plan/Stop 语义与能力开关。它不是
-  Provider adapter，也不能依赖不透明的模型名猜测来放宽权限。
+- [x] 版本化的 Harness Profile v1：数据化的 `HarnessProfile` 类型与按 binding 解析的
+  ProfileCatalog（请求预算 + system/摘要 prompt 槽位），以及权限天花板——profile
+  不携带权限字段，用户覆盖只能收紧或改写 prompt 文本。它不是 Provider adapter，
+  也不依赖模型名猜测放宽权限（见 [harness-profile.md](design/harness-profile.md)）。
+  工具 schema/命名（`ToolPresentation`）、Plan/Stop 语义与 config `profiles`
+  覆盖段仍未实现。
 - [ ] Harness Profile 的 capability negotiation、未知 profile 的 fail-closed fallback，
   以及按 profile 运行的契约/E2E conformance suite。
 - [ ] 模型目录、能力声明、fallback chain、成本/预算和 rate-limit 可见性。
@@ -105,8 +108,15 @@ Windows 已支持任意外部进程执行。
   transcript 展示完整走通。
 - [x] 每 Session 一个进程内 Runner、有界 FIFO 用户输入 Mailbox 与跨 Session 并行。
 - [x] 在下一个可运行 Child 边界接收第二条用户 Prompt，不篡改进行中的 Effect。
+- [x] 停泊期排队 C1：权限门 park 保留 mailbox 条目、恢复路径采纳排队 Prompt、
+  终态审计与入口门。
 - [ ] 可信 Reminder Producer、排序与取消语义。
-- [ ] Context compaction、摘要、选择性上下文与可解释 token 预算。
+- [x] Context compaction v1/v2 与可解释 token 预算：分层历史窗口、被动/主动
+  SummarizeOnDiscard 摘要、确定性省略层、provider context-overflow 的每 turn 一次
+  强制恢复、idle-only 手动 `/compact`（HTTP + CLI）、只读用量投影与 TUI 预算
+  meter（见 [context-design.md](design/context-design.md)）。
+- [ ] 摘要请求复用对话前缀、跨模型 handoff 与用户可控的选择性上下文
+  （context-design.md §5 的 v2 方向）。
 - [ ] 用户可控的 Session/Workspace memory、provenance、过期与 reset；不能把
   未经确认的模型结论伪装为事实。
 - [ ] 跨模型/Provider handoff：验证消息、tool-result、reasoning/附件和 context
@@ -210,23 +220,18 @@ Windows 已支持任意外部进程执行。
 
 ## Roadmap 关联设计
 
-以下文档定义尚未完成能力的架构边界，不能单独改变 checklist 状态：
+以下文档给出相关能力的架构边界与术语规范，不能单独改变 checklist 状态：
 
 - [全局 Session 与数据存储](design/data-storage.md)
 - [斜杠命令](design/slash-commands.md)
-- [异步 Turn Runner](design/agent-harness/asynchronous-turn-runner.md)
-- [Session 存储与恢复](design/agent-harness/session-store-and-recovery.md)
-- [Effect Authority、策略与隔离](design/agent-harness/effect-authority-and-policy.md)
-- [扩展与委派能力](design/agent-harness/extensions-and-delegation.md)
-- [事件、投影与回放](design/agent-harness/event-projection-and-replay.md)
-- [TUI Runtime 契约](design/agent-harness/tui-runtime-contract.md)
-- [验证 Harness 与确定性测试](design/agent-harness/verification-harness.md)
+- [Agent Runtime 运行契约](design/agent-runtime.md)
+- [概念体系对齐](design/concept-alignment.md)
 - [版本化 RPC 与 Event Backpressure 契约](design/versioned-rpc-contract.md)
 
 ## 横向参考后的范围校准
 
-本清单在扫描 `references/` 的 CodeWhale、Codex、OpenCode 与 Claude Code 后更新。
-随后纳入 Pi 与 Trae-X。它们在产品取舍上不同，但共同证明完整 Code Agent 还
+本清单结合 CodeWhale、Codex、OpenCode 与 Claude Code 的横向参考更新，随后纳入
+Pi 与 Trae-X。它们在产品取舍上不同，但共同证明完整 Code Agent 还
 需要模型运营、Harness Profile、会话治理、上下文/记忆、计划/任务、变更管理、
 受控扩展、代码智能、多端协议与可观测性。Pi 说明可嵌入的 event-driven Agent
 Runtime 与 Provider handoff 的边界；它默认不提供权限系统，不能作为安全设计的

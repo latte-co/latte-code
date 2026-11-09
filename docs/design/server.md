@@ -1,7 +1,7 @@
 # Server 设计
 
 状态：**已实现（HTTP REST + SSE），通过 `latte-code serve` 启动**
-日期：2026-08-16
+日期：2026-08-16（2026-11-09 增补端点清单）
 
 ## 1. 概述
 
@@ -57,6 +57,7 @@ Gateway 充当轻量消息总线：
 - **URL**：`http://127.0.0.1:<port>`（默认 4096）
 - **Content-Type**：`application/json`
 - **认证**：`Authorization: Bearer <token>`（必须）
+- **健康检查**：`GET /health` 是唯一免认证端点，仅作存活探针，返回 `ok`。
 
 ### 5.2 认证
 
@@ -74,6 +75,17 @@ Response: { "workspace_id": "ws_abc123", "path": "/canonical/path" }
 ```
 
 Server 会规范化路径并返回稳定的 `workspace_id`。后续请求使用此 ID。
+
+**列出可用 Binding**
+```
+GET /v1/workspaces/{workspace_id}/bindings
+Response: 200 { "bindings": [BindingCatalogEntry, ...] }
+```
+
+返回该 workspace 合并配置中的完整 model 目录。每条 `BindingCatalogEntry` 含
+`provider_name`、`model`、`name`、`is_default` 与完整 `SessionProviderBinding`，
+供 TUI model picker 与远程客户端选取后透传（`StartWithModel` 不在客户端合成
+binding）。
 
 ### 5.4 Session 端点
 
@@ -155,6 +167,55 @@ Response: 200 { "sessions": [...], "next_cursor": "..." }
 GET /v1/workspaces/{workspace_id}/sessions/search?q=...&cursor=...&limit=50
 Response: 200 { "sessions": [...], "next_cursor": "..." }
 ```
+
+**按精确标题查找 Session**
+```
+GET /v1/workspaces/{workspace_id}/sessions/exact-title?q=...&cursor=...&limit=50
+Response: 200 { "sessions": [...], "next_cursor": "..." }
+```
+
+**重命名 Session**
+```
+PATCH /v1/sessions/{id}
+Body: { "title": "新标题" }
+Response: 200 { "snapshot": {...} }
+```
+
+**分叉 Session**
+```
+POST /v1/sessions/{id}/fork
+Body: { "title": "可选标题" }
+Response: 200 { "snapshot": {...} }
+```
+Fork 把已提交对话历史复制到一个不携带运行时 Authority 的新 Session，并记录血缘。
+
+**只读上下文用量投影**
+```
+GET /v1/sessions/{id}/context
+Response: 200 { "session_id": "...", "usage": {...} }
+```
+精确字节 + 估算 token + 丢弃段数 + 压缩策略状态；不做 provider I/O、不改变
+状态（见 [context-design.md](context-design.md) §4.5 与
+[versioned-rpc-contract.md](versioned-rpc-contract.md) §3.3）。
+
+**手动压缩空闲 Session**
+```
+POST /v1/sessions/{id}/compact
+Response: 200 { "snapshot": {...}, "state": {"compacted" | "nothing_to_compact"} }
+```
+idle-only：非空闲或 revision 冲突返回 409；水位以下也强制；空态（无历史、
+策略关闭、熔断、无可压缩边界）返回 200 `nothing_to_compact` 而非错误
+（见 [context-design.md](context-design.md) §4.7）。
+
+**装填一次性 Reminder**
+```
+POST /v1/sessions/{id}/reminder
+Body: { "text": "..." }
+Response: 200 { "session_id": "...", "bytes": 123 }
+```
+仅 `Ready` 会话可装填（非空闲 409）；文本脱敏后只存进程内存，下一次 turn
+构建消费一次即清除，不进 transcript，重启即失
+（见 [context-design.md](context-design.md) §4.8）。
 
 ### 5.5 事件（SSE）
 
@@ -263,10 +324,13 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 
 ### 已完成
 - [x] HTTP server（axum），包含所有 REST 端点
-- [x] Auth 中间件（Bearer token）
+- [x] Auth 中间件（Bearer token；`GET /health` 免认证）
 - [x] 按 workspace 的事件桥接（SSE），能容忍 broadcast 滞后
 - [x] WorkspaceManager，single-flight 创建
-- [x] 所有 session 端点（create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile）
+- [x] 所有 session 端点（create/get/follow-up/cancel/queue/resolve-permission/provide-input/reconcile/rename/fork）
+- [x] `GET /v1/workspaces/{ws}/bindings` binding 发现端点（TUI model picker 与远程客户端透传 binding）
+- [x] `GET /v1/workspaces/{ws}/sessions/exact-title` 精确标题查询
+- [x] `GET /v1/sessions/{id}/context` 只读用量投影、`POST /v1/sessions/{id}/compact` 手动压缩、`POST /v1/sessions/{id}/reminder` 一次性 reminder 槽
 - [x] 异步 create/follow-up：持久化 + 注册后返回 202，turn 后台执行，通过 SSE 观察完成
 - [x] `Idempotency-Key` 持久化变更去重，按 `(token, key)` 索引
 - [x] 版本栅栏：cancel/permission/input 校验 session 和 turn 版本，不匹配时返回 409 + 当前版本
@@ -275,13 +339,73 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 - [x] 单元测试和最终二进制 E2E（portable），覆盖 HTTP 接口和 session 生命周期
 
 ### 待办
-- [ ] Binding 发现端点，让远程（非 co-located）客户端能获取有效的 `SessionProviderBinding`
 - [ ] 性能测试
 - [ ] 远程访问认证（v2）
 
-## 11. 开放问题
+## 11. 运行模式与多 Server 语义
 
-1. 默认端口（4096）？
-2. Workspace 卸载超时（v2）？
-3. Token 轮换策略？
-4. SSE 重放缓冲区大小？
+> 本节并入原 server-client-integration 方案（PR #11–#14，已全部落地）中仍然有效
+> 的部署与决策内容；当时的实施记录见该 PR 与 git 历史。
+
+### 11.1 三种运行模式
+
+1. **内嵌（默认）**：TUI 与 `run`/`list`/`show`/`context`/`compact`/`resume` 在进程
+   内启动 embedded server（loopback 随机端口，token 仅存内存），全部经 HTTP+SSE
+   访问 engine——同进程也没有 in-process 直连路径，协议即边界。
+2. **连接独立 server**：`--server <url>`，token 读 `$LATTE_CODE_HOME/server.token`
+   或 `--token`。
+3. **独立 server**：`latte-code serve [--port N]`（默认 4096）。
+
+### 11.2 多 Server 语义（v1 不做 owner routing）
+
+- **Durable state 共享**：所有 server 共享同一 SQLite + JSONL，任何 server 都能读
+  任何 session 的 durable state。
+- **Live mutation 必须连 owner server**：mailbox、active cancellation、progress 是
+  process-local；连 server B 操作 server A 正在跑的 session，queue/cancel/input
+  会失败（`InvalidState`）。
+- **新 session 创建**：任何 server 都可以创建（durable write 不依赖 live runtime
+  state）。
+- **Live event 隔离**：每个 server 进程有自己的 SSE 广播；要观察 live event，连
+  owner server。
+
+### 11.3 幂等创建故障模型
+
+| 故障场景 | 保护机制 |
+|---|---|
+| 客户端超时，server 存活 | 内存 ledger replay（同 Idempotency-Key） |
+| 客户端超时，ledger 丢失（极端） | client `command_id` + durable digest replay |
+| server crash 在 durable accept 后、202 前 | 重启后命中 `session_command_dedup`，返回 `Replayed`，不重启 provider |
+| server crash 在 durable accept 前 | 同 `session_id`/`command_id` 重试创建原目标 session（无副作用） |
+| 同 `command_id` + 不同 payload | 422 `idempotency_mismatch` |
+| 同 `session_id` 已存在（非重放） | 409 Conflict |
+
+Exactly-once 范围限定：只保证 session admission exactly-once（不重复创建
+session），不保证 provider/effect execution exactly-once；`Started` 后未确认的
+结果转 `Unknown`，走显式 reconciliation。内存 ledger 只做同进程快速 replay，
+不承担 crash correctness。
+
+### 11.4 内嵌 Server 生命周期与退出顺序
+
+- client cancel token 与 server shutdown token 分开；server-side SSE handler
+  `select!` 在 server shutdown token 上，shutdown 时主动结束 stream。
+- 退出顺序：前端退出 → cancel/join client workers（SSE/action）→ cancel 并 await
+  embedded server，确认端口释放。
+- SSE 无 replay：每次连接/重连后客户端立即无条件全量 resync（§5.5）。
+
+### 11.5 CLI 命令契约决策记录
+
+CLI 命令契约曾按 [versioned-rpc-contract.md](versioned-rpc-contract.md) §2.1 的
+早期例外条款直接 breaking change：`run/show/list/resume` 切换到 session 语义、
+JSON envelope v2、v1 run-id 契约与 `--allow`/`--deny` 移除。当时判断依据：早期
+无外部用户依赖，v1 CLI 契约与 session 模型不兼容（run-id vs session-id、权限
+决策 vs follow-up），直接对齐 HTTP API 语义减少长期维护负担。
+
+## 12. 开放问题
+
+已定：默认端口为 4096（`--port 0` 使用临时端口）；SSE 不设重放缓冲区，
+以 `resync_required` + 全量 resync 为契约（见 [versioned-rpc-contract.md](versioned-rpc-contract.md) §5）。
+
+仍未决：
+
+1. Workspace 卸载超时（v2）？
+2. Token 轮换策略？

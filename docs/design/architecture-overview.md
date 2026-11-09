@@ -27,7 +27,7 @@ latte-code CLI/TUI/Server
 
 产品状态位于 `$LATTE_CODE_HOME`，默认是 `$HOME/.latte/latte-code`。全局 SQLite 控制状态为 `state.db`，每个 Session 的追加式 JSONL 位于 `sessions/<workspace-storage-key>/`。`database.path` 只继续用于定位和幂等导入旧工作区数据库。SQLite 启用 WAL、外键、busy timeout 与 full synchronous。单写入者原子提交事件、revision 和 projection，命令 ID 在重启后仍可去重。
 
-Session v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）；迁移 10 新增 Session Scoped Runtime Lease，同时保持 Fencing Token 全局单调；迁移 11 新增全局 Project/Workspace 注册、Session 血缘元数据和 Legacy Import Fingerprint。JSONL 是唯一持久化 Transcript 读取权威；SQLite 的 `conversation_outbox` 只在已接受记录尚未 fsync 到 JSONL 时提供事务缓冲，成功同步后立即删除。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitSessionTurnUpdate`（schema 15 前名 `CommitSessionRunUpdate`）原子提交，未挂 Session 的 turn 仍由 `reject_linked_turn` 12+ 处守卫拦截（见 `docs/design/concept-alignment.md` §4.2，守卫不随改名退役）。
+Session v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）；迁移 10 新增 Session Scoped Runtime Lease，同时保持 Fencing Token 全局单调；迁移 11 新增全局 Project/Workspace 注册、Session 血缘元数据和 Legacy Import Fingerprint。JSONL 是唯一持久化 Transcript 读取权威；SQLite 的 `conversation_outbox` 只在已接受记录尚未 fsync 到 JSONL 时提供事务缓冲，成功同步后立即删除。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitSessionTurnUpdate`（schema 15 前名 `CommitSessionRunUpdate`）原子提交，未挂 Session 的 turn 仍由 `reject_linked_turn` 12+ 处守卫拦截（见 `docs/design/concept-alignment.md` §3，守卫不随改名退役）。
 
 > 命名更新：上述迁移叙述保留了当时的名字（`threads_v2` / Run / `CommitSessionRunUpdate`）。schema 13 已把 Thread 改名 Session（`threads_v2 → sessions`），schema 15 已把物理图与领域类型 Run 改名 Turn（`runs → turns`、`RunState → TurnState`），schema 14 增加持久轮次计数器 `tool_round_count`；线协议字段 `run_id → turn_id` 硬改名，旧持久化数据只读兼容（serde alias、JSONL `run_id` 回退、legacy import）。
 
@@ -67,7 +67,7 @@ Composer 模式拥有包括 `q`、`s`、`j`、`k` 和 `?` 在内的全部可打�
 
 Headless 运行时收集仓库上下文（包括 `AGENTS.md`），调用 OpenAI-compatible chat-completions Provider，通过 engine 执行类型化工具请求，运行配置的验证 argv，并持久化 evidence 与 handoff。需要验证的运行在验证失败、缺失或未执行时不能完成。
 
-CLI 支持 `run`、`resume`、`show`、`list` 与版本化 JSON 输出。TUI 是同一 engine 状态上的 Ratatui 投影：通过 snapshot refresh 处理事件滞后，明确呈现权限、输入和 Unknown 状态，并在正常退出、错误、panic 与中断时恢复终端。
+CLI 支持 `run`、`resume`、`show`、`list`、`context`、`compact`、`serve` 与版本化 JSON 输出；`run`/`list`/`show`/`context`/`compact`/`resume` 都是经内嵌或独立 server 的 session 命令。TUI 是同一 engine 状态上的 Ratatui 投影：通过 snapshot refresh 处理事件滞后，明确呈现权限、输入和 Unknown 状态，并在正常退出、错误、panic 与中断时恢复终端。
 
 ## 信任边界
 

@@ -70,7 +70,7 @@ make run ARGS='--help'
 make run ARGS='--json list'
 ```
 
-CLI/TUI 会先加载内置的应用默认值，再按 `$HOME/.latte/latte-code.jsonc`、`<workspace>/.latte/latte-code.jsonc` 的顺序递归合并；Provider 与 Model 必须显式配置，Latte Code 不内置任何 Provider 或 Model。相同 key 由工作区配置覆盖，数组、标量以及每个 Provider 的完整 `models` 目录整体替换。执行真实的 `run`、`resume --allow` 或 TUI 前，还需导出最终配置所引用的密钥。若要配置当前工作区：
+CLI/TUI 会先加载内置的应用默认值，再按 `$HOME/.latte/latte-code.jsonc`、`<workspace>/.latte/latte-code.jsonc` 的顺序递归合并；Provider 与 Model 必须显式配置，Latte Code 不内置任何 Provider 或 Model。相同 key 由工作区配置覆盖，数组、标量以及每个 Provider 的完整 `models` 目录整体替换。执行真实的 `run`、`resume` 或 TUI 前，还需导出最终配置所引用的密钥。若要配置当前工作区：
 
 ```bash
 mkdir -p .latte
@@ -79,16 +79,16 @@ cp latte-code.config.example.jsonc .latte/latte-code.jsonc
 export OPENAI_API_KEY='...'
 ```
 
-用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。`api_key` 可以直接写字符串，也可以使用 `{ source: "env", name: "OPENAI_API_KEY" }`；环境变量只在实际调用 Provider 时解析。内联密钥会保留在用户自己的 JSONC 源文件中，但不会进入 Debug 输出、Session binding、fingerprint、transcript、SQLite 或普通 Effect 记录；包含内联密钥的文件应限制为当前用户可读。`database.path` 只用于定位并幂等导入旧工作区数据库，不能重定向新状态。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。
+用户配置和工作区配置都可以只写需要覆盖的 key；但某个 Provider 的 `models` 是完整目录，会整体替换前一层。在 `.latte/latte-code.jsonc` 中用唯一的全局 `default_model` 配置 `provider/model` 标识（例如 `primary/model-id`），还可配置 `providers.<name>`、`database.path` 和 `verification.argv`。每个 Provider 的 `models` 对象是 TUI `/model` 在该 Provider 分组下展示的完整模型目录：map key 是实际发送给 Provider 的模型 ID，可选 `name` 只用于展示和搜索，嵌套的 `options` 使用对应 Provider 类型自己的严格 Schema。OpenAI Chat Options 当前支持 `context_window`、`reasoning_effort`、`temperature` 和 `max_tokens`；其中 `context_window` 暂时作为固定进 Session binding 的模型契约保留，供后续上下文管理与压缩实现使用。其他 Provider 类型可以使用不同 key。字符串数组仍是“没有 name 和覆盖项”的简写。Provider 自身不定义默认模型；选中模型的 Options 会进入 Session binding fingerprint，而展示名不会，请求参数只由该 Provider 实现解释。`api_key` 可以直接写字符串，也可以使用 `{ source: "env", name: "OPENAI_API_KEY" }`；环境变量只在实际调用 Provider 时解析。内联密钥会保留在用户自己的 JSONC 源文件中，但不会进入 Debug 输出、Session binding、fingerprint、transcript、SQLite 或普通 Effect 记录；包含内联密钥的文件应限制为当前用户可读。`database.path` 只用于定位并幂等导入旧工作区数据库，不能重定向新状态。`latte-engine::config` 的 `${NAME}` 占位符和 `.latte/latte-engine.jsonc` 仅供嵌入式集成使用，不是 CLI/TUI 的配置接口。workspace 层配置触碰 `providers.*.base_url`/`endpoint` 且存在跨层凭据（home 层 `api_key` 或合并配置引用的环境变量）时，启动会直接报错而不是把密钥发往该端点；只有 HOME 层可以按 provider 写 `trust_repo_endpoint: true` 显式信任，workspace 层无法自证。
 
-`resume --deny`、等待态取消、查看运行记录和 Unknown reconciliation 不依赖 Provider 凭证。
+只读状态命令（`list`、`show`、`context`）、等待态取消和 Unknown reconciliation 不依赖 Provider 凭证。
 
 ## 测试层次
 
 - crate 内单元测试：状态机、存储、权限、工具、进程监督和 TUI reducer，通过 `make test-unit` 运行。
 - contract/component：公开 Engine 生命周期、协议与 repo contract，通过 `make test-contract` 运行。
 - portable 最终二进制 E2E：三平台执行真实 CLI、loopback Provider 和 SQLite 持久化，通过 `make test-e2e-portable` 运行；Windows 不跳过整个 target。
-- Unix 最终二进制 E2E：保留 75 个包含 PTY、process group、signal、symlink 和 Unix verification 的场景，通过 `make test-e2e-unix` 运行。
+- Unix 最终二进制 E2E：包含 PTY、process group、signal、symlink 和 Unix verification 的场景，通过 `make test-e2e-unix` 运行。
 - doc tests：验证公开 authority API 的 compile-fail 边界。
 - Markdown 链接测试：确保 README、AGENTS 和 `docs/` 内的本地链接有效。
 - 覆盖率：UT-only、最终二进制 E2E、全 targets 分别独立统计，行覆盖率不得低于 95%、90%、90%。
@@ -111,7 +111,7 @@ make coverage-e2e
 GitHub Actions 在 `main` push、面向 `main` 的 PR、merge queue 和手工触发时运行。PR 新提交会取消同一 PR 的旧运行，`main` 和 merge queue 的运行不会被新运行取消。底层 job 保持独立可见，包括：
 
 - Linux、macOS、Windows 各自的 Cargo check、Clippy `-D warnings`、UT、Contract、portable 最终二进制 E2E 和 `latte-code` release build；
-- Linux、macOS 的 75 个 Unix PTY/process 最终二进制 E2E；
+- Linux、macOS 的 Unix PTY/process 最终二进制 E2E；
 - Rust 1.93 MSRV、actionlint 1.7.12、ShellCheck、Documentation tests 和 Dependency audit；
 - `Coverage - UT (95%)`、`Coverage - E2E (90%)`、`Coverage - total (90%)` 三个独立状态；
 

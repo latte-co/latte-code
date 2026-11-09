@@ -8,9 +8,10 @@ Latte Code is a Rust 2024 workspace implementing a code agent with a Ratatui fro
 
 - `crates/latte-core`: serializable protocol and state machine; independent of storage, providers, and UI.
 - `crates/latte-engine`: privileged authority for SQLite state, leases, policy, filesystem tools, effects, and supervised processes.
-- `crates/latte-headless`: provider, repository context, agent loop, verification, handoff, and command service.
+- `crates/latte-headless`: provider and registry, repository context, session runtime service (turn loop), profile resolution, and verification plan.
+- `crates/latte-server`: HTTP REST + SSE server with multi-workspace management; the CLI and TUI reach every session command through it.
 - `crates/latte-tui`: pure UI projection/reducer and Ratatui terminal lifecycle.
-- `crates/latte-code`: binary composition and CLI contracts.
+- `crates/latte-code`: binary composition, CLI contracts, and configuration merging.
 - `docs/`: architecture and operations docs (Chinese only).
 
 Local `.latte/`, `.oh-my-code/`, `.tmp/`, `target/`, logs, and secrets are not project source.
@@ -53,7 +54,7 @@ Follow the [E2E authoring guide](docs/testing/e2e-authoring-guide.md). A feature
 
 - `latte-engine` is the sole privileged effect authority; frontends use typed commands and projections.
 - Persist declared/prepared effects before execution. Never infer success after interruption; record `Unknown` and require reconciliation.
-- Bind mutations to exact run revision, lease fencing token, input digest, and single-use approval.
+- Bind mutations to exact turn revision, lease fencing token, input digest, and single-use approval.
 - Keep filesystem mutations workspace-contained and handle-relative. Unsupported safety primitives fail before `Started`.
 - Execute commands argv-first. Explicit shell execution is high-risk and must pass policy.
 - Bound output, timeout, cancellation, and shutdown. On Unix, supervise the whole process group.
@@ -61,4 +62,4 @@ Follow the [E2E authoring guide](docs/testing/e2e-authoring-guide.md). A feature
 - Required verification cannot complete when failed, missing, or not run.
 - TUI actions reduce to typed runtime commands; Enter never implicitly approves permission.
 
-Keep English and Chinese formal docs aligned. Document only implemented behavior and name platform limits. Do not commit, push, tag, publish, or create a PR without an explicit user request.
+Formal docs are maintained in Chinese only; keep that single set current and self-consistent. Document only implemented behavior and name platform limits. Do not commit, push, tag, publish, or create a PR without an explicit user request.

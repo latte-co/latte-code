@@ -1,7 +1,6 @@
 # Latte Code E2E 编写手册
 
-> 本手册规定功能开发时如何配套编写 UT 与最终二进制 E2E。测试卡点的整体设计和场景编号见 [UT / E2E 测试卡点设计](../design/testing-gates.md)。
->
+> 本手册规定功能开发时如何配套编写 UT 与最终二进制 E2E；强制规则的权威是根目录 [AGENTS.md](../../AGENTS.md)。
 
 ## 1. 强制规则
 
@@ -175,7 +174,7 @@ TUI E2E 使用 `PtySession`：
 根据场景选择并组合以下断言，不能只检查退出码：
 
 - CLI exit code、JSON version/status/error code；
-- thread/run lifecycle 与 pending request；
+- session/turn lifecycle 与 pending request；
 - effect 精确状态和 single-use approval；
 - 文件只修改一次，deny/失败路径不修改；
 - verification evidence 与 handoff；
@@ -246,4 +245,4 @@ E2E 命中的代码不能计入 UT 95% 指标，UT、Contract 或直接调用内
 - [ ] child/process group、PTY 和 Provider fixture 能在失败时清理；
 - [ ] `make test-unit`、`make test-contract` 与适用的 portable/Unix E2E target 通过；
 - [ ] `make coverage` 和 `make ci` 通过；
-- [ ] 中英文行为文档同步更新。
+- [ ] 行为文档同步更新（文档为中文单语维护）。

@@ -2,7 +2,7 @@
 
 状态：**已实施**（Phase A/B/C 于 2026-08-26 落地）
 日期：2026-08-21
-关联：[server.md](server.md)、[server-client-integration.md](server-client-integration.md)
+关联：[server.md](server.md)——运行模式与多 Server 语义、幂等创建故障模型
 
 ## 1. 背景与目标
 
@@ -205,8 +205,8 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
   客户端全量拉 snapshot。不断开连接。
 - **慢消费者隔离**：一个慢客户端不影响其他客户端（broadcast 天然隔离）。
 - **无 event ID**：SSE 事件不带 `id:` 字段。客户端不发送 `Last-Event-ID`。
-- **无 replay**：server 不缓存历史事件。重连后客户端立即 resync（§8.1 of
-  server-client-integration.md）。
+- **无 replay**：server 不缓存历史事件。重连后客户端立即 resync（见
+  [server.md](server.md) §11.4）。
 
 ### 5.4 心跳
 

@@ -6,7 +6,7 @@ Latte Code is a Rust code agent for scoped repository changes. Its Ratatui UI is
 
 ## Requirements
 
-- Rust 1.93 or newer (the pinned toolchain is in `rust-toolchain.toml`)
+- Rust 1.93 or newer (the MSRV is declared in `Cargo.toml`)
 - A terminal for the interactive TUI
 - An OpenAI-compatible chat-completions endpoint for `run` and `resume`
 
@@ -30,6 +30,7 @@ latte-code context <session-id>
 latte-code list
 latte-code --json show <session-id>
 latte-code --json context <session-id>
+latte-code compact <session-id>
 latte-code --json list
 latte-code serve --port 4096
 ```
@@ -49,7 +50,9 @@ export OPENAI_API_KEY="..."
 
 Edit `.latte/latte-code.jsonc` to select the single global `default_model` as a `provider/model` ID (for example, `primary/model-id`), configure each `providers.<name>` entry, and set `verification.argv`. Each provider's `models` object is the complete picker catalog: the map key is the actual model ID sent to that Provider, optional `name` is display/search text only, and nested `options` use that provider type's own strict schema. OpenAI Chat options currently accept `context_window`, `reasoning_effort`, `temperature`, and `max_tokens`; `context_window` is retained in the pinned model contract for the subsequent context-management and compaction implementation. Other provider types may define different keys. A string array remains shorthand for models without names or overrides. Providers do not define independent defaults. Selected model options are pinned into the Session binding fingerprint, while display names are not; request options are applied only by the selected Provider implementation. User or workspace files may contain only the keys they override, except that a Provider's `models` catalog always replaces the earlier layer's complete catalog. Latte Code does not ship a built-in Provider or model. OpenAI Chat `api_key` accepts either a literal string such as `"sk-..."` or an environment reference such as `{ source: "env", name: "OPENAI_API_KEY" }`; references are resolved only when a provider call is made. Literal values remain in the user-owned JSONC source but are excluded from Debug output, Session bindings, fingerprints, transcripts, SQLite state, and normal effect records. Restrict files containing literal credentials to the current user. `verification.argv` is executed without a shell. Durable state lives in `$LATTE_CODE_HOME/state.db` with per-Session files below `$LATTE_CODE_HOME/sessions`; the default home is `$HOME/.latte/latte-code`. `database.path` remains parseable only to locate and idempotently import an older workspace database; it cannot redirect new state.
 
-The TUI creates sessions. A completed child is immutable; a follow-up creates a new linked child after its provider binding, internally derived credential/data scope, checkpoint grammar, and exact request budget are validated. Credential binding metadata is derived from the Provider name and `api_key` source; it is not part of the public configuration. `run`/`list`/`show`/`resume` operate on these sessions; the v1 run-id contract is removed.
+The TUI creates sessions. A completed child is immutable; a follow-up creates a new linked child after its provider binding, internally derived credential/data scope, checkpoint grammar, and exact request budget are validated. Credential binding metadata is derived from the Provider name and `api_key` source; it is not part of the public configuration. `run`/`list`/`show`/`context`/`compact`/`resume` operate on these sessions; the v1 run-id contract is removed.
+
+A workspace `.latte/latte-code.jsonc` ships with the repository clone, so Latte Code treats workspace-provided endpoints as untrusted. If the workspace layer sets `providers.*.base_url`/`endpoint` while a credential held outside the workspace — a home-layer `api_key`, or an environment variable the merged configuration references — would be attached to it, startup fails with remediation guidance instead of sending the secret to that endpoint. Only the HOME layer can opt in per provider with `trust_repo_endpoint: true`; the flag is stripped before merging, invisible to the configuration schema, and never enters fingerprints. A workspace provider that carries its own literal `api_key` is treated as self-owned and allowed.
 
 OpenAI Chat Completions can use bounded SSE when `streaming` is true. Only actual deltas are rendered; a valid inline JSON response renders only its final answer. A zero-body unsupported streaming response may make one non-streaming retry; any body byte, malformed SSE, or cancellation does not fall back. Responses API and other provider protocols are not implemented. Provider-issued v2 tool calls are executed only by the engine through fenced durable `Prepare -> Started -> Observe` transitions. A restart or lost authority after `Started` records `Unknown` and requires explicit reconciliation; neither the TUI nor provider has direct effect authority.
 
@@ -74,7 +77,7 @@ providers: {
 - Effect state is persisted before execution. Ambiguous interruption becomes `Unknown` and requires explicit reconciliation; it is never silently retried.
 - File writes use handle-relative replacement on supported platforms and fail before starting on unsupported platforms.
 - Process execution is argv-first, drains bounded output, and terminates Unix process groups on timeout or cancellation. Process supervision fails closed on non-Unix targets; CI still runs Windows check, Clippy, UT, Contract, portable final-binary E2E, and release build gates without claiming Windows process execution support.
-- A turn takes at most `session.max_tool_rounds` tool rounds (default 48) and allows each provider request `session.provider_timeout_ms` (default 60000). The agent loop is a recursion the model drives, so the round budget is what stops a model that keeps calling tools without converging. Exhausting it ends the turn as a retryable failure naming the limit: the work so far stays durable and the Session remains usable. The budget spans the whole turn, so a permission approval resumes the count rather than refilling it.
+- Each provider request gets `session.provider_timeout_ms` (default 60000), and the whole turn may optionally be bounded by `session.max_tool_rounds`: omitted (or null) means unlimited, which is the default — protection against a model that keeps calling tools without converging comes from the per-request timeout, cancellation, and I/O bounds instead. With an explicit budget (at least 1), opening another tool batch beyond it ends the turn as a retryable failure naming the limit: the work so far stays durable and the Session remains usable. The budget spans the whole turn and is tracked by a durable per-turn counter, so a permission approval or input answer resumes the count rather than refilling it.
 - TUI Enter sends a nonblank composer or pending-input value, while Shift+Enter inserts a newline. Permission and reconciliation prompts consume both keys without approving or acknowledging anything; those protected actions require their explicit chords.
 
 ## Configuration library
@@ -105,10 +108,11 @@ Coverage is checked with `cargo llvm-cov --workspace --all-features --all-target
 
 | Crate | Responsibility |
 | --- | --- |
-| `latte-core` | Typed v1/v2 IDs, commands, events, run state, session snapshots, and redaction |
+| `latte-core` | Typed v1/v2 IDs, commands, events, turn state, session snapshots, harness profiles, and redaction |
 | `latte-engine` | SQLite/WAL, v1/v2 leases, session commits, policy, tools, effects, and process supervision |
-| `latte-headless` | Provider/SSE, context, v1 agent loop, and transcript-session coordination |
+| `latte-headless` | Provider/SSE, context construction and compaction, session turn loop, and runtime services |
+| `latte-server` | HTTP REST + SSE server: multi-workspace management and the session command surface for CLI/TUI |
 | `latte-tui` | Ratatui transcript projection/reducer and terminal lifecycle |
-| `latte-code` | Composition crate for the CLI and TUI binary |
+| `latte-code` | Composition crate for the CLI and TUI binary, config merging, and embedded server wiring |
 
 Licensed under the [Apache License 2.0](LICENSE).
