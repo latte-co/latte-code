@@ -27,3 +27,9 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 nix = { workspace = true }
+
+# latte-server does not inherit [lints] workspace; keep only the targeted
+# allow for the clippy 1.99 assert_is_empty lint (see the root Cargo.toml
+# comment) without adopting the workspace pedantic set here.
+[lints.clippy]
+assert_is_empty = "allow"

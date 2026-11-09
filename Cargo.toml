@@ -29,7 +29,7 @@ tracing = "0.1"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time"] }
 uuid = { version = "1.20", features = ["serde", "v7"] }
 json5 = "0.4"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3.24"
 sha2 = "0.10"
 regex = "1.12"
@@ -50,6 +50,11 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# clippy 1.99 (stable, 2026-11) introduced assert_is_empty. The codebase
+# deliberately uses `assert!(x.is_empty())` in tests; the suggested
+# `assert_eq!(x, [])` replacement adds no diagnostic value. Revisit if the
+# lint matures or the assertions are rewritten.
+assert_is_empty = "allow"
 
 [profile.dev]
 debug = 1
