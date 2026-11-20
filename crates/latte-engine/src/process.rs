@@ -1,6 +1,5 @@
 use crate::{
-    EngineHandle, Lease, SessionEffectDescriptor, SessionEffectExecutionError,
-    SessionEffectObservedValue,
+    EffectAuthority, EngineHandle, Lease, SessionEffectExecutionError, SessionEffectObservedValue,
 };
 use latte_core::TurnId;
 use serde::{Deserialize, Serialize};
@@ -298,7 +297,7 @@ impl SessionProcessSpec {
     pub(crate) fn invocation<'a>(
         &'a self,
         turn_revision: u64,
-        descriptor: &'a SessionEffectDescriptor,
+        authority: &'a EffectAuthority,
         lease: &'a Lease,
     ) -> ProcessInvocation<'a> {
         ProcessInvocation {
@@ -311,8 +310,8 @@ impl SessionProcessSpec {
             stdout_cap: self.stdout_cap,
             stderr_cap: self.stderr_cap,
             turn_revision,
-            effect_id: &descriptor.effect_id,
-            attempt: descriptor.attempt,
+            effect_id: authority.effect_id.as_str(),
+            attempt: authority.attempt,
             approval_digest: None,
             lease_owner: lease.owner(),
             lease_token: lease.fencing_token(),
@@ -323,7 +322,7 @@ impl SessionProcessSpec {
 impl EngineHandle {
     pub(crate) async fn execute_started_session_process(
         &self,
-        descriptor: &SessionEffectDescriptor,
+        authority: &EffectAuthority,
         turn_revision: u64,
         lease: &Lease,
         cancellation: &CancellationToken,
@@ -333,9 +332,9 @@ impl EngineHandle {
                 ProcessError::Unsupported.to_string(),
             ));
         }
-        let spec = SessionProcessSpec::from_input(&descriptor.input)
+        let spec = SessionProcessSpec::from_input(&authority.input)
             .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
-        let invocation = spec.invocation(turn_revision, descriptor, lease);
+        let invocation = spec.invocation(turn_revision, authority, lease);
         let cwd = self
             .tools
             .resolve_cwd(&spec.cwd)
@@ -360,8 +359,8 @@ impl EngineHandle {
             Ok(output) => Ok(SessionEffectObservedValue {
                 result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
                 payload: Some(latte_core::redact_session_value(serde_json::json!({
-                    "tool_call_id":descriptor.tool_call_id,
-                    "name":descriptor.name,
+                    "tool_call_id":authority.tool_call_id,
+                    "name":authority.name,
                     "output":output,
                 }))),
                 success: true,
@@ -1233,8 +1232,8 @@ mod tests {
             fencing_token: 7,
             expires_at_ms: 99,
         };
-        let descriptor = SessionEffectDescriptor {
-            effect_id: "effect".into(),
+        let descriptor = EffectAuthority {
+            effect_id: "effect".parse().unwrap(),
             tool_call_id: "call_1".into(),
             name: "process".into(),
             input: serde_json::json!({}),
@@ -1423,8 +1422,8 @@ mod tests {
             );
         }
 
-        let descriptor = SessionEffectDescriptor {
-            effect_id: "session-process".into(),
+        let descriptor = EffectAuthority {
+            effect_id: "session-process".parse().unwrap(),
             tool_call_id: "call".into(),
             name: "process".into(),
             input: serde_json::json!({"argv":["/bin/echo","ok"]}),

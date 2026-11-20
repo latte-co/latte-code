@@ -5,7 +5,9 @@
 //! reading its existing records byte-for-byte, while v2 consumers use the
 //! separate envelopes below.
 
-use crate::{SessionCommandId, SessionEventId, SessionId, TranscriptEntryId, TurnId};
+use crate::{
+    EffectId, ProjectKey, SessionCommandId, SessionEventId, SessionId, TranscriptEntryId, TurnId,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -143,7 +145,8 @@ pub enum ManualCompactionState {
     Compacted {
         tier: ManualCompactionTier,
         /// Session revision after the card append.
-        revision: u64,
+        #[serde(alias = "revision")]
+        session_revision: u64,
     },
     /// Nothing to compact; the session is unchanged.
     NothingToCompact { reason: ManualCompactionIdleReason },
@@ -161,7 +164,9 @@ pub struct ManualCompactionResult {
 /// and generation are durable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProviderBinding {
-    pub version: u32,
+    /// Schema version of the provider-binding record itself (not the session protocol).
+    #[serde(alias = "version")]
+    pub binding_version: u32,
     pub provider_name: String,
     pub provider_type: String,
     pub protocol: String,
@@ -219,7 +224,8 @@ pub struct SessionTurnSummary {
     pub turn_id: TurnId,
     #[serde(alias = "parent_run_id")]
     pub parent_turn_id: Option<TurnId>,
-    pub ordinal: u64,
+    #[serde(alias = "ordinal")]
+    pub turn_ordinal: u64,
     pub status: SessionTurnStatus,
     #[serde(alias = "run_revision")]
     pub turn_revision: u64,
@@ -304,7 +310,8 @@ pub struct SessionSnapshot {
     // break; this only deserializes persisted snapshots/results.
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    pub revision: u64,
+    #[serde(alias = "revision")]
+    pub session_revision: u64,
     pub sequence: u64,
     pub lifecycle: SessionLifecycle,
     pub binding: SessionProviderBinding,
@@ -323,6 +330,15 @@ pub struct SessionSnapshot {
     pub focus: Option<String>,
 }
 
+/// Logical repository catalog record grouping linked Git worktrees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project_key: ProjectKey,
+    pub vcs_identity: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 /// Bounded, transcript-free metadata used by Session catalog discovery.
 /// Provider credentials and executable effect data are intentionally absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +347,8 @@ pub struct SessionSummary {
     pub session_id: SessionId,
     pub title: String,
     pub workspace_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<ProjectKey>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -377,8 +395,7 @@ pub enum SessionPendingRequest {
     },
 }
 
-/// A versioned v2 command. It is isolated from `RuntimeCommand` so v1 JSON
-/// and persisted envelopes remain exactly compatible.
+/// A versioned v2 session command envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCommandEnvelope {
     pub protocol_version: u16,
@@ -446,7 +463,8 @@ pub struct SessionEventEnvelope {
     pub event_id: SessionEventId,
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    pub revision: u64,
+    #[serde(alias = "revision")]
+    pub session_revision: u64,
     pub sequence: u64,
     pub event: SessionEvent,
 }
@@ -474,7 +492,7 @@ pub enum SessionEvent {
     ReconciliationRequired {
         #[serde(alias = "run_id")]
         turn_id: TurnId,
-        effect_id: String,
+        effect_id: EffectId,
     },
 }
 
@@ -742,7 +760,7 @@ mod tests {
     #[test]
     fn session_protocol_rejects_invalid_binding_and_keeps_commands_versioned() {
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "provider".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -755,6 +773,24 @@ mod tests {
             credential_generation: 1,
         };
         assert!(binding.validate().is_ok());
+        // Read-only compatibility: persisted pre-Batch-3 bindings keyed `"version"`.
+        let legacy_binding = serde_json::json!({
+            "version": 1,
+            "provider_name": "provider",
+            "provider_type": "openai-chat",
+            "protocol": "chat",
+            "model": "model",
+            "config_fingerprint": "config",
+            "tools_fingerprint": "tools",
+            "aliases": {"read_file": "rf"},
+            "credential_ref_id": "keychain://main",
+            "data_scope_id": "workspace",
+            "credential_generation": 1
+        });
+        assert_eq!(
+            serde_json::from_value::<SessionProviderBinding>(legacy_binding).unwrap(),
+            binding
+        );
         let mut invalid = binding.clone();
         invalid.model = "\n".into();
         assert!(invalid.validate().is_err());

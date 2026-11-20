@@ -89,7 +89,7 @@ Windows 已支持任意外部进程执行。
 - [x] 每个 Session 一份追加式 JSONL，作为 Transcript 读取权威，并支持有界 Record
   与撕裂末行恢复；SQLite 只保留同步 JSONL 前的事务 Outbox。
 - [x] 幂等导入当前 Workspace 的旧数据库、不修改源文件，并生成 JSONL。
-- [ ] 从孤立 JSONL 重建 Catalog，以及修复缺失的已观察 Tool Result Record。
+- [x] 新建 Session 的两阶段 `materializing` 生命周期、从孤立 JSONL 重建 Catalog（凭据引用置未绑定，续跑前需显式重绑模型），以及基于已认证观察证据确定性修复缺失的 JSONL Tool Result Record（不重复执行工具）。
 - [x] 基于全局 SQLite Catalog 的 `/new`、`/sessions`、`/resume` 临时 Draft 新建、
   当前 Workspace 选择与恢复闭环。
 - [x] 当前 Workspace 搜索、Session 标题与安全分叉。
@@ -113,7 +113,7 @@ Windows 已支持任意外部进程执行。
 - [ ] 可信 Reminder Producer、排序与取消语义。
 - [x] Context compaction v1/v2 与可解释 token 预算：分层历史窗口、被动/主动
   SummarizeOnDiscard 摘要、确定性省略层、provider context-overflow 的每 turn 一次
-  强制恢复、idle-only 手动 `/compact`（HTTP + CLI）、只读用量投影与 TUI 预算
+  强制恢复、idle-only 手动 `/compact`（HTTP + CLI + TUI）、只读用量投影与 TUI 预算
   meter（见 [context-design.md](design/context-design.md)）。
 - [ ] 摘要请求复用对话前缀、跨模型 handoff 与用户可控的选择性上下文
   （context-design.md §5 的 v2 方向）。
@@ -177,7 +177,7 @@ Windows 已支持任意外部进程执行。
 - [x] 与 `Ctrl+P` 共享一个封闭的内建 Slash command Catalog，包含 composer
   suggestion、参数校验与 dispatch 时 availability 重检；动态来源和 fuzzy matching
   仍属于后续能力。
-- [x] `/new`、分级 Session Picker/Search、`/sessions`/`/resume`、生命周期治理命令，
+- [x] `/new`、分级 Session Picker/Search、`/sessions`/`/resume`、`/compact`、`/cancel` 与生命周期治理命令，
   并在切换时安全保留或显式替换当前 Composer Draft。
 - [ ] 变更 diff、验证结果、Effect 历史的可浏览详情与文件跳转。
 - [ ] 辅助功能、主题、键盘映射、国际化和可配置的终端体验。

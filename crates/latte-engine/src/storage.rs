@@ -104,7 +104,7 @@ pub enum CommitSessionTurnUpdate {
     /// begin.  The descriptor is already redacted by the engine wrapper.
     PrepareEffect {
         source_key: String,
-        effect_id: String,
+        effect_id: latte_core::EffectId,
         operation_digest: String,
         /// Redacted projection. This is the only descriptor shape that may
         /// enter the effect ledger, transcript, event stream, or command
@@ -116,42 +116,42 @@ pub enum CommitSessionTurnUpdate {
         canonical_descriptor_json: String,
         policy: SessionEffectPolicy,
         description: String,
-        checkpoint_json: String,
+        effect_stage_marker_json: String,
     },
     /// Fenced, single-use transition from durable preparation to external
     /// authority.  This is the only v2 path which can make an effect started.
     StartEffect {
         source_key: String,
-        effect_id: String,
+        effect_id: latte_core::EffectId,
         operation_digest: String,
-        checkpoint_json: String,
+        effect_stage_marker_json: String,
     },
     /// Records a certified terminal observation and its redacted provider
     /// result before the caller may re-enter the provider loop.
     ObserveEffect {
         source_key: String,
-        effect_id: String,
+        effect_id: latte_core::EffectId,
         operation_digest: String,
         success: bool,
         result: String,
         payload: Option<serde_json::Value>,
-        checkpoint_json: String,
+        effect_stage_marker_json: String,
     },
     /// Conservative terminal path once an effect has started but its outcome
     /// can no longer be certified.
     UnknownEffect {
         source_key: String,
-        effect_id: String,
+        effect_id: latte_core::EffectId,
         operation_digest: String,
-        checkpoint_json: String,
+        effect_stage_marker_json: String,
     },
     /// Explicit reconciliation acknowledgement for a previously unknown v2
     /// effect.  This is deliberately a v2 terminal path, never a legacy run
     /// mutation.
     ReconcileUnknownEffect {
         source_key: String,
-        effect_id: String,
-        checkpoint_json: String,
+        effect_id: latte_core::EffectId,
+        effect_stage_marker_json: String,
     },
     RequestPermission {
         source_key: String,
@@ -187,7 +187,7 @@ pub enum CommitSessionTurnUpdate {
     CompleteVerified {
         source_key: String,
         summary: String,
-        verification_effect_id: String,
+        verification_effect_id: latte_core::EffectId,
         verified_manifest_digest: String,
         files_changed: Vec<String>,
     },
@@ -197,7 +197,7 @@ pub enum CommitSessionTurnUpdate {
     },
     Interrupt {
         source_key: String,
-        reconciliation_effect_id: Option<String>,
+        reconciliation_effect_id: Option<latte_core::EffectId>,
     },
 }
 
@@ -243,7 +243,7 @@ pub struct SessionCommitRequest {
     pub expected_turn_revision: u64,
     pub command_id: latte_core::SessionCommandId,
     pub request_id: Option<String>,
-    pub effect_id: Option<String>,
+    pub effect_id: Option<latte_core::EffectId>,
     pub update: CommitSessionTurnUpdate,
 }
 
@@ -308,7 +308,7 @@ pub enum EffectStatus {
     Unknown,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct EffectAuthority {
+pub(crate) struct FencedEffectToken {
     turn_id: TurnId,
     expected_revision: u64,
     lease: Lease,
@@ -324,6 +324,30 @@ pub(crate) struct VerificationRecord {
     pub passed: bool,
     pub workspace_manifest_digest: String,
     pub summary: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializingPrepared {
+    pub user_entry: TranscriptEntry,
+    pub command_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BeginMaterializingOutcome {
+    Prepared(MaterializingPrepared),
+    Replayed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedEffectRecord {
+    pub turn_id: TurnId,
+    pub effect_id: latte_core::EffectId,
+    pub tool_call_id: String,
+    pub name: String,
+    pub success: bool,
+    pub result: String,
+    pub payload: Option<serde_json::Value>,
+    pub observed_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -1333,6 +1357,13 @@ impl Storage {
     ) -> Result<Option<SessionSnapshot>, StorageError> {
         let workspace_root = validate_workspace_root(workspace_root)?;
         let digest = create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+        );
         let legacy_digest =
             legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
         let conn = self.connection.lock().expect("storage mutex poisoned");
@@ -1346,7 +1377,10 @@ impl Storage {
         let Some((stored_digest, result_json)) = row else {
             return Ok(None);
         };
-        if stored_digest != digest && stored_digest != legacy_digest {
+        if stored_digest != digest
+            && stored_digest != v1_binding_digest
+            && stored_digest != legacy_digest
+        {
             return Err(StorageError::SessionCommandReplayMismatch);
         }
         let snapshot: SessionSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
@@ -1454,6 +1488,13 @@ impl Storage {
         // digests and fail with 422 idempotency_mismatch on replay.
         let command_digest =
             create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+        );
         // Pre-rename (schema <13) durable accepts stored the `thread.*` digest
         // namespace; compute it from the same raw identity so an upgraded binary
         // recognizes a pre-upgrade retry as a replay instead of a mismatch.
@@ -1497,7 +1538,10 @@ impl Storage {
                 )
                 .optional()?;
             if let Some((stored_digest, result_json)) = previous {
-                if stored_digest != command_digest && stored_digest != legacy_command_digest {
+                if stored_digest != command_digest
+                    && stored_digest != v1_binding_digest
+                    && stored_digest != legacy_command_digest
+                {
                     return Err(StorageError::SessionCommandReplayMismatch);
                 }
                 let snapshot: SessionSnapshot =
@@ -1611,7 +1655,7 @@ impl Storage {
                 protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
                 event_id: SessionEventId::from_uuid(Uuid::now_v7()),
                 session_id,
-                revision: session_revision,
+                session_revision,
                 sequence: session_sequence,
                 event: SessionEvent::LifecycleChanged {
                     lifecycle: SessionLifecycle::Running,
@@ -1914,7 +1958,7 @@ impl Storage {
         let summary = SessionTurnSummary {
             turn_id,
             parent_turn_id: parent_state.map(|parent| parent.turn_id),
-            ordinal,
+            turn_ordinal: ordinal,
             status: SessionTurnStatus::Queued,
             turn_revision: 0,
             completed_at_ms: None,
@@ -1924,7 +1968,7 @@ impl Storage {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(Uuid::now_v7()),
             session_id,
-            revision: next_revision,
+            session_revision: next_revision,
             sequence: seq,
             event: SessionEvent::TurnLinked { turn: summary },
         };
@@ -1954,7 +1998,7 @@ impl Storage {
                 protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
                 event_id: SessionEventId::from_uuid(Uuid::now_v7()),
                 session_id,
-                revision: started_revision,
+                session_revision: started_revision,
                 sequence: started_sequence,
                 event: SessionEvent::LifecycleChanged {
                     lifecycle: SessionLifecycle::Running,
@@ -2084,7 +2128,7 @@ impl Storage {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(Uuid::now_v7()),
             session_id,
-            revision: next_revision,
+            session_revision: next_revision,
             sequence: next_sequence,
             event: SessionEvent::BindingChanged {
                 provider_name: binding.provider_name.clone(),
@@ -2188,10 +2232,861 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn advance_session_last_seq_floor(
+        &self,
+        session_id: latte_core::SessionId,
+        min_sequence: u64,
+    ) -> Result<(), StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "UPDATE sessions SET last_seq=MAX(last_seq,?1) WHERE session_id=?2",
+            params![to_i64(min_sequence)?, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_materializing_session_v2(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        binding: &SessionProviderBinding,
+        workspace_root: &str,
+        prompt: &str,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<BeginMaterializingOutcome, StorageError> {
+        binding.validate().map_err(StorageError::InvalidData)?;
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let command_digest =
+            create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+        );
+        let legacy_command_digest =
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let prompt = redact_session_text(prompt);
+        if prompt.trim().is_empty() {
+            return Err(StorageError::InvalidData(
+                "session prompt must not be empty".into(),
+            ));
+        }
+        let title = session_title(&prompt);
+        let expected_scope = session_lease_scope(session_id);
+        require_lease_scope(lease, &expected_scope)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authoritative: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![expected_scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+            |row| row.get(0),
+        )?;
+        if !authoritative {
+            return Err(StorageError::LeaseLost);
+        }
+        let previous: Option<(String, String)> = tx
+            .query_row(
+                "SELECT digest,result_json FROM session_command_dedup WHERE command_id=?1",
+                [command_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_digest, result_json)) = previous {
+            if stored_digest != command_digest
+                && stored_digest != v1_binding_digest
+                && stored_digest != legacy_command_digest
+            {
+                return Err(StorageError::SessionCommandReplayMismatch);
+            }
+            let _snapshot: SessionSnapshot =
+                serde_json::from_str(&result_json).map_err(invalid_json)?;
+            tx.commit()?;
+            return Ok(BeginMaterializingOutcome::Replayed);
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1)",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(StorageError::SessionAlreadyExists(session_id));
+        }
+        tx.execute(
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus) \
+             VALUES(?1,0,0,'materializing',?2,NULL,?3,?3,?4,?5,?6)",
+            params![
+                session_id.to_string(),
+                serde_json::to_string(binding).map_err(invalid_json)?,
+                to_i64(now_ms)?,
+                title,
+                workspace_root,
+                focus
+            ],
+        )?;
+        let user_entry = TranscriptEntry {
+            entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+            sequence: 1,
+            turn_id: Some(turn_id),
+            kind: TranscriptKind::User,
+            text: prompt,
+            payload: None,
+            source_key: "session:create:user".into(),
+            created_at_ms: now_ms,
+        };
+        tx.commit()?;
+        Ok(BeginMaterializingOutcome::Prepared(MaterializingPrepared {
+            user_entry,
+            command_digest,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn activate_materializing_session_v2(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        command_digest: &str,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        user_entry: &TranscriptEntry,
+        baseline: &std::collections::BTreeMap<String, String>,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<(SessionSnapshot, StoredSessionEvent), StorageError> {
+        let expected_scope = session_lease_scope(session_id);
+        require_lease_scope(lease, &expected_scope)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authoritative: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![expected_scope, lease.owner, to_i64(lease.fencing_token)?, to_i64(now_ms)?],
+            |row| row.get(0),
+        )?;
+        if !authoritative {
+            return Err(StorageError::LeaseLost);
+        }
+        let state = TurnState::queued(turn_id)
+            .transition(0, Transition::Start)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let state_json = serde_json::to_string(&state).map_err(invalid_json)?;
+        tx.execute(
+            "INSERT INTO turns(turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) \
+             VALUES(?1,?2,?3,1,1,?4,?5,?5)",
+            params![
+                turn_id.to_string(),
+                state_json,
+                status_name(state.status),
+                to_i64(lease.fencing_token)?,
+                to_i64(now_ms)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO turn_read_model(turn_id,revision,last_seq,state_json) VALUES(?1,1,1,?2)",
+            params![turn_id.to_string(), state_json],
+        )?;
+        tx.execute(
+            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
+            params![
+                turn_id.to_string(),
+                serde_json::to_string(baseline).map_err(invalid_json)?
+            ],
+        )?;
+        let updated = tx.execute(
+            "UPDATE sessions SET revision=1,last_seq=2,lifecycle='running',latest_turn_id=?1,updated_at_ms=?2 \
+             WHERE session_id=?3 AND lifecycle='materializing'",
+            params![turn_id.to_string(), to_i64(now_ms)?, session_id.to_string()],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::SessionNotFound(session_id));
+        }
+        tx.execute(
+            "INSERT INTO session_turns(turn_id,session_id,parent_turn_id,ordinal) VALUES(?1,?2,NULL,0)",
+            params![turn_id.to_string(), session_id.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO session_active_turns(session_id,turn_id,lease_token) VALUES(?1,?2,?3)",
+            params![
+                session_id.to_string(),
+                turn_id.to_string(),
+                to_i64(lease.fencing_token)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
+             VALUES(?1,1,?2,?3,'user',?4,?5,?6)",
+            params![
+                session_id.to_string(),
+                user_entry.entry_id.to_string(),
+                turn_id.to_string(),
+                user_entry.source_key,
+                serde_json::to_string(user_entry).map_err(invalid_json)?,
+                to_i64(now_ms)?
+            ],
+        )?;
+        let turn_event = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: EventId::from_uuid(Uuid::now_v7()),
+            turn_id,
+            revision: state.revision,
+            event: RuntimeEvent::StateChanged {
+                status: TurnStatus::Running,
+            },
+        };
+        tx.execute(
+            "INSERT INTO events(turn_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,1,?2,1,?3,?4)",
+            params![
+                turn_id.to_string(),
+                turn_event.event_id.to_string(),
+                serde_json::to_string(&turn_event).map_err(invalid_json)?,
+                to_i64(now_ms)?
+            ],
+        )?;
+        let envelope = SessionEventEnvelope {
+            protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+            event_id: SessionEventId::from_uuid(Uuid::now_v7()),
+            session_id,
+            session_revision: 1,
+            sequence: 2,
+            event: SessionEvent::LifecycleChanged {
+                lifecycle: SessionLifecycle::Running,
+                turn_id: Some(turn_id),
+            },
+        };
+        tx.execute(
+            "INSERT INTO session_events(session_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,2,?2,1,?3,?4)",
+            params![
+                session_id.to_string(),
+                envelope.event_id.to_string(),
+                serde_json::to_string(&envelope).map_err(invalid_json)?,
+                to_i64(now_ms)?
+            ],
+        )?;
+        let snapshot =
+            current_session_snapshot(&tx, session_id, SESSION_PROJECTION_TRANSCRIPT_LIMIT)?;
+        tx.execute(
+            "INSERT INTO session_command_dedup(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+            params![
+                command_id.to_string(),
+                command_digest,
+                serde_json::to_string(&snapshot).map_err(invalid_json)?,
+                to_i64(now_ms)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok((
+            snapshot,
+            StoredSessionEvent {
+                sequence: 2,
+                envelope,
+            },
+        ))
+    }
+
+    pub(crate) fn delete_materializing_session(
+        &self,
+        session_id: latte_core::SessionId,
+    ) -> Result<(), StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id=?1 AND lifecycle='materializing'",
+            [session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn materializing_sessions_for_workspace(
+        &self,
+        workspace_root: &str,
+        now_ms: u64,
+    ) -> Result<Vec<(latte_core::SessionId, String, Option<String>)>, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT s.session_id,s.binding_json,s.focus \
+             FROM sessions s \
+             WHERE s.workspace_root=?1 AND s.lifecycle='materializing' \
+               AND NOT EXISTS( \
+                 SELECT 1 FROM runtime_lease l \
+                 WHERE l.scope='session:' || s.session_id AND l.expires_at_ms>?2 \
+               ) \
+             ORDER BY s.rowid ASC",
+        )?;
+        let rows = statement.query_map(params![workspace_root, to_i64(now_ms)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (session_id, binding_json, focus) = row?;
+            Ok((parse_session_id(&session_id)?, binding_json, focus))
+        })
+        .collect()
+    }
+
+    pub(crate) fn registered_workspaces(&self) -> Result<Vec<(String, String)>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT workspace_root,storage_key FROM workspaces ORDER BY workspace_root ASC",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn all_session_ids(
+        &self,
+    ) -> Result<std::collections::BTreeSet<latte_core::SessionId>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare("SELECT session_id FROM sessions")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| parse_session_id(&row?))
+            .collect()
+    }
+
+    pub(crate) fn sessions_needing_conversation_reconcile(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<(latte_core::SessionId, u64)>, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT s.session_id,s.created_at_ms \
+             FROM sessions s \
+             WHERE s.workspace_root=?1 AND s.lifecycle <> 'materializing' \
+               AND ( \
+                 EXISTS(SELECT 1 FROM conversation_outbox o WHERE o.session_id=s.session_id) \
+                 OR EXISTS( \
+                   SELECT 1 FROM session_turns st \
+                   JOIN effects e ON e.turn_id=st.turn_id \
+                   WHERE st.session_id=s.session_id \
+                     AND e.status IN ('observed_success','observed_failed') \
+                     AND e.descriptor_json IS NOT NULL \
+                     AND e.post_evidence_json IS NOT NULL \
+                 ) \
+               ) \
+             ORDER BY s.rowid ASC",
+        )?;
+        statement
+            .query_map([workspace_root], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (session_id, created_at_ms) = row?;
+                Ok((parse_session_id(&session_id)?, from_i64(created_at_ms)?))
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn rebuild_sessions_from_jsonl(
+        &self,
+        workspace_root: &str,
+        docs: &[crate::conversation::ConversationDocument],
+        materializing_overrides: &std::collections::BTreeMap<
+            latte_core::SessionId,
+            (String, Option<String>),
+        >,
+        now_ms: u64,
+    ) -> Result<usize, StorageError> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut rebuilt = Vec::new();
+        for doc in docs {
+            if doc.entries.is_empty() {
+                continue;
+            }
+            let (binding_json, focus) =
+                if let Some((binding_json, focus)) = materializing_overrides.get(&doc.session_id) {
+                    let deleted = tx.execute(
+                        "DELETE FROM sessions WHERE session_id=?1 AND lifecycle='materializing'",
+                        [doc.session_id.to_string()],
+                    )?;
+                    if deleted == 0 {
+                        continue;
+                    }
+                    (binding_json.clone(), focus.clone())
+                } else {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1)",
+                        [doc.session_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    if exists {
+                        continue;
+                    }
+                    let binding = recovered_binding_from_entries(&doc.entries);
+                    (serde_json::to_string(&binding).map_err(invalid_json)?, None)
+                };
+            let title = doc
+                .entries
+                .iter()
+                .find(|entry| entry.kind == TranscriptKind::User)
+                .map_or_else(
+                    || "Untitled session".into(),
+                    |entry| session_title(&entry.text),
+                );
+            let created_at_ms = doc.created_at_ms;
+            let updated_at_ms = doc
+                .entries
+                .iter()
+                .map(|entry| entry.created_at_ms)
+                .max()
+                .unwrap_or(created_at_ms)
+                .max(created_at_ms);
+            let last_seq = doc.entries.last().map_or(0, |entry| entry.sequence);
+            let revision = last_seq.max(1);
+
+            let mut turn_ids = Vec::new();
+            for entry in &doc.entries {
+                if let Some(turn_id) = entry.turn_id
+                    && !turn_ids.contains(&turn_id)
+                {
+                    turn_ids.push(turn_id);
+                }
+            }
+
+            let latest_turn_id = turn_ids.last().map(ToString::to_string);
+            tx.execute(
+                "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
+                 VALUES(?1,?2,?3,'ready',?4,?5,?6,?7,?8,?9,NULL,?10)",
+                params![
+                    doc.session_id.to_string(),
+                    to_i64(revision)?,
+                    to_i64(last_seq)?,
+                    binding_json,
+                    latest_turn_id,
+                    to_i64(created_at_ms)?,
+                    to_i64(updated_at_ms)?,
+                    title,
+                    workspace_root,
+                    focus
+                ],
+            )?;
+
+            let mut session_lifecycle = "ready";
+            for (index, &turn_id) in turn_ids.iter().enumerate() {
+                let turn_entries: Vec<&TranscriptEntry> = doc
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.turn_id == Some(turn_id))
+                    .collect();
+                let turn_created = turn_entries
+                    .first()
+                    .map_or(created_at_ms, |entry| entry.created_at_ms);
+                let turn_updated = turn_entries
+                    .iter()
+                    .map(|entry| entry.created_at_ms)
+                    .max()
+                    .unwrap_or(turn_created)
+                    .max(turn_created);
+                let tool_round_count = turn_entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == TranscriptKind::Assistant
+                            && entry
+                                .payload
+                                .as_ref()
+                                .and_then(|value| value.get("tool_calls"))
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|calls| !calls.is_empty())
+                    })
+                    .count();
+                let unreconciled = unreconciled_started_effects(&turn_entries);
+                let is_last_turn = index + 1 == turn_ids.len();
+                let (turn_state, turn_lifecycle) = reconstruct_turn_from_entries(
+                    turn_id,
+                    &turn_entries,
+                    &unreconciled,
+                    !is_last_turn,
+                );
+                if is_last_turn {
+                    session_lifecycle = turn_lifecycle;
+                }
+                let state_json = serde_json::to_string(&turn_state).map_err(invalid_json)?;
+                let ordinal = u64::try_from(index)
+                    .map_err(|_| StorageError::InvalidData("turn ordinal overflow".into()))?;
+                let parent_turn_id = index.checked_sub(1).map(|prev| turn_ids[prev].to_string());
+                tx.execute(
+                    "INSERT OR IGNORE INTO turns(turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,?3,?4,1,0,?5,?6)",
+                    params![
+                        turn_id.to_string(),
+                        state_json,
+                        status_name(turn_state.status),
+                        to_i64(turn_state.revision)?,
+                        to_i64(turn_created)?,
+                        to_i64(turn_updated)?
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO turn_read_model(turn_id,revision,last_seq,state_json) \
+                     VALUES(?1,?2,1,?3)",
+                    params![
+                        turn_id.to_string(),
+                        to_i64(turn_state.revision)?,
+                        state_json
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO turn_baselines(turn_id,manifest_json) VALUES(?1,'{}')",
+                    [turn_id.to_string()],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO session_turns(turn_id,session_id,parent_turn_id,ordinal,completed_at_ms,tool_round_count) \
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        turn_id.to_string(),
+                        doc.session_id.to_string(),
+                        parent_turn_id,
+                        to_i64(ordinal)?,
+                        to_i64(turn_updated)?,
+                        i64::try_from(tool_round_count).map_err(|_| {
+                            StorageError::InvalidData("tool_round_count overflow".into())
+                        })?
+                    ],
+                )?;
+                for effect_id in unreconciled {
+                    tx.execute(
+                        r#"INSERT OR IGNORE INTO effects(effect_id,turn_id,status,started_at_ms,observed_at_ms,attempt,post_evidence_json)
+                           VALUES(?1,?2,'unknown',?3,?4,1,'{"outcome":"rebuilt_from_jsonl_after_start"}')"#,
+                        params![
+                            effect_id.as_str(),
+                            turn_id.to_string(),
+                            to_i64(turn_created)?,
+                            to_i64(now_ms)?
+                        ],
+                    )?;
+                }
+            }
+            if session_lifecycle != "ready" {
+                tx.execute(
+                    "UPDATE sessions SET lifecycle=?1 WHERE session_id=?2",
+                    params![session_lifecycle, doc.session_id.to_string()],
+                )?;
+            }
+            rebuilt.push((
+                doc.session_id,
+                turn_ids.is_empty(),
+                updated_at_ms,
+                &doc.entries,
+            ));
+        }
+
+        // Second pass: restore fork lineage (`parent_session_id`) when the
+        // parent session exists, or attach a completed seed turn if a forked
+        // session has zero child turns and its parent is absent.
+        for (session_id, had_no_turns, updated_at_ms, entries) in &rebuilt {
+            let parent_candidate = entries
+                .first()
+                .and_then(|entry| entry.source_key.strip_prefix("fork:"))
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .map(latte_core::SessionId::from_uuid);
+            let mut linked_parent = false;
+            if let Some(parent_id) = parent_candidate {
+                let parent_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing')",
+                    [parent_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if parent_exists {
+                    tx.execute(
+                        "UPDATE sessions SET parent_session_id=?1 WHERE session_id=?2",
+                        params![parent_id.to_string(), session_id.to_string()],
+                    )?;
+                    linked_parent = true;
+                }
+            }
+            if *had_no_turns && !linked_parent {
+                let seed_turn = TurnId::from_uuid(Uuid::now_v7());
+                let completed = TurnState::queued(seed_turn)
+                    .transition(0, Transition::Start)
+                    .and_then(|running| {
+                        running.transition(
+                            1,
+                            Transition::Complete {
+                                handoff: Handoff {
+                                    summary: "reconstructed conversation seed".into(),
+                                    files_changed: Vec::new(),
+                                    evidence: Vec::new(),
+                                },
+                                policy: CompletionPolicy::VerificationNotRequired,
+                            },
+                        )
+                    })
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                let state_json = serde_json::to_string(&completed).map_err(invalid_json)?;
+                tx.execute(
+                    "INSERT INTO turns(turn_id,state_json,status,revision,last_seq,lease_token,created_at_ms,updated_at_ms) \
+                     VALUES(?1,?2,'completed',2,1,0,?3,?3)",
+                    params![seed_turn.to_string(), state_json, to_i64(*updated_at_ms)?],
+                )?;
+                tx.execute(
+                    "INSERT INTO turn_read_model(turn_id,revision,last_seq,state_json) VALUES(?1,2,1,?2)",
+                    params![seed_turn.to_string(), state_json],
+                )?;
+                tx.execute(
+                    "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,'{}')",
+                    [seed_turn.to_string()],
+                )?;
+                tx.execute(
+                    "INSERT INTO session_turns(turn_id,session_id,parent_turn_id,ordinal,completed_at_ms) VALUES(?1,?2,NULL,0,?3)",
+                    params![seed_turn.to_string(), session_id.to_string(), to_i64(*updated_at_ms)?],
+                )?;
+                tx.execute(
+                    "UPDATE sessions SET latest_turn_id=?1 WHERE session_id=?2",
+                    params![seed_turn.to_string(), session_id.to_string()],
+                )?;
+            }
+        }
+        let count = rebuilt.len();
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub(crate) fn observed_effects_for_repair(
+        &self,
+        session_id: latte_core::SessionId,
+        now_ms: u64,
+    ) -> Result<Vec<ObservedEffectRecord>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT e.turn_id,e.effect_id,e.status,e.descriptor_json,e.post_evidence_json,COALESCE(e.observed_at_ms,e.started_at_ms) \
+             FROM effects e \
+             JOIN session_turns st ON st.turn_id=e.turn_id \
+             WHERE st.session_id=?1 \
+               AND e.status IN ('observed_success','observed_failed') \
+               AND e.descriptor_json IS NOT NULL \
+               AND e.post_evidence_json IS NOT NULL \
+               AND NOT EXISTS( \
+                 SELECT 1 FROM runtime_lease l \
+                 WHERE l.scope='session:' || st.session_id \
+                   AND l.expires_at_ms>?2 \
+               ) \
+             ORDER BY st.ordinal ASC, e.rowid ASC",
+        )?;
+        let rows =
+            statement.query_map(params![session_id.to_string(), to_i64(now_ms)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (turn_raw, effect_raw, status, descriptor_json, post_json, observed_at) = row?;
+            let Ok(post_value) = serde_json::from_str::<serde_json::Value>(&post_json) else {
+                continue;
+            };
+            // Non-executed / reconciled `'observed_failed'` markers (`denied_before_start`,
+            // `cancelled_before_start`, `not_started`, `acknowledged_failed`) never
+            // carry a `"result"` string and must never be turned into `ToolResult` cards.
+            let Some(result) = post_value.get("result").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Ok(descriptor) = serde_json::from_str::<crate::EffectView>(&descriptor_json) else {
+                continue;
+            };
+            let Ok(effect_id) = latte_core::EffectId::new(effect_raw) else {
+                continue;
+            };
+            records.push(ObservedEffectRecord {
+                turn_id: parse_turn_id(&turn_raw)?,
+                effect_id,
+                tool_call_id: descriptor.tool_call_id,
+                name: descriptor.name,
+                success: status == "observed_success",
+                result: result.to_owned(),
+                payload: post_value
+                    .get("payload")
+                    .filter(|value| !value.is_null())
+                    .cloned(),
+                observed_at_ms: from_i64(observed_at)?,
+            });
+        }
+        Ok(records)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn stage_repaired_tool_results(
+        &self,
+        session_id: latte_core::SessionId,
+        jsonl_last_seq: u64,
+        missing: &[ObservedEffectRecord],
+        now_ms: u64,
+    ) -> Result<bool, StorageError> {
+        if missing.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live_lease: bool = tx.query_row(
+            "SELECT EXISTS( \
+               SELECT 1 FROM runtime_lease l \
+               WHERE l.scope='session:' || ?1 AND l.expires_at_ms>?2 \
+             )",
+            params![session_id.to_string(), to_i64(now_ms)?],
+            |row| row.get(0),
+        )?;
+        if live_lease {
+            return Ok(false);
+        }
+        let Some((session_rev, session_seq)): Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT revision,last_seq FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing'",
+                [session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let max_outbox_seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM conversation_outbox WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut next_seq = from_i64(session_seq)?
+            .max(jsonl_last_seq)
+            .max(from_i64(max_outbox_seq)?);
+        let mut next_rev = from_i64(session_rev)?;
+        let mut staged_any = false;
+
+        for record in missing {
+            let source_key = repair_effect_source_key(record.effect_id.as_str());
+            let already_staged: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_outbox WHERE session_id=?1 AND source_key=?2)",
+                params![session_id.to_string(), &source_key],
+                |row| row.get(0),
+            )?;
+            if already_staged {
+                continue;
+            }
+            next_seq = next_seq.checked_add(1).ok_or_else(|| {
+                StorageError::InvalidData("session sequence overflow during repair".into())
+            })?;
+            next_rev = next_rev.checked_add(1).ok_or_else(|| {
+                StorageError::InvalidData("session revision overflow during repair".into())
+            })?;
+            let redacted_result = redact_session_text(&record.result);
+            let mut payload_map = record
+                .payload
+                .clone()
+                .and_then(|value| match redact_session_value(value) {
+                    serde_json::Value::Object(map) => Some(map),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            payload_map
+                .entry("provider_content".to_owned())
+                .or_insert_with(|| serde_json::Value::String(redacted_result.clone()));
+            payload_map
+                .entry("tool_call_id".to_owned())
+                .or_insert_with(|| {
+                    serde_json::Value::String(redact_session_text(&record.tool_call_id))
+                });
+            payload_map
+                .entry("name".to_owned())
+                .or_insert_with(|| serde_json::Value::String(redact_session_text(&record.name)));
+            payload_map.insert(
+                "effect_id".to_owned(),
+                serde_json::Value::String(redact_session_text(record.effect_id.as_str())),
+            );
+            payload_map.insert(
+                "repaired_from_observation".to_owned(),
+                serde_json::Value::Bool(true),
+            );
+            if !record.success && !payload_map.contains_key("error") {
+                payload_map.insert(
+                    "error".to_owned(),
+                    serde_json::Value::String(redacted_result.clone()),
+                );
+            }
+            let entry = TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(Uuid::now_v7()),
+                sequence: next_seq,
+                turn_id: Some(record.turn_id),
+                kind: TranscriptKind::ToolResult,
+                text: redacted_result,
+                payload: Some(redact_session_value(serde_json::Value::Object(payload_map))),
+                source_key,
+                created_at_ms: record.observed_at_ms.max(1),
+            };
+            tx.execute(
+                "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
+                 VALUES(?1,?2,?3,?4,'tool_result',?5,?6,?7)",
+                params![
+                    session_id.to_string(),
+                    to_i64(next_seq)?,
+                    entry.entry_id.to_string(),
+                    record.turn_id.to_string(),
+                    entry.source_key,
+                    serde_json::to_string(&entry).map_err(invalid_json)?,
+                    to_i64(entry.created_at_ms)?
+                ],
+            )?;
+            let envelope = SessionEventEnvelope {
+                protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
+                event_id: SessionEventId::from_uuid(Uuid::now_v7()),
+                session_id,
+                session_revision: next_rev,
+                sequence: next_seq,
+                event: SessionEvent::TranscriptAppended { entry },
+            };
+            tx.execute(
+                "INSERT INTO session_events(session_id,seq,event_id,revision,event_json,created_at_ms) \
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    session_id.to_string(),
+                    to_i64(next_seq)?,
+                    envelope.event_id.to_string(),
+                    to_i64(next_rev)?,
+                    serde_json::to_string(&envelope).map_err(invalid_json)?,
+                    to_i64(now_ms)?
+                ],
+            )?;
+            staged_any = true;
+        }
+        if staged_any {
+            tx.execute(
+                "UPDATE sessions SET revision=?1,last_seq=?2,updated_at_ms=MAX(updated_at_ms,?3) WHERE session_id=?4",
+                params![
+                    to_i64(next_rev)?,
+                    to_i64(next_seq)?,
+                    to_i64(now_ms)?,
+                    session_id.to_string()
+                ],
+            )?;
+            tx.commit()?;
+        }
+        Ok(staged_any)
+    }
+
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionSnapshot>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let mut statement = conn
-            .prepare("SELECT session_id FROM sessions ORDER BY updated_at_ms DESC, rowid DESC")?;
+        let mut statement = conn.prepare(
+            "SELECT session_id FROM sessions WHERE lifecycle <> 'materializing' \
+             ORDER BY updated_at_ms DESC, rowid DESC",
+        )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2217,7 +3112,8 @@ impl Storage {
         let workspace_root = validate_workspace_root(workspace_root)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT session_id FROM sessions WHERE workspace_root=?1 \
+            "SELECT session_id FROM sessions \
+             WHERE workspace_root=?1 AND lifecycle <> 'materializing' \
              ORDER BY updated_at_ms DESC, rowid DESC",
         )?;
         let ids = statement
@@ -2246,50 +3142,16 @@ impl Storage {
         let limit = limit.min(500);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
-             FROM sessions WHERE workspace_root=?1 \
-             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?2",
+            "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+             FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+             WHERE s.workspace_root=?1 AND s.lifecycle <> 'materializing' \
+             ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?2",
         )?;
         let limit = u64::try_from(limit)
             .map_err(|_| StorageError::InvalidData("session list limit exceeds u64".into()))?;
-        let rows = statement.query_map(params![workspace_root, to_i64(limit)?], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (
-                session_id,
-                title,
-                workspace_root,
-                parent,
-                lifecycle,
-                binding_json,
-                created,
-                updated,
-            ) = row?;
-            let binding: SessionProviderBinding =
-                serde_json::from_str(&binding_json).map_err(invalid_json)?;
-            Ok(SessionSummary {
-                session_id: parse_session_id(&session_id)?,
-                title,
-                workspace_root,
-                parent_session_id: parent.as_deref().map(parse_session_id).transpose()?,
-                lifecycle: parse_lifecycle(&lifecycle)?,
-                provider_name: binding.provider_name,
-                model: binding.model,
-                created_at_ms: from_i64(created)?,
-                updated_at_ms: from_i64(updated)?,
-            })
-        })
-        .collect()
+        let rows =
+            statement.query_map(params![workspace_root, to_i64(limit)?], session_summary_row)?;
+        rows.map(|row| Ok(row?.0)).collect()
     }
 
     pub(crate) fn find_sessions_by_exact_title_for_workspace(
@@ -2305,9 +3167,10 @@ impl Storage {
         let limit = limit.min(500);
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-             FROM sessions WHERE workspace_root=?1 AND title=?2 \
-             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+            "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+             FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+             WHERE s.workspace_root=?1 AND s.title=?2 AND s.lifecycle <> 'materializing' \
+             ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?3",
         )?;
         let rows = statement.query_map(
             params![
@@ -2354,7 +3217,7 @@ impl Storage {
             None => {
                 let mut statement = conn.prepare(
                     "SELECT session_id,updated_at_ms,rowid FROM sessions \
-                     WHERE workspace_root=?1 \
+                     WHERE workspace_root=?1 AND lifecycle <> 'materializing' \
                      ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?2",
                 )?;
                 let rows = statement.query_map(
@@ -2377,7 +3240,7 @@ impl Storage {
             Some((updated, rowid)) => {
                 let mut statement = conn.prepare(
                     "SELECT session_id,updated_at_ms,rowid FROM sessions \
-                     WHERE workspace_root=?1 \
+                     WHERE workspace_root=?1 AND lifecycle <> 'materializing' \
                      AND (updated_at_ms<?2 OR (updated_at_ms=?2 AND rowid<?3)) \
                      ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?4",
                 )?;
@@ -2456,10 +3319,11 @@ impl Storage {
         let page_rows: Vec<(SessionSummary, i64, i64)> = match keyset {
             None => {
                 let mut statement = conn.prepare(
-                    "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-                     FROM sessions WHERE workspace_root=?1 AND \
-                     (?2='' OR instr(lower(title),?2)>0 OR instr(lower(session_id),?2)>0) \
-                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+                    "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+                     FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+                     WHERE s.workspace_root=?1 AND s.lifecycle <> 'materializing' AND \
+                     (?2='' OR instr(lower(s.title),?2)>0 OR instr(lower(s.session_id),?2)>0) \
+                     ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?3",
                 )?;
                 let rows = statement.query_map(
                     params![
@@ -2475,11 +3339,12 @@ impl Storage {
             }
             Some((updated, rowid)) => {
                 let mut statement = conn.prepare(
-                    "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-                     FROM sessions WHERE workspace_root=?1 AND \
-                     (?2='' OR instr(lower(title),?2)>0 OR instr(lower(session_id),?2)>0) \
-                     AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND rowid<?4)) \
-                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?5",
+                    "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+                     FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+                     WHERE s.workspace_root=?1 AND s.lifecycle <> 'materializing' AND \
+                     (?2='' OR instr(lower(s.title),?2)>0 OR instr(lower(s.session_id),?2)>0) \
+                     AND (s.updated_at_ms<?3 OR (s.updated_at_ms=?3 AND s.rowid<?4)) \
+                     ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?5",
                 )?;
                 let rows = statement.query_map(
                     params![
@@ -2543,9 +3408,10 @@ impl Storage {
         let page_rows: Vec<(SessionSummary, i64, i64)> = match keyset {
             None => {
                 let mut statement = conn.prepare(
-                    "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-                     FROM sessions WHERE workspace_root=?1 AND title=?2 \
-                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+                    "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+                     FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+                     WHERE s.workspace_root=?1 AND s.title=?2 AND s.lifecycle <> 'materializing' \
+                     ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?3",
                 )?;
                 let rows = statement.query_map(
                     params![
@@ -2561,10 +3427,11 @@ impl Storage {
             }
             Some((updated, rowid)) => {
                 let mut statement = conn.prepare(
-                    "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-                     FROM sessions WHERE workspace_root=?1 AND title=?2 \
-                     AND (updated_at_ms<?3 OR (updated_at_ms=?3 AND rowid<?4)) \
-                     ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?5",
+                    "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+                     FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+                     WHERE s.workspace_root=?1 AND s.title=?2 AND s.lifecycle <> 'materializing' \
+                     AND (s.updated_at_ms<?3 OR (s.updated_at_ms=?3 AND s.rowid<?4)) \
+                     ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?5",
                 )?;
                 let rows = statement.query_map(
                     params![
@@ -2602,42 +3469,16 @@ impl Storage {
         session_id: latte_core::SessionId,
     ) -> Result<Option<SessionSummary>, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let row = conn
-            .query_row(
-                "SELECT title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms \
-                 FROM sessions WHERE session_id=?1",
-                [session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(
-            |(title, workspace_root, parent, lifecycle, binding_json, created, updated)| {
-                let binding: SessionProviderBinding =
-                    serde_json::from_str(&binding_json).map_err(invalid_json)?;
-                Ok(SessionSummary {
-                    session_id,
-                    title,
-                    workspace_root,
-                    parent_session_id: parent.as_deref().map(parse_session_id).transpose()?,
-                    lifecycle: parse_lifecycle(&lifecycle)?,
-                    provider_name: binding.provider_name,
-                    model: binding.model,
-                    created_at_ms: from_i64(created)?,
-                    updated_at_ms: from_i64(updated)?,
-                })
-            },
+        conn.query_row(
+            "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+             FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+             WHERE s.session_id=?1 AND s.lifecycle <> 'materializing'",
+            [session_id.to_string()],
+            session_summary_row,
         )
-        .transpose()
+        .optional()
+        .map(|row| row.map(|(summary, _, _)| summary))
+        .map_err(Into::into)
     }
 
     pub(crate) fn search_sessions(
@@ -2653,10 +3494,11 @@ impl Storage {
         let query = query.trim().to_lowercase();
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT session_id,title,workspace_root,parent_session_id,lifecycle,binding_json,created_at_ms,updated_at_ms,rowid \
-             FROM sessions WHERE workspace_root=?1 AND \
-             (?2='' OR instr(lower(title),?2)>0 OR instr(lower(session_id),?2)>0) \
-             ORDER BY updated_at_ms DESC,rowid DESC LIMIT ?3",
+            "SELECT s.session_id,s.title,s.workspace_root,s.parent_session_id,s.lifecycle,s.binding_json,s.created_at_ms,s.updated_at_ms,s.rowid,w.project_key \
+             FROM sessions s LEFT JOIN workspaces w ON w.workspace_root=s.workspace_root \
+             WHERE s.workspace_root=?1 AND s.lifecycle <> 'materializing' AND \
+             (?2='' OR instr(lower(s.title),?2)>0 OR instr(lower(s.session_id),?2)>0) \
+             ORDER BY s.updated_at_ms DESC,s.rowid DESC LIMIT ?3",
         )?;
         let rows = statement.query_map(
             params![
@@ -2945,8 +3787,8 @@ impl Storage {
         let mut next_lifecycle = lifecycle;
         let mut card: Option<(TranscriptKind, String, Option<serde_json::Value>, String)> = None;
         let mut terminal = false;
-        let mut reconciliation_effect = None;
-        let mut checkpoint: Option<String> = None;
+        let mut reconciliation_effect: Option<latte_core::EffectId> = None;
+        let mut effect_stage_marker: Option<String> = None;
         match &request.update {
             CommitSessionTurnUpdate::Start { .. } => {
                 next = current
@@ -2976,14 +3818,14 @@ impl Storage {
                 canonical_descriptor_json,
                 policy,
                 description,
-                checkpoint_json,
+                effect_stage_marker_json,
             } => {
-                validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
                 serde_json::from_str::<serde_json::Value>(descriptor_json).map_err(invalid_json)?;
-                serde_json::from_str::<crate::SessionEffectDescriptor>(canonical_descriptor_json)
+                serde_json::from_str::<crate::EffectAuthority>(canonical_descriptor_json)
                     .map_err(invalid_json)?;
-                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(effect_stage_marker_json)
+                    .map_err(invalid_json)?;
                 if current.status != TurnStatus::Running {
                     return Err(StorageError::InvalidData(
                         "only a running linked child can prepare an effect".into(),
@@ -2993,14 +3835,14 @@ impl Storage {
                     SessionEffectPolicy::Allow => r#"{"session_policy":"allow"}"#,
                     SessionEffectPolicy::Ask => r#"{"session_policy":"ask"}"#,
                 };
-                tx.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,1,?4,?5,?6,?3)",params![effect_id,request.turn_id.to_string(),to_i64(now_ms)?,descriptor_json,operation_digest,pre_evidence])?;
+                tx.execute("INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt,descriptor_json,approval_digest,pre_evidence_json,prepared_at_ms) VALUES(?1,?2,'prepared',?3,1,?4,?5,?6,?3)",params![effect_id.as_str(),request.turn_id.to_string(),to_i64(now_ms)?,descriptor_json,operation_digest,pre_evidence])?;
                 tx.execute(
                     "INSERT INTO session_effect_canonical(effect_id,turn_id,descriptor_json) VALUES(?1,?2,?3)",
-                    params![effect_id, request.turn_id.to_string(), canonical_descriptor_json],
+                    params![effect_id.as_str(), request.turn_id.to_string(), canonical_descriptor_json],
                 )?;
                 if *policy == SessionEffectPolicy::Ask {
                     let pending = latte_core::PendingPermission {
-                        request_id: redact_session_text(effect_id),
+                        request_id: redact_session_text(effect_id.as_str()),
                         operation_digest: redact_session_text(operation_digest),
                         description: redact_session_text(description),
                     };
@@ -3013,7 +3855,7 @@ impl Storage {
                         .revision
                         .checked_add(2)
                         .ok_or_else(|| StorageError::InvalidData("revision overflow".into()))?;
-                    tx.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id,request.turn_id.to_string(),to_i64(post_approval_revision)?,lease.owner,to_i64(lease.fencing_token)?,operation_digest])?;
+                    tx.execute("INSERT INTO pending_permissions(effect_id,turn_id,turn_revision,lease_owner,lease_token,approval_digest) VALUES(?1,?2,?3,?4,?5,?6)",params![effect_id.as_str(),request.turn_id.to_string(),to_i64(post_approval_revision)?,lease.owner,to_i64(lease.fencing_token)?,operation_digest])?;
                 }
                 card = Some((
                     TranscriptKind::ToolCall,
@@ -3025,17 +3867,17 @@ impl Storage {
                     }))),
                     format!("{source_key}:card"),
                 ));
-                checkpoint = Some(checkpoint_json.clone());
+                effect_stage_marker = Some(effect_stage_marker_json.clone());
             }
             CommitSessionTurnUpdate::StartEffect {
                 source_key,
                 effect_id,
                 operation_digest,
-                checkpoint_json,
+                effect_stage_marker_json,
             } => {
-                validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
-                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(effect_stage_marker_json)
+                    .map_err(invalid_json)?;
                 if current.status != TurnStatus::Running
                     || current.pending_permission.is_some()
                     || current.pending_input.is_some()
@@ -3047,7 +3889,7 @@ impl Storage {
                 let prepared: Option<(String, String)> = tx
                     .query_row(
                         "SELECT approval_digest,pre_evidence_json FROM effects WHERE effect_id=?1 AND turn_id=?2 AND status='prepared'",
-                        params![effect_id, request.turn_id.to_string()],
+                        params![effect_id.as_str(), request.turn_id.to_string()],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
@@ -3062,7 +3904,7 @@ impl Storage {
                 let pending: Option<(i64, String, i64, Option<i64>)> = tx
                     .query_row(
                         "SELECT turn_revision,lease_owner,lease_token,consumed_at_ms FROM pending_permissions WHERE effect_id=?1 AND turn_id=?2",
-                        params![effect_id, request.turn_id.to_string()],
+                        params![effect_id.as_str(), request.turn_id.to_string()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
@@ -3078,7 +3920,7 @@ impl Storage {
                     }
                     tx.execute(
                         "UPDATE pending_permissions SET consumed_at_ms=?1 WHERE effect_id=?2 AND consumed_at_ms IS NULL",
-                        params![to_i64(now_ms)?, effect_id],
+                        params![to_i64(now_ms)?, effect_id.as_str()],
                     )?;
                 } else if policy_marker != r#"{"session_policy":"allow"}"# {
                     return Err(StorageError::InvalidData(
@@ -3087,7 +3929,7 @@ impl Storage {
                 }
                 let started = tx.execute(
                     "UPDATE effects SET status='started',started_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='prepared' AND approval_digest=?4",
-                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
+                    params![to_i64(now_ms)?,effect_id.as_str(),request.turn_id.to_string(),operation_digest],
                 )?;
                 if started != 1 {
                     return Err(StorageError::EffectFenced);
@@ -3103,11 +3945,11 @@ impl Storage {
                     TranscriptKind::System,
                     "tool started".into(),
                     Some(
-                        serde_json::json!({"effect_id":redact_session_text(effect_id),"status":"started"}),
+                        serde_json::json!({"effect_id":redact_session_text(effect_id.as_str()),"status":"started"}),
                     ),
                     format!("{source_key}:card"),
                 ));
-                checkpoint = Some(checkpoint_json.clone());
+                effect_stage_marker = Some(effect_stage_marker_json.clone());
             }
             CommitSessionTurnUpdate::ObserveEffect {
                 source_key,
@@ -3116,11 +3958,11 @@ impl Storage {
                 success,
                 result,
                 payload,
-                checkpoint_json,
+                effect_stage_marker_json,
             } => {
-                validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
-                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(effect_stage_marker_json)
+                    .map_err(invalid_json)?;
                 if current.status != TurnStatus::Running {
                     return Err(StorageError::InvalidData(
                         "effect observation requires a running linked child".into(),
@@ -3128,7 +3970,7 @@ impl Storage {
                 }
                 let changed = tx.execute(
                     "UPDATE effects SET status=?1,post_evidence_json=?2,observed_at_ms=?3 WHERE effect_id=?4 AND turn_id=?5 AND status='started' AND approval_digest=?6",
-                    params![if *success { "observed_success" } else { "observed_failed" },serde_json::to_string(&redact_session_value(serde_json::json!({"result":result,"payload":payload.clone()}))).map_err(invalid_json)?,to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
+                    params![if *success { "observed_success" } else { "observed_failed" },serde_json::to_string(&redact_session_value(serde_json::json!({"result":result,"payload":payload.clone()}))).map_err(invalid_json)?,to_i64(now_ms)?,effect_id.as_str(),request.turn_id.to_string(),operation_digest],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::EffectFenced);
@@ -3139,20 +3981,20 @@ impl Storage {
                     payload.clone().map(redact_session_value),
                     format!("{source_key}:card"),
                 ));
-                checkpoint = Some(checkpoint_json.clone());
+                effect_stage_marker = Some(effect_stage_marker_json.clone());
             }
             CommitSessionTurnUpdate::UnknownEffect {
                 source_key,
                 effect_id,
                 operation_digest,
-                checkpoint_json,
+                effect_stage_marker_json,
             } => {
-                validate_session_effect_id(effect_id)?;
                 validate_session_digest(operation_digest)?;
-                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(effect_stage_marker_json)
+                    .map_err(invalid_json)?;
                 let changed = tx.execute(
                     r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"uncertain"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='started' AND approval_digest=?4"#,
-                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string(),operation_digest],
+                    params![to_i64(now_ms)?,effect_id.as_str(),request.turn_id.to_string(),operation_digest],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::EffectFenced);
@@ -3165,28 +4007,30 @@ impl Storage {
                     .map_err(|error| StorageError::InvalidData(error.to_string()))?;
                 turn_changed = true;
                 terminal = true;
-                reconciliation_effect = Some(redact_session_text(effect_id));
+                let redacted_effect_id = redact_session_text(effect_id.as_str());
+                reconciliation_effect = Some(
+                    latte_core::EffectId::new(redacted_effect_id.clone())
+                        .map_err(StorageError::InvalidData)?,
+                );
                 next_lifecycle = "reconciliation_required".into();
                 card = Some((
                     TranscriptKind::Failure,
                     "effect outcome unknown; reconciliation required".into(),
-                    Some(
-                        serde_json::json!({"effect_id":redact_session_text(effect_id),"status":"unknown"}),
-                    ),
+                    Some(serde_json::json!({"effect_id":redacted_effect_id,"status":"unknown"})),
                     format!("{source_key}:card"),
                 ));
-                checkpoint = Some(checkpoint_json.clone());
+                effect_stage_marker = Some(effect_stage_marker_json.clone());
             }
             CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key,
                 effect_id,
-                checkpoint_json,
+                effect_stage_marker_json,
             } => {
-                validate_session_effect_id(effect_id)?;
-                serde_json::from_str::<serde_json::Value>(checkpoint_json).map_err(invalid_json)?;
+                serde_json::from_str::<serde_json::Value>(effect_stage_marker_json)
+                    .map_err(invalid_json)?;
                 let changed = tx.execute(
                     r#"UPDATE effects SET status='observed_failed',post_evidence_json='{"reconciliation":"acknowledged_failed"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='unknown'"#,
-                    params![to_i64(now_ms)?,effect_id,request.turn_id.to_string()],
+                    params![to_i64(now_ms)?,effect_id.as_str(),request.turn_id.to_string()],
                 )?;
                 if changed != 1 {
                     return Err(StorageError::InvalidData(
@@ -3213,7 +4057,7 @@ impl Storage {
                         code: FailureCode::RuntimeFailed,
                         message: format!(
                             "unknown effect {} acknowledged failed; turn aborted",
-                            redact_session_text(effect_id)
+                            redact_session_text(effect_id.as_str())
                         ),
                         retryability: Retryability::Terminal,
                     });
@@ -3227,7 +4071,7 @@ impl Storage {
                                 code: FailureCode::RuntimeFailed,
                                 message: format!(
                                     "unknown effect {} acknowledged failed; turn aborted",
-                                    redact_session_text(effect_id)
+                                    redact_session_text(effect_id.as_str())
                                 ),
                                 retryability: Retryability::Terminal,
                             }),
@@ -3241,11 +4085,11 @@ impl Storage {
                     TranscriptKind::Failure,
                     "unknown effect acknowledged failed; turn aborted".into(),
                     Some(
-                        serde_json::json!({"effect_id":redact_session_text(effect_id),"status":"reconciled"}),
+                        serde_json::json!({"effect_id":redact_session_text(effect_id.as_str()),"status":"reconciled"}),
                     ),
                     format!("{source_key}:card"),
                 ));
-                checkpoint = Some(checkpoint_json.clone());
+                effect_stage_marker = Some(effect_stage_marker_json.clone());
             }
             CommitSessionTurnUpdate::RequestPermission {
                 source_key,
@@ -3507,7 +4351,7 @@ impl Storage {
                     .filter(|record| {
                         record.revision == current.revision
                             && record.effect_epoch == effect_epoch
-                            && record.effect_id == *verification_effect_id
+                            && record.effect_id == verification_effect_id.as_str()
                             && record.passed
                             && record.workspace_manifest_digest == *verified_manifest_digest
                     })
@@ -3525,7 +4369,7 @@ impl Storage {
                     evidence: vec![Evidence {
                         name: format!(
                             "verification: {}",
-                            redact_session_text(verification_effect_id)
+                            redact_session_text(verification_effect_id.as_str())
                         ),
                         status: VerificationStatus::Passed,
                         summary: format!(
@@ -3581,7 +4425,12 @@ impl Storage {
                         || "failed".into(),
                         |value| redact_session_text(&value.message),
                     ),
-                    None,
+                    next.failure.as_ref().map(|value| {
+                        serde_json::json!({
+                            "code": value.code,
+                            "retryability": value.retryability,
+                        })
+                    }),
                     format!("{source_key}:card"),
                 ));
             }
@@ -3591,7 +4440,9 @@ impl Storage {
             } => {
                 reconciliation_effect = reconciliation_effect_id
                     .as_ref()
-                    .map(|value| redact_session_text(value));
+                    .map(|value| latte_core::EffectId::new(redact_session_text(value.as_str())))
+                    .transpose()
+                    .map_err(StorageError::InvalidData)?;
                 if matches!(
                     current.status,
                     TurnStatus::WaitingPermission | TurnStatus::WaitingInput
@@ -3635,12 +4486,15 @@ impl Storage {
                                 [request.turn_id.to_string()],
                                 |row| row.get::<_, String>(0),
                             )
-                            .optional()?;
+                            .optional()?
+                            .map(|value| latte_core::EffectId::new(redact_session_text(&value)))
+                            .transpose()
+                            .map_err(StorageError::InvalidData)?;
                     }
                     if let Some(effect_id) = reconciliation_effect.as_ref() {
                         tx.execute(
                             r#"UPDATE effects SET status='unknown',post_evidence_json='{"outcome":"cancelled_after_start"}',observed_at_ms=?1 WHERE effect_id=?2 AND turn_id=?3 AND status='started'"#,
-                            params![to_i64(now_ms)?, effect_id, request.turn_id.to_string()],
+                            params![to_i64(now_ms)?, effect_id.as_str(), request.turn_id.to_string()],
                         )?;
                     }
                     let cancelling = current
@@ -3661,10 +4515,17 @@ impl Storage {
                     TranscriptKind::Failure,
                     if reconciliation_effect.is_some() {
                         "effect outcome unknown; reconciliation required".into()
+                    } else if next.failure.is_some() {
+                        "run cancelled while waiting".into()
                     } else {
                         "turn interrupted".into()
                     },
-                    None,
+                    next.failure.as_ref().map(|value| {
+                        serde_json::json!({
+                            "code": value.code,
+                            "retryability": value.retryability,
+                        })
+                    }),
                     format!("{source_key}:card"),
                 ));
             }
@@ -3698,7 +4559,7 @@ impl Storage {
                 return Err(StorageError::LeaseLost);
             }
         }
-        if let Some(payload) = checkpoint {
+        if let Some(payload) = effect_stage_marker {
             tx.execute(
                 "INSERT INTO runtime_checkpoints(turn_id,payload_json,updated_at_ms) VALUES(?1,?2,?3) ON CONFLICT(turn_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at_ms=excluded.updated_at_ms",
                 params![request.turn_id.to_string(), payload, to_i64(now_ms)?],
@@ -3810,7 +4671,7 @@ impl Storage {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(Uuid::now_v7()),
             session_id: request.session_id,
-            revision: next_session_revision,
+            session_revision: next_session_revision,
             sequence: next_sequence,
             event,
         };
@@ -4238,7 +5099,7 @@ impl Storage {
     }
     pub(crate) fn finish_effect(
         &self,
-        authority: &EffectAuthority,
+        authority: &FencedEffectToken,
         success: bool,
         post_evidence_json: &str,
         now_ms: u64,
@@ -4261,7 +5122,7 @@ impl Storage {
     }
     pub(crate) fn mark_effect_unknown(
         &self,
-        authority: &EffectAuthority,
+        authority: &FencedEffectToken,
         now_ms: u64,
     ) -> Result<(), StorageError> {
         require_legacy_runtime_lease(&authority.lease)?;
@@ -4331,7 +5192,7 @@ impl Storage {
         lease: &Lease,
         digest: &str,
         now_ms: u64,
-    ) -> Result<EffectAuthority, StorageError> {
+    ) -> Result<FencedEffectToken, StorageError> {
         require_legacy_runtime_lease(lease)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4360,7 +5221,7 @@ impl Storage {
             |r| r.get(0),
         )?)?;
         tx.commit()?;
-        Ok(EffectAuthority {
+        Ok(FencedEffectToken {
             turn_id,
             expected_revision: turn_revision,
             lease: lease.clone(),
@@ -4450,7 +5311,7 @@ impl Storage {
         &self,
         effect_id: &str,
         turn_id: TurnId,
-    ) -> Result<crate::SessionEffectDescriptor, StorageError> {
+    ) -> Result<crate::EffectAuthority, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let json: String = conn.query_row(
             "SELECT descriptor_json FROM session_effect_canonical WHERE effect_id=?1 AND turn_id=?2",
@@ -5211,6 +6072,7 @@ fn session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(SessionSumm
     let created: i64 = row.get(6)?;
     let updated: i64 = row.get(7)?;
     let rowid: i64 = row.get(8)?;
+    let project_key: Option<String> = row.get(9)?;
     let binding: SessionProviderBinding = serde_json::from_str(&binding_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
     })?;
@@ -5220,6 +6082,16 @@ fn session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(SessionSumm
         })?,
         title,
         workspace_root,
+        project_key: project_key
+            .map(latte_core::ProjectKey::new)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    StorageError::InvalidData(error).into(),
+                )
+            })?,
         parent_session_id: parent
             .as_deref()
             .map(parse_session_id)
@@ -5399,11 +6271,28 @@ fn session_snapshot(
     after: Option<u64>,
     limit: usize,
 ) -> Result<SessionSnapshot, StorageError> {
-    let (revision, sequence, lifecycle, binding_json, latest, focus): (i64, i64, String, String, Option<String>, Option<String>) = connection
+    let (revision, sequence, lifecycle, binding_json, latest, focus): (
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = connection
         .query_row(
-            "SELECT revision,last_seq,lifecycle,binding_json,latest_turn_id,focus FROM sessions WHERE session_id=?1",
+            "SELECT revision,last_seq,lifecycle,binding_json,latest_turn_id,focus \
+             FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing'",
             [session_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?
         .ok_or(StorageError::SessionNotFound(session_id))?;
@@ -5458,7 +6347,7 @@ fn session_snapshot(
             Ok(SessionTurnSummary {
                 turn_id,
                 parent_turn_id,
-                ordinal: from_i64(ordinal)?,
+                turn_ordinal: from_i64(ordinal)?,
                 status: session_turn_status(state.status),
                 turn_revision: state.revision,
                 completed_at_ms: completed.map(from_i64).transpose()?,
@@ -5517,7 +6406,7 @@ fn session_snapshot(
     });
     Ok(SessionSnapshot {
         session_id,
-        revision: from_i64(revision)?,
+        session_revision: from_i64(revision)?,
         sequence: from_i64(sequence)?,
         lifecycle: parse_lifecycle(&lifecycle)?,
         binding,
@@ -5864,7 +6753,7 @@ fn recover_linked_session_turn(
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(Uuid::now_v7()),
             session_id,
-            revision: next_session_revision,
+            session_revision: next_session_revision,
             sequence: next_sequence,
             event: SessionEvent::TranscriptAppended { entry },
         };
@@ -5905,7 +6794,8 @@ fn recover_linked_session_turn(
     let final_event = if let Some(effect_id) = started_effect_ids.first() {
         SessionEvent::ReconciliationRequired {
             turn_id,
-            effect_id: redact_session_text(effect_id),
+            effect_id: latte_core::EffectId::new(redact_session_text(effect_id))
+                .map_err(StorageError::InvalidData)?,
         }
     } else {
         SessionEvent::LifecycleChanged {
@@ -5917,7 +6807,7 @@ fn recover_linked_session_turn(
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(Uuid::now_v7()),
         session_id,
-        revision: next_session_revision,
+        session_revision: next_session_revision,
         sequence: next_sequence,
         event: final_event,
     };
@@ -6041,12 +6931,53 @@ fn follow_up_command_digest(
     )
 }
 
+fn legacy_binding_json_value(binding: &SessionProviderBinding) -> serde_json::Value {
+    serde_json::json!({
+        "version": binding.binding_version,
+        "provider_name": binding.provider_name,
+        "provider_type": binding.provider_type,
+        "protocol": binding.protocol,
+        "model": binding.model,
+        "config_fingerprint": binding.config_fingerprint,
+        "tools_fingerprint": binding.tools_fingerprint,
+        "aliases": binding.aliases,
+        "credential_ref_id": binding.credential_ref_id,
+        "data_scope_id": binding.data_scope_id,
+        "credential_generation": binding.credential_generation,
+    })
+}
+
+/// Legacy digest reproducing the exact bytes a pre-Batch-3 `session.start`
+/// binary wrote when `SessionProviderBinding` serialized `version` instead of
+/// `binding_version`.
+fn legacy_v1_binding_create_command_digest(
+    session_id: latte_core::SessionId,
+    workspace_root: &str,
+    prompt: &str,
+    binding: &SessionProviderBinding,
+    focus: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::json!({
+        "operation": "session.start",
+        "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
+        "workspace": workspace_root,
+        "session_id": session_id.to_string(),
+        "prompt": prompt,
+        "binding": legacy_binding_json_value(binding),
+        "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
 /// Legacy digest reproducing the exact bytes a pre-rename (schema <13) binary
-/// wrote for a session-create command. The binding serializes identically and
-/// the protocol version value is unchanged, so only the operation namespace and
-/// the id/revision key names differ. A durable accept made before the upgrade
-/// stores this digest; on replay we accept either form so a retried request is
-/// recognized as the same command instead of a false `idempotency_mismatch`.
+/// wrote for a session-create command (`thread.start` + binding key `version`).
+/// A durable accept made before the upgrade stores this digest; on replay we
+/// accept either form so a retried request is recognized as the same command
+/// instead of a false `idempotency_mismatch`.
 ///
 /// Fixture-only: exposed so integration tests can reproduce a pre-rename
 /// durable-accept digest byte-for-byte; production replay never calls it.
@@ -6066,7 +6997,7 @@ pub fn legacy_create_command_digest(
         "workspace": workspace_root,
         "thread_id": session_id.to_string(),
         "prompt": prompt,
-        "binding": binding,
+        "binding": legacy_binding_json_value(binding),
         "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
     });
     format!(
@@ -6122,17 +7053,17 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
             canonical_descriptor_json: _,
             policy,
             description,
-            checkpoint_json,
+            effect_stage_marker_json,
         } => {
-            serde_json::json!({"kind":"prepare_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"descriptor":serde_json::from_str::<serde_json::Value>(descriptor_json).ok().map(redact_session_value),"policy":match policy { SessionEffectPolicy::Allow=>"allow", SessionEffectPolicy::Ask=>"ask"},"description":redact_session_text(description),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
+            serde_json::json!({"kind":"prepare_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id.as_str()),"operation_digest":redact_session_text(operation_digest),"descriptor":serde_json::from_str::<serde_json::Value>(descriptor_json).ok().map(redact_session_value),"policy":match policy { SessionEffectPolicy::Allow=>"allow", SessionEffectPolicy::Ask=>"ask"},"description":redact_session_text(description),"checkpoint":serde_json::from_str::<serde_json::Value>(effect_stage_marker_json).ok().map(redact_session_value)})
         }
         CommitSessionTurnUpdate::StartEffect {
             source_key,
             effect_id,
             operation_digest,
-            checkpoint_json,
+            effect_stage_marker_json,
         } => {
-            serde_json::json!({"kind":"start_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
+            serde_json::json!({"kind":"start_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id.as_str()),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(effect_stage_marker_json).ok().map(redact_session_value)})
         }
         CommitSessionTurnUpdate::ObserveEffect {
             source_key,
@@ -6141,24 +7072,24 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
             success,
             result,
             payload,
-            checkpoint_json,
+            effect_stage_marker_json,
         } => {
-            serde_json::json!({"kind":"observe_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"success":success,"result":redact_session_text(result),"payload":payload.clone().map(redact_session_value),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
+            serde_json::json!({"kind":"observe_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id.as_str()),"operation_digest":redact_session_text(operation_digest),"success":success,"result":redact_session_text(result),"payload":payload.clone().map(redact_session_value),"checkpoint":serde_json::from_str::<serde_json::Value>(effect_stage_marker_json).ok().map(redact_session_value)})
         }
         CommitSessionTurnUpdate::UnknownEffect {
             source_key,
             effect_id,
             operation_digest,
-            checkpoint_json,
+            effect_stage_marker_json,
         } => {
-            serde_json::json!({"kind":"unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
+            serde_json::json!({"kind":"unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id.as_str()),"operation_digest":redact_session_text(operation_digest),"checkpoint":serde_json::from_str::<serde_json::Value>(effect_stage_marker_json).ok().map(redact_session_value)})
         }
         CommitSessionTurnUpdate::ReconcileUnknownEffect {
             source_key,
             effect_id,
-            checkpoint_json,
+            effect_stage_marker_json,
         } => {
-            serde_json::json!({"kind":"reconcile_unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id),"checkpoint":serde_json::from_str::<serde_json::Value>(checkpoint_json).ok().map(redact_session_value)})
+            serde_json::json!({"kind":"reconcile_unknown_effect","source_key":redact_session_text(source_key),"effect_id":redact_session_text(effect_id.as_str()),"checkpoint":serde_json::from_str::<serde_json::Value>(effect_stage_marker_json).ok().map(redact_session_value)})
         }
         CommitSessionTurnUpdate::RequestPermission {
             source_key,
@@ -6200,7 +7131,7 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
             verified_manifest_digest,
             files_changed,
         } => {
-            serde_json::json!({"kind":"complete_verified","source_key":redact_session_text(source_key),"summary":redact_session_text(summary),"verification_effect_id":redact_session_text(verification_effect_id),"verified_manifest_digest":redact_session_text(verified_manifest_digest),"files_changed":files_changed.iter().map(|path|redact_session_text(path)).collect::<Vec<_>>()})
+            serde_json::json!({"kind":"complete_verified","source_key":redact_session_text(source_key),"summary":redact_session_text(summary),"verification_effect_id":redact_session_text(verification_effect_id.as_str()),"verified_manifest_digest":redact_session_text(verified_manifest_digest),"files_changed":files_changed.iter().map(|path|redact_session_text(path)).collect::<Vec<_>>()})
         }
         CommitSessionTurnUpdate::Fail {
             source_key,
@@ -6212,25 +7143,16 @@ fn session_command_digest(request: &SessionCommitRequest) -> Result<String, Stor
             source_key,
             reconciliation_effect_id,
         } => {
-            serde_json::json!({"kind":"interrupt","source_key":redact_session_text(source_key),"effect_id":reconciliation_effect_id.as_deref().map(redact_session_text)})
+            serde_json::json!({"kind":"interrupt","source_key":redact_session_text(source_key),"effect_id":reconciliation_effect_id.as_ref().map(|id| redact_session_text(id.as_str()))})
         }
     };
     let canonical = serde_json::json!({
         "session_id":request.session_id.to_string(), "command_id":request.command_id.to_string(), "turn_id":request.turn_id.to_string(),
         "expected_session_revision":request.expected_session_revision, "expected_turn_revision":request.expected_turn_revision,
-        "request_id":request.request_id.as_deref().map(redact_session_text), "effect_id":request.effect_id.as_deref().map(redact_session_text), "update":update
+        "request_id":request.request_id.as_deref().map(redact_session_text), "effect_id":request.effect_id.as_ref().map(|id| redact_session_text(id.as_str())), "update":update
     });
     let bytes = serde_json::to_vec(&canonical).map_err(invalid_json)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-fn validate_session_effect_id(value: &str) -> Result<(), StorageError> {
-    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
-        return Err(StorageError::InvalidData(
-            "invalid session effect id".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_session_digest(value: &str) -> Result<(), StorageError> {
@@ -6240,6 +7162,305 @@ fn validate_session_digest(value: &str) -> Result<(), StorageError> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn repair_effect_source_key(effect_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let candidate = format!("repair:effect:{effect_id}");
+    if candidate.len() <= 256 && !candidate.chars().any(char::is_control) {
+        candidate
+    } else {
+        format!(
+            "repair:effect:sha256:{:x}",
+            Sha256::digest(effect_id.as_bytes())
+        )
+    }
+}
+
+fn recovered_binding_from_entries(entries: &[TranscriptEntry]) -> SessionProviderBinding {
+    let valid_token = |value: &str| {
+        !value.trim().is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
+    };
+    let (provider_name, model) = entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            if entry.kind != TranscriptKind::System
+                || !entry.source_key.starts_with("session:model:")
+            {
+                return None;
+            }
+            let payload = entry.payload.as_ref()?;
+            let provider = payload
+                .get("provider_name")
+                .and_then(serde_json::Value::as_str)?;
+            let model = payload.get("model").and_then(serde_json::Value::as_str)?;
+            (valid_token(provider) && valid_token(model))
+                .then(|| (provider.to_owned(), model.to_owned()))
+        })
+        .unwrap_or_else(|| ("recovered".into(), "recovered".into()));
+    SessionProviderBinding {
+        binding_version: 1,
+        provider_name,
+        provider_type: "openai-chat".into(),
+        protocol: "openai-chat-completions-v1".into(),
+        model,
+        config_fingerprint: "recovered-from-jsonl".into(),
+        tools_fingerprint: "recovered-from-jsonl".into(),
+        aliases: std::collections::BTreeMap::new(),
+        credential_ref_id: "recovered:unbound".into(),
+        data_scope_id: "workspace".into(),
+        credential_generation: 0,
+    }
+}
+
+fn unreconciled_started_effects(turn_entries: &[&TranscriptEntry]) -> Vec<latte_core::EffectId> {
+    let mut tool_call_by_effect = std::collections::BTreeMap::<String, String>::new();
+    let mut pending = Vec::<latte_core::EffectId>::new();
+    for entry in turn_entries {
+        match entry.kind {
+            TranscriptKind::ToolCall => {
+                if let Some(descriptor) = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("descriptor"))
+                    && let (Some(effect_id), Some(tool_call_id)) = (
+                        descriptor
+                            .get("effect_id")
+                            .and_then(serde_json::Value::as_str),
+                        descriptor
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str),
+                    )
+                {
+                    tool_call_by_effect.insert(effect_id.to_owned(), tool_call_id.to_owned());
+                }
+            }
+            TranscriptKind::System => {
+                if entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("started")
+                    && let Some(raw_id) = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("effect_id"))
+                        .and_then(serde_json::Value::as_str)
+                    && let Ok(effect_id) = latte_core::EffectId::new(raw_id)
+                    && !pending.contains(&effect_id)
+                {
+                    pending.push(effect_id);
+                }
+            }
+            TranscriptKind::Failure => {
+                let status = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("status"))
+                    .and_then(serde_json::Value::as_str);
+                let raw_id = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("effect_id"))
+                    .and_then(serde_json::Value::as_str);
+                if status == Some("unknown")
+                    && let Some(raw_id) = raw_id
+                    && let Ok(effect_id) = latte_core::EffectId::new(raw_id)
+                    && !pending.contains(&effect_id)
+                {
+                    pending.push(effect_id);
+                } else if status == Some("reconciled")
+                    && let Some(raw_id) = raw_id
+                {
+                    pending.retain(|candidate| candidate.as_str() != raw_id);
+                }
+            }
+            TranscriptKind::ToolResult => {
+                let by_effect = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("effect_id"))
+                    .and_then(serde_json::Value::as_str);
+                let by_call = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("tool_call_id"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(effect_id) = by_effect {
+                    pending.retain(|candidate| candidate.as_str() != effect_id);
+                } else if let Some(call_id) = by_call
+                    && let Some(pos) = pending.iter().position(|candidate| {
+                        tool_call_by_effect
+                            .get(candidate.as_str())
+                            .map(String::as_str)
+                            == Some(call_id)
+                    })
+                {
+                    pending.remove(pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconstruct_turn_from_entries(
+    turn_id: TurnId,
+    turn_entries: &[&TranscriptEntry],
+    unreconciled: &[latte_core::EffectId],
+    has_later_turn: bool,
+) -> (TurnState, &'static str) {
+    if !unreconciled.is_empty() {
+        return (
+            TurnState {
+                turn_id,
+                revision: 2,
+                status: TurnStatus::Interrupted,
+                pending_permission: None,
+                pending_input: None,
+                failure: None,
+                handoff: None,
+            },
+            "reconciliation_required",
+        );
+    }
+    if let Some(completion) = turn_entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == TranscriptKind::Completion)
+    {
+        let handoff = completion
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("handoff").or(Some(payload)))
+            .and_then(|value| serde_json::from_value::<Handoff>(value.clone()).ok())
+            .map_or_else(
+                || Handoff {
+                    summary: redact_session_text(&completion.text),
+                    files_changed: Vec::new(),
+                    evidence: Vec::new(),
+                },
+                |handoff| redact_handoff(&handoff),
+            );
+        return (
+            TurnState {
+                turn_id,
+                revision: 2,
+                status: TurnStatus::Completed,
+                pending_permission: None,
+                pending_input: None,
+                failure: None,
+                handoff: Some(handoff),
+            },
+            "ready",
+        );
+    }
+    if let Some(failure_entry) = turn_entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == TranscriptKind::Failure)
+    {
+        let payload = failure_entry.payload.as_ref();
+        let is_denied = payload
+            .and_then(|value| value.get("provider_tool_round_aborted"))
+            .and_then(serde_json::Value::as_str)
+            == Some("permission_denied")
+            || failure_entry.text == "permission denied";
+        let is_reconciled = payload
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("reconciled");
+        if is_denied {
+            return (
+                TurnState {
+                    turn_id,
+                    revision: 2,
+                    status: TurnStatus::Failed,
+                    pending_permission: None,
+                    pending_input: None,
+                    failure: Some(TurnFailure {
+                        code: FailureCode::PermissionDenied,
+                        message: redact_session_text(&failure_entry.text),
+                        retryability: Retryability::Terminal,
+                    }),
+                    handoff: None,
+                },
+                "ready",
+            );
+        }
+        if failure_entry.text == "turn interrupted" {
+            return (
+                TurnState {
+                    turn_id,
+                    revision: 2,
+                    status: TurnStatus::Interrupted,
+                    pending_permission: None,
+                    pending_input: None,
+                    failure: None,
+                    handoff: None,
+                },
+                "interrupted",
+            );
+        }
+        let explicit_code = payload
+            .and_then(|value| value.get("code"))
+            .and_then(|value| serde_json::from_value::<FailureCode>(value.clone()).ok());
+        let explicit_retryability = payload
+            .and_then(|value| value.get("retryability"))
+            .and_then(|value| serde_json::from_value::<Retryability>(value.clone()).ok());
+        let retryable = explicit_retryability.map_or_else(
+            || {
+                !is_reconciled
+                    && (has_later_turn
+                        || failure_entry.text.starts_with("provider ")
+                        || failure_entry.text.starts_with("session ")
+                        || failure_entry.text.starts_with("tool round limit"))
+            },
+            |value| value == Retryability::Retryable,
+        );
+        let code =
+            explicit_code.unwrap_or(if failure_entry.text == "run cancelled while waiting" {
+                FailureCode::Cancelled
+            } else {
+                FailureCode::RuntimeFailed
+            });
+        return (
+            TurnState {
+                turn_id,
+                revision: 2,
+                status: TurnStatus::Failed,
+                pending_permission: None,
+                pending_input: None,
+                failure: Some(TurnFailure {
+                    code,
+                    message: redact_session_text(&failure_entry.text),
+                    retryability: if retryable {
+                        Retryability::Retryable
+                    } else {
+                        Retryability::Terminal
+                    },
+                }),
+                handoff: None,
+            },
+            if retryable { "ready" } else { "failed" },
+        );
+    }
+    (
+        TurnState {
+            turn_id,
+            revision: 2,
+            status: TurnStatus::Interrupted,
+            pending_permission: None,
+            pending_input: None,
+            failure: None,
+            handoff: None,
+        },
+        "interrupted",
+    )
 }
 
 #[cfg(test)]
@@ -7336,7 +8557,7 @@ mod tests {
         next.model = "other-model".into();
         next.config_fingerprint = "other-config".into();
         let switched = store
-            .switch_session_binding_v2(session_id, ready.revision, &next, &lease, 14)
+            .switch_session_binding_v2(session_id, ready.session_revision, &next, &lease, 14)
             .unwrap();
         assert_eq!(switched.snapshot.binding, next);
         assert_eq!(switched.snapshot.lifecycle, SessionLifecycle::Ready);
@@ -7358,7 +8579,7 @@ mod tests {
         assert!(matches!(
             store.switch_session_binding_v2(
                 session_id,
-                switched.snapshot.revision,
+                switched.snapshot.session_revision,
                 &session_binding(),
                 &foreign,
                 16
@@ -7525,7 +8746,7 @@ mod tests {
                 &SessionCommitRequest {
                     session_id,
                     turn_id: linked_turn,
-                    expected_session_revision: queued_session.revision,
+                    expected_session_revision: queued_session.session_revision,
                     expected_turn_revision: 0,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -7706,7 +8927,7 @@ mod tests {
             store.declare_effect(id, run, 1, "{}", 2).unwrap();
             store.prepare_effect(id, "d", "{}", 3).unwrap();
             store.start_prepared_effect(id, "d", 4).unwrap();
-            let authority = EffectAuthority {
+            let authority = FencedEffectToken {
                 turn_id: run,
                 expected_revision: 0,
                 lease: lease.clone(),
@@ -7943,7 +9164,7 @@ mod tests {
         let session = SessionId::from_uuid(ids.next_uuid_v7());
         let first = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -8029,7 +9250,7 @@ mod tests {
             .create_session_follow_up_v2(
                 session,
                 child,
-                completed.snapshot.revision,
+                completed.snapshot.session_revision,
                 "next",
                 &std::collections::BTreeMap::new(),
                 7,
@@ -8054,7 +9275,7 @@ mod tests {
         let session = SessionId::from_uuid(ids.next_uuid_v7());
         let turn = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -8152,7 +9373,7 @@ mod tests {
         let session = SessionId::from_uuid(ids.next_uuid_v7());
         let turn = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -8223,7 +9444,7 @@ mod tests {
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -8293,7 +9514,7 @@ mod tests {
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -8898,6 +10119,8 @@ mod tests {
         let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let command_id = SessionCommandId::from_uuid(ids.next_uuid_v7());
         let source_key = "source".to_owned();
+        let effect_id: latte_core::EffectId = "effect".parse().unwrap();
+        let verification_effect_id: latte_core::EffectId = "verification".parse().unwrap();
         let updates = vec![
             CommitSessionTurnUpdate::Start {
                 source_key: source_key.clone(),
@@ -8910,39 +10133,39 @@ mod tests {
             },
             CommitSessionTurnUpdate::PrepareEffect {
                 source_key: source_key.clone(),
-                effect_id: "effect".into(),
+                effect_id: effect_id.clone(),
                 operation_digest: "a".repeat(64),
                 descriptor_json: r#"{"name":"write_file"}"#.into(),
                 canonical_descriptor_json: r#"{"api_key":"sk-private-secret-123456789"}"#.into(),
                 policy: SessionEffectPolicy::Ask,
                 description: "prepare".into(),
-                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
             },
             CommitSessionTurnUpdate::StartEffect {
                 source_key: source_key.clone(),
-                effect_id: "effect".into(),
+                effect_id: effect_id.clone(),
                 operation_digest: "a".repeat(64),
-                checkpoint_json: r#"{"phase":"started"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
             },
             CommitSessionTurnUpdate::ObserveEffect {
                 source_key: source_key.clone(),
-                effect_id: "effect".into(),
+                effect_id: effect_id.clone(),
                 operation_digest: "a".repeat(64),
                 success: true,
                 result: "observed".into(),
                 payload: Some(serde_json::json!({"result":"ok"})),
-                checkpoint_json: r#"{"phase":"observed"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"observed"}"#.into(),
             },
             CommitSessionTurnUpdate::UnknownEffect {
                 source_key: source_key.clone(),
-                effect_id: "effect".into(),
+                effect_id: effect_id.clone(),
                 operation_digest: "a".repeat(64),
-                checkpoint_json: r#"{"phase":"unknown"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"unknown"}"#.into(),
             },
             CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key: source_key.clone(),
-                effect_id: "effect".into(),
-                checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
+                effect_id: effect_id.clone(),
+                effect_stage_marker_json: r#"{"phase":"reconciled"}"#.into(),
             },
             CommitSessionTurnUpdate::RequestPermission {
                 source_key: source_key.clone(),
@@ -8985,7 +10208,7 @@ mod tests {
             CommitSessionTurnUpdate::CompleteVerified {
                 source_key: source_key.clone(),
                 summary: "verified".into(),
-                verification_effect_id: "verification".into(),
+                verification_effect_id,
                 verified_manifest_digest: "c".repeat(64),
                 files_changed: vec!["a.txt".into()],
             },
@@ -8999,7 +10222,7 @@ mod tests {
             },
             CommitSessionTurnUpdate::Interrupt {
                 source_key: source_key.clone(),
-                reconciliation_effect_id: Some("effect".into()),
+                reconciliation_effect_id: Some(effect_id.clone()),
             },
         ];
 
@@ -9013,7 +10236,7 @@ mod tests {
                 expected_turn_revision: 3,
                 command_id,
                 request_id: Some("request".into()),
-                effect_id: Some("effect".into()),
+                effect_id: Some(effect_id.clone()),
                 update: update.clone(),
             };
             let digest = session_command_digest(&request).unwrap();
@@ -9043,7 +10266,7 @@ mod tests {
             expected_turn_revision: 3,
             command_id,
             request_id: Some("request".into()),
-            effect_id: Some("effect".into()),
+            effect_id: Some(effect_id.clone()),
             update,
         };
         assert_eq!(
@@ -9058,12 +10281,12 @@ mod tests {
         use latte_core::{PendingInput, PendingPermission};
         for invalid in ["", "line\nbreak"] {
             assert!(validate_session_source(invalid).is_err());
-            assert!(validate_session_effect_id(invalid).is_err());
+            assert!(latte_core::EffectId::new(invalid).is_err());
         }
         assert!(validate_session_source(&"s".repeat(257)).is_err());
-        assert!(validate_session_effect_id(&"e".repeat(513)).is_err());
+        assert!(latte_core::EffectId::new("e".repeat(513)).is_err());
         validate_session_source(&"s".repeat(256)).unwrap();
-        validate_session_effect_id(&"e".repeat(512)).unwrap();
+        latte_core::EffectId::new("e".repeat(512)).unwrap();
 
         for invalid in ["a".repeat(63), "g".repeat(64), "a".repeat(65)] {
             assert!(validate_session_digest(&invalid).is_err());
@@ -9101,7 +10324,7 @@ mod tests {
 
     fn session_binding() -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "provider".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -9157,7 +10380,7 @@ mod tests {
                 &SessionCommitRequest {
                     session_id: snapshot.session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -9245,7 +10468,7 @@ mod tests {
                 &SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: failed.revision,
+                    expected_session_revision: failed.session_revision,
                     expected_turn_revision: failed.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -9306,7 +10529,7 @@ mod tests {
                 &SessionCommitRequest {
                     session_id: ready_session,
                     turn_id: ready_turn,
-                    expected_session_revision: completed.revision,
+                    expected_session_revision: completed.session_revision,
                     expected_turn_revision: completed.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -9369,7 +10592,7 @@ mod tests {
         )
         .snapshot;
         assert_eq!(current.lifecycle, SessionLifecycle::Ready);
-        let base_revision = current.revision;
+        let base_revision = current.session_revision;
 
         // The Complete released the turn lease in its commit. A manual
         // `/compact` is a separate command on the idle session and acquires
@@ -9395,7 +10618,7 @@ mod tests {
         )
         .snapshot;
         assert_eq!(current.lifecycle, SessionLifecycle::Ready);
-        assert_eq!(current.revision, base_revision + 1);
+        assert_eq!(current.session_revision, base_revision + 1);
         assert!(
             current
                 .transcript
@@ -9424,7 +10647,7 @@ mod tests {
         )
         .snapshot;
         assert_eq!(current.lifecycle, SessionLifecycle::Ready);
-        assert_eq!(current.revision, base_revision + 2);
+        assert_eq!(current.session_revision, base_revision + 2);
         assert!(
             current
                 .transcript
@@ -9439,7 +10662,7 @@ mod tests {
                 &SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: current.revision,
+                    expected_session_revision: current.session_revision,
                     expected_turn_revision: current.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -9479,8 +10702,8 @@ mod tests {
             12,
         )
         .snapshot;
-        let descriptor = crate::SessionEffectDescriptor {
-            effect_id: "rebind-effect".into(),
+        let descriptor = crate::EffectAuthority {
+            effect_id: "rebind-effect".parse().unwrap(),
             tool_call_id: "rebind-call".into(),
             name: "write_file".into(),
             input: serde_json::json!({
@@ -9501,11 +10724,14 @@ mod tests {
                 source_key: "rebind:prepare".into(),
                 effect_id: descriptor.effect_id.clone(),
                 operation_digest: old_digest.clone(),
-                descriptor_json: serde_json::to_string(&descriptor).unwrap(),
+                descriptor_json: serde_json::to_string(&crate::EffectView::from_authority(
+                    &descriptor,
+                ))
+                .unwrap(),
                 canonical_descriptor_json: serde_json::to_string(&descriptor).unwrap(),
                 policy: SessionEffectPolicy::Ask,
                 description: "write rebound.txt".into(),
-                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
             },
             13,
         )
@@ -9522,7 +10748,7 @@ mod tests {
         assert!(second.fencing_token > first.fencing_token);
 
         let mut mismatched_descriptor = descriptor.clone();
-        mismatched_descriptor.effect_id = "different-effect".into();
+        mismatched_descriptor.effect_id = "different-effect".parse().unwrap();
         reopened
             .connection
             .lock()
@@ -9531,7 +10757,7 @@ mod tests {
                 "UPDATE session_effect_canonical SET descriptor_json=?1 WHERE effect_id=?2",
                 params![
                     serde_json::to_string(&mismatched_descriptor).unwrap(),
-                    descriptor.effect_id
+                    descriptor.effect_id.as_str()
                 ],
             )
             .unwrap();
@@ -9544,9 +10770,9 @@ mod tests {
             .resolve_session_effect_permission(
                 session_id,
                 turn_id,
-                preserved.revision,
+                preserved.session_revision,
                 preserved.turns[0].turn_revision,
-                descriptor.effect_id.clone(),
+                descriptor.effect_id.to_string(),
                 "rebind:bad-identifier".into(),
                 true,
                 latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
@@ -9567,7 +10793,7 @@ mod tests {
                 "UPDATE session_effect_canonical SET descriptor_json=?1 WHERE effect_id=?2",
                 params![
                     serde_json::to_string(&descriptor).unwrap(),
-                    descriptor.effect_id
+                    descriptor.effect_id.as_str()
                 ],
             )
             .unwrap();
@@ -9575,9 +10801,9 @@ mod tests {
             .resolve_session_effect_permission(
                 session_id,
                 turn_id,
-                preserved.revision,
+                preserved.session_revision,
                 u64::MAX,
-                descriptor.effect_id.clone(),
+                descriptor.effect_id.to_string(),
                 "rebind:overflow".into(),
                 true,
                 latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
@@ -9593,14 +10819,14 @@ mod tests {
                 &SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: preserved.revision,
+                    expected_session_revision: preserved.session_revision,
                     expected_turn_revision: preserved.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    request_id: Some(descriptor.effect_id.clone()),
+                    request_id: Some(descriptor.effect_id.to_string()),
                     effect_id: Some(descriptor.effect_id.clone()),
                     update: CommitSessionTurnUpdate::ResolvePermission {
                         source_key: "rebind:allow".into(),
-                        request_id: descriptor.effect_id.clone(),
+                        request_id: descriptor.effect_id.to_string(),
                         allow: true,
                         rebound_operation_digest: digest,
                     },
@@ -9615,7 +10841,7 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE pending_permissions SET approval_digest=?1 WHERE effect_id=?2",
-                params!["c".repeat(64), descriptor.effect_id],
+                params!["c".repeat(64), descriptor.effect_id.as_str()],
             )
             .unwrap();
         assert!(
@@ -9630,7 +10856,7 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE pending_permissions SET approval_digest=?1 WHERE effect_id=?2",
-                params![old_digest, descriptor.effect_id],
+                params![old_digest, descriptor.effect_id.as_str()],
             )
             .unwrap();
         assert!(matches!(resolve(None), Err(StorageError::LeaseLost)));
@@ -9672,7 +10898,7 @@ mod tests {
         assert_eq!(allowed.lifecycle, SessionLifecycle::Running);
         assert_eq!(
             reopened
-                .session_effect_digest(&descriptor.effect_id)
+                .session_effect_digest(descriptor.effect_id.as_str())
                 .unwrap(),
             rebound_digest
         );
@@ -9686,13 +10912,15 @@ mod tests {
                 source_key: "rebind:started".into(),
                 effect_id: descriptor.effect_id.clone(),
                 operation_digest: rebound_digest,
-                checkpoint_json: r#"{"phase":"started"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
             },
             16,
         );
         assert_eq!(started.snapshot.lifecycle, SessionLifecycle::Running);
         assert_eq!(
-            reopened.effect_status(&descriptor.effect_id).unwrap(),
+            reopened
+                .effect_status(descriptor.effect_id.as_str())
+                .unwrap(),
             EffectStatus::Started
         );
 
@@ -9735,11 +10963,11 @@ mod tests {
                 &SessionCommitRequest {
                     session_id: generic_session,
                     turn_id: generic_turn,
-                    expected_session_revision: generic_waiting.revision,
+                    expected_session_revision: generic_waiting.session_revision,
                     expected_turn_revision: generic_waiting.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: Some("generic-permission".into()),
-                    effect_id: Some("generic-permission".into()),
+                    effect_id: Some("generic-permission".parse().unwrap()),
                     update: CommitSessionTurnUpdate::ResolvePermission {
                         source_key: "generic:allow".into(),
                         request_id: "generic-permission".into(),
@@ -9787,7 +11015,7 @@ mod tests {
         let append = SessionCommitRequest {
             session_id,
             turn_id,
-            expected_session_revision: snapshot.revision,
+            expected_session_revision: snapshot.session_revision,
             expected_turn_revision: snapshot.turns[0].turn_revision,
             command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
             request_id: None,
@@ -9994,7 +11222,7 @@ mod tests {
             .create_session_follow_up_v2(
                 denied_session,
                 retry_run,
-                denied.snapshot.revision,
+                denied.snapshot.session_revision,
                 "continue after denial",
                 &std::collections::BTreeMap::new(),
                 25,
@@ -10027,10 +11255,10 @@ mod tests {
         )
         .snapshot;
 
-        let effect_id = "effect-1";
+        let effect_id: latte_core::EffectId = "effect-1".parse().unwrap();
         let digest = "c".repeat(64);
-        let canonical_descriptor = crate::SessionEffectDescriptor {
-            effect_id: effect_id.into(),
+        let canonical_descriptor = crate::EffectAuthority {
+            effect_id: effect_id.clone(),
             tool_call_id: "provider-call-1".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"a.txt"}),
@@ -10045,24 +11273,24 @@ mod tests {
             turn_id,
             CommitSessionTurnUpdate::PrepareEffect {
                 source_key: "effect:prepare".into(),
-                effect_id: effect_id.into(),
+                effect_id: effect_id.clone(),
                 operation_digest: digest.clone(),
                 descriptor_json: r#"{"name":"read_file","input":{"path":"a.txt"}}"#.into(),
                 canonical_descriptor_json: canonical.clone(),
                 policy: SessionEffectPolicy::Allow,
                 description: "read a.txt".into(),
-                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
             },
             103,
         )
         .snapshot;
         assert_eq!(
-            store.effect_status(effect_id).unwrap(),
+            store.effect_status(effect_id.as_str()).unwrap(),
             EffectStatus::Prepared
         );
         assert_eq!(
             store
-                .session_effect_canonical_descriptor(effect_id, turn_id)
+                .session_effect_canonical_descriptor(effect_id.as_str(), turn_id)
                 .unwrap(),
             canonical_descriptor
         );
@@ -10074,15 +11302,15 @@ mod tests {
             turn_id,
             CommitSessionTurnUpdate::StartEffect {
                 source_key: "effect:start".into(),
-                effect_id: effect_id.into(),
+                effect_id: effect_id.clone(),
                 operation_digest: digest,
-                checkpoint_json: r#"{"phase":"started"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
             },
             104,
         )
         .snapshot;
         assert_eq!(
-            store.effect_status(effect_id).unwrap(),
+            store.effect_status(effect_id.as_str()).unwrap(),
             EffectStatus::Started
         );
 
@@ -10103,12 +11331,12 @@ mod tests {
             SessionLifecycle::ReconciliationRequired
         );
         assert_eq!(
-            store.effect_status(effect_id).unwrap(),
+            store.effect_status(effect_id.as_str()).unwrap(),
             EffectStatus::Unknown
         );
         assert_eq!(
             store.unknown_effects_for_turn(turn_id).unwrap(),
-            vec![effect_id.to_owned()]
+            vec![effect_id.to_string()]
         );
         // The interrupt terminalized and released the turn's lease; a
         // reconcile is a separate recovery command that acquires its own fresh
@@ -10126,14 +11354,14 @@ mod tests {
             turn_id,
             CommitSessionTurnUpdate::ReconcileUnknownEffect {
                 source_key: "effect:reconcile".into(),
-                effect_id: effect_id.into(),
-                checkpoint_json: r#"{"phase":"reconciled"}"#.into(),
+                effect_id: effect_id.clone(),
+                effect_stage_marker_json: r#"{"phase":"reconciled"}"#.into(),
             },
             106,
         );
         assert_eq!(reconciled.snapshot.lifecycle, SessionLifecycle::Failed);
         assert_eq!(
-            store.effect_status(effect_id).unwrap(),
+            store.effect_status(effect_id.as_str()).unwrap(),
             EffectStatus::ObservedFailed
         );
         assert!(store.unknown_effects_for_turn(turn_id).unwrap().is_empty());
@@ -10159,13 +11387,13 @@ mod tests {
                 111,
             )
             .snapshot;
-            let observed_effect = format!("effect-{suffix}");
+            let observed_effect: latte_core::EffectId = format!("effect-{suffix}").parse().unwrap();
             let observed_digest = if success {
                 "d".repeat(64)
             } else {
                 "e".repeat(64)
             };
-            let observed_canonical = serde_json::to_string(&crate::SessionEffectDescriptor {
+            let observed_canonical = serde_json::to_string(&crate::EffectAuthority {
                 effect_id: observed_effect.clone(),
                 tool_call_id: format!("call-{suffix}"),
                 name: "read_file".into(),
@@ -10187,7 +11415,7 @@ mod tests {
                     canonical_descriptor_json: observed_canonical,
                     policy: SessionEffectPolicy::Allow,
                     description: "read".into(),
-                    checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                    effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
                 },
                 112,
             )
@@ -10202,7 +11430,7 @@ mod tests {
                     source_key: format!("{suffix}:start-effect"),
                     effect_id: observed_effect.clone(),
                     operation_digest: observed_digest.clone(),
-                    checkpoint_json: r#"{"phase":"started"}"#.into(),
+                    effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
                 },
                 113,
             )
@@ -10220,11 +11448,14 @@ mod tests {
                     success,
                     result: suffix.into(),
                     payload: Some(serde_json::json!({"case":suffix})),
-                    checkpoint_json: r#"{"phase":"observed"}"#.into(),
+                    effect_stage_marker_json: r#"{"phase":"observed"}"#.into(),
                 },
                 114,
             );
-            assert_eq!(store.effect_status(&observed_effect).unwrap(), expected);
+            assert_eq!(
+                store.effect_status(observed_effect.as_str()).unwrap(),
+                expected
+            );
             assert_eq!(observed.snapshot.lifecycle, SessionLifecycle::Running);
             assert_eq!(
                 observed.snapshot.transcript.entries.last().unwrap().kind,
@@ -10266,7 +11497,7 @@ mod tests {
                 .create_session_follow_up_v2(
                     session_id,
                     follow_up,
-                    queued.revision,
+                    queued.session_revision,
                     " ",
                     &baseline,
                     12,
@@ -10279,7 +11510,7 @@ mod tests {
             store.create_session_follow_up_v2(
                 session_id,
                 follow_up,
-                queued.revision + 1,
+                queued.session_revision + 1,
                 "next",
                 &baseline,
                 12,
@@ -10291,7 +11522,7 @@ mod tests {
                 .create_session_follow_up_v2(
                     session_id,
                     follow_up,
-                    queued.revision,
+                    queued.session_revision,
                     "next",
                     &baseline,
                     12,
@@ -10323,7 +11554,7 @@ mod tests {
             store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    queued.revision,
+                    queued.session_revision,
                     0,
                     turn_id,
                 ),
@@ -10336,7 +11567,7 @@ mod tests {
             store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    queued.revision + 1,
+                    queued.session_revision + 1,
                     0,
                     turn_id,
                 ),
@@ -10350,7 +11581,7 @@ mod tests {
             store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    queued.revision,
+                    queued.session_revision,
                     0,
                     other_turn,
                 ),
@@ -10363,7 +11594,7 @@ mod tests {
             store.commit_session_turn_update(
                 &start(
                     latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    queued.revision,
+                    queued.session_revision,
                     1,
                     turn_id,
                 ),
@@ -10373,8 +11604,8 @@ mod tests {
             Err(StorageError::StaleRevision { .. })
         ));
 
-        let canonical = crate::SessionEffectDescriptor {
-            effect_id: "effect-matrix".into(),
+        let canonical = crate::EffectAuthority {
+            effect_id: "effect-matrix".parse().unwrap(),
             tool_call_id: "call_matrix".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"a.txt"}),
@@ -10385,20 +11616,20 @@ mod tests {
                        source: &str| SessionCommitRequest {
             session_id,
             turn_id,
-            expected_session_revision: snapshot.revision,
+            expected_session_revision: snapshot.session_revision,
             expected_turn_revision: snapshot.turns[0].turn_revision,
             command_id,
             request_id: None,
-            effect_id: Some("effect-matrix".into()),
+            effect_id: Some("effect-matrix".parse().unwrap()),
             update: CommitSessionTurnUpdate::PrepareEffect {
                 source_key: source.into(),
-                effect_id: "effect-matrix".into(),
+                effect_id: "effect-matrix".parse().unwrap(),
                 operation_digest: "a".repeat(64),
                 descriptor_json: r#"{"name":"read_file","input":{"path":"a.txt"}}"#.into(),
                 canonical_descriptor_json: serde_json::to_string(&canonical).unwrap(),
                 policy: SessionEffectPolicy::Allow,
                 description: "read a.txt".into(),
-                checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
             },
         };
         assert!(
@@ -10434,16 +11665,16 @@ mod tests {
                     &SessionCommitRequest {
                         session_id,
                         turn_id,
-                        expected_session_revision: running.revision,
+                        expected_session_revision: running.session_revision,
                         expected_turn_revision: running.turns[0].turn_revision,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
-                        effect_id: Some("missing-effect".into()),
+                        effect_id: Some("missing-effect".parse().unwrap()),
                         update: CommitSessionTurnUpdate::StartEffect {
                             source_key: "missing:start".into(),
-                            effect_id: "missing-effect".into(),
+                            effect_id: "missing-effect".parse().unwrap(),
                             operation_digest: "b".repeat(64),
-                            checkpoint_json: "{}".into(),
+                            effect_stage_marker_json: "{}".into(),
                         },
                     },
                     &lease,
@@ -10469,16 +11700,16 @@ mod tests {
             |snapshot: &SessionSnapshot, digest: String, source: &str| SessionCommitRequest {
                 session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: snapshot.turns[0].turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: Some("effect-matrix".into()),
-                effect_id: Some("effect-matrix".into()),
+                effect_id: Some("effect-matrix".parse().unwrap()),
                 update: CommitSessionTurnUpdate::StartEffect {
                     source_key: source.into(),
-                    effect_id: "effect-matrix".into(),
+                    effect_id: "effect-matrix".parse().unwrap(),
                     operation_digest: digest,
-                    checkpoint_json: r#"{"phase":"started"}"#.into(),
+                    effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
                 },
             };
         assert!(
@@ -10504,19 +11735,19 @@ mod tests {
             SessionCommitRequest {
                 session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: snapshot.turns[0].turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: Some(effect.into()),
-                effect_id: Some(effect.into()),
+                effect_id: Some(effect.parse().unwrap()),
                 update: CommitSessionTurnUpdate::ObserveEffect {
                     source_key: source.into(),
-                    effect_id: effect.into(),
+                    effect_id: effect.parse().unwrap(),
                     operation_digest: digest,
                     success: true,
                     result: "ok".into(),
                     payload: Some(serde_json::json!({"safe":true})),
-                    checkpoint_json: r#"{"phase":"observed"}"#.into(),
+                    effect_stage_marker_json: r#"{"phase":"observed"}"#.into(),
                 },
             }
         };
@@ -10572,13 +11803,13 @@ mod tests {
                 .iter()
                 .any(|s| s.session_id == session_id)
         );
-        let boundary = |snapshot: &SessionSnapshot, update: CommitSessionTurnUpdate| store.commit_session_turn_update(&SessionCommitRequest { session_id, turn_id, expected_session_revision: snapshot.revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_turn(turn_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = TurnStatus::Failed; store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&failed_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".into(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, checkpoint_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&running_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".into(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitSessionTurnUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".into(), operation_digest: "a".repeat(64), checkpoint_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".into(), checkpoint_json: "{}".into() }).unwrap().snapshot.lifecycle, SessionLifecycle::Failed); let (ask_session, ask_turn, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask_lease = store.acquire_session_lease(ask_session, 30, 10_000).unwrap(); let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::SessionEffectDescriptor { effect_id: "ask-matrix".into(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
-        let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: SessionEffectPolicy::Ask, description: "ask".into(), checkpoint_json: "{}".into() }, 32).snapshot;
-        let start_ask = |snapshot: &SessionSnapshot, source: &str| store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: snapshot.revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".into()), update: CommitSessionTurnUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".into(), operation_digest: ask_digest.clone(), checkpoint_json: "{}".into() } }, &ask_lease, 33);
+        let boundary = |snapshot: &SessionSnapshot, update: CommitSessionTurnUpdate| store.commit_session_turn_update(&SessionCommitRequest { session_id, turn_id, expected_session_revision: snapshot.session_revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update }, &lease, 23); let running_state = store.load_turn(turn_id).unwrap(); let mut failed_state = running_state.clone(); failed_state.status = TurnStatus::Failed; store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&failed_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ObserveEffect { source_key: "matrix:observe-non-running".into(), effect_id: "effect-matrix".parse().unwrap(), operation_digest: "a".repeat(64), success: true, result: "late".into(), payload: None, effect_stage_marker_json: "{}".into() }).unwrap_err().to_string().contains("requires a running linked child")); store.connection.lock().unwrap().execute("UPDATE turns SET state_json=?1 WHERE turn_id=?2", params![serde_json::to_string(&running_state).unwrap(), turn_id.to_string()]).unwrap(); assert!(boundary(&observed.snapshot, CommitSessionTurnUpdate::CompleteVerified { source_key: "matrix:verify-without-evidence".into(), summary: "not verified".into(), verification_effect_id: "missing-verification".parse().unwrap(), verified_manifest_digest: "missing-manifest".into(), files_changed: vec![] }).is_err()); assert!(matches!(boundary(&observed.snapshot, CommitSessionTurnUpdate::UnknownEffect { source_key: "matrix:unknown-missing".into(), effect_id: "missing-effect".parse().unwrap(), operation_digest: "a".repeat(64), effect_stage_marker_json: "{}".into() }), Err(StorageError::EffectFenced))); store.connection.lock().unwrap().execute("UPDATE effects SET status='unknown' WHERE effect_id='effect-matrix'", []).unwrap(); assert_eq!(boundary(&observed.snapshot, CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "matrix:reconcile-running".into(), effect_id: "effect-matrix".parse().unwrap(), effect_stage_marker_json: "{}".into() }).unwrap().snapshot.lifecycle, SessionLifecycle::Failed); let (ask_session, ask_turn, ask) = create_linked_fixture(&store, &ids, "ask", 30); let ask_lease = store.acquire_session_lease(ask_session, 30, 10_000).unwrap(); let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::Start { source_key: "ask:start".into() }, 31).snapshot; let ask_digest = "d".repeat(64); let ask_descriptor = crate::EffectAuthority { effect_id: "ask-matrix".parse().unwrap(), tool_call_id: "ask-call".into(), name: "read_file".into(), input: serde_json::json!({"path":"a.txt"}), attempt: 1 };
+        let ask = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::PrepareEffect { source_key: "ask:prepare".into(), effect_id: "ask-matrix".parse().unwrap(), operation_digest: ask_digest.clone(), descriptor_json: "{}".into(), canonical_descriptor_json: serde_json::to_string(&ask_descriptor).unwrap(), policy: SessionEffectPolicy::Ask, description: "ask".into(), effect_stage_marker_json: "{}".into() }, 32).snapshot;
+        let start_ask = |snapshot: &SessionSnapshot, source: &str| store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: snapshot.session_revision, expected_turn_revision: snapshot.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: Some("ask-matrix".parse().unwrap()), update: CommitSessionTurnUpdate::StartEffect { source_key: source.into(), effect_id: "ask-matrix".parse().unwrap(), operation_digest: ask_digest.clone(), effect_stage_marker_json: "{}".into() } }, &ask_lease, 33);
         assert!(start_ask(&ask, "ask:while-pending").unwrap_err().to_string().contains("without a pending request"));
         let allowed = commit_linked(&store, &ids, &ask_lease, &ask, ask_turn, CommitSessionTurnUpdate::ResolvePermission { source_key: "ask:allow".into(), request_id: "ask-matrix".into(), allow: true, rebound_operation_digest: None }, 34).snapshot;
         store.connection.lock().unwrap().execute("UPDATE pending_permissions SET turn_revision=999 WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:stale").unwrap_err().to_string().contains("stale, mismatched, or consumed"));
-        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM session_active_turns WHERE session_id=?1", [ask_session.to_string()]).unwrap(); conn.execute("UPDATE sessions SET lifecycle='reconciliation_required',latest_turn_id=?1 WHERE session_id=?2", params![ask_turn.to_string(), ask_session.to_string()]).unwrap(); } assert!(store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: allowed.revision, expected_turn_revision: allowed.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".into(), checkpoint_json: "{}".into() } }, &ask_lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
+        store.connection.lock().unwrap().execute("DELETE FROM pending_permissions WHERE effect_id='ask-matrix'", []).unwrap(); assert!(start_ask(&allowed, "ask:missing-auth").unwrap_err().to_string().contains("no durable allow authorization")); { let conn = store.connection.lock().unwrap(); conn.execute("UPDATE effects SET status='unknown' WHERE effect_id='ask-matrix'", []).unwrap(); conn.execute("DELETE FROM session_active_turns WHERE session_id=?1", [ask_session.to_string()]).unwrap(); conn.execute("UPDATE sessions SET lifecycle='reconciliation_required',latest_turn_id=?1 WHERE session_id=?2", params![ask_turn.to_string(), ask_session.to_string()]).unwrap(); } assert!(store.commit_session_turn_update(&SessionCommitRequest { session_id: ask_session, turn_id: ask_turn, expected_session_revision: allowed.session_revision, expected_turn_revision: allowed.turns[0].turn_revision, command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()), request_id: None, effect_id: None, update: CommitSessionTurnUpdate::ReconcileUnknownEffect { source_key: "ask:invalid-recovered".into(), effect_id: "ask-matrix".parse().unwrap(), effect_stage_marker_json: "{}".into() } }, &ask_lease, 36).unwrap_err().to_string().contains("requires an interrupted child"));
     }
 
     #[test]
@@ -11230,7 +12461,7 @@ mod tests {
         assert!(store.append_event(&running, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: TurnStatus::Running }, 43, &next).unwrap_err().to_string().contains("must increment once"));
         assert!(matches!(store.apply_transition(running_only, 0, Transition::Cancel, 43, &next), Err(StorageError::StaleRevision { .. }))); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &forged), Err(StorageError::LeaseLost)));
         store.connection.lock().unwrap().execute("UPDATE turns SET lease_token=?1 WHERE turn_id=?2", params![to_i64(next.fencing_token + 1).unwrap(), running_only.to_string()]).unwrap(); assert!(matches!(store.apply_transition(running_only, running.revision, Transition::Cancel, 43, &next), Err(StorageError::LeaseLost))); let cancelling = running.transition(running.revision, Transition::Cancel).unwrap(); assert!(matches!(store.append_event(&cancelling, running.revision, EventId::from_uuid(ids.next_uuid_v7()), &RuntimeEvent::StateChanged { status: TurnStatus::Cancelling }, 43, &next), Err(StorageError::LeaseLost))); store.connection.lock().unwrap().execute("UPDATE turns SET lease_token=?1 WHERE turn_id=?2", params![to_i64(next.fencing_token).unwrap(), running_only.to_string()]).unwrap();
-        store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = EffectAuthority { turn_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
+        store.start_effect("invalid-status", running_only, 44).unwrap(); store.connection.lock().unwrap().execute("UPDATE effects SET status='invalid' WHERE effect_id='invalid-status'", []).unwrap(); assert!(matches!(store.effect_status("invalid-status"), Err(StorageError::InvalidData(_)))); assert!(store.prepare_effect("missing", "digest", "{}", 45).is_err()); assert!(store.start_prepared_effect("missing", "digest", 45).is_err()); let invalid_authority = FencedEffectToken { turn_id: running_only, expected_revision: running.revision, lease: next.clone(), effect_id: "invalid-status".into(), digest: String::new(), attempt: 0 }; assert!(matches!(store.mark_effect_unknown(&invalid_authority, 45), Err(StorageError::EffectFenced))); assert!(matches!(store.replace_pending_effect("missing", "replacement", running_only, running.revision, 1, "{}", "digest", &next, 45), Err(StorageError::LeaseLost))); assert!(store.apply_transition(running_only, running.revision, Transition::Complete { handoff: Handoff { summary: "done".into(), files_changed: vec![], evidence: vec![] }, policy: CompletionPolicy::VerificationNotRequired }, 46, &next).is_ok()); store.release_lease(&next).unwrap();
     }
 
     #[test]
@@ -11590,10 +12821,10 @@ mod tests {
 
     #[test]
     fn validate_session_effect_id_rejects_invalid() {
-        assert!(validate_session_effect_id("effect-123").is_ok());
-        assert!(validate_session_effect_id("").is_err());
-        assert!(validate_session_effect_id(&"a".repeat(513)).is_err());
-        assert!(validate_session_effect_id("bad\neffect").is_err());
+        assert!(latte_core::EffectId::new("effect-123").is_ok());
+        assert!(latte_core::EffectId::new("").is_err());
+        assert!(latte_core::EffectId::new("a".repeat(513)).is_err());
+        assert!(latte_core::EffectId::new("bad\neffect").is_err());
     }
 
     #[test]
@@ -11669,16 +12900,22 @@ mod tests {
         )
         .snapshot;
         let valid_digest = "a".repeat(64);
-        let canonical = crate::SessionEffectDescriptor {
-            effect_id: "effect-validate".into(),
+        let valid_eid: latte_core::EffectId = "effect-validate".parse().unwrap();
+        let canonical = crate::EffectAuthority {
+            effect_id: valid_eid.clone(),
             tool_call_id: "call-validate".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"a.txt"}),
             attempt: 1,
         };
         let canonical_json = serde_json::to_string(&canonical).unwrap();
-        let session_rev = running.revision;
+        let session_rev = running.session_revision;
         let turn_rev = running.turns[0].turn_revision;
+
+        // Invalid EffectId construction (empty, control, over cap).
+        assert!(latte_core::EffectId::new("").is_err());
+        assert!(latte_core::EffectId::new("bad\neffect").is_err());
+        assert!(latte_core::EffectId::new("x".repeat(513)).is_err());
 
         // PrepareEffect: invalid source key (control character).
         assert!(matches!(
@@ -11690,47 +12927,20 @@ mod tests {
                     expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
-                    effect_id: Some("effect-validate".into()),
+                    effect_id: Some(valid_eid.clone()),
                     update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "bad\nsource".into(),
-                        effect_id: "effect-validate".into(),
+                        effect_id: valid_eid.clone(),
                         operation_digest: valid_digest.clone(),
                         descriptor_json: "{}".into(),
                         canonical_descriptor_json: canonical_json.clone(),
                         policy: SessionEffectPolicy::Allow,
                         description: "read".into(),
-                        checkpoint_json: "{}".into(),
+                        effect_stage_marker_json: "{}".into(),
                     },
                 },
                 &lease,
                 13,
-            ),
-            Err(StorageError::InvalidData(_))
-        ));
-        // PrepareEffect: invalid effect id (empty).
-        assert!(matches!(
-            store.commit_session_turn_update(
-                &SessionCommitRequest {
-                    session_id,
-                    turn_id,
-                    expected_session_revision: session_rev,
-                    expected_turn_revision: turn_rev,
-                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                    request_id: None,
-                    effect_id: Some(String::new()),
-                    update: CommitSessionTurnUpdate::PrepareEffect {
-                        source_key: "validate:empty-id".into(),
-                        effect_id: String::new(),
-                        operation_digest: valid_digest.clone(),
-                        descriptor_json: "{}".into(),
-                        canonical_descriptor_json: canonical_json.clone(),
-                        policy: SessionEffectPolicy::Allow,
-                        description: "read".into(),
-                        checkpoint_json: "{}".into(),
-                    },
-                },
-                &lease,
-                14,
             ),
             Err(StorageError::InvalidData(_))
         ));
@@ -11744,16 +12954,16 @@ mod tests {
                     expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
-                    effect_id: Some("effect-validate".into()),
+                    effect_id: Some(valid_eid.clone()),
                     update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-digest".into(),
-                        effect_id: "effect-validate".into(),
+                        effect_id: valid_eid.clone(),
                         operation_digest: "short".into(),
                         descriptor_json: "{}".into(),
                         canonical_descriptor_json: canonical_json.clone(),
                         policy: SessionEffectPolicy::Allow,
                         description: "read".into(),
-                        checkpoint_json: "{}".into(),
+                        effect_stage_marker_json: "{}".into(),
                     },
                 },
                 &lease,
@@ -11771,16 +12981,16 @@ mod tests {
                     expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
-                    effect_id: Some("effect-validate".into()),
+                    effect_id: Some(valid_eid.clone()),
                     update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-descriptor".into(),
-                        effect_id: "effect-validate".into(),
+                        effect_id: valid_eid.clone(),
                         operation_digest: valid_digest.clone(),
                         descriptor_json: "not json".into(),
                         canonical_descriptor_json: canonical_json.clone(),
                         policy: SessionEffectPolicy::Allow,
                         description: "read".into(),
-                        checkpoint_json: "{}".into(),
+                        effect_stage_marker_json: "{}".into(),
                     },
                 },
                 &lease,
@@ -11788,7 +12998,7 @@ mod tests {
             ),
             Err(StorageError::InvalidData(_))
         ));
-        // PrepareEffect: invalid checkpoint JSON.
+        // PrepareEffect: invalid stage marker JSON.
         assert!(matches!(
             store.commit_session_turn_update(
                 &SessionCommitRequest {
@@ -11798,16 +13008,16 @@ mod tests {
                     expected_turn_revision: turn_rev,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
-                    effect_id: Some("effect-validate".into()),
+                    effect_id: Some(valid_eid.clone()),
                     update: CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "validate:bad-checkpoint".into(),
-                        effect_id: "effect-validate".into(),
+                        effect_id: valid_eid.clone(),
                         operation_digest: valid_digest.clone(),
                         descriptor_json: "{}".into(),
                         canonical_descriptor_json: canonical_json.clone(),
                         policy: SessionEffectPolicy::Allow,
                         description: "read".into(),
-                        checkpoint_json: "not json".into(),
+                        effect_stage_marker_json: "not json".into(),
                     },
                 },
                 &lease,
@@ -11815,11 +13025,11 @@ mod tests {
             ),
             Err(StorageError::InvalidData(_))
         ));
-        // StartEffect: invalid effect id, digest, checkpoint.
-        for (eid, digest, cp) in [
-            ("", valid_digest.as_str(), "{}"),
-            ("effect-validate", "short", "{}"),
-            ("effect-validate", valid_digest.as_str(), "not json"),
+        // StartEffect: invalid source, digest, stage marker.
+        for (src, digest, cp) in [
+            ("bad\nsource", valid_digest.as_str(), "{}"),
+            ("validate:start-effect", "short", "{}"),
+            ("validate:start-effect", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
                 store.commit_session_turn_update(
@@ -11829,13 +13039,13 @@ mod tests {
                         expected_session_revision: session_rev,
                         expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
-                        request_id: Some(eid.into()),
-                        effect_id: Some(eid.into()),
+                        request_id: Some(valid_eid.to_string()),
+                        effect_id: Some(valid_eid.clone()),
                         update: CommitSessionTurnUpdate::StartEffect {
-                            source_key: "validate:start-effect".into(),
-                            effect_id: eid.into(),
+                            source_key: src.into(),
+                            effect_id: valid_eid.clone(),
                             operation_digest: digest.into(),
-                            checkpoint_json: cp.into(),
+                            effect_stage_marker_json: cp.into(),
                         },
                     },
                     &lease,
@@ -11844,11 +13054,11 @@ mod tests {
                 Err(StorageError::InvalidData(_))
             ));
         }
-        // ObserveEffect: invalid effect id, digest, checkpoint.
-        for (eid, digest, cp) in [
-            ("", valid_digest.as_str(), "{}"),
-            ("effect-validate", "short", "{}"),
-            ("effect-validate", valid_digest.as_str(), "not json"),
+        // ObserveEffect: invalid source, digest, stage marker.
+        for (src, digest, cp) in [
+            ("bad\nsource", valid_digest.as_str(), "{}"),
+            ("validate:observe", "short", "{}"),
+            ("validate:observe", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
                 store.commit_session_turn_update(
@@ -11859,15 +13069,15 @@ mod tests {
                         expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
-                        effect_id: Some(eid.into()),
+                        effect_id: Some(valid_eid.clone()),
                         update: CommitSessionTurnUpdate::ObserveEffect {
-                            source_key: "validate:observe".into(),
-                            effect_id: eid.into(),
+                            source_key: src.into(),
+                            effect_id: valid_eid.clone(),
                             operation_digest: digest.into(),
                             success: true,
                             result: "ok".into(),
                             payload: None,
-                            checkpoint_json: cp.into(),
+                            effect_stage_marker_json: cp.into(),
                         },
                     },
                     &lease,
@@ -11876,11 +13086,11 @@ mod tests {
                 Err(StorageError::InvalidData(_))
             ));
         }
-        // UnknownEffect: invalid effect id, digest, checkpoint.
-        for (eid, digest, cp) in [
-            ("", valid_digest.as_str(), "{}"),
-            ("effect-validate", "short", "{}"),
-            ("effect-validate", valid_digest.as_str(), "not json"),
+        // UnknownEffect: invalid source, digest, stage marker.
+        for (src, digest, cp) in [
+            ("bad\nsource", valid_digest.as_str(), "{}"),
+            ("validate:unknown", "short", "{}"),
+            ("validate:unknown", valid_digest.as_str(), "not json"),
         ] {
             assert!(matches!(
                 store.commit_session_turn_update(
@@ -11891,12 +13101,12 @@ mod tests {
                         expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
-                        effect_id: Some(eid.into()),
+                        effect_id: Some(valid_eid.clone()),
                         update: CommitSessionTurnUpdate::UnknownEffect {
-                            source_key: "validate:unknown".into(),
-                            effect_id: eid.into(),
+                            source_key: src.into(),
+                            effect_id: valid_eid.clone(),
                             operation_digest: digest.into(),
-                            checkpoint_json: cp.into(),
+                            effect_stage_marker_json: cp.into(),
                         },
                     },
                     &lease,
@@ -11905,8 +13115,8 @@ mod tests {
                 Err(StorageError::InvalidData(_))
             ));
         }
-        // ReconcileUnknownEffect: invalid effect id, checkpoint.
-        for (eid, cp) in [("", "{}"), ("effect-validate", "not json")] {
+        // ReconcileUnknownEffect: invalid source, stage marker.
+        for (src, cp) in [("bad\nsource", "{}"), ("validate:reconcile", "not json")] {
             assert!(matches!(
                 store.commit_session_turn_update(
                     &SessionCommitRequest {
@@ -11916,11 +13126,11 @@ mod tests {
                         expected_turn_revision: turn_rev,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         request_id: None,
-                        effect_id: Some(eid.into()),
+                        effect_id: Some(valid_eid.clone()),
                         update: CommitSessionTurnUpdate::ReconcileUnknownEffect {
-                            source_key: "validate:reconcile".into(),
-                            effect_id: eid.into(),
-                            checkpoint_json: cp.into(),
+                            source_key: src.into(),
+                            effect_id: valid_eid.clone(),
+                            effect_stage_marker_json: cp.into(),
                         },
                     },
                     &lease,
@@ -12075,7 +13285,13 @@ mod tests {
         let mut bad_binding = session_binding();
         bad_binding.provider_name = String::new();
         assert!(matches!(
-            store.switch_session_binding_v2(session_id, queued.revision, &bad_binding, &lease, 12),
+            store.switch_session_binding_v2(
+                session_id,
+                queued.session_revision,
+                &bad_binding,
+                &lease,
+                12
+            ),
             Err(StorageError::InvalidData(_))
         ));
         // Unknown session → SessionNotFound.
@@ -12084,7 +13300,7 @@ mod tests {
         assert!(matches!(
             store.switch_session_binding_v2(
                 unknown,
-                queued.revision,
+                queued.session_revision,
                 &session_binding(),
                 &unknown_lease,
                 12,
@@ -12095,7 +13311,7 @@ mod tests {
         assert!(matches!(
             store.switch_session_binding_v2(
                 session_id,
-                queued.revision + 1,
+                queued.session_revision + 1,
                 &session_binding(),
                 &lease,
                 12,
@@ -12404,7 +13620,7 @@ mod tests {
             store.create_session_follow_up_v2(
                 unknown,
                 follow_up,
-                queued.revision,
+                queued.session_revision,
                 "next",
                 &baseline,
                 12,
@@ -12418,7 +13634,7 @@ mod tests {
                 None,
                 session_id,
                 follow_up,
-                queued.revision,
+                queued.session_revision,
                 "next",
                 &baseline,
                 &runtime_lease,
@@ -12465,7 +13681,7 @@ mod tests {
         let first_round = SessionCommitRequest {
             session_id,
             turn_id,
-            expected_session_revision: snapshot.revision,
+            expected_session_revision: snapshot.session_revision,
             expected_turn_revision: snapshot.turns[0].turn_revision,
             command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
             request_id: None,
@@ -12543,7 +13759,7 @@ mod tests {
             .unwrap()
             .snapshot;
         assert_ne!(
-            replay.revision, snapshot.revision,
+            replay.session_revision, snapshot.session_revision,
             "replay returns the stored result"
         );
         assert_eq!(store.tool_round_count_for_turn(turn_id).unwrap(), 2);
@@ -12933,5 +14149,102 @@ mod tests {
             !projection.has_more,
             "the projection is semantically complete, not a truncated page"
         );
+    }
+
+    #[test]
+    fn create_replay_accepts_binding_version_and_both_legacy_command_digests() {
+        let store = Storage::memory().unwrap();
+        let ids = SystemIdSource::default();
+        let binding = session_binding();
+
+        for kind in ["current", "pre_batch3_version", "pre_schema13_thread_start"] {
+            let session_id = latte_core::SessionId::from_uuid(ids.next_uuid_v7());
+            let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+            let command_id = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+            let lease = store.acquire_session_lease(session_id, 1, 1000).unwrap();
+            let outcome = store
+                .create_started_session_v2(
+                    Some(&command_id),
+                    session_id,
+                    turn_id,
+                    &binding,
+                    "/workspace",
+                    "replay bridge prompt",
+                    &std::collections::BTreeMap::new(),
+                    &lease,
+                    2,
+                    Some("src/lib.rs"),
+                )
+                .unwrap();
+            assert!(matches!(outcome, latte_core::CreateOutcome::Created(_)));
+            let override_digest = match kind {
+                "current" => None,
+                "pre_batch3_version" => Some(legacy_v1_binding_create_command_digest(
+                    session_id,
+                    "/workspace",
+                    "replay bridge prompt",
+                    &binding,
+                    Some("src/lib.rs"),
+                )),
+                "pre_schema13_thread_start" => Some(legacy_create_command_digest(
+                    session_id,
+                    "/workspace",
+                    "replay bridge prompt",
+                    &binding,
+                    Some("src/lib.rs"),
+                )),
+                _ => unreachable!(),
+            };
+            if let Some(digest) = override_digest {
+                store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE session_command_dedup SET digest=?1 WHERE command_id=?2",
+                        params![digest, command_id.to_string()],
+                    )
+                    .unwrap();
+            }
+            let looked_up = store
+                .lookup_create_replay(
+                    &command_id,
+                    session_id,
+                    "/workspace",
+                    "replay bridge prompt",
+                    &binding,
+                    Some("src/lib.rs"),
+                )
+                .unwrap()
+                .expect("stored command must replay");
+            assert_eq!(looked_up.session_id, session_id);
+            assert!(matches!(
+                store
+                    .begin_materializing_session_v2(
+                        &command_id,
+                        session_id,
+                        turn_id,
+                        &binding,
+                        "/workspace",
+                        "replay bridge prompt",
+                        &lease,
+                        3,
+                        Some("src/lib.rs"),
+                    )
+                    .unwrap(),
+                BeginMaterializingOutcome::Replayed
+            ));
+            assert!(matches!(
+                store.lookup_create_replay(
+                    &command_id,
+                    session_id,
+                    "/workspace",
+                    "mismatched prompt",
+                    &binding,
+                    Some("src/lib.rs"),
+                ),
+                Err(StorageError::SessionCommandReplayMismatch)
+            ));
+        }
     }
 }

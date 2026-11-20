@@ -1,30 +1,7 @@
-use crate::{CommandId, EventId, PROTOCOL_VERSION, TurnId};
+use crate::{EventId, TurnId};
 use serde::{Deserialize, Serialize};
 
-/// A versioned command message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandEnvelope {
-    /// Protocol version; currently always one.
-    pub protocol_version: u16,
-    /// Unique command identifier.
-    pub command_id: CommandId,
-    /// Command payload.
-    pub command: RuntimeCommand,
-}
-
-impl CommandEnvelope {
-    /// Wraps a command in the current protocol version.
-    #[must_use]
-    pub const fn new(command_id: CommandId, command: RuntimeCommand) -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION,
-            command_id,
-            command,
-        }
-    }
-}
-
-/// A versioned event message.
+/// A versioned turn-event message persisted in the turn event ledger.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     /// Protocol version.
@@ -39,76 +16,14 @@ pub struct EventEnvelope {
     pub event: RuntimeEvent,
 }
 
-/// A versioned read-model snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadModelEnvelope {
-    /// Protocol version.
-    pub protocol_version: u16,
-    /// Snapshot payload.
-    #[serde(alias = "run")]
-    pub turn: TurnState,
-}
-
-/// Commands accepted by the runtime boundary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RuntimeCommand {
-    /// Start a new turn.
-    Run { prompt: String },
-    /// Resume an interrupted or retryable failed turn.
-    Resume {
-        turn_id: TurnId,
-        expected_revision: u64,
-    },
-    /// Fetch one turn.
-    Show { turn_id: TurnId },
-    /// List known turns.
-    List,
-    /// Resolve a permission request.
-    ResolvePermission {
-        turn_id: TurnId,
-        request_id: String,
-        expected_revision: u64,
-        decision: PermissionDecision,
-    },
-    /// Supply requested input.
-    ProvideInput {
-        turn_id: TurnId,
-        request_id: String,
-        expected_revision: u64,
-        value: String,
-    },
-    /// Cancel a turn.
-    Cancel {
-        turn_id: TurnId,
-        expected_revision: u64,
-    },
-    /// Stop the engine without mutating a turn.
-    Shutdown,
-}
-
-/// Events emitted by the runtime boundary.
+/// Durable turn-level events persisted alongside `TurnState` transitions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// The durable state changed.
     StateChanged { status: TurnStatus },
-    /// A tool started.
-    ToolStarted { name: String },
-    /// A tool completed.
-    ToolCompleted { name: String, success: bool },
-    /// Verification evidence was recorded.
-    EvidenceRecorded { evidence: Evidence },
     /// A handoff was produced.
     HandoffProduced { handoff: Handoff },
-}
-
-/// Permission resolution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDecision {
-    Allow,
-    Deny,
 }
 
 /// Durable turn status.
@@ -191,20 +106,35 @@ pub struct Handoff {
     pub evidence: Vec<Evidence>,
 }
 
-use crate::TurnState;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdSource, SystemIdSource};
+    use crate::{IdSource, PROTOCOL_VERSION, SystemIdSource};
 
     #[test]
-    fn command_envelope_pins_the_current_version_without_changing_payload() {
+    fn event_envelope_round_trips_turn_transitions_and_handoffs() {
         let ids = SystemIdSource::default();
-        let command_id = CommandId::from_uuid(ids.next_uuid_v7());
-        let envelope = CommandEnvelope::new(command_id, RuntimeCommand::List);
-        assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(envelope.command_id, command_id);
-        assert_eq!(envelope.command, RuntimeCommand::List);
+        let envelope = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: EventId::from_uuid(ids.next_uuid_v7()),
+            turn_id: TurnId::from_uuid(ids.next_uuid_v7()),
+            revision: 1,
+            event: RuntimeEvent::HandoffProduced {
+                handoff: Handoff {
+                    summary: "done".into(),
+                    files_changed: vec!["src/lib.rs".into()],
+                    evidence: vec![Evidence {
+                        name: "tests".into(),
+                        status: VerificationStatus::Passed,
+                        summary: "ok".into(),
+                    }],
+                },
+            },
+        };
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EventEnvelope>(&encoded).unwrap(),
+            envelope
+        );
     }
 }

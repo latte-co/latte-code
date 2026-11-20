@@ -1388,7 +1388,7 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                                     })
                                     .map_or(0, |run| run.turn_revision);
                                 handle
-                                    .cancel(&session_id, snapshot.revision, turn_revision)
+                                    .cancel(&session_id, snapshot.session_revision, turn_revision)
                                     .await
                                     .map(|()| "interruption requested".into())
                                     .map_err(|error| error.to_string())
@@ -1419,7 +1419,7 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                                 handle
                                     .provide_input(
                                         &session_id,
-                                        snapshot.revision,
+                                        snapshot.session_revision,
                                         turn_revision,
                                         &request_id,
                                         &value,
@@ -1454,7 +1454,7 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                                 handle
                                     .resolve_permission(
                                         &session_id,
-                                        snapshot.revision,
+                                        snapshot.session_revision,
                                         turn_revision,
                                         &request_id,
                                         allow,
@@ -1482,12 +1482,19 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let feedback = feedback_tx.clone();
                     tokio::spawn(async move {
                         let result = handle
-                            .reconcile_effect(&session_id, &effect_id)
+                            .reconcile_effect(&session_id, effect_id.as_str())
                             .await
                             .map(|()| "unknown effect acknowledged; child aborted".into())
                             .map_err(|error| error.to_string());
                         let _ = feedback.send(SessionUiFeedback::command(result));
                     });
+                }
+                SessionUiAction::CompactSession { session_id } => {
+                    spawn_tui_compact_action(
+                        server_handle.clone(),
+                        feedback_tx.clone(),
+                        session_id,
+                    );
                 }
                 SessionUiAction::SwitchModel {
                     switch_id,
@@ -1550,6 +1557,21 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
             }
         }
     }
+}
+
+fn spawn_tui_compact_action(
+    handle: server_client::ServerHandle,
+    feedback: std::sync::mpsc::Sender<latte_tui::session::SessionUiFeedback>,
+    session_id: SessionId,
+) {
+    tokio::spawn(async move {
+        let result = handle
+            .compact_session(&session_id)
+            .await
+            .map(|outcome| server_client::render_compact(&outcome))
+            .map_err(|error| error.to_string());
+        let _ = feedback.send(latte_tui::session::SessionUiFeedback::compaction(result));
+    });
 }
 
 /// Default local server port when `--port` is not supplied.
@@ -3215,7 +3237,7 @@ mod tests {
         // failure rather than a startup error.
         let session_id = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "missing".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -3422,10 +3444,17 @@ mod tests {
             emit_client_error(true, &ClientError::Conflict("x".into())),
             1
         );
-        assert_eq!(emit_client_error(true, &ClientError::Failed("x".into())), 1);
+        assert_eq!(
+            emit_client_error(true, &ClientError::IdempotencyMismatch("x".into())),
+            1
+        );
+        assert_eq!(
+            emit_client_error(true, &ClientError::Unclassified("x".into())),
+            1
+        );
         // Non-JSON branch.
         assert_eq!(
-            emit_client_error(false, &ClientError::Failed("x".into())),
+            emit_client_error(false, &ClientError::Unclassified("x".into())),
             1
         );
     }
@@ -3678,14 +3707,19 @@ mod tests {
             "--token".to_string(),
             "dummy".to_string(),
         ];
-        let code =
-            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+        let code = temp_env::with_vars(
+            [
+                ("HOME", Some(temp.path().as_os_str())),
+                ("LATTE_CODE_HOME", Some(temp.path().as_os_str())),
+            ],
+            || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
                 rt.block_on(super::execute_session_command(false, &args))
-            });
+            },
+        );
         assert_eq!(code, 71); // EXIT_SERVER_UNREACHABLE
     }
 
@@ -3762,14 +3796,19 @@ mod tests {
             "--json".to_string(),
             "--unknown-flag".to_string(),
         ];
-        let code =
-            temp_env::with_vars([("LATTE_CODE_HOME", Some(temp.path().as_os_str()))], || {
+        let code = temp_env::with_vars(
+            [
+                ("HOME", Some(temp.path().as_os_str())),
+                ("LATTE_CODE_HOME", Some(temp.path().as_os_str())),
+            ],
+            || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
                 rt.block_on(super::execute_session_command(false, &args))
-            });
+            },
+        );
         assert_eq!(code, 2); // EXIT_USAGE
     }
 
@@ -3994,7 +4033,7 @@ mod tests {
         let (mut projection, _tx) = http_projection_client(&url, "ws-1");
         let snapshot = projection.session(session_id).unwrap();
         assert_eq!(snapshot.session_id, session_id);
-        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.session_revision, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5215,5 +5254,55 @@ mod tests {
                 })
             },
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_tui_compact_action_delivers_compaction_feedback_for_ok_and_error() {
+        let session_id = SessionId::from_uuid(
+            uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap(),
+        );
+        let turn_id = "01900000-0000-7000-8000-000000000002";
+        let ok_body = format!(
+            r#"{{"snapshot":{},"state":{{"nothing_to_compact":{{"reason":"nothing_to_compress"}}}}}}"#,
+            projection_snapshot_body(&session_id.to_string(), &projection_user_entry("hi", 1))
+        );
+        let _ = turn_id;
+        let (ok_url, _ok_server) = start_session_mock_server(move |method, path| {
+            if method == "POST" && path.ends_with("/compact") {
+                (200, "application/json".into(), ok_body.clone())
+            } else {
+                (
+                    404,
+                    "application/json".into(),
+                    r#"{"error":{"type":"not_found","message":"missing"}}"#.into(),
+                )
+            }
+        });
+        let ok_client = crate::server_client::ServerClient::new(ok_url, "token".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::spawn_tui_compact_action(ok_client.handle(), tx, session_id);
+        let feedback = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            feedback,
+            latte_tui::session::SessionUiFeedback::Compaction(Ok(message))
+                if message.contains("nothing to compact")
+        ));
+
+        let (err_url, _err_server) = start_session_mock_server(|_method, _path| {
+            (
+                409,
+                "application/json".into(),
+                r#"{"error":{"type":"conflict","message":"session is busy"}}"#.into(),
+            )
+        });
+        let err_client = crate::server_client::ServerClient::new(err_url, "token".into());
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        super::spawn_tui_compact_action(err_client.handle(), err_tx, session_id);
+        let err_feedback = err_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            err_feedback,
+            latte_tui::session::SessionUiFeedback::Compaction(Err(message))
+                if message.contains("session is busy")
+        ));
     }
 }

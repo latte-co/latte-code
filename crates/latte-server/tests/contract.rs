@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use latte_core::SessionProviderBinding;
 use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
-use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 use latte_server::http::router;
 use latte_server::{ServerState, WorkspaceRuntimeBuilder, new_state};
 use serde_json::Value;
@@ -26,7 +26,7 @@ const TOKEN: &str = "contract-token";
 /// 构造一个合法的、可通过 validate() 的 binding。
 fn valid_binding() -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: "contract".into(),
         provider_type: "openai-chat".into(),
         protocol: "chat".into(),
@@ -55,8 +55,8 @@ fn completing_state() -> Arc<ServerState> {
             }]);
             Ok(ResolvedProvider {
                 provider: Arc::new(provider),
-                binding: ProviderBinding {
-                    version: binding.version,
+                binding: ProviderModelBinding {
+                    binding_version: binding.binding_version,
                     provider_name: binding.provider_name.clone(),
                     provider_type: binding.provider_type.clone(),
                     protocol: binding.protocol.clone(),
@@ -189,7 +189,10 @@ async fn completed_session(state: &Arc<ServerState>, workspace_id: &str) -> (Str
         )
         .await;
         if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            return (session_id, body["snapshot"]["revision"].as_u64().unwrap());
+            return (
+                session_id,
+                body["snapshot"]["session_revision"].as_u64().unwrap(),
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -276,7 +279,7 @@ async fn response_schema_snapshots() {
         &body["snapshot"],
         &[
             "session_id",
-            "revision",
+            "session_revision",
             "sequence",
             "lifecycle",
             "binding",
@@ -296,7 +299,7 @@ async fn response_schema_snapshots() {
         Some(serde_json::json!({
             "command_id": command_id,
             "prompt": "again",
-            "expected_session_revision": body["snapshot"]["revision"].as_u64().unwrap_or(1),
+            "expected_session_revision": body["snapshot"]["session_revision"].as_u64().unwrap_or(1),
         })),
         &[("idempotency-key", &command_id)],
     )
@@ -496,12 +499,12 @@ async fn sse_event_type_completeness() {
     // ServerEvent 的 serde tag 必须固定为三个契约事件名。
     let changed = serde_json::to_value(latte_server::http::ServerEvent::SessionChanged {
         session_id: "s".into(),
-        revision: 1,
+        session_revision: 1,
     })
     .unwrap();
     assert_eq!(changed["type"].as_str(), Some("session_changed"));
     assert_eq!(changed["session_id"].as_str(), Some("s"));
-    assert_eq!(changed["revision"].as_u64(), Some(1));
+    assert_eq!(changed["session_revision"].as_u64(), Some(1));
 
     let progress = serde_json::to_value(latte_server::http::ServerEvent::Progress {
         session_id: "s".into(),

@@ -124,7 +124,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 
 新增端点直接按类型化 DTO 落地：
 
-- `POST /v1/sessions/{id}/compact` → `CompactSessionResponse { snapshot: SessionSnapshot, state: ManualCompactionState }`（空闲手动压缩，见 [context-design.md](context-design.md) §4.7；`state` 为 `compacted { tier, revision }` 或 `nothing_to_compact { reason }`，空态是 200 而非错误；非空闲/版本冲突返回 409，未知 session 返回 404）
+- `POST /v1/sessions/{id}/compact` → `CompactSessionResponse { snapshot: SessionSnapshot, state: ManualCompactionState }`（空闲手动压缩，见 [context-design.md](context-design.md) §4.7；`state` 为 `compacted { tier, session_revision }` 或 `nothing_to_compact { reason }`，空态是 200 而非错误；非空闲/版本冲突返回 409，未知 session 返回 404）
 - `POST /v1/sessions/{id}/reminder`，请求体 `ArmReminderRequest { text: String }` → `ReminderResponse { session_id: String, bytes: u64 }`（装填一次性、非持久的 `<system-reminder>` 槽，见 [context-design.md](context-design.md) §4.8；`bytes` 为脱敏后 UTF-8 字节数。仅 `Ready` 会话可装填：非空闲返回 409 并回带 `current_revision`；空文本/超 4096 字节/坏 body 返回 400 `rejected`；未知 session 返回 404。装填值只保存在进程内存中，被下一次 turn 构建消费一次，不进 transcript，重启即失；无对应 CLI 命令）
 
 ## 4. 错误契约
@@ -160,19 +160,25 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 - `message` 是人类可读的英文诊断，不保证稳定。客户端应基于 `type` 编程，
   不基于 `message`。
 
-### 4.3 客户端错误映射
+### 4.3 客户端错误映射与三维状态合成
 
-`ClientError` 枚举已覆盖所有错误类型，保持不变：
+`ClientError` 枚举优先匹配 `error.type`，未知类型再按 HTTP 状态码降级：
 
-| ClientError | exit_code | code | 对应 HTTP |
+| ClientError | exit_code | code | 对应 HTTP / `error.type` |
 |---|---|---|---|
 | `Unreachable` | 71 | `server_unreachable` | 连接失败/超时 |
-| `Usage` | 2 | `usage` | 400 |
-| `NotFound` | 4 | `not_found` | 404 |
-| `Unauthorized` | 70 | `unauthorized` | 401 |
-| `Conflict` | 1 | `conflict` | 409 |
-| `Internal` | 70 | `internal` | 5xx |
-| `Failed` | 1 | `failed` | 其他 |
+| `Usage` | 2 | `usage` | 400 / `rejected` |
+| `NotFound` | 4 | `not_found` | 404 / `not_found` |
+| `Unauthorized` | 70 | `unauthorized` | 401 / `unauthorized` |
+| `Conflict` | 1 | `conflict` | 409 / `conflict` |
+| `IdempotencyMismatch` | 1 | `idempotency_mismatch` | 422 / `idempotency_mismatch` |
+| `Internal` | 70 | `internal` | 5xx / `failed` |
+| `Unclassified` | 1 | `unclassified` | 其他未知非 5xx 响应（不再与服务端 500 `failed` 重名） |
+
+CLI JSON 信封同时表达三个正交状态维度：
+1. `data.session.lifecycle`（`SessionLifecycle`）：会话后续是否还可接收 follow-up（例如权限拒绝或可重试失败后仍为 `ready`）。
+2. `data.session.turns[last].{status, failure_code}`（`SessionTurnSummary`）：最新一次 Turn 的执行结局（`completed` / `failed` + `permission_denied` | `cancelled` | `runtime_failed` 等）。
+3. 顶层 `status` 与进程退出码（`TerminalOutcome::classify`）：综合前两个维度得出的单次 CLI 调用结局（`completed`=0、`waiting`=10、`interrupted`=130、`failed`=1）。
 
 ## 5. SSE Event Backpressure 契约
 
@@ -191,7 +197,7 @@ server-client-integration 三个阶段合并后，HTTP+SSE 成为唯一的前端
 
 | event | data 字段 | 语义 | 丢失影响 |
 |---|---|---|---|
-| `session_changed` | `{session_id, revision}` | session 的持久状态变更 | 客户端下次 resync 时补齐 |
+| `session_changed` | `{session_id, session_revision}` | session 的持久状态变更 | 客户端下次 resync 时补齐 |
 | `progress` | `{session_id, turn_id, progress}` | 瞬态流式进度 | 丢失只影响 UI 流畅度，不影响正确性 |
 | `resync_required` | `{}` | 客户端必须全量 resync | 不适用（这就是 resync 信号） |
 
@@ -262,7 +268,7 @@ search/exact-title 只消费 `limit`（`limit=0` 被 clamp 为 1）；cursor 被
 v1 客户端必须：
 
 - 容忍未知 JSON 字段（`serde` 默认行为）。
-- 容忍未知错误 type（当作 `failed`）。
+- 容忍未知错误 type（CLI 侧映射为 `unclassified`）。
 - 容忍未知 SSE event type（忽略）。
 - 容忍未知枚举变体（当作未知/默认）。
 

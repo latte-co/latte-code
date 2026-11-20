@@ -52,7 +52,7 @@ fn has_one_durable_terminal_tool_result(
 
 fn session_boundary_binding() -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: "main".into(),
         provider_type: "openai-chat".into(),
         protocol: "openai-chat-completions-v1".into(),
@@ -108,25 +108,24 @@ fn tui_status_bar_renders_the_context_usage_meter() {
 
     pty.write(b"show me the context meter\r");
     assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
-    // The completion card splits words with cursor moves; wait for the
-    // contiguous follow-up bar instead, then for the meter itself.
+    // Reconstruct the 40x120 screen buffer so Ratatui cell-diff cursor jumps
+    // across an optional intermediate `Running · mock` frame never split
+    // `Ready for follow-up` or the status-bar context meter.
     assert!(
-        pty.wait_for_output(b"Ready for follow-up", Duration::from_secs(5)),
-        "session never settled: {}",
-        String::from_utf8_lossy(&pty.output())
+        wait_for_screen_text(&pty, 40, 120, "Ready for follow-up", Duration::from_secs(5)),
+        "session never settled:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
     );
     assert!(
-        pty.wait_for_output(b"Context ", Duration::from_secs(5)),
-        "context meter never rendered: {}",
-        String::from_utf8_lossy(&pty.output())
+        wait_for_screen_text(&pty, 40, 120, "Context ", Duration::from_secs(5)),
+        "context meter never rendered:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
     );
-    let raw = pty.output();
-    let screen = String::from_utf8_lossy(&raw);
-    let line = screen
+    let screen = pty_screen_text(&pty.output(), 40, 120);
+    let clean = screen
         .lines()
         .find(|line| line.contains("Context "))
         .expect("a status line contains the meter");
-    let clean: String = line.chars().filter(|ch| !ch.is_control()).collect();
     let percent = clean
         .split("Context ")
         .nth(1)
@@ -1221,7 +1220,7 @@ fn completed_tui_session_accepts_a_follow_up_as_an_immutable_child_with_history(
     let sessions = engine.list_sessions().unwrap();
     assert_eq!(sessions[0].turns[0].turn_id, parent_id);
     assert_eq!(sessions[0].turns[1].parent_turn_id, Some(parent_id));
-    assert_eq!(sessions[0].turns[1].ordinal, 1);
+    assert_eq!(sessions[0].turns[1].turn_ordinal, 1);
     let requests = provider.requests();
     let second_messages = requests[1].body["messages"].as_array().unwrap();
     assert!(
@@ -1792,4 +1791,466 @@ fn process_timeout_reaps_the_group_and_returns_one_terminal_tool_result() {
             .count(),
         1
     );
+}
+
+#[allow(clippy::too_many_lines)]
+fn pty_screen_text(output: &[u8], rows: usize, cols: usize) -> String {
+    let mut grid = vec![vec![' '; cols]; rows];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let decoded = String::from_utf8_lossy(output);
+    let mut chars = decoded.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek().copied() {
+                Some('[') => {
+                    let _ = chars.next();
+                    let private = matches!(chars.peek(), Some('?' | '>' | '<'));
+                    if private {
+                        let _ = chars.next();
+                    }
+                    let mut params = String::new();
+                    let mut final_byte = '\0';
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            final_byte = c;
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    if private {
+                        continue;
+                    }
+                    let nums: Vec<usize> = params
+                        .split(';')
+                        .map(|part| part.parse::<usize>().unwrap_or(0))
+                        .collect();
+                    let p1 = nums.first().copied().unwrap_or(0);
+                    let p2 = nums.get(1).copied().unwrap_or(0);
+                    match final_byte {
+                        'H' | 'f' => {
+                            row = p1.max(1).saturating_sub(1).min(rows.saturating_sub(1));
+                            col = p2.max(1).saturating_sub(1).min(cols.saturating_sub(1));
+                        }
+                        'G' => col = p1.max(1).saturating_sub(1).min(cols.saturating_sub(1)),
+                        'd' => row = p1.max(1).saturating_sub(1).min(rows.saturating_sub(1)),
+                        'A' => row = row.saturating_sub(p1.max(1)),
+                        'B' => row = (row + p1.max(1)).min(rows.saturating_sub(1)),
+                        'C' => col = (col + p1.max(1)).min(cols.saturating_sub(1)),
+                        'D' => col = col.saturating_sub(p1.max(1)),
+                        'J' if p1 == 2 => {
+                            for line in &mut grid {
+                                line.fill(' ');
+                            }
+                            row = 0;
+                            col = 0;
+                        }
+                        'K' => match p1 {
+                            0 if row < rows => {
+                                for cell in grid[row].iter_mut().skip(col) {
+                                    *cell = ' ';
+                                }
+                            }
+                            1 if row < rows => {
+                                for cell in grid[row].iter_mut().take((col + 1).min(cols)) {
+                                    *cell = ' ';
+                                }
+                            }
+                            2 if row < rows => {
+                                grid[row].fill(' ');
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                Some(']') => {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = chars.next();
+                }
+            },
+            '\r' => col = 0,
+            '\n' => row = (row + 1).min(rows.saturating_sub(1)),
+            c if c.is_control() => {}
+            c => {
+                if row < rows && col < cols {
+                    grid[row][col] = c;
+                    col += 1;
+                }
+            }
+        }
+    }
+    grid.into_iter()
+        .map(|line| line.into_iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wait_for_screen_text(
+    pty: &PtySession,
+    rows: usize,
+    cols: usize,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, || {
+        pty_screen_text(&pty.output(), rows, cols).contains(needle)
+    })
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_slash_compact_validates_availability_compacts_history_and_refreshes_context_meter() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion(&"y".repeat(700)),
+        ProviderReply::completion(&"z".repeat(700)),
+        ProviderReply::completion("TUI-MANUAL-COMPACT-SUMMARY"),
+    ]);
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["/usr/bin/true"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
+            endpoint = provider.endpoint()
+        ),
+    )
+    .unwrap();
+    let mut command = scenario.command(&["tui"]);
+    command.env("TEST_OPENAI_KEY", "tui-compact-secret");
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Describe an outcome",
+        Duration::from_secs(5)
+    ));
+
+    // 1. In SessionDraft, `/compact extra` rejects forbidden arguments and preserves composer.
+    pty.write(b"/compact extra\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "/compact does not accept arguments",
+            Duration::from_secs(5)
+        ),
+        "expected /compact argument validation error:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert_eq!(provider.requests().len(), 0);
+    pty.write(&[0x7f; 20]);
+
+    // 2. In SessionDraft, `/compact` reports disabled reason without calling the provider.
+    pty.write(b"/compact\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "This command requires an open saved session",
+            Duration::from_secs(5)
+        ),
+        "expected /compact disabled reason:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert_eq!(provider.requests().len(), 0);
+    pty.write(&[0x7f; 12]);
+
+    // 3. Complete turn 1; single-segment `/compact` reports `nothing to compact`.
+    pty.write(b"first compactable turn\r");
+    assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
+    let engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .build()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1 && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+        })
+    }));
+    pty.write(b"/compact\r");
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "nothing to compact", Duration::from_secs(5)),
+        "single-segment compact did not report nothing to compact:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert_eq!(provider.requests().len(), 1);
+
+    // 4. Complete turn 2 so an older segment becomes compressible, then run `/compact`.
+    pty.write(b"second turn before manual compact\r");
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].turns.len() == 2
+                && sessions[0].turns[1].status == latte_core::SessionTurnStatus::Completed
+        })
+    }));
+    pty.write(b"/compact\r");
+    assert!(provider.wait_for_calls(3, Duration::from_secs(5)));
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "compacted history", Duration::from_secs(5)),
+        "productive /compact did not render notice:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "TUI-MANUAL-COMPACT-SUMMARY",
+            Duration::from_secs(5)
+        ),
+        "productive /compact did not refresh summary card into transcript:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert!(wait_until(Duration::from_secs(5), || {
+        engine.list_sessions().is_ok_and(|sessions| {
+            sessions[0]
+                .transcript
+                .entries
+                .iter()
+                .any(|entry| entry.kind == TranscriptKind::CompactSummary)
+        })
+    }));
+
+    // 5. Repeating `/compact` is idempotent and spends zero extra provider calls.
+    pty.write(b"/compact\r");
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "nothing to compact", Duration::from_secs(5)),
+        "repeat /compact did not report nothing to compact:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    provider.assert_consumed();
+
+    pty.write(F10);
+    let (status, _) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_slash_cancel_and_batch4_permission_outcomes_preserve_session_safety() {
+    let cancel_scenario = Scenario::new();
+    let cancel_provider = ScriptedProvider::start([
+        ProviderReply::error(503, "busy").header("retry-after", "5"),
+        ProviderReply::completion("unreachable-after-cancel"),
+    ]);
+    cancel_scenario.write_config_with_provider_fields(
+        cancel_provider.endpoint(),
+        r#"["/usr/bin/true"]"#,
+        ".latte/latte-code.db",
+        ",max_attempts:3",
+    );
+    let mut cancel_command = cancel_scenario.command(&["tui"]);
+    cancel_command.env("TEST_OPENAI_KEY", "tui-cancel-secret");
+    let mut pty = PtySession::spawn(cancel_command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Describe an outcome",
+        Duration::from_secs(5)
+    ));
+
+    // 1. `/cancel extra` and idle `/cancel` reject locally and preserve composer.
+    pty.write(b"/cancel extra\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "/cancel does not accept arguments",
+            Duration::from_secs(5)
+        ),
+        "expected /cancel argument validation error:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    pty.write(&[0x7f; 20]);
+
+    pty.write(b"/cancel\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "No active turn to cancel",
+            Duration::from_secs(5)
+        ),
+        "expected /cancel disabled reason:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    pty.write(&[0x7f; 12]);
+    assert_eq!(cancel_provider.requests().len(), 0);
+
+    // 2. Start a running turn, wait until TUI renders Running, verify `/compact`
+    //    is disabled while running, then `/cancel` interrupts the turn without
+    //    exiting the TUI or arming Ctrl+C exit.
+    pty.write(b"slow turn for slash cancel\r");
+    assert!(cancel_provider.wait_for_calls(1, Duration::from_secs(5)));
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "Running · mock", Duration::from_secs(5)),
+        "TUI never rendered Running state:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+
+    pty.write(b"/compact\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Compact requires an idle Ready session",
+        Duration::from_secs(5)
+    ));
+    pty.write(&[0x7f; 12]);
+
+    let cancel_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(cancel_scenario.root())
+        .database_path(cancel_scenario.database_path())
+        .build()
+        .unwrap();
+    pty.write(b"/cancel\r");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            cancel_engine.list_sessions().is_ok_and(|sessions| {
+                sessions.len() == 1
+                    && sessions[0].lifecycle == latte_core::SessionLifecycle::Interrupted
+                    && sessions[0].turns[0].status == latte_core::SessionTurnStatus::Interrupted
+            })
+        }),
+        "slash /cancel did not interrupt active turn:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    assert!(pty.is_running());
+
+    // Proves `/cancel` did NOT arm `ctrl_c_exit_armed_until`: a single Ctrl+C
+    // now arms exit confirmation instead of quitting the TUI.
+    pty.write(CTRL_C);
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Ctrl+C again to exit",
+        Duration::from_secs(5)
+    ));
+    assert!(pty.is_running());
+    pty.write(F10);
+    let (cancel_status, _) = pty.finish(Duration::from_secs(5));
+    assert!(cancel_status.success());
+
+    // 3. Batch 4 outcomes: trigger `WaitingPermission`, verify Enter does not
+    //    approve, deny with `d` -> `Permission denied · ready`, then follow up
+    //    and cancel waiting permission with Ctrl+C -> `Cancelled`.
+    let perm_scenario = Scenario::new();
+    let perm_provider = ScriptedProvider::start([
+        write_file_reply("batch4-deny-write"),
+        write_file_reply("batch4-cancel-write"),
+    ]);
+    let mut perm_command = perm_scenario.command(&["tui"]);
+    perm_scenario.configure_provider(
+        &mut perm_command,
+        perm_provider.endpoint(),
+        r#"["/usr/bin/true"]"#,
+        "tui-perm-secret",
+    );
+    let mut perm_pty = PtySession::spawn(perm_command);
+    assert!(perm_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &perm_pty,
+        40,
+        120,
+        "Describe an outcome",
+        Duration::from_secs(5)
+    ));
+
+    perm_pty.write(b"propose write to deny\r");
+    assert!(perm_provider.wait_for_calls(1, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &perm_pty,
+        40,
+        120,
+        "Permission required",
+        Duration::from_secs(5)
+    ));
+    perm_pty.write(ENTER);
+    assert!(!perm_scenario.root().join("new.txt").exists());
+    perm_pty.write(b"d");
+    assert!(
+        wait_for_screen_text(
+            &perm_pty,
+            40,
+            120,
+            "Permission denied · ready",
+            Duration::from_secs(5)
+        ),
+        "expected distinct Permission denied · ready label:\n{}",
+        pty_screen_text(&perm_pty.output(), 40, 120)
+    );
+    assert!(!perm_scenario.root().join("new.txt").exists());
+    let perm_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(perm_scenario.root())
+        .database_path(perm_scenario.database_path())
+        .build()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        perm_engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Ready
+                && sessions[0].turns.len() == 1
+                && sessions[0].turns[0].failure_code
+                    == Some(latte_core::FailureCode::PermissionDenied)
+        })
+    }));
+
+    // 4. Follow up on the same ready session, park on permission again, and
+    //    cancel via Ctrl+C — verifying distinct `Cancelled` outcome.
+    perm_pty.write(b"propose write to cancel\r");
+    assert!(perm_provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &perm_pty,
+        40,
+        120,
+        "Permission required",
+        Duration::from_secs(5)
+    ));
+    perm_pty.write(CTRL_C);
+    assert!(wait_until(Duration::from_secs(5), || {
+        perm_engine.list_sessions().is_ok_and(|sessions| {
+            sessions.len() == 1
+                && sessions[0].lifecycle == latte_core::SessionLifecycle::Failed
+                && sessions[0].turns.len() == 2
+                && sessions[0].turns[1].failure_code == Some(latte_core::FailureCode::Cancelled)
+        })
+    }));
+    assert!(wait_for_screen_text(
+        &perm_pty,
+        40,
+        120,
+        "Cancelled",
+        Duration::from_secs(5)
+    ));
+    assert!(!perm_scenario.root().join("new.txt").exists());
+    perm_provider.assert_consumed();
+
+    perm_pty.write(F10);
+    let (perm_status, _) = perm_pty.finish(Duration::from_secs(5));
+    assert!(perm_status.success());
 }

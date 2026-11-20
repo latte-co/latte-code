@@ -240,8 +240,8 @@ JSONL**，省略只发生在模型可见投影层。
 
 显式手动压缩复用同一套分层与卡片，只在触发资格与失败语义上不同：
 
-- **端点/CLI**：`POST /v1/sessions/{id}/compact` 与 `latte-code compact
-  <session-id>`，无请求体。
+- **端点/CLI/TUI**：`POST /v1/sessions/{id}/compact`、`latte-code compact
+  <session-id>` 与 TUI `/compact`（及 `Ctrl+P` 命令面板），无参数/无请求体；TUI 压缩完成后刷新权威快照与状态栏 `ContextUsage` meter。
 - **idle-only（fail-closed）**：仅 `Ready` 且无活跃 runner 的会话可执行；
   `running`/`waiting_permission`/`waiting_input` 等一律 409。卡片落库走一条
   独立的存储闸门：只有 `compact_summary` / `tool_result_elision` 两种 kind、

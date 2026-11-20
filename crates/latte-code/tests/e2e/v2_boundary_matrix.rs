@@ -1,13 +1,14 @@
 use super::support::{PtySession, Scenario, json, wait_until};
 use latte_core::{
-    FailureCode, Handoff, IdSource, PendingInput, Retryability, SessionCommandId, SessionEvent,
-    SessionEventEnvelope, SessionEventId, SessionId, SessionLifecycle, SessionPendingRequest,
-    SessionProviderBinding, SessionSummary, SessionTransientProgress, SessionTurnStatus,
-    SystemIdSource, TranscriptEntry, TranscriptEntryId, TranscriptKind, TurnFailure, TurnId,
+    EffectId, FailureCode, Handoff, IdSource, PendingInput, Retryability, SessionCommandId,
+    SessionEvent, SessionEventEnvelope, SessionEventId, SessionId, SessionLifecycle,
+    SessionPendingRequest, SessionProviderBinding, SessionSummary, SessionTransientProgress,
+    SessionTurnStatus, SystemIdSource, TranscriptEntry, TranscriptEntryId, TranscriptKind,
+    TurnFailure, TurnId,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionTurnUpdate, EngineBuilder, EngineHandle, Lease, ProcessOutput,
-    ProcessTermination, SessionCommitRequest, SessionEffectDescriptor, SessionEffectObservedValue,
+    CancellationToken, CommitSessionTurnUpdate, EffectAuthority, EngineBuilder, EngineHandle,
+    Lease, ProcessOutput, ProcessTermination, SessionCommitRequest, SessionEffectObservedValue,
     SessionEffectPolicy, SessionEffectRequest, SessionEffectStartRequest, StorageError,
     SubscriptionError,
 };
@@ -19,7 +20,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use latte_tui::{
     ConnectionState,
     session::{
-        ActiveConversation, PendingInputSubmission, PendingModelSwitch, PendingSubmission,
+        ActiveSession, PendingInputSubmission, PendingModelSwitch, PendingSubmission,
         SessionModelOption, SessionPermissionMode, SessionStartupPresentation, SessionUiAction,
         SessionUiInput, SessionUiModel, reduce,
     },
@@ -43,7 +44,7 @@ fn command_id() -> SessionCommandId {
 
 fn binding() -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: "v2-boundary".into(),
         provider_type: "openai-chat".into(),
         protocol: "openai-chat-completions-v1".into(),
@@ -90,7 +91,7 @@ fn commit_with_command(
         SessionCommitRequest {
             session_id: snapshot.session_id,
             turn_id,
-            expected_session_revision: snapshot.revision,
+            expected_session_revision: snapshot.session_revision,
             expected_turn_revision: turn_revision,
             command_id,
             request_id: None,
@@ -170,12 +171,12 @@ fn prepare_effect(
             SessionEffectRequest {
                 session_id: snapshot.session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:prepare"),
-                descriptor: SessionEffectDescriptor {
-                    effect_id: effect_id.into(),
+                authority: EffectAuthority {
+                    effect_id: EffectId::new(effect_id).unwrap(),
                     tool_call_id: format!("call-{effect_id}"),
                     name: name.into(),
                     input,
@@ -201,11 +202,11 @@ fn start_effect(
             SessionEffectStartRequest {
                 session_id: prepared.snapshot.session_id,
                 turn_id,
-                expected_session_revision: prepared.snapshot.revision,
+                expected_session_revision: prepared.snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("boundary:{effect_id}:start"),
-                effect_id: effect_id.into(),
+                effect_id: EffectId::new(effect_id).unwrap(),
             },
             prepared.operation_digest.clone(),
             lease,
@@ -350,6 +351,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         session_id,
         title: "public reducer authoritative session".into(),
         workspace_root: scenario.root().display().to_string(),
+        project_key: None,
         parent_session_id: None,
         lifecycle: SessionLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
@@ -364,10 +366,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         )
         .is_empty()
     );
-    assert_eq!(
-        model.active_conversation,
-        Some(ActiveConversation::NewSessionDraft)
-    );
+    assert_eq!(model.active_session, Some(ActiveSession::SessionDraft));
     assert!(
         reduce(
             &mut model,
@@ -429,8 +428,8 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         .is_empty()
     );
     assert_eq!(
-        model.active_conversation,
-        Some(ActiveConversation::Session(session_id))
+        model.active_session,
+        Some(ActiveSession::Existing(session_id))
     );
     assert_eq!(model.selected_session(), Some(&ready));
 
@@ -469,7 +468,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-        revision: 1,
+        session_revision: 1,
         sequence: 1,
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Running,
@@ -484,7 +483,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision.saturating_add(2),
+        session_revision: ready.session_revision.saturating_add(2),
         sequence: ready.sequence.saturating_add(2),
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Running,
@@ -505,7 +504,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision + 1,
+        session_revision: ready.session_revision + 1,
         sequence: ready.sequence + 1,
         event: SessionEvent::LifecycleChanged {
             lifecycle: SessionLifecycle::Interrupted,
@@ -521,7 +520,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision + 2,
+        session_revision: ready.session_revision + 2,
         sequence: ready.sequence + 2,
         event: SessionEvent::TranscriptAppended {
             entry: TranscriptEntry {
@@ -547,7 +546,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
     let linked_turn = latte_core::SessionTurnSummary {
         turn_id: TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         parent_turn_id: Some(turn_id),
-        ordinal: 1,
+        turn_ordinal: 1,
         status: SessionTurnStatus::Queued,
         turn_revision: 0,
         completed_at_ms: None,
@@ -557,7 +556,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision + 3,
+        session_revision: ready.session_revision + 3,
         sequence: ready.sequence + 3,
         event: SessionEvent::TurnLinked {
             turn: linked_turn.clone(),
@@ -572,7 +571,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision + 4,
+        session_revision: ready.session_revision + 4,
         sequence: ready.sequence + 4,
         event: SessionEvent::BindingChanged {
             provider_name: "secondary".into(),
@@ -699,7 +698,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
 
     let mut queued_model = SessionUiModel::default();
     queued_model.sessions = vec![ready.clone()];
-    queued_model.active_conversation = Some(ActiveConversation::Session(session_id));
+    queued_model.active_session = Some(ActiveSession::Existing(session_id));
     queued_model.pending_submission = Some(PendingSubmission {
         submission_id: 11,
         prompt: "queued public follow-up".into(),
@@ -707,7 +706,8 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         after_sequence: ready.sequence,
     });
     queued_model.queued_follow_up = Some("queued public follow-up".into());
-    queued_model.reconciliation_confirmation = Some((session_id, "obsolete-effect".into()));
+    queued_model.reconciliation_confirmation =
+        Some((session_id, EffectId::new("obsolete-effect").unwrap()));
     assert_eq!(
         reduce(
             &mut queued_model,
@@ -716,7 +716,7 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         vec![SessionUiAction::FollowUp {
             submission_id: 11,
             session_id,
-            expected_session_revision: ready.revision,
+            expected_session_revision: ready.session_revision,
             prompt: "queued public follow-up".into(),
         }]
     );
@@ -756,11 +756,11 @@ fn public_tui_projection_reducer_matrix_tracks_authoritative_engine_snapshot() {
         protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
         event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
         session_id,
-        revision: ready.revision + 1,
+        session_revision: ready.session_revision + 1,
         sequence: ready.sequence + 1,
         event: SessionEvent::ReconciliationRequired {
             turn_id,
-            effect_id: "event-unknown-effect".into(),
+            effect_id: EffectId::new("event-unknown-effect").unwrap(),
         },
     };
     assert!(
@@ -890,6 +890,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         session_id,
         title: "render boundary session".into(),
         workspace_root: scenario.root().display().to_string(),
+        project_key: None,
         parent_session_id: None,
         lifecycle: SessionLifecycle::Ready,
         provider_name: ready.binding.provider_name.clone(),
@@ -1035,7 +1036,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         },
     ]);
     rich.sequence = next_sequence + 7;
-    model.active_conversation = Some(ActiveConversation::Session(session_id));
+    model.active_session = Some(ActiveSession::Existing(session_id));
     reduce(&mut model, SessionUiInput::Snapshot(vec![rich.clone()]));
 
     let mut assigned_model = SessionUiModel::with_startup(model.startup.clone().unwrap());
@@ -1058,8 +1059,8 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         },
     );
     assert_eq!(
-        assigned_model.active_conversation,
-        Some(ActiveConversation::Session(session_id))
+        assigned_model.active_session,
+        Some(ActiveSession::Existing(session_id))
     );
 
     model.focus = latte_tui::session::SessionFocus::Navigation;
@@ -1118,7 +1119,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     );
 
     let mut busy_picker = SessionUiModel::with_startup(model.startup.clone().unwrap());
-    busy_picker.active_conversation = Some(ActiveConversation::Session(session_id));
+    busy_picker.active_session = Some(ActiveSession::Existing(session_id));
     reduce(
         &mut busy_picker,
         SessionUiInput::Snapshot(vec![rich.clone()]),
@@ -1193,7 +1194,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     terminal.active_turn_id = None;
 
     let mut stranded_model = model.clone();
-    stranded_model.active_conversation = Some(ActiveConversation::Session(session_id));
+    stranded_model.active_session = Some(ActiveSession::Existing(session_id));
     stranded_model.queued_follow_up = Some("stranded queued follow-up".into());
     stranded_model.pending_submission = Some(PendingSubmission {
         submission_id: 90,
@@ -1228,7 +1229,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     reduce(&mut model, SessionUiInput::Snapshot(vec![terminal]));
     assert!(model.composer.contains("restore after"));
 
-    model.reconciliation_confirmation = Some((session_id, "render-effect".into()));
+    model.reconciliation_confirmation = Some((session_id, EffectId::new("render-effect").unwrap()));
     assert!(reduce(&mut model, key(KeyCode::Char('d'))).is_empty());
     assert!(model.reconciliation_confirmation.is_none());
     model.connection = ConnectionState::Disconnected;
@@ -1393,7 +1394,8 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
         &mut reconciliation_model,
         SessionUiInput::Snapshot(vec![reconciliation]),
     );
-    reconciliation_model.reconciliation_confirmation = Some((session_id, "render-effect".into()));
+    reconciliation_model.reconciliation_confirmation =
+        Some((session_id, EffectId::new("render-effect").unwrap()));
     assert!(reduce(&mut reconciliation_model, key(KeyCode::Enter)).is_empty());
     assert!(matches!(
         reduce(
@@ -1401,7 +1403,8 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
             modified_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         )
         .as_slice(),
-        [SessionUiAction::ReconcileUnknown { effect_id, .. }] if effect_id == "render-effect"
+        [SessionUiAction::ReconcileUnknown { effect_id, .. }]
+            if effect_id.as_str() == "render-effect"
     ));
     render_models.push(reconciliation_model);
 
@@ -1443,7 +1446,7 @@ fn public_tui_key_and_render_matrix_covers_every_modal_and_viewport_tier() {
     render_models.push(slash_model);
 
     let mut picker_model = SessionUiModel::with_startup(startup);
-    picker_model.active_conversation = Some(ActiveConversation::Session(session_id));
+    picker_model.active_session = Some(ActiveSession::Existing(session_id));
     reduce(
         &mut picker_model,
         SessionUiInput::Snapshot(vec![rich.clone()]),
@@ -1572,7 +1575,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         engine.create_session_follow_up_v2(
             session_id,
             TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            running.revision,
+            running.session_revision,
             "",
             now + 4,
         ),
@@ -1582,7 +1585,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         engine.create_session_follow_up_v2(
             session_id,
             TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            running.revision,
+            running.session_revision,
             "not ready",
             now + 4,
         ),
@@ -1591,7 +1594,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            running.revision,
+            running.session_revision,
             &binding(),
             &lease,
             now + 4,
@@ -1658,7 +1661,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            ready.revision.saturating_add(1),
+            ready.session_revision.saturating_add(1),
             &binding(),
             &lease,
             now + 6,
@@ -1670,7 +1673,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            ready.revision,
+            ready.session_revision,
             &invalid_binding,
             &lease,
             now + 6,
@@ -1687,7 +1690,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            ready.revision,
+            ready.session_revision,
             &binding(),
             &wrong_lease,
             now + 7,
@@ -1699,7 +1702,13 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
     alternate.provider_name = "alternate".into();
     alternate.model = "alternate-model".into();
     let switched = engine
-        .switch_session_binding_v2(session_id, ready.revision, &alternate, &lease, now + 7)
+        .switch_session_binding_v2(
+            session_id,
+            ready.session_revision,
+            &alternate,
+            &lease,
+            now + 7,
+        )
         .unwrap();
     assert_eq!(switched.binding.model, "alternate-model");
 
@@ -1717,7 +1726,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
         engine.create_session_follow_up_v2(
             session_id,
             TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            switched.revision.saturating_add(1),
+            switched.session_revision.saturating_add(1),
             "stale follow-up",
             now + 8,
         ),
@@ -1728,7 +1737,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
             None,
             session_id,
             TurnId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            switched.revision,
+            switched.session_revision,
             "wrong scoped follow-up",
             &foreign_lease,
             now + 8,
@@ -1741,7 +1750,7 @@ fn public_engine_session_creation_catalog_and_binding_preconditions_fail_closed(
             None,
             session_id,
             child_id,
-            switched.revision,
+            switched.session_revision,
             "valid atomic follow-up",
             &lease,
             now + 9,
@@ -2411,7 +2420,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         .create_session_follow_up_v2(
             tree_session_id,
             interrupted_turn_id,
-            parent.revision,
+            parent.session_revision,
             "boundary interrupted follow-up",
             now + 10,
         )
@@ -2459,11 +2468,12 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         now + 14,
     );
     let (_, verification_revision) = active_turn(&verification);
+    let failed_verification_id = EffectId::new("boundary-verification-failed").unwrap();
     engine
         .record_session_verification(
             verification_turn_id,
             verification_revision,
-            "boundary-verification-failed",
+            &failed_verification_id,
             &ProcessOutput {
                 exit_code: Some(9),
                 stdout: "verification stdout sentinel".into(),
@@ -2480,7 +2490,7 @@ fn failed_effect_verification_and_interrupted_child_tree_are_final_binary_visibl
         .complete_session_verified(
             &verification,
             "must not complete".into(),
-            "boundary-verification-failed".into(),
+            failed_verification_id,
             &verification_lease,
             now + 16,
         )
@@ -2610,7 +2620,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let fixed_request = SessionCommitRequest {
         session_id,
         turn_id,
-        expected_session_revision: started.revision,
+        expected_session_revision: started.session_revision,
         expected_turn_revision: started_turn_revision,
         command_id: command_id(),
         request_id: None,
@@ -2625,7 +2635,10 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let first = engine
         .commit_session_turn_update(fixed_request.clone(), &lease, now + 3)
         .unwrap();
-    assert_eq!(first.snapshot.revision, started.revision + 1);
+    assert_eq!(
+        first.snapshot.session_revision,
+        started.session_revision + 1
+    );
     assert_eq!(first.snapshot.sequence, started.sequence + 1);
 
     let replay = engine
@@ -2633,7 +2646,10 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         .unwrap();
     assert_eq!(replay, first);
     let after_replay = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_replay.revision, first.snapshot.revision);
+    assert_eq!(
+        after_replay.session_revision,
+        first.snapshot.session_revision
+    );
     assert_eq!(after_replay.sequence, first.snapshot.sequence);
     assert_eq!(
         after_replay
@@ -2662,7 +2678,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let stale_session = SessionCommitRequest {
         session_id,
         turn_id,
-        expected_session_revision: first.snapshot.revision - 1,
+        expected_session_revision: first.snapshot.session_revision - 1,
         expected_turn_revision: current_turn_revision,
         command_id: command_id(),
         request_id: None,
@@ -2681,7 +2697,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
     let stale_run = SessionCommitRequest {
         session_id,
         turn_id,
-        expected_session_revision: first.snapshot.revision,
+        expected_session_revision: first.snapshot.session_revision,
         expected_turn_revision: current_turn_revision - 1,
         command_id: command_id(),
         request_id: None,
@@ -2698,7 +2714,10 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         Err(StorageError::StaleRevision { .. })
     ));
     let after_rejections = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_rejections.revision, first.snapshot.revision);
+    assert_eq!(
+        after_rejections.session_revision,
+        first.snapshot.session_revision
+    );
     assert_eq!(after_rejections.sequence, first.snapshot.sequence);
     assert!(!after_rejections.transcript.entries.iter().any(|entry| {
         entry.text == "conflicting replay must not persist"
@@ -2721,7 +2740,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
             now + 10 + ordinal,
         );
     }
-    let authoritative_revision = current.revision;
+    let authoritative_revision = current.session_revision;
     let authoritative_sequence = current.sequence;
     let (_, authoritative_turn_revision) = active_turn(&current);
 
@@ -2784,7 +2803,7 @@ fn command_revision_and_lease_fences_preserve_paged_projection_in_final_binary()
         Err(StorageError::LeaseLost)
     ));
     let after_expiry = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_expiry.revision, authoritative_revision);
+    assert_eq!(after_expiry.session_revision, authoritative_revision);
     assert_eq!(after_expiry.sequence, authoritative_sequence);
     assert!(
         !after_expiry
@@ -2874,7 +2893,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Prepared
     );
-    let prepared_revision = prepared.snapshot.revision;
+    let prepared_revision = prepared.snapshot.session_revision;
     let prepared_sequence = prepared.snapshot.sequence;
     let (prepared_turn_id, prepared_turn_revision) = active_turn(&prepared.snapshot);
     assert_eq!(prepared_turn_id, turn_id);
@@ -2886,7 +2905,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         expected_turn_revision: prepared_turn_revision,
         command_id: command_id(),
         source_key: "boundary:effect-authority:start-exact".into(),
-        effect_id: effect_id.into(),
+        effect_id: EffectId::new(effect_id).unwrap(),
     };
     let wrong_digest = engine
         .start_session_effect(start_request.clone(), "0".repeat(64), &lease, now + 4)
@@ -2901,12 +2920,12 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         latte_engine::EffectStatus::Prepared
     );
     let after_wrong_digest = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_wrong_digest.revision, prepared_revision);
+    assert_eq!(after_wrong_digest.session_revision, prepared_revision);
     assert_eq!(after_wrong_digest.sequence, prepared_sequence);
 
     let wrong_id = engine.start_session_effect(
         SessionEffectStartRequest {
-            effect_id: "boundary-missing-effect".into(),
+            effect_id: EffectId::new("boundary-missing-effect").unwrap(),
             command_id: command_id(),
             source_key: "boundary:effect-authority:wrong-id".into(),
             ..start_request.clone()
@@ -2921,7 +2940,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         latte_engine::EffectStatus::Prepared
     );
     let after_wrong_id = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_wrong_id.revision, prepared_revision);
+    assert_eq!(after_wrong_id.session_revision, prepared_revision);
     assert_eq!(after_wrong_id.sequence, prepared_sequence);
 
     let foreign_scenario = Scenario::new();
@@ -2945,7 +2964,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         latte_engine::EffectStatus::Prepared
     );
     let after_foreign_start = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_foreign_start.revision, prepared_revision);
+    assert_eq!(after_foreign_start.session_revision, prepared_revision);
     assert_eq!(after_foreign_start.sequence, prepared_sequence);
 
     let started = engine
@@ -2960,7 +2979,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         engine.effect_status(effect_id).unwrap(),
         latte_engine::EffectStatus::Started
     );
-    let started_revision = started.snapshot.revision;
+    let started_revision = started.snapshot.session_revision;
     let started_sequence = started.snapshot.sequence;
     let observed_value = SessionEffectObservedValue {
         result: r#"{"value":"must remain uncertified"}"#.into(),
@@ -2987,7 +3006,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         latte_engine::EffectStatus::Started
     );
     let after_foreign_observe = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_foreign_observe.revision, started_revision);
+    assert_eq!(after_foreign_observe.session_revision, started_revision);
     assert_eq!(after_foreign_observe.sequence, started_sequence);
 
     assert!(matches!(
@@ -3006,7 +3025,7 @@ fn wrong_effect_identity_digest_and_observation_authority_never_mutate_final_pro
         latte_engine::EffectStatus::Started
     );
     let after_expired_observe = engine.session_snapshot_v2(session_id, None, 500).unwrap();
-    assert_eq!(after_expired_observe.revision, started_revision);
+    assert_eq!(after_expired_observe.session_revision, started_revision);
     assert_eq!(after_expired_observe.sequence, started_sequence);
     assert!(
         !after_expired_observe
@@ -3102,7 +3121,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         engine
             .switch_session_binding_v2(
                 session_id,
-                started.revision,
+                started.session_revision,
                 &changed_binding,
                 &lease,
                 now + 3,
@@ -3138,13 +3157,19 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
         .unwrap();
     assert!(
         engine
-            .switch_session_binding_v2(session_id, completed.revision, &binding(), &lease, now + 5,)
+            .switch_session_binding_v2(
+                session_id,
+                completed.session_revision,
+                &binding(),
+                &lease,
+                now + 5,
+            )
             .is_err()
     );
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            completed.revision - 1,
+            completed.session_revision - 1,
             &changed_binding,
             &lease,
             now + 6,
@@ -3154,7 +3179,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     assert!(matches!(
         engine.switch_session_binding_v2(
             session_id,
-            completed.revision,
+            completed.session_revision,
             &changed_binding,
             &wrong_scope,
             now + 7,
@@ -3164,7 +3189,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
     let switched = engine
         .switch_session_binding_v2(
             session_id,
-            completed.revision,
+            completed.session_revision,
             &changed_binding,
             &lease,
             now + 8,
@@ -3380,7 +3405,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             None,
             fork_session_id,
             fork_turn_id,
-            fork.revision,
+            fork.session_revision,
             "independent fork child",
             &fork_lease,
             now + 24,
@@ -3414,7 +3439,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             None,
             session_id,
             follow_up_id,
-            switched.revision - 1,
+            switched.session_revision - 1,
             "atomic follow-up must not appear",
             &lease,
             now + 9,
@@ -3427,7 +3452,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             None,
             session_id,
             follow_up_id,
-            switched.revision,
+            switched.session_revision,
             "atomic follow-up must not appear",
             &wrong_scope,
             now + 10,
@@ -3440,7 +3465,7 @@ fn atomic_session_and_follow_up_enforce_scope_and_remain_final_binary_visible() 
             None,
             session_id,
             follow_up_id,
-            switched.revision,
+            switched.session_revision,
             "atomic follow-up accepted",
             &lease,
             now + 11,
@@ -3565,13 +3590,14 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         .find(|run| run.turn_id == turn_id)
         .unwrap()
         .turn_revision;
+    let explicit_unknown_id = EffectId::new("explicit-unknown-effect").unwrap();
     assert!(matches!(
         engine.reconcile_session_effect_unknown(
             session_id,
             turn_id,
-            unknown.revision,
+            unknown.session_revision,
             turn_revision,
-            "explicit-unknown-effect".into(),
+            explicit_unknown_id.clone(),
             "boundary:unknown:wrong-scope-reconcile".into(),
             command_id(),
             &wrong_scope,
@@ -3591,9 +3617,9 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         engine.reconcile_session_effect_unknown(
             session_id,
             turn_id,
-            unknown.revision - 1,
+            unknown.session_revision - 1,
             turn_revision,
-            "explicit-unknown-effect".into(),
+            explicit_unknown_id.clone(),
             "boundary:unknown:stale-reconcile".into(),
             command_id(),
             &lease,
@@ -3605,9 +3631,9 @@ fn explicit_unknown_reconciliation_is_fenced_and_final_binary_visible() {
         .reconcile_session_effect_unknown(
             session_id,
             turn_id,
-            unknown.revision,
+            unknown.session_revision,
             turn_revision,
-            "explicit-unknown-effect".into(),
+            explicit_unknown_id,
             "boundary:unknown:reconcile".into(),
             command_id(),
             &lease,
@@ -3677,7 +3703,7 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         .unwrap();
     let created_event = session_events.try_recv().unwrap().unwrap();
     assert_eq!(created_event.session_id, session_id);
-    assert_eq!(created_event.revision, snapshot.revision);
+    assert_eq!(created_event.session_revision, snapshot.session_revision);
 
     snapshot = commit(
         &engine,
@@ -3714,7 +3740,10 @@ async fn public_change_feeds_require_snapshot_reload_after_lag_and_close_cleanly
         Err(SubscriptionError::Lagged(count)) if count >= 6
     ));
     let authoritative_tail = engine.session_snapshot_tail_v2(session_id, 5).unwrap();
-    assert_eq!(authoritative_tail.revision, snapshot.revision);
+    assert_eq!(
+        authoritative_tail.session_revision,
+        snapshot.session_revision
+    );
     assert_eq!(authoritative_tail.sequence, snapshot.sequence);
     assert_eq!(authoritative_tail.transcript.entries.len(), 5);
     assert_eq!(
@@ -3848,46 +3877,43 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     let (validation, validation_lease, _) =
         create_started_effect_session(&engine, "effect descriptor validation", now);
     let (validation_turn_id, validation_turn_revision) = active_turn(&validation);
-    let valid_descriptor = SessionEffectDescriptor {
-        effect_id: "validation-effect".into(),
+    assert!(EffectId::new("").is_err());
+    let valid_authority = EffectAuthority {
+        effect_id: EffectId::new("validation-effect").unwrap(),
         tool_call_id: "call-validation-effect".into(),
         name: "read_file".into(),
         input: serde_json::json!({"path":"permission-summary.txt"}),
         attempt: 1,
     };
-    let invalid_descriptors = [
-        SessionEffectDescriptor {
-            effect_id: String::new(),
-            ..valid_descriptor.clone()
-        },
-        SessionEffectDescriptor {
+    let invalid_authorities = [
+        EffectAuthority {
             name: "read\nfile".into(),
-            ..valid_descriptor.clone()
+            ..valid_authority.clone()
         },
-        SessionEffectDescriptor {
+        EffectAuthority {
             tool_call_id: "invalid tool call id".into(),
-            ..valid_descriptor.clone()
+            ..valid_authority.clone()
         },
-        SessionEffectDescriptor {
+        EffectAuthority {
             attempt: 0,
-            ..valid_descriptor.clone()
+            ..valid_authority.clone()
         },
-        SessionEffectDescriptor {
+        EffectAuthority {
             input: serde_json::json!(["not", "an", "object"]),
-            ..valid_descriptor.clone()
+            ..valid_authority
         },
     ];
-    for (ordinal, descriptor) in invalid_descriptors.into_iter().enumerate() {
+    for (ordinal, authority) in invalid_authorities.into_iter().enumerate() {
         let error = engine
             .prepare_session_effect(
                 SessionEffectRequest {
                     session_id: validation.session_id,
                     turn_id: validation_turn_id,
-                    expected_session_revision: validation.revision,
+                    expected_session_revision: validation.session_revision,
                     expected_turn_revision: validation_turn_revision,
                     command_id: command_id(),
                     source_key: format!("validation:{ordinal}"),
-                    descriptor,
+                    authority,
                 },
                 &validation_lease,
                 now + 3 + u64::try_from(ordinal).unwrap(),
@@ -3895,16 +3921,16 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             .unwrap_err();
         assert!(matches!(error, StorageError::InvalidData(_)));
     }
-    for (ordinal, descriptor) in [
-        SessionEffectDescriptor {
-            effect_id: "validation-denied-process".into(),
+    for (ordinal, authority) in [
+        EffectAuthority {
+            effect_id: EffectId::new("validation-denied-process").unwrap(),
             tool_call_id: "call-validation-denied-process".into(),
             name: "process".into(),
             input: serde_json::json!({"shell":"rm -rf /","cwd":"."}),
             attempt: 1,
         },
-        SessionEffectDescriptor {
-            effect_id: "validation-unknown-tool".into(),
+        EffectAuthority {
+            effect_id: EffectId::new("validation-unknown-tool").unwrap(),
             tool_call_id: "call-validation-unknown-tool".into(),
             name: "unknown_tool".into(),
             input: serde_json::json!({}),
@@ -3919,11 +3945,11 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
                 SessionEffectRequest {
                     session_id: validation.session_id,
                     turn_id: validation_turn_id,
-                    expected_session_revision: validation.revision,
+                    expected_session_revision: validation.session_revision,
                     expected_turn_revision: validation_turn_revision,
                     command_id: command_id(),
                     source_key: format!("policy-rejection:{ordinal}"),
-                    descriptor,
+                    authority,
                 },
                 &validation_lease,
                 now + 8 + u64::try_from(ordinal).unwrap(),

@@ -1,14 +1,24 @@
 use super::support::Scenario;
 use latte_core::{
-    CommandEnvelope, CommandId, CompletionPolicy, Evidence, FailureCode, Handoff, HeadlessOutcome,
-    IdSource, PendingInput, PendingPermission, Retryability, RuntimeCommand, SessionCommand,
-    SessionCommandEnvelope, SessionCommandId, SessionLifecycle, SystemIdSource, Transition,
-    TransitionError, TurnFailure, TurnId, TurnState, TurnStatus, VerificationStatus,
-    redact_session_text, redact_session_value, valid_openai_chat_input_request_id,
-    valid_openai_chat_opaque_id, valid_openai_chat_tool_call_id,
+    CompactionStrategy, CompletionPolicy, ContextPolicy, EffectId, Evidence, FailureCode, Handoff,
+    HarnessProfile, IdSource, ManualCompactionState, ManualCompactionTier, PendingInput,
+    PendingPermission, ProfileVersion, ProjectKey, ProjectSummary, Retryability, RoundId,
+    SessionCommand, SessionCommandEnvelope, SessionCommandId, SessionEffectKind, SessionLifecycle,
+    SystemIdSource, SystemPromptSpec, Transition, TransitionError, TurnFailure, TurnId, TurnState,
+    TurnStatus, VerificationStatus, redact_session_text, redact_session_value,
+    valid_openai_chat_input_request_id, valid_openai_chat_opaque_id,
+    valid_openai_chat_tool_call_id,
 };
-use latte_headless::{context, registry::ProviderRegistry};
-use latte_tui::command::{SlashResolution, resolve_slash, slash_suggestions};
+use latte_headless::{
+    context, profile::ProfileCatalog, provider::Message, registry::ProviderRegistry,
+};
+use latte_tui::{
+    command::{
+        BuiltinCommand, CommandAvailability, CommandContext, SlashResolution, command_availability,
+        resolve_slash, slash_suggestions,
+    },
+    session::SessionUiFeedback,
+};
 use std::path::Path;
 
 fn turn_id() -> TurnId {
@@ -31,10 +41,126 @@ fn handoff(status: VerificationStatus) -> Handoff {
 #[allow(clippy::too_many_lines)]
 fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() {
     let ids = SystemIdSource::default();
-    let command_id = CommandId::from_uuid(ids.next_uuid_v7());
-    let envelope = CommandEnvelope::new(command_id, RuntimeCommand::List);
-    assert_eq!(envelope.command_id.as_uuid(), command_id.as_uuid());
-    assert_eq!(envelope.protocol_version, latte_core::PROTOCOL_VERSION);
+    let round_id = RoundId::from_u64(1);
+    assert_eq!(round_id.as_u64(), 1);
+    assert_eq!(round_id.to_string(), "1");
+    let turn_for_effect = turn_id();
+    let tool_effect_id = EffectId::for_tool_call(turn_for_effect, round_id, 0, "call_1").unwrap();
+    assert!(!tool_effect_id.is_verification());
+    assert_eq!(
+        tool_effect_id.parse_session(),
+        Some(SessionEffectKind::ToolCall {
+            turn_id: turn_for_effect,
+            round_id,
+            call_ordinal: 0,
+            tool_call_id: "call_1".to_string(),
+        })
+    );
+    let verification_effect_id = EffectId::for_verification(turn_for_effect);
+    assert!(verification_effect_id.is_verification());
+    assert_eq!(
+        verification_effect_id.parse_session(),
+        Some(SessionEffectKind::Verification {
+            turn_id: turn_for_effect,
+        })
+    );
+    assert!(EffectId::new("").is_err());
+    assert!(EffectId::new("bad\nid").is_err());
+    assert!(EffectId::new("x".repeat(513)).is_err());
+    assert!(EffectId::for_tool_call(turn_for_effect, round_id, 0, "bad id").is_err());
+    let malformed_tool_effect =
+        EffectId::new(format!("session-effect:{turn_for_effect}:1:0:bad id")).unwrap();
+    assert_eq!(malformed_tool_effect.parse_session(), None);
+    let parsed_effect: EffectId = "opaque-effect".parse().unwrap();
+    assert_eq!(
+        <EffectId as AsRef<str>>::as_ref(&parsed_effect),
+        "opaque-effect"
+    );
+    let project_key = ProjectKey::new("proj_0123456789abcdef").unwrap();
+    assert_eq!(project_key.as_str(), "proj_0123456789abcdef");
+    assert_eq!(
+        <ProjectKey as AsRef<str>>::as_ref(&project_key),
+        "proj_0123456789abcdef"
+    );
+    assert_eq!(project_key.to_string(), "proj_0123456789abcdef");
+    assert_eq!(
+        serde_json::from_str::<ProjectKey>(r#""proj_0123456789abcdef""#).unwrap(),
+        project_key
+    );
+    assert!(ProjectKey::new("").is_err());
+    assert!(ProjectKey::new("bad/key").is_err());
+    let mut ctx_policy = ContextPolicy::default();
+    assert!(ctx_policy.validate().is_ok());
+    let mut zero_req = ctx_policy.clone();
+    zero_req.max_request_bytes = 0;
+    assert!(zero_req.validate().is_err());
+    let mut zero_timeout = ctx_policy.clone();
+    zero_timeout.provider_timeout_ms = 0;
+    assert!(zero_timeout.validate().is_err());
+    let mut zero_rounds = ctx_policy.clone();
+    zero_rounds.max_tool_rounds = Some(0);
+    assert!(zero_rounds.validate().is_err());
+    let mut zero_bpt = ctx_policy.clone();
+    zero_bpt.token_estimate.bytes_per_token = 0;
+    assert!(zero_bpt.validate().is_err());
+    ctx_policy.compaction.strategy = CompactionStrategy::ElideToolResultsThenSummarize;
+    let mut bad_trigger = ctx_policy.clone();
+    bad_trigger.compaction.trigger_ratio = 0;
+    assert!(bad_trigger.validate().is_err());
+    let mut bad_retain = ctx_policy.clone();
+    bad_retain.compaction.retain_ratio = 90;
+    assert!(bad_retain.validate().is_err());
+    let mut bad_source = ctx_policy.clone();
+    bad_source.compaction.max_summary_source_bytes = 0;
+    assert!(bad_source.validate().is_err());
+    let mut bad_slot = ctx_policy.clone();
+    bad_slot.compaction.summary_prompt_id.clear();
+    assert!(bad_slot.validate().is_err());
+    let mut harness_profile = HarnessProfile {
+        profile_id: "default".into(),
+        version: ProfileVersion::V1_0,
+        context: ContextPolicy::default(),
+        prompts: SystemPromptSpec::default(),
+    };
+    assert!(harness_profile.validate().is_ok());
+    harness_profile.profile_id.clear();
+    assert!(harness_profile.validate().is_err());
+    let resolved_base = ProfileCatalog::without_registry(ContextPolicy::default())
+        .resolve_base()
+        .unwrap();
+    assert_eq!(resolved_base.fingerprint().len(), 64);
+    assert!(
+        ProfileCatalog::without_registry(zero_req)
+            .resolve_base()
+            .is_err()
+    );
+    let sys_msg = Message::System {
+        content: "sys".into(),
+    };
+    let user_msg = Message::User {
+        content: "usr".into(),
+    };
+    let asst_msg = Message::Assistant {
+        content: Some("ans".into()),
+        tool_calls: Vec::new(),
+    };
+    let tool_msg = Message::Tool {
+        tool_call_id: "c1".into(),
+        name: None,
+        content: "res".into(),
+    };
+    assert!(sys_msg.is_role("system") && sys_msg.content() == Some("sys"));
+    assert!(user_msg.is_role("user") && user_msg.content() == Some("usr"));
+    assert!(asst_msg.is_role("assistant") && asst_msg.content() == Some("ans"));
+    assert!(tool_msg.is_role("tool") && tool_msg.content() == Some("res"));
+    assert!(!tool_msg.is_role("user"));
+    let summary = ProjectSummary {
+        project_key,
+        vcs_identity: "git:/tmp/project".into(),
+        created_at_ms: 1,
+        updated_at_ms: 2,
+    };
+    assert_eq!(summary.project_key.as_str(), "proj_0123456789abcdef");
     let session_command_id = SessionCommandId::from_uuid(ids.next_uuid_v7());
     let session_envelope = SessionCommandEnvelope::new(
         session_command_id,
@@ -49,16 +175,15 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         session_envelope.protocol_version,
         latte_core::SESSION_PROTOCOL_VERSION
     );
-    for (status, code) in [
-        (HeadlessOutcome::Success, 0),
-        (HeadlessOutcome::Failed, 1),
-        (HeadlessOutcome::UsageError, 2),
-        (HeadlessOutcome::Interrupted, 130),
-        (HeadlessOutcome::Cancelled, 130),
-        (HeadlessOutcome::InternalError, 70),
-    ] {
-        assert_eq!(status.exit_code(), code);
-    }
+    let compacted_state = ManualCompactionState::Compacted {
+        tier: ManualCompactionTier::Elided,
+        session_revision: 3,
+    };
+    assert_eq!(
+        serde_json::to_value(compacted_state).unwrap()["compacted"]["session_revision"],
+        3
+    );
+    let _ = SessionUiFeedback::compaction(Ok("compacted history".into()));
     assert!(SessionLifecycle::Ready.accepts_follow_up());
     assert!(!SessionLifecycle::Running.accepts_follow_up());
     for valid in ["opaque", "call_123", "req-1"] {
@@ -99,6 +224,93 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     assert!(slash_suggestions("/bad name").is_empty());
     assert!(slash_suggestions(&format!("/{}", "x".repeat(65))).is_empty());
     assert_eq!(slash_suggestions("/q")[0].name, "quit");
+    assert_eq!(slash_suggestions("/co")[0].name, "compact");
+    assert_eq!(slash_suggestions("/ca")[0].name, "cancel");
+    assert!(matches!(
+        resolve_slash("/compact"),
+        SlashResolution::Command { descriptor, .. } if descriptor.id == BuiltinCommand::Compact
+    ));
+    assert!(matches!(
+        resolve_slash("/cancel"),
+        SlashResolution::Command { descriptor, .. } if descriptor.id == BuiltinCommand::Cancel
+    ));
+    assert!(matches!(
+        resolve_slash("/compact bad"),
+        SlashResolution::ValidationError(_)
+    ));
+    assert!(matches!(
+        resolve_slash("/cancel bad"),
+        SlashResolution::ValidationError(_)
+    ));
+    let draft_ctx = CommandContext {
+        connected: true,
+        ..CommandContext::default()
+    };
+    assert!(matches!(
+        command_availability(BuiltinCommand::Compact, &draft_ctx),
+        CommandAvailability::Disabled { .. }
+    ));
+    assert!(matches!(
+        command_availability(BuiltinCommand::Cancel, &draft_ctx),
+        CommandAvailability::Disabled { .. }
+    ));
+    let idle_ctx = CommandContext {
+        connected: true,
+        has_open_session: true,
+        lifecycle: Some(SessionLifecycle::Ready),
+        ..CommandContext::default()
+    };
+    assert_eq!(
+        command_availability(BuiltinCommand::Compact, &idle_ctx),
+        CommandAvailability::Enabled
+    );
+    let running_ctx = CommandContext {
+        connected: true,
+        has_open_session: true,
+        lifecycle: Some(SessionLifecycle::Running),
+        has_active_turn: true,
+        ..CommandContext::default()
+    };
+    assert_eq!(
+        command_availability(BuiltinCommand::Cancel, &running_ctx),
+        CommandAvailability::Enabled
+    );
+    let disconnected_ctx = CommandContext::default();
+    for cmd in [
+        BuiltinCommand::Sessions,
+        BuiltinCommand::Rename,
+        BuiltinCommand::Fork,
+        BuiltinCommand::Compact,
+        BuiltinCommand::Cancel,
+    ] {
+        assert!(matches!(
+            command_availability(cmd, &disconnected_ctx),
+            CommandAvailability::Disabled { .. }
+        ));
+    }
+    let compacting_ctx = CommandContext {
+        has_pending_compaction: true,
+        ..idle_ctx
+    };
+    assert!(matches!(
+        command_availability(BuiltinCommand::Compact, &compacting_ctx),
+        CommandAvailability::Disabled { .. }
+    ));
+    let waiting_perm_ctx = CommandContext {
+        connected: true,
+        has_open_session: true,
+        lifecycle: Some(SessionLifecycle::WaitingPermission),
+        has_pending_request: true,
+        ..CommandContext::default()
+    };
+    assert!(matches!(
+        command_availability(BuiltinCommand::Cancel, &waiting_perm_ctx),
+        CommandAvailability::Disabled { .. }
+    ));
+    assert!(matches!(
+        resolve_slash("/rename"),
+        SlashResolution::ValidationError(_)
+    ));
 
     let queued = TurnState::queued(turn_id());
     assert!(matches!(
