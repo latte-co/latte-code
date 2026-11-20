@@ -6,17 +6,18 @@
 use crate::{
     ConnectionState, TuiError,
     command::{
-        BUILTINS, BuiltinCommand, CommandDescriptor, SlashResolution, resolve_slash,
-        slash_suggestions,
+        ArgumentPolicy, BUILTINS, BuiltinCommand, CommandAvailability, CommandContext,
+        CommandDescriptor, SlashResolution, command_availability, resolve_slash, slash_suggestions,
     },
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use latte_core::{
-    ContextUsage, SessionEvent, SessionEventEnvelope, SessionId, SessionLifecycle,
-    SessionPendingRequest, SessionSnapshot, SessionSummary, SessionTransientProgress,
-    SessionTurnStatus, TranscriptEntry, TranscriptKind, TurnId, redact_session_text,
+    ContextUsage, EffectId, FailureCode, SessionEvent, SessionEventEnvelope, SessionId,
+    SessionLifecycle, SessionPendingRequest, SessionSnapshot, SessionSummary,
+    SessionTransientProgress, SessionTurnStatus, SessionTurnSummary, TranscriptEntry,
+    TranscriptKind, TurnId, redact_session_text,
 };
 use ratatui::{
     Frame, Terminal,
@@ -58,6 +59,7 @@ pub trait SessionProjectionClient {
                         .find(|entry| entry.kind == TranscriptKind::User)
                         .map_or_else(|| "Untitled session".into(), |entry| entry.text.clone()),
                     workspace_root: String::new(),
+                    project_key: None,
                     parent_session_id: None,
                     lifecycle: snapshot.lifecycle,
                     provider_name: snapshot.binding.provider_name,
@@ -153,6 +155,8 @@ pub enum SessionUiInput {
     Disconnected,
     CommandError(String),
     CommandCompleted(String),
+    CompactionError(String),
+    CompactionCompleted(String),
     SubmissionAssigned {
         submission_id: u64,
         session_id: SessionId,
@@ -208,6 +212,7 @@ pub enum SessionUiFeedback {
         result: Result<String, String>,
     },
     Command(Result<String, String>),
+    Compaction(Result<String, String>),
     SessionManagement(Result<SessionManagementOutcome, String>),
 }
 
@@ -245,6 +250,11 @@ impl SessionUiFeedback {
     #[must_use]
     pub fn command(result: Result<String, String>) -> Self {
         Self::Command(result)
+    }
+
+    #[must_use]
+    pub fn compaction(result: Result<String, String>) -> Self {
+        Self::Compaction(result)
     }
 
     #[must_use]
@@ -302,7 +312,10 @@ pub enum SessionUiAction {
     /// normal permission approval and requires its own confirmation chord.
     ReconcileUnknown {
         session_id: SessionId,
-        effect_id: String,
+        effect_id: EffectId,
+    },
+    CompactSession {
+        session_id: SessionId,
     },
     ShowSessions {
         query: Option<String>,
@@ -413,11 +426,11 @@ pub enum SessionFocus {
     Navigation,
 }
 
-/// Explicit conversation target. A new draft has no durable Session identity.
+/// Explicit session target. A new draft has no durable Session identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActiveConversation {
-    NewSessionDraft,
-    Session(SessionId),
+pub enum ActiveSession {
+    SessionDraft,
+    Existing(SessionId),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -443,7 +456,7 @@ pub struct SessionUiModel {
     /// identity across refreshes but never compares per-session sequence values.
     pub sessions: Vec<SessionSnapshot>,
     pub session_catalog: Vec<SessionSummary>,
-    pub active_conversation: Option<ActiveConversation>,
+    pub active_session: Option<ActiveSession>,
     pub selected: usize,
     pub composer: String,
     pub input: String,
@@ -453,6 +466,9 @@ pub struct SessionUiModel {
     pub connection: ConnectionState,
     pub progress: Vec<SessionTransientProgress>,
     pub status: String,
+    /// Transient user-visible notice from slash validation, disabled command
+    /// invocation, or manual compaction feedback.
+    pub command_notice: Option<String>,
     pub help: bool,
     /// Explicit command palette opened by Ctrl+P. Keeping this as local UI
     /// state means no palette command can bypass the typed runtime boundary.
@@ -463,7 +479,7 @@ pub struct SessionUiModel {
     pub session_picker: bool,
     pub session_index: usize,
     model_picker: Option<ModelPickerState>,
-    draft_model: Option<(String, String)>,
+    pub pending_model_selection: Option<(String, String)>,
     pub focus: SessionFocus,
     pub navigation_index: usize,
     pub expanded_actions: BTreeSet<String>,
@@ -475,10 +491,10 @@ pub struct SessionUiModel {
     /// transcript entry arrives. While present the composer is intentionally
     /// locked, preventing duplicate Enter dispatches.
     pub pending_submission: Option<PendingSubmission>,
-    /// A next-message draft displaced while an earlier submission is restored
+    /// A next-message text displaced while an earlier submission is restored
     /// after a persistence failure. It returns to the composer after the
     /// restored submission is durably accepted, so eager typing is never lost.
-    deferred_composer_draft: Option<String>,
+    deferred_composer_text: Option<String>,
     /// A request-scoped input value retained until its exact durable input
     /// card is observed. It is independent from the composer submission so a
     /// provider/configuration failure cannot consume or restore the wrong
@@ -487,6 +503,8 @@ pub struct SessionUiModel {
     /// The composer remains locked until the authoritative snapshot contains
     /// the selected binding, preventing a follow-up from racing the switch.
     pub pending_model_switch: Option<PendingModelSwitch>,
+    /// Session currently running an explicit idle `/compact` command.
+    pub pending_compaction: Option<SessionId>,
     /// Permission decisions are accepted only after the exact request has
     /// reached a rendered frame. Projection updates are processed before
     /// terminal input, so this barrier prevents an already-buffered `d` or
@@ -503,11 +521,11 @@ pub struct SessionUiModel {
     /// A reconciliation acknowledgement is high-impact: it records the
     /// unknown effect as failed and terminalizes the linked child. Opening
     /// this state is not itself an action; only Ctrl+A can dispatch it.
-    pub reconciliation_confirmation: Option<(SessionId, String)>,
+    pub reconciliation_confirmation: Option<(SessionId, EffectId)>,
     /// Event-only hint retained until the next authoritative snapshot. Normal
     /// projection snapshots derive the same identifier from their durable
     /// failure card, so this is never an authority source.
-    pub reconciliation_hint: Option<(SessionId, String)>,
+    pub reconciliation_hint: Option<(SessionId, EffectId)>,
     /// A first Ctrl+C interrupts active work and arms a short, explicit exit
     /// confirmation. Only a second Ctrl+C inside the window exits the TUI.
     pub ctrl_c_exit_armed_until: Option<Instant>,
@@ -528,7 +546,7 @@ impl Default for SessionUiModel {
             startup: None,
             sessions: Vec::new(),
             session_catalog: Vec::new(),
-            active_conversation: None,
+            active_session: None,
             selected: 0,
             composer: String::new(),
             input: String::new(),
@@ -536,6 +554,7 @@ impl Default for SessionUiModel {
             connection: ConnectionState::Connected,
             progress: Vec::new(),
             status: "Ready".into(),
+            command_notice: None,
             help: false,
             command_palette: false,
             command_index: 0,
@@ -544,16 +563,17 @@ impl Default for SessionUiModel {
             session_picker: false,
             session_index: 0,
             model_picker: None,
-            draft_model: None,
+            pending_model_selection: None,
             focus: SessionFocus::Composer,
             navigation_index: 0,
             expanded_actions: BTreeSet::new(),
             size: (80, 24),
             queued_follow_up: None,
             pending_submission: None,
-            deferred_composer_draft: None,
+            deferred_composer_text: None,
             pending_input_submission: None,
             pending_model_switch: None,
+            pending_compaction: None,
             rendered_permission_request: None,
             input_target: None,
             submission_refresh: SubmissionRefreshState::default(),
@@ -572,7 +592,7 @@ impl Default for SessionUiModel {
 impl SessionUiModel {
     #[must_use]
     pub fn with_startup(startup: SessionStartupPresentation) -> Self {
-        let draft_model = (!startup.default_provider.is_empty()
+        let pending_model_selection = (!startup.default_provider.is_empty()
             && !startup.default_model.is_empty())
         .then(|| {
             (
@@ -580,25 +600,25 @@ impl SessionUiModel {
                 startup.default_model.clone(),
             )
         });
-        let status = if draft_model.is_some() {
+        let status = if pending_model_selection.is_some() {
             "Ready".into()
         } else {
             PROVIDER_SETUP_GUIDANCE.into()
         };
         Self {
             startup: Some(startup),
-            draft_model,
+            pending_model_selection,
             status,
-            active_conversation: Some(ActiveConversation::NewSessionDraft),
+            active_session: Some(ActiveSession::SessionDraft),
             ..Self::default()
         }
     }
 
     #[must_use]
     pub fn selected_session(&self) -> Option<&SessionSnapshot> {
-        match self.active_conversation {
-            Some(ActiveConversation::NewSessionDraft) => None,
-            Some(ActiveConversation::Session(session_id)) => self
+        match self.active_session {
+            Some(ActiveSession::SessionDraft) => None,
+            Some(ActiveSession::Existing(session_id)) => self
                 .sessions
                 .iter()
                 .find(|session| session.session_id == session_id),
@@ -641,6 +661,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
         }
         SessionUiInput::Disconnected => {
             model.connection = ConnectionState::Disconnected;
+            model.pending_compaction = None;
             model.status = "Disconnected: actions disabled".into();
         }
         SessionUiInput::Lagged => {
@@ -652,7 +673,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
         SessionUiInput::Snapshot(sessions) => {
             let selected_id = model.selected_session().map(|session| session.session_id);
             model.sessions = sessions;
-            if model.active_conversation == Some(ActiveConversation::NewSessionDraft)
+            if model.active_session == Some(ActiveSession::SessionDraft)
                 && let Some(pending) = model.pending_submission.as_ref()
                 && let Some(session_id) = pending.session_id
                 && model
@@ -660,12 +681,12 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                     .iter()
                     .any(|session| session.session_id == session_id)
             {
-                model.active_conversation = Some(ActiveConversation::Session(session_id));
+                model.active_session = Some(ActiveSession::Existing(session_id));
             }
             model.selected = selected_id
-                .or(match model.active_conversation {
-                    Some(ActiveConversation::Session(session_id)) => Some(session_id),
-                    Some(ActiveConversation::NewSessionDraft) | None => None,
+                .or(match model.active_session {
+                    Some(ActiveSession::Existing(session_id)) => Some(session_id),
+                    Some(ActiveSession::SessionDraft) | None => None,
                 })
                 .and_then(|id| {
                     model
@@ -683,15 +704,18 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             model.connection = ConnectionState::Connected;
             model.progress.clear();
             model.status = "Transcript synchronized".into();
-            if model.selected_session().is_some_and(|session| {
-                session.lifecycle == SessionLifecycle::ReconciliationRequired
-                    || matches!(
-                        session.pending,
-                        Some(SessionPendingRequest::Permission { .. })
-                    )
-            }) {
-                model.command_palette = false;
-                model.help = false;
+            if model
+                .selected_session()
+                .is_some_and(session_blocks_overlays)
+            {
+                close_overlays_for_blocking_session(model);
+            }
+            if model
+                .selected_session()
+                .is_some_and(|session| session.active_turn_id.is_none())
+                && model.command_notice.as_deref() == Some("Cancelling active turn…")
+            {
+                model.command_notice = None;
             }
             model.reconciliation_hint = model.selected_session().and_then(|session| {
                 reconciliation_effect_from_snapshot(session)
@@ -710,8 +734,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                     model.selected_session().is_none_or(|session| {
                         session.session_id != *session_id
                             || session.lifecycle != SessionLifecycle::ReconciliationRequired
-                            || reconciliation_effect_id(model, session).as_deref()
-                                != Some(effect_id.as_str())
+                            || reconciliation_effect_id(model, session).as_ref() != Some(effect_id)
                     })
                 })
             {
@@ -721,7 +744,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 && let Some((session_id, expected_session_revision)) = model
                     .selected_session()
                     .filter(|session| session.lifecycle == SessionLifecycle::Ready)
-                    .map(|session| (session.session_id, session.revision))
+                    .map(|session| (session.session_id, session.session_revision))
                 && let Some(submission_id) = model
                     .pending_submission
                     .as_ref()
@@ -780,12 +803,31 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
         SessionUiInput::SessionOpened(snapshot) => {
             let snapshot = *snapshot;
             let session_id = snapshot.session_id;
+            let same_session = model
+                .selected_session()
+                .is_some_and(|current| current.session_id == session_id);
+            if !same_session {
+                model.command_notice = None;
+            }
             model.sessions = vec![snapshot];
             model.selected = 0;
-            model.active_conversation = Some(ActiveConversation::Session(session_id));
+            model.active_session = Some(ActiveSession::Existing(session_id));
             model.session_picker = false;
             model.command_palette = false;
             model.help = false;
+            if model
+                .selected_session()
+                .is_some_and(session_blocks_overlays)
+            {
+                close_overlays_for_blocking_session(model);
+            }
+            if model
+                .selected_session()
+                .is_some_and(|session| session.active_turn_id.is_none())
+                && model.command_notice.as_deref() == Some("Cancelling active turn…")
+            {
+                model.command_notice = None;
+            }
             model.progress.clear();
             model.scroll = 0;
             model.status = format!("Resumed session {session_id}");
@@ -811,12 +853,12 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             else {
                 return vec![SessionUiAction::RefreshSnapshots];
             };
-            if event.revision != session.revision.saturating_add(1) {
+            if event.session_revision != session.session_revision.saturating_add(1) {
                 model.connection = ConnectionState::SnapshotRequired;
                 model.progress.clear();
                 return vec![SessionUiAction::RefreshSnapshots];
             }
-            session.revision = event.revision;
+            session.session_revision = event.session_revision;
             session.sequence = event.sequence;
             match event.event {
                 SessionEvent::LifecycleChanged { lifecycle, .. } => session.lifecycle = lifecycle,
@@ -838,13 +880,36 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                     model.reconciliation_hint = Some((session.session_id, effect_id));
                 }
             }
+            if model
+                .selected_session()
+                .is_some_and(session_blocks_overlays)
+            {
+                close_overlays_for_blocking_session(model);
+            }
             reconcile_pending_submission(model);
             reconcile_pending_input_submission(model);
             synchronize_input_target(model);
         }
         SessionUiInput::Progress(progress) => record_progress(model, progress),
-        SessionUiInput::CommandError(error) => model.status = format!("Command rejected: {error}"),
+        SessionUiInput::CommandError(error) => {
+            let notice = format!("Command rejected: {error}");
+            model.status.clone_from(&notice);
+            model.command_notice = Some(notice);
+        }
         SessionUiInput::CommandCompleted(message) => model.status = message,
+        SessionUiInput::CompactionError(error) => {
+            model.pending_compaction = None;
+            let notice = format!("Compaction failed: {error}");
+            model.status.clone_from(&notice);
+            model.command_notice = Some(notice);
+            return vec![SessionUiAction::RefreshSnapshots];
+        }
+        SessionUiInput::CompactionCompleted(message) => {
+            model.pending_compaction = None;
+            model.status.clone_from(&message);
+            model.command_notice = Some(message);
+            return vec![SessionUiAction::RefreshSnapshots];
+        }
         SessionUiInput::ModelSwitchError { switch_id, error } => {
             if model
                 .pending_model_switch
@@ -880,13 +945,13 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 false
             };
             if assigned {
-                if model.active_conversation == Some(ActiveConversation::NewSessionDraft)
+                if model.active_session == Some(ActiveSession::SessionDraft)
                     && let Some(index) = model
                         .sessions
                         .iter()
                         .position(|session| session.session_id == session_id)
                 {
-                    model.active_conversation = Some(ActiveConversation::Session(session_id));
+                    model.active_session = Some(ActiveSession::Existing(session_id));
                     model.selected = index;
                 }
                 reconcile_pending_submission(model);
@@ -1140,6 +1205,43 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
     }
 }
 
+fn session_blocks_overlays(session: &SessionSnapshot) -> bool {
+    matches!(
+        session.lifecycle,
+        SessionLifecycle::WaitingPermission
+            | SessionLifecycle::WaitingInput
+            | SessionLifecycle::ReconciliationRequired
+    ) || session.pending.is_some()
+}
+
+fn close_overlays_for_blocking_session(model: &mut SessionUiModel) {
+    model.command_palette = false;
+    model.help = false;
+    model.session_picker = false;
+    model.model_picker = None;
+}
+
+fn command_context(model: &SessionUiModel) -> CommandContext {
+    let session = model.selected_session();
+    CommandContext {
+        connected: model.authority_enabled(),
+        has_open_session: session.is_some(),
+        lifecycle: session.map(|value| value.lifecycle),
+        has_active_turn: session.is_some_and(|value| value.active_turn_id.is_some()),
+        has_pending_request: session.is_some_and(|value| value.pending.is_some()),
+        has_pending_submission: model.pending_submission.is_some(),
+        has_pending_model_switch: model.pending_model_switch.is_some(),
+        has_pending_compaction: model.pending_compaction.is_some(),
+        has_queued_follow_up: model.queued_follow_up.is_some(),
+    }
+}
+
+fn set_notice(model: &mut SessionUiModel, message: impl Into<String>) {
+    let message = message.into();
+    model.status.clone_from(&message);
+    model.command_notice = Some(message);
+}
+
 fn slash_popup_suggestions(model: &SessionUiModel) -> Vec<&'static CommandDescriptor> {
     if model.focus != SessionFocus::Composer
         || model.pending_submission.is_some()
@@ -1148,14 +1250,9 @@ fn slash_popup_suggestions(model: &SessionUiModel) -> Vec<&'static CommandDescri
         || model.command_palette
         || model.session_picker
         || model.model_picker.is_some()
-        || model.selected_session().is_some_and(|session| {
-            matches!(
-                session.lifecycle,
-                SessionLifecycle::WaitingPermission
-                    | SessionLifecycle::WaitingInput
-                    | SessionLifecycle::ReconciliationRequired
-            ) || session.pending.is_some()
-        })
+        || model
+            .selected_session()
+            .is_some_and(session_blocks_overlays)
     {
         return Vec::new();
     }
@@ -1183,20 +1280,36 @@ fn reduce_slash_popup_key(
             model.slash_index = (model.slash_index + 1).min(suggestions.len().saturating_sub(1));
             Some(Vec::new())
         }
-        KeyCode::Enter
-            if model.authority_enabled()
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) =>
-        {
+        KeyCode::Tab if key.modifiers.is_empty() => {
             let command = suggestions[model.slash_index.min(suggestions.len().saturating_sub(1))];
-            if !matches!(
-                command.id,
-                BuiltinCommand::New | BuiltinCommand::Sessions | BuiltinCommand::Model
-            ) || session_switch_available(model)
+            model.composer = if command.arguments == ArgumentPolicy::None {
+                format!("/{}", command.name)
+            } else {
+                format!("/{} ", command.name)
+            };
+            model.slash_index = 0;
+            model.slash_popup_state = SlashPopupState::Eligible;
+            model.command_notice = None;
+            Some(Vec::new())
+        }
+        KeyCode::Enter if key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL => {
+            let command = suggestions[model.slash_index.min(suggestions.len().saturating_sub(1))];
+            if let CommandAvailability::Disabled { reason } =
+                command_availability(command.id, &command_context(model))
             {
-                model.composer.clear();
+                set_notice(model, reason);
+                return Some(Vec::new());
+            }
+            if command.arguments == ArgumentPolicy::Required {
+                model.composer = format!("/{} ", command.name);
                 model.slash_index = 0;
                 model.slash_popup_state = SlashPopupState::Eligible;
+                set_notice(model, format!("/{} requires an argument", command.name));
+                return Some(Vec::new());
             }
+            model.composer.clear();
+            model.slash_index = 0;
+            model.slash_popup_state = SlashPopupState::Eligible;
             Some(dispatch_builtin(model, command.id, String::new()))
         }
         _ => None,
@@ -1220,6 +1333,20 @@ fn reduce_palette_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<SessionU
         KeyCode::Enter => {
             let command = &BUILTINS[model.command_index.min(BUILTINS.len().saturating_sub(1))];
             model.command_palette = false;
+            if let CommandAvailability::Disabled { reason } =
+                command_availability(command.id, &command_context(model))
+            {
+                set_notice(model, reason);
+                return Vec::new();
+            }
+            if command.arguments == ArgumentPolicy::Required {
+                model.focus = SessionFocus::Composer;
+                model.composer = format!("/{} ", command.name);
+                model.slash_index = 0;
+                model.slash_popup_state = SlashPopupState::Eligible;
+                set_notice(model, format!("/{} requires an argument", command.name));
+                return Vec::new();
+            }
             return dispatch_builtin(model, command.id, String::new());
         }
         _ => {}
@@ -1279,7 +1406,7 @@ fn filtered_model_options(model: &SessionUiModel) -> Vec<SessionModelOption> {
 
 fn selected_provider_model(model: &SessionUiModel) -> Option<(String, String)> {
     model.selected_session().map_or_else(
-        || model.draft_model.clone(),
+        || model.pending_model_selection.clone(),
         |session| {
             Some((
                 session.binding.provider_name.clone(),
@@ -1362,7 +1489,7 @@ fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Ses
                     return Vec::new();
                 }
                 let session_id = session.session_id;
-                let expected_session_revision = session.revision;
+                let expected_session_revision = session.session_revision;
                 let switch_id = model.next_model_switch_id;
                 model.next_model_switch_id = model.next_model_switch_id.saturating_add(1);
                 model.pending_model_switch = Some(PendingModelSwitch {
@@ -1383,7 +1510,8 @@ fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Ses
                     model: option.model,
                 }];
             }
-            model.draft_model = Some((option.provider_name.clone(), option.model.clone()));
+            model.pending_model_selection =
+                Some((option.provider_name.clone(), option.model.clone()));
             model.status = format!(
                 "New sessions will use {}/{}",
                 option.provider_name, option.model
@@ -1394,41 +1522,25 @@ fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Ses
     Vec::new()
 }
 
-fn session_switch_available(model: &SessionUiModel) -> bool {
-    model.pending_submission.is_none()
-        && model.pending_model_switch.is_none()
-        && model.selected_session().is_none_or(|session| {
-            session.active_turn_id.is_none()
-                && session.pending.is_none()
-                && session.lifecycle != SessionLifecycle::ReconciliationRequired
-        })
-}
-
 fn dispatch_builtin(
     model: &mut SessionUiModel,
     command: BuiltinCommand,
     argument: String,
 ) -> Vec<SessionUiAction> {
-    if matches!(
-        command,
-        BuiltinCommand::New
-            | BuiltinCommand::Sessions
-            | BuiltinCommand::Model
-            | BuiltinCommand::Rename
-            | BuiltinCommand::Fork
-    ) && !session_switch_available(model)
+    if let CommandAvailability::Disabled { reason } =
+        command_availability(command, &command_context(model))
     {
-        model.status = "Session switching is disabled while work or a request is active".into();
+        set_notice(model, reason);
         return Vec::new();
     }
     match command {
         BuiltinCommand::New => {
             model.sessions.clear();
             model.selected = 0;
-            model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+            model.active_session = Some(ActiveSession::SessionDraft);
             model.session_picker = false;
             model.model_picker = None;
-            model.draft_model = model.startup.as_ref().and_then(|startup| {
+            model.pending_model_selection = model.startup.as_ref().and_then(|startup| {
                 (!startup.default_provider.is_empty() && !startup.default_model.is_empty()).then(
                     || {
                         (
@@ -1439,39 +1551,72 @@ fn dispatch_builtin(
                 )
             });
             model.help = false;
+            model.command_notice = None;
             model.progress.clear();
             model.scroll = 0;
-            model.status = "New conversation draft".into();
+            model.status = "New session draft".into();
             Vec::new()
         }
-        BuiltinCommand::Sessions => dispatch_session_search(model, &argument),
+        BuiltinCommand::Sessions => {
+            model.command_notice = None;
+            dispatch_session_search(model, &argument)
+        }
         BuiltinCommand::Rename => {
+            model.command_notice = None;
             selected_session_action(model, |session_id| SessionUiAction::RenameSession {
                 session_id,
                 title: argument,
             })
         }
         BuiltinCommand::Fork => {
+            model.command_notice = None;
             selected_session_action(model, |session_id| SessionUiAction::ForkSession {
                 session_id,
                 title: (!argument.is_empty()).then_some(argument),
             })
         }
         BuiltinCommand::Model => {
+            model.command_notice = None;
             open_model_picker(model);
             Vec::new()
         }
         BuiltinCommand::Help => {
+            model.command_notice = None;
             model.help = true;
             Vec::new()
         }
         BuiltinCommand::Navigation => {
+            model.command_notice = None;
             model.focus = SessionFocus::Navigation;
             model.help = false;
             Vec::new()
         }
-        BuiltinCommand::Refresh => vec![SessionUiAction::RefreshSnapshots],
+        BuiltinCommand::Refresh => {
+            model.command_notice = None;
+            vec![SessionUiAction::RefreshSnapshots]
+        }
         BuiltinCommand::Quit => vec![SessionUiAction::Quit],
+        BuiltinCommand::Compact => {
+            let Some(session_id) = model.selected_session().map(|session| session.session_id)
+            else {
+                set_notice(model, "This command requires an open saved session");
+                return Vec::new();
+            };
+            model.pending_compaction = Some(session_id);
+            set_notice(model, "Compacting conversation history…");
+            vec![SessionUiAction::CompactSession { session_id }]
+        }
+        BuiltinCommand::Cancel => {
+            let Some(session_id) = model.selected_session().map(|session| session.session_id)
+            else {
+                set_notice(model, "No active turn to cancel");
+                return Vec::new();
+            };
+            // Deliberately do NOT arm `ctrl_c_exit_armed_until`: `/cancel`
+            // interrupts the active turn without starting the Ctrl+C exit timer.
+            set_notice(model, "Cancelling active turn…");
+            vec![SessionUiAction::Cancel { session_id }]
+        }
     }
 }
 
@@ -1480,7 +1625,7 @@ fn selected_session_action(
     action: impl FnOnce(SessionId) -> SessionUiAction,
 ) -> Vec<SessionUiAction> {
     let Some(session_id) = model.selected_session().map(|session| session.session_id) else {
-        model.status = "This command requires an open saved session".into();
+        set_notice(model, "This command requires an open saved session");
         return Vec::new();
     };
     vec![action(session_id)]
@@ -1503,7 +1648,10 @@ fn dispatch_session_search(model: &mut SessionUiModel, argument: &str) -> Vec<Se
         .split_whitespace()
         .any(|part| part.starts_with("--"))
     {
-        model.status = "The /sessions command accepts only a current-workspace query".into();
+        set_notice(
+            model,
+            "The /sessions command accepts only a current-workspace query",
+        );
         return Vec::new();
     }
     vec![SessionUiAction::SearchSessions {
@@ -1521,16 +1669,19 @@ fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Session
             pop_grapheme(&mut model.composer);
             model.slash_index = 0;
             model.slash_popup_state = SlashPopupState::Eligible;
+            model.command_notice = None;
         }
         KeyCode::Enter if is_newline(key) => {
             model.composer.push('\n');
             model.slash_index = 0;
             model.slash_popup_state = SlashPopupState::Eligible;
+            model.command_notice = None;
         }
         KeyCode::F(5) | KeyCode::Enter
             if is_submit(key)
                 && model.authority_enabled()
-                && model.pending_submission.is_none() =>
+                && (model.pending_submission.is_none()
+                    || model.composer.trim_start().starts_with('/')) =>
         {
             return submit_composer(model);
         }
@@ -1541,6 +1692,7 @@ fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Session
             model.composer.push(value);
             model.slash_index = 0;
             model.slash_popup_state = SlashPopupState::Eligible;
+            model.command_notice = None;
         }
         _ => {}
     }
@@ -1611,6 +1763,7 @@ fn reduce_paste(model: &mut SessionUiModel, value: &str) {
         append_editor_text(&mut model.composer, value, 16 * 1024);
         model.slash_index = 0;
         model.slash_popup_state = SlashPopupState::Eligible;
+        model.command_notice = None;
     }
 }
 
@@ -1718,20 +1871,17 @@ fn is_newline(key: KeyEvent) -> bool {
 fn submit_slash_candidate(model: &mut SessionUiModel) -> Option<Vec<SessionUiAction>> {
     match resolve_slash(&model.composer) {
         SlashResolution::ValidationError(error) => {
-            model.status = error;
+            set_notice(model, error);
             Some(Vec::new())
         }
         SlashResolution::Command {
             descriptor,
             argument,
         } => {
-            if matches!(
-                descriptor.id,
-                BuiltinCommand::New | BuiltinCommand::Sessions | BuiltinCommand::Model
-            ) && !session_switch_available(model)
+            if let CommandAvailability::Disabled { reason } =
+                command_availability(descriptor.id, &command_context(model))
             {
-                model.status =
-                    "Session switching is disabled while work or a request is active".into();
+                set_notice(model, reason);
                 return Some(Vec::new());
             }
             model.composer.clear();
@@ -1741,17 +1891,29 @@ fn submit_slash_candidate(model: &mut SessionUiModel) -> Option<Vec<SessionUiAct
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
-    if model.pending_submission.is_some() || model.composer.trim().is_empty() {
+    if model.composer.trim().is_empty() {
         return Vec::new();
     }
     if model.pending_model_switch.is_some() {
         model.status = "Wait for the model switch to finish before submitting".into();
         return Vec::new();
     }
+    if model.pending_compaction.is_some() {
+        set_notice(model, "Wait for compaction to finish before submitting");
+        return Vec::new();
+    }
+    // Allow exact slash commands (such as `/cancel` while a follow-up is queued
+    // and `pending_submission` is held) to resolve before `pending_submission`
+    // locking checks.
     if let Some(actions) = submit_slash_candidate(model) {
         return actions;
     }
+    if model.pending_submission.is_some() {
+        return Vec::new();
+    }
+    model.command_notice = None;
     if model.selected_session().is_none()
         && model.startup.is_some()
         && selected_provider_model(model).is_none()
@@ -1815,7 +1977,7 @@ fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
             vec![SessionUiAction::FollowUp {
                 submission_id,
                 session_id: session.session_id,
-                expected_session_revision: session.revision,
+                expected_session_revision: session.session_revision,
                 prompt,
             }]
         }
@@ -1864,7 +2026,7 @@ fn reconcile_pending_submission(model: &mut SessionUiModel) {
         model.submission_error = None;
         model.submission_refresh.composer = false;
         if model.composer.is_empty()
-            && let Some(draft) = model.deferred_composer_draft.take()
+            && let Some(draft) = model.deferred_composer_text.take()
         {
             model.composer = draft;
         }
@@ -1883,7 +2045,7 @@ fn restore_pending_submission(model: &mut SessionUiModel) {
     };
     model.queued_follow_up = None;
     if !model.composer.is_empty() {
-        model.deferred_composer_draft = Some(std::mem::take(&mut model.composer));
+        model.deferred_composer_text = Some(std::mem::take(&mut model.composer));
     }
     model.composer = pending.prompt;
     model.status = MESSAGE.into();
@@ -2126,6 +2288,7 @@ enum PresentationItem {
     Message {
         kind: TranscriptKind,
         text: String,
+        failure_code: Option<FailureCode>,
     },
     Completion {
         text: String,
@@ -2169,6 +2332,9 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
     groups
         .into_iter()
         .map(|(turn_id, entries)| {
+            let turn_failure_code = turn_id
+                .and_then(|id| session.turns.iter().find(|turn| turn.turn_id == id))
+                .and_then(|turn| turn.failure_code);
             let heading = turn_heading(session, turn_id);
             let mut items = Vec::new();
             for entry in entries {
@@ -2267,6 +2433,7 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
                             items.push(PresentationItem::Message {
                                 kind: TranscriptKind::System,
                                 text: presentation_text(&entry.text, 2 * 1024),
+                                failure_code: None,
                             });
                         }
                     }
@@ -2279,7 +2446,14 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
                     kind => {
                         let text = presentation_text(&entry.text, 2 * 1024);
                         if !text.is_empty() {
-                            items.push(PresentationItem::Message { kind, text });
+                            let failure_code = (kind == TranscriptKind::Failure)
+                                .then(|| entry_failure_code(entry).or(turn_failure_code))
+                                .flatten();
+                            items.push(PresentationItem::Message {
+                                kind,
+                                text,
+                                failure_code,
+                            });
                         }
                     }
                 }
@@ -2382,9 +2556,25 @@ fn presentation_text(value: &str, cap: usize) -> String {
     output
 }
 
+fn entry_failure_code(entry: &TranscriptEntry) -> Option<FailureCode> {
+    let payload = entry.payload.as_ref()?;
+    if let Some(code) = payload
+        .get("code")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<FailureCode>(value).ok())
+    {
+        return Some(code);
+    }
+    match payload.get("status").and_then(serde_json::Value::as_str) {
+        Some("denied") => Some(FailureCode::PermissionDenied),
+        Some("cancelled") => Some(FailureCode::Cancelled),
+        _ => None,
+    }
+}
+
 fn turn_heading(session: &SessionSnapshot, turn_id: Option<TurnId>) -> String {
     let Some(turn_id) = turn_id else {
-        return "Conversation".into();
+        return "Session".into();
     };
     session
         .turns
@@ -2392,8 +2582,50 @@ fn turn_heading(session: &SessionSnapshot, turn_id: Option<TurnId>) -> String {
         .find(|turn| turn.turn_id == turn_id)
         .map_or_else(
             || "Turn activity".into(),
-            |turn| format!("Turn {} · {}", turn.ordinal, turn_status_label(turn.status)),
+            |turn| format!("Turn {} · {}", turn.turn_ordinal, turn_outcome_label(turn)),
         )
+}
+
+const fn turn_outcome_label(turn: &SessionTurnSummary) -> &'static str {
+    match (turn.status, turn.failure_code) {
+        (SessionTurnStatus::Failed, Some(FailureCode::PermissionDenied)) => "Permission denied",
+        (SessionTurnStatus::Failed, Some(FailureCode::Cancelled)) => "Cancelled",
+        (status, _) => turn_status_label(status),
+    }
+}
+
+const fn turn_outcome_color(turn: &SessionTurnSummary) -> Color {
+    match (turn.status, turn.failure_code) {
+        (
+            SessionTurnStatus::Failed,
+            Some(FailureCode::PermissionDenied | FailureCode::Cancelled),
+        ) => AMBER,
+        (status, _) => turn_status_color(status),
+    }
+}
+
+fn session_status_presentation(session: &SessionSnapshot) -> (&'static str, Color) {
+    let latest_turn = session
+        .latest_turn_id
+        .and_then(|id| session.turns.iter().find(|turn| turn.turn_id == id))
+        .or_else(|| session.turns.iter().max_by_key(|turn| turn.turn_ordinal));
+    match (
+        session.lifecycle,
+        latest_turn.map(|turn| (turn.status, turn.failure_code)),
+    ) {
+        (
+            SessionLifecycle::Ready,
+            Some((SessionTurnStatus::Failed, Some(FailureCode::PermissionDenied))),
+        ) => ("Permission denied · ready", AMBER),
+        (SessionLifecycle::Ready, Some((SessionTurnStatus::Failed, _))) => {
+            ("Last turn failed · ready", AMBER)
+        }
+        (
+            SessionLifecycle::Failed,
+            Some((SessionTurnStatus::Failed, Some(FailureCode::Cancelled))),
+        ) => ("Cancelled", AMBER),
+        (lifecycle, _) => (lifecycle_label(lifecycle), lifecycle_color(lifecycle)),
+    }
 }
 
 const fn turn_status_label(status: SessionTurnStatus) -> &'static str {
@@ -2445,7 +2677,9 @@ pub fn render(frame: &mut Frame<'_>, model: &SessionUiModel) {
     let blocking = matches!(
         visual_state,
         VisualState::Permission | VisualState::Reconciliation
-    );
+    ) || model
+        .selected_session()
+        .is_some_and(session_blocks_overlays);
     if !blocking {
         render_slash_suggestions(frame, model, layout);
     }
@@ -2494,6 +2728,7 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, model: &SessionUiModel, layou
     if visible == 0 {
         return;
     }
+    let ctx = command_context(model);
     let selected = model.slash_index.min(suggestions.len().saturating_sub(1));
     let start = selected
         .saturating_add(1)
@@ -2506,10 +2741,11 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, model: &SessionUiModel, layou
         .take(visible)
         .map(|(index, command)| {
             let selected = index == selected;
+            let availability = command_availability(command.id, &ctx);
             let argument = command
                 .argument_hint
                 .map_or_else(String::new, |hint| format!(" {hint}"));
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
                     Style::default().fg(LATTE_BRIGHT),
@@ -2517,14 +2753,25 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, model: &SessionUiModel, layou
                 Span::styled(
                     format!("/{}{}  {}", command.name, argument, command.description),
                     Style::default()
-                        .fg(if selected { TEXT } else { TEXT_SOFT })
-                        .add_modifier(if selected {
+                        .fg(match (selected, availability) {
+                            (_, CommandAvailability::Disabled { .. }) => MUTED,
+                            (true, CommandAvailability::Enabled) => TEXT,
+                            (false, CommandAvailability::Enabled) => TEXT_SOFT,
+                        })
+                        .add_modifier(if selected && availability.is_enabled() {
                             Modifier::BOLD
                         } else {
                             Modifier::empty()
                         }),
                 ),
-            ])
+            ];
+            if let CommandAvailability::Disabled { reason } = availability {
+                spans.push(Span::styled(
+                    format!("  ({reason})"),
+                    Style::default().fg(FAINT),
+                ));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
     lines.push(Line::from(Span::styled(
@@ -2552,14 +2799,24 @@ fn render_slash_suggestions(frame: &mut Frame<'_>, model: &SessionUiModel, layou
 }
 
 fn render_command_palette(frame: &mut Frame<'_>, model: &SessionUiModel, area: Rect) {
-    let overlay = centered(area, 62, 34);
+    let overlay = centered(area, 86, 52);
     frame.render_widget(Clear, overlay);
+    let ctx = command_context(model);
+    let visible = usize::from(overlay.height.saturating_sub(4)).max(1);
+    let selected_index = model.command_index.min(BUILTINS.len().saturating_sub(1));
+    let start = selected_index
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(BUILTINS.len().saturating_sub(visible));
     let lines = BUILTINS
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(index, command)| {
-            let selected = index == model.command_index;
-            Line::from(vec![
+            let selected = index == selected_index;
+            let availability = command_availability(command.id, &ctx);
+            let mut spans = vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
                     Style::default().fg(LATTE_BRIGHT),
@@ -2567,14 +2824,25 @@ fn render_command_palette(frame: &mut Frame<'_>, model: &SessionUiModel, area: R
                 Span::styled(
                     format!("/{:<12} {}", command.name, command.description),
                     Style::default()
-                        .fg(if selected { TEXT } else { TEXT_SOFT })
-                        .add_modifier(if selected {
+                        .fg(match (selected, availability) {
+                            (_, CommandAvailability::Disabled { .. }) => MUTED,
+                            (true, CommandAvailability::Enabled) => TEXT,
+                            (false, CommandAvailability::Enabled) => TEXT_SOFT,
+                        })
+                        .add_modifier(if selected && availability.is_enabled() {
                             Modifier::BOLD
                         } else {
                             Modifier::empty()
                         }),
                 ),
-            ])
+            ];
+            if let CommandAvailability::Disabled { reason } = availability {
+                spans.push(Span::styled(
+                    format!("  ({reason})"),
+                    Style::default().fg(FAINT),
+                ));
+            }
+            Line::from(spans)
         })
         .chain(std::iter::once(Line::from("")))
         .chain(std::iter::once(Line::from(Span::styled(
@@ -2962,10 +3230,7 @@ fn render_header(
         VisualState::Reconciliation => ("Reconciliation required", AMBER),
         VisualState::Permission => ("Waiting for approval", AMBER),
         VisualState::Complete => ("Ready", GREEN),
-        VisualState::Active => (
-            lifecycle_label(session.lifecycle),
-            lifecycle_color(session.lifecycle),
-        ),
+        VisualState::Active => session_status_presentation(session),
         VisualState::Idle => unreachable!(),
     };
     let inset = bounded_inset(layout.app.width, layout.tier.compact_inset());
@@ -3411,6 +3676,7 @@ fn render_transcript(
             &mut lines,
             TranscriptKind::User,
             &pending.prompt,
+            None,
             area.width,
         );
     }
@@ -3426,7 +3692,7 @@ fn render_transcript(
             let phase_color = group
                 .turn_id
                 .and_then(|turn_id| session.turns.iter().find(|turn| turn.turn_id == turn_id))
-                .map_or(TEXT_SOFT, |turn| turn_status_color(turn.status));
+                .map_or(TEXT_SOFT, turn_outcome_color);
             let last_action_index = group
                 .items
                 .iter()
@@ -3457,8 +3723,12 @@ fn render_transcript(
                     heading_rendered = true;
                 }
                 match item {
-                    PresentationItem::Message { kind, text } => {
-                        render_message_lines(&mut lines, kind, &text, area.width);
+                    PresentationItem::Message {
+                        kind,
+                        text,
+                        failure_code,
+                    } => {
+                        render_message_lines(&mut lines, kind, &text, failure_code, area.width);
                     }
                     PresentationItem::Completion { text, handoff } => {
                         render_completion_lines(&mut lines, &text, handoff.as_ref(), area.width);
@@ -3713,14 +3983,14 @@ fn render_blocking_card(
             let Some(effect_id) = reconciliation_effect_id(model, session) else {
                 return;
             };
-            render_reconciliation_card(&mut lines, model, session, &effect_id, area.width);
+            render_reconciliation_card(&mut lines, model, session, effect_id.as_str(), area.width);
             compact_lines.extend([
                 Line::from(Span::styled(
                     "! Reconciliation required",
                     Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    format!("Effect · {}", presentation_text(&effect_id, 160)),
+                    format!("Effect · {}", presentation_text(effect_id.as_str(), 160)),
                     Style::default().fg(TEXT),
                 )),
                 Line::from(Span::styled(
@@ -3761,6 +4031,7 @@ fn render_message_lines(
     lines: &mut Vec<Line<'static>>,
     kind: TranscriptKind,
     text: &str,
+    failure_code: Option<FailureCode>,
     width: u16,
 ) {
     if kind == TranscriptKind::User {
@@ -3799,7 +4070,11 @@ fn render_message_lines(
         TranscriptKind::Assistant => (" • ", TEXT, false),
         TranscriptKind::Permission => (" ! Permission · ", AMBER, false),
         TranscriptKind::Input => (" ? Input · ", AMBER, false),
-        TranscriptKind::Failure => (" ! Failed · ", RED, true),
+        TranscriptKind::Failure => match failure_code {
+            Some(FailureCode::PermissionDenied) => (" ! Permission denied · ", AMBER, true),
+            Some(FailureCode::Cancelled) => (" ! Cancelled · ", AMBER, true),
+            _ => (" ! Failed · ", RED, true),
+        },
         TranscriptKind::System => (" · ", MUTED, false),
         TranscriptKind::CompactSummary => (" ◇ Compacted · ", MUTED, false),
         TranscriptKind::ToolResultElision => (" ◇ Elided tool results · ", MUTED, false),
@@ -4201,31 +4476,61 @@ fn render_composer(
             Rect::new(inner.x, footer_y + 1, inner.width, 1),
         );
     } else if footer_rows == 1 && layout.tier == ViewportTier::Narrow {
+        let narrow = if model.command_notice.is_some()
+            && model.connection == ConnectionState::Connected
+            && !matches!(
+                visual_state,
+                VisualState::Permission | VisualState::Reconciliation
+            ) {
+            left
+        } else {
+            right
+        };
         frame.render_widget(
-            Paragraph::new(right).style(Style::default().fg(MUTED)),
+            Paragraph::new(narrow).style(Style::default().fg(MUTED)),
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
     } else if footer_rows == 1 {
-        let right_width = u16::try_from(display_width(&right).min(usize::from(inner.width)))
-            .unwrap_or(inner.width);
-        frame.render_widget(
-            Paragraph::new(left).style(Style::default().fg(TEXT_SOFT)),
-            Rect::new(
-                inner.x,
-                footer_y,
-                inner.width.saturating_sub(right_width),
-                1,
-            ),
-        );
-        frame.render_widget(
-            Paragraph::new(right).style(Style::default().fg(MUTED)),
-            Rect::new(
-                inner.right().saturating_sub(right_width),
-                footer_y,
-                right_width,
-                1,
-            ),
-        );
+        let notice_active = model.command_notice.is_some()
+            && model.ctrl_c_exit_armed_until.is_none()
+            && model.connection == ConnectionState::Connected
+            && !matches!(
+                visual_state,
+                VisualState::Permission | VisualState::Reconciliation
+            );
+        if notice_active
+            && display_width(&left)
+                .saturating_add(2)
+                .saturating_add(display_width(&right))
+                > usize::from(inner.width)
+        {
+            frame.render_widget(
+                Paragraph::new(clip_to_width(&left, usize::from(inner.width)))
+                    .style(Style::default().fg(TEXT_SOFT)),
+                Rect::new(inner.x, footer_y, inner.width, 1),
+            );
+        } else {
+            let right_width = u16::try_from(display_width(&right).min(usize::from(inner.width)))
+                .unwrap_or(inner.width);
+            frame.render_widget(
+                Paragraph::new(left).style(Style::default().fg(TEXT_SOFT)),
+                Rect::new(
+                    inner.x,
+                    footer_y,
+                    inner.width.saturating_sub(right_width),
+                    1,
+                ),
+            );
+            frame.render_widget(
+                Paragraph::new(right).style(Style::default().fg(MUTED)),
+                Rect::new(
+                    inner.right().saturating_sub(right_width),
+                    footer_y,
+                    right_width,
+                    1,
+                ),
+            );
+        }
     }
     let disabled = matches!(
         visual_state,
@@ -4252,13 +4557,21 @@ fn render_composer(
 }
 
 fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String) {
-    if model.pending_submission.is_some() {
+    if model.pending_submission.is_some()
+        && model.command_notice.as_deref() != Some("Cancelling active turn…")
+    {
         return (
             "Submitting".into(),
             "Compose next prompt · Shift+Enter newline".into(),
         );
     }
     let Some(session) = model.selected_session() else {
+        if let Some(notice) = model.command_notice.as_deref() {
+            return (
+                presentation_text(notice, 140),
+                "Ctrl+Enter send · Ctrl+P commands".into(),
+            );
+        }
         if selected_provider_model(model).is_none()
             && model
                 .startup
@@ -4296,12 +4609,21 @@ fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String)
         return (left, "Ctrl+Enter send · Ctrl+P commands".into());
     };
     let model_name = presentation_text(&session.binding.model, 80);
-    let left = match state {
-        VisualState::Permission => format!("Attention · {model_name}"),
-        VisualState::Reconciliation => format!("Reconciliation · {model_name}"),
-        VisualState::Complete => format!("Ready for follow-up · {model_name}"),
-        VisualState::Active => format!("{} · {model_name}", lifecycle_label(session.lifecycle)),
-        VisualState::Idle => unreachable!(),
+    let left = if !matches!(state, VisualState::Permission | VisualState::Reconciliation)
+        && session.pending.is_none()
+        && let Some(notice) = model.command_notice.as_deref()
+    {
+        presentation_text(notice, 140)
+    } else {
+        match state {
+            VisualState::Permission => format!("Attention · {model_name}"),
+            VisualState::Reconciliation => format!("Reconciliation · {model_name}"),
+            VisualState::Complete => format!("Ready for follow-up · {model_name}"),
+            VisualState::Active => {
+                format!("{} · {model_name}", session_status_presentation(session).0)
+            }
+            VisualState::Idle => unreachable!(),
+        }
     };
     let right = if model
         .ctrl_c_exit_armed_until
@@ -4552,7 +4874,7 @@ const fn connection_label(connection: ConnectionState) -> &'static str {
     }
 }
 
-fn reconciliation_effect_from_snapshot(session: &SessionSnapshot) -> Option<String> {
+fn reconciliation_effect_from_snapshot(session: &SessionSnapshot) -> Option<EffectId> {
     if session.lifecycle != SessionLifecycle::ReconciliationRequired {
         return None;
     }
@@ -4565,15 +4887,11 @@ fn reconciliation_effect_from_snapshot(session: &SessionSnapshot) -> Option<Stri
             return None;
         }
         let effect_id = payload.get("effect_id").and_then(|value| value.as_str())?;
-        if effect_id.is_empty() || effect_id.len() > 512 || effect_id.chars().any(char::is_control)
-        {
-            return None;
-        }
-        Some(effect_id.to_owned())
+        EffectId::new(effect_id).ok()
     })
 }
 
-fn reconciliation_effect_id(model: &SessionUiModel, session: &SessionSnapshot) -> Option<String> {
+fn reconciliation_effect_id(model: &SessionUiModel, session: &SessionSnapshot) -> Option<EffectId> {
     model
         .reconciliation_hint
         .as_ref()
@@ -4797,18 +5115,16 @@ fn apply_session_actions(
                 // runtime effect. Consume it in the terminal adapter so a
                 // production command closure cannot accidentally ignore the
                 // recovery path after a broadcast receiver reports Lagged.
-                let next = match model.active_conversation {
-                    Some(ActiveConversation::Session(session_id)) => {
+                let next = match model.active_session {
+                    Some(ActiveSession::Existing(session_id)) => {
                         let snapshot = projection.session(session_id).map_err(TuiError::Action)?;
                         reduce_session_opened(projection, model, snapshot)
                     }
-                    Some(ActiveConversation::NewSessionDraft)
-                        if model.pending_submission.is_none() =>
-                    {
+                    Some(ActiveSession::SessionDraft) if model.pending_submission.is_none() => {
                         let sessions = projection.session_catalog().map_err(TuiError::Action)?;
                         reduce(model, SessionUiInput::SessionCatalog(sessions))
                     }
-                    Some(ActiveConversation::NewSessionDraft) | None => {
+                    Some(ActiveSession::SessionDraft) | None => {
                         let snapshots = projection.snapshots().map_err(TuiError::Action)?;
                         reduce(model, SessionUiInput::Snapshot(snapshots))
                     }
@@ -4878,6 +5194,12 @@ fn drain_runtime_updates(
             SessionUiFeedback::Command(Err(error))
             | SessionUiFeedback::SessionManagement(Err(error)) => {
                 reduce(model, SessionUiInput::CommandError(error))
+            }
+            SessionUiFeedback::Compaction(Ok(message)) => {
+                reduce(model, SessionUiInput::CompactionCompleted(message))
+            }
+            SessionUiFeedback::Compaction(Err(error)) => {
+                reduce(model, SessionUiInput::CompactionError(error))
             }
             SessionUiFeedback::SessionManagement(Ok(SessionManagementOutcome::Updated(
                 message,
@@ -5027,11 +5349,11 @@ mod tests {
         let ids = SystemIdSource::default();
         SessionSnapshot {
             session_id: SessionId::from_uuid(ids.next_uuid_v7()),
-            revision: 1,
+            session_revision: 1,
             sequence: 1,
             lifecycle,
             binding: SessionProviderBinding {
-                version: 1,
+                binding_version: 1,
                 provider_name: "p".into(),
                 provider_type: "t".into(),
                 protocol: "p".into(),
@@ -5074,7 +5396,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 0,
+            turn_ordinal: 0,
             status: SessionTurnStatus::Running,
             turn_revision: 1,
             completed_at_ms: None,
@@ -5092,6 +5414,7 @@ mod tests {
             session_id: snapshot.session_id,
             title: title.into(),
             workspace_root: workspace_root.into(),
+            project_key: None,
             parent_session_id: None,
             lifecycle: snapshot.lifecycle,
             provider_name: snapshot.binding.provider_name.clone(),
@@ -5118,10 +5441,7 @@ mod tests {
             ..Default::default()
         };
         assert!(reduce(&mut new, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-        assert_eq!(
-            new.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
-        );
+        assert_eq!(new.active_session, Some(ActiveSession::SessionDraft));
     }
 
     struct ScriptedProjection {
@@ -5238,7 +5558,7 @@ mod tests {
             .unwrap()
         );
 
-        model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+        model.active_session = Some(ActiveSession::SessionDraft);
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready.clone()]]),
             poll: SessionProjectionPoll::Empty,
@@ -5253,7 +5573,7 @@ mod tests {
             .unwrap()
         );
 
-        model.active_conversation = None;
+        model.active_session = None;
         let mut projection = ScriptedProjection {
             snapshots: VecDeque::from([vec![ready]]),
             poll: SessionProjectionPoll::Empty,
@@ -5339,7 +5659,7 @@ mod tests {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
             session_id: SessionId::from_uuid(ids.next_uuid_v7()),
-            revision: 2,
+            session_revision: 2,
             sequence: 2,
             event: SessionEvent::LifecycleChanged {
                 lifecycle: SessionLifecycle::Ready,
@@ -5356,7 +5676,7 @@ mod tests {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
             session_id,
-            revision: 2,
+            session_revision: 2,
             sequence: 2,
             event: SessionEvent::LifecycleChanged {
                 lifecycle: SessionLifecycle::Ready,
@@ -5369,7 +5689,7 @@ mod tests {
         let run = latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Running,
             turn_revision: 1,
             completed_at_ms: None,
@@ -5379,7 +5699,7 @@ mod tests {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
             session_id,
-            revision: 3,
+            session_revision: 3,
             sequence: 3,
             event: SessionEvent::TurnLinked { turn: run.clone() },
         };
@@ -5391,17 +5711,17 @@ mod tests {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
             session_id,
-            revision: 4,
+            session_revision: 4,
             sequence: 4,
             event: SessionEvent::ReconciliationRequired {
                 turn_id,
-                effect_id: "effect-1".into(),
+                effect_id: EffectId::new("effect-1").unwrap(),
             },
         };
         assert!(reduce(&mut model, SessionUiInput::Event(reconciliation)).is_empty());
         assert_eq!(
             model.reconciliation_hint,
-            Some((session_id, "effect-1".into()))
+            Some((session_id, EffectId::new("effect-1").unwrap()))
         );
     }
 
@@ -5589,7 +5909,7 @@ mod tests {
         );
         assert!(payload_string(&invalid, &["missing"]).is_none());
         assert!(payload_string(&invalid, &["value"]).is_none());
-        assert_eq!(turn_heading(&session, None), "Conversation");
+        assert_eq!(turn_heading(&session, None), "Session");
         assert_eq!(turn_heading(&session, Some(turn_id)), "Turn activity");
     }
 
@@ -5726,7 +6046,9 @@ mod tests {
             Some(serde_json::json!({"status":"unknown","effect_id":"safe-effect"})),
         ));
         assert_eq!(
-            reconciliation_effect_from_snapshot(&safe).as_deref(),
+            reconciliation_effect_from_snapshot(&safe)
+                .as_ref()
+                .map(EffectId::as_str),
             Some("safe-effect")
         );
         safe.transcript.entries.last_mut().unwrap().payload =
@@ -5755,7 +6077,7 @@ mod tests {
         let mut stale = snapshot(SessionLifecycle::Running);
         stale.transcript.entries[0].text = "stale card".into();
         let mut current = stale.clone();
-        current.revision = 2;
+        current.session_revision = 2;
         current.sequence = 2;
         current.lifecycle = SessionLifecycle::Ready;
         current.transcript.entries.push(TranscriptEntry {
@@ -5868,7 +6190,7 @@ mod tests {
         assert!(reduce(&mut model, key(KeyCode::Char('r'), KeyModifiers::CONTROL)).is_empty());
         assert_eq!(
             model.reconciliation_confirmation,
-            Some((session_id, effect_id.into()))
+            Some((session_id, EffectId::new(effect_id).unwrap()))
         );
         let composer_before = model.composer.clone();
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
@@ -5877,7 +6199,7 @@ mod tests {
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![SessionUiAction::ReconcileUnknown {
                 session_id,
-                effect_id: effect_id.into(),
+                effect_id: EffectId::new(effect_id).unwrap(),
             }]
         );
     }
@@ -5967,7 +6289,7 @@ mod tests {
             .push(latte_core::SessionTurnSummary {
                 turn_id: failed_turn,
                 parent_turn_id: None,
-                ordinal: 0,
+                turn_ordinal: 0,
                 status: SessionTurnStatus::Failed,
                 turn_revision: 2,
                 completed_at_ms: Some(2),
@@ -6067,7 +6389,7 @@ mod tests {
         let session_id = session.session_id;
         let mut model = SessionUiModel {
             sessions: vec![session],
-            reconciliation_confirmation: Some((session_id, effect_id.into())),
+            reconciliation_confirmation: Some((session_id, EffectId::new(effect_id).unwrap())),
             composer: "kept".into(),
             input: "also kept".into(),
             ..Default::default()
@@ -6086,7 +6408,7 @@ mod tests {
             reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
             vec![SessionUiAction::ReconcileUnknown {
                 session_id,
-                effect_id: effect_id.into(),
+                effect_id: EffectId::new(effect_id).unwrap(),
             }]
         );
         assert!(model.reconciliation_confirmation.is_none());
@@ -6227,7 +6549,7 @@ mod tests {
         restore_pending_submission(&mut model);
         assert_eq!(model.composer, "retry me");
         assert_eq!(
-            model.deferred_composer_draft.as_deref(),
+            model.deferred_composer_text.as_deref(),
             Some("next draft\nsecond line")
         );
 
@@ -6253,7 +6575,7 @@ mod tests {
 
         reduce(&mut model, SessionUiInput::Snapshot(vec![session]));
         assert!(model.pending_submission.is_none());
-        assert!(model.deferred_composer_draft.is_none());
+        assert!(model.deferred_composer_text.is_none());
         assert_eq!(model.composer, "next draft\nsecond line");
     }
 
@@ -6337,7 +6659,7 @@ mod tests {
         reduce(&mut model, SessionUiInput::Snapshot(vec![terminal]));
         assert_eq!(model.composer, "queued once");
         assert!(model.pending_submission.is_none());
-        assert!(session_switch_available(&model));
+        assert!(command_context(&model).session_switch_available());
     }
 
     #[test]
@@ -6470,7 +6792,7 @@ mod tests {
             source_key: "unknown-effect-shift-enter".into(),
             created_at_ms: 2,
         });
-        let session_revision = session.revision;
+        let session_revision = session.session_revision;
         let pending_before = session.pending.clone();
         let mut model = SessionUiModel {
             sessions: vec![session],
@@ -6484,7 +6806,7 @@ mod tests {
         }
         assert_eq!(model.composer, "kept");
         assert_eq!(model.input, "also kept");
-        assert_eq!(model.sessions[0].revision, session_revision);
+        assert_eq!(model.sessions[0].session_revision, session_revision);
         assert_eq!(model.sessions[0].pending, pending_before);
         assert!(model.reconciliation_confirmation.is_none());
     }
@@ -6640,7 +6962,7 @@ mod tests {
         ready.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: latte_core::SessionTurnStatus::Completed,
             turn_revision: 3,
             completed_at_ms: Some(3),
@@ -6692,7 +7014,7 @@ mod tests {
                     protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
                     event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
                     session_id: ready.session_id,
-                    revision: 2,
+                    session_revision: 2,
                     sequence: 2,
                     event: SessionEvent::TranscriptAppended {
                         entry: entry.clone()
@@ -6709,7 +7031,7 @@ mod tests {
                     protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
                     event_id: SessionEventId::from_uuid(ids.next_uuid_v7()),
                     session_id: ready.session_id,
-                    revision: 4,
+                    session_revision: 4,
                     sequence: 3,
                     event: SessionEvent::LifecycleChanged {
                         lifecycle: SessionLifecycle::Ready,
@@ -6833,10 +7155,7 @@ mod tests {
         assert!(model.command_palette);
         assert!(rendered(&model, 100, 30).contains("Commands"));
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-        assert_eq!(
-            model.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
-        );
+        assert_eq!(model.active_session, Some(ActiveSession::SessionDraft));
 
         reduce(&mut model, ctrl_p());
         for _ in 0..BUILTINS
@@ -6952,7 +7271,7 @@ mod tests {
         ready.binding.provider_name = "runtime-provider".into();
         ready.binding.model = "runtime-model".into();
         let session_id = ready.session_id;
-        let revision = ready.revision;
+        let revision = ready.session_revision;
         let mut session = SessionUiModel::with_startup(test_startup());
         reduce(&mut session, SessionUiInput::SessionOpened(Box::new(ready)));
         session.composer = "/model".into();
@@ -7087,14 +7406,14 @@ mod tests {
             SessionUiInput::Snapshot(vec![assigned.clone()]),
         );
         assert_eq!(
-            materializing.active_conversation,
-            Some(ActiveConversation::Session(assigned_id))
+            materializing.active_session,
+            Some(ActiveSession::Existing(assigned_id))
         );
         let event = SessionEventEnvelope {
             protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
             event_id: SessionEventId::from_uuid(SystemIdSource::default().next_uuid_v7()),
             session_id: assigned_id,
-            revision: assigned.revision + 1,
+            session_revision: assigned.session_revision + 1,
             sequence: assigned.sequence + 1,
             event: SessionEvent::BindingChanged {
                 provider_name: "other".into(),
@@ -7173,7 +7492,7 @@ mod tests {
         assert!(reduce(&mut model, key(KeyCode::Char('/'), KeyModifiers::NONE)).is_empty());
         let all = rendered(&model, 100, 32);
         assert!(all.contains("Suggestions"));
-        assert!(all.contains("Start a new conversation draft"));
+        assert!(all.contains("Start a new session draft"));
         assert!(all.contains("Find and resume a saved session"));
         assert!(all.contains("↑/↓ select · Enter run · Esc close"));
 
@@ -7240,6 +7559,7 @@ mod tests {
             session_id: existing.session_id,
             title: "Saved session".into(),
             workspace_root: "/workspace".into(),
+            project_key: None,
             parent_session_id: None,
             lifecycle: SessionLifecycle::Ready,
             provider_name: "provider".into(),
@@ -7256,10 +7576,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert_eq!(
-            startup.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
-        );
+        assert_eq!(startup.active_session, Some(ActiveSession::SessionDraft));
         assert!(startup.sessions.is_empty());
 
         let mut explicit_new = SessionUiModel::with_startup(test_startup());
@@ -7273,8 +7590,8 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            explicit_new.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
+            explicit_new.active_session,
+            Some(ActiveSession::SessionDraft)
         );
     }
 
@@ -7311,6 +7628,7 @@ mod tests {
             session_id: existing.session_id,
             title: "Resume me".into(),
             workspace_root: "/workspace".into(),
+            project_key: None,
             parent_session_id: None,
             lifecycle: SessionLifecycle::Ready,
             provider_name: "p".into(),
@@ -7321,10 +7639,7 @@ mod tests {
 
         model.composer = "/new".into();
         assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-        assert_eq!(
-            model.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
-        );
+        assert_eq!(model.active_session, Some(ActiveSession::SessionDraft));
         assert!(model.sessions.is_empty());
 
         model.composer = format!("/resume {}", summary.session_id);
@@ -7355,11 +7670,11 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            model.active_conversation,
-            Some(ActiveConversation::Session(existing.session_id))
+            model.active_session,
+            Some(ActiveSession::Existing(existing.session_id))
         );
 
-        model.active_conversation = Some(ActiveConversation::NewSessionDraft);
+        model.active_session = Some(ActiveSession::SessionDraft);
         model.sessions.clear();
         model.composer = "/tmp/file".into();
         assert_eq!(
@@ -7439,7 +7754,7 @@ mod tests {
         let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
         let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
         let mut model = SessionUiModel {
-            active_conversation: Some(ActiveConversation::Session(current)),
+            active_session: Some(ActiveSession::Existing(current)),
             ..SessionUiModel::default()
         };
 
@@ -7525,8 +7840,8 @@ mod tests {
         );
         assert!(dispatched.is_empty());
         assert_eq!(
-            exact_model.active_conversation,
-            Some(ActiveConversation::Session(saved.session_id))
+            exact_model.active_session,
+            Some(ActiveSession::Existing(saved.session_id))
         );
 
         let mut picker_projection = ScriptedProjection {
@@ -7617,7 +7932,7 @@ mod tests {
             poll: SessionProjectionPoll::Empty,
         };
         let mut draft_model = SessionUiModel {
-            active_conversation: Some(ActiveConversation::NewSessionDraft),
+            active_session: Some(ActiveSession::SessionDraft),
             ..Default::default()
         };
         assert!(
@@ -7665,8 +7980,8 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            startup_empty.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
+            startup_empty.active_session,
+            Some(ActiveSession::SessionDraft)
         );
 
         let mut empty = SessionUiModel::default();
@@ -7751,8 +8066,8 @@ mod tests {
             .is_empty()
         );
         assert_eq!(
-            materializing.active_conversation,
-            Some(ActiveConversation::NewSessionDraft)
+            materializing.active_session,
+            Some(ActiveSession::SessionDraft)
         );
         reduce(
             &mut materializing,
@@ -7762,8 +8077,8 @@ mod tests {
             },
         );
         assert_eq!(
-            materializing.active_conversation,
-            Some(ActiveConversation::Session(first.session_id))
+            materializing.active_session,
+            Some(ActiveSession::Existing(first.session_id))
         );
         assert!(materializing.pending_submission.is_none());
         assert!(
@@ -8116,7 +8431,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 3,
+            turn_ordinal: 3,
             status: SessionTurnStatus::Completed,
             turn_revision: 4,
             completed_at_ms: Some(4),
@@ -8197,7 +8512,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Running,
             turn_revision: 2,
             completed_at_ms: None,
@@ -8420,7 +8735,7 @@ mod tests {
         complete.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Completed,
             turn_revision: 2,
             completed_at_ms: Some(2),
@@ -8807,7 +9122,7 @@ mod tests {
         complete.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Completed,
             turn_revision: 2,
             completed_at_ms: Some(2),
@@ -9127,10 +9442,13 @@ mod tests {
     fn snapshot_refresh_invalidates_stale_reconciliation_and_dispatches_one_queued_follow_up() {
         let mut model = SessionUiModel::default();
         let mut ready = snapshot(SessionLifecycle::Ready);
-        ready.revision = 9;
+        ready.session_revision = 9;
         let session_id = ready.session_id;
         model.sessions = vec![snapshot(SessionLifecycle::ReconciliationRequired)];
-        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "stale".into()));
+        model.reconciliation_confirmation = Some((
+            model.sessions[0].session_id,
+            EffectId::new("stale").unwrap(),
+        ));
         model.queued_follow_up = Some("continue from durable state".into());
         model.pending_submission = Some(PendingSubmission {
             submission_id: 41,
@@ -9163,11 +9481,12 @@ mod tests {
             Some(serde_json::json!({"status":"unknown","effect_id":"effect-current"})),
         ));
         let reconciling_id = reconciling.session_id;
-        model.reconciliation_confirmation = Some((reconciling_id, "effect-current".into()));
+        model.reconciliation_confirmation =
+            Some((reconciling_id, EffectId::new("effect-current").unwrap()));
         assert!(reduce(&mut model, SessionUiInput::Snapshot(vec![reconciling])).is_empty());
         assert_eq!(
             model.reconciliation_confirmation,
-            Some((reconciling_id, "effect-current".into()))
+            Some((reconciling_id, EffectId::new("effect-current").unwrap()))
         );
     }
 
@@ -9218,7 +9537,10 @@ mod tests {
         );
 
         model.connection = ConnectionState::Connected;
-        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "effect".into()));
+        model.reconciliation_confirmation = Some((
+            model.sessions[0].session_id,
+            EffectId::new("effect").unwrap(),
+        ));
         assert!(
             reduce_key_at(
                 &mut model,
@@ -9229,7 +9551,10 @@ mod tests {
         );
         assert!(model.reconciliation_confirmation.is_none());
         assert!(model.status.contains("cancelled"));
-        model.reconciliation_confirmation = Some((model.sessions[0].session_id, "effect".into()));
+        model.reconciliation_confirmation = Some((
+            model.sessions[0].session_id,
+            EffectId::new("effect").unwrap(),
+        ));
         assert!(
             reduce_key_at(
                 &mut model,
@@ -9683,6 +10008,7 @@ mod tests {
             &mut lines,
             TranscriptKind::Completion,
             "completed response wraps",
+            None,
             12,
         );
         let completion = lines_text(&lines);
@@ -9697,7 +10023,7 @@ mod tests {
             (TranscriptKind::ToolCall, " · "),
             (TranscriptKind::ToolResult, " · "),
         ] {
-            render_message_lines(&mut lines, kind, "detail", 40);
+            render_message_lines(&mut lines, kind, "detail", None, 40);
             assert!(lines_text(&lines).contains(expected));
             lines.clear();
         }
@@ -9761,7 +10087,7 @@ mod tests {
         let mut reconciliation = reconciliation_model();
         reconciliation.reconciliation_confirmation = Some((
             reconciliation.sessions[0].session_id,
-            "effect-authoritative-matrix".into(),
+            EffectId::new("effect-authoritative-matrix").unwrap(),
         ));
         assert!(
             composer_meta(&reconciliation, VisualState::Reconciliation)
@@ -9811,7 +10137,7 @@ mod tests {
         let mut reconciliation = reconciliation_model();
         reconciliation.reconciliation_confirmation = Some((
             reconciliation.sessions[0].session_id,
-            "effect-authoritative-matrix".into(),
+            EffectId::new("effect-authoritative-matrix").unwrap(),
         ));
         assert!(rendered(&reconciliation, 120, 40).contains("Ctrl+A confirm failed"));
 
@@ -9922,7 +10248,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Completed,
             turn_revision: 2,
             completed_at_ms: Some(2),
@@ -9967,7 +10293,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status,
             turn_revision: 2,
             completed_at_ms: (status == SessionTurnStatus::Completed).then_some(2),
@@ -10002,7 +10328,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: if state == ActivityState::Waiting {
                 SessionTurnStatus::WaitingPermission
             } else {
@@ -10090,7 +10416,7 @@ mod tests {
         };
         let mut model = SessionUiModel::with_startup(startup);
 
-        assert!(model.draft_model.is_none());
+        assert!(model.pending_model_selection.is_none());
         assert_eq!(model.status, PROVIDER_SETUP_GUIDANCE);
         assert!(rendered(&model, 100, 32).contains(MODEL_NOT_CONFIGURED));
 
@@ -10118,7 +10444,7 @@ mod tests {
         session.turns.push(latte_core::SessionTurnSummary {
             turn_id,
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status: SessionTurnStatus::Running,
             turn_revision: 2,
             completed_at_ms: None,
@@ -10422,7 +10748,7 @@ mod tests {
         );
         assert_eq!(
             model.reconciliation_hint,
-            Some((session.session_id, "effect-1".to_owned()))
+            Some((session.session_id, EffectId::new("effect-1").unwrap()))
         );
     }
 
@@ -10597,7 +10923,7 @@ mod tests {
         session.active_turn_id = None;
         let mut model = SessionUiModel {
             sessions: Vec::new(),
-            active_conversation: Some(ActiveConversation::Session(session.session_id)),
+            active_session: Some(ActiveSession::Existing(session.session_id)),
             pending_submission: Some(PendingSubmission {
                 submission_id: 1,
                 prompt: "queued prompt".into(),
@@ -10877,7 +11203,7 @@ mod tests {
         let ready = snapshot(SessionLifecycle::Ready);
         let mut model = SessionUiModel {
             sessions: vec![ready.clone()],
-            active_conversation: Some(ActiveConversation::Session(ready.session_id)),
+            active_session: Some(ActiveSession::Existing(ready.session_id)),
             ..Default::default()
         };
         let mut projection = ScriptedProjection {
@@ -10894,7 +11220,7 @@ mod tests {
 
         // Refresh of a fresh draft without pending work fails.
         let mut model = SessionUiModel {
-            active_conversation: Some(ActiveConversation::NewSessionDraft),
+            active_session: Some(ActiveSession::SessionDraft),
             ..Default::default()
         };
         let mut projection = ScriptedProjection {
@@ -11114,5 +11440,302 @@ mod tests {
         ));
         let presentation = permission_presentation(&session, "effect-1", "do thing");
         assert_eq!(presentation.operation, "Repository operation");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn compact_and_cancel_slash_and_palette_flows_preserve_drafts_refresh_context_and_never_arm_exit()
+     {
+        let mut draft = SessionUiModel::with_startup(test_startup());
+        draft.composer = "/compact".into();
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(draft.composer, "/compact");
+        assert_eq!(
+            draft.command_notice.as_deref(),
+            Some("This command requires an open saved session")
+        );
+        assert!(rendered(&draft, 100, 30).contains("This command requires an open saved session"));
+
+        draft.composer = "/cancel".into();
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(draft.composer, "/cancel");
+        assert_eq!(
+            draft.command_notice.as_deref(),
+            Some("No active turn to cancel")
+        );
+
+        draft.composer = "/compact extra".into();
+        assert!(reduce(&mut draft, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(draft.composer, "/compact extra");
+        assert_eq!(
+            draft.command_notice.as_deref(),
+            Some("/compact does not accept arguments")
+        );
+
+        // Tab completes non-argument vs argument commands cleanly and clears notice.
+        draft.composer = "/co".into();
+        assert!(reduce(&mut draft, key(KeyCode::Tab, KeyModifiers::NONE)).is_empty());
+        assert_eq!(draft.composer, "/compact");
+        assert!(draft.command_notice.is_none());
+        draft.composer = "/ren".into();
+        assert!(reduce(&mut draft, key(KeyCode::Tab, KeyModifiers::NONE)).is_empty());
+        assert_eq!(draft.composer, "/rename ");
+
+        // Ready session: `/compact` dispatches `CompactSession`, locks submission,
+        // and `Compaction` feedback refreshes both snapshot and context meter while
+        // preserving the notice on same-session reload.
+        let ready = snapshot(SessionLifecycle::Ready);
+        let session_id = ready.session_id;
+        let mut model = SessionUiModel::with_startup(test_startup());
+        reduce(
+            &mut model,
+            SessionUiInput::SessionOpened(Box::new(ready.clone())),
+        );
+
+        // Selecting `/rename` (Required argument) from popup or palette completes into composer.
+        model.composer = "/ren".into();
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.composer, "/rename ");
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("/rename requires an argument")
+        );
+
+        model.composer.clear();
+        model.command_palette = true;
+        model.command_index = 7; // Rename
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.composer, "/rename ");
+
+        // Windowed palette scrolls cleanly to Compact (9) and Cancel (10) on 80x24.
+        model.composer.clear();
+        model.command_palette = true;
+        model.command_index = 9;
+        let palette_compact = rendered(&model, 80, 24);
+        assert!(palette_compact.contains("Compact conversation history"));
+        model.command_index = 10;
+        let palette_cancel = rendered(&model, 80, 24);
+        assert!(palette_cancel.contains("Cancel the active turn"));
+        assert!(palette_cancel.contains("No active turn to cancel"));
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("No active turn to cancel")
+        );
+
+        // Execute `/compact` via composer.
+        model.composer = "/compact".into();
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![SessionUiAction::CompactSession { session_id }]
+        );
+        assert!(model.composer.is_empty());
+        assert_eq!(model.pending_compaction, Some(session_id));
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("Compacting conversation history…")
+        );
+
+        // Prompt submission is blocked while compaction is in flight.
+        model.composer = "wait for me".into();
+        assert!(reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert_eq!(model.composer, "wait for me");
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("Wait for compaction to finish before submitting")
+        );
+
+        let (feedback_tx, feedback_rx) = std::sync::mpsc::channel();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
+        feedback_tx
+            .send(SessionUiFeedback::compaction(Ok(
+                "Compacted (light) · session revision 2".into(),
+            )))
+            .unwrap();
+        let (changed, actions) = drain_runtime_updates(&mut model, &feedback_rx, &progress_rx);
+        assert!(changed);
+        assert_eq!(actions, vec![SessionUiAction::RefreshSnapshots]);
+        assert!(model.pending_compaction.is_none());
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("Compacted (light) · session revision 2")
+        );
+        // Same-session reload preserves notice; narrow and medium viewports render it.
+        let mut compacted_snapshot = ready.clone();
+        compacted_snapshot.session_revision = 2;
+        reduce(
+            &mut model,
+            SessionUiInput::SessionOpened(Box::new(compacted_snapshot)),
+        );
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("Compacted (light) · session revision 2")
+        );
+        assert!(rendered(&model, 80, 24).contains("Compacted (light) · session revision 2"));
+        assert!(rendered(&model, 60, 24).contains("Compacted (light)"));
+
+        // Compaction error path also clears `pending_compaction` and refreshes.
+        model.pending_compaction = Some(session_id);
+        feedback_tx
+            .send(SessionUiFeedback::compaction(Err("conflict".into())))
+            .unwrap();
+        let (_, err_actions) = drain_runtime_updates(&mut model, &feedback_rx, &progress_rx);
+        assert_eq!(err_actions, vec![SessionUiAction::RefreshSnapshots]);
+        assert!(model.pending_compaction.is_none());
+        assert_eq!(
+            model.command_notice.as_deref(),
+            Some("Compaction failed: conflict")
+        );
+
+        // Editing clears `command_notice`.
+        reduce(&mut model, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(model.command_notice.is_none());
+
+        // Running session: `/cancel` works even when a follow-up is queued, and
+        // never arms `ctrl_c_exit_armed_until`.
+        let running = running_snapshot();
+        let running_id = running.session_id;
+        let mut active = SessionUiModel::with_startup(test_startup());
+        reduce(
+            &mut active,
+            SessionUiInput::SessionOpened(Box::new(running)),
+        );
+        active.queued_follow_up = Some("queued".into());
+        active.pending_submission = Some(PendingSubmission {
+            submission_id: 7,
+            prompt: "queued".into(),
+            session_id: Some(running_id),
+            after_sequence: 1,
+        });
+        active.composer = "/cancel".into();
+        assert_eq!(
+            reduce(&mut active, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![SessionUiAction::Cancel {
+                session_id: running_id
+            }]
+        );
+        assert!(active.ctrl_c_exit_armed_until.is_none());
+        assert_eq!(
+            active.command_notice.as_deref(),
+            Some("Cancelling active turn…")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn waiting_input_closes_and_hides_overlays_and_batch4_renders_denied_cancelled_and_failed_ready()
+     {
+        let ids = SystemIdSource::default();
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+
+        // WaitingInput suppresses command_palette, help, session_picker, and model_picker.
+        let mut waiting = snapshot(SessionLifecycle::WaitingInput);
+        waiting.active_turn_id = Some(turn_id);
+        waiting.pending = Some(SessionPendingRequest::Input {
+            turn_id,
+            request_id: "req-1".into(),
+            prompt: "enter name".into(),
+            expected_turn_revision: 2,
+        });
+        let mut model = SessionUiModel::with_startup(test_startup());
+        model.active_session = Some(ActiveSession::Existing(waiting.session_id));
+        model.command_palette = true;
+        model.help = true;
+        model.session_picker = true;
+        open_model_picker(&mut model);
+        model.command_palette = true;
+        model.help = true;
+        model.session_picker = true;
+        reduce(&mut model, SessionUiInput::Snapshot(vec![waiting]));
+        assert!(!model.command_palette);
+        assert!(!model.help);
+        assert!(!model.session_picker);
+        assert!(model.model_picker.is_none());
+
+        // PermissionDenied on a Ready session renders distinct header, footer, heading, and card.
+        let mut denied = snapshot(SessionLifecycle::Ready);
+        denied.latest_turn_id = Some(turn_id);
+        denied.turns.push(SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
+            turn_ordinal: 1,
+            status: SessionTurnStatus::Failed,
+            turn_revision: 2,
+            completed_at_ms: Some(2),
+            failure_code: Some(FailureCode::PermissionDenied),
+        });
+        denied.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(turn_id),
+            TranscriptKind::Failure,
+            "permission denied",
+            Some(serde_json::json!({ "status": "denied" })),
+        ));
+        let denied_model = SessionUiModel {
+            sessions: vec![denied],
+            ..Default::default()
+        };
+        let denied_screen = rendered(&denied_model, 110, 28);
+        assert!(denied_screen.contains("Permission denied · ready"));
+        assert!(denied_screen.contains("Turn 1 · Permission denied"));
+        assert!(denied_screen.contains("! Permission denied · permission denied"));
+
+        // Cancelled turn on a Failed session renders Cancelled across header, footer, heading, and card.
+        let mut cancelled = snapshot(SessionLifecycle::Failed);
+        cancelled.latest_turn_id = Some(turn_id);
+        cancelled.turns.push(SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
+            turn_ordinal: 1,
+            status: SessionTurnStatus::Failed,
+            turn_revision: 2,
+            completed_at_ms: Some(2),
+            failure_code: Some(FailureCode::Cancelled),
+        });
+        cancelled.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(turn_id),
+            TranscriptKind::Failure,
+            "run cancelled while waiting",
+            Some(serde_json::json!({ "code": "cancelled", "retryability": "terminal" })),
+        ));
+        let cancelled_model = SessionUiModel {
+            sessions: vec![cancelled],
+            ..Default::default()
+        };
+        let cancelled_screen = rendered(&cancelled_model, 110, 28);
+        assert!(cancelled_screen.contains("Cancelled · m"));
+        assert!(cancelled_screen.contains("Turn 1 · Cancelled"));
+        assert!(cancelled_screen.contains("! Cancelled · run cancelled while waiting"));
+
+        // Retryably failed turn on a Ready session renders `Last turn failed · ready` while keeping `! Failed ·`.
+        let mut retryable = snapshot(SessionLifecycle::Ready);
+        retryable.latest_turn_id = Some(turn_id);
+        retryable.turns.push(SessionTurnSummary {
+            turn_id,
+            parent_turn_id: None,
+            turn_ordinal: 1,
+            status: SessionTurnStatus::Failed,
+            turn_revision: 2,
+            completed_at_ms: Some(2),
+            failure_code: Some(FailureCode::RuntimeFailed),
+        });
+        retryable.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(turn_id),
+            TranscriptKind::Failure,
+            "provider timeout",
+            Some(serde_json::json!({ "code": "runtime_failed", "retryability": "retryable" })),
+        ));
+        let retryable_model = SessionUiModel {
+            sessions: vec![retryable],
+            ..Default::default()
+        };
+        let retryable_screen = rendered(&retryable_model, 110, 28);
+        assert!(retryable_screen.contains("Last turn failed · ready"));
+        assert!(retryable_screen.contains("! Failed · provider timeout"));
     }
 }

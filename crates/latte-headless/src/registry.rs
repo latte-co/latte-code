@@ -236,8 +236,9 @@ impl SecretRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProviderBinding {
-    pub version: u32,
+pub struct ProviderModelBinding {
+    #[serde(alias = "version")]
+    pub binding_version: u32,
     pub provider_name: String,
     pub provider_type: String,
     pub protocol: String,
@@ -246,11 +247,11 @@ pub struct ProviderBinding {
     pub tools_fingerprint: String,
     pub aliases: BTreeMap<String, String>,
 }
-impl ProviderBinding {
+impl ProviderModelBinding {
     #[cfg(test)]
     pub(crate) fn direct(tools: &[ToolDescriptor]) -> Self {
         Self {
-            version: BINDING_VERSION,
+            binding_version: BINDING_VERSION,
             provider_name: "embedded".into(),
             provider_type: "embedded".into(),
             protocol: "latte-provider-v1".into(),
@@ -273,7 +274,7 @@ impl ProviderBinding {
         credential_generation: u64,
     ) -> SessionProviderBinding {
         SessionProviderBinding {
-            version: self.version,
+            binding_version: self.binding_version,
             provider_name: self.provider_name.clone(),
             provider_type: self.provider_type.clone(),
             protocol: self.protocol.clone(),
@@ -304,7 +305,7 @@ pub enum RegistryError {
 
 pub struct ResolvedProvider {
     pub provider: Arc<dyn Provider>,
-    pub binding: ProviderBinding,
+    pub binding: ProviderModelBinding,
 }
 
 /// Secret-free provider/model option exposed to interactive clients.
@@ -401,7 +402,7 @@ impl ProviderRegistry {
 
     pub fn resolve_bound(
         &self,
-        binding: &ProviderBinding,
+        binding: &ProviderModelBinding,
         tools: &[ToolDescriptor],
     ) -> Result<ResolvedProvider, RegistryError> {
         let definition = self
@@ -639,12 +640,12 @@ impl ProviderRegistry {
         definition: &ProviderDefinition,
         selected_model: &str,
         tools: &[ToolDescriptor],
-    ) -> Result<ProviderBinding, RegistryError> {
+    ) -> Result<ProviderModelBinding, RegistryError> {
         match definition {
             ProviderDefinition::OpenaiChat { aliases, .. } => {
                 let alias_table = ToolAliases::new(tools, aliases)?.canonical_to_wire;
-                Ok(ProviderBinding {
-                    version: BINDING_VERSION,
+                Ok(ProviderModelBinding {
+                    binding_version: BINDING_VERSION,
                     provider_name: name.into(),
                     provider_type: "openai-chat".into(),
                     protocol: "openai-chat-completions-v1".into(),
@@ -977,7 +978,7 @@ fn binding_matches_with_legacy_tools(
     proposed: &SessionProviderBinding,
     legacy_tools_fingerprint: &str,
 ) -> bool {
-    let identity_matches = stored.version == proposed.version
+    let identity_matches = stored.binding_version == proposed.binding_version
         && stored.provider_name == proposed.provider_name
         && stored.provider_type == proposed.provider_type
         && stored.protocol == proposed.protocol
@@ -1623,7 +1624,7 @@ mod tests {
 
     #[test]
     fn direct_binding_with_tools_builds_aliases() {
-        let binding = ProviderBinding::direct(&[tool("read_file")]);
+        let binding = ProviderModelBinding::direct(&[tool("read_file")]);
         assert!(!binding.aliases.is_empty());
         assert_eq!(binding.aliases["read_file"], "read_file");
     }

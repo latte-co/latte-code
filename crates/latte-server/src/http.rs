@@ -153,7 +153,8 @@ impl ServerState {
 pub enum ServerEvent {
     SessionChanged {
         session_id: String,
-        revision: u64,
+        #[serde(alias = "revision")]
+        session_revision: u64,
     },
     Progress {
         session_id: String,
@@ -627,12 +628,12 @@ async fn create_session_owned(
     // Wake subscribers so they fetch the new session snapshot.
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: outcome.revision,
+        session_revision: outcome.session_revision,
     });
 
     let body = SessionCreatedResponse {
         session_id: session_id.to_string(),
-        accepted_revision: outcome.revision,
+        accepted_revision: outcome.session_revision,
     };
     Ok((status, body))
 }
@@ -791,7 +792,7 @@ async fn compact_session(
                 let current = workspace
                     .snapshot(session_id)
                     .ok()
-                    .map(|snapshot| snapshot.revision);
+                    .map(|snapshot| snapshot.session_revision);
                 conflict("session is not idle for manual compaction", current)
             } else {
                 failed(&format!("manual compaction failed: {error}"))
@@ -828,7 +829,7 @@ async fn arm_session_reminder(
                 let current = workspace
                     .snapshot(session_id)
                     .ok()
-                    .map(|snapshot| snapshot.revision);
+                    .map(|snapshot| snapshot.session_revision);
                 conflict("session is not idle for arming a reminder", current)
             }
             // Empty/oversize/redacted-to-empty text is a client error.
@@ -935,11 +936,11 @@ async fn follow_up_owned(
 
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: outcome.revision,
+        session_revision: outcome.session_revision,
     });
 
     let body = FollowUpResponse {
-        accepted_revision: outcome.revision,
+        accepted_revision: outcome.session_revision,
         workspace_id: workspace.id.clone(),
     };
     Ok((status, body))
@@ -960,7 +961,10 @@ async fn switch_model(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -987,7 +991,10 @@ async fn cancel_session(
         Err(error) => {
             // On a fence/state rejection, surface the current revision so the
             // client can re-fetch and retry.
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1046,7 +1053,10 @@ async fn resolve_permission(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1077,7 +1087,10 @@ async fn provide_input(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1088,6 +1101,7 @@ async fn reconcile_effect(
     Path((id, effect_id)): Path<(String, String)>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
     let session_id = parse_session_id(&id)?;
+    latte_core::EffectId::new(&effect_id).map_err(|error| bad_request(&error))?;
     let workspace = lookup_workspace(&state, session_id).await?;
 
     match workspace
@@ -1120,7 +1134,7 @@ async fn rename_session(
         .map_err(|error| failed(&format!("snapshot failed: {error}")))?;
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: snapshot.revision,
+        session_revision: snapshot.session_revision,
     });
     Ok(Json(SessionResponse { snapshot }))
 }
@@ -1148,7 +1162,7 @@ async fn fork_session(
         .map_err(|error| failed(&format!("fork failed: {error}")))?;
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: fork_id.to_string(),
-        revision: snapshot.revision,
+        session_revision: snapshot.session_revision,
     });
     Ok(Json(SessionResponse { snapshot }))
 }
@@ -1459,7 +1473,7 @@ mod tests {
 
     fn valid_binding() -> serde_json::Value {
         serde_json::json!({
-            "version": 1,
+            "binding_version": 1,
             "provider_name": "test",
             "provider_type": "openai-chat",
             "protocol": "chat",
@@ -1551,7 +1565,7 @@ mod tests {
     /// idle state and the follow-up/switch/read success paths are reachable.
     fn completing_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1565,8 +1579,8 @@ mod tests {
                 }]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1594,7 +1608,7 @@ mod tests {
             let (status, body) =
                 call(state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
             if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                let revision = body["snapshot"]["revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
                 return (session_id, revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1607,7 +1621,7 @@ mod tests {
     /// path is reachable.
     fn permission_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1639,8 +1653,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1673,7 +1687,7 @@ mod tests {
             if status == StatusCode::OK
                 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission")
             {
-                let revision = body["snapshot"]["revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"]
                     .as_str()
@@ -1695,7 +1709,7 @@ mod tests {
         use latte_headless::provider::{
             FakeProvider, InputRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1723,8 +1737,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1757,7 +1771,7 @@ mod tests {
             if status == StatusCode::OK
                 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input")
             {
-                let revision = body["snapshot"]["revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"].as_str().unwrap().to_string();
                 let turn_revision = pending["expected_turn_revision"].as_u64().unwrap();
@@ -2879,7 +2893,7 @@ mod tests {
         // every server event type to its named frame.
         let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
             session_id: "abc".into(),
-            revision: 7,
+            session_revision: 7,
         });
         let _ = workspace.event_tx.send(ServerEvent::Progress {
             session_id: "abc".into(),
@@ -3732,14 +3746,14 @@ mod tests {
     }
 
     fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(Blocking(gate.clone())),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -3894,7 +3908,7 @@ mod tests {
         use latte_headless::provider::{
             FakeProvider, InputRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let provider = std::sync::Arc::new(FakeProvider::scripted([
             ProviderResponse {
@@ -3922,8 +3936,8 @@ mod tests {
             std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -3988,7 +4002,7 @@ mod tests {
                 if status == StatusCode::OK {
                     let snapshot = &body["snapshot"];
                     if let Some(active_turn_id) = snapshot["active_turn_id"].as_str() {
-                        let revision = snapshot["revision"].as_u64().unwrap();
+                        let revision = snapshot["session_revision"].as_u64().unwrap();
                         let turn_revision = snapshot["turns"]
                             .as_array()
                             .unwrap()
@@ -4027,7 +4041,7 @@ mod tests {
     #[cfg(unix)]
     fn process_reconciliation_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -4057,8 +4071,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -5118,6 +5132,22 @@ mod tests {
             "POST",
             "/v1/sessions/not-a-uuid/reminder",
             Some(serde_json::json!({ "text": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn reconcile_effect_rejects_malformed_effect_id() {
+        let state = state();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let overlong = "x".repeat(513);
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/effects/{overlong}/reconcile"),
+            None,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

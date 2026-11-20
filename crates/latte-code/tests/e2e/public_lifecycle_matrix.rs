@@ -1,11 +1,11 @@
 use super::support::{PtySession, Scenario, json, wait_until};
 use latte_core::{
-    FailureCode, IdSource, Retryability, SessionCommandId, SessionId, SessionProviderBinding,
-    SystemIdSource, TurnFailure, TurnId,
+    EffectId, FailureCode, IdSource, Retryability, SessionCommandId, SessionId,
+    SessionProviderBinding, SystemIdSource, TurnFailure, TurnId,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionTurnUpdate, EngineHandle, Lease, ProcessOutput,
-    ProcessTermination, SessionCommitRequest, SessionEffectDescriptor, SessionEffectObservedValue,
+    CancellationToken, CommitSessionTurnUpdate, EffectAuthority, EngineHandle, Lease,
+    ProcessOutput, ProcessTermination, SessionCommitRequest, SessionEffectObservedValue,
     SessionEffectPolicy, SessionEffectRequest, SessionEffectStartRequest, SessionLeaseLossRecovery,
     StorageError,
 };
@@ -30,7 +30,7 @@ fn command_id() -> SessionCommandId {
 
 fn binding() -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: "public-fixture".into(),
         provider_type: "openai-chat".into(),
         protocol: "openai-chat-completions-v1".into(),
@@ -77,7 +77,7 @@ fn commit_session(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 request_id: None,
@@ -123,12 +123,12 @@ fn prepare_read(
             SessionEffectRequest {
                 session_id: snapshot.session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("public:{effect_id}:prepare"),
-                descriptor: SessionEffectDescriptor {
-                    effect_id: effect_id.into(),
+                authority: EffectAuthority {
+                    effect_id: EffectId::new(effect_id).unwrap(),
                     tool_call_id: format!("call-{effect_id}"),
                     name: "read_file".into(),
                     input: serde_json::json!({"path":path}),
@@ -156,11 +156,11 @@ fn start_effect(
             SessionEffectStartRequest {
                 session_id: prepared.snapshot.session_id,
                 turn_id,
-                expected_session_revision: prepared.snapshot.revision,
+                expected_session_revision: prepared.snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: command_id(),
                 source_key: format!("public:{effect_id}:start"),
-                effect_id: effect_id.into(),
+                effect_id: EffectId::new(effect_id).unwrap(),
             },
             prepared.operation_digest.clone(),
             lease,
@@ -235,11 +235,12 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         )
         .unwrap();
     let (parent_turn_id, parent_revision) = active_turn(&observed.snapshot);
+    let verification_id = EffectId::new("public-session-verification").unwrap();
     engine
         .record_session_verification(
             parent_turn_id,
             parent_revision,
-            "public-session-verification",
+            &verification_id,
             &ProcessOutput {
                 exit_code: Some(0),
                 stdout: "public verification passed".into(),
@@ -256,7 +257,7 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         .complete_session_verified(
             &observed.snapshot,
             "public parent verified".into(),
-            "public-session-verification".into(),
+            verification_id,
             &success_lease,
             now + 7,
         )
@@ -278,7 +279,7 @@ async fn public_session_effects_verification_and_follow_up_render_through_final_
         .create_session_follow_up_v2(
             success_session_id,
             follow_up_id,
-            completed_parent.revision,
+            completed_parent.session_revision,
             "public immutable follow-up",
             now + 8,
         )
@@ -471,7 +472,7 @@ fn public_lease_takeover_recovers_unknown_and_final_tui_reconciles_it() {
         SessionCommitRequest {
             session_id,
             turn_id,
-            expected_session_revision: started.snapshot.revision,
+            expected_session_revision: started.snapshot.session_revision,
             expected_turn_revision: started_revision,
             command_id: command_id(),
             request_id: None,

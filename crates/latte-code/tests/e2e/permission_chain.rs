@@ -284,7 +284,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
 
     // Wait for the process permission request.
     let snapshot = wait_for_lifecycle(&server, &session_id, &["waiting_permission"]);
-    let revision = snapshot["revision"].as_u64().unwrap();
+    let revision = snapshot["session_revision"].as_u64().unwrap();
     let request_id = snapshot["pending"]["request_id"]
         .as_str()
         .unwrap()
@@ -360,7 +360,7 @@ fn process_permission_then_verification_permission_fails_durably_on_second_resum
 
     // A follow-up on a ready (completed) session is accepted (the session is
     // not terminal in v2 — ready sessions accept follow-up turns).
-    let session_revision = snapshot["revision"].as_u64().unwrap();
+    let session_revision = snapshot["session_revision"].as_u64().unwrap();
     let follow_command_id = "01900000-0000-7000-8000-0000000000b1".to_string();
     let (follow_status, _) = server.request(
         "POST",

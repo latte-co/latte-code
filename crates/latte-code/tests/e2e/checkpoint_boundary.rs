@@ -290,7 +290,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
 
     let snapshot = wait_for_lifecycle(&server, &session_id, &["waiting_permission"]);
     let turn_id_str = snapshot["active_turn_id"].as_str().unwrap().to_string();
-    let session_revision = snapshot["revision"].as_u64().unwrap();
+    let session_revision = snapshot["session_revision"].as_u64().unwrap();
     let request_id = snapshot["pending"]["request_id"]
         .as_str()
         .unwrap()
@@ -412,7 +412,7 @@ fn public_checkpoint_corruption_matrix_fails_closed_in_fresh_final_cli_processes
     );
     let current_snapshot = &current_body["snapshot"];
     let current_lifecycle = current_snapshot["lifecycle"].as_str().unwrap_or("");
-    let current_revision = current_snapshot["revision"]
+    let current_revision = current_snapshot["session_revision"]
         .as_u64()
         .unwrap_or(session_revision);
     let current_turn_revision = current_snapshot["turns"][0]["turn_revision"]

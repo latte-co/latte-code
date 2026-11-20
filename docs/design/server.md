@@ -228,7 +228,7 @@ Accept: text/event-stream
 
 ```
 event: session_changed
-data: {"session_id": "...", "revision": 42}
+data: {"session_id": "...", "session_revision": 42}
 
 event: progress
 data: {"session_id": "...", "turn_id": "...", "progress": {...}}
@@ -283,7 +283,7 @@ SSE 是通知通道，不是持久事件日志：事件不带 `id:` 字段，ser
 
 - `current_revision` 仅在 `conflict` 时出现，供客户端刷新后重试。
 - `message` 是人类可读的英文诊断，不保证稳定；客户端应基于 `type` 编程。
-- 客户端必须容忍未知错误 type（当作 `failed` 处理）。
+- 客户端必须容忍未知错误 type（CLI 侧映射为 `unclassified`，避免与服务端 500 `failed` 混淆）。
 
 ### 5.7 幂等性
 

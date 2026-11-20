@@ -1,12 +1,12 @@
 use super::support::{ProviderReply, PtySession, Scenario, ScriptedProvider, wait_until};
 use latte_core::{
-    Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability, SessionCommandId,
-    SessionId, SessionProviderBinding, SystemIdSource, TranscriptKind, TurnFailure,
-    VerificationStatus,
+    EffectId, Evidence, FailureCode, Handoff, IdSource, PendingPermission, Retryability,
+    SessionCommandId, SessionId, SessionProviderBinding, SystemIdSource, TranscriptKind,
+    TurnFailure, VerificationStatus,
 };
 use latte_engine::{
-    CommitSessionTurnUpdate, EngineHandle, Lease, SessionCommitRequest, SessionEffectDescriptor,
-    SessionEffectPolicy,
+    CommitSessionTurnUpdate, EffectAuthority, EffectView, EngineHandle, Lease,
+    SessionCommitRequest, SessionEffectPolicy,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -16,7 +16,7 @@ const CTRL_P: &[u8] = b"\x1b[112;5u";
 
 fn binding() -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: "fixture".into(),
         provider_type: "openai-chat".into(),
         protocol: "openai-chat-completions-v1".into(),
@@ -73,7 +73,7 @@ fn commit(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision: turn_revision,
                 command_id: SessionCommandId::from_uuid(SystemIdSource::default().next_uuid_v7()),
                 request_id: None,
@@ -297,14 +297,16 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                 b"Interrupted"
             }
             "reconciliation" => {
-                let descriptor = SessionEffectDescriptor {
-                    effect_id: "matrix-effect".into(),
+                let authority = EffectAuthority {
+                    effect_id: EffectId::new("matrix-effect").unwrap(),
                     tool_call_id: "matrix-call".into(),
                     name: "read_file".into(),
                     input: serde_json::json!({"path":"matrix.txt"}),
                     attempt: 1,
                 };
-                let descriptor_json = serde_json::to_string(&descriptor).unwrap();
+                let descriptor_json =
+                    serde_json::to_string(&EffectView::from_authority(&authority)).unwrap();
+                let canonical_descriptor_json = serde_json::to_string(&authority).unwrap();
                 let digest = "e".repeat(64);
                 snapshot = commit(
                     &engine,
@@ -312,13 +314,13 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &snapshot,
                     CommitSessionTurnUpdate::PrepareEffect {
                         source_key: "fixture:prepare".into(),
-                        effect_id: descriptor.effect_id.clone(),
+                        effect_id: authority.effect_id.clone(),
                         operation_digest: digest.clone(),
-                        descriptor_json: descriptor_json.clone(),
-                        canonical_descriptor_json: descriptor_json,
+                        descriptor_json,
+                        canonical_descriptor_json,
                         policy: SessionEffectPolicy::Allow,
                         description: "read matrix.txt".into(),
-                        checkpoint_json: r#"{"phase":"prepared"}"#.into(),
+                        effect_stage_marker_json: r#"{"phase":"prepared"}"#.into(),
                     },
                     1_018,
                 );
@@ -328,9 +330,9 @@ fn seeded_lifecycle_matrix_is_visible_through_the_final_tui() {
                     &snapshot,
                     CommitSessionTurnUpdate::StartEffect {
                         source_key: "fixture:start-effect".into(),
-                        effect_id: descriptor.effect_id,
+                        effect_id: authority.effect_id,
                         operation_digest: digest,
-                        checkpoint_json: r#"{"phase":"started"}"#.into(),
+                        effect_stage_marker_json: r#"{"phase":"started"}"#.into(),
                     },
                     1_019,
                 );
@@ -612,7 +614,7 @@ fn session_projection_client_defaults_derive_catalog_selection_search_and_meter(
             SessionCommitRequest {
                 session_id: untitled_id,
                 turn_id: untitled.latest_turn_id.unwrap(),
-                expected_session_revision: untitled.revision,
+                expected_session_revision: untitled.session_revision,
                 expected_turn_revision: untitled.turns[0].turn_revision,
                 command_id: SessionCommandId::from_uuid(ids.next_uuid_v7()),
                 request_id: None,

@@ -248,7 +248,7 @@ impl WorkspaceInstance {
                         // SSE is wake-up only; clients refetch snapshots.
                         let server_event = ServerEvent::SessionChanged {
                             session_id: event.session_id.to_string(),
-                            revision: event.revision,
+                            session_revision: event.session_revision,
                         };
                         let _ = event_tx.send(server_event);
                     }
@@ -583,7 +583,7 @@ mod tests {
         // rather than a panic.
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -741,7 +741,7 @@ mod tests {
         // Produce more session events than the channel capacity (64) without
         // yielding, so the bridge receiver falls behind and lags.
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -860,7 +860,7 @@ mod tests {
         // Simulate a crash: a running session whose lease is already expired
         // against the wall clock (absolute expiry at epoch 1001ms).
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -979,7 +979,7 @@ mod tests {
             FinishReason, Provider, ProviderContext, ProviderEvent, ProviderFuture,
             ProviderRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         // A provider that emits progress events through the context sink before
         // returning a one-step completion, so the workspace progress closure is
@@ -1010,8 +1010,8 @@ mod tests {
             Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(ProgressProvider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1032,7 +1032,7 @@ mod tests {
 
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),

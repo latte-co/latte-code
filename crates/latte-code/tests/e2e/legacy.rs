@@ -235,7 +235,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
             session_id,
             turn_id,
             SessionProviderBinding {
-                version: 1,
+                binding_version: 1,
                 provider_name: "main".into(),
                 provider_type: "openai-chat".into(),
                 protocol: "openai-chat-completions-v1".into(),

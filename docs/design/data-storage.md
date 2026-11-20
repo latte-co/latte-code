@@ -1,13 +1,15 @@
 # 全局 Session 与数据存储设计
 
-状态：**本地 Session 存储与当前 Workspace 管理已实现。**
+状态：**本地 Session 存储、当前 Workspace 管理与 JSONL ↔ SQLite 双向恢复已实现。**
 
 当前实现使用 `$LATTE_CODE_HOME`（默认 `$HOME/.latte/latte-code`）保存全局 SQLite
-控制状态和每 Session JSONL。Schema 11 注册稳定的 Project/Workspace Identity，
-Session Lease 继续分区；JSONL 已是 Transcript 读取权威并支持撕裂尾行修复；旧工作区
-数据库可幂等导入且源文件字节不变。SQLite 的事务 `conversation_outbox` 只保留尚未
-fsync 到 JSONL 的已接受记录，同步成功后立即删除。当前 Workspace 内的发现、搜索、
-重命名和 Fork 已实现；跨 Workspace 发现与从孤立 JSONL 重建 Catalog 仍是目标工作。
+控制状态和每 Session JSONL。Schema 11-15 注册稳定的 Project/Workspace Identity 与
+Session/Turn 控制表，Session Lease 继续分区；新建 Session 采用两阶段
+`materializing` 生命周期；JSONL 是 Transcript 读取权威，支持撕裂尾行修复、从孤立
+JSONL 重建 SQLite Catalog，以及基于 SQLite `effects` 已认证观察证据确定性补齐缺失的
+`ToolResult` 记录。旧工作区数据库可幂等导入且源文件字节不变。SQLite 的事务
+`conversation_outbox` 只保留尚未 fsync 到 JSONL 的已接受记录，同步成功后立即删除。
+当前 Workspace 内的发现、搜索、重命名和 Fork 已实现；跨 Workspace 发现仍是目标工作。
 
 ## 1. 已确定的决策
 
@@ -427,13 +429,29 @@ Target、同步已接受 Record，并且只修复撕裂的最后一行。公开 
 JSONL；SQLite `conversation_outbox` 只保存尚未同步到 JSONL 的事务记录，同步后
 立即删除。Legacy Import 对源文件取
 Fingerprint，拒绝外部 Workspace Row 与 ID 冲突，保持源文件不变，跳过 Live Lease，
-恢复控制状态并把导入对话生成为 JSONL。TUI Discovery 与 Search 仅限当前
-Workspace；从孤立 JSONL 重建 Catalog 尚未实现。
+恢复控制状态并把导入对话生成为 JSONL。引擎启动对账（`reconcile_startup_conversations`）
+已完成双向闭环：
+1. 新建 Session 先写入 `materializing` 行并同步首条 JSONL 记录，再原子激活并发布事件；
+   若进程在激活前崩溃，下次启动会根据是否已落盘首条 User 记录自动提升或清理悬空行。
+2. 当 `state.db` 丢失而 `$LATTE_CODE_HOME/sessions/<storage_key>/` 下仍存留合法
+   `<session-id>.jsonl` 时，按两趟顺序跳过 0 字节文件、拒绝符号链接、截断撕裂尾行，
+   重建 `sessions`、`turns`、`turn_read_model`、`turn_baselines`、`session_turns`
+   （含 `tool_round_count`）、`parent_session_id` 分叉血缘与 `effects`；对仅记录
+   `"tool started"` 而无观察结果的调用标记 `Unknown` 与 `ReconciliationRequired`，
+   绝不猜测执行成功；重建出的 Binding 将凭据标记为未绑定（`credential_generation = 0`），
+   只读查看立即可用，续跑前须通过 `/model` 显式重绑配置中的模型。
+3. 当 SQLite `effects` 已记录 `observed_success` / `observed_failed` 且携带认证
+   `post_evidence_json["result"]`，而对应 `.jsonl` 缺失该 `tool_result` 记录时，
+   确定性补写 `ToolResult` 到 JSONL 并推进 `last_seq`，全程不重复执行任何工具、也不读取
+   私有 `session_effect_canonical`。
+TUI Discovery 与 Search 仅限当前 Workspace；跨 Workspace UI 发现尚未实现。
 
 UT 覆盖全局 Home 解析、迁移至当前 Schema（15）、Worktree-Aware Catalog Identity、
-Scoped Authority、JSONL 尾行修复与读取权威、幂等 Legacy Import，以及持久、可重试
-的 Provider Failure。最终二进制 E2E 覆盖全局 State/JSONL 创建、旧库源文件不变的
-导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Turn。
+Scoped Authority、两阶段 `materializing` 创建、JSONL 尾行修复、孤立 JSONL Catalog
+重建、缺失已观察 `ToolResult` 幂等修复、幂等 Legacy Import，以及持久、可重试的
+Provider Failure。最终二进制 E2E 覆盖全局 State/JSONL 创建、删库后从孤立 JSONL
+重建并在重绑模型后续跑、不重跑工具修复缺失 `ToolResult`、符号链接 fail-closed 拒绝、
+旧库源文件不变的导入、`/resume`、`/new`、长尾 Follow-up 和 TUI 排队多行 Turn。
 
 ## 16. 交付阶段
 

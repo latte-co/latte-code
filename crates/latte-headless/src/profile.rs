@@ -385,7 +385,7 @@ mod tests {
 
     fn binding(provider_type: &str, model: &str) -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 2,
+            binding_version: 2,
             provider_name: "main".into(),
             provider_type: provider_type.into(),
             protocol: "openai-chat".into(),
