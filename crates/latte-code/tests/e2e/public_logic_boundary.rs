@@ -578,7 +578,8 @@ fn anthropic_provider_registry_profile_and_edit_error_boundaries() {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -1025,4 +1026,806 @@ fn anthropic_provider_registry_profile_and_edit_error_boundaries() {
         assert_eq!(out.tool_calls[5].name, "process");
         assert_eq!(out.tool_calls[5].input["shell"], "FOO=1 env");
     });
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engine_reissue_verification_legacy_import_and_mid_turn_compaction_boundaries() {
+    use latte_core::{CompactionPolicy, CompactionStrategy, PermissionMode, SessionId, Transition};
+    use latte_engine::{
+        CancellationToken, EffectStatus, EngineBuilder, ProcessDecision, ProcessError,
+        ProcessInvocation, ToolError, ToolInvocation, classify,
+    };
+    use latte_headless::{
+        provider::{FakeProvider, ProviderError, ProviderResponse, ProviderUsage, ToolCall},
+        registry::ResolvedProvider,
+        session::{SessionHistoryPolicy, SessionRuntimeService},
+    };
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SeqProv(
+        std::sync::Arc<
+            std::sync::Mutex<std::collections::VecDeque<Result<ProviderResponse, ProviderError>>>,
+        >,
+    );
+    impl latte_headless::provider::Provider for SeqProv {
+        fn complete(
+            &self,
+            _req: latte_headless::provider::ProviderRequest,
+            _ctx: latte_headless::provider::ProviderContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>> + Send>,
+        > {
+            let res = self.0.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { res })
+        }
+    }
+
+    struct LeaseStealProv {
+        engine: latte_engine::EngineHandle,
+        session_id: SessionId,
+    }
+    impl latte_headless::provider::Provider for LeaseStealProv {
+        fn complete(
+            &self,
+            _req: latte_headless::provider::ProviderRequest,
+            _ctx: latte_headless::provider::ProviderContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>> + Send>,
+        > {
+            let engine = self.engine.clone();
+            let sid = self.session_id;
+            Box::pin(async move {
+                let _ = engine.acquire_session_lease(sid, u64::MAX / 4, 60_000);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(ProviderResponse {
+                    message: Some("late".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                })
+            })
+        }
+    }
+
+    // 1. `classify` edge matrix (`--recursive`, `--force`, `--no-preserve-root`, `--`, `git` flags).
+    let empty_env = BTreeMap::new();
+    let classify_argv = |argv: &[String]| {
+        classify(&ProcessInvocation {
+            argv,
+            shell: None,
+            cwd: ".",
+            env: &empty_env,
+            timeout_ms: 1_000,
+            grace_ms: 50,
+            stdout_cap: 1024,
+            stderr_cap: 1024,
+            turn_revision: 1,
+            effect_id: "eff",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "o",
+            lease_token: 1,
+        })
+    };
+    let s = |items: &[&str]| items.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        classify_argv(&s(&["rm", "--recursive", "--force", "/"])),
+        ProcessDecision::Deny
+    );
+    assert_eq!(
+        classify_argv(&s(&["rm", "--no-preserve-root", "tmp"])),
+        ProcessDecision::Deny
+    );
+    assert_eq!(
+        classify_argv(&s(&["rm", "--", "-rf", "local_file"])),
+        ProcessDecision::Ask
+    );
+    assert_eq!(
+        classify_argv(&s(&[
+            "git",
+            "status",
+            "-s",
+            "-b",
+            "--porcelain",
+            "-u",
+            "--untracked-files=no"
+        ])),
+        ProcessDecision::Allow
+    );
+    assert_eq!(
+        classify_argv(&s(&["git", "rev-parse", "HEAD"])),
+        ProcessDecision::Allow
+    );
+    assert_eq!(classify_argv(&s(&["git"])), ProcessDecision::Ask);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        // 3. Non-linked v1 EngineHandle: tool/process permission reissue, execute_verification,
+        //    failed approved tool (`finish_effect(false)`), and IO-failed approved tool (`mark_effect_unknown` + `unknown_effects_for_turn`).
+        let scenario = Scenario::new();
+        std::fs::write(scenario.root().join("a.txt"), "hello\n").unwrap();
+        let ro_dir = scenario.root().join("ro");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let engine = EngineBuilder::new()
+            .workspace_root(scenario.root())
+            .database_path(scenario.database_path())
+            .build()
+            .unwrap();
+        let tid = turn_id();
+        engine.create_turn(tid, 1).unwrap();
+        let old_lease = engine.acquire_turn_lease(tid, "owner-1", 2, 50).unwrap();
+        let mut sub = engine.subscribe();
+        assert!(sub.try_recv().unwrap().is_none());
+        let running = engine
+            .apply_transition(tid, 0, Transition::Start, 3, &old_lease)
+            .unwrap();
+        let _ = sub.recv().await.unwrap();
+        let mut cur_rev = running.revision;
+
+        let read_in = serde_json::json!({"path": "a.txt"});
+        let sha = engine
+            .execute_tool(
+                tid,
+                &old_lease,
+                4,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &read_in,
+                    turn_revision: cur_rev,
+                    effect_id: "r1",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: old_lease.owner(),
+                    lease_token: old_lease.fencing_token(),
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let write_in = serde_json::json!({"path": "a.txt", "content": "world\n"});
+        let old_write = ToolInvocation {
+            name: "write_file",
+            input: &write_in,
+            turn_revision: cur_rev + 2,
+            effect_id: "old-w",
+            attempt: 1,
+            precondition: Some(&sha),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: old_lease.owner(),
+            lease_token: old_lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine.execute_tool(tid, &old_lease, 5, &old_write),
+            Err(ToolError::PermissionRequired { .. })
+        ));
+
+        let echo_argv = s(&["/bin/echo", "reissued"]);
+        let old_proc = ProcessInvocation {
+            argv: &echo_argv,
+            shell: None,
+            cwd: ".",
+            env: &empty_env,
+            timeout_ms: 2_000,
+            grace_ms: 50,
+            stdout_cap: 1024,
+            stderr_cap: 1024,
+            turn_revision: cur_rev + 2,
+            effect_id: "old-p",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: old_lease.owner(),
+            lease_token: old_lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine
+                .execute_process(tid, &old_lease, 6, &old_proc, &CancellationToken::new())
+                .await,
+            Err(ProcessError::PermissionRequired { .. })
+        ));
+
+        let fresh = engine.acquire_turn_lease(tid, "owner-2", 100, 1_000).unwrap();
+        let fresh_write = ToolInvocation {
+            effect_id: "fresh-w",
+            attempt: 2,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+            ..old_write
+        };
+        let w_digest = engine
+            .reissue_tool_permission("old-w", tid, &fresh, 101, &fresh_write)
+            .unwrap();
+        assert!(!w_digest.is_empty());
+        assert_eq!(engine.effect_status("old-w").unwrap(), EffectStatus::ObservedFailed);
+
+        let fresh_proc = ProcessInvocation {
+            effect_id: "fresh-p",
+            attempt: 2,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+            ..old_proc
+        };
+        let p_digest = engine
+            .reissue_process_permission("old-p", tid, &fresh, 102, &fresh_proc)
+            .unwrap();
+        engine
+            .apply_transition(
+                tid,
+                cur_rev,
+                Transition::RequestPermission(PendingPermission {
+                    request_id: "req-p".into(),
+                    operation_digest: p_digest.clone(),
+                    description: "echo".into(),
+                }),
+                103,
+                &fresh,
+            )
+            .unwrap();
+        cur_rev = engine
+            .apply_transition(
+                tid,
+                cur_rev + 1,
+                Transition::ResolvePermission {
+                    request_id: "req-p".into(),
+                    allowed: true,
+                },
+                104,
+                &fresh,
+            )
+            .unwrap()
+            .revision;
+        let approved_proc = ProcessInvocation {
+            approval_digest: Some(&p_digest),
+            turn_revision: cur_rev,
+            ..fresh_proc
+        };
+        let proc_out = engine
+            .execute_process(tid, &fresh, 105, &approved_proc, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(proc_out.command_succeeded());
+
+        let ver_argv = s(&["/bin/pwd"]);
+        let ver_out = engine
+            .execute_verification(
+                tid,
+                cur_rev,
+                &fresh,
+                106,
+                &ProcessInvocation {
+                    argv: &ver_argv,
+                    shell: None,
+                    cwd: ".",
+                    env: &empty_env,
+                    timeout_ms: 2_000,
+                    grace_ms: 50,
+                    stdout_cap: 1024,
+                    stderr_cap: 1024,
+                    turn_revision: cur_rev,
+                    effect_id: "ver-1",
+                    attempt: 1,
+                    approval_digest: None,
+                    lease_owner: fresh.owner(),
+                    lease_token: fresh.fencing_token(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(ver_out.command_succeeded());
+
+        // Approved `edit_file` failing `MatchCount(0)` -> `finish_effect(false)`.
+        let bad_edit_in = serde_json::json!({"path": "a.txt", "before": "missing", "after": "x"});
+        let bad_edit_prep = ToolInvocation {
+            name: "edit_file",
+            input: &bad_edit_in,
+            turn_revision: cur_rev + 2,
+            effect_id: "edit-fail",
+            attempt: 1,
+            precondition: Some(&sha),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+        };
+        let Err(ToolError::PermissionRequired { digest: edit_dig, .. }) =
+            engine.execute_tool(tid, &fresh, 107, &bad_edit_prep)
+        else {
+            panic!("expected PermissionRequired");
+        };
+        engine
+            .apply_transition(
+                tid,
+                cur_rev,
+                Transition::RequestPermission(PendingPermission {
+                    request_id: "req-e".into(),
+                    operation_digest: edit_dig.clone(),
+                    description: "edit".into(),
+                }),
+                108,
+                &fresh,
+            )
+            .unwrap();
+        cur_rev = engine
+            .apply_transition(
+                tid,
+                cur_rev + 1,
+                Transition::ResolvePermission {
+                    request_id: "req-e".into(),
+                    allowed: true,
+                },
+                109,
+                &fresh,
+            )
+            .unwrap()
+            .revision;
+        assert!(engine
+            .execute_tool(
+                tid,
+                &fresh,
+                110,
+                &ToolInvocation {
+                    approval_digest: Some(&edit_dig),
+                    turn_revision: cur_rev,
+                    ..bad_edit_prep
+                }
+            )
+            .is_err());
+
+        // Approved `write_file` inside `0o555` readonly directory -> `mark_effect_unknown` + `unknown_effects_for_turn`.
+        let io_write_in =
+            serde_json::json!({"path": "ro/blocked.txt", "content": "x", "create_intent": true});
+        let io_write_prep = ToolInvocation {
+            name: "write_file",
+            input: &io_write_in,
+            turn_revision: cur_rev + 2,
+            effect_id: "io-unk",
+            attempt: 1,
+            precondition: None,
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+        };
+        let Err(ToolError::PermissionRequired { digest: io_dig, .. }) =
+            engine.execute_tool(tid, &fresh, 111, &io_write_prep)
+        else {
+            panic!("expected PermissionRequired");
+        };
+        engine
+            .apply_transition(
+                tid,
+                cur_rev,
+                Transition::RequestPermission(PendingPermission {
+                    request_id: "req-io".into(),
+                    operation_digest: io_dig.clone(),
+                    description: "write".into(),
+                }),
+                112,
+                &fresh,
+            )
+            .unwrap();
+        cur_rev = engine
+            .apply_transition(
+                tid,
+                cur_rev + 1,
+                Transition::ResolvePermission {
+                    request_id: "req-io".into(),
+                    allowed: true,
+                },
+                113,
+                &fresh,
+            )
+            .unwrap()
+            .revision;
+        assert!(engine
+            .execute_tool(
+                tid,
+                &fresh,
+                114,
+                &ToolInvocation {
+                    approval_digest: Some(&io_dig),
+                    turn_revision: cur_rev,
+                    ..io_write_prep
+                }
+            )
+            .is_err());
+        assert_eq!(engine.unknown_effects_for_turn(tid).unwrap(), vec!["io-unk".to_owned()]);
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 4. `import_legacy_workspace_database` from a separate SQLite file into a fresh global DB.
+        let legacy_src = Scenario::new();
+        let legacy_db = legacy_src.root().join("legacy.db");
+        let legacy_engine = EngineBuilder::new()
+            .workspace_root(scenario.root())
+            .database_path(&legacy_db)
+            .build()
+            .unwrap();
+        let leg_reg = ProviderRegistry::parse_jsonc(
+            r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9/v1/chat/completions",api_key:"k"}}}"#,
+        )
+        .unwrap();
+        let leg_binding = leg_reg
+            .session_binding_for_default(&legacy_engine.tool_descriptors())
+            .unwrap();
+        let leg_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        legacy_engine
+            .create_session_v2(leg_sid, turn_id(), leg_binding.clone(), "legacy imported title", 50)
+            .unwrap();
+        drop(legacy_engine);
+
+        assert!(engine.import_legacy_workspace_database(&legacy_db, 200).is_err());
+        assert!(
+            !engine
+                .import_legacy_workspace_database(scenario.root().join("missing.db"), 201)
+                .unwrap()
+        );
+        engine
+            .create_session_v2(
+                leg_sid,
+                turn_id(),
+                leg_binding.clone(),
+                "legacy imported title",
+                202,
+            )
+            .unwrap();
+
+        // 5. In-process `latte_server` + `WorkspaceInstance` + `ServerClient` SessionServer methods.
+        let srv_reg = Arc::new(leg_reg);
+        let srv_engine = engine.clone();
+        let builder: latte_server::WorkspaceRuntimeBuilder = Arc::new(move |root| {
+            let reg = Arc::clone(&srv_reg);
+            let reg_for_factory = Arc::clone(&srv_reg);
+            let descriptors = srv_engine.tool_descriptors();
+            let runtime = SessionRuntimeService::new(
+                srv_engine.clone(),
+                root,
+                SessionHistoryPolicy::default(),
+                Arc::new(move |selected| {
+                    let resolved = reg_for_factory
+                        .resolve_session_bound(selected, &descriptors)
+                        .map_err(|e| e.to_string())?;
+                    Ok(ResolvedProvider {
+                        provider: Arc::new(FakeProvider::scripted([
+                            ProviderResponse {
+                                message: Some("server-ok".into()),
+                                tool_calls: vec![],
+                                input_request: None,
+                                usage: ProviderUsage::default(),
+                                finish_reason: None,
+                                provider_state: None,
+                            },
+                            ProviderResponse {
+                                message: Some("server-followup-ok".into()),
+                                tool_calls: vec![],
+                                input_request: None,
+                                usage: ProviderUsage::default(),
+                                finish_reason: None,
+                                provider_state: None,
+                            },
+                        ])),
+                        binding: resolved.binding,
+                    })
+                }),
+            );
+            Ok(latte_server::BuiltWorkspace {
+                engine: srv_engine.clone(),
+                runtime,
+                registry: reg,
+            })
+        });
+        let root_for_loc = scenario.root().to_path_buf();
+        let locator: latte_server::SessionLocator = Arc::new(move |_| Some(root_for_loc.clone()));
+        let state = latte_server::new_state("tok-test".into(), builder, locator);
+        let ws_inst = state.workspaces.get_or_create(scenario.root()).await.unwrap();
+        assert!(!ws_inst.list_sessions().unwrap().is_empty());
+        assert!(!ws_inst.search_sessions("legacy", 10).unwrap().is_empty());
+        assert!(!ws_inst
+            .find_sessions_by_exact_title("legacy imported title", 10)
+            .unwrap()
+            .is_empty());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv_task = tokio::spawn(async move {
+            let _ = latte_server::serve_with_shutdown(state, listener, async {
+                let _ = stop_rx.await;
+            })
+            .await;
+        });
+
+        let srv_url = format!("http://{srv_addr}");
+        let srv_list = scenario.output(
+            &["--json", "list", "--server", &srv_url, "--token", "tok-test"],
+            |_| {},
+        );
+        assert!(srv_list.status.success());
+        let srv_run = scenario.output(
+            &[
+                "--json",
+                "run",
+                "--server",
+                &srv_url,
+                "--token",
+                "tok-test",
+                "--custom-flag",
+                "hello",
+            ],
+            |_| {},
+        );
+        assert!(srv_run.status.success());
+        let srv_sid = super::support::json(&srv_run)["data"]["session"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let srv_resume = scenario.output(
+            &[
+                "--json",
+                "resume",
+                "--server",
+                &srv_url,
+                "--token",
+                "tok-test",
+                &srv_sid,
+                "again",
+            ],
+            |_| {},
+        );
+        assert!(srv_resume.status.success());
+        let http = reqwest::Client::new();
+        let exact_resp = http
+            .get(format!(
+                "{srv_url}/v1/workspaces/{}/sessions/exact-title?q=legacy%20imported%20title&limit=10",
+                ws_inst.id
+            ))
+            .bearer_auth("tok-test")
+            .send()
+            .await
+            .unwrap();
+        assert!(exact_resp.status().is_success());
+        let _ = stop_tx.send(());
+        let _ = srv_task.await;
+
+        // 6. Mid-turn `ElideToolResultsThenSummarize` (`reuse_prefix: false`) — elision cure, failing summary audit, succeeding cold-prefix summary, and lease-loss recovery.
+        let mid_ws = Scenario::new();
+        std::fs::write(mid_ws.root().join("big.txt"), "X".repeat(3_600)).unwrap();
+        let mid_engine = EngineBuilder::new()
+            .workspace_root(mid_ws.root())
+            .permission_mode(PermissionMode::FullAuto)
+            .build()
+            .unwrap();
+        let mid_desc = mid_engine.tool_descriptors();
+        let mid_reg = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"oai/m",providers:{oai:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9/v1/chat/completions",api_key:"k"}}}"#,
+            )
+            .unwrap(),
+        );
+        let mid_binding = mid_reg.session_binding_for_default(&mid_desc).unwrap();
+        let mid_policy = SessionHistoryPolicy {
+            max_request_bytes: 9_216,
+            max_input_bytes: 9_216,
+            reserved_output_bytes: 512,
+            context_cap_bytes: 1_024,
+            provider_timeout_ms: 2_000,
+            max_tool_rounds: Some(8),
+        };
+        let mid_compaction = CompactionPolicy {
+            strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+            max_summary_source_bytes: 16_384,
+            trigger_ratio: 45,
+            retain_ratio: 1,
+            reuse_prefix: false,
+            ..CompactionPolicy::default()
+        };
+        let mid_cat = Arc::new(
+            ProfileCatalog::new(
+                ContextPolicy {
+                    max_request_bytes: 9_216,
+                    max_input_bytes: 9_216,
+                    reserved_output_bytes: 512,
+                    context_cap_bytes: 1_024,
+                    max_tool_rounds: Some(8),
+                    provider_timeout_ms: 2_000,
+                    compaction: mid_compaction,
+                    ..ContextPolicy::default()
+                },
+                Arc::clone(&mid_reg),
+            )
+            .unwrap(),
+        );
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            // Turn 1: small read + 1_600-byte assistant text (stays right below 45% * 8_704 = 3_916 before Turn 2).
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t1-l".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("A".repeat(1_800)),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            // Turn 2 Round 1: read big.txt (3_600 bytes) -> pushes over 45%; eliding Turn 1's tiny list_directory does NOT cure it,
+            // so `mid_turn_summarize` runs! First attempt fails -> `compact-summary-failed:round` audit card; Round 2 runs another
+            // list_directory -> `mid_turn_summarize` succeeds with `reuse_prefix: false` -> Round 3 completes!
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-r".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "big.txt"}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Err(ProviderError::Transport("mid-turn summary transient".into())),
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-l2".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("cold-prefix mid-turn summary".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("turn2 done".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+        ])));
+        let seq_prov: Arc<dyn latte_headless::provider::Provider> = Arc::new(SeqProv(calls));
+        let reg_for_mid = Arc::clone(&mid_reg);
+        let desc_for_mid = mid_desc.clone();
+        let mid_svc = SessionRuntimeService::new(
+            mid_engine.clone(),
+            mid_ws.root(),
+            mid_policy,
+            Arc::new(move |sel| {
+                let res = reg_for_mid
+                    .resolve_session_bound(sel, &desc_for_mid)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&seq_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_profile_catalog(mid_cat);
+
+        let m_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let s1 = mid_svc
+            .start(m_sid, "seed history".into(), mid_binding.clone(), None)
+            .await
+            .unwrap();
+        let s2 = mid_svc
+            .follow_up(m_sid, s1.session_revision, "trigger mid-turn summarize".into())
+            .await
+            .unwrap();
+        assert_eq!(s2.lifecycle, SessionLifecycle::Ready);
+        assert!(s2
+            .transcript
+            .entries
+            .iter()
+            .any(|e| e.kind == latte_core::TranscriptKind::CompactSummary));
+
+        // Lease-loss heartbeat recovery during provider request (`recover_lease_loss`).
+        let steal_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let steal_prov: Arc<dyn latte_headless::provider::Provider> = Arc::new(LeaseStealProv {
+            engine: mid_engine.clone(),
+            session_id: steal_sid,
+        });
+        let reg_for_steal = Arc::clone(&mid_reg);
+        let steal_svc = SessionRuntimeService::new(
+            mid_engine,
+            mid_ws.root(),
+            SessionHistoryPolicy::default(),
+            Arc::new(move |sel| {
+                let res = reg_for_steal
+                    .resolve_session_bound(sel, &mid_desc)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&steal_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_lease_ttl_ms(20);
+        assert!(
+            steal_svc
+                .start(steal_sid, "lose lease".into(), mid_binding, None)
+                .await
+                .is_err()
+        );
+    });
+
+    // 7. Human-readable CLI `context`, `compact` (when disabled), and CLI usage error arms.
+    let cli_ws = Scenario::new();
+    for bad_args in [
+        &["list", "--auto"][..],
+        &["list", "--permission-mode", "ask"][..],
+        &["context"][..],
+        &["compact"][..],
+    ] {
+        assert!(!cli_ws.output(bad_args, |_| {}).status.success());
+    }
+    let provider =
+        super::support::ScriptedProvider::start([super::support::ProviderReply::completion(
+            "cli-human-ok",
+        )]);
+    std::fs::create_dir_all(cli_ws.home().join(".latte")).unwrap();
+    let ep = provider.endpoint();
+    std::fs::write(
+        cli_ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"p/m",providers:{{p:{{type:"openai-chat",models:["m"],endpoint:{ep:?},api_key:"k"}}}},session:{{compaction:{{enabled:false}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let run_out = cli_ws.output(&["--json", "run", "hello"], |_| {});
+    assert!(run_out.status.success());
+    let run_sid = super::support::json(&run_out)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ctx_out = cli_ws.output(&["context", &run_sid], |_| {});
+    assert!(ctx_out.status.success());
+    let cmp_out = cli_ws.output(&["compact", &run_sid], |_| {});
+    assert!(cmp_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&cmp_out.stdout)
+            .contains("compaction is disabled in the resolved profile")
+    );
 }
