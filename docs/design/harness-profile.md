@@ -1,8 +1,8 @@
 # Harness Profile 抽象设计（v1 薄切片）
 
-状态：**v1 已实现**（类型 + 解析管道 + loop 接线 + 权限天花板，#18）；
+状态：**v1.1 已实现**（类型 + 解析管道 + loop 接线 + 权限天花板 + `anthropic-messages` 内置 profile + `ToolPresentationStyle` 工具面映射 + `reuse_prefix` 热前缀压缩）；
 上下文分层与压缩策略的架构见 [Context 架构](context-design.md)；
-**批次 2 部分实现**（#19 后续切片）：compaction 本体（摘要 turn 替代静默丢弃、
+**批次 2 已实现**（#19 后续切片）：compaction 本体（摘要 turn 替代静默丢弃、
 失败降级审计、JSONL 持久化、`session.compaction.enabled` 配置面）已落地；
 主动水位（`trigger_ratio`/`retain_ratio`）与确定性省略层
 （`session.compaction.mode:"elide_then_summarize"`，先骨架化旧 tool result、
@@ -10,9 +10,9 @@
 （见 context-design.md §4/§4.6）；idle-only 手动 `/compact`（HTTP + CLI，
 水位以下强制、明确空态、409 非空闲）已落地（§4.7）；预算可见性 TUI 状态栏
 （头部第二行 meter：填充百分比、估算 token、omitted/compaction due 提示）已落地
-（context-design.md §4.5）；
+（context-design.md §4.5）；`ToolPresentationStyle`（`canonical` / `claude_code` 双向工具呈现映射）与 `reuse_prefix` 热前缀摘要已落地；
 未实现：binding 快照三字段（schema 迁移）、
-config `profiles` 覆盖段、`ToolPresentation`/`StopSemantics`。
+config `profiles` 覆盖段、`StopSemantics`。
 日期：2026-09-12
 范围：定义 `HarnessProfile` 的概念位置、核心类型、解析管道、约束边界与首个消费者
 （context compaction）的集成点。工具呈现与 stop 语义是 v2 扩展方向，v1 不含。

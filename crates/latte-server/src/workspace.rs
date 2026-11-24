@@ -45,8 +45,12 @@ pub struct WorkspaceInstance {
     workspace_root: String,
     /// The session runtime service for this workspace.
     pub runtime: Arc<latte_headless::session::SessionRuntimeService>,
-    /// Event sender for this workspace.
+    /// Authoritative event sender (`SessionChanged`, `ResyncRequired`).
     pub event_tx: broadcast::Sender<ServerEvent>,
+    /// High-capacity transient progress sender (`Progress`), decoupled from
+    /// `event_tx` so high-rate `AssistantDelta` streaming never overflows the
+    /// authoritative `SessionChanged` channel into a `resync_required` storm.
+    pub progress_tx: broadcast::Sender<ServerEvent>,
     /// Engine handle for event subscription.
     pub engine: latte_engine::EngineHandle,
     /// Provider registry for binding discovery.
@@ -70,8 +74,9 @@ impl WorkspaceInstance {
             .to_string_lossy()
             .into_owned();
 
-        // Wire progress events to the workspace event channel.
-        let progress_event_tx = event_tx.clone();
+        // Wire transient progress events to the dedicated high-capacity progress channel.
+        let (progress_tx, _) = broadcast::channel(4096);
+        let progress_event_tx = progress_tx.clone();
         let progress_sink: std::sync::Arc<dyn latte_headless::session::SessionProgressSink> =
             std::sync::Arc::new(
                 move |session_id: latte_core::SessionId,
@@ -102,6 +107,7 @@ impl WorkspaceInstance {
             workspace_root,
             runtime: Arc::new(runtime),
             event_tx,
+            progress_tx,
             engine,
             registry,
         };
@@ -1028,7 +1034,7 @@ mod tests {
 
         // Subscribe before starting the turn so the progress events are not
         // missed (broadcast channels only deliver to existing receivers).
-        let mut events = workspace.event_tx.subscribe();
+        let mut events = workspace.progress_tx.subscribe();
 
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let binding = latte_core::SessionProviderBinding {

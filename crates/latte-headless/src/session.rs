@@ -73,16 +73,27 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
+fn is_readonly_session_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_directory" | "search" | "read_project_manifest" | "git_diff"
+    )
+}
+
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
-    let calls = segment
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            Message::Assistant { tool_calls, .. } => Some(tool_calls.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let observed = segment
+    let Some((last_assistant_idx, calls)) =
+        segment
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, message)| match message {
+                Message::Assistant { tool_calls, .. } => Some((idx, tool_calls.clone())),
+                _ => None,
+            })
+    else {
+        return;
+    };
+    let observed = segment[last_assistant_idx + 1..]
         .iter()
         .filter_map(|message| match message {
             Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
@@ -96,6 +107,30 @@ fn append_denied_tool_results(segment: &mut Vec<Message>) {
             content: "permission denied by user; tool was not executed".into(),
         })
     }));
+}
+
+fn redact_thinking_blocks(
+    blocks: &[crate::provider::ThinkingBlock],
+) -> Vec<crate::provider::ThinkingBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            crate::provider::ThinkingBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let redacted = redact_session_text(thinking);
+                let preserved_sig = (redacted == *thinking).then(|| signature.clone()).flatten();
+                crate::provider::ThinkingBlock::Thinking {
+                    thinking: redacted,
+                    signature: preserved_sig,
+                }
+            }
+            crate::provider::ThinkingBlock::RedactedThinking { data } => {
+                crate::provider::ThinkingBlock::RedactedThinking { data: data.clone() }
+            }
+        })
+        .collect()
 }
 
 /// Exact request-size policy for child history construction.
@@ -129,14 +164,14 @@ pub struct SessionHistoryPolicy {
 impl Default for SessionHistoryPolicy {
     fn default() -> Self {
         Self {
-            max_request_bytes: 512 * 1024,
-            max_input_bytes: 384 * 1024,
-            reserved_output_bytes: 128 * 1024,
-            context_cap_bytes: 64 * 1024,
+            max_request_bytes: 2 * 1024 * 1024,
+            max_input_bytes: 1536 * 1024,
+            reserved_output_bytes: 256 * 1024,
+            context_cap_bytes: 128 * 1024,
             // Unlimited by default. Wall-clock protection comes from the
             // per-request provider timeout and cancellation instead.
             max_tool_rounds: None,
-            provider_timeout_ms: 60_000,
+            provider_timeout_ms: 120_000,
         }
     }
 }
@@ -319,24 +354,41 @@ struct VolatileTurnContext {
 }
 
 impl VolatileTurnContext {
-    /// The two messages in wire order: repository snapshot then reminder.
-    fn messages(&self) -> Vec<Message> {
-        [self.repository.clone(), self.reminder.clone()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    /// Chronological fit entries for the volatile block: repository first
-    /// (dropped only after the reminder under pressure), reminder second
-    /// (newest, hence most discardable).
-    fn fit_entries(&self) -> Vec<FitEntry> {
-        let mut entries = Vec::new();
+    /// Chronological fit entries for `[summary_seg?, repository?, history…, reminder?, active_turn…, prompt?]`:
+    /// `<repository-context>` is head-anchored right after `[system, summary?]` so Turn N
+    /// remains a strict prefix extension of Turn N-1 when workspace docs are unchanged,
+    /// while `<system-reminder>` sits immediately before the active turn or new prompt.
+    fn place_entries(
+        &self,
+        segments: &[HistorySegment],
+        active_turn: Option<TurnId>,
+        prompt: Option<HistorySegment>,
+    ) -> Vec<FitEntry> {
+        let mut entries = Vec::with_capacity(segments.len() + 3);
+        let prior_start = if segments.first().is_some_and(|seg| seg.from_summary)
+            && (active_turn.is_none() || segments[0].turn_id != active_turn)
+        {
+            entries.push(FitEntry::history(segments[0].clone()));
+            1
+        } else {
+            0
+        };
         if let Some(message) = &self.repository {
             entries.push(FitEntry::volatile(
                 FitKind::Repository,
                 std::slice::from_ref(message),
             ));
+        }
+        let split = active_turn
+            .and_then(|turn| {
+                segments[prior_start..]
+                    .iter()
+                    .position(|seg| seg.turn_id == Some(turn))
+                    .map(|rel| prior_start + rel)
+            })
+            .unwrap_or(segments.len());
+        for seg in &segments[prior_start..split] {
+            entries.push(FitEntry::history(seg.clone()));
         }
         if let Some(message) = &self.reminder {
             entries.push(FitEntry::volatile(
@@ -344,12 +396,18 @@ impl VolatileTurnContext {
                 std::slice::from_ref(message),
             ));
         }
+        for seg in &segments[split..] {
+            entries.push(FitEntry::history(seg.clone()));
+        }
+        if let Some(prompt_seg) = prompt {
+            entries.push(FitEntry::prompt(prompt_seg));
+        }
         entries
     }
 
     /// The survivors of the two-phase fit: tails are slack-fillers and are
     /// admitted only as one ordered wire prefix (repository, then reminder),
-    /// so a reminder never survives without the repository tail in front of
+    /// so a reminder never survives without the repository block in front of
     /// it.
     fn filtered(&self, repository_kept: bool, reminder_kept: bool) -> Self {
         Self {
@@ -602,6 +660,17 @@ impl SessionRuntimeService {
             .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))
     }
 
+    /// Updates the permission posture for `session_id`.
+    pub fn set_permission_mode(&self, session_id: SessionId, mode: latte_core::PermissionMode) {
+        self.engine.set_session_permission_mode(session_id, mode);
+    }
+
+    /// Reads the active permission posture for `session_id`.
+    #[must_use]
+    pub fn permission_mode(&self, session_id: SessionId) -> latte_core::PermissionMode {
+        self.engine.session_permission_mode(session_id)
+    }
+
     /// Read-only projection of how full the next request window is for one
     /// durable session: exact bytes used/remaining against the resolved
     /// profile's request budget, token estimates for display, the segment
@@ -642,8 +711,7 @@ impl SessionRuntimeService {
         let bundle = context::build(&self.root, focus, policy.context_cap_bytes)
             .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
         let volatile = Self::build_volatile_turn_context(&bundle, None);
-        let mut entries: Vec<FitEntry> = segments.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
+        let entries = volatile.place_entries(&segments, None, None);
         let fit = Self::fit_request(&system, &entries, budget)?;
         let discarded = segments.len() - fit.history_kept;
         let mut messages = Vec::with_capacity(fit.messages.len() + 1);
@@ -804,9 +872,19 @@ impl SessionRuntimeService {
         // Tier 2: model summary. There is no new prompt to fold in: when the
         // retain suffix is empty, the summary simply covers the boundary.
         let (retain_from, source) = Self::compaction_source(&fitting, boundary, compaction);
+        let warm_prefix = Self::assemble_request(
+            &system,
+            None,
+            &fitting[..boundary],
+            &VolatileTurnContext {
+                repository: volatile.repository.clone(),
+                reminder: None,
+            },
+            None,
+        );
         // The lease is held across the summarizer and heartbeated inside.
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(&lease))
+            .summarize_history(&snapshot, &source, Some(&warm_prefix), Some(&lease))
             .await
         {
             Ok(Some(summary)) => summary,
@@ -1887,9 +1965,14 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        let done = match self
-            .run_provider_turn(running, messages, volatile, provider.provider, lease)
-            .await
+        let done = match Box::pin(self.run_provider_turn(
+            running,
+            messages,
+            volatile,
+            provider.provider,
+            lease,
+        ))
+        .await
         {
             Ok(done) => done,
             Err(error) => {
@@ -1897,22 +1980,7 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        // The guard MUST reach drain open (same contract as
-        // `resolve_permission`): every `?` escape inside drain then reclaims
-        // the mailbox entry via `Drop`, so a mid-drain failure (e.g. the
-        // follow-up revision/lease races) leaves the session reusable.
-        // Marking it closed here would leak the entry instead — and a leaked
-        // entry fails `begin_runner` forever, permanently locking the
-        // session behind `InvalidState` with no in-process recovery.
-        //
-        // Coverage note: this call site is NOT covered by automation — the
-        // escape window between the turn's lease release and the queued
-        // follow-up's own acquire is race-only and cannot be reached
-        // deterministically through `provide_input` (provider failures are
-        // swallowed by `fail_retryable`, never `?`). The drain ownership
-        // tests pin the contract at the drain unit; this open-guard handoff
-        // is review-enforced.
-        self.drain_mailbox(done, runner).await
+        Box::pin(self.drain_mailbox(done, runner)).await
     }
 
     /// Resolves a durable v2 effect permission. Allow consumes the exact
@@ -2052,8 +2120,18 @@ impl SessionRuntimeService {
                 .active_turn_id
                 .ok_or(SessionRuntimeError::InvalidState)?;
             let segments = Self::scan_history_segments(&after_effect);
-            let messages =
-                Self::assemble_mid_turn_request(&head, None, &segments, active_turn, &volatile);
+            let budget = profile.history_policy().budget()?;
+            let fit_entries = volatile.place_entries(&segments, Some(active_turn), None);
+            let fit = Self::fit_request(&head, &fit_entries, budget)?;
+            let volatile = volatile.filtered(fit.repository_kept, fit.reminder_kept);
+            let kept_start = segments.len().saturating_sub(fit.history_kept);
+            let messages = Self::assemble_mid_turn_request(
+                &head,
+                None,
+                &segments[kept_start..],
+                active_turn,
+                &volatile,
+            );
             // Finish the remaining calls of this approved batch, then re-enter the
             // iterative turn loop. The loop re-reads the persisted round counter
             // itself, so approval/restart resumptions never reset the budget.
@@ -2069,14 +2147,20 @@ impl SessionRuntimeService {
             match outcome {
                 ToolBatchOutcome::Parked(parked) => Ok(parked),
                 ToolBatchOutcome::Completed { snapshot, messages } => {
-                    self.run_provider_turn(snapshot, messages, volatile, provider.provider, lease)
-                        .await
+                    Box::pin(self.run_provider_turn(
+                        snapshot,
+                        messages,
+                        volatile,
+                        provider.provider,
+                        lease,
+                    ))
+                    .await
                 }
             }
         }
         .await;
         match resumed {
-            Ok(snapshot) => self.drain_mailbox(snapshot, runner).await,
+            Ok(snapshot) => Box::pin(self.drain_mailbox(snapshot, runner)).await,
             Err(error) => {
                 // Keep the queue intake: the durable session state owns the
                 // truth about this turn, and a parked queue must survive a
@@ -2282,8 +2366,8 @@ impl SessionRuntimeService {
         let policy = profile.history_policy();
         let volatile = Self::build_volatile_turn_context(bundle, reminder);
         let head = Self::build_system_head(profile)?;
-        let mut entries = volatile.fit_entries();
-        entries.push(FitEntry::prompt(Self::prospective_prompt_segment(prompt)));
+        let entries =
+            volatile.place_entries(&[], None, Some(Self::prospective_prompt_segment(prompt)));
         let fit = Self::fit_request(&head, &entries, policy.budget()?)?;
         if !fit.prompt_kept {
             return Err(SessionRuntimeError::History(
@@ -2439,9 +2523,11 @@ impl SessionRuntimeService {
         // current prompt. The mandatory core takes the full budget first;
         // the tails only fill the slack, so the request assembled below is
         // exactly the fitted set and can never exceed the byte budget.
-        let mut entries: Vec<FitEntry> = history.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
-        entries.push(FitEntry::prompt(Self::prospective_prompt_segment(prompt)));
+        let entries = volatile.place_entries(
+            &history,
+            None,
+            Some(Self::prospective_prompt_segment(prompt)),
+        );
         let fit = Self::fit_request(&system, &entries, budget)?;
         // The prompt is non-discardable; failing to fit it fails closed
         // rather than issuing a request without the user's words.
@@ -2544,15 +2630,11 @@ impl SessionRuntimeService {
         let cured = if reactive {
             // Re-cure is measured over the REAL shape, volatile tails and
             // prompt included: every history segment must fit.
-            let mut cured_entries: Vec<FitEntry> = elided_segments
-                .iter()
-                .cloned()
-                .map(FitEntry::history)
-                .collect();
-            cured_entries.extend(env.volatile.fit_entries());
-            cured_entries.push(FitEntry::prompt(Self::prospective_prompt_segment(
-                env.prompt,
-            )));
+            let cured_entries = env.volatile.place_entries(
+                &elided_segments,
+                None,
+                Some(Self::prospective_prompt_segment(env.prompt)),
+            );
             let cured_fit = Self::fit_request(env.system, &cured_entries, env.budget)?;
             cured_fit.prompt_kept && cured_fit.history_kept == elided_segments.len()
         } else {
@@ -2616,9 +2698,22 @@ impl SessionRuntimeService {
                 compaction.max_summary_source_bytes,
             );
         }
+        let warm_prefix = Self::assemble_request(
+            env.system,
+            None,
+            &fitting[..boundary],
+            &VolatileTurnContext {
+                repository: env.volatile.repository.clone(),
+                reminder: None,
+            },
+            retain_from.is_none().then_some(env.prompt_message),
+        );
         // Pre-turn preparation holds no lease yet, so the summarizer runs
         // without a lease heartbeat; provider-side failures degrade.
-        let summary = match self.summarize_history(snapshot, &source, None).await {
+        let summary = match self
+            .summarize_history(snapshot, &source, Some(&warm_prefix), None)
+            .await
+        {
             Ok(Some(summary)) => summary,
             Ok(None) => {
                 self.note_compaction_failure(snapshot.session_id);
@@ -2821,10 +2916,12 @@ impl SessionRuntimeService {
     /// longer than the lease TTL) cancels the request and returns `Err` so a
     /// late success cannot be silently dropped at append time. `lease` is
     /// `None` only for pre-turn preparation, which runs before acquisition.
+    #[allow(clippy::too_many_lines)]
     async fn summarize_history(
         &self,
         snapshot: &SessionSnapshot,
         source_text: &str,
+        warm_prefix: Option<&[Message]>,
         lease: Option<&SessionLeaseGuard>,
     ) -> Result<Option<String>, SessionRuntimeError> {
         let Ok(profile) = self.resolved_profile(&snapshot.binding) else {
@@ -2835,6 +2932,44 @@ impl SessionRuntimeService {
         };
         let Ok(provider) = (self.provider)(&snapshot.binding) else {
             return Ok(None);
+        };
+        let budget = profile.history_policy().budget().unwrap_or(0);
+        let (messages, tools) = if profile.compaction().reuse_prefix
+            && let Some(prefix) = warm_prefix.filter(|p| !p.is_empty())
+        {
+            let mut candidate = prefix.to_vec();
+            candidate.push(Message::User {
+                content: format!(
+                    "{instructions}\n[Summarize the conversation turns above according to these instructions.]"
+                ),
+            });
+            if wire_bytes(&candidate).is_ok_and(|bytes| bytes <= budget) {
+                (candidate, self.engine.tool_descriptors())
+            } else {
+                (
+                    vec![
+                        Message::System {
+                            content: instructions,
+                        },
+                        Message::User {
+                            content: source_text.to_owned(),
+                        },
+                    ],
+                    Vec::new(),
+                )
+            }
+        } else {
+            (
+                vec![
+                    Message::System {
+                        content: instructions,
+                    },
+                    Message::User {
+                        content: source_text.to_owned(),
+                    },
+                ],
+                Vec::new(),
+            )
         };
         let cancellation = CancellationToken::new();
         // Reuses the per-session active-cancellation slot: preparation is
@@ -2848,15 +2983,8 @@ impl SessionRuntimeService {
             .insert(snapshot.session_id, cancellation.clone());
         let output = provider.provider.complete(
             ProviderRequest {
-                messages: vec![
-                    Message::System {
-                        content: instructions,
-                    },
-                    Message::User {
-                        content: source_text.to_owned(),
-                    },
-                ],
-                tools: Vec::new(),
+                messages,
+                tools,
                 session_ref: crate::provider::session_ref_for(snapshot.session_id),
             },
             ProviderContext {
@@ -3063,8 +3191,28 @@ impl SessionRuntimeService {
                         .and_then(|payload| payload.get("tool_calls"))
                         .and_then(|calls| serde_json::from_value(calls.clone()).ok())
                         .unwrap_or_default();
+                    let content_absent = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("content_absent"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let reasoning_content = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("reasoning_content"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let thinking_blocks = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("thinking_blocks"))
+                        .and_then(|blocks| serde_json::from_value(blocks.clone()).ok())
+                        .unwrap_or_default();
                     segment.push_message(Message::Assistant {
-                        content: Some(entry.text.clone()),
+                        content: (!content_absent).then(|| entry.text.clone()),
+                        reasoning_content,
+                        thinking_blocks,
                         tool_calls,
                     });
                     segment.push_text(&format!("[assistant]\n{}\n", entry.text), entry.sequence);
@@ -3350,9 +3498,10 @@ impl SessionRuntimeService {
         })
     }
 
-    /// Assembles a full request with the non-persistent volatile block and
-    /// the current prompt after durable history (and an optional summary):
-    /// `[head, summary?, history…, repository?, reminder?, prompt?]`.
+    /// Assembles a full request with `<repository-context>` head-anchored
+    /// directly under `[system, summary?]` and `<system-reminder>` immediately
+    /// ahead of the new prompt:
+    /// `[head, summary?, repository?, history…, reminder?, prompt?]`.
     fn assemble_request(
         system: &Message,
         summary: Option<&str>,
@@ -3361,27 +3510,37 @@ impl SessionRuntimeService {
         prompt: Option<&Message>,
     ) -> Vec<Message> {
         let mut messages = vec![system.clone()];
-        if let Some(summary) = summary {
+        let prior_start = if let Some(summary) = summary {
             messages.push(Message::User {
                 content: format!(
                     "Earlier conversation, automatically compacted to this summary:\n\n{summary}"
                 ),
             });
+            0
+        } else if history.first().is_some_and(|seg| seg.from_summary) {
+            messages.extend(history[0].messages.iter().cloned());
+            1
+        } else {
+            0
+        };
+        if let Some(repository) = &volatile.repository {
+            messages.push(repository.clone());
         }
-        for segment in history {
+        for segment in &history[prior_start..] {
             messages.extend(segment.messages.iter().cloned());
         }
-        messages.extend(volatile.messages());
+        if let Some(reminder) = &volatile.reminder {
+            messages.push(reminder.clone());
+        }
         if let Some(prompt) = prompt {
             messages.push(prompt.clone());
         }
         messages
     }
 
-    /// Re-inserts the per-turn volatile block immediately before the open
-    /// (active) turn's first segment after a mid-turn rebuild. Completed
-    /// history precedes the block; the open turn (its prompt, assistant
-    /// batches, tool results) follows it verbatim.
+    /// Re-inserts `<repository-context>` directly under `[system, summary?]`
+    /// and `<system-reminder>` immediately before the open (active) turn's
+    /// first segment after a mid-turn rebuild.
     fn assemble_mid_turn_request(
         system: &Message,
         summary: Option<&str>,
@@ -3389,22 +3548,35 @@ impl SessionRuntimeService {
         active_turn: TurnId,
         volatile: &VolatileTurnContext,
     ) -> Vec<Message> {
-        let split = segments
-            .iter()
-            .position(|segment| segment.turn_id == Some(active_turn))
-            .unwrap_or(segments.len());
         let mut messages = vec![system.clone()];
-        if let Some(summary) = summary {
+        let prior_start = if let Some(summary) = summary {
             messages.push(Message::User {
                 content: format!(
                     "Earlier conversation, automatically compacted to this summary:\n\n{summary}"
                 ),
             });
+            0
+        } else if segments.first().is_some_and(|seg| seg.from_summary)
+            && segments[0].turn_id != Some(active_turn)
+        {
+            messages.extend(segments[0].messages.iter().cloned());
+            1
+        } else {
+            0
+        };
+        let split = segments[prior_start..]
+            .iter()
+            .position(|segment| segment.turn_id == Some(active_turn))
+            .map_or(segments.len(), |rel| prior_start + rel);
+        if let Some(repository) = &volatile.repository {
+            messages.push(repository.clone());
         }
-        for segment in &segments[..split] {
+        for segment in &segments[prior_start..split] {
             messages.extend(segment.messages.iter().cloned());
         }
-        messages.extend(volatile.messages());
+        if let Some(reminder) = &volatile.reminder {
+            messages.push(reminder.clone());
+        }
         for segment in &segments[split..] {
             messages.extend(segment.messages.iter().cloned());
         }
@@ -3547,12 +3719,28 @@ impl SessionRuntimeService {
             now_ms(),
         )?;
         if !output.command_succeeded() {
-            return self.fail(
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            let snippet = if detail.is_empty() {
+                String::new()
+            } else {
+                let mut cut = detail.len().min(512);
+                while !detail.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!(" ({})", &detail[..cut])
+            };
+            return self.fail_with_code(
                 snapshot.session_id,
                 turn_id,
                 snapshot.session_revision,
                 turn_revision,
-                "configured verification failed; evidence was recorded".into(),
+                FailureCode::VerificationFailed,
+                &format!("configured verification failed; evidence was recorded{snippet}"),
+                Retryability::Retryable,
                 lease,
             );
         }
@@ -3607,10 +3795,28 @@ impl SessionRuntimeService {
             )?;
             return Ok(ToolBatchOutcome::Parked(failed));
         }
+        let content_absent = response.message.is_none();
+        let reasoning_content = response.reasoning_content().map(redact_session_text);
+        let thinking_blocks = redact_thinking_blocks(&response.thinking_blocks());
         let assistant_text = response.message.clone().unwrap_or_default();
         let first_tool_call_id = response.tool_calls[0].id.clone();
         let tool_calls = response.tool_calls;
         let round_id = RoundId::from_u64(snapshot.sequence.saturating_add(1));
+        let mut payload_obj = serde_json::json!({
+            "round_id": round_id,
+            "tool_calls": tool_calls.clone(),
+        });
+        if content_absent {
+            payload_obj["content_absent"] = serde_json::Value::Bool(true);
+        }
+        if let Some(reasoning) = &reasoning_content {
+            payload_obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+        }
+        if !thinking_blocks.is_empty()
+            && let Ok(serialized) = serde_json::to_value(&thinking_blocks)
+        {
+            payload_obj["thinking_blocks"] = serialized;
+        }
         let current = self.commit(
             session_id,
             turn_id,
@@ -3623,24 +3829,14 @@ impl SessionRuntimeService {
                 ),
                 kind: TranscriptKind::Assistant,
                 text: assistant_text.clone(),
-                // This is intentionally more than display data: it is the
-                // durable ordered continuation queue.  A restart while an
-                // Ask call waits for approval reloads this exact assistant
-                // envelope and completes the remaining calls before another
-                // provider request can be made. A `length`-cut response
-                // never reaches this envelope: the truncated arm above
-                // fails the turn before any tool call can execute, because
-                // a cut call's arguments can be truncated at a syntacti-
-                // cally valid boundary and still pass schema validation.
-                payload: Some(serde_json::json!({
-                    "round_id": round_id,
-                    "tool_calls": tool_calls.clone(),
-                })),
+                payload: Some(payload_obj),
             },
             lease,
         )?;
         messages.push(Message::Assistant {
             content: response.message,
+            reasoning_content,
+            thinking_blocks,
             tool_calls: tool_calls.clone(),
         });
         let round = ToolRound {
@@ -3682,7 +3878,7 @@ impl SessionRuntimeService {
                 input: call.input.clone(),
                 attempt: 1,
             };
-            let prepared = self.engine.prepare_session_effect(
+            let outcome = self.engine.prepare_or_reject_session_effect(
                 session_effect_request(
                     &current,
                     authority.clone(),
@@ -3697,6 +3893,21 @@ impl SessionRuntimeService {
                 lease,
                 now_ms(),
             )?;
+            let prepared = match outcome {
+                latte_engine::SessionEffectPrepareOutcome::Prepared(prepared) => prepared,
+                latte_engine::SessionEffectPrepareOutcome::Rejected {
+                    snapshot,
+                    error_json,
+                } => {
+                    current = snapshot;
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id,
+                        name: Some(call.name),
+                        content: error_json,
+                    });
+                    continue;
+                }
+            };
             current = prepared.snapshot;
             if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
                 return Ok(ToolBatchOutcome::Parked(current));
@@ -3999,8 +4210,7 @@ impl SessionRuntimeService {
         // segments (completed history plus the open turn) and the same
         // non-persistent volatile tails, which only fill slack the mandatory
         // core leaves.
-        let mut entries: Vec<FitEntry> = segments.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
+        let entries = volatile.place_entries(&segments, Some(turn_id), None);
         let fit = Self::fit_request(&system, &entries, budget)?;
         let fitted_volatile = volatile.filtered(fit.repository_kept, fit.reminder_kept);
         let discarded = segments.len() - fit.history_kept;
@@ -4047,12 +4257,8 @@ impl SessionRuntimeService {
                 let cured = if forced {
                     true
                 } else if reactive {
-                    let mut cured_entries: Vec<FitEntry> = elided_segments
-                        .iter()
-                        .cloned()
-                        .map(FitEntry::history)
-                        .collect();
-                    cured_entries.extend(fitted_volatile.fit_entries());
+                    let cured_entries =
+                        fitted_volatile.place_entries(&elided_segments, Some(turn_id), None);
                     let cured_fit = Self::fit_request(&system, &cured_entries, budget)?;
                     cured_fit.history_kept == elided_segments.len()
                 } else {
@@ -4198,8 +4404,18 @@ impl SessionRuntimeService {
         if forced && self.compaction_breaker_tripped(snapshot.session_id) {
             return Ok(unchanged!());
         }
+        let warm_prefix = Self::assemble_request(
+            &system,
+            None,
+            &segments[..boundary],
+            &VolatileTurnContext {
+                repository: volatile.repository.clone(),
+                reminder: None,
+            },
+            None,
+        );
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(lease))
+            .summarize_history(&snapshot, &source, Some(&warm_prefix), Some(lease))
             .await
         {
             // Provider-side failure: forced recovery reports no progress so
@@ -4626,6 +4842,8 @@ impl SessionRuntimeService {
                 // truncated arm above fails the turn first, for the
                 // final-text shape and the tool-call shape alike. What
                 // remains is a complete outcome.
+                let final_reasoning = response.reasoning_content().map(redact_session_text);
+                let final_thinking = redact_thinking_blocks(&response.thinking_blocks());
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
                     let failed = self.fail(
@@ -4638,6 +4856,23 @@ impl SessionRuntimeService {
                     )?;
                     return Ok(RoundFlow::Done(failed));
                 };
+                let final_payload = if final_reasoning.is_none() && final_thinking.is_empty() {
+                    None
+                } else {
+                    let mut map = serde_json::Map::new();
+                    if let Some(reasoning) = final_reasoning {
+                        map.insert(
+                            "reasoning_content".into(),
+                            serde_json::Value::String(reasoning),
+                        );
+                    }
+                    if !final_thinking.is_empty()
+                        && let Ok(serialized) = serde_json::to_value(&final_thinking)
+                    {
+                        map.insert("thinking_blocks".into(), serialized);
+                    }
+                    Some(serde_json::Value::Object(map))
+                };
                 let appended = self.commit(
                     session_id,
                     turn_id,
@@ -4647,26 +4882,26 @@ impl SessionRuntimeService {
                         source_key: format!("{turn_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
-                        payload: None,
+                        payload: final_payload,
                     },
                     lease,
                 )?;
                 let changed = self.engine.session_turn_changed_files(turn_id)?;
                 if !changed.is_empty() {
-                    if self.verification.is_none() {
+                    if self.verification.is_some() {
+                        let verified = self.begin_verification(appended, message, lease).await?;
+                        return Ok(RoundFlow::Done(verified));
+                    } else if self.engine.requires_verification() {
                         let failed = self.fail(
                             session_id,
                             turn_id,
                             appended.session_revision,
                             turn_revision,
-                            "workspace changed but no configured verification plan is available"
-                                .into(),
+                            "workspace changed without a configured verification plan".into(),
                             lease,
                         )?;
                         return Ok(RoundFlow::Done(failed));
                     }
-                    let verified = self.begin_verification(appended, message, lease).await?;
-                    return Ok(RoundFlow::Done(verified));
                 }
                 snapshot = self.commit(
                     session_id,
@@ -4677,7 +4912,7 @@ impl SessionRuntimeService {
                         source_key: format!("{turn_id}:complete"),
                         handoff: latte_core::Handoff {
                             summary: message,
-                            files_changed: Vec::new(),
+                            files_changed: changed,
                             evidence: Vec::new(),
                         },
                     },
@@ -4742,6 +4977,30 @@ impl SessionRuntimeService {
         retryability: Retryability,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        self.fail_with_code(
+            session_id,
+            turn_id,
+            session_revision,
+            turn_revision,
+            FailureCode::RuntimeFailed,
+            message,
+            retryability,
+            lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_with_code(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        session_revision: u64,
+        turn_revision: u64,
+        code: FailureCode,
+        message: &str,
+        retryability: Retryability,
+        lease: &Lease,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.commit(
             session_id,
             turn_id,
@@ -4750,7 +5009,7 @@ impl SessionRuntimeService {
             CommitSessionTurnUpdate::Fail {
                 source_key: format!("{turn_id}:failure"),
                 failure: TurnFailure {
-                    code: FailureCode::RuntimeFailed,
+                    code,
                     message: redact_session_text(message),
                     retryability,
                 },
@@ -4858,6 +5117,38 @@ impl SessionRuntimeService {
             .snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
+        if is_readonly_session_tool(&started.view.name) {
+            let observed = self.engine.observe_session_effect(
+                started,
+                bounded_source_key(
+                    "effect-cancelled-readonly",
+                    format!(
+                        "{turn_id}:effect:{}:cancelled-readonly",
+                        started.view.effect_id
+                    ),
+                ),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
+                latte_engine::SessionEffectObservedValue {
+                    result: serde_json::json!({ "error": "cancelled" }).to_string(),
+                    payload: None,
+                    success: false,
+                },
+                lease,
+                now_ms(),
+            )?;
+            let revision = active_turn_revision(&observed.snapshot)?;
+            return self.commit(
+                observed.snapshot.session_id,
+                turn_id,
+                observed.snapshot.session_revision,
+                revision,
+                CommitSessionTurnUpdate::Interrupt {
+                    source_key: format!("{turn_id}:interrupt-cancelled-readonly"),
+                    reconciliation_effect_id: None,
+                },
+                lease,
+            );
+        }
         self.engine
             .mark_session_effect_unknown(
                 started,
@@ -6458,7 +6749,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn v2_uncertain_process_launch_requires_reconciliation_without_tool_result() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -6468,11 +6763,15 @@ mod tests {
             engine.clone(),
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -7098,7 +7397,7 @@ mod tests {
             latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
             latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
-        let failed = mutated
+        let completed = mutated
             .resolve_permission(
                 waiting.session_id,
                 waiting.session_revision,
@@ -7108,14 +7407,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
-        assert!(
-            engine
-                .show(failed.latest_turn_id.unwrap())
-                .unwrap()
-                .handoff
-                .is_none()
-        );
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        let mutated_handoff = engine
+            .show(completed.latest_turn_id.unwrap())
+            .unwrap()
+            .handoff
+            .unwrap();
+        assert_eq!(mutated_handoff.files_changed, vec!["new.txt".to_owned()]);
+        assert!(mutated_handoff.evidence.is_empty());
     }
 
     #[cfg(unix)]
@@ -7161,7 +7460,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
         let run = engine.show(failed.latest_turn_id.unwrap()).unwrap();
         assert_eq!(run.status, latte_core::TurnStatus::Failed);
         assert!(run.handoff.is_none());
@@ -8735,7 +9034,9 @@ mod tests {
         observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
         presentation.effect_id = "failed-verification".parse().unwrap();
         presentation.input = descriptor.input;
-        assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, SessionLifecycle::Failed);
+        let failed_ver = verified.finish_verification(&observed, &presentation, &live).unwrap();
+        assert_eq!(failed_ver.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(failed_ver.turns[0].status, latte_core::SessionTurnStatus::Failed);
         verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
     }
 
@@ -8993,6 +9294,8 @@ mod tests {
         let mut segment = vec![
             Message::Assistant {
                 content: Some("calling tools".into()),
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![
                     ToolCall {
                         id: "call-1".into(),
@@ -9201,6 +9504,8 @@ mod tests {
         let segment = vec![
             Message::Assistant {
                 content: None,
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "read_file".into(),
@@ -11685,6 +11990,8 @@ mod tests {
                     },
                     Message::Assistant {
                         content: None,
+                        reasoning_content: None,
+                        thinking_blocks: vec![],
                         tool_calls: vec![crate::provider::ToolCall {
                             id: id.into(),
                             name: name.into(),
@@ -12460,6 +12767,8 @@ mod tests {
             vec![
                 Message::Assistant {
                     content: None,
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "c1".into(),
                         name: "read_file".into(),
@@ -13060,7 +13369,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconciliation_drain_keeps_the_parked_queue_untouched() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -13070,11 +13383,15 @@ mod tests {
             engine,
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -13130,7 +13447,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconciling_to_failed_discards_and_audits_the_parked_queue() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -13140,11 +13461,15 @@ mod tests {
             engine,
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -14159,6 +14484,8 @@ mod tests {
                     },
                     Message::Assistant {
                         content: Some("old answer".into()),
+                        reasoning_content: None,
+                        thinking_blocks: vec![],
                         tool_calls: vec![],
                     },
                 ],
@@ -14197,17 +14524,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Old durable history, then both volatile tails, then the open turn
-        // verbatim — and the tails sit nowhere else in the shape.
+        // `<repository-context>` is head-anchored right under `system` ahead of
+        // old history, while `<system-reminder>` sits immediately before the
+        // open turn's prompt.
         assert_eq!(texts.len(), 4);
-        assert_eq!(texts[0], "old prompt");
-        assert!(texts[1].contains("REPO-SNAPSHOT-MARKER"));
+        assert!(texts[0].starts_with("<repository-context>"));
+        assert!(texts[0].contains("REPO-SNAPSHOT-MARKER"));
+        assert_eq!(texts[1], "old prompt");
+        assert!(texts[2].starts_with("<system-reminder>"));
         assert!(texts[2].contains("REMINDER-MARKER"));
         assert_eq!(texts[3], "active prompt");
-        assert!(texts[1].starts_with("<repository-context>"));
-        assert!(texts[2].starts_with("<system-reminder>"));
         // A summary, when present, stays directly under the head and ahead of
-        // every durable segment.
+        // `<repository-context>` and every durable segment.
         let summarized = SessionRuntimeService::assemble_mid_turn_request(
             &system,
             Some("SUMMARY-MARKER"),
@@ -14217,6 +14545,9 @@ mod tests {
         );
         assert!(
             matches!(&summarized[1], Message::User { content } if content.contains("SUMMARY-MARKER"))
+        );
+        assert!(
+            matches!(&summarized[2], Message::User { content } if content.starts_with("<repository-context>"))
         );
     }
 
@@ -14407,6 +14738,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider::scripted([
             response(Some("first"), vec![]),
             response(Some("second"), vec![]),
+            response(Some("third"), vec![]),
         ]));
         let service = recording_service(root.path(), engine, Arc::clone(&provider));
         let session_id = SessionId::from_uuid(Uuid::now_v7());
@@ -14416,15 +14748,20 @@ mod tests {
             .unwrap()
             .session_revision;
 
-        // The workspace file changes between turns; durable history already
-        // contains the first prompt.
+        // The workspace file changes between turn 1 and turn 2.
         std::fs::write(&agents, "# workspace\nREPO-MARKER-V2-BRAVO\n").unwrap();
         revision = service
             .follow_up(session_id, revision, "SECOND-PROMPT-MARKER".into())
             .await
             .unwrap()
             .session_revision;
-        let _ = revision;
+
+        // Between turn 2 and turn 3, AGENTS.md is unchanged: turn 3 must be a
+        // strict prefix extension of turn 2 so provider KV cache hits 100%.
+        let _ = service
+            .follow_up(session_id, revision, "THIRD-PROMPT-MARKER".into())
+            .await
+            .unwrap();
 
         let requests = provider.requests.lock().unwrap().clone();
         let head_1 = match &requests[0][0] {
@@ -14439,40 +14776,23 @@ mod tests {
         assert!(!head_1.contains("REPO-MARKER"));
         assert!(!head_1.contains("FIRST-PROMPT-MARKER"));
 
-        // Each turn's repository snapshot rides a volatile user tail, never
-        // the head; turn 1 sees V1, turn 2 sees the edited V2.
         let wire_1 = joined(&requests[0]);
         let wire_2 = joined(&requests[1]);
         assert!(wire_1.contains("REPO-MARKER-V1-ALPHA"));
         assert!(!wire_1.contains("REPO-MARKER-V2-BRAVO"));
         assert!(wire_2.contains("REPO-MARKER-V2-BRAVO"));
-        // Tails are framed and sit immediately ahead of their turn's prompt.
-        let tail_at_1 = requests[0]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content.starts_with("<repository-context>"))
-            })
-            .unwrap();
-        let prompt_at_1 = requests[0]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content == "FIRST-PROMPT-MARKER")
-            })
-            .unwrap();
-        assert_eq!(tail_at_1 + 1, prompt_at_1);
-        let tail_at_2 = requests[1]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content.starts_with("<repository-context>"))
-            })
-            .unwrap();
-        let prompt_at_2 = requests[1]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content == "SECOND-PROMPT-MARKER")
-            })
-            .unwrap();
-        assert_eq!(tail_at_2 + 1, prompt_at_2);
+        // `<repository-context>` is head-anchored at index 1 right under `system`.
+        assert!(
+            matches!(&requests[0][1], Message::User { content } if content.starts_with("<repository-context>"))
+        );
+        assert!(
+            matches!(&requests[1][1], Message::User { content } if content.starts_with("<repository-context>"))
+        );
+        assert_eq!(
+            &requests[2][..requests[1].len()],
+            &requests[1][..],
+            "unchanged workspace docs keep turn 2 an exact message prefix of turn 3"
+        );
         // The volatile snapshot is non-persistent: durable transcript keeps
         // prompts but never the framed workspace contents.
         let snapshot = service.load_full(session_id).unwrap();
@@ -14518,13 +14838,13 @@ mod tests {
                     read_call("call-tail", "bravo.txt"),
                 ],
             ),
-            // Round 3: non-fatal observed tool error (`git_diff` in a non-Git workspace).
+            // Round 3: non-fatal observed tool error (invalid regex in `search`, cross-platform).
             response(
                 None,
                 vec![crate::provider::ToolCall {
                     id: "call-tool-err".into(),
-                    name: "git_diff".into(),
-                    input: serde_json::json!({}),
+                    name: "search".into(),
+                    input: serde_json::json!({"query": "[", "regex": true}),
                 }],
             ),
             // Final assistant response after observing tool error + call-tail result.
@@ -14542,15 +14862,7 @@ mod tests {
             root.path(),
             SessionHistoryPolicy::default(),
             factory,
-        )
-        .with_verification(VerificationPlan {
-            argv: vec!["/usr/bin/true".into()],
-            cwd: ".".into(),
-            timeout_ms: 5_000,
-            grace_ms: 500,
-            stdout_cap: 4096,
-            stderr_cap: 4096,
-        });
+        );
 
         let session_id = SessionId::from_uuid(Uuid::now_v7());
         let parked = service
@@ -14579,34 +14891,13 @@ mod tests {
         ));
 
         // Approving round 2's "call-dup" must resume round 2 (running "call-tail"), then round 3,
-        // then park at the verification permission gate (`session-verification:{turn_id}`).
-        let verification_parked = service
+        // and complete cleanly on every OS when verification is not configured.
+        let completed = service
             .resolve_permission(
                 session_id,
                 parked.session_revision,
                 test_turn_revision(&parked),
                 request_id,
-                true,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            verification_parked.lifecycle,
-            SessionLifecycle::WaitingPermission
-        );
-        let verify_req = match verification_parked.pending.as_ref().unwrap() {
-            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
-            other @ latte_core::SessionPendingRequest::Input { .. } => {
-                panic!("expected verification permission request, got {other:?}")
-            }
-        };
-        assert!(EffectId::new(&verify_req).unwrap().is_verification());
-        let completed = service
-            .resolve_permission(
-                session_id,
-                verification_parked.session_revision,
-                test_turn_revision(&verification_parked),
-                verify_req,
                 true,
             )
             .await

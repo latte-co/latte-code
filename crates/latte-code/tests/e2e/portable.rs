@@ -190,7 +190,10 @@ fn final_binary_context_endpoint_reports_usage_that_grows_with_history() {
     );
     assert!(first["usage"]["estimated_used_tokens"].as_u64().unwrap() > 0);
     assert_eq!(first["usage"]["discarded_segments"], 0);
-    assert_eq!(first["usage"]["compaction_strategy"], "off");
+    assert_eq!(
+        first["usage"]["compaction_strategy"],
+        "elide_tool_results_then_summarize"
+    );
     assert_eq!(first["usage"]["proactive_compaction_due"], false);
 
     let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
@@ -252,7 +255,10 @@ fn final_binary_context_endpoint_reports_usage_that_grows_with_history() {
         Some(second_used),
         "CLI and HTTP projections agree on exact used bytes"
     );
-    assert_eq!(cli_body["data"]["context"]["compaction_strategy"], "off");
+    assert_eq!(
+        cli_body["data"]["context"]["compaction_strategy"],
+        "elide_tool_results_then_summarize"
+    );
     let text_cli = scenario.output(&["context", &session_id], |command| {
         command.env("TEST_OPENAI_KEY", "context-e2e-key");
     });
@@ -385,7 +391,7 @@ fn final_binary_compaction_retains_recent_turns_raw_across_processes() {
     std::fs::write(
         scenario.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:6200,max_input_bytes:6200,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -613,7 +619,7 @@ fn final_binary_mid_turn_summary_rebuilds_with_volatile_tail_and_verbatim_active
     std::fs::write(
         scenario.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:6200,max_input_bytes:6200,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -730,7 +736,7 @@ fn final_binary_manual_compact_elides_tool_results_without_a_summary_request() {
     std::fs::write(
         scenario.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:6200,max_input_bytes:6200,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -824,7 +830,7 @@ fn final_binary_proactive_pre_turn_elides_before_a_discard_without_summary() {
             // Trigger at 80% fill: after the big-result turn plus one small
             // turn, fill is ~95% — past the trigger but still inside the hard
             // 5600 budget, so nothing is discarded before the tier runs.
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:80,retain_ratio:20}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:6200,max_input_bytes:6200,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:80,retain_ratio:20}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -911,7 +917,7 @@ fn final_binary_mid_turn_reactive_elision_cures_without_a_summary_request() {
     std::fs::write(
         scenario.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5900,max_input_bytes:5900,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -1087,7 +1093,7 @@ fn final_binary_manual_compact_forces_below_watermark_and_reports_empty_state() 
     std::fs::write(
         scenario.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:".latte/latte-code.db"}},verification:{{argv:["verification-must-not-run"]}},session:{{max_request_bytes:6200,max_input_bytes:6200,reserved_output_bytes:1,context_cap_bytes:65536,provider_timeout_ms:60000,compaction:{{enabled:true,max_summary_source_bytes:8192,trigger_ratio:100}}}}}}"#,
             endpoint = provider.endpoint()
         ),
     )
@@ -1630,6 +1636,7 @@ fn final_binary_system_head_is_stable_across_agents_md_edit() {
     let provider = ScriptedProvider::start([
         ProviderReply::completion("stable head one"),
         ProviderReply::completion("stable head two"),
+        ProviderReply::completion("stable head three"),
     ]);
     std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
     std::fs::write(
@@ -1666,8 +1673,16 @@ fn final_binary_system_head_is_stable_across_agents_md_edit() {
     );
     assert!(second.status.success(), "second turn failed");
 
+    // Third turn with AGENTS.md unchanged: Turn 2's messages must be an exact
+    // prefix of Turn 3's messages so provider KV cache hits 100%.
+    let third = scenario.output(
+        &["--json", "resume", &session, "STABLE-E2E-PROMPT-THREE"],
+        env,
+    );
+    assert!(third.status.success(), "third turn failed");
+
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "exactly the two turn requests");
+    assert_eq!(requests.len(), 3, "three turn requests");
     let head = |index: usize| {
         requests[index].body["messages"][0]["content"]
             .as_str()
@@ -1710,18 +1725,27 @@ fn final_binary_system_head_is_stable_across_agents_md_edit() {
         "no genuine system-reminder frame can be forged from repository text"
     );
 
-    // The framed repository tail sits directly ahead of its turn prompt.
+    // `<repository-context>` is head-anchored at index 1 right under `system`,
+    // ahead of durable history, so unchanged workspace docs preserve the full
+    // multi-turn KV-cache prefix.
     let tail_one = e2e_user_message_index(&requests[0].body, "<repository-context>")
-        .expect("turn one carries the repository tail");
+        .expect("turn one carries the repository block");
     let prompt_one = e2e_user_message_index(&requests[0].body, "STABLE-E2E-PROMPT-ONE").unwrap();
+    assert_eq!(tail_one, 1);
     assert_eq!(tail_one + 1, prompt_one);
     let tail_two = e2e_user_message_index(&requests[1].body, "<repository-context>")
-        .expect("turn two carries the edited repository tail");
-    let prompt_two = e2e_user_message_index(&requests[1].body, "STABLE-E2E-PROMPT-TWO").unwrap();
-    assert_eq!(tail_two + 1, prompt_two);
-    // The first prompt is durable history in request two and precedes the tail.
+        .expect("turn two carries the edited repository block");
     let history_one = e2e_user_message_index(&requests[1].body, "STABLE-E2E-PROMPT-ONE").unwrap();
-    assert!(history_one < tail_two);
+    let prompt_two = e2e_user_message_index(&requests[1].body, "STABLE-E2E-PROMPT-TWO").unwrap();
+    assert_eq!(tail_two, 1);
+    assert!(tail_two < history_one && history_one < prompt_two);
+    let msgs_two = requests[1].body["messages"].as_array().unwrap();
+    let msgs_three = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(
+        &msgs_three[..msgs_two.len()],
+        msgs_two.as_slice(),
+        "unchanged AGENTS.md keeps turn 2 an exact wire prefix of turn 3"
+    );
 
     // The volatile snapshot never reaches the durable session JSONL.
     let mut transcript = String::new();
@@ -11658,8 +11682,8 @@ fn final_binary_cli_run_with_safe_grep_process_completes() {
 #[test]
 fn final_binary_cli_run_with_denied_shell_process_fails() {
     // A shell command matching the deny list (e.g. `rm -rf /`) must be
-    // rejected without a permission round-trip. Covers the shell Deny
-    // branch of the process classifier.
+    // rejected without a permission round-trip, recorded as a failed tool
+    // result, and fed back to the model so the session remains usable.
     let scenario = Scenario::new();
     let process = serde_json::json!({
         "shell": "rm -rf /",
@@ -11670,21 +11694,18 @@ fn final_binary_cli_run_with_denied_shell_process_fails() {
         "stdout_cap": 1024,
         "stderr_cap": 1024
     });
-    let provider =
-        ScriptedProvider::start([ProviderReply::tool_call("deny-1", "process", &process)]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("deny-1", "process", &process),
+        ProviderReply::completion("dangerous command refused safely"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "run a dangerous command"], |command| {
         command.env("TEST_OPENAI_KEY", "denied-shell-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
@@ -11859,71 +11880,67 @@ fn final_binary_cli_run_with_variant_finish_reasons_matches_stop_semantics() {
     }
 }
 
-/// `edit_file` without `before` or `anchor` must fail with an input error,
-/// covering the tool preparation validation branch.
+/// `edit_file` without `before` or `anchor` returns a structured tool input
+/// error to the model rather than crashing the session.
 #[test]
 fn final_binary_cli_run_with_edit_file_missing_before_fails() {
     let scenario = Scenario::new();
     std::fs::write(scenario.root().join("target.txt"), "original\n").unwrap();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "edit-1",
-        "edit_file",
-        &serde_json::json!({
-            "path": "target.txt",
-            "after": "replaced",
-            "precondition": {"hash": "abc", "size": 9, "modified_ns": 0}
-        }),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "edit-1",
+            "edit_file",
+            &serde_json::json!({
+                "path": "target.txt",
+                "after": "replaced",
+                "precondition": {"hash": "abc", "size": 9, "modified_ns": 0}
+            }),
+        ),
+        ProviderReply::completion("edit input error observed"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "edit without before"], |command| {
         command.env("TEST_OPENAI_KEY", "edit-missing-before-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
-/// `edit_file` with a `before` that doesn't match the file content must fail,
-/// covering the edit execution mismatch branch.
+/// `edit_file` with a mismatched `precondition` returns a structured tool
+/// error (or asks permission when valid), keeping the session usable.
 #[test]
 fn final_binary_cli_run_with_edit_file_mismatched_before_fails() {
     let scenario = Scenario::new();
     std::fs::write(scenario.root().join("target.txt"), "original content\n").unwrap();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "edit-1",
-        "edit_file",
-        &serde_json::json!({
-            "path": "target.txt",
-            "before": "nonexistent text",
-            "after": "replaced",
-            "precondition": {"hash": "abc", "size": 17, "modified_ns": 0}
-        }),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "edit-1",
+            "edit_file",
+            &serde_json::json!({
+                "path": "target.txt",
+                "before": "nonexistent text",
+                "after": "replaced",
+                "precondition": {"hash": "abc", "size": 17, "modified_ns": 0}
+            }),
+        ),
+        ProviderReply::completion("edit precondition error observed"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "edit with mismatch"], |command| {
         command.env("TEST_OPENAI_KEY", "edit-mismatch-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
-/// Process tool with an empty argv must be denied without spawning, covering
-/// the empty-argv Deny branch of the process classifier.
+/// Process tool with an empty argv is denied before spawning and returned as a
+/// structured tool error so the model can self-correct.
 #[cfg(unix)]
 #[test]
 fn final_binary_cli_run_with_empty_argv_process_denied() {
@@ -11937,172 +11954,152 @@ fn final_binary_cli_run_with_empty_argv_process_denied() {
         "stdout_cap": 1024,
         "stderr_cap": 1024
     });
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "empty-argv-1",
-        "process",
-        &process,
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("empty-argv-1", "process", &process),
+        ProviderReply::completion("empty argv rejected"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "run an empty argv"], |command| {
         command.env("TEST_OPENAI_KEY", "empty-argv-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
-/// `list_directory` on a file path (not a directory) must fail with an
-/// input error, covering the tool's type-check branch.
+/// `list_directory` on a regular file returns a certified `ToolResult` error
+/// (never locking a read-only call into `reconciliation_required`).
 #[test]
 fn final_binary_cli_run_with_list_directory_on_file_fails() {
     let scenario = Scenario::new();
     std::fs::write(scenario.root().join("notadir.txt"), "i am a file\n").unwrap();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "ls-1",
-        "list_directory",
-        &serde_json::json!({"path": "notadir.txt"}),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "ls-1",
+            "list_directory",
+            &serde_json::json!({"path": "notadir.txt"}),
+        ),
+        ProviderReply::completion("not a directory error observed"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "list a file"], |command| {
         command.env("TEST_OPENAI_KEY", "ls-file-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted"
-            || body["status"] == "reconciliation_required",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
-/// `search` with an empty query must fail with an input error, covering the
-/// tool's validation branch.
+/// `search` with an empty query returns an input error to the model.
 #[test]
 fn final_binary_cli_run_with_empty_search_query_fails() {
     let scenario = Scenario::new();
     std::fs::write(scenario.root().join("target.txt"), "hello\n").unwrap();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "search-1",
-        "search",
-        &serde_json::json!({"query": "", "path": "."}),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "search-1",
+            "search",
+            &serde_json::json!({"query": "", "path": "."}),
+        ),
+        ProviderReply::completion("empty search query observed"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "search with empty query"], |command| {
         command.env("TEST_OPENAI_KEY", "empty-search-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
 #[test]
 fn final_binary_cli_run_with_missing_file_tool_covers_error_path() {
     let scenario = Scenario::new();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "read-1",
-        "read_file",
-        &serde_json::json!({"path": "nonexistent.txt"}),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "read-1",
+            "read_file",
+            &serde_json::json!({"path": "nonexistent.txt"}),
+        ),
+        ProviderReply::completion("missing file observed and handled"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "read a missing file"], |command| {
         command.env("TEST_OPENAI_KEY", "missing-file-secret");
     });
-    // The tool error is observed and the provider re-enters; the session
-    // completes (or fails durably) — either way the error path in the
-    // engine is exercised.
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
 #[test]
 fn final_binary_cli_run_with_path_escape_tool_covers_error_path() {
     let scenario = Scenario::new();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "read-1",
-        "read_file",
-        &serde_json::json!({"path": "../escape.txt"}),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "read-1",
+            "read_file",
+            &serde_json::json!({"path": "../escape.txt"}),
+        ),
+        ProviderReply::completion("path escape rejected safely"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "read an escaping path"], |command| {
         command.env("TEST_OPENAI_KEY", "escape-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
 #[cfg(unix)]
 #[test]
 fn final_binary_cli_run_with_symlink_mutation_covers_error_path() {
-    // Writing through a symlinked path component must fail with a symlink
-    // error (engine workspace mutation guard). The symlink target is
-    // relative so the storage layer's session-creation validation accepts it.
+    // Writing through a symlinked path component fails with a symlink error
+    // returned as a ToolResult so the session stays usable without mutating.
     let scenario = Scenario::new();
     std::fs::create_dir_all(scenario.root().join("realdir")).unwrap();
     std::os::unix::fs::symlink("realdir", scenario.root().join("link")).unwrap();
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "write-1",
-        "write_file",
-        &serde_json::json!({"path": "link/test.txt", "content": "test", "create_intent": true}),
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-1",
+            "write_file",
+            &serde_json::json!({"path": "link/test.txt", "content": "test", "create_intent": true}),
+        ),
+        ProviderReply::completion("symlink write rejected safely"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
     let output = scenario.output(&["--json", "run", "write through a symlink"], |command| {
         command.env("TEST_OPENAI_KEY", "symlink-mutation-secret");
     });
     let body = json(&output);
-    assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
-    );
+    assert_eq!(body["status"], "completed");
+    assert!(!scenario.root().join("realdir/test.txt").exists());
+    assert_eq!(provider.requests().len(), 2);
     provider.assert_consumed();
 }
 
 #[test]
 fn final_binary_cli_run_with_missing_parent_dir_covers_error_path() {
-    // Writing to a path whose parent directory does not exist must fail with
-    // a missing error (engine workspace mutation guard, non-final component).
+    // Missing parent directories are accepted during preparation (`waiting` in
+    // default Ask mode), while a non-directory parent component (`file/child`)
+    // is rejected as a structured ToolResult error.
     let scenario = Scenario::new();
     let provider = ScriptedProvider::start([ProviderReply::tool_call(
         "write-1",
         "write_file",
-        &serde_json::json!({"path": "nonexistent_dir/test.txt", "content": "test", "create_intent": true}),
+        &serde_json::json!({"path": "nonexistent_dir/test.txt", "content": "test"}),
     )]);
     scenario.write_config(provider.endpoint(), r#"["true"]"#);
 
@@ -12110,12 +12107,361 @@ fn final_binary_cli_run_with_missing_parent_dir_covers_error_path() {
         command.env("TEST_OPENAI_KEY", "missing-parent-secret");
     });
     let body = json(&output);
+    assert_eq!(body["status"], "waiting");
+    provider.assert_consumed();
+
+    let file_parent = Scenario::new();
+    std::fs::write(file_parent.root().join("regular_file"), "not a dir\n").unwrap();
+    let file_provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "write-bad-parent",
+            "write_file",
+            &serde_json::json!({"path": "regular_file/test.txt", "content": "test"}),
+        ),
+        ProviderReply::completion("non-directory parent rejected"),
+    ]);
+    file_parent.write_config(file_provider.endpoint(), r#"["true"]"#);
+    let bad_output = file_parent.output(
+        &["--json", "run", "write under a regular file"],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "missing-parent-secret");
+        },
+    );
+    assert_eq!(json(&bad_output)["status"], "completed");
+    file_provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_binary_cli_run_auto_executes_full_agent_workflow_without_verification_or_preconditions() {
+    let scenario = Scenario::new();
+    let outside = scenario.root().parent().unwrap().join("external-ref-dir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, scenario.root().join("references")).unwrap();
+    std::fs::write(
+        scenario.root().join("src.rs"),
+        "fn greet() -> &'static str {\n    \"old\"\n}\n",
+    )
+    .unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "read-src",
+            "read_file",
+            &serde_json::json!({"path": "src.rs", "offset": 1, "limit": 10}),
+        ),
+        ProviderReply::tool_call(
+            "edit-src",
+            "edit_file",
+            &serde_json::json!({
+                "path": "src.rs",
+                "before": "\"old\"",
+                "after": "\"rectified\""
+            }),
+        ),
+        ProviderReply::tool_call(
+            "write-nested",
+            "write_file",
+            &serde_json::json!({
+                "path": "nested/new_dir/helper.rs",
+                "content": "pub const READY: bool = true;\n"
+            }),
+        ),
+        ProviderReply::tool_call(
+            "run-check",
+            "process",
+            &serde_json::json!({"shell": "test -f nested/new_dir/helper.rs && printf ok"}),
+        ),
+        ProviderReply::completion("workflow completed cleanly"),
+    ]);
+    // Write config WITHOUT `verification` to prove optional verification + default compaction.
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                "$schema": "https://latte.dev/schema/latte-code.json",
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }}
+            }}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    let output = scenario.output(
+        &["--json", "run", "--auto", "update src and add helper"],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "auto-workflow-secret");
+        },
+    );
     assert!(
-        body["status"] == "completed"
-            || body["status"] == "failed"
-            || body["status"] == "interrupted",
-        "unexpected status: {}",
-        body["status"]
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("src.rs")).unwrap(),
+        "fn greet() -> &'static str {\n    \"rectified\"\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("nested/new_dir/helper.rs")).unwrap(),
+        "pub const READY: bool = true;\n"
+    );
+    provider.assert_consumed();
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cli_exercises_rectified_tools_context_reasoning_and_modes() {
+    let scenario = Scenario::new();
+    scenario.init_git();
+    let outside = scenario.root().parent().unwrap().join("external-ref-2");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, scenario.root().join("references")).unwrap();
+    std::os::unix::fs::symlink("missing-target", scenario.root().join("dangling_link")).unwrap();
+    std::fs::write(scenario.root().join("CLAUDE.md"), "Claude repo rules\n").unwrap();
+    std::fs::write(scenario.root().join(".gitignore"), "ignored_dir/\n").unwrap();
+    std::fs::create_dir_all(scenario.root().join("ignored_dir")).unwrap();
+    std::fs::write(scenario.root().join("ignored_dir/skip.rs"), "skip\n").unwrap();
+    for idx in 0..62 {
+        std::fs::write(scenario.root().join(format!("top_{idx:02}.txt")), "t\n").unwrap();
+    }
+    std::fs::write(scenario.root().join("blob.bin"), b"abc\0def").unwrap();
+    std::fs::create_dir_all(scenario.root().join("bin")).unwrap();
+    let script_path = scenario.root().join("bin/run.sh");
+    std::fs::write(&script_path, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(
+        &script_path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir_all(scenario.root().join("nested/sub")).unwrap();
+    std::fs::write(
+        scenario.root().join("nested/sub/deep.rs"),
+        format!("// NEEDLE_MARKER {}\nfn ok() {{}}\n", "x".repeat(600)),
+    )
+    .unwrap();
+    std::fs::create_dir_all(scenario.root().join("links")).unwrap();
+    std::os::unix::fs::symlink(
+        "../nested/sub/deep.rs",
+        scenario.root().join("links/deep_link.rs"),
+    )
+    .unwrap();
+
+    let reasoning_tool_reply = ProviderReply::json(
+        200,
+        &serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_content": "checking binary and pagination first",
+                    "tool_calls": [
+                        {
+                            "id": "r-bin",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": r#"{"path":"blob.bin"}"#
+                            }
+                        },
+                        {
+                            "id": "r-oob",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": r#"{"path":"bin/run.sh","offset":50,"limit":5}"#
+                            }
+                        },
+                        {
+                            "id": "r-page",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": r#"{"path":"bin/run.sh","offset":1,"limit":1}"#
+                            }
+                        },
+                        {
+                            "id": "ls-glob",
+                            "type": "function",
+                            "function": {
+                                "name": "list_directory",
+                                "arguments": r#"{"path":".","max_depth":4,"glob":"*.rs"}"#
+                            }
+                        },
+                        {
+                            "id": "srch-scoped",
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": r#"{"query":"NEEDLE_MARKER","path":"nested","glob":"*.rs"}"#
+                            }
+                        },
+                        {
+                            "id": "diff-unborn",
+                            "type": "function",
+                            "function": {
+                                "name": "git_diff",
+                                "arguments": "{}"
+                            }
+                        },
+                        {
+                            "id": "which-sh",
+                            "type": "function",
+                            "function": {
+                                "name": "process",
+                                "arguments": r#"{"argv":["which","sh"]}"#
+                            }
+                        },
+                        {
+                            "id": "enoent-proc",
+                            "type": "function",
+                            "function": {
+                                "name": "process",
+                                "arguments": r#"{"argv":["/definitely-missing-latte-binary-xyz"]}"#
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    );
+
+    let provider = ScriptedProvider::start([
+        reasoning_tool_reply,
+        ProviderReply::tool_call(
+            "read-full-script",
+            "read_file",
+            &serde_json::json!({"path": "bin/run.sh"}),
+        ),
+        ProviderReply::tool_call(
+            "edit-script",
+            "edit_file",
+            &serde_json::json!({
+                "path": "bin/run.sh",
+                "before": "echo old",
+                "after": "echo new"
+            }),
+        ),
+        ProviderReply::tool_call(
+            "mutate-proc",
+            "process",
+            &serde_json::json!({"shell": "printf done > proc_marker.txt"}),
+        ),
+        ProviderReply::completion("all rectified tools verified"),
+        ProviderReply::tool_call(
+            "resume-write",
+            "write_file",
+            &serde_json::json!({"path": "resumed_auto_edit.txt", "content": "ok\n"}),
+        ),
+        ProviderReply::completion("resumed auto-edit completed"),
+    ]);
+
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                "$schema": "https://latte.dev/schema/latte-code.json",
+                default_provider: "legacy-v0",
+                version: 1,
+                default_model: "main/mock",
+                verification: {{ argv: ["/bin/pwd"] }},
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }}
+            }}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+
+    // Reject invalid CLI flags on `tui` and `run`.
+    let bad_tui = scenario.output(&["tui", "--bogus"], |_| {});
+    assert_eq!(bad_tui.status.code(), Some(2));
+    let bad_mode = scenario.output(
+        &["--json", "run", "--permission-mode", "bogus", "hi"],
+        |_| {},
+    );
+    assert_eq!(bad_mode.status.code(), Some(2));
+
+    let first = scenario.output(
+        &[
+            "--json",
+            "run",
+            "--permission-mode",
+            "full-auto",
+            "exercise rectified tools",
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "rectified-e2e-key");
+        },
+    );
+    assert!(
+        first.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let sid = session_id(&first);
+    let mode_bits = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::mode(
+        &std::fs::metadata(&script_path).unwrap().permissions(),
+    );
+    assert_ne!(
+        mode_bits & 0o111,
+        0,
+        "executable bit preserved on edit_file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("proc_marker.txt")).unwrap(),
+        "done"
+    );
+
+    // Verify `reasoning_content` and `CLAUDE.md` + truncated `top_level` overview reached the wire.
+    let second_req = serde_json::to_string(&provider.requests()[1].body).unwrap();
+    assert!(second_req.contains("checking binary and pagination first"));
+    assert!(second_req.contains("Claude repo rules"));
+    assert!(second_req.contains("+2 more") || second_req.contains("more)"));
+
+    let second = scenario.output(
+        &[
+            "--json",
+            "resume",
+            &sid,
+            "--permission-mode",
+            "auto-edit",
+            "write resumed file",
+        ],
+        |command| {
+            command.env("TEST_OPENAI_KEY", "rectified-e2e-key");
+        },
+    );
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("resumed_auto_edit.txt")).unwrap(),
+        "ok\n"
     );
     provider.assert_consumed();
 }
@@ -13617,4 +13963,511 @@ fn final_binary_reconciles_materializing_rows_fork_lineage_and_orphaned_lifecycl
         )
         .unwrap();
     assert_eq!(unknown_db_count, 2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_anthropic_messages_streams_thinking_claude_tools_and_warm_prefix_compaction() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let scenario = Scenario::new();
+    std::fs::create_dir_all(scenario.root().join("src")).unwrap();
+    std::fs::write(
+        scenario.root().join("AGENTS.md"),
+        "# repo guide\nANTHROPIC-REPO-ANCHOR\n",
+    )
+    .unwrap();
+    std::fs::write(
+        scenario.root().join("src/app.rs"),
+        concat!(
+            "const TAG: &str = \u{201C}legacy\u{201D};\r\n",
+            "fn compute() {\r\n",
+            "    let old_val = 1;\r\n",
+            "    let next = old_val + old_val;\r\n",
+            "    if next > 0 {\r\n",
+            "        println!(\"running\");\r\n",
+            "        println!(\"done\");\r\n",
+            "    }\r\n",
+            "}\r\n",
+        ),
+    )
+    .unwrap();
+
+    // Scripted HTTP sequence for Anthropic `/v1/messages`:
+    // 0: 529 Overloaded (proves retry on Anthropic 529)
+    // 1: Turn 1 Round 1 SSE — thinking + signature + redacted_thinking + Glob + Grep + Read
+    // 2: Turn 1 Round 2 SSE — Edit (replace_all) + Edit (curly quotes) + Edit (indent shift) + Write
+    // 3: Turn 1 Round 3 inline JSON — end_turn completion
+    // 4: Turn 2 Round 1 SSE — end_turn completion (verifies cross-process thinking replay & repo prefix)
+    // 5: Manual `/compact` warm-prefix summary response
+    let round1_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"cache_creation_input_tokens\":120,\"cache_read_input_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Inspecting src/app.rs first.\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_round_1\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"redacted_r1\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_glob\",\"name\":\"Glob\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"**/*.rs\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_grep\",\"name\":\"Grep\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"fn compute(\\\",\\\"path\\\":\\\"src\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_read\",\"name\":\"Read\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"src/app.rs\\\",\\\"offset\\\":1,\\\"limit\\\":50}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":4}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let round2_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":15,\"cache_read_input_tokens\":150}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit_all\",\"name\":\"Edit\",\"input\":{\"file_path\":\"src/app.rs\",\"old_string\":\"old_val\",\"new_string\":\"new_val\",\"replace_all\":true}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit_quote\",\"name\":\"Edit\",\"input\":{\"file_path\":\"src/app.rs\",\"old_string\":\"const TAG: &str = \\\"legacy\\\";\",\"new_string\":\"const TAG: &str = \\\"modern\\\";\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_edit_indent\",\"name\":\"Edit\",\"input\":{\"file_path\":\"src/app.rs\",\"old_string\":\"    println!(\\\"running\\\");\\n    println!(\\\"done\\\");\",\"new_string\":\"    println!(\\\"updated\\\");\\n    println!(\\\"verified\\\");\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_write\",\"name\":\"Write\",\"input\":{\"file_path\":\"src/extra.rs\",\"content\":\"pub const EXTRA: usize = 42;\\n\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":60}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let round3_json = r#"{"type":"message","content":[{"type":"thinking","thinking":"All edits applied.","signature":"sig_final_1"},{"type":"text","text":"ANTHROPIC-TURN1-COMPLETE"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":220,"output_tokens":15}}"#;
+    let turn2_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":280}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ANTHROPIC-TURN2-COMPLETE\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let summary_json = r#"{"type":"message","content":[{"type":"text","text":"WARM-PREFIX-ANTHROPIC-SUMMARY"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"cache_read_input_tokens":260,"output_tokens":12}}"#;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured: Arc<Mutex<Vec<(String, String, serde_json::Value)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+    let replies: Vec<(&'static str, &'static str, String)> = vec![
+        (
+            "529 Overloaded",
+            "application/json",
+            r#"{"error":{"type":"overloaded_error","message":"busy"}}"#.into(),
+        ),
+        ("200 OK", "text/event-stream", round1_sse.into()),
+        ("200 OK", "text/event-stream", round2_sse.into()),
+        ("200 OK", "application/json", round3_json.into()),
+        ("200 OK", "text/event-stream", turn2_sse.into()),
+        ("200 OK", "application/json", summary_json.into()),
+    ];
+    let server_handle = std::thread::spawn(move || {
+        for (status, ctype, body) in replies {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut raw = Vec::new();
+            let mut header_end = None;
+            let mut content_len = 0_usize;
+            loop {
+                let mut chunk = [0_u8; 8192];
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let hdr_str = String::from_utf8_lossy(&raw[..end]);
+                    for line in hdr_str.lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(end) = header_end
+                    && raw.len() >= end + content_len
+                {
+                    break;
+                }
+            }
+            let end = header_end.expect("HTTP headers");
+            let hdr_text = String::from_utf8_lossy(&raw[..end]).into_owned();
+            let req_line = hdr_text.lines().next().unwrap_or_default().to_owned();
+            let json_body: serde_json::Value =
+                serde_json::from_slice(&raw[end..end + content_len]).unwrap();
+            captured_clone
+                .lock()
+                .unwrap()
+                .push((req_line, hdr_text, json_body));
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    let base_url = format!("http://{addr}");
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "claude/seed-evolving",
+                providers: {{
+                    claude: {{
+                        type: "anthropic-messages",
+                        models: {{
+                            "seed-evolving": {{
+                                name: "Seed Evolving",
+                                options: {{
+                                    context_window: 200000,
+                                    reasoning_effort: "high",
+                                    max_tokens: 16384
+                                }}
+                            }}
+                        }},
+                        base_url: {base_url:?},
+                        api_key: {{ source: "env", name: "TEST_ANTHROPIC_TOKEN" }},
+                        max_attempts: 2
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 32768,
+                    max_input_bytes: 32768,
+                    reserved_output_bytes: 1024,
+                    context_cap_bytes: 8192,
+                    compaction: {{
+                        enabled: true,
+                        mode: "summarize",
+                        max_summary_source_bytes: 32768,
+                        retain_ratio: 1,
+                        reuse_prefix: true
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let env = |cmd: &mut std::process::Command| {
+        cmd.env("TEST_ANTHROPIC_TOKEN", "cpk-e2e-token");
+    };
+    let turn1 = scenario.output(
+        &[
+            "--json",
+            "run",
+            "--auto",
+            "Update src/app.rs and add src/extra.rs",
+        ],
+        env,
+    );
+    assert!(
+        turn1.status.success(),
+        "turn1 failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&turn1.stdout),
+        String::from_utf8_lossy(&turn1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&turn1.stdout).contains("ANTHROPIC-TURN1-COMPLETE"),
+        "stdout={}",
+        String::from_utf8_lossy(&turn1.stdout)
+    );
+    let sid = session_id(&turn1);
+
+    // Verify all three Edit modes (replace_all, curly-quote fallback, indentation shift) + CRLF preservation + Write!
+    let updated_app = std::fs::read_to_string(scenario.root().join("src/app.rs")).unwrap();
+    assert!(updated_app.contains("const TAG: &str = \"modern\";\r\n"));
+    assert!(updated_app.contains("let new_val = 1;\r\n    let next = new_val + new_val;\r\n"));
+    assert!(
+        updated_app
+            .contains("        println!(\"updated\");\r\n        println!(\"verified\");\r\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("src/extra.rs")).unwrap(),
+        "pub const EXTRA: usize = 42;\n"
+    );
+
+    let turn2 = scenario.output(
+        &[
+            "--json",
+            "resume",
+            &sid,
+            "--auto",
+            "Confirm follow-up state",
+        ],
+        env,
+    );
+    assert!(turn2.status.success(), "turn2 failed");
+    assert!(
+        String::from_utf8_lossy(&turn2.stdout).contains("ANTHROPIC-TURN2-COMPLETE"),
+        "stdout={}",
+        String::from_utf8_lossy(&turn2.stdout)
+    );
+
+    let compact = scenario.output(&["--json", "compact", &sid], env);
+    assert!(
+        compact.status.success(),
+        "compact failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&compact.stdout),
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    assert_eq!(json(&compact)["status"], "completed");
+
+    // Exercise `session_snapshot_projection_v2` over a durable `compact_summary` window.
+    let shown = scenario.output(&["--json", "show", &sid], env);
+    assert!(
+        shown.status.success(),
+        "show after compact failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("compact_summary"),
+        "stdout={}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+
+    server_handle.join().unwrap();
+    let calls = captured.lock().unwrap();
+    assert_eq!(calls.len(), 6);
+    // Endpoint derived `/v1/messages` from root `base_url`.
+    assert!(calls[0].0.starts_with("POST /v1/messages "));
+    let hdr0 = calls[0].1.to_ascii_lowercase();
+    assert!(hdr0.contains("x-api-key: cpk-e2e-token"));
+    assert!(hdr0.contains("authorization: bearer cpk-e2e-token"));
+    assert!(hdr0.contains("anthropic-version: 2023-06-01"));
+    assert!(hdr0.contains("anthropic-beta: interleaved-thinking-2025-05-14"));
+
+    // Round 2 replayed signed thinking + redacted_thinking and coalesced 3 tool_result blocks into one user turn.
+    let round2_body = &calls[2].2;
+    let r2_asst = round2_body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(r2_asst[0]["type"], "thinking");
+    assert_eq!(r2_asst[0]["signature"], "sig_round_1");
+    assert_eq!(r2_asst[1]["type"], "redacted_thinking");
+    let r2_user = round2_body["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(r2_user.len(), 3);
+    assert!(r2_user.iter().all(|b| b["type"] == "tool_result"));
+
+    // Turn 2 across process restart replayed `sig_final_1` from JSONL and anchored `<repository-context>` first.
+    let turn2_body = &calls[4].2;
+    assert!(
+        turn2_body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<repository-context>")
+    );
+    let turn2_wire = serde_json::to_string(turn2_body).unwrap();
+    assert!(turn2_wire.contains("sig_final_1"));
+
+    // Manual `/compact` with `reuse_prefix: true` reused tools + system + `<repository-context>` + Turn 1 history!
+    let summary_body = &calls[5].2;
+    assert!(
+        summary_body["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty())
+    );
+    assert!(
+        summary_body["system"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        summary_body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<repository-context>")
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_claude_edit_fallbacks_and_ambiguity_errors_report_cleanly() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let scenario = Scenario::new();
+    std::fs::create_dir_all(scenario.root().join("src")).unwrap();
+    // Fixture exercising:
+    // - Stage 1 trailing-whitespace + CRLF normalization (`replace_all: true` + `MatchCount(2)` when `replace_all: false`)
+    // - Stage 2 curly-quote `MatchCount(2)` ambiguity
+    // - Stage 3 negative-delta indentation shift (2-space file vs 6-space needle with inner blank line & trailing newline)
+    // - Stage 3 `MatchCount(2)` ambiguity and `MatchCount(0)` missing needle
+    let fixture = concat!(
+        "let dup_ws = 1;   \r\n",
+        "let dup_ws = 1;\t\r\n",
+        "let uniq_ws = 9;   \r\n",
+        "const Q: &str = \u{201c}dup\u{201d};\r\n",
+        "const Q2: &str = \u{201c}dup\u{201d};\r\n",
+        "const S: &str = \u{2018}single\u{2019};\r\n",
+        "  let dedent_target = 10;\r\n",
+        "\r\n",
+        "  let dedent_end = 20;\r\n",
+        "  let amb_indent = 1;\r\n",
+        "  let amb_tail = 2;\r\n",
+        "    let amb_indent = 1;\r\n",
+        "    let amb_tail = 2;\r\n",
+    );
+    std::fs::write(scenario.root().join("src/fuzzy.rs"), fixture).unwrap();
+
+    // Round 1: Read (with offset/limit), Glob (with path), Grep (escaped/class/group regex, unbalanced paren, explicit regex:true).
+    let r1 = r#"{"type":"message","content":[
+        {"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"src/fuzzy.rs","offset":1,"limit":50}},
+        {"type":"tool_use","id":"g1","name":"Glob","input":{"path":"src"}},
+        {"type":"tool_use","id":"s1","name":"Grep","input":{"path":"src","pattern":"dedent_[a-z]+\\s*=\\s*(10|20)"}},
+        {"type":"tool_use","id":"s2","name":"Grep","input":{"path":"src","pattern":"unbalanced)paren"}},
+        {"type":"tool_use","id":"s3","name":"Grep","input":{"path":"src","pattern":"uniq_ws","regex":true}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":20}}"#;
+
+    // Round 2: Ambiguity/missing errors (Stage 1 dup, Stage 2 quote dup, Stage 3 indent dup, missing)
+    // followed by valid Stage 1 trailing-ws single + Stage 1 replace_all + Stage 2 single-curly-quote + Stage 3 negative-delta shift.
+    let r2 = r#"{"type":"message","content":[
+        {"type":"tool_use","id":"e_ws_amb","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"let dup_ws = 1;\n","new_string":"let dup_ws = 2;\n"}},
+        {"type":"tool_use","id":"e_q_amb","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"\"dup\"","new_string":"\"fixed\""}},
+        {"type":"tool_use","id":"e_ind_amb","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"let amb_indent = 1;\nlet amb_tail = 2;\n","new_string":"let amb_indent = 3;\nlet amb_tail = 4;\n"}},
+        {"type":"tool_use","id":"e_miss","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"never_present_token","new_string":"x"}},
+        {"type":"tool_use","id":"e_ws_ok","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"let uniq_ws = 9;\n","new_string":"let uniq_ws = 99;\n"}},
+        {"type":"tool_use","id":"e_ws_all","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"let dup_ws = 1;\n","new_string":"let dup_ws = 7;\n","replace_all":true}},
+        {"type":"tool_use","id":"e_sq_ok","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"'single'","new_string":"'straight'"}},
+        {"type":"tool_use","id":"e_dedent","name":"Edit","input":{"file_path":"src/fuzzy.rs","old_string":"      let dedent_target = 10;\n\n      let dedent_end = 20;\n","new_string":"      let dedent_target = 100;\n\n      let dedent_end = 200;\n"}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":30,"output_tokens":40}}"#;
+
+    let r3 = r#"{"type":"message","content":[{"type":"text","text":"FUZZY-EDITS-VERIFIED"}],"stop_reason":"end_turn","usage":{"input_tokens":50,"output_tokens":10}}"#;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap_clone = std::sync::Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        for body in [r1, r2, r3] {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut end = None;
+            let mut len = 0_usize;
+            loop {
+                let mut buf = [0_u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if end.is_none()
+                    && let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    end = Some(p + 4);
+                    for line in String::from_utf8_lossy(&raw[..p + 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(e) = end
+                    && raw.len() >= e + len
+                {
+                    break;
+                }
+            }
+            let e = end.unwrap();
+            cap_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&raw[e..e + len]).unwrap());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    let base_url = format!("http://{addr}");
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"claude/m",providers:{{claude:{{type:"anthropic-messages",models:["m"],base_url:{base_url:?},api_key:"k",streaming:false}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let out = scenario.output(&["--json", "run", "--auto", "exercise fuzzy edits"], |_| {});
+    assert!(
+        out.status.success(),
+        "fuzzy run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    handle.join().unwrap();
+
+    let final_file = std::fs::read_to_string(scenario.root().join("src/fuzzy.rs")).unwrap();
+    assert!(
+        final_file.contains("let uniq_ws = 99;\r\n"),
+        "{final_file:?}"
+    );
+    assert_eq!(final_file.matches("let dup_ws = 7;\r\n").count(), 2);
+    assert!(final_file.contains("const S: &str = 'straight';\r\n"));
+    assert!(
+        final_file.contains("  let dedent_target = 100;\r\n\r\n  let dedent_end = 200;\r\n"),
+        "{final_file:?}"
+    );
+
+    let reqs = captured.lock().unwrap();
+    let round3_wire = serde_json::to_string(&reqs[2]).unwrap();
+    assert_eq!(
+        round3_wire
+            .matches("edit match count must be exactly one, found 2")
+            .count(),
+        3,
+        "{round3_wire}"
+    );
+    assert!(
+        round3_wire.contains("edit match count must be exactly one, found 0"),
+        "{round3_wire}"
+    );
 }

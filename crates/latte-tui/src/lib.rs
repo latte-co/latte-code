@@ -162,7 +162,10 @@ impl TerminalGuard {
     /// Panics only if the process-local stage mutex is poisoned; the partially-created guard
     /// still rolls back raw/alternate terminal modes during unwinding.
     pub fn enter() -> Result<Self, TuiError> {
-        Self::enter_with_hook(|_| {})
+        let enable_mouse = std::env::var_os("LATTE_TUI_MOUSE_CAPTURE")
+            .is_some_and(|val| val == "1" || val.eq_ignore_ascii_case("true"));
+        let ops: Arc<dyn TerminalOps> = Arc::new(CrosstermTerminalOps);
+        Self::enter_with_hook_ops_and_mouse(|_| {}, &ops, enable_mouse)
     }
 
     /// Enters with a callback after each committed stage, before interrupt checking.
@@ -177,8 +180,16 @@ impl TerminalGuard {
     }
 
     fn enter_with_hook_and_ops(
+        hook: impl FnMut(TerminalStage),
+        ops: &Arc<dyn TerminalOps>,
+    ) -> Result<Self, TuiError> {
+        Self::enter_with_hook_ops_and_mouse(hook, ops, true)
+    }
+
+    fn enter_with_hook_ops_and_mouse(
         mut hook: impl FnMut(TerminalStage),
         ops: &Arc<dyn TerminalOps>,
+        enable_mouse: bool,
     ) -> Result<Self, TuiError> {
         let terminal_lock = TERMINAL_LOCK
             .lock()
@@ -222,10 +233,12 @@ impl TerminalGuard {
         stages.lock().unwrap().alternate = true;
         hook(TerminalStage::Alternate);
         guard.check_interrupted()?;
-        ops.enable_mouse()?;
-        stages.lock().unwrap().mouse = true;
-        hook(TerminalStage::Mouse);
-        guard.check_interrupted()?;
+        if enable_mouse {
+            ops.enable_mouse()?;
+            stages.lock().unwrap().mouse = true;
+            hook(TerminalStage::Mouse);
+            guard.check_interrupted()?;
+        }
         ops.enable_paste()?;
         stages.lock().unwrap().paste = true;
         hook(TerminalStage::Paste);

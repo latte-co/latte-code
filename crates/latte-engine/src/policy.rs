@@ -89,8 +89,11 @@ impl PermissionPolicy {
             version,
         })
     }
+    pub(crate) fn is_denied(&self, target: &str) -> bool {
+        self.denies.is_match(target)
+    }
     pub(crate) fn decide(&self, effect: EffectClass, target: &str) -> PolicyDecision {
-        if self.denies.is_match(target) {
+        if self.is_denied(target) {
             PolicyDecision::Deny
         } else if effect == EffectClass::Read {
             PolicyDecision::Allow

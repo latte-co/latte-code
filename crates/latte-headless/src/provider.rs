@@ -11,6 +11,19 @@ use std::{
 };
 use thiserror::Error;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingBlock {
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -22,6 +35,10 @@ pub enum Message {
     },
     Assistant {
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<ThinkingBlock>,
         tool_calls: Vec<ToolCall>,
     },
     Tool {
@@ -76,6 +93,25 @@ pub struct ProviderResponse {
     pub provider_state: Option<Value>,
 }
 
+impl ProviderResponse {
+    #[must_use]
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.provider_state
+            .as_ref()
+            .and_then(|state| state.get("reasoning_content"))
+            .and_then(Value::as_str)
+    }
+
+    #[must_use]
+    pub fn thinking_blocks(&self) -> Vec<ThinkingBlock> {
+        self.provider_state
+            .as_ref()
+            .and_then(|state| state.get("thinking_blocks"))
+            .and_then(|blocks| serde_json::from_value(blocks.clone()).ok())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub messages: Vec<Message>,
@@ -91,6 +127,16 @@ pub struct ProviderRequest {
 /// would let a config file replace resolved credentials or the wire format.
 pub(crate) const RESERVED_HEADERS: [&str; 4] =
     ["authorization", "content-type", "host", "content-length"];
+
+/// Headers the Anthropic Messages provider derives itself.
+pub(crate) const ANTHROPIC_RESERVED_HEADERS: [&str; 6] = [
+    "authorization",
+    "x-api-key",
+    "anthropic-version",
+    "content-type",
+    "host",
+    "content-length",
+];
 
 /// The only placeholder a configured header value may use.
 pub(crate) const SESSION_ID_PLACEHOLDER: &str = "${session_id}";
@@ -265,7 +311,7 @@ impl OpenAiProvider {
         timeout: Duration,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(30)))
             .build()
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         Ok(Self {
@@ -279,7 +325,7 @@ impl OpenAiProvider {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
-            streaming: false,
+            streaming: true,
             headers: std::collections::BTreeMap::new(),
         })
     }
@@ -357,6 +403,8 @@ enum WireRequestMessage<'a> {
     },
     Assistant {
         content: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<&'a str>,
         /// Omitted when the assistant turn made no calls. An empty array is not
         /// the same as absence on the wire: some Providers reject `tool_calls:
         /// []`, which would fail every follow-up turn of a Session whose
@@ -430,6 +478,8 @@ struct WireMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<WireCall>,
     #[serde(default)]
     input_request: Option<InputRequest>,
@@ -450,9 +500,12 @@ fn wire_message(message: &Message) -> Result<WireRequestMessage<'_>, ProviderErr
         Message::User { content } => WireRequestMessage::User { content },
         Message::Assistant {
             content,
+            reasoning_content,
             tool_calls,
+            ..
         } => WireRequestMessage::Assistant {
             content: content.as_deref(),
+            reasoning_content: reasoning_content.as_deref(),
             tool_calls: tool_calls
                 .iter()
                 .map(|call| {
@@ -512,77 +565,25 @@ impl Provider for OpenAiProvider {
                 reasoning_effort: this.reasoning_effort.as_deref(),
                 stream: this.streaming.then_some(true),
             };
-            let mut attempt = 0;
-            let response = loop {
-                attempt += 1;
-                if context.cancellation.is_cancelled() {
-                    return Err(ProviderError::Cancelled);
-                }
-                emit_provider_event(&context, ProviderEvent::Attempt { number: attempt });
-                let remaining = context
-                    .deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(this.timeout);
-                if remaining.is_zero() {
-                    return Err(ProviderError::Timeout);
-                }
-                let sent = tokio::time::timeout(
-                    remaining,
+            let response =
+                send_json_with_retries(&body, this.timeout, this.max_attempts, &context, || {
                     apply_headers(
                         this.client.post(&this.endpoint).bearer_auth(&this.api_key),
                         &this.headers,
                         &request.session_ref,
                     )
-                    .json(&body)
-                    .send(),
-                )
-                .await;
-                let response = match sent {
-                    Err(_) => return Err(ProviderError::Timeout),
-                    Ok(Err(error)) if error.is_connect() && attempt < this.max_attempts => {
-                        retry_pause(&context, attempt, None).await?;
-                        continue;
-                    }
-                    Ok(Err(error)) => {
-                        return Err(if error.is_timeout() {
-                            ProviderError::Timeout
-                        } else {
-                            ProviderError::Transport(error.to_string())
-                        });
-                    }
-                    Ok(Ok(response)) => response,
-                };
-                let status = response.status().as_u16();
-                if !response.status().is_success()
-                    && is_retryable_status(status)
-                    && attempt < this.max_attempts
-                {
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-                    retry_pause(&context, attempt, retry_after).await?;
-                    continue;
-                }
-                break response;
-            };
+                })
+                .await?;
             if !response.status().is_success() {
                 let status = response.status().as_u16();
-                let request_id = response
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| format!(" (request {v})"))
-                    .unwrap_or_default();
+                let request_id = extract_request_id(response.headers());
                 // Buffer the (bounded) error body once: the empty-body case
                 // may still fall back to an inline request, while every other
                 // rejection is classified from its body (context-overflow in
                 // particular drives deterministic recovery in the session).
-                let error_body = response
-                    .bytes()
+                let error_body = tokio::time::timeout(this.timeout, response.bytes())
                     .await
+                    .map_err(|_| ProviderError::Timeout)?
                     .map_err(|error| ProviderError::Transport(error.to_string()))?;
                 let error_body = &error_body;
                 if this.streaming
@@ -614,11 +615,11 @@ impl Provider for OpenAiProvider {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if this.streaming && content_type.contains("text/event-stream") {
-                return parse_openai_sse(response, &context).await;
+                return parse_openai_sse(response, this.timeout, &context).await;
             }
-            let wire: Wire = response
-                .json()
+            let wire: Wire = tokio::time::timeout(this.timeout, response.json())
                 .await
+                .map_err(|_| ProviderError::Timeout)?
                 .map_err(|e| ProviderError::Malformed(e.to_string()))?;
             decode_wire(wire, this.compatibility_input_request)
         })
@@ -668,7 +669,16 @@ fn apply_headers(
 /// meaningful; only 401/403 terminalize — see the `Err` arm in
 /// `session.rs`).
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 502 | 503 | 504 | 529)
+}
+
+fn extract_request_id(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .or_else(|| headers.get("request-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|v| format!(" (request {v})"))
+        .unwrap_or_default()
 }
 
 /// Maps one non-success HTTP response to the session-facing error. A
@@ -698,12 +708,14 @@ const CONTEXT_OVERFLOW_CODES: &[&str] = &[
 ];
 
 /// Message substrings used only when no structured code is present
-/// (proxies and non-OpenAI-compatible error envelopes).
+/// (proxies, Anthropic `/v1/messages`, and non-OpenAI-compatible error envelopes).
 const CONTEXT_OVERFLOW_MESSAGE_MARKERS: &[&str] = &[
     "maximum context length",
     "context length",
     "context window",
     "too many tokens",
+    "prompt is too long",
+    "exceed context limit",
 ];
 
 fn body_signals_context_overflow(body: &[u8]) -> bool {
@@ -736,12 +748,100 @@ fn body_signals_context_overflow(body: &[u8]) -> bool {
 }
 
 fn emit_provider_event(context: &ProviderContext, event: ProviderEvent) {
-    // Rendering observers are intentionally outside the provider critical
-    // path. A slow terminal reducer cannot hold the network response open.
+    // Deliver deltas synchronously in exact FIFO chunk order. Sinks are
+    // non-blocking channel senders, never blocking I/O.
     if let Some(sink) = &context.events {
-        let sink = Arc::clone(sink);
-        tokio::task::spawn_blocking(move || sink.observe(event));
+        sink.observe(event);
     }
+}
+
+async fn send_json_with_retries<B, F>(
+    body: &B,
+    timeout: Duration,
+    max_attempts: u32,
+    context: &ProviderContext,
+    make_builder: F,
+) -> Result<reqwest::Response, ProviderError>
+where
+    B: Serialize + ?Sized,
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        if context.cancellation.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        emit_provider_event(context, ProviderEvent::Attempt { number: attempt });
+        let remaining = context
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(timeout);
+        if remaining.is_zero() {
+            return Err(ProviderError::Timeout);
+        }
+        let sent = tokio::time::timeout(remaining, make_builder().json(body).send()).await;
+        let response = match sent {
+            Err(_) => return Err(ProviderError::Timeout),
+            Ok(Err(error)) if error.is_connect() && attempt < max_attempts => {
+                retry_pause(context, attempt, None).await?;
+                continue;
+            }
+            Ok(Err(error)) => {
+                return Err(if error.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Transport(error.to_string())
+                });
+            }
+            Ok(Ok(response)) => response,
+        };
+        let status = response.status().as_u16();
+        if !response.status().is_success() && is_retryable_status(status) && attempt < max_attempts
+        {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            retry_pause(context, attempt, retry_after).await?;
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
+async fn send_json_once(
+    body: &Value,
+    timeout: Duration,
+    context: &ProviderContext,
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, ProviderError> {
+    if context.cancellation.is_cancelled() {
+        return Err(ProviderError::Cancelled);
+    }
+    let remaining = context
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .min(timeout);
+    if remaining.is_zero() {
+        return Err(ProviderError::Timeout);
+    }
+    let response = tokio::time::timeout(remaining, builder.json(body).send())
+        .await
+        .map_err(|_| ProviderError::Timeout)?
+        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let request_id = extract_request_id(response.headers());
+        let error_body = tokio::time::timeout(timeout, response.bytes())
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        return Err(classify_http_error(status, request_id, &error_body));
+    }
+    Ok(response)
 }
 
 async fn complete_inline_once(
@@ -750,18 +850,10 @@ async fn complete_inline_once(
     session_ref: &str,
     context: &ProviderContext,
 ) -> Result<ProviderResponse, ProviderError> {
-    if context.cancellation.is_cancelled() {
-        return Err(ProviderError::Cancelled);
-    }
-    let remaining = context
-        .deadline
-        .saturating_duration_since(Instant::now())
-        .min(provider.timeout);
-    if remaining.is_zero() {
-        return Err(ProviderError::Timeout);
-    }
-    let response = tokio::time::timeout(
-        remaining,
+    let response = send_json_once(
+        &body,
+        provider.timeout,
+        context,
         apply_headers(
             provider
                 .client
@@ -769,30 +861,12 @@ async fn complete_inline_once(
                 .bearer_auth(&provider.api_key),
             &provider.headers,
             session_ref,
-        )
-        .json(&body)
-        .send(),
+        ),
     )
-    .await
-    .map_err(|_| ProviderError::Timeout)?
-    .map_err(|error| ProviderError::Transport(error.to_string()))?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| format!(" (request {value})"))
-            .unwrap_or_default();
-        let error_body = response
-            .bytes()
-            .await
-            .map_err(|error| ProviderError::Transport(error.to_string()))?;
-        return Err(classify_http_error(status, request_id, &error_body));
-    }
-    let wire = response
-        .json()
+    .await?;
+    let wire = tokio::time::timeout(provider.timeout, response.json())
         .await
+        .map_err(|_| ProviderError::Timeout)?
         .map_err(|error| ProviderError::Malformed(error.to_string()))?;
     decode_wire(wire, provider.compatibility_input_request)
 }
@@ -819,13 +893,17 @@ fn decode_wire(
         ));
     }
     let tool_calls = decode_tool_calls(message.tool_calls)?;
+    let provider_state = message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+        .map(|reasoning| serde_json::json!({ "reasoning_content": reasoning }));
     Ok(ProviderResponse {
         message: message.content,
         tool_calls,
         input_request: message.input_request,
         usage,
         finish_reason: choice.finish_reason.map(finish_reason),
-        provider_state: None,
+        provider_state,
     })
 }
 
@@ -902,6 +980,8 @@ struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
 }
 #[derive(Debug, Deserialize)]
@@ -922,6 +1002,7 @@ struct StreamFunction {
 #[derive(Default)]
 struct StreamAssembly {
     content: String,
+    reasoning_content: String,
     tools: Vec<StreamToolAssembly>,
     finish_reason: Option<String>,
     usage: Option<WireUsage>,
@@ -933,18 +1014,23 @@ struct StreamToolAssembly {
     arguments: String,
 }
 
-async fn parse_openai_sse(
+async fn stream_sse_events<F>(
     mut response: reqwest::Response,
+    idle_timeout: Duration,
     context: &ProviderContext,
-) -> Result<ProviderResponse, ProviderError> {
+    mut on_event: F,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(&str, &ProviderContext) -> Result<bool, ProviderError>,
+{
     let mut buffer = Vec::<u8>::new();
     let mut data_lines = Vec::<String>::new();
     let mut total = 0_usize;
     let mut done = false;
-    let mut assembly = StreamAssembly::default();
     loop {
         let next = tokio::select! {
             chunk = response.chunk() => chunk.map_err(|error| ProviderError::Transport(error.to_string()))?,
+            () = tokio::time::sleep(idle_timeout) => return Err(ProviderError::Timeout),
             () = context.cancellation.cancelled() => return Err(ProviderError::Cancelled),
         };
         let Some(chunk) = next else {
@@ -963,8 +1049,7 @@ async fn parse_openai_sse(
             }
             if line.is_empty() {
                 if !data_lines.is_empty() {
-                    done =
-                        consume_sse_event(&data_lines.join("\n"), &mut assembly, context)? || done;
+                    done = on_event(&data_lines.join("\n"), context)? || done;
                     data_lines.clear();
                     if done {
                         break;
@@ -997,8 +1082,21 @@ async fn parse_openai_sse(
         }
     }
     if !data_lines.is_empty() && !done {
-        done = consume_sse_event(&data_lines.join("\n"), &mut assembly, context)?;
+        done = on_event(&data_lines.join("\n"), context)?;
     }
+    Ok(done)
+}
+
+async fn parse_openai_sse(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    context: &ProviderContext,
+) -> Result<ProviderResponse, ProviderError> {
+    let mut assembly = StreamAssembly::default();
+    let done = stream_sse_events(response, idle_timeout, context, |data, ctx| {
+        consume_sse_event(data, &mut assembly, ctx)
+    })
+    .await?;
     if !done {
         return Err(ProviderError::Malformed(
             "SSE stream ended without [DONE]".into(),
@@ -1023,13 +1121,15 @@ async fn parse_openai_sse(
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
     validate_tool_calls(&calls)?;
+    let provider_state = (!assembly.reasoning_content.is_empty())
+        .then(|| serde_json::json!({ "reasoning_content": assembly.reasoning_content }));
     Ok(ProviderResponse {
         message: (!assembly.content.is_empty()).then_some(assembly.content),
         tool_calls: calls,
         input_request: None,
         usage: usage_from_wire(assembly.usage),
         finish_reason: assembly.finish_reason.map(finish_reason),
-        provider_state: None,
+        provider_state,
     })
 }
 
@@ -1051,6 +1151,16 @@ fn consume_sse_event(
     };
     if let Some(reason) = choice.finish_reason {
         assembly.finish_reason = Some(reason);
+    }
+    if let Some(reasoning) = choice.delta.reasoning_content
+        && !reasoning.is_empty()
+    {
+        assembly.reasoning_content.push_str(&reasoning);
+        if assembly.reasoning_content.len() > MAX_SSE_BODY_BYTES {
+            return Err(ProviderError::Malformed(
+                "stream reasoning content exceeds limit".into(),
+            ));
+        }
     }
     if let Some(delta) = choice.delta.content
         && !delta.is_empty()
@@ -1127,29 +1237,945 @@ impl std::fmt::Debug for OpenAiProvider {
             .finish_non_exhaustive()
     }
 }
+
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 16_384;
+const MAX_SSE_CONTENT_BLOCKS: usize = 256;
+
+#[derive(Clone)]
+pub struct AnthropicProvider {
+    client: reqwest::Client,
+    endpoint: String,
+    model: String,
+    api_key: String,
+    timeout: Duration,
+    max_attempts: u32,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+    streaming: bool,
+    prompt_caching: bool,
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+impl AnthropicProvider {
+    pub fn new(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeout.min(Duration::from_secs(30)))
+            .build()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        Ok(Self {
+            client,
+            endpoint: endpoint.into(),
+            model: model.into(),
+            api_key: api_key.into(),
+            timeout,
+            max_attempts: 1,
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            streaming: true,
+            prompt_caching: true,
+            headers: std::collections::BTreeMap::new(),
+        })
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: std::collections::BTreeMap<String, String>) -> Self {
+        self.headers = headers
+            .into_iter()
+            .filter(|(name, _)| {
+                !ANTHROPIC_RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+            })
+            .collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_sampling_options(
+        mut self,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    #[must_use]
+    pub fn with_streaming(mut self, enabled: bool) -> Self {
+        self.streaming = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching = enabled;
+        self
+    }
+
+    fn request_builder(
+        &self,
+        session_ref: &str,
+        thinking_enabled: bool,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self
+            .client
+            .post(&self.endpoint)
+            .header("x-api-key", &self.api_key)
+            .bearer_auth(&self.api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION);
+        if thinking_enabled
+            && !self
+                .headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("anthropic-beta"))
+        {
+            builder = builder.header("anthropic-beta", ANTHROPIC_INTERLEAVED_THINKING_BETA);
+        }
+        apply_headers(builder, &self.headers, session_ref)
+    }
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+fn sanitize_anthropic_tool_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return id.to_owned();
+    }
+    let digest = Sha256::digest(id.as_bytes());
+    format!("toolu_{digest:x}")[..38].to_owned()
+}
+
+fn resolve_anthropic_budgets(
+    configured_max_tokens: Option<u32>,
+    reasoning_effort: Option<&str>,
+) -> (u32, Option<u32>) {
+    let raw_thinking = reasoning_effort.and_then(|effort| {
+        let normalized = effort.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "none" | "off" | "disabled" => None,
+            "minimal" => Some(1_024),
+            "low" => Some(4_096),
+            "medium" => Some(10_000),
+            "high" => Some(16_384),
+            "xhigh" | "max" => Some(31_999),
+            other => other.parse::<u32>().ok().filter(|&tokens| tokens >= 1_024),
+        }
+    });
+    match (configured_max_tokens, raw_thinking) {
+        (Some(max_tokens), Some(budget)) if max_tokens >= 2_048 => {
+            (max_tokens, Some(budget.min(max_tokens - 1_024)))
+        }
+        (Some(max_tokens), _) => (max_tokens.max(1), None),
+        (None, Some(budget)) => (
+            ANTHROPIC_DEFAULT_MAX_TOKENS.max(budget.saturating_add(8_192)),
+            Some(budget),
+        ),
+        (None, None) => (ANTHROPIC_DEFAULT_MAX_TOKENS, None),
+    }
+}
+
+fn push_anthropic_turn(turns: &mut Vec<(String, Vec<Value>)>, role: &str, blocks: Vec<Value>) {
+    if let Some((last_role, last_blocks)) = turns.last_mut()
+        && last_role == role
+    {
+        last_blocks.extend(blocks);
+        return;
+    }
+    turns.push((role.to_owned(), blocks));
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_anthropic_payload(
+    provider: &AnthropicProvider,
+    request: &ProviderRequest,
+) -> (Value, bool) {
+    let (max_tokens, thinking_budget) =
+        resolve_anthropic_budgets(provider.max_tokens, provider.reasoning_effort.as_deref());
+    let ephemeral = || serde_json::json!({ "type": "ephemeral" });
+
+    let mut system_blocks = Vec::<Value>::new();
+    let mut turns = Vec::<(String, Vec<Value>)>::new();
+    for message in &request.messages {
+        match message {
+            Message::System { content } => {
+                if !content.is_empty() {
+                    system_blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": content,
+                    }));
+                }
+            }
+            Message::User { content } => {
+                let text = if content.is_empty() {
+                    " "
+                } else {
+                    content.as_str()
+                };
+                push_anthropic_turn(
+                    &mut turns,
+                    "user",
+                    vec![serde_json::json!({ "type": "text", "text": text })],
+                );
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                push_anthropic_turn(
+                    &mut turns,
+                    "user",
+                    vec![serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": sanitize_anthropic_tool_id(tool_call_id),
+                        "content": content,
+                    })],
+                );
+            }
+            Message::Assistant {
+                content,
+                thinking_blocks,
+                tool_calls,
+                ..
+            } => {
+                let mut blocks = Vec::<Value>::new();
+                for block in thinking_blocks {
+                    match block {
+                        ThinkingBlock::Thinking {
+                            thinking,
+                            signature: Some(sig),
+                        } if !sig.is_empty() => {
+                            blocks.push(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": thinking,
+                                "signature": sig,
+                            }));
+                        }
+                        ThinkingBlock::RedactedThinking { data } if !data.is_empty() => {
+                            blocks.push(serde_json::json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                            }));
+                        }
+                        ThinkingBlock::Thinking { .. } | ThinkingBlock::RedactedThinking { .. } => {
+                        }
+                    }
+                }
+                if let Some(text) = content.as_deref().filter(|s| !s.is_empty()) {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                for call in tool_calls {
+                    let input = if call.input.is_object() {
+                        call.input.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": sanitize_anthropic_tool_id(&call.id),
+                        "name": call.name,
+                        "input": input,
+                    }));
+                }
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": " " }));
+                }
+                push_anthropic_turn(&mut turns, "assistant", blocks);
+            }
+        }
+    }
+    if turns.first().is_some_and(|(role, _)| role == "assistant") {
+        turns.insert(
+            0,
+            (
+                "user".to_owned(),
+                vec![serde_json::json!({ "type": "text", "text": "[continued]" })],
+            ),
+        );
+    }
+
+    let mut wire_tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect();
+
+    if provider.prompt_caching {
+        if let Some(last_tool) = wire_tools.last_mut() {
+            last_tool["cache_control"] = ephemeral();
+        }
+        if let Some(last_sys) = system_blocks.last_mut() {
+            last_sys["cache_control"] = ephemeral();
+        }
+        let last_turn_idx = turns.len().checked_sub(1);
+        let mut tagged_repo = false;
+        for (turn_idx, (role, blocks)) in turns.iter_mut().enumerate() {
+            if tagged_repo {
+                break;
+            }
+            if role != "user" {
+                continue;
+            }
+            let block_count = blocks.len();
+            for (block_idx, block) in blocks.iter_mut().enumerate() {
+                let is_repo = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("<repository-context>"));
+                let is_overall_tail =
+                    Some(turn_idx) == last_turn_idx && block_idx + 1 == block_count;
+                if is_repo && !is_overall_tail {
+                    block["cache_control"] = ephemeral();
+                    tagged_repo = true;
+                    break;
+                }
+            }
+        }
+        if let Some((_, blocks)) = turns.last_mut()
+            && let Some(last_block) = blocks.last_mut()
+        {
+            last_block["cache_control"] = ephemeral();
+        }
+    }
+
+    let wire_messages: Vec<Value> = turns
+        .into_iter()
+        .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": provider.model,
+        "max_tokens": max_tokens,
+        "messages": wire_messages,
+    });
+    if !system_blocks.is_empty() {
+        body["system"] = Value::Array(system_blocks);
+    }
+    if !wire_tools.is_empty() {
+        body["tools"] = Value::Array(wire_tools);
+        body["tool_choice"] = serde_json::json!({ "type": "auto" });
+    }
+    if let Some(budget) = thinking_budget {
+        body["thinking"] = serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": budget,
+        });
+    } else if let Some(temperature) = provider.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if provider.streaming {
+        body["stream"] = Value::Bool(true);
+    }
+    (body, thinking_budget.is_some())
+}
+
+impl Provider for AnthropicProvider {
+    fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
+        let this = self.clone();
+        Box::pin(async move {
+            if context.cancellation.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            let (body, thinking_enabled) = build_anthropic_payload(&this, &request);
+            let response =
+                send_json_with_retries(&body, this.timeout, this.max_attempts, &context, || {
+                    this.request_builder(&request.session_ref, thinking_enabled)
+                })
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let request_id = extract_request_id(response.headers());
+                let error_body = tokio::time::timeout(this.timeout, response.bytes())
+                    .await
+                    .map_err(|_| ProviderError::Timeout)?
+                    .map_err(|error| ProviderError::Transport(error.to_string()))?;
+                if this.streaming
+                    && matches!(status, 400 | 404 | 415 | 422)
+                    && error_body.is_empty()
+                {
+                    let mut inline_body = body;
+                    if let Some(obj) = inline_body.as_object_mut() {
+                        obj.remove("stream");
+                    }
+                    let fallback = send_json_once(
+                        &inline_body,
+                        this.timeout,
+                        &context,
+                        this.request_builder(&request.session_ref, thinking_enabled),
+                    )
+                    .await?;
+                    let wire: AnthropicWireMessage =
+                        tokio::time::timeout(this.timeout, fallback.json())
+                            .await
+                            .map_err(|_| ProviderError::Timeout)?
+                            .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+                    return decode_anthropic_message(wire);
+                }
+                return Err(classify_http_error(status, request_id, &error_body));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if this.streaming && content_type.contains("text/event-stream") {
+                return parse_anthropic_sse(response, this.timeout, &context).await;
+            }
+            let wire: AnthropicWireMessage = tokio::time::timeout(this.timeout, response.json())
+                .await
+                .map_err(|_| ProviderError::Timeout)?
+                .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+            decode_anthropic_message(wire)
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            tools: true,
+            parallel_tool_calls: true,
+            input_request: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct AnthropicWireUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl AnthropicWireUsage {
+    fn merge(&mut self, newer: Self) {
+        if let Some(v) = newer.input_tokens {
+            self.input_tokens = Some(v);
+        }
+        if let Some(v) = newer.output_tokens {
+            self.output_tokens = Some(v);
+        }
+        if let Some(v) = newer.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = Some(v);
+        }
+        if let Some(v) = newer.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(v);
+        }
+    }
+
+    fn into_provider_usage(self) -> ProviderUsage {
+        let has_input = self.input_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some();
+        let total_input = has_input.then(|| {
+            self.input_tokens
+                .unwrap_or(0)
+                .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+                .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+        });
+        let total_tokens = match (total_input, self.output_tokens) {
+            (Some(inp), Some(out)) => Some(inp.saturating_add(out)),
+            (Some(inp), None) => Some(inp),
+            (None, Some(out)) => Some(out),
+            (None, None) => None,
+        };
+        ProviderUsage {
+            input_tokens: total_input,
+            output_tokens: self.output_tokens,
+            total_tokens,
+            cached_tokens: self.cache_read_input_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicWireMessage {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicWireUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+fn anthropic_finish_reason(reason: String) -> FinishReason {
+    match reason.as_str() {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "tool_use" => FinishReason::ToolCalls,
+        "max_tokens" => FinishReason::Length,
+        "refusal" => FinishReason::ContentFilter,
+        _ => FinishReason::Other(reason),
+    }
+}
+
+fn build_anthropic_provider_state(
+    reasoning_parts: &[String],
+    thinking_blocks: &[ThinkingBlock],
+) -> Option<Value> {
+    let reasoning = reasoning_parts.join("\n\n");
+    if reasoning.is_empty() && thinking_blocks.is_empty() {
+        return None;
+    }
+    let mut state = serde_json::Map::new();
+    if !reasoning.is_empty() {
+        state.insert("reasoning_content".into(), Value::String(reasoning));
+    }
+    if !thinking_blocks.is_empty()
+        && let Ok(serialized) = serde_json::to_value(thinking_blocks)
+    {
+        state.insert("thinking_blocks".into(), serialized);
+    }
+    Some(Value::Object(state))
+}
+
+fn decode_anthropic_message(wire: AnthropicWireMessage) -> Result<ProviderResponse, ProviderError> {
+    let mut text = String::new();
+    let mut reasoning_parts = Vec::<String>::new();
+    let mut thinking_blocks = Vec::<ThinkingBlock>::new();
+    let mut tool_calls = Vec::<ToolCall>::new();
+    for block in wire.content {
+        match block.kind.as_str() {
+            "text" => {
+                if let Some(chunk) = block.text {
+                    text.push_str(&chunk);
+                }
+            }
+            "thinking" => {
+                let thought = block.thinking.unwrap_or_default();
+                if !thought.is_empty() {
+                    reasoning_parts.push(thought.clone());
+                }
+                thinking_blocks.push(ThinkingBlock::Thinking {
+                    thinking: thought,
+                    signature: block.signature.filter(|sig| !sig.is_empty()),
+                });
+            }
+            "redacted_thinking" => {
+                if let Some(data) = block.data.filter(|d| !d.is_empty()) {
+                    thinking_blocks.push(ThinkingBlock::RedactedThinking { data });
+                }
+            }
+            "tool_use" => {
+                let id = block
+                    .id
+                    .ok_or_else(|| ProviderError::Malformed("tool_use missing id".into()))?;
+                let name = block
+                    .name
+                    .ok_or_else(|| ProviderError::Malformed("tool_use missing name".into()))?;
+                let input = block.input.unwrap_or_else(|| serde_json::json!({}));
+                if !input.is_object() {
+                    return Err(ProviderError::Malformed(
+                        "tool_use input must be a JSON object".into(),
+                    ));
+                }
+                tool_calls.push(ToolCall { id, name, input });
+            }
+            _ => {}
+        }
+    }
+    validate_tool_calls(&tool_calls)?;
+    let provider_state = build_anthropic_provider_state(&reasoning_parts, &thinking_blocks);
+    Ok(ProviderResponse {
+        message: (!text.is_empty()).then_some(text),
+        tool_calls,
+        input_request: None,
+        usage: wire.usage.map_or_else(
+            ProviderUsage::default,
+            AnthropicWireUsage::into_provider_usage,
+        ),
+        finish_reason: wire.stop_reason.map(anthropic_finish_reason),
+        provider_state,
+    })
+}
+
+enum AnthropicStreamBlock {
+    Empty,
+    Text(String),
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+        initial_input: Option<Value>,
+    },
+}
+
+#[derive(Default)]
+struct AnthropicStreamAssembly {
+    blocks: Vec<AnthropicStreamBlock>,
+    stop_reason: Option<String>,
+    usage: AnthropicWireUsage,
+    saw_start: bool,
+}
+
+async fn parse_anthropic_sse(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    context: &ProviderContext,
+) -> Result<ProviderResponse, ProviderError> {
+    let mut assembly = AnthropicStreamAssembly::default();
+    let done = stream_sse_events(response, idle_timeout, context, |data, ctx| {
+        consume_anthropic_sse_event(data, &mut assembly, ctx)
+    })
+    .await?;
+    if !done || !assembly.saw_start {
+        return Err(ProviderError::Malformed(
+            "Anthropic SSE stream ended without message_stop".into(),
+        ));
+    }
+    let mut text = String::new();
+    let mut reasoning_parts = Vec::<String>::new();
+    let mut thinking_blocks = Vec::<ThinkingBlock>::new();
+    let mut tool_calls = Vec::<ToolCall>::new();
+    for block in assembly.blocks {
+        match block {
+            AnthropicStreamBlock::Empty => {}
+            AnthropicStreamBlock::Text(chunk) => text.push_str(&chunk),
+            AnthropicStreamBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                if !thinking.is_empty() {
+                    reasoning_parts.push(thinking.clone());
+                }
+                thinking_blocks.push(ThinkingBlock::Thinking {
+                    thinking,
+                    signature: (!signature.is_empty()).then_some(signature),
+                });
+            }
+            AnthropicStreamBlock::RedactedThinking { data } => {
+                if !data.is_empty() {
+                    thinking_blocks.push(ThinkingBlock::RedactedThinking { data });
+                }
+            }
+            AnthropicStreamBlock::ToolUse {
+                id,
+                name,
+                input_json,
+                initial_input,
+            } => {
+                let input = if input_json.trim().is_empty() {
+                    initial_input.unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::from_str::<Value>(&input_json)
+                        .map_err(|error| ProviderError::Malformed(error.to_string()))?
+                };
+                if !input.is_object() {
+                    return Err(ProviderError::Malformed(
+                        "stream tool_use input must be a JSON object".into(),
+                    ));
+                }
+                tool_calls.push(ToolCall { id, name, input });
+            }
+        }
+    }
+    validate_tool_calls(&tool_calls)?;
+    let provider_state = build_anthropic_provider_state(&reasoning_parts, &thinking_blocks);
+    Ok(ProviderResponse {
+        message: (!text.is_empty()).then_some(text),
+        tool_calls,
+        input_request: None,
+        usage: assembly.usage.into_provider_usage(),
+        finish_reason: assembly.stop_reason.map(anthropic_finish_reason),
+        provider_state,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn consume_anthropic_sse_event(
+    data: &str,
+    assembly: &mut AnthropicStreamAssembly,
+    context: &ProviderContext,
+) -> Result<bool, ProviderError> {
+    if data == "[DONE]" {
+        return Ok(assembly.saw_start && assembly.stop_reason.is_some());
+    }
+    let event: Value = serde_json::from_str(data).map_err(|error| {
+        ProviderError::Malformed(format!("invalid Anthropic SSE JSON: {error}"))
+    })?;
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match kind {
+        "message_stop" => Ok(true),
+        "error" => {
+            if body_signals_context_overflow(data.as_bytes()) {
+                return Err(ProviderError::ContextOverflow {
+                    request_id: String::new(),
+                });
+            }
+            let err_type = event
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if err_type == "overloaded_error" {
+                return Err(ProviderError::Http {
+                    status: 529,
+                    request_id: String::new(),
+                    retryable: true,
+                });
+            }
+            let msg = event
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("stream error");
+            Err(ProviderError::Malformed(format!(
+                "Anthropic stream error: {msg}"
+            )))
+        }
+        "message_start" => {
+            assembly.saw_start = true;
+            if let Some(usage_val) = event.get("message").and_then(|m| m.get("usage"))
+                && let Ok(usage) = serde_json::from_value::<AnthropicWireUsage>(usage_val.clone())
+            {
+                assembly.usage.merge(usage);
+            }
+            Ok(false)
+        }
+        "content_block_start" => {
+            let index = event
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|idx| usize::try_from(idx).ok())
+                .ok_or_else(|| {
+                    ProviderError::Malformed("content_block_start missing index".into())
+                })?;
+            if index >= MAX_SSE_CONTENT_BLOCKS {
+                return Err(ProviderError::Malformed(
+                    "too many Anthropic content blocks".into(),
+                ));
+            }
+            while assembly.blocks.len() <= index {
+                assembly.blocks.push(AnthropicStreamBlock::Empty);
+            }
+            let block: AnthropicContentBlock = event
+                .get("content_block")
+                .cloned()
+                .ok_or_else(|| ProviderError::Malformed("missing content_block".into()))
+                .and_then(|val| {
+                    serde_json::from_value(val)
+                        .map_err(|err| ProviderError::Malformed(err.to_string()))
+                })?;
+            assembly.blocks[index] = match block.kind.as_str() {
+                "text" => {
+                    let initial = block.text.unwrap_or_default();
+                    if !initial.is_empty() {
+                        emit_provider_event(
+                            context,
+                            ProviderEvent::AssistantDelta {
+                                text: initial.clone(),
+                            },
+                        );
+                    }
+                    AnthropicStreamBlock::Text(initial)
+                }
+                "thinking" => AnthropicStreamBlock::Thinking {
+                    thinking: block.thinking.unwrap_or_default(),
+                    signature: block.signature.unwrap_or_default(),
+                },
+                "redacted_thinking" => AnthropicStreamBlock::RedactedThinking {
+                    data: block.data.unwrap_or_default(),
+                },
+                "tool_use" => {
+                    let id = block
+                        .id
+                        .ok_or_else(|| ProviderError::Malformed("tool_use missing id".into()))?;
+                    let name = block
+                        .name
+                        .ok_or_else(|| ProviderError::Malformed("tool_use missing name".into()))?;
+                    AnthropicStreamBlock::ToolUse {
+                        id,
+                        name,
+                        input_json: String::new(),
+                        initial_input: block.input,
+                    }
+                }
+                _ => AnthropicStreamBlock::Empty,
+            };
+            Ok(false)
+        }
+        "content_block_delta" => {
+            let index = event
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|idx| usize::try_from(idx).ok())
+                .ok_or_else(|| {
+                    ProviderError::Malformed("content_block_delta missing index".into())
+                })?;
+            let target = assembly.blocks.get_mut(index).ok_or_else(|| {
+                ProviderError::Malformed("content_block_delta for unstarted block".into())
+            })?;
+            let delta = event.get("delta").ok_or_else(|| {
+                ProviderError::Malformed("content_block_delta missing delta".into())
+            })?;
+            let delta_type = delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match (target, delta_type) {
+                (AnthropicStreamBlock::Text(buf), "text_delta") => {
+                    if let Some(chunk) = delta.get("text").and_then(Value::as_str)
+                        && !chunk.is_empty()
+                    {
+                        buf.push_str(chunk);
+                        if buf.len() > MAX_SSE_BODY_BYTES {
+                            return Err(ProviderError::Malformed(
+                                "stream assistant content exceeds limit".into(),
+                            ));
+                        }
+                        emit_provider_event(
+                            context,
+                            ProviderEvent::AssistantDelta {
+                                text: chunk.to_owned(),
+                            },
+                        );
+                    }
+                }
+                (AnthropicStreamBlock::Thinking { thinking, .. }, "thinking_delta") => {
+                    if let Some(chunk) = delta.get("thinking").and_then(Value::as_str) {
+                        thinking.push_str(chunk);
+                        if thinking.len() > MAX_SSE_BODY_BYTES {
+                            return Err(ProviderError::Malformed(
+                                "stream thinking content exceeds limit".into(),
+                            ));
+                        }
+                    }
+                }
+                (AnthropicStreamBlock::Thinking { signature, .. }, "signature_delta") => {
+                    if let Some(chunk) = delta.get("signature").and_then(Value::as_str) {
+                        signature.push_str(chunk);
+                    }
+                }
+                (AnthropicStreamBlock::ToolUse { input_json, .. }, "input_json_delta") => {
+                    if let Some(chunk) = delta.get("partial_json").and_then(Value::as_str) {
+                        input_json.push_str(chunk);
+                        if input_json.len() > MAX_SSE_EVENT_BYTES {
+                            return Err(ProviderError::Malformed(
+                                "stream tool_use partial_json exceeds limit".into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(false)
+        }
+        "message_delta" => {
+            if let Some(reason) = event
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                assembly.stop_reason = Some(reason.to_owned());
+            }
+            if let Some(usage_val) = event.get("usage")
+                && let Ok(usage) = serde_json::from_value::<AnthropicWireUsage>(usage_val.clone())
+            {
+                assembly.usage.merge(usage);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
 #[cfg(test)]
 fn tool_schema(name: &str) -> Value {
     match name {
         "read_file" => {
-            serde_json::json!({"type":"object","required":["path"],"properties":{"path":path_schema(),"max_output":output_cap_schema()},"additionalProperties":false})
+            serde_json::json!({"type":"object","required":["path"],"properties":{"path":path_schema(),"offset":{"type":"integer","minimum":1,"maximum":1_000_000},"limit":{"type":"integer","minimum":1,"maximum":10_000},"max_output":output_cap_schema()},"additionalProperties":false})
         }
         "list_directory" => {
-            serde_json::json!({"type":"object","required":["path"],"properties":{"path":path_schema(),"max_entries":{"type":"integer","minimum":1,"maximum":10000}},"additionalProperties":false})
+            serde_json::json!({"type":"object","required":[],"properties":{"path":path_schema(),"max_depth":{"type":"integer","minimum":1,"maximum":8},"glob":{"type":"string","minLength":1,"maxLength":1024},"max_entries":{"type":"integer","minimum":1,"maximum":10_000}},"additionalProperties":false})
         }
         "search" => {
-            serde_json::json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10000},"max_output":output_cap_schema()},"additionalProperties":false})
+            serde_json::json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"path":path_schema(),"glob":{"type":"string","minLength":1,"maxLength":1024},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10_000},"max_output":output_cap_schema()},"additionalProperties":false})
         }
         "read_project_manifest" | "git_diff" => {
             serde_json::json!({"type":"object","required":[],"properties":{"max_output":output_cap_schema()},"additionalProperties":false})
         }
         "edit_file" => {
-            serde_json::json!({"type":"object","required":["path","after","precondition"],"properties":{"path":path_schema(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"precondition":digest_schema()},"anyOf":[{"required":["before"]},{"required":["anchor"]}],"additionalProperties":false})
+            serde_json::json!({"type":"object","required":["path","after"],"properties":{"path":path_schema(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"precondition":digest_schema()},"additionalProperties":false})
         }
         "write_file" => {
-            serde_json::json!({"type":"object","required":["path","content","create_intent"],"properties":{"path":path_schema(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest_schema()},"additionalProperties":false})
+            serde_json::json!({"type":"object","required":["path","content"],"properties":{"path":path_schema(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest_schema()},"additionalProperties":false})
         }
         "process" => {
-            serde_json::json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path_schema(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"oneOf":[{"required":["argv"]},{"required":["shell"]}],"additionalProperties":false})
+            serde_json::json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path_schema(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"additionalProperties":false})
         }
         _ => {
             serde_json::json!({"type":"object","required":[],"properties":{},"additionalProperties":false})
@@ -1695,6 +2721,8 @@ mod tests {
         let messages = vec![
             Message::Assistant {
                 content: None,
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "read_file".into(),
@@ -1890,7 +2918,8 @@ mod tests {
             tool_schema("process")["properties"]["timeout_ms"]["maximum"],
             600_000
         );
-        assert_eq!(tool_schema("process")["oneOf"].as_array().unwrap().len(), 2);
+        assert!(tool_schema("process").get("oneOf").is_none());
+        assert!(tool_schema("edit_file").get("anyOf").is_none());
         assert_eq!(
             tool_schema("process")["properties"]["grace_ms"]["minimum"],
             0
@@ -2008,6 +3037,8 @@ mod tests {
             },
             Message::Assistant {
                 content: Some("assistant".into()),
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".into(),
@@ -2040,6 +3071,8 @@ mod tests {
         let plain = serde_json::to_value(
             wire_message(&Message::Assistant {
                 content: Some("just an answer".into()),
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![],
             })
             .unwrap(),
@@ -2052,6 +3085,8 @@ mod tests {
         let calling = serde_json::to_value(
             wire_message(&Message::Assistant {
                 content: None,
+                reasoning_content: Some("thinking step".into()),
+                thinking_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".into(),
@@ -2066,6 +3101,7 @@ mod tests {
             Some(1),
             "a real call is still serialized: {calling}"
         );
+        assert_eq!(calling["reasoning_content"], "thinking step");
 
         let missing: Wire = serde_json::from_value(serde_json::json!({"choices":[]})).unwrap();
         assert!(matches!(
@@ -2132,6 +3168,8 @@ mod tests {
         assert_eq!(
             Message::Assistant {
                 content: Some("a".into()),
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![],
             }
             .content(),
@@ -2140,6 +3178,8 @@ mod tests {
         assert_eq!(
             Message::Assistant {
                 content: None,
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![],
             }
             .content(),
@@ -2957,6 +3997,481 @@ mod tests {
         assert!(
             !head.iter().any(|line| line.starts_with("x-broken")),
             "{head:?}"
+        );
+    }
+
+    fn count_cache_controls(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                usize::from(map.contains_key("cache_control"))
+                    + map.values().map(count_cache_controls).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(count_cache_controls).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn anthropic_payload_places_up_to_four_cache_breakpoints_coalesces_turns_and_filters_unsigned_thinking()
+     {
+        assert_eq!(resolve_anthropic_budgets(None, None), (16_384, None));
+        assert_eq!(resolve_anthropic_budgets(None, Some("off")), (16_384, None));
+        assert_eq!(
+            resolve_anthropic_budgets(None, Some("minimal")),
+            (16_384, Some(1_024))
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(None, Some("low")),
+            (16_384, Some(4_096))
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(None, Some("medium")),
+            (18_192, Some(10_000))
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(Some(65_536), Some("xhigh")),
+            (65_536, Some(31_999))
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(Some(4_096), Some("high")),
+            (4_096, Some(3_072))
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(Some(1_024), Some("low")),
+            (1_024, None)
+        );
+        assert_eq!(
+            resolve_anthropic_budgets(Some(8_192), Some("2048")),
+            (8_192, Some(2_048))
+        );
+
+        let overlong_id = "call_".to_owned() + &"a".repeat(80);
+        let sanitized = sanitize_anthropic_tool_id(&overlong_id);
+        assert_eq!(sanitized.len(), 38);
+        assert_eq!(sanitized, sanitize_anthropic_tool_id(&overlong_id));
+        assert_eq!(sanitize_anthropic_tool_id("toolu_valid-1"), "toolu_valid-1");
+
+        let provider = AnthropicProvider::new(
+            "http://127.0.0.1:1/v1/messages",
+            "seed-evolving",
+            "secret-anth-key",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_sampling_options(Some(0.3), Some(32_768))
+        .with_reasoning_effort(Some("high".into()))
+        .with_headers(BTreeMap::from([
+            ("x-api-key".into(), "attacker".into()),
+            ("authorization".into(), "Bearer attacker".into()),
+            ("anthropic-version".into(), "1999-01-01".into()),
+            ("x-trace".into(), "sid-${session_id}".into()),
+        ]));
+        assert!(!format!("{provider:?}").contains("secret-anth-key"));
+        assert!(format!("{provider:?}").contains("[REDACTED]"));
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                tools: true,
+                parallel_tool_calls: true,
+                input_request: false,
+            }
+        );
+
+        let tools = vec![
+            ToolDescriptor {
+                name: "Read".into(),
+                description: "Read file".into(),
+                input_schema: tool_schema("read_file"),
+                version: 1,
+                effect: "read".into(),
+            },
+            ToolDescriptor {
+                name: "Edit".into(),
+                description: "Edit file".into(),
+                input_schema: tool_schema("edit_file"),
+                version: 1,
+                effect: "mutate".into(),
+            },
+        ];
+        let request = ProviderRequest {
+            session_ref: "sess123".into(),
+            tools,
+            messages: vec![
+                Message::System {
+                    content: "System instructions".into(),
+                },
+                Message::User {
+                    content: "<repository-context>\nAGENTS.md\n</repository-context>".into(),
+                },
+                Message::User {
+                    content: "Fix src/lib.rs".into(),
+                },
+                Message::Assistant {
+                    content: Some("Inspecting first.".into()),
+                    reasoning_content: Some("unsigned foreign reasoning".into()),
+                    thinking_blocks: vec![
+                        ThinkingBlock::Thinking {
+                            thinking: "unsigned block".into(),
+                            signature: None,
+                        },
+                        ThinkingBlock::Thinking {
+                            thinking: "signed thought".into(),
+                            signature: Some("sig-abc".into()),
+                        },
+                        ThinkingBlock::RedactedThinking {
+                            data: "enc-xyz".into(),
+                        },
+                    ],
+                    tool_calls: vec![ToolCall {
+                        id: overlong_id.clone(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"path": "src/lib.rs"}),
+                    }],
+                },
+                Message::Tool {
+                    tool_call_id: overlong_id,
+                    name: Some("Read".into()),
+                    content: "fn main() {}".into(),
+                },
+                Message::User {
+                    content: "<system-reminder>mode: ask</system-reminder>".into(),
+                },
+            ],
+        };
+
+        let (payload, thinking_on) = build_anthropic_payload(&provider, &request);
+        assert!(thinking_on);
+        assert_eq!(count_cache_controls(&payload), 4);
+        // Thinking enabled omits `temperature` and sets `thinking.budget_tokens`.
+        assert!(payload.get("temperature").is_none());
+        assert_eq!(payload["thinking"]["budget_tokens"], 16_384);
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(payload["tools"][0].get("cache_control").is_none());
+        assert_eq!(payload["tools"][1]["cache_control"]["type"], "ephemeral");
+        // Consecutive User messages and Tool + User messages coalesce into strictly alternating roles.
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "repository-context block carries breakpoint #3"
+        );
+        assert_eq!(msgs[1]["role"], "assistant");
+        let asst_blocks = msgs[1]["content"].as_array().unwrap();
+        // Unsigned thinking was dropped; signed thinking + redacted_thinking + text + tool_use remain.
+        assert_eq!(asst_blocks.len(), 4);
+        assert_eq!(asst_blocks[0]["type"], "thinking");
+        assert_eq!(asst_blocks[0]["signature"], "sig-abc");
+        assert_eq!(asst_blocks[1]["type"], "redacted_thinking");
+        assert_eq!(asst_blocks[2]["type"], "text");
+        assert_eq!(asst_blocks[3]["type"], "tool_use");
+        assert_eq!(asst_blocks[3]["id"], sanitized);
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], sanitized);
+        assert_eq!(msgs[2]["content"][1]["cache_control"]["type"], "ephemeral");
+
+        // Disabling prompt_caching emits zero cache_control markers; disabling thinking keeps temperature.
+        let no_cache = provider
+            .with_prompt_caching(false)
+            .with_reasoning_effort(Some("none".into()));
+        let (plain_payload, plain_thinking) = build_anthropic_payload(
+            &no_cache,
+            &ProviderRequest {
+                session_ref: "s".into(),
+                tools: vec![],
+                messages: vec![Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
+                    tool_calls: vec![],
+                }],
+            },
+        );
+        assert!(!plain_thinking);
+        assert_eq!(count_cache_controls(&plain_payload), 0);
+        assert_eq!(plain_payload["temperature"], 0.3);
+        assert_eq!(plain_payload["messages"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anthropic_sse_streams_thinking_signature_text_and_tools_and_accounts_cache_tokens() {
+        #[derive(Default)]
+        struct Sink(Mutex<Vec<ProviderEvent>>);
+        impl ProviderEventSink for Sink {
+            fn observe(&self, event: ProviderEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":400}}}\n\n",
+            "event: ping\n",
+            "data: {\"type\":\"ping\"}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me check \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"src/lib.rs.\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_stream_1\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque_blob\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"Reading \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"file.\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"src/lib.rs\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_02\",\"name\":\"GitDiff\",\"input\":{}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":4}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":55}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hdr_tx, hdr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            hdr_tx
+                .send(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase())
+                .unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_body}",
+                sse_body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let sink = Arc::new(Sink::default());
+        let provider = AnthropicProvider::new(
+            format!("http://{addr}/v1/messages"),
+            "seed-evolving",
+            "cpk-test-token",
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .with_reasoning_effort(Some("high".into()));
+        let response = provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "sess_abc".into(),
+                    messages: vec![Message::User {
+                        content: "Inspect".into(),
+                    }],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    cancellation: latte_engine::CancellationToken::new(),
+                    events: Some(sink.clone()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let raw_req = hdr_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(raw_req.contains("x-api-key: cpk-test-token"));
+        assert!(raw_req.contains("authorization: bearer cpk-test-token"));
+        assert!(raw_req.contains("anthropic-version: 2023-06-01"));
+        assert!(raw_req.contains("anthropic-beta: interleaved-thinking-2025-05-14"));
+
+        assert_eq!(response.message.as_deref(), Some("Reading file."));
+        assert_eq!(
+            response.reasoning_content(),
+            Some("Let me check src/lib.rs.")
+        );
+        assert_eq!(
+            response.thinking_blocks(),
+            vec![
+                ThinkingBlock::Thinking {
+                    thinking: "Let me check src/lib.rs.".into(),
+                    signature: Some("sig_stream_1".into()),
+                },
+                ThinkingBlock::RedactedThinking {
+                    data: "opaque_blob".into(),
+                },
+            ]
+        );
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].name, "Read");
+        assert_eq!(
+            response.tool_calls[0].input,
+            serde_json::json!({"file_path": "src/lib.rs"})
+        );
+        assert_eq!(response.tool_calls[1].name, "GitDiff");
+        assert_eq!(response.tool_calls[1].input, serde_json::json!({}));
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        assert_eq!(
+            response.usage,
+            ProviderUsage {
+                input_tokens: Some(520),
+                output_tokens: Some(55),
+                total_tokens: Some(575),
+                cached_tokens: Some(400),
+            }
+        );
+        let observed = sink.0.lock().unwrap().clone();
+        assert!(observed.contains(&ProviderEvent::AssistantDelta {
+            text: "Reading ".into()
+        }));
+        assert!(observed.contains(&ProviderEvent::AssistantDelta {
+            text: "file.".into()
+        }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anthropic_retries_529_falls_back_on_empty_400_and_classifies_overflow_and_errors() {
+        // 1) 529 Overloaded retries then succeeds on inline JSON; 400 "prompt is too long" -> ContextOverflow.
+        let (endpoint, _heads) = header_capturing_server(vec![
+            (
+                "529 Overloaded",
+                r#"{"error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"type":"message","content":[{"type":"thinking","thinking":"ok","signature":"s1"},{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}"#,
+            ),
+        ]);
+        let ok_resp = AnthropicProvider::new(endpoint, "m", "k", Duration::from_secs(2))
+            .unwrap()
+            .with_max_attempts(2)
+            .with_streaming(false)
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.message.as_deref(), Some("done"));
+        assert_eq!(ok_resp.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(ok_resp.thinking_blocks().len(), 1);
+
+        // 2) Empty-body 400 on stream=true falls back to non-streaming inline JSON.
+        let (fallback_ep, fallback_heads) = header_capturing_server(vec![
+            ("400 Bad Request", ""),
+            (
+                "200 OK",
+                r#"{"type":"message","content":[{"type":"text","text":"inline-ok"}],"stop_reason":"max_tokens","usage":{"output_tokens":9}}"#,
+            ),
+        ]);
+        let fb = AnthropicProvider::new(fallback_ep, "m", "k", Duration::from_secs(2))
+            .unwrap()
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        let _ = fallback_heads.recv_timeout(Duration::from_secs(1));
+        assert_eq!(fb.message.as_deref(), Some("inline-ok"));
+        assert_eq!(fb.finish_reason, Some(FinishReason::Length));
+
+        // 3) Anthropic "prompt is too long" HTTP 400 -> ContextOverflow.
+        let overflow_ep = server(
+            "400 Bad Request",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+            0,
+        );
+        let overflow_err = AnthropicProvider::new(overflow_ep, "m", "k", Duration::from_secs(1))
+            .unwrap()
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            overflow_err,
+            ProviderError::ContextOverflow { .. }
+        ));
+
+        // 4) Truncated SSE stream (missing message_stop) and SSE overloaded_error fail closed.
+        let mut truncated = AnthropicStreamAssembly::default();
+        assert!(
+            !consume_anthropic_sse_event(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+                &mut truncated,
+                &context(),
+            )
+            .unwrap()
+        );
+        let sse_overloaded = consume_anthropic_sse_event(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+            &mut truncated,
+            &context(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            sse_overloaded,
+            ProviderError::Http {
+                status: 529,
+                retryable: true,
+                ..
+            }
+        ));
+        let sse_overflow = consume_anthropic_sse_event(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+            &mut truncated,
+            &context(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            sse_overflow,
+            ProviderError::ContextOverflow { .. }
+        ));
+        assert_eq!(
+            anthropic_finish_reason("refusal".into()),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(
+            anthropic_finish_reason("custom".into()),
+            FinishReason::Other("custom".into())
         );
     }
 }

@@ -62,17 +62,17 @@ Windows 已支持任意外部进程执行。
 - [x] Provider binding、工具别名，以及内部派生凭据/data scope 的 resume 校验。
 - [x] 从已配置 Catalog 显式选择模型/Provider，并通过 TUI model picker 修改每个
   Session 的 binding；切换从下一个不可变 child 生效，并记录在公开 transcript 中。
-- [x] 版本化的 Harness Profile v1：数据化的 `HarnessProfile` 类型与按 binding 解析的
-  ProfileCatalog（请求预算 + system/摘要 prompt 槽位），以及权限天花板——profile
+- [x] 版本化的 Harness Profile v1/v1.1：数据化的 `HarnessProfile` 类型与按 binding 解析的
+  ProfileCatalog（请求预算 + system/摘要 prompt 槽位 + `ToolPresentationStyle` 双向工具呈现映射 `canonical`/`claude_code` + `reuse_prefix` 热前缀压缩），以及权限天花板——profile
   不携带权限字段，用户覆盖只能收紧或改写 prompt 文本。它不是 Provider adapter，
   也不依赖模型名猜测放宽权限（见 [harness-profile.md](design/harness-profile.md)）。
-  工具 schema/命名（`ToolPresentation`）、Plan/Stop 语义与 config `profiles`
-  覆盖段仍未实现。
+  Plan/Stop 语义与 config `profiles` 覆盖段仍未实现。
 - [ ] Harness Profile 的 capability negotiation、未知 profile 的 fail-closed fallback，
   以及按 profile 运行的契约/E2E conformance suite。
 - [ ] 模型目录、能力声明、fallback chain、成本/预算和 rate-limit 可见性。
 - [ ] 用户账户、登录/登出、凭据轮换与受控的凭据存储策略。
-- [ ] 其他 Provider 协议适配器；Responses API、Anthropic 等并未实现。
+- [x] 原生 Anthropic `/v1/messages` Provider 适配器（`type: "anthropic-messages"`）：显式 `ephemeral` `cache_control` 断点（至多 4 处）、签名 `thinking` / `redacted_thinking` 跨轮透传、连续 `User`/`Tool` 轮次合并与 `529` 重试。
+- [ ] OpenAI Responses API 等其他 Provider 协议适配器。
 - [ ] 可观测且可控的 Provider 限流、退避、配额与本地健康诊断。
 
 ## 工作区、Session 与历史
@@ -113,9 +113,9 @@ Windows 已支持任意外部进程执行。
 - [ ] 可信 Reminder Producer、排序与取消语义。
 - [x] Context compaction v1/v2 与可解释 token 预算：分层历史窗口、被动/主动
   SummarizeOnDiscard 摘要、确定性省略层、provider context-overflow 的每 turn 一次
-  强制恢复、idle-only 手动 `/compact`（HTTP + CLI + TUI）、只读用量投影与 TUI 预算
+  强制恢复、摘要请求复用对话前缀（`reuse_prefix`）、`<repository-context>` 跨轮前缀锚定、idle-only 手动 `/compact`（HTTP + CLI + TUI）、只读用量投影与 TUI 预算
   meter（见 [context-design.md](design/context-design.md)）。
-- [ ] 摘要请求复用对话前缀、跨模型 handoff 与用户可控的选择性上下文
+- [ ] 跨模型 handoff 与用户可控的选择性上下文
   （context-design.md §5 的 v2 方向）。
 - [ ] 用户可控的 Session/Workspace memory、provenance、过期与 reset；不能把
   未经确认的模型结论伪装为事实。

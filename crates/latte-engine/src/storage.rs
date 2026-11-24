@@ -3598,6 +3598,100 @@ impl Storage {
         Ok(())
     }
 
+    /// Summarizes engine-recorded mutating effects for `turn_id` alongside its
+    /// optional lazy baseline so read-only and file-tool turns never scan the
+    /// workspace filesystem.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn session_turn_mutation_summary(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<
+        (
+            std::collections::BTreeMap<String, String>,
+            Vec<crate::EffectAuthority>,
+            bool,
+        ),
+        StorageError,
+    > {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let baseline_json: String = conn
+            .query_row(
+                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                [turn_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::InvalidData("linked child has no engine-owned baseline".into())
+            })?;
+        let baseline: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&baseline_json).map_err(invalid_json)?;
+        let mut stmt = conn.prepare(
+            "SELECT e.effect_id, e.status, c.descriptor_json \
+             FROM effects e \
+             JOIN session_effect_canonical c ON c.effect_id=e.effect_id AND c.turn_id=e.turn_id \
+             WHERE e.turn_id=?1 AND e.status IN ('started','observed_success','observed_failed','unknown') \
+             ORDER BY e.rowid ASC",
+        )?;
+        let rows = stmt.query_map([turn_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut file_mutations = Vec::new();
+        let mut mutating_process_ran = false;
+        for row in rows {
+            let (effect_id_raw, status, descriptor_raw) = row?;
+            if latte_core::EffectId::new(effect_id_raw)
+                .is_ok_and(|effect_id| effect_id.is_verification())
+            {
+                continue;
+            }
+            let Ok(authority) = serde_json::from_str::<crate::EffectAuthority>(&descriptor_raw)
+            else {
+                continue;
+            };
+            match authority.name.as_str() {
+                "edit_file" | "write_file" if status == "observed_success" => {
+                    file_mutations.push(authority);
+                }
+                "process" if !crate::process::is_readonly_process_input(&authority.input) => {
+                    mutating_process_ran = true;
+                }
+                _ => {}
+            }
+        }
+        Ok((baseline, file_mutations, mutating_process_ran))
+    }
+
+    pub(crate) fn has_nonempty_turn_baseline(&self, turn_id: TurnId) -> Result<bool, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                [turn_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.is_some_and(|text| text != "{}" && !text.trim().is_empty()))
+    }
+
+    pub(crate) fn store_lazy_turn_baseline(
+        &self,
+        turn_id: TurnId,
+        manifest: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), StorageError> {
+        let encoded = serde_json::to_string(manifest).map_err(invalid_json)?;
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "UPDATE turn_baselines SET manifest_json=?1 WHERE turn_id=?2 AND manifest_json='{}'",
+            params![encoded, turn_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Computes the exact workspace paths changed since this linked child was
     /// created.  The engine supplies the fresh manifest; the baseline never
     /// leaves durable storage except as this checked display list.

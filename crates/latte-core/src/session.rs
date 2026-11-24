@@ -86,6 +86,89 @@ impl SessionLifecycle {
     }
 }
 
+/// Session-scoped permission posture enforced by `latte-engine`.
+///
+/// Hard safety boundaries (workspace path containment, symlink mutation
+/// refusal, `deny_globs`, and destructive command blocks) remain enforced
+/// unconditionally in every mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Ask before file mutations and non-allowlisted process executions.
+    #[default]
+    Ask,
+    /// Auto-allow workspace-contained file mutations (`edit_file`, `write_file`);
+    /// continue asking for non-allowlisted process executions.
+    #[serde(alias = "auto-edit")]
+    AutoEdit,
+    /// Auto-allow workspace-contained file mutations and non-denied process executions.
+    #[serde(alias = "full-auto", alias = "auto")]
+    FullAuto,
+}
+
+impl PermissionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto_edit",
+            Self::FullAuto => "full_auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAuto => "full-auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::AutoEdit => "Auto-edit",
+            Self::FullAuto => "Full-auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn card_label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask mode",
+            Self::AutoEdit => "Auto-edit mode",
+            Self::FullAuto => "Full-auto mode",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::AutoEdit,
+            Self::AutoEdit => Self::FullAuto,
+            Self::FullAuto => Self::Ask,
+        }
+    }
+
+    /// Parses a user-supplied permission mode identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when `value` is not a recognized mode.
+    pub fn parse_mode(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "auto_edit" | "auto-edit" | "autoedit" => Ok(Self::AutoEdit),
+            "full_auto" | "full-auto" | "fullauto" | "auto" => Ok(Self::FullAuto),
+            other => Err(format!(
+                "invalid permission mode `{other}`; expected `ask`, `auto-edit`, or `full-auto`"
+            )),
+        }
+    }
+}
+
 /// Outcome of a session create operation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CreateOutcome<T = SessionSnapshot> {
@@ -841,5 +924,61 @@ mod tests {
         assert_eq!(value["authorization"], "[REDACTED]");
         assert_eq!(value["nested"][1]["credential_id"], "[REDACTED]");
         assert_eq!(value["nested"][1]["safe"], "ok");
+    }
+
+    #[test]
+    fn permission_mode_cycles_parses_aliases_and_round_trips_serde() {
+        assert_eq!(PermissionMode::default(), PermissionMode::Ask);
+        assert_eq!(PermissionMode::Ask.next(), PermissionMode::AutoEdit);
+        assert_eq!(PermissionMode::AutoEdit.next(), PermissionMode::FullAuto);
+        assert_eq!(PermissionMode::FullAuto.next(), PermissionMode::Ask);
+
+        assert_eq!(PermissionMode::Ask.as_str(), "ask");
+        assert_eq!(PermissionMode::AutoEdit.as_str(), "auto_edit");
+        assert_eq!(PermissionMode::FullAuto.as_str(), "full_auto");
+
+        assert_eq!(PermissionMode::Ask.cli_name(), "ask");
+        assert_eq!(PermissionMode::AutoEdit.cli_name(), "auto-edit");
+        assert_eq!(PermissionMode::FullAuto.cli_name(), "full-auto");
+
+        assert_eq!(PermissionMode::Ask.label(), "Ask");
+        assert_eq!(PermissionMode::AutoEdit.label(), "Auto-edit");
+        assert_eq!(PermissionMode::FullAuto.label(), "Full-auto");
+
+        assert_eq!(PermissionMode::Ask.card_label(), "Ask mode");
+        assert_eq!(PermissionMode::AutoEdit.card_label(), "Auto-edit mode");
+        assert_eq!(PermissionMode::FullAuto.card_label(), "Full-auto mode");
+
+        for (raw, expected) in [
+            ("ask", PermissionMode::Ask),
+            ("ASK", PermissionMode::Ask),
+            ("auto-edit", PermissionMode::AutoEdit),
+            ("auto_edit", PermissionMode::AutoEdit),
+            ("autoedit", PermissionMode::AutoEdit),
+            ("full-auto", PermissionMode::FullAuto),
+            ("full_auto", PermissionMode::FullAuto),
+            ("fullauto", PermissionMode::FullAuto),
+            ("auto", PermissionMode::FullAuto),
+        ] {
+            assert_eq!(PermissionMode::parse_mode(raw).unwrap(), expected);
+        }
+        assert!(PermissionMode::parse_mode("yolo").is_err());
+
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AutoEdit,
+            PermissionMode::FullAuto,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<PermissionMode>(&json).unwrap(), mode);
+        }
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"auto-edit\"").unwrap(),
+            PermissionMode::AutoEdit
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"full-auto\"").unwrap(),
+            PermissionMode::FullAuto
+        );
     }
 }

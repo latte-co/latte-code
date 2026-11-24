@@ -234,10 +234,11 @@ fn tui_runs_inside_a_real_pty_and_restores_terminal_modes() {
     assert!(terminal.contains("second"));
     assert!(terminal.contains("\u{1b}[>3u"));
     assert!(terminal.contains("\u{1b}[?1049h"));
-    assert!(terminal.contains("\u{1b}[?1000h"));
-    assert!(terminal.contains("\u{1b}[?1006h"));
-    assert!(terminal.contains("\u{1b}[?1006l"));
-    assert!(terminal.contains("\u{1b}[?1000l"));
+    assert!(
+        !terminal.contains("\u{1b}[?1000h"),
+        "mouse capture defaults off so native terminal copy/selection works"
+    );
+    assert!(!terminal.contains("\u{1b}[?1006h"));
     assert!(terminal.contains("\u{1b}[?1049l"));
     assert!(terminal.contains("\u{1b}[<1u"));
 }
@@ -2253,4 +2254,165 @@ fn tui_slash_cancel_and_batch4_permission_outcomes_preserve_session_safety() {
     perm_pty.write(F10);
     let (perm_status, _) = perm_pty.finish(Duration::from_secs(5));
     assert!(perm_status.success());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_supports_cursor_editing_ctrl_j_newline_and_permission_mode_switching() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("diff_target.txt"), "old_line\nkeep\n").unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "read-diff-1",
+            "read_file",
+            &serde_json::json!({"path": "diff_target.txt"}),
+        ),
+        ProviderReply::tool_call(
+            "ask-edit-1",
+            "edit_file",
+            &serde_json::json!({
+                "path": "diff_target.txt",
+                "before": "old_line",
+                "after": "new_line"
+            }),
+        ),
+        ProviderReply::completion("diff approved and switched to auto"),
+        ProviderReply::tool_call(
+            "auto-write-2",
+            "write_file",
+            &serde_json::json!({"path": "auto_created.txt", "content": "written without second prompt\n"}),
+        ),
+        ProviderReply::completion("auto-edit write completed"),
+    ]);
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}}}}"#,
+            provider.endpoint()
+        ),
+    )
+    .unwrap();
+    let mut command = scenario.command(&["tui", "--permission-mode", "auto-edit"]);
+    command
+        .env("TEST_OPENAI_KEY", "tui-mode-secret")
+        .env("LATTE_TUI_MOUSE_CAPTURE", "1");
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Auto-edit",
+        Duration::from_secs(5)
+    ));
+
+    // Exercise Shift+Tab (`\x1b[Z`) mode cycling (`Auto-edit -> Full-auto -> Ask`),
+    // `/mode` no-arg cycling (`Ask -> Auto-edit`), `/mode bogus` error, and `/mode ask`.
+    pty.write(b"\x1b[Z");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Full-auto mode",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"\x1b[Z");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Ask mode",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/mode\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Permission mode set to Auto-edit mode",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/mode bogus\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Unknown permission mode",
+        Duration::from_secs(5)
+    ));
+    // Clear `/mode bogus` via Ctrl+U (`\x15`), then set `/mode ask`.
+    pty.write(b"\x15/mode ask\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Permission mode set to Ask mode",
+        Duration::from_secs(5)
+    ));
+
+    // Exercise cursor navigation: Home (`\x1b[H`), End (`\x1b[F`), Delete (`\x1b[3~`),
+    // Ctrl+W (`\x17`), Up (`\x1b[A`), Down (`\x1b[B`), Left (`\x1b[D`), Right (`\x1b[C`), Ctrl+J (`\n`).
+    pty.write(b"xac\x1b[H\x1b[3~\x1b[F\x1b[Db\x1b[C\nline2 extra\x17\x1b[A\x1b[B\r");
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
+    // Wait for `edit_file` permission card with unified diff preview (`- old_line` / `+ new_line`),
+    // then press `a` to approve AND switch the live session to Auto-edit mode over HTTP!
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "- old_line",
+        Duration::from_secs(5)
+    ));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "+ new_line",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"a");
+    assert!(provider.wait_for_calls(3, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "diff approved and switched to auto",
+        Duration::from_secs(5)
+    ));
+
+    // Exercise Up/Down prompt history recall + PageUp/PageDown scrolling, then submit follow-up
+    // (which now runs in Auto-edit mode without asking permission!).
+    pty.write(b"\x1b[5~\x1b[6~\x1b[A\x1b[Bfollow up write\r");
+    assert!(provider.wait_for_calls(5, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "auto-edit write completed",
+        Duration::from_secs(5)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("diff_target.txt")).unwrap(),
+        "new_line\nkeep\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("auto_created.txt")).unwrap(),
+        "written without second prompt\n"
+    );
+    let requests = provider.requests();
+    let first_req = serde_json::to_string(&requests[0].body).unwrap();
+    assert!(
+        first_req.contains("abc\\nline2"),
+        "expected cursor-edited multiline prompt in {first_req}"
+    );
+
+    pty.write(F10);
+    let (status, raw_out) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+    let terminal = String::from_utf8_lossy(&raw_out);
+    assert!(
+        terminal.contains("\u{1b}[?1000h") && terminal.contains("\u{1b}[?1000l"),
+        "LATTE_TUI_MOUSE_CAPTURE=1 enables and restores mouse capture cleanly"
+    );
 }

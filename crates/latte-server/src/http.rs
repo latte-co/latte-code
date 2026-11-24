@@ -198,6 +198,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         )
         .route("/v1/sessions/{session_id}/follow-up", post(follow_up))
         .route("/v1/sessions/{session_id}/model", post(switch_model))
+        .route(
+            "/v1/sessions/{session_id}/permission-mode",
+            post(set_permission_mode),
+        )
         .route("/v1/sessions/{session_id}/cancel", post(cancel_session))
         .route("/v1/sessions/{session_id}/queue", post(queue_follow_up))
         .route(
@@ -280,6 +284,8 @@ pub struct CreateSessionRequest {
     pub binding: SessionProviderBinding,
     #[serde(default)]
     pub focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<latte_core::PermissionMode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -338,6 +344,19 @@ pub struct FollowUpRequest {
     pub command_id: latte_core::SessionCommandId,
     pub prompt: String,
     pub expected_session_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<latte_core::PermissionMode>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetPermissionModeRequest {
+    pub permission_mode: latte_core::PermissionMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionModeResponse {
+    pub session_id: String,
+    pub permission_mode: latte_core::PermissionMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -589,6 +608,9 @@ async fn create_session_owned(
     let prompt = req.prompt;
     let focus = req.focus.map(std::path::PathBuf::from);
     let binding = req.binding;
+    if let Some(mode) = req.permission_mode {
+        runtime.set_permission_mode(session_id, mode);
+    }
 
     // Run the turn under supervised background execution, but only acknowledge
     // 202 after the runtime signals the submission is durably accepted.
@@ -913,6 +935,9 @@ async fn follow_up_owned(
     let command_id = req.command_id;
     let prompt = req.prompt;
     let expected = req.expected_session_revision;
+    if let Some(mode) = req.permission_mode {
+        runtime.set_permission_mode(session_id, mode);
+    }
 
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -944,6 +969,22 @@ async fn follow_up_owned(
         workspace_id: workspace.id.clone(),
     };
     Ok((status, body))
+}
+
+async fn set_permission_mode(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    ValidatedJson(req): ValidatedJson<SetPermissionModeRequest>,
+) -> Result<Json<PermissionModeResponse>, HandlerError> {
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
+    workspace
+        .runtime
+        .set_permission_mode(session_id, req.permission_mode);
+    Ok(Json(PermissionModeResponse {
+        session_id: session_id.to_string(),
+        permission_mode: req.permission_mode,
+    }))
 }
 
 async fn switch_model(
@@ -1363,8 +1404,8 @@ async fn workspace_events(
     // Get the workspace's event receiver
     let workspace = state.workspaces.get_by_id(&workspace_id).await;
 
-    let rx = match workspace {
-        Some(ws) => ws.event_tx.subscribe(),
+    let (rx, progress_rx) = match workspace {
+        Some(ws) => (ws.event_tx.subscribe(), ws.progress_tx.subscribe()),
         None => {
             // Return an empty stream if workspace not found
             let empty: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
@@ -1373,22 +1414,27 @@ async fn workspace_events(
         }
     };
 
-    let stream = BroadcastStream::new(rx).map(|result| {
-        match result {
-            Ok(event) => {
-                let event_type = match &event {
-                    ServerEvent::SessionChanged { .. } => "session_changed",
-                    ServerEvent::Progress { .. } => "progress",
-                    ServerEvent::ResyncRequired => "resync_required",
-                };
-                let data = serde_json::to_string(&event).unwrap_or_default();
-                Ok(Event::default().event(event_type).data(data))
-            }
-            // A lagged broadcast receiver means the client fell behind the
-            // channel capacity. Signal a resync instead of terminating.
-            Err(_) => Ok(Event::default().event("resync_required").data("{}")),
+    let authoritative = BroadcastStream::new(rx).map(|result| match result {
+        Ok(event) => {
+            let event_type = match &event {
+                ServerEvent::SessionChanged { .. } => "session_changed",
+                ServerEvent::Progress { .. } => "progress",
+                ServerEvent::ResyncRequired => "resync_required",
+            };
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok(Event::default().event(event_type).data(data))
         }
+        // A lagged authoritative receiver means the client fell behind the
+        // durable state-change channel capacity. Signal a resync.
+        Err(_) => Ok(Event::default().event("resync_required").data("{}")),
     });
+    let transient = BroadcastStream::new(progress_rx).filter_map(|result| {
+        result.ok().map(|event| {
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok(Event::default().event("progress").data(data))
+        })
+    });
+    let stream = authoritative.merge(transient);
 
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(stream);
@@ -1399,12 +1445,14 @@ async fn workspace_events(
 /// `LATTE_RECOVERY_SWEEP_MS` environment variable overrides it (in
 /// milliseconds, clamped to at least 1ms) so end-to-end tests can drive the
 /// crash-recovery journey without waiting the full production cadence.
-fn recovery_sweep_interval() -> std::time::Duration {
-    std::env::var("LATTE_RECOVERY_SWEEP_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+fn parse_recovery_sweep_interval(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
         .map(|ms| std::time::Duration::from_millis(ms.max(1)))
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+fn recovery_sweep_interval() -> std::time::Duration {
+    parse_recovery_sweep_interval(std::env::var("LATTE_RECOVERY_SWEEP_MS").ok().as_deref())
 }
 
 /// Serve until `shutdown` resolves. Separating the shutdown future lets tests
@@ -4047,12 +4095,14 @@ mod tests {
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
-                        message: Some("attempting failed process".into()),
+                        message: Some("attempting uncertain write".into()),
                         tool_calls: vec![ToolCall {
-                            id: "failed-process".into(),
-                            name: "process".into(),
+                            id: "uncertain-write".into(),
+                            name: "write_file".into(),
                             input: serde_json::json!({
-                                "argv": ["/definitely-missing-latte-command"]
+                                "path": "readonly_dir/out.txt",
+                                "content": "x",
+                                "create_intent": true,
                             }),
                         }],
                         input_request: None,
@@ -4089,14 +4139,27 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconcile_effect_on_reconciliation_required_session_succeeds() {
-        // A process launch that fails after permission is granted leaves the
-        // session in ReconciliationRequired; reconciling the unknown effect
-        // returns 200 (covers the Ok arm of reconcile_effect).
+        use std::os::unix::fs::PermissionsExt;
+        // A write into an unwritable directory fails after Started and leaves
+        // the session in ReconciliationRequired; reconciling returns 200.
         let state = process_reconciliation_state();
         let workspace = tempfile::tempdir().unwrap();
+        let ro_dir = workspace.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
+
+        let (mode_status, mode_body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/permission-mode"),
+            Some(serde_json::json!({ "permission_mode": "auto_edit" })),
+        )
+        .await;
+        assert_eq!(mode_status, StatusCode::OK);
+        assert_eq!(mode_body["permission_mode"], "auto_edit");
 
         // Grant permission; the launch fails and the session enters
         // ReconciliationRequired.
@@ -4430,65 +4493,26 @@ mod tests {
 
     #[test]
     fn recovery_sweep_interval_honors_env_override_and_default() {
-        // The recovery-sweep cadence defaults to 30s and can be shortened via
-        // LATTE_RECOVERY_SWEEP_MS (clamped to >=1ms) so E2E crash-recovery tests
-        // do not wait the full production interval. This exercises the parse /
-        // clamp / default branches directly without racing on process env by
-        // asserting the default in the common (unset) case.
-        //
-        // SAFETY: single-sessioned #[test]; we set and immediately clear the var
-        // within this test's own scope. No other test reads this variable.
-        let key = "LATTE_RECOVERY_SWEEP_MS";
-        let saved = std::env::var(key).ok();
-
-        // Run the sequence with the var unset first (the helper observes
-        // previous=None) and then pre-set (previous=Some), so both arms of the
-        // helper's restore match are exercised.
-        unsafe { std::env::remove_var(key) };
-        run_recovery_sweep_interval_sequence(key);
-        unsafe { std::env::set_var(key, "preset") };
-        run_recovery_sweep_interval_sequence(key);
-
-        match saved {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    fn run_recovery_sweep_interval_sequence(key: &str) {
-        let previous = std::env::var(key).ok();
-
-        unsafe { std::env::set_var(key, "250") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("250")),
             std::time::Duration::from_millis(250)
         );
-
-        unsafe { std::env::set_var(key, "0") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("0")),
             std::time::Duration::from_millis(1),
             "zero must clamp to at least 1ms"
         );
-
-        unsafe { std::env::set_var(key, "not-a-number") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("not-a-number")),
             std::time::Duration::from_secs(30),
             "unparseable value falls back to the 30s default"
         );
-
-        unsafe { std::env::remove_var(key) };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(None),
             std::time::Duration::from_secs(30),
             "unset value uses the 30s default"
         );
-
-        match previous {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        assert!(recovery_sweep_interval() >= std::time::Duration::from_millis(1));
     }
 
     #[tokio::test]

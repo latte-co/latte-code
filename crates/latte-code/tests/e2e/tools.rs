@@ -350,26 +350,21 @@ fn final_cli_rejects_symlink_escape_before_provider_transport_or_workspace_mutat
     std::fs::write(&outside, "must-not-be-read\n").unwrap();
     symlink(&outside, scenario.root().join("escape-link")).unwrap();
     let input = serde_json::json!({"path": "escape-link"});
-    let provider = ScriptedProvider::start([ProviderReply::tool_call(
-        "symlink-escape",
-        "read_file",
-        &input,
-    )]);
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call("symlink-escape", "read_file", &input),
+        ProviderReply::completion("symlink read rejected safely"),
+    ]);
     scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
     let output = scenario.output(&["--json", "run", "read the escaped link"], |command| {
         command.env("TEST_OPENAI_KEY", "secret");
     });
 
     assert!(
-        output.status.code() == Some(1) || output.status.code() == Some(70),
-        "stdout={} stderr={}",
+        output.status.success(),
+        "external symlinks in workspace must not crash session creation; tool escape is returned as a structured ToolResult error: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let error = json(&output)["error"]["message"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
     let transcript = json(&output)["data"]["session"]["transcript"]["entries"]
         .as_array()
         .map(|entries| {
@@ -381,15 +376,20 @@ fn final_cli_rejects_symlink_escape_before_provider_transport_or_workspace_mutat
         })
         .unwrap_or_default();
     assert!(
-        error.contains("workspace path rejected")
-            || error.contains("symbolic link")
-            || transcript.contains("workspace path rejected")
-            || transcript.contains("symbolic link")
-            || transcript.contains("lease authority lost")
-            || transcript.contains("effect outcome unknown"),
-        "error={error} transcript={transcript}"
+        transcript.contains("workspace path rejected") || transcript.contains("symbolic link"),
+        "transcript={transcript}"
     );
-    assert!(provider.requests().is_empty());
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second_request = serde_json::to_string(&requests[1].body).unwrap();
+    assert!(
+        !second_request.contains("must-not-be-read"),
+        "external symlink target content must never be read or sent to provider"
+    );
+    assert!(
+        second_request.contains("symbolic link")
+            || second_request.contains("workspace path rejected")
+    );
     assert_eq!(
         std::fs::read_to_string(outside).unwrap(),
         "must-not-be-read\n"
@@ -967,4 +967,103 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
 
     third.write(b"\x1b[21~");
     assert!(third.finish(Duration::from_secs(5)).0.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn anthropic_bash_allows_readonly_inspection_and_denies_catastrophic_argv() {
+    let scenario = Scenario::new();
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(scenario.root())
+        .status()
+        .unwrap();
+    std::fs::write(scenario.root().join("hello.txt"), "hi\n").unwrap();
+
+    // Run in default `ask` mode (no `--auto`): safe read-only `ls` & `git status`
+    // are auto-allowed via argv-first translation, while `rm -rf /` is hard-denied
+    // before prompting or executing!
+    let r1 = r#"{"type":"message","content":[
+        {"type":"tool_use","id":"b1","name":"Bash","input":{"command":"ls -la"}},
+        {"type":"tool_use","id":"b2","name":"Bash","input":{"command":"git status --short"}},
+        {"type":"tool_use","id":"b3","name":"Bash","input":{"command":"git branch --show-current"}},
+        {"type":"tool_use","id":"b4","name":"Bash","input":{"command":"rm -rf /"}},
+        {"type":"tool_use","id":"b5","name":"Bash","input":{"command":"sh -c 'rm -rf /'"}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":15}}"#;
+    let r2 = r#"{"type":"message","content":[{"type":"text","text":"readonly allowed and rm denied"}],"stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":8}}"#;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap_clone = std::sync::Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for body in [r1, r2] {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut end = None;
+            let mut len = 0_usize;
+            loop {
+                let mut buf = [0_u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if end.is_none()
+                    && let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    end = Some(p + 4);
+                    for line in String::from_utf8_lossy(&raw[..p + 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(e) = end
+                    && raw.len() >= e + len
+                {
+                    break;
+                }
+            }
+            let e = end.unwrap();
+            cap_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&raw[e..e + len]).unwrap());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    let endpoint = format!("http://{addr}/v1/messages");
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"claude/m",providers:{{claude:{{type:"anthropic-messages",models:["m"],endpoint:{endpoint:?},api_key:"k",streaming:false}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let out = scenario.output(&["--json", "run", "inspect repo safely"], |_| {});
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    handle.join().unwrap();
+    let reqs = captured.lock().unwrap();
+    let second_wire = serde_json::to_string(&reqs[1]).unwrap();
+    assert!(second_wire.contains("?? hello.txt"), "{second_wire}");
+    assert!(
+        second_wire.contains("process policy denied operation"),
+        "{second_wire}"
+    );
 }

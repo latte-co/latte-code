@@ -22,20 +22,22 @@ const STORAGE_HOME_ENV: &str = "LATTE_CODE_HOME";
 const DEFAULT_CONFIG: &str = r#"{
   version: 1,
   session: {
-    max_request_bytes: 524288,
-    max_input_bytes: 393216,
-    reserved_output_bytes: 131072,
-    context_cap_bytes: 65536,
+    max_request_bytes: 2097152,
+    max_input_bytes: 1572864,
+    reserved_output_bytes: 262144,
+    context_cap_bytes: 131072,
+    provider_timeout_ms: 120000,
+    compaction: {
+      enabled: true,
+      mode: "elide_then_summarize",
+      max_summary_source_bytes: 524288,
+      reuse_prefix: true,
+    },
   },
   database: { path: ".latte/latte-code.db" },
-  verification: {
-    argv: ["cargo", "test", "--workspace"],
-    cwd: ".",
-    timeout_ms: 120000,
-  },
   providers: {},
 }"#;
-const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code tui\n  latte-code [--json] run [--focus <path>] [--server url] [--token token] <prompt>\n  latte-code [--json] resume <session-id> <prompt> [--server url] [--token token]\n  latte-code [--json] show <session-id> [--server url] [--token token]\n  latte-code [--json] list [--server url] [--token token]\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. run/list/show/resume are session commands served over HTTP+SSE: by default the server is embedded in this process (random loopback port, token kept in memory); --server connects to a standalone server, reading its token from $LATTE_CODE_HOME/server.token or --token. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
+const HELP: &str = "Latte Code agent\n\nUsage:\n  latte-code [tui] [--auto | --permission-mode <ask|auto-edit|full-auto>]\n  latte-code [--json] run [--auto | --permission-mode <ask|auto-edit|full-auto>] [--focus <path>] [--server url] [--token token] <prompt>\n  latte-code [--json] resume <session-id> [--auto | --permission-mode <ask|auto-edit|full-auto>] <prompt> [--server url] [--token token]\n  latte-code [--json] show <session-id> [--server url] [--token token]\n  latte-code [--json] context <session-id> [--server url] [--token token]\n  latte-code [--json] compact <session-id> [--server url] [--token token]\n  latte-code [--json] list [--server url] [--token token]\n  latte-code [--json] serve [--port <port>]\n  latte-code [--json] --help\n\nLatte Code merges built-in application defaults, $HOME/.latte/latte-code.jsonc, then workspace .latte/latte-code.jsonc; later values win. Configure the global default_model and at least one Provider model explicitly. Durable state lives in $LATTE_CODE_HOME/state.db, defaulting to $HOME/.latte/latte-code/state.db. database.path remains parseable for migration compatibility but does not redirect user history. Provider credentials may be literal strings or environment references in those files. run/list/show/resume are session commands served over HTTP+SSE: by default the server is embedded in this process (random loopback port, token kept in memory); --server connects to a standalone server, reading its token from $LATTE_CODE_HOME/server.token or --token. serve starts the local HTTP server on 127.0.0.1 (default port 4096, or an ephemeral port with --port 0); its Bearer token is written to $LATTE_CODE_HOME/server.token with owner-only permissions.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,7 +48,8 @@ pub struct AppConfig {
     pub providers: serde_json::Value,
     #[serde(default)]
     pub database: DatabaseConfig,
-    pub verification: VerificationConfig,
+    #[serde(default)]
+    pub verification: Option<VerificationConfig>,
     #[serde(default)]
     pub session: SessionConfig,
 }
@@ -107,6 +110,9 @@ pub struct SessionCompactionConfig {
     /// newest-first, so tool-call/result pairs are never split. `0` means
     /// "use the profile default" (20).
     pub retain_ratio: u8,
+    /// Reuse the live conversation prefix (`[system, tools, <repository-context>, turns…]`)
+    /// when issuing bounded compaction summary requests so provider KV cache hits.
+    pub reuse_prefix: Option<bool>,
 }
 
 /// Config-layer name for the summarization-only strategy.
@@ -249,7 +255,9 @@ impl AppConfig {
 
         let config: Self = serde_json::from_value(merged.clone())
             .map_err(|error| format!("invalid merged configuration: {error}"))?;
-        if config.verification.argv.is_empty() {
+        if let Some(verification) = &config.verification
+            && verification.argv.is_empty()
+        {
             return Err("verification.argv must not be empty".into());
         }
         SessionHistoryPolicy {
@@ -272,15 +280,16 @@ impl AppConfig {
         let registry = ProviderRegistry::parse_jsonc(&merged_text).map_err(|e| e.to_string())?;
         Ok((config, registry))
     }
-    fn plan(&self) -> VerificationPlan {
-        VerificationPlan {
-            argv: self.verification.argv.clone(),
-            cwd: self.verification.cwd.clone(),
-            timeout_ms: self.verification.timeout_ms,
+    fn plan(&self) -> Option<VerificationPlan> {
+        let verification = self.verification.as_ref()?;
+        Some(VerificationPlan {
+            argv: verification.argv.clone(),
+            cwd: verification.cwd.clone(),
+            timeout_ms: verification.timeout_ms,
             grace_ms: 250,
             stdout_cap: 16 * 1024,
             stderr_cap: 16 * 1024,
-        }
+        })
     }
     fn legacy_database_path(&self, root: &Path) -> PathBuf {
         let path = Path::new(&self.database.path);
@@ -341,6 +350,18 @@ fn read_optional_config(path: &Path) -> Result<Option<Value>, String> {
             "invalid JSONC {}: top-level configuration must be an object",
             path.display()
         ));
+    }
+    if let Some(object) = overlay.as_object_mut() {
+        // Editor `$schema` hints are always allowed and stripped before merge.
+        object.remove("$schema");
+        for deprecated in ["default_provider", "approval_policy", "permissions"] {
+            if object.remove(deprecated).is_some() {
+                eprintln!(
+                    "warning: {} contains deprecated v0 field `{deprecated}`; ignoring it (use `default_model: \"<provider>/<model>\"` instead)",
+                    path.display()
+                );
+            }
+        }
     }
     normalize_legacy_thread_block(&mut overlay, path)?;
     Ok(Some(overlay))
@@ -545,6 +566,19 @@ fn merge_value_at(base: &mut Value, overlay: Value, path: &mut Vec<String>) {
                     base.insert(key, value);
                     continue;
                 }
+                // An explicit `session.compaction` block that omits `mode`
+                // selects the documented `"summarize"` default rather than
+                // inheriting the built-in `"elide_then_summarize"` mode.
+                if key == "compaction"
+                    && path.len() == 1
+                    && path[0] == "session"
+                    && value
+                        .as_object()
+                        .is_some_and(|obj| !obj.contains_key("mode"))
+                    && let Some(Value::Object(existing_compaction)) = base.get_mut(&key)
+                {
+                    existing_compaction.remove("mode");
+                }
                 if let Some(existing) = base.get_mut(&key) {
                     path.push(key);
                     merge_value_at(existing, value, path);
@@ -724,12 +758,21 @@ fn spawn_sse_bridge(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut first = true;
+        let mut retry_ms = 250_u64;
         loop {
-            // Open the SSE stream for this workspace.
+            // Open the SSE stream for this workspace. On transient connection
+            // failure, notify the TUI (`Closed`) and retry with bounded
+            // exponential backoff instead of exiting permanently.
             if client.open_events(&workspace_id).await.is_err() {
-                let _ = event_tx.send(ProjectionEvent::Closed);
-                return;
+                if event_tx.send(ProjectionEvent::Closed).is_err() {
+                    return; // TUI dropped the receiver
+                }
+                first = false;
+                tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                retry_ms = retry_ms.saturating_mul(2).min(2_000);
+                continue;
             }
+            retry_ms = 250;
             // On reconnect, refresh once the new subscription is live. The
             // pre-reconnect refresh (below) races the disconnect: events that
             // land after it but before resubscription are lost from the
@@ -780,6 +823,28 @@ pub async fn run_cli() -> i32 {
     execute().await
 }
 
+fn parse_tui_args(args: &[String]) -> Result<latte_core::PermissionMode, String> {
+    let mut mode = latte_core::PermissionMode::Ask;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--auto" => mode = latte_core::PermissionMode::FullAuto,
+            "--permission-mode" => {
+                let Some(raw) = iter.next() else {
+                    return Err("--permission-mode requires a value".to_string());
+                };
+                mode = latte_core::PermissionMode::parse_mode(raw).map_err(|_| {
+                    format!(
+                        "invalid --permission-mode `{raw}`: expected ask, auto-edit, or full-auto"
+                    )
+                })?;
+            }
+            other => return Err(format!("unexpected tui argument: {other}")),
+        }
+    }
+    Ok(mode)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -791,8 +856,15 @@ async fn execute() -> i32 {
         && !json
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
-    if implicit_tui || matches!(args.as_slice(), [command] if command == "tui") {
+    if implicit_tui {
         return execute_tui().await;
+    }
+    if !json && matches!(args.first().map(String::as_str), Some("tui")) {
+        let mode = match parse_tui_args(&args[1..]) {
+            Ok(mode) => mode,
+            Err(message) => return emit_error(false, "usage", "usage", &message, EXIT_USAGE, true),
+        };
+        return execute_tui_with_mode(mode).await;
     }
     if matches!(args.first().map(String::as_str), Some("serve")) {
         return execute_serve(&args[1..], json).await;
@@ -874,11 +946,18 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
             return EXIT_INTERRUPTED;
         }
     };
-    let outcome =
-        execute_session_command_inner(&mut client, parsed.command, &root, json, async move {
+    let permission_mode = parsed.permission_mode;
+    let outcome = execute_session_command_inner_with_mode(
+        &mut client,
+        parsed.command,
+        permission_mode,
+        &root,
+        json,
+        async move {
             let _ = cancel_rx.await;
-        })
-        .await;
+        },
+    )
+    .await;
     // Close the client (dropping any open SSE stream) before stopping the
     // embedded server so graceful shutdown does not wait on it.
     drop(client);
@@ -891,6 +970,7 @@ async fn execute_session_command(json: bool, args: &[String]) -> i32 {
     }
 }
 
+#[cfg(test)]
 async fn execute_session_command_inner(
     client: &mut server_client::ServerClient,
     command: server_client::SessionCommand,
@@ -898,23 +978,42 @@ async fn execute_session_command_inner(
     json: bool,
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<i32, server_client::ClientError> {
+    execute_session_command_inner_with_mode(client, command, None, root, json, cancel).await
+}
+
+async fn execute_session_command_inner_with_mode(
+    client: &mut server_client::ServerClient,
+    command: server_client::SessionCommand,
+    permission_mode: Option<latte_core::PermissionMode>,
+    root: &Path,
+    json: bool,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<i32, server_client::ClientError> {
     use server_client::SessionServer;
+    let mut last_ended_with_newline = true;
     let mut progress = |text: &str| {
+        if !text.is_empty() {
+            last_ended_with_newline = text.ends_with('\n');
+        }
         eprint!("{text}");
         let _ = std::io::stderr().flush();
     };
     let mut cancel = std::pin::pin!(cancel);
     match command {
         server_client::SessionCommand::Run { prompt, focus } => {
-            let result = server_client::run_session(
+            let result = server_client::run_session_with_mode(
                 client,
                 root,
                 &prompt,
                 focus.as_deref(),
+                permission_mode,
                 &mut progress,
                 cancel,
             )
             .await?;
+            if !last_ended_with_newline {
+                eprintln!();
+            }
             if json {
                 println!("{}", server_client::run_envelope(&result));
             } else if let Some(snapshot) = result.snapshot() {
@@ -923,15 +1022,19 @@ async fn execute_session_command_inner(
             Ok(result.exit_code())
         }
         server_client::SessionCommand::Resume { session_id, prompt } => {
-            let result = server_client::resume_session(
+            let result = server_client::resume_session_with_mode(
                 client,
                 root,
                 &session_id,
                 &prompt,
+                permission_mode,
                 &mut progress,
                 cancel,
             )
             .await?;
+            if !last_ended_with_newline {
+                eprintln!();
+            }
             if json {
                 println!("{}", server_client::run_envelope(&result));
             } else if let Some(snapshot) = result.snapshot() {
@@ -1055,7 +1158,12 @@ struct TuiSetup {
 
 /// Resolves config, server connection, and runtime state for the TUI.
 /// Separated from [`execute_tui`] so the setup paths are testable without a TTY.
+#[cfg(test)]
 async fn tui_setup() -> Result<TuiSetup, i32> {
+    tui_setup_for_mode(latte_core::PermissionMode::Ask).await
+}
+
+async fn tui_setup_for_mode(permission_mode: latte_core::PermissionMode) -> Result<TuiSetup, i32> {
     let root = match std::env::current_dir() {
         Ok(root) => discover_workspace_root(&root),
         Err(error) => {
@@ -1070,13 +1178,22 @@ async fn tui_setup() -> Result<TuiSetup, i32> {
             return Err(EXIT_USAGE);
         }
     };
-    tui_setup_with(&root, &storage_home).await
+    tui_setup_with_mode(&root, &storage_home, permission_mode).await
 }
 
 /// Core setup logic with injected paths (unit-testable without a TTY or a
 /// process-wide working directory).
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i32> {
+    tui_setup_with_mode(root, storage_home, latte_core::PermissionMode::Ask).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn tui_setup_with_mode(
+    root: &Path,
+    storage_home: &Path,
+    permission_mode: latte_core::PermissionMode,
+) -> Result<TuiSetup, i32> {
     // Connect to the embedded server (the server is the single engine host).
     let (client, embedded) = match server_client::connect(None, None, root, storage_home).await {
         Ok(connected) => connected,
@@ -1150,7 +1267,7 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
             })
             .collect(),
         workspace_display: workspace_display_path(root),
-        permission_mode: latte_tui::session::SessionPermissionMode::Ask,
+        permission_mode,
     };
     // Spawn the SSE bridge: background task → mpsc channels for the sync TUI.
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ProjectionEvent>();
@@ -1184,13 +1301,17 @@ async fn tui_setup_with(root: &Path, storage_home: &Path) -> Result<TuiSetup, i3
 /// submits v2 conversation requests over HTTP+SSE (the server is the single
 /// engine host; there is no in-process engine in the TUI path).
 async fn execute_tui() -> i32 {
+    execute_tui_with_mode(latte_core::PermissionMode::Ask).await
+}
+
+async fn execute_tui_with_mode(permission_mode: latte_core::PermissionMode) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         eprintln!(
             "interactive TUI requires a TTY; use --json list/show/run/resume for non-interactive use"
         );
         return EXIT_USAGE;
     }
-    let setup = match tui_setup().await {
+    let setup = match tui_setup_for_mode(permission_mode).await {
         Ok(setup) => setup,
         Err(code) => return code,
     };
@@ -1214,6 +1335,8 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
         sse_task,
         ..
     } = setup;
+    let current_permission_mode =
+        std::sync::Arc::new(std::sync::Mutex::new(startup.permission_mode));
     // Resolve a provider+model pair to a binding from the cached catalog.
     let resolve_binding = |provider_name: &str, model: &str| -> Option<Value> {
         bindings
@@ -1288,6 +1411,9 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     let ws = workspace_id.clone();
+                    let mode = *current_permission_mode
+                        .lock()
+                        .expect("permission mode lock");
                     let session_id =
                         SessionId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
                     let command_id = latte_core::SessionCommandId::from_uuid(
@@ -1298,7 +1424,14 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         serde_json::to_value(&binding).map_err(|error| error.to_string())?;
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(&ws, session_id, command_id, &prompt, &binding_value)
+                            .create_session_with_mode(
+                                &ws,
+                                session_id,
+                                command_id,
+                                &prompt,
+                                &binding_value,
+                                Some(mode),
+                            )
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -1321,6 +1454,9 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let handle = server_handle.clone();
                     let feedback = feedback_tx.clone();
                     let ws = workspace_id.clone();
+                    let perm_mode = *current_permission_mode
+                        .lock()
+                        .expect("permission mode lock");
                     let session_id =
                         SessionId::from_uuid(latte_core::SystemIdSource::default().next_uuid_v7());
                     let command_id = latte_core::SessionCommandId::from_uuid(
@@ -1329,7 +1465,14 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     let _ = feedback.send(SessionUiFeedback::assigned(submission_id, session_id));
                     tokio::spawn(async move {
                         let result = handle
-                            .create_session(&ws, session_id, command_id, &prompt, &binding_value)
+                            .create_session_with_mode(
+                                &ws,
+                                session_id,
+                                command_id,
+                                &prompt,
+                                &binding_value,
+                                Some(perm_mode),
+                            )
                             .await
                             .map(|_| "conversation completed".into())
                             .map_err(|error| error.to_string());
@@ -1520,6 +1663,22 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                             .map_err(|error| error.to_string());
                         let _ = feedback.send(SessionUiFeedback::model_switch(switch_id, result));
                     });
+                }
+                SessionUiAction::SetPermissionMode { session_id, mode } => {
+                    *current_permission_mode
+                        .lock()
+                        .expect("permission mode lock") = mode;
+                    if let Some(session_id) = session_id {
+                        let handle = server_handle.clone();
+                        let feedback = feedback_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle.set_permission_mode(&session_id, mode).await
+                            {
+                                let _ = feedback
+                                    .send(SessionUiFeedback::command(Err(error.to_string())));
+                            }
+                        });
+                    }
                 }
                 SessionUiAction::RefreshSnapshots
                 | SessionUiAction::ShowSessions { .. }
@@ -1760,16 +1919,29 @@ fn prepare_server_with_home(
                 .workspace_root(workspace_root)
                 .database_path(&builder_db)
                 .conversation_root(&builder_conv)
+                .require_verification(config.verification.is_some())
                 .build()
                 .map_err(|error| error.to_string())?;
-            // Import any v1 legacy workspace database once, the same way the
-            // in-process TUI path does, so server-driven sessions see history.
-            engine
-                .import_legacy_workspace_database(
-                    config.legacy_database_path(workspace_root),
-                    wall_time_ms(),
-                )
-                .map_err(|error| format!("legacy import: {error}"))?;
+            // Import any v1 (schema 9..=12) legacy workspace database once.
+            // Pre-v9 (schema 0..=8) or post-v12 `.latte/latte-code.db` files
+            // left in local checkouts do not hold `threads_v2` tables and must
+            // be skipped with a warning rather than bricking the workspace,
+            // while corrupt non-SQLite files continue to fail closed.
+            match engine.import_legacy_workspace_database(
+                config.legacy_database_path(workspace_root),
+                wall_time_ms(),
+            ) {
+                Ok(_) => {}
+                Err(latte_engine::StorageError::InvalidData(message))
+                    if message.contains("cannot be imported; expected 9 through 12") =>
+                {
+                    eprintln!(
+                        "warning: skipping incompatible legacy workspace database at {}: {message}",
+                        config.legacy_database_path(workspace_root).display()
+                    );
+                }
+                Err(error) => return Err(format!("legacy import: {error}")),
+            }
             let factory_engine = engine.clone();
             let factory_registry = registry.clone();
             let factory: latte_headless::session::SessionProviderFactory =
@@ -1806,6 +1978,9 @@ fn prepare_server_with_home(
             if config.session.compaction.retain_ratio != 0 {
                 base_policy.compaction.retain_ratio = config.session.compaction.retain_ratio;
             }
+            if let Some(reuse_prefix) = config.session.compaction.reuse_prefix {
+                base_policy.compaction.reuse_prefix = reuse_prefix;
+            }
             let profile_catalog = std::sync::Arc::new(
                 latte_headless::profile::ProfileCatalog::new(
                     base_policy,
@@ -1819,8 +1994,11 @@ fn prepare_server_with_home(
                 config.session_policy(),
                 factory,
             )
-            .with_profile_catalog(profile_catalog)
-            .with_verification(config.plan());
+            .with_profile_catalog(profile_catalog);
+            let runtime = match config.plan() {
+                Some(plan) => runtime.with_verification(plan),
+                None => runtime,
+            };
             let runtime = match server_lease_ttl_ms() {
                 Some(ttl_ms) => runtime.with_lease_ttl_ms(ttl_ms),
                 None => runtime,
@@ -2001,14 +2179,14 @@ mod tests {
             default_model: "primary/test".into(),
             providers: json!({}),
             database: DatabaseConfig::default(),
-            verification: VerificationConfig {
+            verification: Some(VerificationConfig {
                 argv: vec!["cargo".into(), "test".into()],
                 cwd: "checks".into(),
                 timeout_ms: 42,
-            },
+            }),
             session: sessions,
         };
-        let plan = config.plan();
+        let plan = config.plan().expect("configured verification plan");
         assert_eq!(plan.argv, ["cargo", "test"]);
         assert_eq!(plan.cwd, "checks");
         assert_eq!(plan.timeout_ms, 42);
@@ -2018,6 +2196,11 @@ mod tests {
         let derived = config.session_policy();
         assert_eq!(derived.max_request_bytes, policy.max_request_bytes);
         assert_eq!(derived.context_cap_bytes, policy.context_cap_bytes);
+        let no_verify = AppConfig {
+            verification: None,
+            ..config
+        };
+        assert!(no_verify.plan().is_none());
     }
 
     #[test]
@@ -2054,11 +2237,11 @@ mod tests {
             database: DatabaseConfig {
                 path: configured.display().to_string(),
             },
-            verification: VerificationConfig {
+            verification: Some(VerificationConfig {
                 argv: vec!["true".into()],
                 cwd: ".".into(),
                 timeout_ms: 1,
-            },
+            }),
             session: SessionConfig::default(),
         };
         assert_eq!(config.database.path, configured.display().to_string());
@@ -2151,6 +2334,7 @@ mod tests {
             max_summary_source_bytes: 1024,
             trigger_ratio: 90,
             retain_ratio: 20,
+            reuse_prefix: None,
         };
         assert!(valid().validate().is_ok());
         let mut bad_trigger = valid();
@@ -2387,8 +2571,9 @@ mod tests {
             "verification": { "argv": ["true"] }
         }))
         .unwrap();
-        assert_eq!(config.verification.cwd, dot());
-        assert_eq!(config.verification.timeout_ms, verify_timeout());
+        let verification = config.verification.expect("configured verification");
+        assert_eq!(verification.cwd, dot());
+        assert_eq!(verification.timeout_ms, verify_timeout());
         assert_eq!(config.database.path, ".latte/latte-code.db");
 
         emit_data("completed", &json!({"kind":"contract-probe"}));
@@ -2478,11 +2663,11 @@ mod tests {
             database: DatabaseConfig {
                 path: ".latte/latte-code.db".into(),
             },
-            verification: VerificationConfig {
+            verification: Some(VerificationConfig {
                 argv: vec!["true".into()],
                 cwd: ".".into(),
                 timeout_ms: 1000,
-            },
+            }),
             session: SessionConfig::default(),
         };
         assert_eq!(
@@ -2654,7 +2839,7 @@ mod tests {
         .unwrap();
         let (config, _registry) =
             AppConfig::load_with_home(root.path(), Some(home.path())).unwrap();
-        assert_eq!(config.verification.argv, ["echo", "home"]);
+        assert_eq!(config.verification.unwrap().argv, ["echo", "home"]);
     }
 
     #[test]
@@ -2666,8 +2851,10 @@ mod tests {
         std::fs::write(
             home.path().join(".latte/latte-code.jsonc"),
             r#"{
+                "$schema": "https://latte.dev/schema/latte-code.json",
+                default_provider: "legacy-ignored",
                 database: { path: "user.db" },
-                verification: { timeout_ms: 9000 },
+                verification: { argv: ["true"], timeout_ms: 9000 },
                 default_model: "primary/user-model",
                 providers: { primary: {
                     type: "openai-chat",
@@ -2692,9 +2879,20 @@ mod tests {
         let binding = registry.session_binding_for_default(&[]).unwrap();
 
         assert_eq!(config.database.path, "workspace.db");
-        assert_eq!(config.verification.timeout_ms, 9000);
+        assert_eq!(config.verification.unwrap().timeout_ms, 9000);
         assert_eq!(binding.model, "workspace-model");
         assert_eq!(registry.model_catalog().len(), 1);
+        assert_eq!(
+            super::parse_tui_args(&["--auto".to_string()]).unwrap(),
+            latte_core::PermissionMode::FullAuto
+        );
+        assert_eq!(
+            super::parse_tui_args(&["--permission-mode".to_string(), "auto-edit".to_string()])
+                .unwrap(),
+            latte_core::PermissionMode::AutoEdit
+        );
+        assert!(super::parse_tui_args(&["--permission-mode".to_string()]).is_err());
+        assert!(super::parse_tui_args(&["--bogus".to_string()]).is_err());
     }
 
     #[test]

@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 /// existing behavior.
 pub const GENERIC_OPENAI_CHAT_PROFILE_ID: &str = "generic-openai-chat";
 
+/// Identifier of the built-in profile for Anthropic Messages bindings
+/// (`type = "anthropic-messages"`), pairing RL-aligned `ClaudeCode` tool
+/// presentation with warm-prefix compaction reuse.
+pub const ANTHROPIC_MESSAGES_PROFILE_ID: &str = "anthropic-messages";
+
 /// Slot holding the main system prompt rendered at every provider request.
 pub const AGENT_SYSTEM_PROMPT_SLOT: &str = "agent.system";
 
@@ -47,6 +52,27 @@ impl ProfileVersion {
     /// Version of the initial profile surface shipped with the profile
     /// abstraction itself.
     pub const V1_0: Self = Self { major: 1, minor: 0 };
+    /// Version introducing `ToolPresentationStyle` and warm-prefix compaction
+    /// reuse (`reuse_prefix`).
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
+}
+
+/// Model-facing tool naming and input-schema presentation style.
+///
+/// Presentation affects only how tools are advertised to the Provider and how
+/// wire tool-call inputs are translated at the `latte-headless` adapter
+/// boundary; `latte-engine` still validates and executes canonical
+/// `EffectAuthority` descriptors with unchanged permissions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationStyle {
+    /// Canonical Latte Code tool names and schemas (`read_file`, `edit_file`,
+    /// `write_file`, `list_directory`, `search`, `process`, ...).
+    #[default]
+    Canonical,
+    /// Claude Code / Seed RL-aligned tool names and parameter schemas (`Read`,
+    /// `Edit`, `Write`, `Glob`, `Grep`, `Bash`, `GitDiff`, `ReadManifest`).
+    ClaudeCode,
 }
 
 /// Data-shaped compaction strategy selector. The loop `match`es this value
@@ -101,6 +127,14 @@ pub struct CompactionPolicy {
     pub summary_prompt_id: String,
     /// Byte bound on the history one summarization request may read.
     pub max_summary_source_bytes: usize,
+    /// When `true`, summarization reuses the active conversation prefix
+    /// (`[system, repository_context?, prior_summary?, discarded_segments…]`)
+    /// plus `tools` and appends the summarization instruction as the final
+    /// `user` message whenever that request fits both `request_budget_bytes`
+    /// and `max_summary_source_bytes`, falling back to bounded plain-text
+    /// summarization when it does not.
+    #[serde(default)]
+    pub reuse_prefix: bool,
 }
 
 impl Default for CompactionPolicy {
@@ -110,7 +144,8 @@ impl Default for CompactionPolicy {
             trigger_ratio: 90,
             retain_ratio: 20,
             summary_prompt_id: AGENT_SUMMARIZE_PROMPT_SLOT.to_owned(),
-            max_summary_source_bytes: 32 * 1024,
+            max_summary_source_bytes: 512 * 1024,
+            reuse_prefix: false,
         }
     }
 }
@@ -211,12 +246,12 @@ pub struct ContextPolicy {
 impl Default for ContextPolicy {
     fn default() -> Self {
         Self {
-            max_request_bytes: 512 * 1024,
-            max_input_bytes: 384 * 1024,
-            reserved_output_bytes: 128 * 1024,
-            context_cap_bytes: 64 * 1024,
+            max_request_bytes: 2 * 1024 * 1024,
+            max_input_bytes: 1536 * 1024,
+            reserved_output_bytes: 256 * 1024,
+            context_cap_bytes: 128 * 1024,
             max_tool_rounds: None,
-            provider_timeout_ms: 60_000,
+            provider_timeout_ms: 120_000,
             compaction: CompactionPolicy::default(),
             token_estimate: TokenEstimateParams::default(),
         }
@@ -340,15 +375,17 @@ impl SystemPromptSpec {
 
 /// The resolved per-model behavioral contract consumed by the agent loop.
 ///
-/// `tools` and `semantics` are reserved dimensions declared by the design;
-/// they stay `None` until a real consumer exists, and a `None` value must
-/// never change loop behavior.
+/// `tools` selects the model-facing tool presentation without altering
+/// `latte-engine` effect authority or permissions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessProfile {
     pub profile_id: String,
     pub version: ProfileVersion,
     pub context: ContextPolicy,
     pub prompts: SystemPromptSpec,
+    #[serde(default)]
+    pub tools: ToolPresentationStyle,
 }
 
 impl HarnessProfile {
@@ -574,6 +611,7 @@ mod tests {
             version: ProfileVersion::V1_0,
             context: valid_context(),
             prompts: SystemPromptSpec::default(),
+            tools: ToolPresentationStyle::Canonical,
         };
         assert!(profile.validate().is_err());
         profile.profile_id = GENERIC_OPENAI_CHAT_PROFILE_ID.to_owned();
@@ -582,15 +620,40 @@ mod tests {
 
     #[test]
     fn profile_types_round_trip_through_serde() {
-        let profile = HarnessProfile {
-            profile_id: GENERIC_OPENAI_CHAT_PROFILE_ID.to_owned(),
-            version: ProfileVersion::V1_0,
-            context: valid_context(),
-            prompts: SystemPromptSpec::default(),
-        };
-        let json = serde_json::to_string(&profile).expect("serializable");
-        let parsed: HarnessProfile = serde_json::from_str(&json).expect("deserializable");
-        assert_eq!(profile, parsed);
+        for tools in [
+            ToolPresentationStyle::Canonical,
+            ToolPresentationStyle::ClaudeCode,
+        ] {
+            let mut context = valid_context();
+            context.compaction.reuse_prefix = tools == ToolPresentationStyle::ClaudeCode;
+            let profile = HarnessProfile {
+                profile_id: ANTHROPIC_MESSAGES_PROFILE_ID.to_owned(),
+                version: ProfileVersion::V1_1,
+                context,
+                prompts: SystemPromptSpec::default(),
+                tools,
+            };
+            let json = serde_json::to_string(&profile).expect("serializable");
+            let parsed: HarnessProfile = serde_json::from_str(&json).expect("deserializable");
+            assert_eq!(profile, parsed);
+        }
+        // v1.0 snapshots without `tools` or `reuse_prefix` deserialize cleanly.
+        let v1_json = serde_json::json!({
+            "profile_id": GENERIC_OPENAI_CHAT_PROFILE_ID,
+            "version": {"major": 1, "minor": 0},
+            "context": {
+                "max_request_bytes": 524_288,
+                "max_input_bytes": 393_216,
+                "reserved_output_bytes": 131_072,
+                "context_cap_bytes": 65_536,
+                "max_tool_rounds": null,
+                "provider_timeout_ms": 60_000
+            },
+            "prompts": {"slots": {}}
+        });
+        let legacy: HarnessProfile = serde_json::from_value(v1_json).expect("v1 compatible");
+        assert_eq!(legacy.tools, ToolPresentationStyle::Canonical);
+        assert!(!legacy.context.compaction.reuse_prefix);
     }
 
     #[test]

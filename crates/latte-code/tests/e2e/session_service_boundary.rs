@@ -231,8 +231,14 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
             && entry.text.contains("selected model could not be started")
     }));
 
+    let strict_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .require_verification(true)
+        .build()
+        .unwrap();
     let no_verification = SessionRuntimeService::new(
-        engine.clone(),
+        strict_engine.clone(),
         scenario.root(),
         SessionHistoryPolicy::default(),
         factory([
@@ -291,6 +297,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         .unwrap();
     assert_eq!(failed_verification.lifecycle, SessionLifecycle::Failed);
     assert!(scenario.root().join("service-write.txt").exists());
+    drop(strict_engine);
 
     let invalid_outcomes = [
         ProviderResponse {
@@ -345,17 +352,33 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         assert_eq!(invalid.lifecycle, SessionLifecycle::Failed);
     }
 
-    std::fs::create_dir(scenario.root().join("unreadable-as-file")).unwrap();
+    let readonly_dir = scenario.root().join("readonly-dir");
+    std::fs::create_dir(&readonly_dir).unwrap();
+    std::fs::set_permissions(
+        &readonly_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o555),
+    )
+    .unwrap();
+    let auto_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .permission_mode(latte_core::PermissionMode::FullAuto)
+        .build()
+        .unwrap();
     let uncertain_tool = SessionRuntimeService::new(
-        engine.clone(),
+        auto_engine.clone(),
         scenario.root(),
         SessionHistoryPolicy::default(),
         factory([ProviderResponse {
             message: None,
             tool_calls: vec![ToolCall {
-                id: "missing-read".into(),
-                name: "read_file".into(),
-                input: serde_json::json!({"path":"unreadable-as-file"}),
+                id: "uncertain-write".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path":"readonly-dir/out.txt",
+                    "content":"blocked after start\n",
+                    "create_intent":true
+                }),
             }],
             input_request: None,
             usage: ProviderUsage::default(),
@@ -372,6 +395,12 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         )
         .await
         .unwrap();
+    std::fs::set_permissions(
+        &readonly_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    drop(auto_engine);
     assert_eq!(
         reconciliation.lifecycle,
         SessionLifecycle::ReconciliationRequired

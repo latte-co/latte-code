@@ -4004,15 +4004,52 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         .unwrap_err();
     assert!(matches!(
         cancellation_error,
-        latte_engine::SessionEffectExecutionError::Uncertain(message)
+        latte_engine::SessionEffectExecutionError::Certified(message)
             if message.contains("tool cancelled after Started")
     ));
 
+    let strict_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .permission_mode(latte_core::PermissionMode::FullAuto)
+        .require_verification(true)
+        .build()
+        .unwrap();
     let (changed, changed_lease, _) =
-        create_started_effect_session(&engine, "changed completion rejection", now + 14);
-    std::fs::write(scenario.root().join("changed-after-start.txt"), "changed\n").unwrap();
+        create_started_effect_session(&strict_engine, "changed completion rejection", now + 14);
+    let write_prepared = prepare_effect(
+        &strict_engine,
+        &changed_lease,
+        &changed,
+        "changed-write",
+        "write_file",
+        serde_json::json!({"path":"changed-after-start.txt","content":"changed\n"}),
+        now + 15,
+    );
+    let write_started = start_effect(
+        &strict_engine,
+        &changed_lease,
+        &write_prepared,
+        "changed-write",
+        now + 16,
+    );
+    let write_observed = strict_engine
+        .execute_started_session_effect(&write_started, &changed_lease, &CancellationToken::new())
+        .await
+        .unwrap();
+    let changed = strict_engine
+        .observe_session_effect(
+            &write_started,
+            "changed-write:observe".into(),
+            command_id(),
+            write_observed,
+            &changed_lease,
+            now + 16,
+        )
+        .unwrap()
+        .snapshot;
     let changed_error = commit_with_command(
-        &engine,
+        &strict_engine,
         &changed_lease,
         &changed,
         command_id(),
@@ -4032,7 +4069,8 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
             .to_string()
             .contains("use verified completion")
     );
-    engine.release_lease(&changed_lease).unwrap();
+    strict_engine.release_lease(&changed_lease).unwrap();
+    drop(strict_engine);
 
     let mut leases = vec![validation_lease];
     let shell_process_session_id;
@@ -4170,7 +4208,7 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
         assert!(matches!(
             shell_process.snapshot.pending.as_ref(),
             Some(SessionPendingRequest::Permission { description, .. })
-                if description == "Run shell command (cwd: .)"
+                if description == "Run shell command: printf boundary (cwd: .)"
         ));
         shell_process_session_id = shell_process.snapshot.session_id;
     }
@@ -4188,7 +4226,10 @@ async fn effect_validation_and_permission_summaries_are_final_binary_visible() {
     let mut tui = PtySession::spawn(scenario.command(&["tui"]));
     assert!(tui.wait_for_output(TUI_READY, Duration::from_secs(5)));
     tui.write(format!("/resume {shell_process_session_id}\r").as_bytes());
-    assert!(tui.wait_for_output(b"Run shell command (cwd: .)", Duration::from_secs(5)));
+    assert!(tui.wait_for_output(
+        b"Run shell command: printf boundary (cwd: .)",
+        Duration::from_secs(5)
+    ));
     tui.write(F10);
     assert!(tui.finish(Duration::from_secs(5)).0.success());
 }

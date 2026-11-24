@@ -100,13 +100,19 @@ pub(crate) struct Prepared {
 enum Action {
     Read {
         path: std::path::PathBuf,
+        offset: Option<usize>,
+        limit: Option<usize>,
         max: usize,
     },
     List {
         path: std::path::PathBuf,
+        max_depth: usize,
+        glob: Option<String>,
         max: usize,
     },
     Search {
+        path: std::path::PathBuf,
+        glob: Option<String>,
         query: String,
         regex: bool,
         max_results: usize,
@@ -119,6 +125,7 @@ enum Action {
         path: std::path::PathBuf,
         before: String,
         after: String,
+        replace_all: bool,
     },
     Write {
         path: std::path::PathBuf,
@@ -128,6 +135,32 @@ enum Action {
     GitDiff {
         max: usize,
     },
+}
+
+pub(crate) fn is_readonly_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_directory" | "search" | "read_project_manifest" | "git_diff"
+    )
+}
+
+fn is_ignored_walk_dir(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            ".git"
+                | ".latte"
+                | ".oh-my-code"
+                | ".opencode"
+                | ".worktree"
+                | ".tmp"
+                | "target"
+                | "node_modules"
+                | ".venv"
+                | "__pycache__"
+                | ".pytest_cache"
+        )
+    )
 }
 
 struct Builtin {
@@ -144,39 +177,62 @@ impl Tool for Builtin {
             effect: format!("{:?}", self.effect).to_lowercase(),
         }
     }
+    #[allow(clippy::too_many_lines)]
     fn prepare(&self, input: &Value, context: &Context<'_>) -> Result<Prepared, ToolError> {
         let path = || string(input, "path");
         let max = || usize_field(input, "max_output", DEFAULT_CAP, 1, DEFAULT_CAP);
         let (target, action) = match self.name {
             "read_file" => {
                 let p = path()?;
+                let offset = optional_usize_field(input, "offset", 1, 1_000_000)?;
+                let limit = optional_usize_field(input, "limit", 1, 10_000)?;
                 (
                     context.workspace.display(p)?,
                     Action::Read {
                         path: context.workspace.read(p)?,
+                        offset,
+                        limit,
                         max: max()?,
                     },
                 )
             }
             "list_directory" => {
-                let p = path()?;
+                let p = optional_string(input, "path")?.unwrap_or(".");
+                let max_depth = usize_field(input, "max_depth", 1, 1, 8)?;
+                let glob = optional_string(input, "glob")?.map(str::to_owned);
+                if let Some(pattern) = &glob {
+                    globset::Glob::new(pattern)
+                        .map_err(|error| ToolError::Input(format!("invalid glob: {error}")))?;
+                }
                 (
                     context.workspace.display(p)?,
                     Action::List {
                         path: context.workspace.read(p)?,
+                        max_depth,
+                        glob,
                         max: usize_field(input, "max_entries", 1000, 1, 10_000)?,
                     },
                 )
             }
-            "search" => (
-                ".".into(),
-                Action::Search {
-                    query: string(input, "query")?.into(),
-                    regex: bool_field(input, "regex", false)?,
-                    max_results: usize_field(input, "max_results", 100, 1, 10_000)?,
-                    max_output: max()?,
-                },
-            ),
+            "search" => {
+                let p = optional_string(input, "path")?.unwrap_or(".");
+                let glob = optional_string(input, "glob")?.map(str::to_owned);
+                if let Some(pattern) = &glob {
+                    globset::Glob::new(pattern)
+                        .map_err(|error| ToolError::Input(format!("invalid glob: {error}")))?;
+                }
+                (
+                    context.workspace.display(p)?,
+                    Action::Search {
+                        path: context.workspace.read(p)?,
+                        glob,
+                        query: string(input, "query")?.into(),
+                        regex: bool_field(input, "regex", false)?,
+                        max_results: usize_field(input, "max_results", 100, 1, 10_000)?,
+                        max_output: max()?,
+                    },
+                )
+            }
             "read_project_manifest" => (".".into(), Action::Manifest { max: max()? }),
             "edit_file" => {
                 let p = path()?;
@@ -188,23 +244,33 @@ impl Tool for Builtin {
                     .ok_or_else(|| {
                         ToolError::Input("before or anchor must be a non-empty string".into())
                     })?;
+                let replace_all = optional_bool_field(input, "replace_all")?.unwrap_or(false);
                 (
                     context.workspace.display(p)?,
                     Action::Edit {
                         path: context.workspace.mutation(p, false)?,
                         before: before.into(),
-                        after: string(input, "after")?.into(),
+                        after: raw_string(input, "after")?.into(),
+                        replace_all,
                     },
                 )
             }
             "write_file" => {
                 let p = path()?;
-                let create = bool_field(input, "create_intent", false)?;
+                let display = context.workspace.display(p)?;
+                let explicit_create = optional_bool_field(input, "create_intent")?;
+                let create = match explicit_create {
+                    Some(explicit) => explicit,
+                    None => context
+                        .workspace
+                        .mutation(p, false)
+                        .is_err_and(|error| matches!(error, PathError::Missing(_))),
+                };
                 (
-                    context.workspace.display(p)?,
+                    display,
                     Action::Write {
                         path: context.workspace.mutation(p, create)?,
-                        content: string(input, "content")?.into(),
+                        content: raw_string(input, "content")?.into(),
                         create,
                     },
                 )
@@ -228,26 +294,28 @@ impl Tool for Builtin {
 
 /// Model-visible tool documentation. The schema constrains shape; this states
 /// the contracts a schema cannot express, above all that `edit_file` and
-/// `write_file` need the `sha256` a prior `read_file` returned. A model that
-/// cannot see that link omits `precondition` and every mutation is rejected.
+/// `write_file` require reading an existing file first (with optional
+/// `sha256` `precondition`).
 pub(crate) fn tool_description(name: &str) -> &'static str {
     match name {
         "read_file" => {
-            "Read a UTF-8 text file inside the workspace. Returns \
-             {content, sha256, size, modified_ns}, where `sha256` is the digest of the \
-             file as read. Keep that value: editing or overwriting this path requires \
-             passing it back as `precondition`. Long files are truncated to `max_output` \
-             bytes; a truncated read still reports the digest of the whole file."
+            "Read a UTF-8 text file inside the workspace. Supports optional 1-based line \
+             pagination via `offset` and `limit` for large files. Returns {content, \
+             start_line, end_line, total_lines, has_more, sha256, size, modified_ns}. \
+             Reading a file records its fresh snapshot so subsequent `edit_file` or \
+             `write_file` calls on the same path succeed without copying `sha256` \
+             (though passing `sha256` as `precondition` is also supported)."
         }
         "list_directory" => {
-            "List the immediate entry names of one workspace directory, sorted, without \
-             recursing. Returns {entries}. Use `search` to find content across the tree."
+            "List workspace entries under `path` (default `.`), sorted, appending `/` to \
+             directories. Set `max_depth` (1..=8) or `glob` (e.g. `**/*.rs`) to discover \
+             files across subdirectories while honouring .gitignore."
         }
         "search" => {
-            "Search workspace file contents line by line, honouring .gitignore. Returns \
-             {matches} as `path:line:text` strings. `query` is a literal substring unless \
-             `regex` is true, in which case it is a Rust regular expression. Results stop \
-             at `max_results` or `max_output` bytes, whichever comes first."
+            "Search workspace file contents line by line, honouring .gitignore. Optional \
+             `path` scopes the directory/file and optional `glob` filters filenames. \
+             Returns {matches} as `path:line:text` strings. `query` is a literal substring \
+             unless `regex` is true. Results stop at `max_results` or `max_output` bytes."
         }
         "read_project_manifest" => {
             "Read the workspace's dependency manifests (Cargo.toml, package.json, \
@@ -256,37 +324,31 @@ pub(crate) fn tool_description(name: &str) -> &'static str {
              proposing changes."
         }
         "git_diff" => {
-            "Show the workspace's uncommitted changes as a unified diff against the Git \
-             index. Returns an empty result when nothing is modified. Use it to review \
-             your own edits before reporting them as complete."
+            "Show the workspace's uncommitted changes (stat + unified diff against HEAD \
+             plus untracked files). Returns an empty result when nothing is modified. Use \
+             it to review your own edits before reporting them as complete."
         }
         "edit_file" => {
-            "Replace one exact span of an existing file. Call `read_file` on the same path \
-             first and pass the `sha256` it returned as `precondition`; the edit is \
-             rejected as stale if the file changed since that read. `before` must match \
-             the current contents verbatim, including whitespace and indentation, and must \
-             occur exactly once — the edit is rejected when it matches zero times or more \
-             than once, so widen `before` with surrounding lines until it is unique. \
-             `after` replaces it and may be empty to delete the span. Prefer this over \
-             `write_file` for changing part of a file: it cannot silently discard content \
-             you did not read."
+            "Replace a span of an existing file. Call `read_file` on the same path first \
+             (the engine tracks the read `sha256` automatically, or you may pass an explicit \
+             `precondition`). `before` must match the target span verbatim and occur exactly once \
+             (unless `replace_all` is true) — widen `before` with surrounding lines until it is \
+             unique. `after` replaces it and may be empty to delete the span. Prefer this over \
+             `write_file` for partial edits."
         }
         "write_file" => {
-            "Write a file's complete contents, replacing anything already there. To create \
-             a new file, set `create_intent` to true and omit `precondition`; this fails if \
-             the path already exists. To overwrite an existing file, leave `create_intent` \
-             false and pass the `sha256` from a prior `read_file` as `precondition`. \
-             `content` becomes the entire file, so an overwrite drops every line you did \
-             not include — use `edit_file` for partial changes."
+            "Write a file's complete contents, automatically creating missing parent \
+             directories when creating a new file. When `create_intent` is omitted, new \
+             paths are created and existing paths overwrite after a prior `read_file` \
+             (with optional `sha256` `precondition`). Prefer `edit_file` for partial edits."
         }
         "process" => {
             "Run a command inside the workspace under engine supervision. Prefer `argv`, \
              an argument vector executed directly with no shell, so no quoting or \
-             expansion applies. `shell` runs a shell command line instead and is \
-             high-risk: it needs explicit policy approval and should be reserved for \
-             pipelines and redirection that `argv` cannot express. Output is captured up \
-             to `stdout_cap`/`stderr_cap` bytes and the process group is terminated at \
-             `timeout_ms`. Returns the exit status with the captured streams."
+             expansion applies. `shell` runs a `/bin/sh -c` command line instead and \
+             requires policy approval; reserve it for pipelines and redirection. Output is \
+             captured up to `stdout_cap`/`stderr_cap` bytes and the process group is \
+             terminated at `timeout_ms`."
         }
         _ => "Engine-owned workspace operation.",
     }
@@ -298,25 +360,25 @@ pub(crate) fn tool_schema(name: &str) -> Value {
     let digest = || json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
     match name {
         "read_file" => {
-            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_output":cap()},"additionalProperties":false})
+            json!({"type":"object","required":["path"],"properties":{"path":path(),"offset":{"type":"integer","minimum":1,"maximum":1_000_000},"limit":{"type":"integer","minimum":1,"maximum":10_000},"max_output":cap()},"additionalProperties":false})
         }
         "list_directory" => {
-            json!({"type":"object","required":["path"],"properties":{"path":path(),"max_entries":{"type":"integer","minimum":1,"maximum":10000}},"additionalProperties":false})
+            json!({"type":"object","required":[],"properties":{"path":path(),"max_depth":{"type":"integer","minimum":1,"maximum":8},"glob":{"type":"string","minLength":1,"maxLength":1024},"max_entries":{"type":"integer","minimum":1,"maximum":10_000}},"additionalProperties":false})
         }
         "search" => {
-            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10000},"max_output":cap()},"additionalProperties":false})
+            json!({"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"path":path(),"glob":{"type":"string","minLength":1,"maxLength":1024},"regex":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":10_000},"max_output":cap()},"additionalProperties":false})
         }
         "read_project_manifest" | "git_diff" => {
             json!({"type":"object","required":[],"properties":{"max_output":cap()},"additionalProperties":false})
         }
         "edit_file" => {
-            json!({"type":"object","required":["path","after","precondition"],"properties":{"path":path(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"precondition":digest()},"anyOf":[{"required":["before"]},{"required":["anchor"]}],"additionalProperties":false})
+            json!({"type":"object","required":["path","after"],"properties":{"path":path(),"before":{"type":"string","minLength":1},"anchor":{"type":"string","minLength":1},"after":{"type":"string"},"replace_all":{"type":"boolean"},"precondition":digest()},"additionalProperties":false})
         }
         "write_file" => {
-            json!({"type":"object","required":["path","content","create_intent"],"properties":{"path":path(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest()},"additionalProperties":false})
+            json!({"type":"object","required":["path","content"],"properties":{"path":path(),"content":{"type":"string"},"create_intent":{"type":"boolean"},"precondition":digest()},"additionalProperties":false})
         }
         "process" => {
-            json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"oneOf":[{"required":["argv"]},{"required":["shell"]}],"additionalProperties":false})
+            json!({"type":"object","required":[],"properties":{"argv":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"string","minLength":1,"maxLength":4096}},"shell":{"type":"string","minLength":1,"maxLength":16384},"cwd":path(),"env":{"type":"object","maxProperties":128,"additionalProperties":{"type":"string","maxLength":16384}},"timeout_ms":{"type":"integer","minimum":1,"maximum":600_000},"grace_ms":{"type":"integer","minimum":0,"maximum":30_000},"stdout_cap":{"type":"integer","minimum":1,"maximum":1_048_576},"stderr_cap":{"type":"integer","minimum":1,"maximum":1_048_576}},"additionalProperties":false})
         }
         _ => json!({"type":"object","required":[],"properties":{},"additionalProperties":false}),
     }
@@ -340,16 +402,38 @@ impl std::fmt::Debug for ToolRegistry {
     }
 }
 impl ToolRegistry {
+    pub(crate) fn display_path(&self, input: &str) -> Result<String, ToolError> {
+        Ok(self.workspace.display(input)?)
+    }
+    pub(crate) fn single_file_manifest_digest(
+        &self,
+        display_path: &str,
+    ) -> Result<String, ToolError> {
+        let target = self.workspace.root().join(display_path);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_file() => Ok(WorkspacePath::identity(&target)?.hash),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let raw = fs::read_link(&target)?;
+                Ok(format!(
+                    "symlink:{:x}",
+                    Sha256::digest(raw.to_string_lossy().as_bytes())
+                ))
+            }
+            Ok(_) => Ok("nonfile".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".into()),
+            Err(error) => Err(ToolError::Io(error)),
+        }
+    }
     pub(crate) fn workspace_manifest(&self) -> Result<BTreeMap<String, String>, ToolError> {
+        const STREAM_HASH_CAP_BYTES: u64 = 16 * 1024 * 1024;
         let mut result = BTreeMap::new();
         for entry in WalkBuilder::new(self.workspace.root())
             .hidden(false)
-            .filter_entry(|entry| {
-                !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | ".latte" | "target")
-                )
-            })
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(true)
+            .require_git(false)
+            .filter_entry(|entry| !is_ignored_walk_dir(entry.file_name().to_str()))
             .build()
         {
             let entry = entry.map_err(|e| ToolError::Io(std::io::Error::other(e)))?;
@@ -362,19 +446,16 @@ impl ToolRegistry {
                 let before = fs::symlink_metadata(entry.path())?;
                 let raw_target = fs::read_link(entry.path())?;
                 let raw_target_components = Self::raw_target_components(&raw_target)?;
-                let normalized = self.safe_symlink_target(entry.path(), &raw_target)?;
-                let canonical = fs::canonicalize(entry.path())
-                    .map_err(|error| ToolError::WorkspaceUnsafe(format!("{relative}: {error}")))?;
-                if !canonical.starts_with(self.workspace.root()) {
-                    return Err(ToolError::WorkspaceUnsafe(format!(
-                        "{relative}: target escapes workspace"
-                    )));
-                }
-                let target_identity = if canonical.is_file() {
-                    Some(WorkspacePath::identity(&canonical)?.hash)
-                } else {
-                    None
-                };
+                let normalized = self.safe_symlink_target(entry.path(), &raw_target).ok();
+                let target_identity = normalized.as_ref().and_then(|_| {
+                    fs::canonicalize(entry.path())
+                        .ok()
+                        .filter(|canonical| {
+                            canonical.starts_with(self.workspace.root()) && canonical.is_file()
+                        })
+                        .and_then(|canonical| WorkspacePath::identity(&canonical).ok())
+                        .map(|identity| identity.hash)
+                });
                 let after_target = fs::read_link(entry.path())?;
                 let after = fs::symlink_metadata(entry.path())?;
                 if raw_target != after_target
@@ -386,7 +467,10 @@ impl ToolRegistry {
                 let record = serde_json::json!({
                     "path": relative,
                     "type": "symlink",
-                    "raw_target": { "absolute": false, "components": raw_target_components },
+                    "raw_target": {
+                        "absolute": raw_target.is_absolute(),
+                        "components": raw_target_components,
+                    },
                     "normalized_target": normalized,
                     "target_identity": target_identity,
                 });
@@ -412,15 +496,26 @@ impl ToolRegistry {
             }
             let before = fs::metadata(entry.path())?;
             let before_modified = before.modified()?;
-            let bytes = fs::read(entry.path())?;
+            let file_hash = if before.len() > STREAM_HASH_CAP_BYTES {
+                let modified_ns = before_modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)?
+                    .as_nanos();
+                format!(
+                    "{:x}",
+                    Sha256::digest(format!("oversized:{}:{modified_ns}", before.len()).as_bytes())
+                )
+            } else {
+                let mut file = fs::File::open(entry.path())?;
+                let mut hasher = Sha256::new();
+                std::io::copy(&mut file, &mut hasher)?;
+                format!("{:x}", hasher.finalize())
+            };
             let after = fs::metadata(entry.path())?;
             if before.len() != after.len() || before_modified != after.modified()? {
                 return Err(ToolError::WorkspaceUnstable(relative));
             }
-            if result
-                .insert(relative, format!("{:x}", Sha256::digest(bytes)))
-                .is_some()
-            {
+            if result.insert(relative, file_hash).is_some() {
                 return Err(ToolError::WorkspaceUnsafe("duplicate manifest path".into()));
             }
         }
@@ -507,9 +602,14 @@ impl ToolRegistry {
                 ])),
                 std::path::Component::CurDir => Ok(serde_json::json!(["current"])),
                 std::path::Component::ParentDir => Ok(serde_json::json!(["parent"])),
-                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                    Err(ToolError::WorkspaceUnsafe("absolute symlink target".into()))
-                }
+                std::path::Component::RootDir => Ok(serde_json::json!(["root"])),
+                std::path::Component::Prefix(prefix) => Ok(serde_json::json!([
+                    "prefix",
+                    prefix
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| ToolError::WorkspaceUnsafe("NonUtf8Path".into()))?
+                ])),
             })
             .collect()
     }
@@ -631,7 +731,14 @@ impl ToolRegistry {
         if prepared.effect != EffectClass::Read {
             self.workspace.validate_mutation_support()?;
         }
-        if prepared.effect == EffectClass::Modify && invocation.precondition.is_none() {
+        if prepared.effect == EffectClass::Modify
+            && invocation.precondition.is_none()
+            && !self
+                .snapshots
+                .lock()
+                .unwrap()
+                .contains_key(&prepared.target)
+        {
             return Err(ToolError::ReadRequired(prepared.target));
         }
         prepared.expected_hash = invocation.precondition.map(str::to_owned);
@@ -662,12 +769,13 @@ impl ToolRegistry {
             .tools
             .get(invocation.name)
             .ok_or_else(|| ToolError::Unknown(invocation.name.into()))?;
-        let prepared = tool.prepare(
+        let mut prepared = tool.prepare(
             invocation.input,
             &Context {
                 workspace: &self.workspace,
             },
         )?;
+        prepared.expected_hash = invocation.precondition.map(str::to_owned);
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
             turn_revision: invocation.turn_revision,
@@ -708,23 +816,164 @@ impl ToolRegistry {
     #[allow(clippy::too_many_lines)]
     fn execute(&self, prepared: Prepared) -> Result<ToolOutput, ToolError> {
         match prepared.action {
-            Action::Read { path, max } => {
-                let bytes = fs::read(&path)?;
-                let id = WorkspacePath::identity(&path)?;
+            Action::Read {
+                path,
+                offset,
+                limit,
+                max,
+            } => {
+                let (bytes, id) = WorkspacePath::read_with_identity(&path)?;
+                if bytes[..bytes.len().min(8192)].contains(&0) {
+                    return Err(ToolError::Input(format!(
+                        "cannot read binary file {} (contains NUL bytes)",
+                        prepared.target
+                    )));
+                }
                 self.snapshots
                     .lock()
                     .unwrap()
                     .insert(prepared.target, id.clone());
-                let (text, truncated) = bounded(&String::from_utf8_lossy(&bytes), max);
+                let full_text = String::from_utf8_lossy(&bytes);
+                let total_lines = full_text.lines().count();
+                if offset.is_some() || limit.is_some() {
+                    let lines: Vec<&str> = full_text.lines().collect();
+                    let start_idx = offset.unwrap_or(1).saturating_sub(1);
+                    let take_count = limit.unwrap_or(2000);
+                    if start_idx >= lines.len() {
+                        return Ok(ToolOutput {
+                            value: json!({
+                                "content": "",
+                                "start_line": start_idx + 1,
+                                "end_line": start_idx,
+                                "total_lines": total_lines,
+                                "has_more": false,
+                                "sha256": id.hash,
+                                "size": id.size,
+                                "modified_ns": id.modified_ns,
+                            }),
+                            truncated: false,
+                        });
+                    }
+                    let end_idx = lines.len().min(start_idx.saturating_add(take_count));
+                    let mut sliced = lines[start_idx..end_idx].join("\n");
+                    if end_idx < lines.len() || full_text.ends_with('\n') {
+                        sliced.push('\n');
+                    }
+                    let (text, byte_truncated) = bounded(&sliced, max);
+                    let shown_lines = text.lines().count();
+                    let end_line = start_idx.saturating_add(shown_lines);
+                    let has_more = end_idx < lines.len() || byte_truncated;
+                    return Ok(ToolOutput {
+                        value: json!({
+                            "content": text,
+                            "start_line": start_idx + 1,
+                            "end_line": end_line,
+                            "total_lines": total_lines,
+                            "has_more": has_more,
+                            "sha256": id.hash,
+                            "size": id.size,
+                            "modified_ns": id.modified_ns,
+                        }),
+                        truncated: has_more,
+                    });
+                }
+                let (text, truncated) = bounded(&full_text, max);
+                let end_line = text.lines().count();
                 Ok(ToolOutput {
-                    value: json!({"content":text,"sha256":id.hash,"size":id.size,"modified_ns":id.modified_ns}),
+                    value: json!({
+                        "content": text,
+                        "start_line": usize::from(!full_text.is_empty()),
+                        "end_line": end_line,
+                        "total_lines": total_lines,
+                        "has_more": truncated,
+                        "sha256": id.hash,
+                        "size": id.size,
+                        "modified_ns": id.modified_ns,
+                    }),
                     truncated,
                 })
             }
-            Action::List { path, max } => {
-                let mut entries = fs::read_dir(path)?
-                    .map(|e| e.map(|v| v.file_name().to_string_lossy().into_owned()))
-                    .collect::<Result<Vec<_>, _>>()?;
+            Action::List {
+                path,
+                max_depth,
+                glob,
+                max,
+            } => {
+                let glob_matcher = glob
+                    .as_deref()
+                    .map(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|compiled| compiled.compile_matcher())
+                            .map_err(|error| ToolError::Input(format!("invalid glob: {error}")))
+                    })
+                    .transpose()?;
+                let mut entries = Vec::new();
+                if max_depth == 1 && glob_matcher.is_none() {
+                    for dir_entry in fs::read_dir(&path)? {
+                        let dir_entry = dir_entry?;
+                        let name = dir_entry.file_name().to_string_lossy().into_owned();
+                        if is_ignored_walk_dir(Some(name.as_str())) {
+                            continue;
+                        }
+                        let is_dir = dir_entry.file_type().is_ok_and(|kind| kind.is_dir());
+                        let entry_path = dir_entry.path();
+                        if let Ok(rel) = entry_path.strip_prefix(self.workspace.root()) {
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if self.policy.is_denied(&rel_str)
+                                || (is_dir && self.policy.is_denied(&format!("{rel_str}/_")))
+                            {
+                                continue;
+                            }
+                        }
+                        entries.push(if is_dir { format!("{name}/") } else { name });
+                    }
+                } else {
+                    for walked in WalkBuilder::new(&path)
+                        .max_depth(Some(max_depth))
+                        .hidden(false)
+                        .git_ignore(true)
+                        .git_global(false)
+                        .git_exclude(true)
+                        .require_git(false)
+                        .filter_entry(|entry| {
+                            entry.depth() == 0 || !is_ignored_walk_dir(entry.file_name().to_str())
+                        })
+                        .build()
+                        .filter_map(Result::ok)
+                    {
+                        if walked.depth() == 0 {
+                            continue;
+                        }
+                        let is_dir = walked.file_type().is_some_and(|kind| kind.is_dir());
+                        let Ok(ws_rel) = walked.path().strip_prefix(self.workspace.root()) else {
+                            continue;
+                        };
+                        let ws_rel_str = ws_rel.to_string_lossy().replace('\\', "/");
+                        if self.policy.is_denied(&ws_rel_str)
+                            || (is_dir && self.policy.is_denied(&format!("{ws_rel_str}/_")))
+                        {
+                            continue;
+                        }
+                        let Ok(rel) = walked.path().strip_prefix(&path) else {
+                            continue;
+                        };
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if let Some(matcher) = &glob_matcher {
+                            let file_name = walked.file_name().to_string_lossy();
+                            if !matcher.is_match(&rel_str)
+                                && !matcher.is_match(&ws_rel_str)
+                                && !matcher.is_match(file_name.as_ref())
+                            {
+                                continue;
+                            }
+                        }
+                        entries.push(if is_dir {
+                            format!("{rel_str}/")
+                        } else {
+                            rel_str
+                        });
+                    }
+                }
                 entries.sort();
                 let truncated = entries.len() > max;
                 entries.truncate(max);
@@ -734,22 +983,61 @@ impl ToolRegistry {
                 })
             }
             Action::Search {
+                path,
+                glob,
                 query,
                 regex,
                 max_results,
                 max_output,
             } => {
+                const MAX_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+                const MAX_MATCH_LINE_BYTES: usize = 512;
                 let matcher = regex.then(|| Regex::new(&query)).transpose()?;
+                let glob_matcher = glob
+                    .as_deref()
+                    .map(|pattern| {
+                        globset::Glob::new(pattern)
+                            .map(|compiled| compiled.compile_matcher())
+                            .map_err(|error| ToolError::Input(format!("invalid glob: {error}")))
+                    })
+                    .transpose()?;
                 let mut results = Vec::new();
                 let mut used = 0;
                 let mut truncated = false;
-                for entry in WalkBuilder::new(self.workspace.root())
+                for entry in WalkBuilder::new(&path)
                     .hidden(false)
                     .git_ignore(true)
+                    .git_global(false)
+                    .git_exclude(true)
+                    .require_git(false)
+                    .filter_entry(|entry| {
+                        entry.depth() == 0 || !is_ignored_walk_dir(entry.file_name().to_str())
+                    })
                     .build()
                     .filter_map(Result::ok)
                     .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
                 {
+                    let Ok(rel_path) = entry.path().strip_prefix(self.workspace.root()) else {
+                        continue;
+                    };
+                    let rel = rel_path.to_string_lossy().replace('\\', "/");
+                    if self.policy.is_denied(&rel) {
+                        continue;
+                    }
+                    if let Some(glob_matcher) = &glob_matcher {
+                        let file_name = entry.file_name().to_string_lossy();
+                        if !glob_matcher.is_match(&rel)
+                            && !glob_matcher.is_match(file_name.as_ref())
+                        {
+                            continue;
+                        }
+                    }
+                    if entry
+                        .metadata()
+                        .is_ok_and(|meta| meta.len() > MAX_SEARCH_FILE_BYTES)
+                    {
+                        continue;
+                    }
                     let Ok(text) = fs::read_to_string(entry.path()) else {
                         continue;
                     };
@@ -758,13 +1046,13 @@ impl ToolRegistry {
                             .as_ref()
                             .map_or_else(|| line.contains(&query), |r| r.is_match(line))
                         {
-                            let rel = entry
-                                .path()
-                                .strip_prefix(self.workspace.root())
-                                .unwrap()
-                                .to_string_lossy()
-                                .replace('\\', "/");
-                            let item = format!("{rel}:{}:{line}", i + 1);
+                            let (bounded_line, line_cut) = bounded(line, MAX_MATCH_LINE_BYTES);
+                            let display_line = if line_cut {
+                                format!("{bounded_line}…")
+                            } else {
+                                bounded_line
+                            };
+                            let item = format!("{rel}:{}:{display_line}", i + 1);
                             if results.len() == max_results || used + item.len() > max_output {
                                 truncated = true;
                                 break;
@@ -804,6 +1092,7 @@ impl ToolRegistry {
                 path,
                 before,
                 after,
+                replace_all,
             } => {
                 let checked = self.workspace.mutation(&prepared.target, false)?;
                 if checked != path {
@@ -813,14 +1102,14 @@ impl ToolRegistry {
                 }
                 self.require_fresh(&prepared.target, &path, prepared.expected_hash.as_deref())?;
                 let content = fs::read_to_string(&path)?;
-                let count = content.match_indices(&before).count();
-                if count != 1 {
-                    return Err(ToolError::MatchCount(count));
-                }
-                let next = content.replacen(&before, &after, 1);
+                let next = apply_edit_span(&content, &before, &after, replace_all)?;
                 self.workspace
                     .atomic_replace(&prepared.target, next.as_bytes(), false)?;
                 let id = WorkspacePath::identity(&path)?;
+                self.snapshots
+                    .lock()
+                    .unwrap()
+                    .insert(prepared.target, id.clone());
                 Ok(ToolOutput {
                     value: json!({"sha256":id.hash,"size":id.size}),
                     truncated: false,
@@ -849,6 +1138,10 @@ impl ToolRegistry {
                 self.workspace
                     .atomic_replace(&prepared.target, content.as_bytes(), create)?;
                 let id = WorkspacePath::identity(&path)?;
+                self.snapshots
+                    .lock()
+                    .unwrap()
+                    .insert(prepared.target, id.clone());
                 Ok(ToolOutput {
                     value: json!({"sha256":id.hash,"size":id.size}),
                     truncated: false,
@@ -898,11 +1191,47 @@ fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str, ToolError> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ToolError::Input(format!("{key} must be a non-empty string")))
 }
+fn raw_string<'a>(v: &'a Value, key: &str) -> Result<&'a str, ToolError> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Input(format!("{key} must be a string")))
+}
+fn optional_string<'a>(v: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.as_str())),
+        Some(_) => Err(ToolError::Input(format!(
+            "{key} must be a non-empty string"
+        ))),
+    }
+}
+fn optional_bool_field(v: &Value, key: &str) -> Result<Option<bool>, ToolError> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(ToolError::Input(format!("{key} must be boolean"))),
+    }
+}
 fn bool_field(v: &Value, key: &str, default: bool) -> Result<bool, ToolError> {
-    v.get(key).map_or(Ok(default), |x| {
-        x.as_bool()
-            .ok_or_else(|| ToolError::Input(format!("{key} must be boolean")))
-    })
+    optional_bool_field(v, key).map(|value| value.unwrap_or(default))
+}
+fn optional_usize_field(
+    v: &Value,
+    key: &str,
+    min: usize,
+    max: usize,
+) -> Result<Option<usize>, ToolError> {
+    let Some(raw) = v.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let n = raw
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| ToolError::Input(format!("{key} must be an integer")))?;
+    if !(min..=max).contains(&n) {
+        return Err(ToolError::Input(format!("{key} is out of bounds")));
+    }
+    Ok(Some(n))
 }
 fn usize_field(
     v: &Value,
@@ -911,15 +1240,7 @@ fn usize_field(
     min: usize,
     max: usize,
 ) -> Result<usize, ToolError> {
-    let n = v.get(key).map_or(Ok(default), |x| {
-        x.as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| ToolError::Input(format!("{key} must be an integer")))
-    })?;
-    if !(min..=max).contains(&n) {
-        return Err(ToolError::Input(format!("{key} is out of bounds")));
-    }
-    Ok(n)
+    optional_usize_field(v, key, min, max).map(|value| value.unwrap_or(default))
 }
 fn bounded(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
@@ -930,6 +1251,272 @@ fn bounded(text: &str, max: usize) -> (String, bool) {
         end -= 1;
     }
     (text[..end].into(), true)
+}
+
+#[derive(Clone, Copy)]
+struct LineSpan<'a> {
+    start: usize,
+    end_body: usize,
+    end_full: usize,
+    body: &'a str,
+}
+
+fn split_line_spans(text: &str) -> Vec<LineSpan<'_>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for chunk in text.split_inclusive('\n') {
+        let start = cursor;
+        let end_full = start + chunk.len();
+        let body = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        spans.push(LineSpan {
+            start,
+            end_body: start + body.len(),
+            end_full,
+            body,
+        });
+        cursor = end_full;
+    }
+    spans
+}
+
+fn adapt_line_endings(after: &str, use_crlf: bool) -> String {
+    if use_crlf && !after.contains("\r\n") && after.contains('\n') {
+        after.replace('\n', "\r\n")
+    } else {
+        after.to_owned()
+    }
+}
+
+fn normalize_quotes_with_map(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut norm_to_orig = Vec::with_capacity(text.len() + 1);
+    for (orig_idx, ch) in text.char_indices() {
+        let mapped = match ch {
+            '\u{2018}' | '\u{2019}' => '\'',
+            '\u{201C}' | '\u{201D}' => '"',
+            other => other,
+        };
+        for _ in 0..mapped.len_utf8() {
+            norm_to_orig.push(orig_idx);
+        }
+        out.push(mapped);
+    }
+    norm_to_orig.push(text.len());
+    (out, norm_to_orig)
+}
+
+fn min_space_indent<'a>(lines: impl Iterator<Item = &'a str>) -> Option<(usize, usize)> {
+    let mut min_indent = usize::MAX;
+    let mut non_empty = 0usize;
+    for line in lines {
+        let trimmed = line.trim_end_matches([' ', '\t']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('\t') {
+            return None;
+        }
+        let spaces = trimmed.bytes().take_while(|b| *b == b' ').count();
+        min_indent = min_indent.min(spaces);
+        non_empty += 1;
+    }
+    (non_empty > 0).then_some((min_indent, non_empty))
+}
+
+fn shift_space_indent(text: &str, delta: isize, use_crlf: bool) -> String {
+    let newline = if use_crlf { "\r\n" } else { "\n" };
+    let trailing_newline = text.ends_with('\n');
+    let raw_lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let slice = if trailing_newline && raw_lines.last() == Some(&"") {
+        &raw_lines[..raw_lines.len() - 1]
+    } else {
+        &raw_lines[..]
+    };
+    let mut shifted = Vec::with_capacity(slice.len());
+    for line in slice {
+        if line.trim().is_empty() {
+            shifted.push(String::new());
+            continue;
+        }
+        if delta >= 0 {
+            let pad = " ".repeat(delta.unsigned_abs());
+            shifted.push(format!("{pad}{line}"));
+        } else {
+            let drop_spaces = delta.unsigned_abs();
+            let leading = line.bytes().take_while(|b| *b == b' ').count();
+            shifted.push(line[leading.min(drop_spaces)..].to_owned());
+        }
+    }
+    let mut joined = shifted.join(newline);
+    if trailing_newline {
+        joined.push_str(newline);
+    }
+    joined
+}
+
+/// Replaces `before` with `after` in `content`.
+///
+/// Tries exact verbatim matching first. When exact matching finds zero hits,
+/// runs three deterministic, uniqueness-checked normalization stages:
+/// 1. CRLF / trailing-whitespace line comparison;
+/// 2. typographic curly-quote normalization (`‘’` / `“”`);
+/// 3. uniform space-indentation shift for multi-line blocks (`>= 2` non-empty
+///    lines) when `replace_all` is `false`.
+#[allow(clippy::too_many_lines)]
+fn apply_edit_span(
+    content: &str,
+    before: &str,
+    after: &str,
+    replace_all: bool,
+) -> Result<String, ToolError> {
+    let exact_count = content.match_indices(before).count();
+    if exact_count == 1 {
+        return Ok(content.replacen(before, after, 1));
+    }
+    if exact_count > 1 {
+        return if replace_all {
+            Ok(content.replace(before, after))
+        } else {
+            Err(ToolError::MatchCount(exact_count))
+        };
+    }
+
+    let use_crlf = content.contains("\r\n");
+    let before_has_trailing_nl = before.ends_with('\n');
+    let needle_spans = split_line_spans(before);
+    let cand_spans = split_line_spans(content);
+
+    // Stage 1: line-trimmed-end & CRLF normalization.
+    if !needle_spans.is_empty()
+        && needle_spans
+            .iter()
+            .any(|s| !s.body.trim_end_matches([' ', '\t']).is_empty())
+        && cand_spans.len() >= needle_spans.len()
+    {
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        let win = needle_spans.len();
+        let mut idx = 0usize;
+        while idx + win <= cand_spans.len() {
+            let matched = (0..win).all(|offset| {
+                cand_spans[idx + offset].body.trim_end_matches([' ', '\t'])
+                    == needle_spans[offset].body.trim_end_matches([' ', '\t'])
+            });
+            if matched {
+                let start = cand_spans[idx].start;
+                let last = &cand_spans[idx + win - 1];
+                let end = if before_has_trailing_nl {
+                    last.end_full
+                } else {
+                    last.end_body
+                };
+                hits.push((start, end));
+                idx += if replace_all { win } else { 1 };
+            } else {
+                idx += 1;
+            }
+        }
+        if hits.len() == 1 || (replace_all && !hits.is_empty()) {
+            let adapted = adapt_line_endings(after, use_crlf);
+            let mut out = content.to_owned();
+            for &(start, end) in hits.iter().rev() {
+                out.replace_range(start..end, &adapted);
+            }
+            return Ok(out);
+        }
+        if hits.len() > 1 {
+            return Err(ToolError::MatchCount(hits.len()));
+        }
+    }
+
+    // Stage 2: typographic curly-quote normalization.
+    let (norm_content, norm_map) = normalize_quotes_with_map(content);
+    let (norm_before, _) = normalize_quotes_with_map(before);
+    if !norm_before.is_empty() {
+        let quote_hits: Vec<(usize, usize)> = norm_content
+            .match_indices(&norm_before)
+            .map(|(start, matched)| (norm_map[start], norm_map[start + matched.len()]))
+            .collect();
+        if quote_hits.len() == 1 || (replace_all && !quote_hits.is_empty()) {
+            let mut out = content.to_owned();
+            for &(start, end) in quote_hits.iter().rev() {
+                out.replace_range(start..end, after);
+            }
+            return Ok(out);
+        }
+        if quote_hits.len() > 1 {
+            return Err(ToolError::MatchCount(quote_hits.len()));
+        }
+    }
+
+    // Stage 3: uniform space-indentation shift for multi-line blocks (`!replace_all`).
+    if !replace_all
+        && let Some((needle_indent, non_empty)) =
+            min_space_indent(needle_spans.iter().map(|s| s.body))
+        && non_empty >= 2
+        && cand_spans.len() >= needle_spans.len()
+    {
+        let win = needle_spans.len();
+        let dedented_needle: Vec<&str> = needle_spans
+            .iter()
+            .map(|s| {
+                let trimmed = s.body.trim_end_matches([' ', '\t']);
+                if trimmed.is_empty() {
+                    ""
+                } else {
+                    &trimmed[needle_indent..]
+                }
+            })
+            .collect();
+        let mut indent_hits: Vec<(usize, usize, usize)> = Vec::new();
+        for idx in 0..=(cand_spans.len() - win) {
+            let window = &cand_spans[idx..idx + win];
+            let Some((cand_indent, cand_non_empty)) =
+                min_space_indent(window.iter().map(|s| s.body))
+            else {
+                continue;
+            };
+            if cand_non_empty != non_empty {
+                continue;
+            }
+            let matched = window.iter().zip(&dedented_needle).all(|(cand, expected)| {
+                let trimmed = cand.body.trim_end_matches([' ', '\t']);
+                let actual = if trimmed.is_empty() {
+                    ""
+                } else {
+                    &trimmed[cand_indent..]
+                };
+                actual == *expected
+            });
+            if matched {
+                let start = window[0].start;
+                let last = &window[win - 1];
+                let end = if before_has_trailing_nl {
+                    last.end_full
+                } else {
+                    last.end_body
+                };
+                indent_hits.push((start, end, cand_indent));
+            }
+        }
+        if indent_hits.len() == 1 {
+            let (start, end, cand_indent) = indent_hits[0];
+            let delta = isize::try_from(cand_indent).unwrap_or(0)
+                - isize::try_from(needle_indent).unwrap_or(0);
+            let shifted = shift_space_indent(after, delta, use_crlf);
+            let mut out = content.to_owned();
+            out.replace_range(start..end, &shifted);
+            return Ok(out);
+        }
+        if indent_hits.len() > 1 {
+            return Err(ToolError::MatchCount(indent_hits.len()));
+        }
+    }
+
+    Err(ToolError::MatchCount(0))
 }
 
 #[cfg(test)]
@@ -1281,28 +1868,21 @@ mod tests {
 
         fs::remove_file(dir.path().join("link")).unwrap();
         symlink("missing", dir.path().join("link")).unwrap();
-        assert!(matches!(
-            registry.workspace_manifest(),
-            Err(ToolError::WorkspaceUnsafe(_))
-        ));
+        let dangling = registry.workspace_manifest().unwrap();
+        assert!(dangling.contains_key(link_key));
         fs::remove_file(dir.path().join("link")).unwrap();
         symlink("/tmp", dir.path().join("link")).unwrap();
-        assert!(matches!(
-            registry.workspace_manifest(),
-            Err(ToolError::WorkspaceUnsafe(_))
-        ));
-        fs::remove_file(dir.path().join("link")).unwrap(); symlink("/tmp", dir.path().join("inside")).unwrap(); symlink("inside", dir.path().join("link")).unwrap(); assert!(matches!(registry.workspace_manifest(), Err(ToolError::WorkspaceUnsafe(_)))); fs::remove_file(dir.path().join("link")).unwrap(); fs::remove_file(dir.path().join("inside")).unwrap();
+        let external_abs = registry.workspace_manifest().unwrap();
+        assert!(external_abs.contains_key(link_key));
+        assert_ne!(dangling[link_key], external_abs[link_key]);
+        fs::remove_file(dir.path().join("link")).unwrap();
         symlink("../outside", dir.path().join("link")).unwrap();
-        assert!(matches!(
-            registry.workspace_manifest(),
-            Err(ToolError::WorkspaceUnsafe(_))
-        ));
+        let parent_escape = registry.workspace_manifest().unwrap();
+        assert_ne!(external_abs[link_key], parent_escape[link_key]);
         fs::remove_file(dir.path().join("link")).unwrap();
         symlink("link", dir.path().join("link")).unwrap();
-        assert!(matches!(
-            registry.workspace_manifest(),
-            Err(ToolError::WorkspaceUnsafe(_))
-        ));
+        let loop_link = registry.workspace_manifest().unwrap();
+        assert_ne!(parent_escape[link_key], loop_link[link_key]);
 
         fs::remove_file(dir.path().join("link")).unwrap();
         fs::create_dir(dir.path().join("folder")).unwrap();
@@ -1427,7 +2007,7 @@ mod tests {
         assert_eq!(ToolRegistry::normal_components(Path::new("./a")).unwrap(), vec!["a"]);
         assert!(ToolRegistry::normal_components(Path::new("/absolute")).is_err());
         assert_eq!(ToolRegistry::raw_target_components(Path::new("./a/../b")).unwrap().len(), 4);
-        assert!(ToolRegistry::raw_target_components(Path::new("/absolute")).is_err());
+        assert_eq!(ToolRegistry::raw_target_components(Path::new("/absolute")).unwrap()[0], json!(["root"]));
         let context = Context {
             workspace: &registry.workspace,
         };
@@ -1461,7 +2041,9 @@ mod tests {
         drop(dir);
 
         let process_schema = tool_schema("process");
-        assert_eq!(process_schema["oneOf"].as_array().unwrap().len(), 2);
+        assert!(process_schema.get("oneOf").is_none());
+        assert!(process_schema["properties"].get("argv").is_some());
+        assert!(process_schema["properties"].get("shell").is_some());
         assert_eq!(tool_schema("not_registered")["additionalProperties"], false);
     }
 
@@ -1536,8 +2118,22 @@ mod tests {
         );
 
         let missing_precondition = json!({"path":"a.txt","content":"next"});
+        // Because `registry` already read and edited `a.txt`, consecutive mutation without
+        // explicit `precondition` succeeds via the engine-recorded snapshot!
+        let (consecutive, consecutive_decision, _) = registry
+            .prepare_for_engine(&call("write_file", &missing_precondition, None))
+            .unwrap();
+        assert_eq!(consecutive_decision, PolicyDecision::Ask);
+        registry.execute_prepared(consecutive).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "next"
+        );
+
+        // A fresh registry that has NOT read `a.txt` still requires `read_file` first.
+        let unread = ToolRegistry::new(dir.path(), None, &[], None).unwrap();
         assert!(matches!(
-            registry.prepare_for_engine(&call("write_file", &missing_precondition, None)),
+            unread.prepare_for_engine(&call("write_file", &missing_precondition, None)),
             Err(ToolError::ReadRequired(target)) if target == "a.txt"
         ));
 
@@ -1601,5 +2197,229 @@ mod tests {
         assert!(manifests.truncated);
         assert_eq!(manifests.value["Cargo.toml"], "[");
         assert_eq!(manifests.value["package.json"], "{");
+    }
+
+    #[test]
+    fn read_pagination_binary_rejection_scoped_search_and_recursive_list_work() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        fs::create_dir_all(dir.path().join("secret")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        fs::write(dir.path().join("src/big.rs"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+        fs::write(dir.path().join("src/sub/mod.rs"), "pub fn needle_fn() {}\n").unwrap();
+        fs::write(dir.path().join("secret/keys.txt"), "needle_fn secret\n").unwrap();
+        fs::write(
+            dir.path().join("node_modules/pkg/index.js"),
+            "needle_fn ignored\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/minified.js"),
+            format!("{}needle_fn{}\n", "x".repeat(600), "y".repeat(600)),
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/bin.dat"), b"abc\0def").unwrap();
+
+        let registry = ToolRegistry::new(dir.path(), None, &["secret/**".into()], None).unwrap();
+
+        // Paginated read_file with offset + limit.
+        let page = registry
+            .invoke(&call(
+                "read_file",
+                &json!({"path":"src/big.rs","offset":3,"limit":2}),
+                None,
+            ))
+            .unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.value["content"], "l3\nl4\n");
+        assert_eq!(page.value["start_line"], 3);
+        assert_eq!(page.value["end_line"], 4);
+        assert_eq!(page.value["total_lines"], 6);
+        assert_eq!(page.value["has_more"], true);
+
+        // Offset past EOF returns empty content cleanly.
+        let past_eof = registry
+            .invoke(&call(
+                "read_file",
+                &json!({"path":"src/big.rs","offset":99,"limit":5}),
+                None,
+            ))
+            .unwrap();
+        assert!(!past_eof.truncated);
+        assert_eq!(past_eof.value["content"], "");
+
+        // NUL-containing binary file is rejected cleanly.
+        assert!(matches!(
+            registry.invoke(&call("read_file", &json!({"path":"src/bin.dat"}), None)),
+            Err(ToolError::Input(msg)) if msg.contains("binary")
+        ));
+
+        // list_directory distinguishes directories with `/` and respects deny_globs + ignored dirs.
+        let root_list = registry
+            .invoke(&call("list_directory", &json!({}), None))
+            .unwrap();
+        assert_eq!(root_list.value["entries"], json!(["src/"]));
+
+        let glob_list = registry
+            .invoke(&call(
+                "list_directory",
+                &json!({"path":"src","max_depth":3,"glob":"*.rs"}),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(glob_list.value["entries"], json!(["big.rs", "sub/mod.rs"]));
+
+        // search enforces deny_globs, skips node_modules, filters by glob, and truncates long lines.
+        let scoped = registry
+            .invoke(&call(
+                "search",
+                &json!({"query":"needle_fn","path":"src","glob":"*.rs"}),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            scoped.value["matches"],
+            json!(["src/sub/mod.rs:1:pub fn needle_fn() {}"])
+        );
+
+        let all_matches = registry
+            .invoke(&call("search", &json!({"query":"needle_fn"}), None))
+            .unwrap();
+        let matches = all_matches.value["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(
+            matches
+                .iter()
+                .all(|m| !m.as_str().unwrap().contains("secret/"))
+        );
+        assert!(
+            matches
+                .iter()
+                .all(|m| !m.as_str().unwrap().contains("node_modules"))
+        );
+        assert!(matches.iter().any(|m| m.as_str().unwrap().ends_with('…')));
+
+        // Auto-inferred create_intent + mkdir -p on missing nested file.
+        approve(
+            &registry,
+            "write_file",
+            &json!({"path":"generated/nested/out.txt","content":""}),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("generated/nested/out.txt")).unwrap(),
+            ""
+        );
+        assert_ne!(
+            registry
+                .single_file_manifest_digest("generated/nested/out.txt")
+                .unwrap(),
+            "missing"
+        );
+        assert_eq!(
+            registry
+                .single_file_manifest_digest("generated/nested/missing.txt")
+                .unwrap(),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn edit_file_supports_replace_all_and_uniqueness_checked_fallbacks() {
+        // 1. Exact replace_all vs ambiguous rejection when replace_all is false.
+        let repeated = "alpha = 1;\nbeta = 2;\nalpha = 1;\n";
+        assert!(matches!(
+            apply_edit_span(repeated, "alpha = 1;", "alpha = 9;", false),
+            Err(ToolError::MatchCount(2))
+        ));
+        assert_eq!(
+            apply_edit_span(repeated, "alpha = 1;", "alpha = 9;", true).unwrap(),
+            "alpha = 9;\nbeta = 2;\nalpha = 9;\n"
+        );
+
+        // 2. CRLF & trailing whitespace normalization preserves CRLF endings.
+        let crlf = "fn greet() {   \r\n    println!(\"hi\");\t\r\n}\r\n";
+        let edited_crlf = apply_edit_span(
+            crlf,
+            "fn greet() {\n    println!(\"hi\");\n}\n",
+            "fn greet() {\n    println!(\"hello\");\n}\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            edited_crlf,
+            "fn greet() {\r\n    println!(\"hello\");\r\n}\r\n"
+        );
+        let ambig_ws = "item = 1   \nitem = 1\t\n";
+        assert!(matches!(
+            apply_edit_span(ambig_ws, "item = 1\n", "item = 2\n", false),
+            Err(ToolError::MatchCount(2))
+        ));
+        assert_eq!(
+            apply_edit_span(ambig_ws, "item = 1\n", "item = 2\n", true).unwrap(),
+            "item = 2\nitem = 2\n"
+        );
+
+        // 3. Typographic curly-quote normalization across multi-byte UTF-8 spans.
+        let curly = "let msg = \u{201C}don\u{2019}t panic\u{201D};\n";
+        assert_eq!(
+            apply_edit_span(
+                curly,
+                "let msg = \"don't panic\";",
+                "let msg = \"stay calm\";",
+                false
+            )
+            .unwrap(),
+            "let msg = \"stay calm\";\n"
+        );
+        let ambig_curly = "\u{201C}dup\u{201D}\n\u{201C}dup\u{201D}\n";
+        assert!(matches!(
+            apply_edit_span(ambig_curly, "\"dup\"", "\"ok\"", false),
+            Err(ToolError::MatchCount(2))
+        ));
+        assert_eq!(
+            apply_edit_span(ambig_curly, "\"dup\"", "\"ok\"", true).unwrap(),
+            "\"ok\"\n\"ok\"\n"
+        );
+
+        // 4. Uniform space-indentation shift (both positive and negative delta).
+        let indented = "impl Demo {\n    fn calc(&self) -> u32 {\n        1 + 1\n    }\n}\n";
+        let plus_shift = apply_edit_span(
+            indented,
+            "fn calc(&self) -> u32 {\n    1 + 1\n}",
+            "fn calc(&self) -> u32 {\n\n    2 + 2\n}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            plus_shift,
+            "impl Demo {\n    fn calc(&self) -> u32 {\n\n        2 + 2\n    }\n}\n"
+        );
+        let unindented = "fn calc() -> u32 {\n    1 + 1\n}\n";
+        let minus_shift = apply_edit_span(
+            unindented,
+            "    fn calc() -> u32 {\n        1 + 1\n    }\n",
+            "    fn calc() -> u32 {\n        3 + 3\n    }\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(minus_shift, "fn calc() -> u32 {\n    3 + 3\n}\n");
+
+        // Tab-indented or duplicate dedented blocks are safely rejected.
+        let tabbed = "\tfn a() {\n\t\t1\n\t}\n";
+        assert!(matches!(
+            apply_edit_span(tabbed, "fn a() {\n    1\n}", "fn a() {\n    2\n}", false),
+            Err(ToolError::MatchCount(0))
+        ));
+        let dup_indent = "  if ok {\n    run();\n  }\n    if ok {\n      run();\n    }\n";
+        assert!(matches!(
+            apply_edit_span(
+                dup_indent,
+                "if ok {\n  run();\n}",
+                "if ok {\n  stop();\n}",
+                false
+            ),
+            Err(ToolError::MatchCount(2))
+        ));
     }
 }

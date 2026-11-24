@@ -172,15 +172,17 @@ pub struct ParsedSessionCommand {
     pub json: bool,
     pub server: Option<String>,
     pub token: Option<String>,
+    pub permission_mode: Option<latte_core::PermissionMode>,
 }
 
 /// Parses `run`/`list`/`show`/`resume` plus the shared `--json`/`--server`/
 /// `--token` flags (accepted in any position). `--focus` is only valid on
-/// `run`.
+/// `run`; `--auto` and `--permission-mode` are valid on `run` and `resume`.
 ///
 /// # Errors
 /// Returns a usage message for unknown commands/options, missing values, wrong
 /// arity, or malformed session ids.
+#[allow(clippy::too_many_lines)]
 pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, String> {
     let (name, rest) = args.split_first().ok_or_else(|| {
         "expected a command: run | list | show | context | compact | resume".to_string()
@@ -189,6 +191,7 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
     let mut server = None;
     let mut token = None;
     let mut focus = None;
+    let mut permission_mode = None;
     let mut positional = Vec::new();
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
@@ -206,6 +209,22 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
                 focus = Some(PathBuf::from(next_value(&mut iter, "--focus")?));
             }
             "--focus" => return Err("--focus is only valid with run".to_string()),
+            "--auto" if name == "run" || name == "resume" => {
+                permission_mode = Some(latte_core::PermissionMode::FullAuto);
+            }
+            "--auto" => return Err("--auto is only valid with run or resume".to_string()),
+            "--permission-mode" if name == "run" || name == "resume" => {
+                let raw = next_value(&mut iter, "--permission-mode")?;
+                let mode = latte_core::PermissionMode::parse_mode(&raw).map_err(|_| {
+                    format!(
+                        "invalid --permission-mode `{raw}`: expected ask, auto-edit, or full-auto"
+                    )
+                })?;
+                permission_mode = Some(mode);
+            }
+            "--permission-mode" => {
+                return Err("--permission-mode is only valid with run or resume".to_string());
+            }
             // Removed v1 flags that must remain hard errors.
             flag @ ("--allow" | "--deny") => {
                 return Err(format!(
@@ -280,6 +299,7 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
         json,
         server,
         token,
+        permission_mode,
     })
 }
 
@@ -732,6 +752,22 @@ pub trait SessionServer {
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError>;
+    /// Creates a session with an optional initial permission mode.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_session_with_mode(
+        &mut self,
+        workspace_id: &str,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: &str,
+        focus: Option<&Path>,
+        binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<u64, ClientError> {
+        let _ = permission_mode;
+        self.create_session(workspace_id, session_id, command_id, prompt, focus, binding)
+            .await
+    }
     /// Appends a follow-up turn. Returns the accepted revision and the
     /// workspace id that owns the session (so the caller can subscribe to
     /// the correct event stream when the cwd workspace differs). The
@@ -744,6 +780,19 @@ pub trait SessionServer {
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError>;
+    /// Appends a follow-up turn with an optional permission mode override.
+    async fn follow_up_with_mode(
+        &mut self,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
+        expected_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<(u64, String), ClientError> {
+        let _ = permission_mode;
+        self.follow_up(session_id, command_id, expected_revision, prompt)
+            .await
+    }
     /// Fetches the authoritative session snapshot.
     async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError>;
     /// Fetches the read-only context-usage projection for one session.
@@ -778,11 +827,26 @@ pub trait SessionServer {
 
 /// Creates a session and observes it to a terminal state, streaming progress
 /// through `on_progress`. `cancel` resolves on local Ctrl+C.
+#[cfg(test)]
 pub async fn run_session(
     server: &mut impl SessionServer,
     root: &Path,
     prompt: &str,
     focus: Option<&Path>,
+    on_progress: &mut impl FnMut(&str),
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<TurnResult, ClientError> {
+    run_session_with_mode(server, root, prompt, focus, None, on_progress, cancel).await
+}
+
+/// Creates a session with an optional permission mode and observes it to a
+/// terminal state.
+pub async fn run_session_with_mode(
+    server: &mut impl SessionServer,
+    root: &Path,
+    prompt: &str,
+    focus: Option<&Path>,
+    permission_mode: Option<latte_core::PermissionMode>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<TurnResult, ClientError> {
@@ -798,13 +862,14 @@ pub async fn run_session(
     let session_id = SessionId::from_uuid(Uuid::now_v7());
     let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     tokio::select! {
-        result = server.create_session(
+        result = server.create_session_with_mode(
             &workspace_id,
             session_id,
             command_id,
             prompt,
             focus,
             &binding,
+            permission_mode,
         ) => result?,
         () = &mut cancel => {
             // The session may have been created server-side even though the
@@ -817,11 +882,26 @@ pub async fn run_session(
 }
 
 /// Appends a follow-up turn and observes the session to a terminal state.
+#[cfg(test)]
 pub async fn resume_session(
     server: &mut impl SessionServer,
     root: &Path,
     session_id: &str,
     prompt: &str,
+    on_progress: &mut impl FnMut(&str),
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<TurnResult, ClientError> {
+    resume_session_with_mode(server, root, session_id, prompt, None, on_progress, cancel).await
+}
+
+/// Appends a follow-up turn with an optional permission mode override and
+/// observes the session to a terminal state.
+pub async fn resume_session_with_mode(
+    server: &mut impl SessionServer,
+    root: &Path,
+    session_id: &str,
+    prompt: &str,
+    permission_mode: Option<latte_core::PermissionMode>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<TurnResult, ClientError> {
@@ -840,7 +920,13 @@ pub async fn resume_session(
     // instead of appending a duplicate turn.
     let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     let (_, event_workspace_id) = tokio::select! {
-        result = server.follow_up(&session_id, &command_id, snapshot.session_revision, prompt) => result?,
+        result = server.follow_up_with_mode(
+            &session_id,
+            &command_id,
+            snapshot.session_revision,
+            prompt,
+            permission_mode,
+        ) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &session_id).await),
     };
     observe_session(
@@ -1352,21 +1438,28 @@ impl ServerHandle {
         })
     }
 
-    /// Creates a session and starts its first turn.
-    pub async fn create_session(
+    /// Creates a session with an optional initial permission mode and starts
+    /// its first turn.
+    pub async fn create_session_with_mode(
         &self,
         workspace_id: &str,
         session_id: SessionId,
         command_id: SessionCommandId,
         prompt: &str,
         binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
     ) -> Result<u64, ClientError> {
-        let body = json!({
+        let mut body = json!({
             "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         let value = self
             .post(
                 &format!("/v1/workspaces/{workspace_id}/sessions"),
@@ -1380,6 +1473,21 @@ impl ServerHandle {
             .ok_or_else(|| {
                 ClientError::Unclassified("create response missing accepted_revision".into())
             })
+    }
+
+    /// Updates a session's in-memory permission mode on the server.
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &SessionId,
+        permission_mode: latte_core::PermissionMode,
+    ) -> Result<(), ClientError> {
+        self.post(
+            &format!("/v1/sessions/{session_id}/permission-mode"),
+            json!({ "permission_mode": permission_mode }),
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Appends a follow-up turn to an existing session. The caller supplies a
@@ -1750,13 +1858,41 @@ impl SessionServer for ServerClient {
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError> {
-        let body = json!({
+        self.create_session_with_mode(
+            workspace_id,
+            session_id,
+            command_id,
+            prompt,
+            focus,
+            binding,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_session_with_mode(
+        &mut self,
+        workspace_id: &str,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: &str,
+        focus: Option<&Path>,
+        binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<u64, ClientError> {
+        let mut body = json!({
             "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
             "focus": focus.map(|path| path.display().to_string()),
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         let value = self
             .post(
                 &format!("/v1/workspaces/{workspace_id}/sessions"),
@@ -1779,11 +1915,28 @@ impl SessionServer for ServerClient {
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError> {
-        let body = json!({
+        self.follow_up_with_mode(session_id, command_id, expected_revision, prompt, None)
+            .await
+    }
+
+    async fn follow_up_with_mode(
+        &mut self,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
+        expected_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<(u64, String), ClientError> {
+        let mut body = json!({
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_session_revision": expected_revision,
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         // Follow-up is a durable mutation: the stable command_id doubles as
         // the Idempotency-Key so a timeout/retry replays instead of
         // appending a duplicate turn.
@@ -2076,6 +2229,32 @@ mod tests {
         assert!(
             error.contains("--deny") && error.contains("permission API"),
             "unexpected error: {error}"
+        );
+        // `--auto` and `--permission-mode` parse cleanly on `run` and `resume`
+        // and reject invalid modes or non-turn subcommands.
+        let auto_run = parse_session_command(&args(&["run", "--auto", "fix", "bug"])).unwrap();
+        assert_eq!(
+            auto_run.permission_mode,
+            Some(latte_core::PermissionMode::FullAuto)
+        );
+        let auto_edit = parse_session_command(&args(&[
+            "resume",
+            "01900000-0000-7000-8000-000000000001",
+            "--permission-mode",
+            "auto-edit",
+            "continue",
+        ]))
+        .unwrap();
+        assert_eq!(
+            auto_edit.permission_mode,
+            Some(latte_core::PermissionMode::AutoEdit)
+        );
+        assert!(parse_session_command(&args(&["list", "--auto"])).is_err());
+        assert!(
+            parse_session_command(&args(&["show", "--permission-mode", "ask", "foo"])).is_err()
+        );
+        assert!(
+            parse_session_command(&args(&["run", "--permission-mode", "bogus", "hi"])).is_err()
         );
     }
 

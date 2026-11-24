@@ -216,14 +216,10 @@ fn session_effect_permission_summary(descriptor: &EffectAuthority) -> String {
                 .get("content")
                 .and_then(Value::as_str)
                 .map_or(0, str::len);
-            let intent = if input
-                .get("create_intent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                "create or replace"
-            } else {
-                "replace existing"
+            let intent = match input.get("create_intent").and_then(Value::as_bool) {
+                Some(true) => "create or replace",
+                Some(false) => "replace existing",
+                None => "write",
             };
             format!("Write {path} ({intent}; {content_bytes} bytes of content)")
         }
@@ -231,6 +227,7 @@ fn session_effect_permission_summary(descriptor: &EffectAuthority) -> String {
             let path = input_string(input, "path", "[unknown path]");
             let before = input
                 .get("before")
+                .or_else(|| input.get("anchor"))
                 .and_then(Value::as_str)
                 .map_or(0, str::len);
             let after = input
@@ -250,17 +247,16 @@ fn session_effect_permission_summary(descriptor: &EffectAuthority) -> String {
             });
             match argv.filter(|argv| !argv.is_empty()) {
                 Some(argv) => format!("Run argv: {argv} (cwd: {cwd})"),
-                None => format!("Run shell command (cwd: {cwd})"),
+                None => match input.get("shell").and_then(Value::as_str) {
+                    Some(shell) if !shell.trim().is_empty() => {
+                        format!("Run shell command: {} (cwd: {cwd})", summary_argv(shell))
+                    }
+                    _ => format!("Run shell command (cwd: {cwd})"),
+                },
             }
         }
-        "read_file" | "list_directory" => {
-            let verb = if descriptor.name == "read_file" {
-                "Read"
-            } else {
-                "List"
-            };
-            format!("{verb} {}", input_string(input, "path", "[unknown path]"))
-        }
+        "read_file" => format!("Read {}", input_string(input, "path", "[unknown path]")),
+        "list_directory" => format!("List {}", input_string(input, "path", ".")),
         "search" => format!(
             "Search workspace for {}",
             input_string(input, "query", "[unspecified query]")
@@ -453,6 +449,22 @@ pub(crate) struct VerificationEvidence<'a> {
     pub blob_ref: Option<&'a str>,
 }
 
+/// Outcome of preparing or pre-start-rejecting a model-requested tool call.
+///
+/// Deterministic pre-execution rejections (missing path, path escape, policy
+/// deny, schema mismatch, unread modification target, unsupported platform)
+/// never start an external effect and are recorded as a durable failed
+/// `ToolResult` card so the model can self-correct on the next round without
+/// bricking the session.
+#[derive(Clone, Debug)]
+pub enum SessionEffectPrepareOutcome {
+    Prepared(SessionEffectPrepared),
+    Rejected {
+        snapshot: SessionSnapshot,
+        error_json: String,
+    },
+}
+
 /// Configures and starts an engine actor.
 #[derive(Debug, Default)]
 pub struct EngineBuilder {
@@ -461,6 +473,8 @@ pub struct EngineBuilder {
     enabled_tools: Option<BTreeSet<String>>,
     deny_globs: Vec<String>,
     conversation_root: Option<PathBuf>,
+    permission_mode: latte_core::PermissionMode,
+    require_verification: bool,
 }
 impl EngineBuilder {
     /// Creates a builder.
@@ -472,6 +486,8 @@ impl EngineBuilder {
             enabled_tools: None,
             deny_globs: Vec::new(),
             conversation_root: None,
+            permission_mode: latte_core::PermissionMode::Ask,
+            require_verification: false,
         }
     }
     /// Selects the trusted workspace root for engine-owned tools.
@@ -502,6 +518,18 @@ impl EngineBuilder {
     #[must_use]
     pub fn conversation_root(mut self, path: impl AsRef<Path>) -> Self {
         self.conversation_root = Some(path.as_ref().to_owned());
+        self
+    }
+    /// Sets the default session permission mode enforced by the engine.
+    #[must_use]
+    pub const fn permission_mode(mut self, mode: latte_core::PermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+    /// Enforces verified completion whenever a linked turn mutates workspace files.
+    #[must_use]
+    pub const fn require_verification(mut self, required: bool) -> Self {
+        self.require_verification = required;
         self
     }
     /// Starts the actor and initializes durable storage.
@@ -591,6 +619,11 @@ impl EngineBuilder {
             operation_gate: Arc::new(Semaphore::new(1)),
             conversation_root,
             conversation_store,
+            default_permission_mode: self.permission_mode,
+            session_permission_modes: Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            require_verification: self.require_verification,
             #[cfg(test)]
             completion_hook: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -699,6 +732,10 @@ pub struct EngineHandle {
     operation_gate: Arc<Semaphore>,
     conversation_root: Option<PathBuf>,
     conversation_store: Option<Arc<conversation::ConversationStore>>,
+    default_permission_mode: latte_core::PermissionMode,
+    session_permission_modes:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<SessionId, latte_core::PermissionMode>>>,
+    require_verification: bool,
     #[cfg(test)]
     completion_hook: CompletionHook,
 }
@@ -714,6 +751,36 @@ impl EngineHandle {
     #[must_use]
     pub const fn project_key(&self) -> &latte_core::ProjectKey {
         &self.project_key
+    }
+
+    /// Updates the in-memory permission posture for `session_id`.
+    pub fn set_session_permission_mode(
+        &self,
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+    ) {
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, mode);
+    }
+
+    /// Reads the active permission posture for `session_id`.
+    #[must_use]
+    pub fn session_permission_mode(&self, session_id: SessionId) -> latte_core::PermissionMode {
+        self.session_permission_modes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .copied()
+            .unwrap_or(self.default_permission_mode)
+    }
+
+    /// Returns whether this engine enforces post-mutation verification before
+    /// a changed turn may commit `Complete`.
+    #[must_use]
+    pub fn requires_verification(&self) -> bool {
+        self.require_verification
     }
 
     fn reconcile_startup_conversations(&self) -> Result<(), StorageError> {
@@ -1282,9 +1349,7 @@ impl EngineHandle {
         prompt: &str,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let baseline = std::collections::BTreeMap::new();
         self.storage.create_session_v2(
             session_id,
             turn_id,
@@ -1316,9 +1381,7 @@ impl EngineHandle {
         now_ms: u64,
         focus: Option<&str>,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let baseline = std::collections::BTreeMap::new();
         if let Some(store) = &self.conversation_store {
             match self.storage.begin_materializing_session_v2(
                 command_id,
@@ -1460,9 +1523,7 @@ impl EngineHandle {
         prompt: &str,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let baseline = std::collections::BTreeMap::new();
         self.storage.create_session_follow_up_v2(
             session_id,
             turn_id,
@@ -1494,9 +1555,7 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let baseline = std::collections::BTreeMap::new();
         let (outcome, session_event) = self.storage.create_started_session_follow_up_v2(
             command_id,
             session_id,
@@ -1876,18 +1935,14 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionCommitResponse, StorageError> {
-        if matches!(&request.update, CommitSessionTurnUpdate::Complete { .. }) {
-            // `VerificationNotRequired` is legal only for a child whose
-            // engine-owned baseline still equals a stable current workspace
-            // snapshot.  This keeps the public v2 commit entrypoint from
-            // becoming a bypass around configured verification.
+        if self.require_verification
+            && matches!(&request.update, CommitSessionTurnUpdate::Complete { .. })
+        {
+            // When verification is configured, `VerificationNotRequired`
+            // completion is legal only when the linked child recorded zero
+            // workspace mutations.
             let _operation = self.operation_permit();
-            let (_, current_manifest) = self.stable_completion_snapshot()?;
-            if !self
-                .storage
-                .session_changed_files(request.turn_id, &current_manifest)?
-                .is_empty()
-            {
+            if !self.session_turn_changed_files(request.turn_id)?.is_empty() {
                 return Err(StorageError::InvalidData(
                     "linked child changed the workspace; use verified completion".into(),
                 ));
@@ -1898,14 +1953,85 @@ impl EngineHandle {
             .commit_session_turn_update(&request, lease, now_ms)?;
         self.finish_session_response(response)
     }
-    /// Returns the exact files changed since this linked v2 child began.
-    /// The comparison is against an engine-owned baseline captured before the
-    /// provider can receive effect authority.
+
+    fn targeted_session_verification_snapshot(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<(String, Vec<String>), StorageError> {
+        let (baseline, file_mutations, mutating_process_ran) =
+            self.storage.session_turn_mutation_summary(turn_id)?;
+        let mut changed = BTreeSet::new();
+        for authority in &file_mutations {
+            if let Some(raw_path) = authority.input.get("path").and_then(Value::as_str)
+                && let Ok(display) = self.tools.display_path(raw_path)
+            {
+                changed.insert(display);
+            }
+        }
+        if mutating_process_ran || !baseline.is_empty() {
+            let (digest, current_manifest) = self.stable_completion_snapshot()?;
+            for path in self
+                .storage
+                .session_changed_files(turn_id, &current_manifest)?
+            {
+                changed.insert(path);
+            }
+            return Ok((digest, changed.into_iter().collect()));
+        }
+        let paths: Vec<String> = changed.into_iter().collect();
+        for _ in 0..3 {
+            let mut first = std::collections::BTreeMap::new();
+            for path in &paths {
+                let entry = self
+                    .tools
+                    .single_file_manifest_digest(path)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                first.insert(path.clone(), entry);
+            }
+            let first_digest = manifest_map_digest(&first)?;
+            let mut second = std::collections::BTreeMap::new();
+            for path in &paths {
+                let entry = self
+                    .tools
+                    .single_file_manifest_digest(path)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                second.insert(path.clone(), entry);
+            }
+            let second_digest = manifest_map_digest(&second)?;
+            if first_digest == second_digest {
+                return Ok((second_digest, paths));
+            }
+        }
+        Err(StorageError::InvalidData(
+            "workspace remained unstable across completion sampling".into(),
+        ))
+    }
+
+    /// Returns the exact files changed by this linked v2 child.
+    /// Pure read-only and file-tool turns resolve in O(1) from engine-owned
+    /// effect records without scanning the workspace tree; mutating `process`
+    /// turns diff against the lazy pre-process baseline.
     pub fn session_turn_changed_files(&self, turn_id: TurnId) -> Result<Vec<String>, StorageError> {
+        let (baseline, file_mutations, mutating_process_ran) =
+            self.storage.session_turn_mutation_summary(turn_id)?;
+        let mut changed = BTreeSet::new();
+        for authority in &file_mutations {
+            if let Some(raw_path) = authority.input.get("path").and_then(Value::as_str)
+                && let Ok(display) = self.tools.display_path(raw_path)
+            {
+                changed.insert(display);
+            }
+        }
+        if !mutating_process_ran && baseline.is_empty() {
+            return Ok(changed.into_iter().collect());
+        }
         let current = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.session_changed_files(turn_id, &current)
+        for path in self.storage.session_changed_files(turn_id, &current)? {
+            changed.insert(path);
+        }
+        Ok(changed.into_iter().collect())
     }
     /// Persists the actual configured verification result under the linked
     /// child's current fenced revision/effect epoch.  This is deliberately
@@ -1919,7 +2045,8 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<(), StorageError> {
-        let (workspace_manifest_digest, _) = self.stable_completion_snapshot()?;
+        let (workspace_manifest_digest, _) =
+            self.targeted_session_verification_snapshot(turn_id)?;
         let effect_epoch = self.storage.effect_epoch(turn_id)?;
         let summary = serde_json::to_string(output)
             .map(|value| latte_core::redact_session_text(&value))
@@ -1962,10 +2089,8 @@ impl EngineHandle {
             .ok_or(StorageError::SessionActiveTurnMismatch)?;
         let expected_turn_revision = turn_revision(snapshot, verification_effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("linked child is missing".into()))?;
-        let (verified_manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
-        let files_changed = self
-            .storage
-            .session_changed_files(turn_id, &current_manifest)?;
+        let (verified_manifest_digest, files_changed) =
+            self.targeted_session_verification_snapshot(turn_id)?;
         self.commit_session_turn_update(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
@@ -1997,11 +2122,22 @@ impl EngineHandle {
         now_ms: u64,
     ) -> Result<SessionEffectPrepared, StorageError> {
         validate_session_effect_authority(&request.authority)?;
-        let (policy, mut operation_digest) = self.session_effect_policy_and_digest(
+        let (mut policy, mut operation_digest) = self.session_effect_policy_and_digest(
             &request.authority,
             request.expected_turn_revision,
             lease,
         )?;
+        if policy == SessionEffectPolicy::Ask {
+            match self.session_permission_mode(request.session_id) {
+                latte_core::PermissionMode::FullAuto => {
+                    policy = SessionEffectPolicy::Allow;
+                }
+                latte_core::PermissionMode::AutoEdit if request.authority.name != "process" => {
+                    policy = SessionEffectPolicy::Allow;
+                }
+                latte_core::PermissionMode::Ask | latte_core::PermissionMode::AutoEdit => {}
+            }
+        }
         if policy == SessionEffectPolicy::Ask {
             let post_approval_revision = request
                 .expected_turn_revision
@@ -2056,6 +2192,64 @@ impl EngineHandle {
             operation_digest,
         })
     }
+
+    /// Prepares a model-requested tool call, or durably records a failed
+    /// `ToolResult` card when pre-execution validation rejects the call
+    /// (e.g. missing path, path escape, `deny_globs`, unread modification target,
+    /// schema error, or disabled tool) so the agent loop can self-correct.
+    pub fn prepare_or_reject_session_effect(
+        &self,
+        request: SessionEffectRequest,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<SessionEffectPrepareOutcome, StorageError> {
+        validate_session_effect_authority(&request.authority)?;
+        match self.session_effect_policy_and_digest(
+            &request.authority,
+            request.expected_turn_revision,
+            lease,
+        ) {
+            Ok(_) => self
+                .prepare_session_effect(request, lease, now_ms)
+                .map(SessionEffectPrepareOutcome::Prepared),
+            Err(StorageError::InvalidData(reason)) => {
+                let redacted_reason = latte_core::redact_session_text(&reason);
+                let error_json = serde_json::json!({ "error": redacted_reason }).to_string();
+                let view = EffectView::from_authority(&request.authority);
+                let response = self.commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: request.session_id,
+                        turn_id: request.turn_id,
+                        expected_session_revision: request.expected_session_revision,
+                        expected_turn_revision: request.expected_turn_revision,
+                        command_id: request.command_id,
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::AppendTranscript {
+                            source_key: format!("{}:rejected", request.source_key),
+                            kind: TranscriptKind::ToolResult,
+                            text: error_json.clone(),
+                            payload: Some(serde_json::json!({
+                                "provider_content": error_json,
+                                "tool_call_id": view.tool_call_id,
+                                "name": view.name,
+                                "effect_id": view.effect_id.to_string(),
+                                "error": redacted_reason,
+                            })),
+                        },
+                    },
+                    lease,
+                    now_ms,
+                )?;
+                Ok(SessionEffectPrepareOutcome::Rejected {
+                    snapshot: response.snapshot,
+                    error_json,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolves a prepared v2 Ask effect. When permission is allowed after a
     /// waiting Session has released its old coordinator lease, the operation
     /// digest and single-use capability are rebound atomically to the current
@@ -2144,6 +2338,16 @@ impl EngineHandle {
             return Err(StorageError::InvalidData(
                 "canonical session effect digest mismatch".into(),
             ));
+        }
+        if authority.name == "process"
+            && !authority.effect_id.is_verification()
+            && !process::is_readonly_process_input(&authority.input)
+            && !self.storage.has_nonempty_turn_baseline(request.turn_id)?
+            && let Ok(manifest) = self.workspace_manifest()
+        {
+            let _ = self
+                .storage
+                .store_lazy_turn_baseline(request.turn_id, &manifest);
         }
         let effect_stage_marker_json = session_effect_stage_marker(
             "started",
@@ -2254,9 +2458,11 @@ impl EngineHandle {
         cancellation: &CancellationToken,
     ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         if cancellation.is_cancelled() {
-            return Err(SessionEffectExecutionError::Uncertain(
-                "tool cancelled after Started".into(),
-            ));
+            return Err(if tools::is_readonly_tool_name(&authority.name) {
+                SessionEffectExecutionError::Certified("tool cancelled after Started".into())
+            } else {
+                SessionEffectExecutionError::Uncertain("tool cancelled after Started".into())
+            });
         }
         let invocation = ToolInvocation {
             name: &authority.name,
@@ -2275,9 +2481,13 @@ impl EngineHandle {
             self.tools
                 .prepare_for_engine(&invocation)
                 .map_err(|error| {
-                    SessionEffectExecutionError::Uncertain(format!(
-                        "effect precondition changed: {error}"
-                    ))
+                    if tools::is_readonly_tool_name(&authority.name) {
+                        SessionEffectExecutionError::Certified(error.to_string())
+                    } else {
+                        SessionEffectExecutionError::Uncertain(format!(
+                            "effect precondition changed: {error}"
+                        ))
+                    }
                 })?;
         if exact != operation_digest || decision == policy::PolicyDecision::Deny {
             return Err(SessionEffectExecutionError::Uncertain(
@@ -2298,7 +2508,9 @@ impl EngineHandle {
             }),
             Err(
                 error @ (ToolError::Io(_) | ToolError::Path(_) | ToolError::WorkspaceUnsafe(_)),
-            ) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
+            ) if !tools::is_readonly_tool_name(&authority.name) => {
+                Err(SessionEffectExecutionError::Uncertain(error.to_string()))
+            }
             Err(error) => Ok(SessionEffectObservedValue {
                 result: serde_json::json!({"error":error.to_string()}).to_string(),
                 payload: Some(serde_json::json!({
@@ -4339,6 +4551,12 @@ mod tool_effect_tests {
         cancelled.cancel();
         assert!(matches!(
             engine.execute_started_session_tool(&read, 1, &read_digest, &lease, &cancelled),
+            Err(SessionEffectExecutionError::Certified(message))
+                if message.contains("cancelled")
+        ));
+        let write_cancel = descriptor("write_file", json!({"path":"cancel-out.txt","content":"x"}));
+        assert!(matches!(
+            engine.execute_started_session_tool(&write_cancel, 1, "unused", &lease, &cancelled),
             Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("cancelled")
         ));
@@ -4365,6 +4583,32 @@ mod tool_effect_tests {
                 &disappearing,
                 1,
                 &disappearing_digest,
+                &lease,
+                &CancellationToken::new(),
+            ),
+            Err(SessionEffectExecutionError::Certified(_))
+        ));
+
+        std::fs::write(dir.path().join("vanishing_mut.txt"), "before\n").unwrap();
+        let vanishing_hash = format!("{:x}", Sha256::digest(b"before\n"));
+        let vanishing_edit = descriptor(
+            "edit_file",
+            json!({
+                "path": "vanishing_mut.txt",
+                "before": "before",
+                "after": "after",
+                "precondition": vanishing_hash,
+            }),
+        );
+        let (_, vanishing_digest) = engine
+            .session_effect_policy_and_digest(&vanishing_edit, 1, &lease)
+            .unwrap();
+        std::fs::remove_file(dir.path().join("vanishing_mut.txt")).unwrap();
+        assert!(matches!(
+            engine.execute_started_session_tool(
+                &vanishing_edit,
+                1,
+                &vanishing_digest,
                 &lease,
                 &CancellationToken::new(),
             ),
@@ -6486,5 +6730,225 @@ mod tool_effect_tests {
             follow_up.transcript.entries.last().unwrap().text,
             "continue after repair"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_or_reject_permission_modes_and_zero_scan_changed_files_survive_external_symlinks()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "external").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("references")).unwrap();
+
+        let ids = SystemIdSource::default();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .permission_mode(latte_core::PermissionMode::Ask)
+            .require_verification(true)
+            .build()
+            .unwrap();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let created = engine
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "test external symlink + modes",
+                1,
+            )
+            .unwrap();
+        let lease = engine.acquire_session_lease(session_id, 1, 60_000).unwrap();
+        let started_snapshot = engine
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: created.session_revision,
+                    expected_turn_revision: created.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: "start-modes-test".into(),
+                    },
+                },
+                &lease,
+                1,
+            )
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            engine.session_permission_mode(session_id),
+            latte_core::PermissionMode::Ask
+        );
+
+        // Missing path is rejected into a durable ToolResult without bricking the session.
+        let missing_outcome = engine
+            .prepare_or_reject_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: started_snapshot.session_revision,
+                    expected_turn_revision: started_snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "reject-missing".into(),
+                    authority: EffectAuthority {
+                        effect_id: "effect-missing".parse().unwrap(),
+                        tool_call_id: "call-missing".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "does-not-exist.rs"}),
+                        attempt: 1,
+                    },
+                },
+                &lease,
+                2,
+            )
+            .unwrap();
+        let after_reject = match missing_outcome {
+            SessionEffectPrepareOutcome::Rejected {
+                snapshot,
+                error_json,
+            } => {
+                assert!(error_json.contains("error"));
+                snapshot
+            }
+            SessionEffectPrepareOutcome::Prepared(_) => panic!("expected Rejected"),
+        };
+
+        // Switch session to AutoEdit: write_file becomes Allow (no Ask), creating nested parent dirs.
+        engine.set_session_permission_mode(session_id, latte_core::PermissionMode::AutoEdit);
+        assert_eq!(
+            engine.session_permission_mode(session_id),
+            latte_core::PermissionMode::AutoEdit
+        );
+        let write_outcome = engine
+            .prepare_or_reject_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: after_reject.session_revision,
+                    expected_turn_revision: after_reject.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "prep-write".into(),
+                    authority: EffectAuthority {
+                        effect_id: "effect-write-nested".parse().unwrap(),
+                        tool_call_id: "call-write-nested".into(),
+                        name: "write_file".into(),
+                        input: json!({"path": "nested/dir/hello.rs", "content": "pub fn hi() {}\n"}),
+                        attempt: 1,
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap();
+        let prepared_write = match write_outcome {
+            SessionEffectPrepareOutcome::Prepared(prepared) => {
+                assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
+                prepared
+            }
+            SessionEffectPrepareOutcome::Rejected { .. } => panic!("expected Prepared"),
+        };
+        let started_write = engine
+            .start_session_effect(
+                SessionEffectStartRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: prepared_write.snapshot.session_revision,
+                    expected_turn_revision: prepared_write.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "start-write".into(),
+                    effect_id: "effect-write-nested".parse().unwrap(),
+                },
+                prepared_write.operation_digest.clone(),
+                &lease,
+                4,
+            )
+            .unwrap();
+        let write_val = engine
+            .execute_started_session_effect(&started_write, &lease, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(write_val.success);
+        let observed_write = engine
+            .observe_session_effect(
+                &started_write,
+                "obs-write".into(),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                write_val,
+                &lease,
+                5,
+            )
+            .unwrap();
+
+        // Changed files reflect the exact engine-recorded mutation, and require_verification blocks unverified Complete.
+        assert_eq!(
+            engine.session_turn_changed_files(turn_id).unwrap(),
+            vec!["nested/dir/hello.rs".to_owned()]
+        );
+        let unverified_err = engine
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: observed_write.snapshot.session_revision,
+                    expected_turn_revision: observed_write.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Complete {
+                        source_key: "unverified-complete".into(),
+                        handoff: latte_core::Handoff {
+                            summary: "done".into(),
+                            files_changed: vec![],
+                            evidence: vec![],
+                        },
+                    },
+                },
+                &lease,
+                6,
+            )
+            .unwrap_err();
+        assert!(
+            unverified_err
+                .to_string()
+                .contains("use verified completion")
+        );
+
+        // FullAuto promotes process shell Ask -> Allow as well.
+        engine.set_session_permission_mode(session_id, latte_core::PermissionMode::FullAuto);
+        #[cfg(unix)]
+        {
+            let proc_outcome = engine
+                .prepare_or_reject_session_effect(
+                    SessionEffectRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: observed_write.snapshot.session_revision,
+                        expected_turn_revision: observed_write.snapshot.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: "prep-shell".into(),
+                        authority: EffectAuthority {
+                            effect_id: "effect-shell".parse().unwrap(),
+                            tool_call_id: "call-shell".into(),
+                            name: "process".into(),
+                            input: json!({"shell": "echo ok"}),
+                            attempt: 1,
+                        },
+                    },
+                    &lease,
+                    7,
+                )
+                .unwrap();
+            match proc_outcome {
+                SessionEffectPrepareOutcome::Prepared(prepared) => {
+                    assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
+                }
+                SessionEffectPrepareOutcome::Rejected { .. } => panic!("expected Prepared"),
+            }
+        }
     }
 }

@@ -1,8 +1,8 @@
 # Context 架构与上下文管理策略
 
-状态：**v1 已实现**（分层模型、SummarizeOnDiscard 策略、策略选择器数据化、
-主动水位、确定性省略层、token 估算、只读用量投影与 TUI 状态栏 meter）；
-文中标注 v2 的条目（摘要请求复用对话前缀、跨模型 handoff）未实现。
+状态：**v1.1 已实现**（分层模型、SummarizeOnDiscard 策略、策略选择器数据化、
+主动水位、确定性省略层、token 估算、只读用量投影、TUI 状态栏 meter、`<repository-context>` 前缀锚定与摘要请求热前缀复用 `reuse_prefix`）；
+文中标注 v2 的跨模型 handoff 尚未实现。
 日期：2026-09-13（2026-09-17 增补 TUI 状态栏）
 关联：[Harness Profile 抽象设计](harness-profile.md)——策略选择器是 profile 的组成部分
 
@@ -300,11 +300,9 @@ provider 的 prompt cache 以 system 开头的稳定前缀为键；工作区文�
   `<system-reminder>` 块；形如带属性/畸形的 token（标签后不是纯空白接 `>`）
   原样保留，不做猜测式替换。扫描按字符边界进行，非 ASCII 内容逐字节保持。
 - **wire 顺序**：
-  `[system 头] [summary?] [持久历史…] [repository-context?] [system-reminder?] [当前 prompt]`。
-  tool 轮内重建（mid-turn rebuild）以活跃 turn 的第一段为界：volatile 块整块
-  重新插在该边界之前，已完成历史在前、开放 turn（prompt、assistant 批次、tool
-  result）原文在后——同一 turn 内只重建一次 volatile 并全程复用，轮内前缀也保持
-  稳定。审批恢复路径重建 repo tail，但不补发已消费的 reminder。
+  `[system 头] [summary?] [repository-context?] [持久历史…] [system-reminder?] [当前 prompt]`。
+  `<repository-context>` 锚定在 `[system 头, summary?]` 之后、持久历史之前，因此只要工作区指导文档未修改，第 N 轮请求严格是第 N-1 轮的字节前缀扩展（跨轮次 KV Cache 100% 命中）；`<system-reminder>` 则紧挨在活跃 turn 或新 prompt 之前消费一次。
+  tool 轮内重建（mid-turn rebuild）同样保持 `<repository-context>` 在头下、`<system-reminder>` 在活跃 turn 第一段之前——同一 turn 内只重建一次 volatile 并全程复用，轮内前缀也保持稳定。审批恢复路径重建 repo 块，但不补发已消费的 reminder。
 - **预算紧张时的两阶段拟合（exact-byte，fail-closed）**：拟合分两阶段而不是一条
   newest-first 单走，避免可丢尾部把强制历史"挤"出预算：
   1. **阶段一·强制核心**：`[持久历史…, 当前 prompt]` 作为强制单元，在**全部**

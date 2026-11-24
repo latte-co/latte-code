@@ -30,6 +30,10 @@ nix = { workspace = true }
 
 # latte-server does not inherit [lints] workspace; keep only the targeted
 # allow for the clippy 1.99 assert_is_empty lint (see the root Cargo.toml
-# comment) without adopting the workspace pedantic set here.
+# comment) without adopting the workspace pedantic set here, while still
+# forbidding unsafe code like the rest of the workspace.
+[lints.rust]
+unsafe_code = "forbid"
+
 [lints.clippy]
 assert_is_empty = "allow"

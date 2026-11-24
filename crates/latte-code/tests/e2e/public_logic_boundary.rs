@@ -121,6 +121,7 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
         version: ProfileVersion::V1_0,
         context: ContextPolicy::default(),
         prompts: SystemPromptSpec::default(),
+        tools: latte_core::ToolPresentationStyle::Canonical,
     };
     assert!(harness_profile.validate().is_ok());
     harness_profile.profile_id.clear();
@@ -142,6 +143,8 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
     };
     let asst_msg = Message::Assistant {
         content: Some("ans".into()),
+        reasoning_content: None,
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
     };
     let tool_msg = Message::Tool {
@@ -557,4 +560,469 @@ fn public_core_state_context_and_registry_boundaries_are_final_cli_compatible() 
             .status
             .success()
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn anthropic_provider_registry_profile_and_edit_error_boundaries() {
+    use latte_core::{
+        CompactionPolicy, CompactionStrategy, SessionProviderBinding, ToolPresentationStyle,
+    };
+    use latte_engine::{CancellationToken, EngineBuilder};
+    use latte_headless::provider::{
+        AnthropicProvider, FinishReason, Provider, ProviderContext, ProviderError, ProviderRequest,
+        ThinkingBlock, ToolCall,
+    };
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 1. Registry + ProfileCatalog boundaries for `anthropic-messages` & `tool_style: "claude_code"`.
+    assert!(ProviderRegistry::parse_jsonc(
+        r#"{version:1,default_model:"c/m",providers:{c:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1",api_key:"k",temperature:1.5}}}"#
+    ).is_err());
+    let bad_hdr_reg = ProviderRegistry::parse_jsonc(
+        r#"{version:1,default_model:"c/m",providers:{c:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1/",api_key:"k",headers:{"x-api-key":"override"}}}}"#
+    ).unwrap();
+    assert!(bad_hdr_reg.resolve_model("c", "m", &[]).is_err());
+
+    let scenario = Scenario::new();
+    let engine = EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .build()
+        .unwrap();
+    let descriptors = engine.tool_descriptors();
+
+    let dual_reg = std::sync::Arc::new(ProviderRegistry::parse_jsonc(
+        r#"{
+            version: 1,
+            default_model: "claude/m",
+            providers: {
+                claude: {
+                    type: "anthropic-messages",
+                    models: { m: { options: { context_window: 128000, reasoning_effort: "low", max_tokens: 4096 } } },
+                    base_url: "https://api.anthropic.com/v1/",
+                    api_key: "secret-anth",
+                    prompt_caching: false
+                },
+                oai_claude: {
+                    type: "openai-chat",
+                    models: ["m2"],
+                    endpoint: "http://127.0.0.1:9/v1/chat/completions",
+                    api_key: "secret-oai",
+                    tool_style: "claude_code"
+                }
+            }
+        }"#
+    ).unwrap());
+    let base_ctx = ContextPolicy {
+        compaction: CompactionPolicy {
+            strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+            ..CompactionPolicy::default()
+        },
+        ..ContextPolicy::default()
+    };
+    let catalog = ProfileCatalog::new(base_ctx, std::sync::Arc::clone(&dual_reg)).unwrap();
+    let anth_binding: SessionProviderBinding = dual_reg
+        .session_binding_for_model("claude", "m", &descriptors)
+        .unwrap();
+    let anth_prof = catalog.resolve(&anth_binding).unwrap();
+    assert_eq!(
+        anth_prof.tool_presentation(),
+        ToolPresentationStyle::ClaudeCode
+    );
+    assert!(anth_prof.compaction().reuse_prefix);
+    assert!(anth_prof.system_prompt("").unwrap().contains("`Edit`"));
+
+    let oai_binding = dual_reg
+        .session_binding_for_model("oai_claude", "m2", &descriptors)
+        .unwrap();
+    let oai_prof = catalog.resolve(&oai_binding).unwrap();
+    assert_eq!(
+        oai_prof.tool_presentation(),
+        ToolPresentationStyle::ClaudeCode
+    );
+    assert!(oai_prof.system_prompt("").unwrap().contains("`Bash`"));
+
+    // 2. AnthropicProvider transport, fallback, error classification, and budget variants.
+    let serve_seq = |replies: Vec<(&'static str, &'static str, &'static str)>| -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (status, ctype, body) in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 16 * 1024];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nrequest-id: req_test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1/messages")
+    };
+
+    rt.block_on(async {
+        let ctx = || ProviderContext {
+            deadline: Instant::now() + Duration::from_secs(3),
+            cancellation: CancellationToken::new(),
+            events: None,
+        };
+
+        // Empty-body 400 stream fallback -> inline JSON with redacted_thinking & max_tokens,
+        // plus exercising assistant-first turn, overlong tool_id, unsigned thinking drop, and prompt_caching=false.
+        let ep_fallback = serve_seq(vec![
+            ("400 Bad Request", "application/json", ""),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"type":"message","content":[{"type":"redacted_thinking","data":"enc1"},{"type":"text","text":"fb-ok"}],"stop_reason":"max_tokens","usage":{"output_tokens":7}}"#,
+            ),
+        ]);
+        let prov = AnthropicProvider::new(ep_fallback, "m", "secret-token", Duration::from_secs(2))
+            .unwrap()
+            .with_prompt_caching(false)
+            .with_sampling_options(Some(0.2), None)
+            .with_reasoning_effort(Some("off".into()))
+            .with_headers(BTreeMap::from([
+                ("x-api-key".into(), "ignored".into()),
+                ("anthropic-beta".into(), "custom-beta".into()),
+            ]));
+        assert!(format!("{prov:?}").contains("[REDACTED]"));
+        assert!(!prov.capabilities().input_request);
+        let overlong = "call_".to_owned() + &"z".repeat(80);
+        let fb_out = prov
+            .complete(
+                ProviderRequest {
+                    session_ref: "s1".into(),
+                    tools: vec![],
+                    messages: vec![
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![ThinkingBlock::Thinking {
+                                thinking: "unsigned".into(),
+                                signature: None,
+                            }],
+                            tool_calls: vec![ToolCall {
+                                id: overlong.clone(),
+                                name: "Read".into(),
+                                input: serde_json::json!("non-object"),
+                            }],
+                        },
+                        Message::Tool {
+                            tool_call_id: overlong,
+                            name: Some("Read".into()),
+                            content: "ok".into(),
+                        },
+                    ],
+                },
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fb_out.message.as_deref(), Some("fb-ok"));
+        assert_eq!(fb_out.finish_reason, Some(FinishReason::Length));
+        assert_eq!(fb_out.thinking_blocks().len(), 1);
+
+        // Exercise remaining reasoning_effort budget tiers ("minimal", "low", "medium", "xhigh", "2048", small max_tokens).
+        for (effort, max_tok, stop, expected_reason) in [
+            ("minimal", None, "refusal", FinishReason::ContentFilter),
+            ("low", Some(1024), "stop_sequence", FinishReason::Stop),
+            ("medium", None, "custom_stop", FinishReason::Other("custom_stop".into())),
+            ("xhigh", Some(65_536), "end_turn", FinishReason::Stop),
+            ("2048", Some(8_192), "end_turn", FinishReason::Stop),
+        ] {
+            let body = format!(
+                r#"{{"type":"message","content":[{{"type":"text","text":"ok"}}],"stop_reason":{stop:?},"usage":{{"input_tokens":5}}}}"#
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            });
+            let res = AnthropicProvider::new(
+                format!("http://{addr}/v1/messages"),
+                "m",
+                "k",
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .with_streaming(false)
+            .with_sampling_options(Some(0.5), max_tok)
+            .with_reasoning_effort(Some(effort.into()))
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![Message::User { content: String::new() }],
+                },
+                ctx(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(res.finish_reason, Some(expected_reason));
+        }
+
+        // HTTP 400 "prompt is too long" -> ContextOverflow; SSE overloaded, SSE overflow, SSE generic error, truncated SSE.
+        let ep_err = serve_seq(vec![
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 > 200000"}}"#,
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            ),
+        ]);
+        let err_prov = AnthropicProvider::new(ep_err, "m", "k", Duration::from_secs(2)).unwrap();
+        let req = || ProviderRequest {
+            session_ref: "s".into(),
+            tools: vec![],
+            messages: vec![Message::User { content: "u".into() }],
+        };
+        assert!(matches!(
+            err_prov.complete(req(), ctx()).await,
+            Err(ProviderError::ContextOverflow { .. })
+        ));
+        assert!(matches!(
+            err_prov.complete(req(), ctx()).await,
+            Err(ProviderError::Http { status: 529, retryable: true, .. })
+        ));
+        assert!(matches!(
+            err_prov.complete(req(), ctx()).await,
+            Err(ProviderError::ContextOverflow { .. })
+        ));
+        assert!(matches!(
+            err_prov.complete(req(), ctx()).await,
+            Err(ProviderError::Malformed(_))
+        ));
+        assert!(matches!(
+            err_prov.complete(req(), ctx()).await,
+            Err(ProviderError::Malformed(_))
+        ));
+
+        // ClaudeCode AliasedProvider outbound/inbound translation across all canonical & edge forms,
+        // plus OpenAiProvider Debug redaction and SSE malformed block guards.
+        let oai_dbg = latte_headless::provider::OpenAiProvider::new(
+            "http://127.0.0.1:9/v1/chat/completions",
+            "m",
+            "super-secret-oai",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let oai_rendered = format!("{oai_dbg:?}");
+        assert!(oai_rendered.contains("[REDACTED]"));
+        assert!(!oai_rendered.contains("super-secret-oai"));
+        assert!(!oai_dbg.capabilities().input_request);
+
+        let ep_sse_malformed = serve_seq(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Read\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"seed\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0}\n\n",
+            ),
+        ]);
+        let sse_prov =
+            AnthropicProvider::new(ep_sse_malformed, "m", "k", Duration::from_secs(2)).unwrap();
+        for _ in 0..6 {
+            assert!(matches!(
+                sse_prov
+                    .complete(
+                        ProviderRequest {
+                            session_ref: "s".into(),
+                            tools: vec![],
+                            messages: vec![
+                                Message::User { content: "u".into() },
+                                Message::Assistant {
+                                    content: None,
+                                    reasoning_content: None,
+                                    thinking_blocks: vec![],
+                                    tool_calls: vec![],
+                                },
+                            ],
+                        },
+                        ctx(),
+                    )
+                    .await,
+                Err(ProviderError::Malformed(_))
+            ));
+        }
+
+        let ep_claude = serve_seq(vec![(
+            "200 OK",
+            "application/json",
+            r#"{"type":"message","content":[
+                {"type":"tool_use","id":"c1","name":"GitDiff","input":{}},
+                {"type":"tool_use","id":"c2","name":"ReadManifest","input":{}},
+                {"type":"tool_use","id":"c3","name":"Grep","input":{"pattern":"a+b","literal":true}},
+                {"type":"tool_use","id":"c4","name":"Write","input":{"file_path":"w.txt","content":"hi","create_intent":true}},
+                {"type":"tool_use","id":"c5","name":"Bash","input":{"argv":["ls"],"cwd":".","timeout_ms":500}},
+                {"type":"tool_use","id":"c6","name":"Bash","input":{"command":"FOO=1 env"}}
+            ],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}"#,
+        )]);
+        let reg = ProviderRegistry::parse_jsonc(&format!(
+            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",models:["m"],endpoint:{ep_claude:?},api_key:"k",streaming:false}}}}}}"#
+        ))
+        .unwrap();
+        assert!(format!("{reg:?}").contains("[REDACTED]"));
+        let resolved = reg.resolve_default(&descriptors).unwrap();
+        let out = resolved
+            .provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: descriptors.clone(),
+                    messages: vec![
+                        Message::User { content: "check".into() },
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![],
+                            tool_calls: vec![
+                                ToolCall {
+                                    id: "h1".into(),
+                                    name: "search".into(),
+                                    input: serde_json::json!({"query": "lit", "regex": false, "glob": "*.rs"}),
+                                },
+                                ToolCall {
+                                    id: "h2".into(),
+                                    name: "process".into(),
+                                    input: serde_json::json!({"shell": "echo a | cat", "cwd": ".", "timeout_ms": 1000}),
+                                },
+                                ToolCall {
+                                    id: "h3".into(),
+                                    name: "read_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "offset": 1, "limit": 10}),
+                                },
+                                ToolCall {
+                                    id: "h4".into(),
+                                    name: "edit_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "before": "x", "after": "y", "replace_all": true}),
+                                },
+                                ToolCall {
+                                    id: "h5".into(),
+                                    name: "write_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "content": "z"}),
+                                },
+                                ToolCall {
+                                    id: "h6".into(),
+                                    name: "list_directory".into(),
+                                    input: serde_json::json!({"path": "src"}),
+                                },
+                                ToolCall {
+                                    id: "h7".into(),
+                                    name: "git_diff".into(),
+                                    input: serde_json::json!("raw"),
+                                },
+                            ],
+                        },
+                        Message::Tool {
+                            tool_call_id: "h1".into(),
+                            name: Some("search".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h2".into(),
+                            name: Some("process".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h3".into(),
+                            name: Some("read_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h4".into(),
+                            name: Some("edit_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h5".into(),
+                            name: Some("write_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h6".into(),
+                            name: Some("list_directory".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h7".into(),
+                            name: Some("git_diff".into()),
+                            content: "ok".into(),
+                        },
+                    ],
+                },
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls[0].name, "git_diff");
+        assert_eq!(out.tool_calls[1].name, "read_project_manifest");
+        assert_eq!(out.tool_calls[2].name, "search");
+        assert_eq!(out.tool_calls[2].input["regex"], false);
+        assert_eq!(out.tool_calls[3].name, "write_file");
+        assert_eq!(out.tool_calls[3].input["create_intent"], true);
+        assert_eq!(out.tool_calls[4].name, "process");
+        assert_eq!(out.tool_calls[4].input["argv"], serde_json::json!(["ls"]));
+        assert_eq!(out.tool_calls[5].name, "process");
+        assert_eq!(out.tool_calls[5].input["shell"], "FOO=1 env");
+    });
 }

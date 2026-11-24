@@ -2,11 +2,19 @@
   "version": 1,
   "default_model": "primary/model-id",
   "session": {
-    "max_request_bytes": 524288,
-    "max_input_bytes": 393216,
-    "reserved_output_bytes": 131072,
-    "context_cap_bytes": 65536
+    "max_request_bytes": 2097152,
+    "max_input_bytes": 1572864,
+    "reserved_output_bytes": 262144,
+    "context_cap_bytes": 131072,
+    "provider_timeout_ms": 120000,
+    "compaction": {
+      "enabled": true,
+      "mode": "elide_then_summarize",
+      "max_summary_source_bytes": 524288,
+      "reuse_prefix": true
+    }
   },
+  // Optional: omit `verification` when no automatic post-mutation command is desired.
   "verification": { "argv": ["cargo", "test", "--workspace"], "cwd": ".", "timeout_ms": 120000 },
   "providers": {
     "primary": {
@@ -20,11 +28,26 @@
       "base_url": "https://provider.example/v1",
       // A literal string is also supported: "api_key": "sk-..."
       "api_key": { "source": "env", "name": "OPENAI_API_KEY" },
-      "timeout_ms": 60000,
+      "timeout_ms": 120000,
       "max_attempts": 1,
       "streaming": true,
       "compatibility_input_request": false,
       "aliases": {}
+    },
+    "claude": {
+      "type": "anthropic-messages",
+      "models": {
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5",
+          "options": { "context_window": 200000, "reasoning_effort": "high", "max_tokens": 16384 }
+        }
+      },
+      "base_url": "https://api.anthropic.com",
+      "api_key": { "source": "env", "name": "ANTHROPIC_API_KEY" },
+      "timeout_ms": 120000,
+      "max_attempts": 2,
+      "streaming": true,
+      "prompt_caching": true
     }
   }
 }

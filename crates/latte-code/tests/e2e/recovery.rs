@@ -536,7 +536,7 @@ fn failed_verification_is_durable_and_never_claims_completion() {
         server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
-    assert_eq!(terminal["lifecycle"], "failed");
+    assert_eq!(terminal["lifecycle"], "ready");
     assert_eq!(terminal["turns"][0]["status"], "failed");
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("new.txt")).unwrap(),

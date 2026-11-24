@@ -341,6 +341,10 @@ pub enum SessionUiAction {
         provider_name: String,
         model: String,
     },
+    SetPermissionMode {
+        session_id: Option<SessionId>,
+        mode: latte_core::PermissionMode,
+    },
     RefreshSnapshots,
     Quit,
 }
@@ -398,24 +402,8 @@ struct ModelPickerState {
     index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionPermissionMode {
-    Ask,
-}
-
-impl SessionPermissionMode {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "Ask",
-        }
-    }
-
-    const fn card_label(self) -> &'static str {
-        match self {
-            Self::Ask => "Ask mode",
-        }
-    }
-}
+/// Alias for [`latte_core::PermissionMode`] kept on the TUI session surface.
+pub type SessionPermissionMode = latte_core::PermissionMode;
 
 /// The composer is the default and owns every printable character. Transcript
 /// shortcuts are reachable only after an explicit mode switch.
@@ -460,6 +448,19 @@ pub struct SessionUiModel {
     pub selected: usize,
     pub composer: String,
     pub input: String,
+    /// Byte offset from the end of `composer` (`0` = caret at the end).
+    composer_tail_offset: usize,
+    /// Byte offset from the end of `input` (`0` = caret at the end).
+    input_tail_offset: usize,
+    /// Submitted prompts in chronological order for Up/Down history recall.
+    pub history: Vec<String>,
+    history_index: Option<usize>,
+    history_saved_draft: String,
+    /// Active session permission mode (`Ask`, `AutoEdit`, `FullAuto`).
+    pub permission_mode: latte_core::PermissionMode,
+    /// Most recent redacted runtime submission error reason, if any.
+    last_submission_error: Option<String>,
+    last_input_submission_error: Option<String>,
     /// Wrapped display rows above the current transcript tail. Zero follows
     /// new durable cards; `u16::MAX` represents the oldest available row.
     pub scroll: u16,
@@ -550,6 +551,14 @@ impl Default for SessionUiModel {
             selected: 0,
             composer: String::new(),
             input: String::new(),
+            composer_tail_offset: 0,
+            input_tail_offset: 0,
+            history: Vec::new(),
+            history_index: None,
+            history_saved_draft: String::new(),
+            permission_mode: latte_core::PermissionMode::Ask,
+            last_submission_error: None,
+            last_input_submission_error: None,
             scroll: 0,
             connection: ConnectionState::Connected,
             progress: Vec::new(),
@@ -605,9 +614,11 @@ impl SessionUiModel {
         } else {
             PROVIDER_SETUP_GUIDANCE.into()
         };
+        let permission_mode = startup.permission_mode;
         Self {
             startup: Some(startup),
             pending_model_selection,
+            permission_mode,
             status,
             active_session: Some(ActiveSession::SessionDraft),
             ..Self::default()
@@ -917,7 +928,9 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 .is_some_and(|pending| pending.switch_id == switch_id)
             {
                 model.pending_model_switch = None;
-                model.status = format!("Model switch rejected: {error}");
+                let notice = format!("Model switch rejected: {error}");
+                model.status.clone_from(&notice);
+                model.command_notice = Some(notice);
             }
         }
         SessionUiInput::ModelSwitchCompleted { switch_id } => {
@@ -1108,25 +1121,44 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
         {
             if model.authority_enabled()
                 && model.permission_was_rendered(session.session_id, request_id)
-                && key.code == KeyCode::Char('d')
-                && key.modifiers.is_empty()
             {
-                return vec![SessionUiAction::ResolvePermission {
-                    session_id: session.session_id,
-                    request_id: request_id.clone(),
-                    allow: false,
-                }];
-            }
-            if model.authority_enabled()
-                && model.permission_was_rendered(session.session_id, request_id)
-                && key.code == KeyCode::Char('a')
-                && key.modifiers == KeyModifiers::CONTROL
-            {
-                return vec![SessionUiAction::ResolvePermission {
-                    session_id: session.session_id,
-                    request_id: request_id.clone(),
-                    allow: true,
-                }];
+                if matches!(key.code, KeyCode::Char('d' | 'n')) && key.modifiers.is_empty() {
+                    return vec![SessionUiAction::ResolvePermission {
+                        session_id: session.session_id,
+                        request_id: request_id.clone(),
+                        allow: false,
+                    }];
+                }
+                if (key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL)
+                    || (key.code == KeyCode::Char('y') && key.modifiers.is_empty())
+                {
+                    return vec![SessionUiAction::ResolvePermission {
+                        session_id: session.session_id,
+                        request_id: request_id.clone(),
+                        allow: true,
+                    }];
+                }
+                if key.code == KeyCode::Char('a') && key.modifiers.is_empty() {
+                    let is_process = pending_permission_tool_name(&session, request_id).as_deref()
+                        == Some("process");
+                    let next_mode = if is_process {
+                        latte_core::PermissionMode::FullAuto
+                    } else {
+                        latte_core::PermissionMode::AutoEdit
+                    };
+                    set_model_permission_mode(model, next_mode);
+                    return vec![
+                        SessionUiAction::SetPermissionMode {
+                            session_id: Some(session.session_id),
+                            mode: next_mode,
+                        },
+                        SessionUiAction::ResolvePermission {
+                            session_id: session.session_id,
+                            request_id: request_id.clone(),
+                            allow: true,
+                        },
+                    ];
+                }
             }
             // Permission owns the entire event. Enter, printable characters,
             // and navigation keys cannot mutate any pending input/composer.
@@ -1143,6 +1175,7 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
             }
             if model.authority_enabled() && is_submit(key) && !model.input.trim().is_empty() {
                 let value = std::mem::take(&mut model.input);
+                model.input_tail_offset = 0;
                 let submission_id = model.next_submission_id;
                 model.next_submission_id = model.next_submission_id.saturating_add(1);
                 model.pending_input_submission = Some(PendingInputSubmission {
@@ -1161,21 +1194,12 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
                     value,
                 }];
             }
-            if key.code == KeyCode::Backspace {
-                pop_grapheme(&mut model.input);
-                return Vec::new();
-            }
-            if is_newline(key) && model.input.len() < 16 * 1024 {
-                model.input.push('\n');
-                return Vec::new();
-            }
-            if let KeyCode::Char(value) = key.code
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && model.input.len() < 16 * 1024
-            {
-                model.input.push(value);
-                return Vec::new();
-            }
+            let _ = apply_editor_key(
+                &mut model.input,
+                &mut model.input_tail_offset,
+                key,
+                16 * 1024,
+            );
             // Waiting-input also owns the event; unhandled keys never fall
             // through into the follow-up composer.
             return Vec::new();
@@ -1522,6 +1546,7 @@ fn reduce_model_picker_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Ses
     Vec::new()
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch_builtin(
     model: &mut SessionUiModel,
     command: BuiltinCommand,
@@ -1617,6 +1642,37 @@ fn dispatch_builtin(
             set_notice(model, "Cancelling active turn…");
             vec![SessionUiAction::Cancel { session_id }]
         }
+        BuiltinCommand::Mode => {
+            let next_mode = if argument.trim().is_empty() {
+                model.permission_mode.next()
+            } else {
+                let Ok(parsed) = latte_core::PermissionMode::parse_mode(&argument) else {
+                    set_notice(
+                        model,
+                        "Unknown permission mode; expected ask, auto-edit, or full-auto",
+                    );
+                    return Vec::new();
+                };
+                parsed
+            };
+            set_model_permission_mode(model, next_mode);
+            let session_id = model.selected_session().map(|session| session.session_id);
+            set_notice(
+                model,
+                format!("Permission mode set to {}", next_mode.card_label()),
+            );
+            vec![SessionUiAction::SetPermissionMode {
+                session_id,
+                mode: next_mode,
+            }]
+        }
+    }
+}
+
+fn set_model_permission_mode(model: &mut SessionUiModel, mode: latte_core::PermissionMode) {
+    model.permission_mode = mode;
+    if let Some(startup) = model.startup.as_mut() {
+        startup.permission_mode = mode;
     }
 }
 
@@ -1664,18 +1720,28 @@ fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Session
         KeyCode::Esc => {
             model.focus = SessionFocus::Navigation;
             model.help = false;
+            return Vec::new();
         }
-        KeyCode::Backspace => {
-            pop_grapheme(&mut model.composer);
-            model.slash_index = 0;
-            model.slash_popup_state = SlashPopupState::Eligible;
-            model.command_notice = None;
+        KeyCode::BackTab => {
+            let next_mode = model.permission_mode.next();
+            set_model_permission_mode(model, next_mode);
+            let session_id = model.selected_session().map(|session| session.session_id);
+            set_notice(
+                model,
+                format!("Permission mode: {}", next_mode.card_label()),
+            );
+            return vec![SessionUiAction::SetPermissionMode {
+                session_id,
+                mode: next_mode,
+            }];
         }
-        KeyCode::Enter if is_newline(key) => {
-            model.composer.push('\n');
-            model.slash_index = 0;
-            model.slash_popup_state = SlashPopupState::Eligible;
-            model.command_notice = None;
+        KeyCode::PageUp => {
+            model.scroll = model.scroll.saturating_add(8);
+            return Vec::new();
+        }
+        KeyCode::PageDown => {
+            model.scroll = model.scroll.saturating_sub(8);
+            return Vec::new();
         }
         KeyCode::F(5) | KeyCode::Enter
             if is_submit(key)
@@ -1685,16 +1751,56 @@ fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Session
         {
             return submit_composer(model);
         }
-        KeyCode::Char(value)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && model.composer.len() < 16 * 1024 =>
-        {
-            model.composer.push(value);
-            model.slash_index = 0;
-            model.slash_popup_state = SlashPopupState::Eligible;
-            model.command_notice = None;
+        KeyCode::Up if key.modifiers.is_empty() => {
+            if move_cursor_vertical(&model.composer, &mut model.composer_tail_offset, -1) {
+                return Vec::new();
+            }
+            if !model.history.is_empty() {
+                let next_idx = match model.history_index {
+                    None => {
+                        model.history_saved_draft = model.composer.clone();
+                        model.history.len() - 1
+                    }
+                    Some(idx) => idx.saturating_sub(1),
+                };
+                model.history_index = Some(next_idx);
+                model.composer = model.history[next_idx].clone();
+                model.composer_tail_offset = 0;
+                model.slash_index = 0;
+                model.slash_popup_state = SlashPopupState::Eligible;
+            }
+            return Vec::new();
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            if move_cursor_vertical(&model.composer, &mut model.composer_tail_offset, 1) {
+                return Vec::new();
+            }
+            if let Some(idx) = model.history_index {
+                if idx + 1 < model.history.len() {
+                    model.history_index = Some(idx + 1);
+                    model.composer = model.history[idx + 1].clone();
+                } else {
+                    model.history_index = None;
+                    model.composer = std::mem::take(&mut model.history_saved_draft);
+                }
+                model.composer_tail_offset = 0;
+                model.slash_index = 0;
+                model.slash_popup_state = SlashPopupState::Eligible;
+            }
+            return Vec::new();
         }
         _ => {}
+    }
+    if apply_editor_key(
+        &mut model.composer,
+        &mut model.composer_tail_offset,
+        key,
+        16 * 1024,
+    ) {
+        model.history_index = None;
+        model.slash_index = 0;
+        model.slash_popup_state = SlashPopupState::Eligible;
+        model.command_notice = None;
     }
     Vec::new()
 }
@@ -1758,9 +1864,20 @@ fn reduce_paste(model: &mut SessionUiModel, value: &str) {
         .selected_session()
         .is_some_and(|session| matches!(session.pending, Some(SessionPendingRequest::Input { .. })))
     {
-        append_editor_text(&mut model.input, value, 16 * 1024);
+        insert_editor_text_at_cursor(
+            &mut model.input,
+            &mut model.input_tail_offset,
+            value,
+            16 * 1024,
+        );
     } else if model.focus == SessionFocus::Composer {
-        append_editor_text(&mut model.composer, value, 16 * 1024);
+        insert_editor_text_at_cursor(
+            &mut model.composer,
+            &mut model.composer_tail_offset,
+            value,
+            16 * 1024,
+        );
+        model.history_index = None;
         model.slash_index = 0;
         model.slash_popup_state = SlashPopupState::Eligible;
         model.command_notice = None;
@@ -1779,14 +1896,15 @@ fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgres
             }) = model.progress.last_mut()
                 && *current_turn == turn_id
             {
-                append_bounded(current, &text, 16 * 1024);
+                append_bounded(current, &text, latte_core::SESSION_TEXT_CAP_BYTES);
                 return;
             }
-            if model.progress.len() < 64 {
-                model
-                    .progress
-                    .push(SessionTransientProgress::AssistantDelta { turn_id, text });
+            if model.progress.len() >= 64 {
+                model.progress.remove(0);
             }
+            model
+                .progress
+                .push(SessionTransientProgress::AssistantDelta { turn_id, text });
         }
         SessionTransientProgress::ProviderAttempt { turn_id, number } => {
             if let Some(SessionTransientProgress::ProviderAttempt {
@@ -1797,7 +1915,10 @@ fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgres
             }) {
                 *current_turn = turn_id;
                 *current = number;
-            } else if model.progress.len() < 64 {
+            } else {
+                if model.progress.len() >= 64 {
+                    model.progress.remove(0);
+                }
                 model
                     .progress
                     .push(SessionTransientProgress::ProviderAttempt { turn_id, number });
@@ -1814,7 +1935,10 @@ fn record_progress(model: &mut SessionUiModel, progress: SessionTransientProgres
                 matches!(item, SessionTransientProgress::ToolProgress { turn_id: candidate, name: candidate_name, .. } if *candidate == turn_id && candidate_name == &name)
             }) {
                 *current = detail;
-            } else if model.progress.len() < 64 {
+            } else {
+                if model.progress.len() >= 64 {
+                    model.progress.remove(0);
+                }
                 model.progress.push(SessionTransientProgress::ToolProgress {
                     turn_id,
                     name,
@@ -1834,7 +1958,169 @@ fn append_bounded(target: &mut String, value: &str, cap: usize) {
     }
 }
 
+fn cursor_byte_pos(text: &str, tail_offset: usize) -> usize {
+    let raw = text.len().saturating_sub(tail_offset);
+    if raw >= text.len() {
+        return text.len();
+    }
+    let mut boundary = 0;
+    for (idx, _) in text.grapheme_indices(true) {
+        if idx <= raw {
+            boundary = idx;
+        } else {
+            break;
+        }
+    }
+    boundary
+}
+
+fn move_cursor_left(text: &str, tail_offset: &mut usize) {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    if let Some((prev_idx, _)) = text[..pos].grapheme_indices(true).next_back() {
+        *tail_offset = text.len().saturating_sub(prev_idx);
+    }
+}
+
+fn move_cursor_right(text: &str, tail_offset: &mut usize) {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    if let Some((_, g)) = text[pos..].grapheme_indices(true).next() {
+        let next_pos = pos + g.len();
+        *tail_offset = text.len().saturating_sub(next_pos);
+    }
+}
+
+fn move_cursor_line_start(text: &str, tail_offset: &mut usize) {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    *tail_offset = text.len().saturating_sub(start);
+}
+
+fn move_cursor_line_end(text: &str, tail_offset: &mut usize) {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let end = text[pos..].find('\n').map_or(text.len(), |rel| pos + rel);
+    *tail_offset = text.len().saturating_sub(end);
+}
+
+fn move_cursor_vertical(text: &str, tail_offset: &mut usize, delta_line: isize) -> bool {
+    if !text.contains('\n') {
+        return false;
+    }
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    let col_width = display_width(&text[line_start..pos]);
+    if delta_line < 0 {
+        if line_start == 0 {
+            return false;
+        }
+        let prev_end = line_start - 1;
+        let prev_start = text[..prev_end].rfind('\n').map_or(0, |nl| nl + 1);
+        let mut target = prev_start;
+        let mut acc = 0_usize;
+        for (rel, g) in text[prev_start..prev_end].grapheme_indices(true) {
+            let w = grapheme_width_at(g, acc);
+            if acc + w > col_width {
+                break;
+            }
+            acc += w;
+            target = prev_start + rel + g.len();
+        }
+        *tail_offset = text.len().saturating_sub(target);
+        true
+    } else {
+        let Some(rel_nl) = text[pos..].find('\n') else {
+            return false;
+        };
+        let next_start = pos + rel_nl + 1;
+        let next_end = text[next_start..]
+            .find('\n')
+            .map_or(text.len(), |r| next_start + r);
+        let mut target = next_start;
+        let mut acc = 0_usize;
+        for (rel, g) in text[next_start..next_end].grapheme_indices(true) {
+            let w = grapheme_width_at(g, acc);
+            if acc + w > col_width {
+                break;
+            }
+            acc += w;
+            target = next_start + rel + g.len();
+        }
+        *tail_offset = text.len().saturating_sub(target);
+        true
+    }
+}
+
+fn backspace_at_cursor(text: &mut String, tail_offset: &mut usize) -> bool {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let Some((prev_idx, _)) = text[..pos].grapheme_indices(true).next_back() else {
+        return false;
+    };
+    text.replace_range(prev_idx..pos, "");
+    *tail_offset = text.len().saturating_sub(prev_idx);
+    true
+}
+
+fn delete_at_cursor(text: &mut String, tail_offset: &mut usize) -> bool {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let Some((_, g)) = text[pos..].grapheme_indices(true).next() else {
+        return false;
+    };
+    let end = pos + g.len();
+    text.replace_range(pos..end, "");
+    *tail_offset = text.len().saturating_sub(pos);
+    true
+}
+
+fn delete_prev_word(text: &mut String, tail_offset: &mut usize) -> bool {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    if pos == 0 {
+        return false;
+    }
+    let prefix = &text[..pos];
+    let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+    let start = if trimmed.len() < prefix.len() && trimmed.ends_with('\n') {
+        trimmed.len()
+    } else {
+        trimmed.rfind(char::is_whitespace).map_or(0, |ws| ws + 1)
+    };
+    text.replace_range(start..pos, "");
+    *tail_offset = text.len().saturating_sub(start);
+    true
+}
+
+fn delete_to_line_start(text: &mut String, tail_offset: &mut usize) -> bool {
+    let pos = cursor_byte_pos(text, *tail_offset);
+    let start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    if start == pos {
+        return false;
+    }
+    text.replace_range(start..pos, "");
+    *tail_offset = text.len().saturating_sub(start);
+    true
+}
+
+fn insert_char_at_cursor(text: &mut String, tail_offset: &mut usize, ch: char, cap: usize) -> bool {
+    if text.len() + ch.len_utf8() > cap {
+        return false;
+    }
+    let pos = cursor_byte_pos(text, *tail_offset);
+    text.insert(pos, ch);
+    *tail_offset = text.len().saturating_sub(pos + ch.len_utf8());
+    true
+}
+
+#[cfg(test)]
 fn append_editor_text(target: &mut String, value: &str, cap: usize) {
+    let mut tail = 0;
+    insert_editor_text_at_cursor(target, &mut tail, value, cap);
+}
+
+fn insert_editor_text_at_cursor(
+    target: &mut String,
+    tail_offset: &mut usize,
+    value: &str,
+    cap: usize,
+) {
+    let mut sanitized = String::new();
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
@@ -1851,10 +2137,71 @@ fn append_editor_text(target: &mut String, value: &str, cap: usize) {
         if ch.is_control() && ch != '\n' && ch != '\t' {
             continue;
         }
-        if target.len() + ch.len_utf8() > cap {
+        if target.len() + sanitized.len() + ch.len_utf8() > cap {
             break;
         }
-        target.push(ch);
+        sanitized.push(ch);
+    }
+    if sanitized.is_empty() {
+        return;
+    }
+    let pos = cursor_byte_pos(target, *tail_offset);
+    target.insert_str(pos, &sanitized);
+    *tail_offset = target.len().saturating_sub(pos + sanitized.len());
+}
+
+fn apply_editor_key(text: &mut String, tail_offset: &mut usize, key: KeyEvent, cap: usize) -> bool {
+    if is_newline(key) {
+        return insert_char_at_cursor(text, tail_offset, '\n', cap);
+    }
+    match key.code {
+        KeyCode::Left => {
+            move_cursor_left(text, tail_offset);
+            false
+        }
+        KeyCode::Right => {
+            move_cursor_right(text, tail_offset);
+            false
+        }
+        KeyCode::Home => {
+            move_cursor_line_start(text, tail_offset);
+            false
+        }
+        KeyCode::End => {
+            move_cursor_line_end(text, tail_offset);
+            false
+        }
+        KeyCode::Up if key.modifiers.is_empty() => {
+            let _ = move_cursor_vertical(text, tail_offset, -1);
+            false
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            let _ = move_cursor_vertical(text, tail_offset, 1);
+            false
+        }
+        KeyCode::Backspace => backspace_at_cursor(text, tail_offset),
+        KeyCode::Delete => delete_at_cursor(text, tail_offset),
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+            move_cursor_line_start(text, tail_offset);
+            false
+        }
+        KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+            move_cursor_line_end(text, tail_offset);
+            false
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            delete_at_cursor(text, tail_offset)
+        }
+        KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
+            delete_prev_word(text, tail_offset)
+        }
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+            delete_to_line_start(text, tail_offset)
+        }
+        KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            insert_char_at_cursor(text, tail_offset, value, cap)
+        }
+        _ => false,
     }
 }
 
@@ -1865,7 +2212,9 @@ fn is_submit(key: KeyEvent) -> bool {
 }
 
 fn is_newline(key: KeyEvent) -> bool {
-    key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT
+    (key.code == KeyCode::Enter
+        && (key.modifiers == KeyModifiers::SHIFT || key.modifiers == KeyModifiers::ALT))
+        || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
 }
 
 fn submit_slash_candidate(model: &mut SessionUiModel) -> Option<Vec<SessionUiAction>> {
@@ -1885,6 +2234,8 @@ fn submit_slash_candidate(model: &mut SessionUiModel) -> Option<Vec<SessionUiAct
                 return Some(Vec::new());
             }
             model.composer.clear();
+            model.composer_tail_offset = 0;
+            model.history_index = None;
             Some(dispatch_builtin(model, descriptor.id, argument))
         }
         SlashResolution::Prompt => None,
@@ -1932,6 +2283,15 @@ fn submit_composer(model: &mut SessionUiModel) -> Vec<SessionUiAction> {
         return Vec::new();
     }
     let prompt = std::mem::take(&mut model.composer);
+    model.composer_tail_offset = 0;
+    model.history_index = None;
+    model.history_saved_draft.clear();
+    if model.history.last() != Some(&prompt) {
+        if model.history.len() >= 128 {
+            model.history.remove(0);
+        }
+        model.history.push(prompt.clone());
+    }
     let submission_id = model.next_submission_id;
     model.next_submission_id = model.next_submission_id.saturating_add(1);
     let (session_id, after_sequence) = model.selected_session().map_or((None, 0), |session| {
@@ -2048,8 +2408,20 @@ fn restore_pending_submission(model: &mut SessionUiModel) {
         model.deferred_composer_text = Some(std::mem::take(&mut model.composer));
     }
     model.composer = pending.prompt;
-    model.status = MESSAGE.into();
-    model.submission_error = Some(MESSAGE.into());
+    model.composer_tail_offset = 0;
+    let detail = model
+        .last_submission_error
+        .take()
+        .map(|err| presentation_text(err.trim(), 200))
+        .filter(|err| !err.is_empty());
+    let message = match detail {
+        Some(detail) => {
+            format!("Unable to persist submission ({detail}). Prompt restored for retry.")
+        }
+        None => MESSAGE.to_owned(),
+    };
+    model.status.clone_from(&message);
+    model.submission_error = Some(message);
     model.submission_refresh.composer = false;
 }
 
@@ -2099,9 +2471,20 @@ fn finalize_failed_submissions_after_snapshot(model: &mut SessionUiModel) {
         && let Some(pending) = model.pending_input_submission.take()
     {
         model.input = pending.value;
+        model.input_tail_offset = 0;
         model.input_target = Some((pending.session_id, pending.request_id));
         model.submission_refresh.input = false;
-        model.status = "Unable to persist input. Input restored for retry.".into();
+        let detail = model
+            .last_input_submission_error
+            .take()
+            .map(|err| presentation_text(err.trim(), 160))
+            .filter(|err| !err.is_empty());
+        model.status = match detail {
+            Some(detail) => {
+                format!("Unable to persist input ({detail}). Input restored for retry.")
+            }
+            None => "Unable to persist input. Input restored for retry.".into(),
+        };
     }
 }
 
@@ -2277,10 +2660,17 @@ struct ActionResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct PermissionDiffLine {
+    text: String,
+    color: Color,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PermissionPresentation {
     operation: String,
     target: String,
     scope: String,
+    diff_lines: Vec<PermissionDiffLine>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2432,19 +2822,26 @@ fn project_transcript(session: &SessionSnapshot) -> Vec<TurnPresentation> {
                         } else {
                             items.push(PresentationItem::Message {
                                 kind: TranscriptKind::System,
-                                text: presentation_text(&entry.text, 2 * 1024),
+                                text: presentation_text(
+                                    &entry.text,
+                                    latte_core::SESSION_TEXT_CAP_BYTES,
+                                ),
                                 failure_code: None,
                             });
                         }
                     }
                     TranscriptKind::Completion => {
                         items.push(PresentationItem::Completion {
-                            text: presentation_text(&entry.text, 2 * 1024),
+                            text: presentation_text(
+                                &entry.text,
+                                latte_core::SESSION_TEXT_CAP_BYTES,
+                            ),
                             handoff: completion_handoff(entry),
                         });
                     }
                     kind => {
-                        let text = presentation_text(&entry.text, 2 * 1024);
+                        let text =
+                            presentation_text(&entry.text, latte_core::SESSION_TEXT_CAP_BYTES);
                         if !text.is_empty() {
                             let failure_code = (kind == TranscriptKind::Failure)
                                 .then(|| entry_failure_code(entry).or(turn_failure_code))
@@ -2485,7 +2882,7 @@ fn completion_handoff(entry: &TranscriptEntry) -> Option<latte_core::Handoff> {
     serde_json::from_value::<latte_core::Handoff>(value)
         .ok()
         .map(|handoff| latte_core::Handoff {
-            summary: presentation_text(&handoff.summary, 2 * 1024),
+            summary: presentation_text(&handoff.summary, latte_core::SESSION_TEXT_CAP_BYTES),
             files_changed: handoff
                 .files_changed
                 .into_iter()
@@ -2535,6 +2932,11 @@ fn tool_metadata(entry: &TranscriptEntry) -> Vec<(String, String)> {
             .join(" ");
         if !command.is_empty() {
             metadata.push(("Command".into(), presentation_text(&command, 512)));
+        }
+    } else if let Some(shell) = input.get("shell").and_then(serde_json::Value::as_str) {
+        let command = presentation_text(shell, 512);
+        if !command.is_empty() {
+            metadata.push(("Shell".into(), command));
         }
     }
     metadata
@@ -3135,13 +3537,17 @@ fn viewport_layout(area: Rect, state: VisualState, model: &SessionUiModel) -> Vi
 }
 
 fn editor_text(model: &SessionUiModel) -> String {
+    editor_text_and_tail(model).0.to_owned()
+}
+
+fn editor_text_and_tail(model: &SessionUiModel) -> (&str, usize) {
     if model
         .selected_session()
         .is_some_and(|session| matches!(session.pending, Some(SessionPendingRequest::Input { .. })))
     {
-        model.input.clone()
+        (&model.input, model.input_tail_offset)
     } else {
-        model.composer.clone()
+        (&model.composer, model.composer_tail_offset)
     }
 }
 
@@ -3966,7 +4372,7 @@ fn render_blocking_card(
                 return;
             };
             let permission = permission_presentation(session, request_id, description);
-            render_permission_card(&mut lines, &permission, area.width);
+            render_permission_card(&mut lines, &permission, area.width, area.height);
             compact_lines.extend([
                 Line::from(Span::styled(
                     format!("! Permission · {}", permission.operation),
@@ -3974,7 +4380,7 @@ fn render_blocking_card(
                 )),
                 Line::from(Span::styled(permission.target, Style::default().fg(TEXT))),
                 Line::from(Span::styled(
-                    "d deny · Ctrl+A allow once",
+                    "y/Ctrl+A allow · a auto · n/d deny",
                     Style::default().fg(AMBER),
                 )),
             ]);
@@ -4189,6 +4595,7 @@ fn render_permission_card(
     lines: &mut Vec<Line<'static>>,
     permission: &PermissionPresentation,
     width: u16,
+    max_height: u16,
 ) {
     let card_width = width.saturating_sub(2).clamp(20, 76);
     card_top(lines, "Permission required", card_width);
@@ -4217,9 +4624,25 @@ fn render_permission_card(
         card_width,
         TEXT_SOFT,
     );
+    let diff_budget = usize::from(max_height.saturating_sub(11));
+    if diff_budget > 0 && !permission.diff_lines.is_empty() {
+        card_divider(lines, card_width);
+        let shown = permission.diff_lines.len().min(diff_budget);
+        for diff_line in permission.diff_lines.iter().take(shown) {
+            card_row(lines, &diff_line.text, card_width, diff_line.color);
+        }
+        if permission.diff_lines.len() > shown {
+            card_row(
+                lines,
+                &format!("… +{} more lines", permission.diff_lines.len() - shown),
+                card_width,
+                MUTED,
+            );
+        }
+    }
     card_row(
         lines,
-        "[d] Deny  ·  [Ctrl+A] Allow once  ·  Enter does nothing",
+        "[n]/[d] Deny  ·  [y]/[Ctrl+A] Allow once  ·  [a] Auto  ·  Enter does nothing",
         card_width,
         AMBER,
     );
@@ -4317,13 +4740,18 @@ fn card_bottom(lines: &mut Vec<Line<'static>>, width: u16) {
 
 fn render_progress(lines: &mut Vec<Line<'static>>, progress: &SessionTransientProgress) {
     match progress {
-        SessionTransientProgress::AssistantDelta { text, .. } => lines.push(Line::from(vec![
-            Span::styled(" • ", Style::default().fg(CYAN)),
-            Span::styled(
-                presentation_text(text, 2 * 1024),
-                Style::default().fg(TEXT_SOFT),
-            ),
-        ])),
+        SessionTransientProgress::AssistantDelta { text, .. } => {
+            let safe = presentation_text(text, latte_core::SESSION_TEXT_CAP_BYTES);
+            for (idx, row) in safe.split('\n').enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if idx == 0 { " • " } else { "   " },
+                        Style::default().fg(CYAN),
+                    ),
+                    Span::styled(row.to_owned(), Style::default().fg(TEXT_SOFT)),
+                ]));
+            }
+        }
         _ => lines.push(Line::from(Span::styled(
             format!("  └─ ◌ {}", progress_text(progress)),
             Style::default().fg(MUTED),
@@ -4430,7 +4858,8 @@ fn render_composer(
         .max(1);
     let prompt_y = area.y.saturating_add(top_rows);
     let content_width = inner.width.saturating_sub(2).max(1);
-    let editor_layout = composer_text_layout(&editor_text(model), content_width);
+    let (raw_editor, tail_offset) = editor_text_and_tail(model);
+    let editor_layout = composer_text_layout_with_cursor(raw_editor, tail_offset, content_width);
     let prompt_rows = if placeholder {
         vec![clip_to_width(&text, usize::from(content_width))]
     } else {
@@ -4556,6 +4985,7 @@ fn render_composer(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String) {
     if model.pending_submission.is_some()
         && model.command_notice.as_deref() != Some("Cancelling active turn…")
@@ -4589,6 +5019,12 @@ fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String)
                 "Enter retry · Shift+Enter newline · Ctrl+P commands".into(),
             );
         }
+        if !model.status.is_empty() && model.status != "Ready" {
+            return (
+                presentation_text(&model.status, 140),
+                "Ctrl+Enter send · Ctrl+P commands".into(),
+            );
+        }
         let left = model.startup.as_ref().map_or_else(String::new, |startup| {
             let selected = selected_provider_model(model).map_or_else(
                 || {
@@ -4603,12 +5039,13 @@ fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String)
             format!(
                 "Build · {} · {}",
                 presentation_text(&selected, 80),
-                startup.permission_mode.label()
+                model.permission_mode.label()
             )
         });
         return (left, "Ctrl+Enter send · Ctrl+P commands".into());
     };
     let model_name = presentation_text(&session.binding.model, 80);
+    let mode_label = model.permission_mode.label();
     let left = if !matches!(state, VisualState::Permission | VisualState::Reconciliation)
         && session.pending.is_none()
         && let Some(notice) = model.command_notice.as_deref()
@@ -4618,9 +5055,12 @@ fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String)
         match state {
             VisualState::Permission => format!("Attention · {model_name}"),
             VisualState::Reconciliation => format!("Reconciliation · {model_name}"),
-            VisualState::Complete => format!("Ready for follow-up · {model_name}"),
+            VisualState::Complete => format!("Ready for follow-up · {model_name} · {mode_label}"),
             VisualState::Active => {
-                format!("{} · {model_name}", session_status_presentation(session).0)
+                format!(
+                    "{} · {model_name} · {mode_label}",
+                    session_status_presentation(session).0
+                )
             }
             VisualState::Idle => unreachable!(),
         }
@@ -4639,13 +5079,13 @@ fn composer_meta(model: &SessionUiModel, state: VisualState) -> (String, String)
             "Ctrl+R review · Enter does nothing".into()
         }
     } else if state == VisualState::Permission {
-        "d deny · Ctrl+A allow once · Enter does nothing".into()
+        "y/Ctrl+A allow · a auto · n/d deny · Enter does nothing".into()
     } else if matches!(session.pending, Some(SessionPendingRequest::Input { .. })) {
-        "Enter send · Shift+Enter newline".into()
+        "Enter send · Ctrl+J/Shift+Enter newline".into()
     } else if model.focus == SessionFocus::Navigation {
         "j/k select · Enter expand · Esc composer".into()
     } else {
-        "Enter send · Shift+Enter newline · Ctrl+P commands".into()
+        "Enter send · Shift+Tab mode · Ctrl+P commands".into()
     };
     (left, right)
 }
@@ -4733,12 +5173,30 @@ struct ComposerTextLayout {
 }
 
 fn composer_text_layout(text: &str, width: u16) -> ComposerTextLayout {
+    composer_text_layout_with_cursor(text, 0, width)
+}
+
+fn composer_text_layout_with_cursor(
+    text: &str,
+    tail_offset: usize,
+    width: u16,
+) -> ComposerTextLayout {
     let width = usize::from(width.max(1));
+    let caret_byte = cursor_byte_pos(text, tail_offset);
     let mut rows = Vec::new();
     let mut row = String::new();
     let mut column = 0_usize;
+    let mut caret_pos: Option<(usize, usize)> = None;
 
-    for grapheme in text.graphemes(true) {
+    for (byte_idx, grapheme) in text.grapheme_indices(true) {
+        if byte_idx == caret_byte {
+            let (r, c) = if column >= width {
+                (rows.len() + 1, 0)
+            } else {
+                (rows.len(), column)
+            };
+            caret_pos = Some((r, c));
+        }
         if grapheme == "\n" {
             rows.push(std::mem::take(&mut row));
             column = 0;
@@ -4768,10 +5226,12 @@ fn composer_text_layout(text: &str, width: u16) -> ComposerTextLayout {
         rows.push(String::new());
         column = 0;
     }
+    let (caret_row, caret_column) =
+        caret_pos.unwrap_or_else(|| (rows.len().saturating_sub(1), column));
     ComposerTextLayout {
-        caret_row: rows.len().saturating_sub(1),
-        caret_column: column,
         rows,
+        caret_row,
+        caret_column,
     }
 }
 
@@ -4921,6 +5381,93 @@ fn permission_context(description: &str) -> String {
     }
 }
 
+fn pending_permission_tool_name(session: &SessionSnapshot, request_id: &str) -> Option<String> {
+    session.transcript.entries.iter().rev().find_map(|entry| {
+        if entry.kind != TranscriptKind::ToolCall {
+            return None;
+        }
+        let descriptor = entry.payload.as_ref()?.get("descriptor")?;
+        if descriptor
+            .get("effect_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(request_id)
+        {
+            return None;
+        }
+        descriptor
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn permission_diff_preview(
+    name: Option<&str>,
+    input: Option<&serde_json::Value>,
+) -> Vec<PermissionDiffLine> {
+    let Some(input) = input else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match name {
+        Some("edit_file") => {
+            if let Some(before) = input
+                .get("before")
+                .or_else(|| input.get("anchor"))
+                .and_then(serde_json::Value::as_str)
+            {
+                for line in before.lines().take(8) {
+                    out.push(PermissionDiffLine {
+                        text: format!("- {}", presentation_text(line, 240)),
+                        color: DIFF_REMOVE,
+                    });
+                }
+            }
+            if let Some(after) = input.get("after").and_then(serde_json::Value::as_str) {
+                for line in after.lines().take(8) {
+                    out.push(PermissionDiffLine {
+                        text: format!("+ {}", presentation_text(line, 240)),
+                        color: DIFF_ADD,
+                    });
+                }
+            }
+        }
+        Some("write_file") => {
+            if let Some(content) = input.get("content").and_then(serde_json::Value::as_str) {
+                for line in content.lines().take(10) {
+                    out.push(PermissionDiffLine {
+                        text: format!("+ {}", presentation_text(line, 240)),
+                        color: DIFF_ADD,
+                    });
+                }
+            }
+        }
+        Some("process") => {
+            if let Some(argv) = input.get("argv").and_then(serde_json::Value::as_array) {
+                let cmd = argv
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|p| presentation_text(p, 160))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !cmd.is_empty() {
+                    out.push(PermissionDiffLine {
+                        text: format!("$ {}", presentation_text(&cmd, 240)),
+                        color: CYAN,
+                    });
+                }
+            } else if let Some(shell) = input.get("shell").and_then(serde_json::Value::as_str) {
+                out.push(PermissionDiffLine {
+                    text: format!("$ {}", presentation_text(shell, 240)),
+                    color: CYAN,
+                });
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn permission_presentation(
     session: &SessionSnapshot,
     request_id: &str,
@@ -4969,10 +5516,12 @@ fn permission_presentation(
             || "Not exposed by runtime".into(),
             |value| presentation_text(value, 360),
         );
+    let diff_lines = permission_diff_preview(name.as_deref(), input);
     PermissionPresentation {
         operation,
         target,
         scope: permission_context(description),
+        diff_lines,
     }
 }
 
@@ -4982,7 +5531,10 @@ fn progress_text(progress: &SessionTransientProgress) -> String {
             format!("… provider attempt {number}")
         }
         SessionTransientProgress::AssistantDelta { text, .. } => {
-            format!("… {}", presentation_text(text, 2 * 1024))
+            format!(
+                "… {}",
+                presentation_text(text, latte_core::SESSION_TEXT_CAP_BYTES)
+            )
         }
         SessionTransientProgress::ToolProgress { name, detail, .. } => format!(
             "… {}: {}",
@@ -5164,8 +5716,11 @@ fn drain_runtime_updates(
             } => reduce(model, SessionUiInput::SubmissionCompleted { submission_id }),
             SessionUiFeedback::SubmissionResult {
                 submission_id,
-                result: Err(_),
-            } => reduce(model, SessionUiInput::SubmissionError { submission_id }),
+                result: Err(error),
+            } => {
+                model.last_submission_error = Some(redact_session_text(&error));
+                reduce(model, SessionUiInput::SubmissionError { submission_id })
+            }
             SessionUiFeedback::InputSubmissionResult {
                 submission_id,
                 result: Ok(_),
@@ -5175,11 +5730,14 @@ fn drain_runtime_updates(
             ),
             SessionUiFeedback::InputSubmissionResult {
                 submission_id,
-                result: Err(_),
-            } => reduce(
-                model,
-                SessionUiInput::InputSubmissionError { submission_id },
-            ),
+                result: Err(error),
+            } => {
+                model.last_input_submission_error = Some(redact_session_text(&error));
+                reduce(
+                    model,
+                    SessionUiInput::InputSubmissionError { submission_id },
+                )
+            }
             SessionUiFeedback::ModelSwitchResult {
                 switch_id,
                 result: Ok(_),
@@ -11737,5 +12295,158 @@ mod tests {
         let retryable_screen = rendered(&retryable_model, 110, 28);
         assert!(retryable_screen.contains("Last turn failed · ready"));
         assert!(retryable_screen.contains("! Failed · provider timeout"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cursor_editor_universal_newlines_permission_modes_diff_cards_and_long_messages_work() {
+        let mut model = SessionUiModel::default();
+        // Type "ac", move Left, insert 'b' -> "abc", Home -> '>', Ctrl+E -> '!', Ctrl+W -> deletes word.
+        reduce(&mut model, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Char('c'), KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Left, KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(model.composer, "abc");
+        reduce(&mut model, key(KeyCode::Home, KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(model.composer, "bc");
+        reduce(&mut model, key(KeyCode::End, KeyModifiers::NONE));
+        // Ctrl+J and Alt+Enter both insert newlines across terminals.
+        reduce(&mut model, key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        reduce(&mut model, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Enter, KeyModifiers::ALT));
+        reduce(&mut model, key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(model.composer, "bc\nx\ny");
+        // Vertical cursor movement across lines, then Ctrl+U deletes to line start.
+        reduce(&mut model, key(KeyCode::Up, KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(model.composer, "bc\n\ny");
+
+        // Submit records history; Up/Down recalls history and restores draft.
+        let _ = reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE));
+        model.pending_submission = None;
+        reduce(&mut model, key(KeyCode::Char('d'), KeyModifiers::NONE));
+        reduce(&mut model, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(model.composer, "bc\n\ny");
+        reduce(&mut model, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(model.composer, "d");
+        reduce(&mut model, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(model.composer, "");
+
+        // Shift+Tab cycles permission modes; `/mode full-auto` sets explicitly.
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            vec![SessionUiAction::SetPermissionMode {
+                session_id: None,
+                mode: latte_core::PermissionMode::AutoEdit,
+            }]
+        );
+        model.composer = "/mode full-auto".into();
+        assert_eq!(
+            reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![SessionUiAction::SetPermissionMode {
+                session_id: None,
+                mode: latte_core::PermissionMode::FullAuto,
+            }]
+        );
+
+        // Permission card renders unified diff preview and supports `y`, `a`, `n`.
+        let ids = SystemIdSource::default();
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut perm_session = snapshot(SessionLifecycle::WaitingPermission);
+        perm_session.pending = Some(SessionPendingRequest::Permission {
+            turn_id,
+            request_id: "perm-edit-diff".into(),
+            description: "Edit src/lib.rs (replace one match; 6 bytes → 6 bytes)".into(),
+            expected_turn_revision: 2,
+        });
+        perm_session.transcript.entries.push(transcript_entry(
+            &ids,
+            2,
+            Some(turn_id),
+            TranscriptKind::ToolCall,
+            "Edit src/lib.rs",
+            Some(serde_json::json!({
+                "descriptor": {
+                    "effect_id": "perm-edit-diff",
+                    "name": "edit_file",
+                    "input": {
+                        "path": "src/lib.rs",
+                        "before": "old_fn()",
+                        "after": "new_fn()",
+                    }
+                }
+            })),
+        ));
+        let mut perm_model = SessionUiModel {
+            sessions: vec![perm_session.clone()],
+            size: (110, 32),
+            ..Default::default()
+        };
+        let screen = rendered(&perm_model, 110, 32);
+        assert!(screen.contains("- old_fn()"));
+        assert!(screen.contains("+ new_fn()"));
+        reduce(&mut perm_model, SessionUiInput::FrameRendered);
+        assert_eq!(
+            reduce(&mut perm_model, key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            vec![
+                SessionUiAction::SetPermissionMode {
+                    session_id: Some(perm_session.session_id),
+                    mode: latte_core::PermissionMode::AutoEdit,
+                },
+                SessionUiAction::ResolvePermission {
+                    session_id: perm_session.session_id,
+                    request_id: "perm-edit-diff".into(),
+                    allow: true,
+                },
+            ]
+        );
+        assert_eq!(
+            reduce(&mut perm_model, key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            vec![SessionUiAction::ResolvePermission {
+                session_id: perm_session.session_id,
+                request_id: "perm-edit-diff".into(),
+                allow: false,
+            }]
+        );
+
+        // Long (>2 KiB) assistant message is preserved in full without 2 KiB truncation.
+        let mut long_session = snapshot(SessionLifecycle::Ready);
+        let long_text = format!("{}TAIL_MARKER_4096", "a".repeat(3_500));
+        long_session.transcript.entries.push(transcript_entry(
+            &ids,
+            3,
+            Some(turn_id),
+            TranscriptKind::Assistant,
+            &long_text,
+            None,
+        ));
+        let projected = project_transcript(&long_session);
+        let rendered_items = format!("{projected:?}");
+        assert!(rendered_items.contains("TAIL_MARKER_4096"));
+
+        // SubmissionResult::Err preserves redacted server reason when restored.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_ptx, prx) = std::sync::mpsc::channel();
+        let mut err_model = SessionUiModel {
+            composer: "Hi".into(),
+            ..Default::default()
+        };
+        let _ = reduce(&mut err_model, key(KeyCode::Enter, KeyModifiers::NONE));
+        tx.send(SessionUiFeedback::submission(
+            1,
+            Err("500 Internal Server Error: workspace failure".into()),
+        ))
+        .unwrap();
+        let (_, actions) = drain_runtime_updates(&mut err_model, &rx, &prx);
+        assert_eq!(actions, vec![SessionUiAction::RefreshSnapshots]);
+        reduce(&mut err_model, SessionUiInput::Snapshot(vec![]));
+        assert!(
+            err_model
+                .submission_error
+                .as_deref()
+                .unwrap()
+                .contains("500 Internal Server Error")
+        );
     }
 }

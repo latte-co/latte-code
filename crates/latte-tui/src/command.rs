@@ -19,6 +19,7 @@ pub enum BuiltinCommand {
     Quit,
     Compact,
     Cancel,
+    Mode,
 }
 
 /// Execution boundary selected by the catalog.
@@ -93,6 +94,7 @@ impl CommandContext {
 /// Evaluates whether `command` may execute in `ctx`, returning a bounded
 /// user-facing reason when disabled.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub const fn command_availability(
     command: BuiltinCommand,
     ctx: &CommandContext,
@@ -101,7 +103,8 @@ pub const fn command_availability(
         BuiltinCommand::Help
         | BuiltinCommand::Navigation
         | BuiltinCommand::Refresh
-        | BuiltinCommand::Quit => CommandAvailability::Enabled,
+        | BuiltinCommand::Quit
+        | BuiltinCommand::Mode => CommandAvailability::Enabled,
         BuiltinCommand::New | BuiltinCommand::Model => {
             if ctx.session_switch_available() {
                 CommandAvailability::Enabled
@@ -327,6 +330,16 @@ pub const BUILTINS: &[CommandDescriptor] = &[
         kind: CommandKind::TypedAction,
         arguments: ArgumentPolicy::None,
         concurrency: ConcurrencyPolicy::RunningOnly,
+    },
+    CommandDescriptor {
+        id: BuiltinCommand::Mode,
+        name: "mode",
+        aliases: &["permissions"],
+        description: "Cycle or set permission mode (ask, auto-edit, full-auto)",
+        argument_hint: Some("[ask|auto-edit|full-auto]"),
+        kind: CommandKind::TypedAction,
+        arguments: ArgumentPolicy::Optional,
+        concurrency: ConcurrencyPolicy::Always,
     },
 ];
 

@@ -93,6 +93,8 @@ pub enum ProcessError {
     InvalidApproval,
     #[error("process supervision unsupported on this platform")]
     Unsupported,
+    #[error("process failed to spawn: {0}")]
+    SpawnFailed(String),
     #[error("process supervision failed: {0}")]
     Supervision(String),
 }
@@ -127,35 +129,183 @@ impl CancellationToken {
     }
 }
 
+fn is_catastrophic_shell_text(shell: &str) -> bool {
+    let lower = shell.to_ascii_lowercase();
+    lower.contains("rm -rf /")
+        || lower.contains("rm -fr /")
+        || lower.contains("--no-preserve-root")
+        || lower.contains(":(){")
+        || lower.contains("mkfs")
+}
+
+fn is_catastrophic_argv(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return true;
+    };
+    let prog = std::path::Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first.as_str())
+        .to_ascii_lowercase();
+    if prog == "mkfs" || prog.starts_with("mkfs.") {
+        return true;
+    }
+    if matches!(prog.as_str(), "sh" | "bash" | "zsh") {
+        let mut iter = argv.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
+            {
+                if let Some(script) = iter.next()
+                    && is_catastrophic_shell_text(script)
+                {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    if prog == "rm" {
+        let mut recursive = false;
+        let mut force = false;
+        let mut no_preserve_root = false;
+        let mut targets_root = false;
+        let mut after_double_dash = false;
+        for arg in argv.iter().skip(1) {
+            if !after_double_dash && arg == "--" {
+                after_double_dash = true;
+                continue;
+            }
+            if !after_double_dash && let Some(long) = arg.strip_prefix("--") {
+                match long {
+                    "recursive" => recursive = true,
+                    "force" => force = true,
+                    "no-preserve-root" => no_preserve_root = true,
+                    _ => {}
+                }
+                continue;
+            }
+            if !after_double_dash && arg.starts_with('-') && arg.len() > 1 {
+                for ch in arg[1..].chars() {
+                    match ch {
+                        'r' | 'R' => recursive = true,
+                        'f' => force = true,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            let trimmed = arg.trim_end_matches('/');
+            if arg == "/" || arg == "/*" || trimmed.is_empty() {
+                targets_root = true;
+            }
+        }
+        if no_preserve_root || (recursive && force && targets_root) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_safe_relative_arg(arg: &str) -> bool {
+    !arg.is_empty()
+        && !std::path::Path::new(arg).is_absolute()
+        && !std::path::Path::new(arg)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn is_safe_readonly_git(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    if !matches!(first.as_str(), "git" | "/usr/bin/git") || argv.len() < 2 {
+        return false;
+    }
+    // Reject any leading `git -c ...` or `--git-dir` / `--work-tree` overrides.
+    match argv[1].as_str() {
+        "status" => argv[2..].iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "-s" | "--short"
+                    | "-b"
+                    | "--branch"
+                    | "--porcelain"
+                    | "-u"
+                    | "--untracked-files=no"
+            )
+        }),
+        "branch" => argv[2..] == ["--show-current"],
+        "rev-parse" => {
+            argv.len() == 3 && matches!(argv[2].as_str(), "HEAD" | "--abbrev-ref" | "--short")
+        }
+        _ => false,
+    }
+}
+
 #[must_use]
 pub fn classify(invocation: &ProcessInvocation<'_>) -> ProcessDecision {
     if let Some(shell) = invocation.shell {
-        let lower = shell.to_ascii_lowercase();
-        if lower.contains("rm -rf /") || lower.contains(":(){") || lower.contains("mkfs") {
+        if is_catastrophic_shell_text(shell) {
             ProcessDecision::Deny
         } else {
             ProcessDecision::Ask
         }
     } else {
-        let Some(command) = invocation.argv.first() else {
+        if is_catastrophic_argv(invocation.argv) {
             return ProcessDecision::Deny;
-        };
+        }
+        let command = &invocation.argv[0];
         let safe_grep = command == "/usr/bin/grep"
             && invocation.argv.len() == 4
             && invocation.argv[1] == "-q"
             && !invocation.argv[2].is_empty()
-            && !std::path::Path::new(&invocation.argv[3]).is_absolute()
-            && !std::path::Path::new(&invocation.argv[3])
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
+            && is_safe_relative_arg(&invocation.argv[3]);
+        let safe_single =
+            matches!(command.as_str(), "/bin/pwd" | "pwd") && invocation.argv.len() == 1;
+        let safe_which = matches!(command.as_str(), "/usr/bin/which" | "which")
+            && invocation.argv.len() == 2
+            && !invocation.argv[1].starts_with('-');
+        let safe_ls = matches!(command.as_str(), "/bin/ls" | "ls")
+            && invocation.argv.len() <= 4
+            && invocation.argv[1..].iter().all(|arg| {
+                matches!(arg.as_str(), "-l" | "-a" | "-la" | "-al" | "-1" | "-F")
+                    || (!arg.starts_with('-') && is_safe_relative_arg(arg))
+            });
         if invocation.env.is_empty()
-            && ((command == "/bin/pwd" && invocation.argv.len() == 1) || safe_grep)
+            && (safe_single
+                || safe_which
+                || safe_grep
+                || safe_ls
+                || is_safe_readonly_git(invocation.argv))
         {
             ProcessDecision::Allow
         } else {
             ProcessDecision::Ask
         }
     }
+}
+
+pub(crate) fn is_readonly_process_input(input: &Value) -> bool {
+    let Ok(spec) = SessionProcessSpec::from_input(input) else {
+        return false;
+    };
+    let invocation = ProcessInvocation {
+        argv: &spec.argv,
+        shell: spec.shell.as_deref(),
+        cwd: &spec.cwd,
+        env: &spec.env,
+        timeout_ms: spec.timeout_ms,
+        grace_ms: spec.grace_ms,
+        stdout_cap: spec.stdout_cap,
+        stderr_cap: spec.stderr_cap,
+        turn_revision: 0,
+        effect_id: "classify-probe",
+        attempt: 1,
+        approval_digest: None,
+        lease_owner: "probe",
+        lease_token: 0,
+    };
+    classify(&invocation) == ProcessDecision::Allow
 }
 
 #[derive(Serialize)]
@@ -333,12 +483,12 @@ impl EngineHandle {
             ));
         }
         let spec = SessionProcessSpec::from_input(&authority.input)
-            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Certified(error.to_string()))?;
         let invocation = spec.invocation(turn_revision, authority, lease);
         let cwd = self
             .tools
             .resolve_cwd(&spec.cwd)
-            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Certified(error.to_string()))?;
         let _operation = std::sync::Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
@@ -356,15 +506,30 @@ impl EngineHandle {
                     "process cancelled after its external outcome may have happened".into(),
                 ))
             }
-            Ok(output) => Ok(SessionEffectObservedValue {
-                result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
-                payload: Some(latte_core::redact_session_value(serde_json::json!({
-                    "tool_call_id":authority.tool_call_id,
-                    "name":authority.name,
-                    "output":output,
-                }))),
-                success: true,
-            }),
+            Ok(output) => {
+                let succeeded = output.command_succeeded();
+                let result = serde_json::to_string(&output).unwrap_or_else(|_| "{}".into());
+                let mut payload = serde_json::json!({
+                    "tool_call_id": authority.tool_call_id,
+                    "name": authority.name,
+                    "exit_code": output.exit_code,
+                    "termination": output.termination,
+                });
+                if !succeeded {
+                    payload["error"] = serde_json::Value::String(format!(
+                        "process exited with {:?} ({:?})",
+                        output.exit_code, output.termination
+                    ));
+                }
+                Ok(SessionEffectObservedValue {
+                    result,
+                    payload: Some(latte_core::redact_session_value(payload)),
+                    success: succeeded,
+                })
+            }
+            Err(error @ ProcessError::SpawnFailed(_)) => {
+                Err(SessionEffectExecutionError::Certified(error.to_string()))
+            }
             Err(error) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
         }
     }
@@ -647,11 +812,51 @@ fn storage(error: crate::StorageError) -> ProcessError {
     ProcessError::Supervision(format!("durable sequencing: {error}"))
 }
 
+fn resolve_git_binary() -> &'static str {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "git"
+}
+
 pub(crate) fn supervise_git_diff(
     cwd: &std::path::Path,
     cap: usize,
 ) -> Result<(String, bool), ProcessError> {
-    supervise_git(cwd, cap, GitQuery::DiffStat)
+    let (mut diff, mut truncated) = match supervise_git(cwd, cap, GitQuery::UnifiedDiffHead) {
+        Ok(result) => result,
+        Err(_) => supervise_git(cwd, cap, GitQuery::UnifiedDiffIndex)?,
+    };
+    if !truncated && diff.len() + 32 < cap {
+        let remaining = cap.saturating_sub(diff.len()).saturating_sub(24);
+        if let Ok((untracked, untracked_truncated)) =
+            supervise_git(cwd, remaining, GitQuery::Untracked)
+        {
+            let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
+            if !files.is_empty() {
+                if !diff.is_empty() && !diff.ends_with('\n') {
+                    diff.push('\n');
+                }
+                diff.push_str("Untracked files:\n");
+                for file in files {
+                    let line = format!("  {file}\n");
+                    if diff.len() + line.len() > cap {
+                        truncated = true;
+                        break;
+                    }
+                    diff.push_str(&line);
+                }
+                truncated |= untracked_truncated;
+            }
+        }
+    }
+    Ok((diff, truncated))
 }
 pub(crate) fn supervise_git_changed_files(
     cwd: &std::path::Path,
@@ -678,7 +883,8 @@ pub(crate) fn supervise_git_changed_files(
 
 #[derive(Clone, Copy)]
 enum GitQuery {
-    DiffStat,
+    UnifiedDiffHead,
+    UnifiedDiffIndex,
     TrackedChanges,
     Untracked,
 }
@@ -699,7 +905,7 @@ fn supervise_git(
             .map_err(|e| ProcessError::Supervision(e.to_string()))?;
         runtime.block_on(async move {
             let mut argv = vec![
-                "/usr/bin/git".into(),
+                resolve_git_binary().into(),
                 "--no-pager".into(),
                 "-c".into(),
                 "core.hooksPath=/dev/null".into(),
@@ -707,14 +913,30 @@ fn supervise_git(
                 "diff.external=".into(),
                 "-c".into(),
                 "core.attributesFile=/dev/null".into(),
+                "-c".into(),
+                "core.fsmonitor=false".into(),
             ];
             match query {
-                GitQuery::DiffStat => argv.extend([
+                GitQuery::UnifiedDiffHead => argv.extend([
                     "diff".into(),
-                    "--stat".into(),
+                    "--patch-with-stat".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
+                    "HEAD".into(),
+                    "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
+                ]),
+                GitQuery::UnifiedDiffIndex => argv.extend([
+                    "diff".into(),
+                    "--patch-with-stat".into(),
                     "--no-ext-diff".into(),
                     "--no-textconv".into(),
                     "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
                 ]),
                 GitQuery::TrackedChanges => argv.extend([
                     "diff".into(),
@@ -770,6 +992,39 @@ fn supervise_git(
 }
 
 #[cfg(unix)]
+const SAFE_INHERITED_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "NVM_DIR",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PYENV_ROOT",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
+
+#[cfg(unix)]
 async fn drain(
     mut reader: impl AsyncRead + Unpin,
     cap: usize,
@@ -798,7 +1053,7 @@ async fn supervise(
 ) -> Result<ProcessOutput, ProcessError> {
     use std::os::unix::process::CommandExt;
     if cancel.is_cancelled() {
-        return Err(ProcessError::Supervision(
+        return Err(ProcessError::SpawnFailed(
             "process cancelled before it could be started".into(),
         ));
     }
@@ -814,13 +1069,18 @@ async fn supervise(
     command
         .current_dir(cwd)
         .env_clear()
-        .envs(i.env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in SAFE_INHERITED_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.envs(i.env);
     command.as_std_mut().process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|e| ProcessError::Supervision(e.to_string()))?;
+        .map_err(|e| ProcessError::SpawnFailed(e.to_string()))?;
     let pid = child
         .id()
         .ok_or_else(|| ProcessError::Supervision("missing child pid".into()))?;
@@ -1118,7 +1378,7 @@ mod tests {
             classify(&invocation(None, &empty, "empty", &lease, None)),
             ProcessDecision::Deny
         );
-        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test"] {
+        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test", "rm -fr /"] {
             assert_eq!(
                 classify(&invocation(
                     Some(dangerous),
@@ -1128,6 +1388,61 @@ mod tests {
                     None
                 )),
                 ProcessDecision::Deny
+            );
+        }
+        for dangerous_argv in [
+            vec!["rm".into(), "-rf".into(), "/".into()],
+            vec![
+                "/bin/rm".into(),
+                "--recursive".into(),
+                "--force".into(),
+                "/*".into(),
+            ],
+            vec![
+                "rm".into(),
+                "--no-preserve-root".into(),
+                "-rf".into(),
+                "dir".into(),
+            ],
+            vec!["/sbin/mkfs.ext4".into(), "/dev/null".into()],
+            vec!["/bin/sh".into(), "-c".into(), "rm -rf /".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(
+                    None,
+                    &dangerous_argv,
+                    "argv-deny",
+                    &lease,
+                    None
+                )),
+                ProcessDecision::Deny
+            );
+        }
+        let safe_rm_rel = vec!["rm".into(), "--".into(), "-rf".into(), "local.tmp".into()];
+        assert_eq!(
+            classify(&invocation(None, &safe_rm_rel, "rm-rel", &lease, None)),
+            ProcessDecision::Ask
+        );
+        for allowed_ro in [
+            vec!["git".into(), "status".into(), "--short".into()],
+            vec!["git".into(), "branch".into(), "--show-current".into()],
+            vec!["git".into(), "rev-parse".into(), "HEAD".into()],
+            vec!["ls".into(), "-la".into(), "src".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(None, &allowed_ro, "ro", &lease, None)),
+                ProcessDecision::Allow
+            );
+        }
+        for gated_git in [
+            vec!["git".into()],
+            vec!["git".into(), "commit".into(), "-m".into(), "x".into()],
+            vec!["git".into(), "status".into(), "--ignored=matching".into()],
+            vec!["ls".into(), "/etc".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(None, &gated_git, "gated", &lease, None)),
+                ProcessDecision::Ask
             );
         }
         let safe_grep = vec![
@@ -1934,5 +2249,70 @@ mod tests {
             )
             .unwrap();
         assert!(!new_digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_process_certifies_enoent_inherits_safe_path_and_unified_git_diff_includes_untracked()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let lease = engine.acquire_lease("owner", 1, 10_000).unwrap();
+
+        // Missing binary fails at spawn with zero external side effects → Certified, not Uncertain!
+        let missing = EffectAuthority {
+            effect_id: "missing-bin".parse().unwrap(),
+            tool_call_id: "call-missing".into(),
+            name: "process".into(),
+            input: serde_json::json!({"argv":["/nonexistent/latte-missing-binary-xyz"]}),
+            attempt: 1,
+        };
+        assert!(matches!(
+            engine
+                .execute_started_session_process(&missing, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(SessionEffectExecutionError::Certified(msg)) if msg.contains("failed to spawn")
+        ));
+
+        // Non-zero exit code sets success=false while returning full stdout/stderr JSON.
+        let nonzero = EffectAuthority {
+            effect_id: "nonzero-exit".parse().unwrap(),
+            tool_call_id: "call-nonzero".into(),
+            name: "process".into(),
+            input: serde_json::json!({"shell":"printf '$PATH'; exit 7"}),
+            attempt: 1,
+        };
+        let observed = engine
+            .execute_started_session_process(&nonzero, 0, &lease, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!observed.success);
+        let parsed: ProcessOutput = serde_json::from_str(&observed.result).unwrap();
+        assert_eq!(parsed.exit_code, Some(7));
+        assert!(!parsed.stdout.is_empty(), "PATH should be inherited");
+
+        // Readonly classifier helper.
+        assert!(is_readonly_process_input(
+            &serde_json::json!({"argv":["pwd"]})
+        ));
+        assert!(is_readonly_process_input(
+            &serde_json::json!({"argv":["which","sh"]})
+        ));
+        assert!(!is_readonly_process_input(
+            &serde_json::json!({"shell":"rm -f a"})
+        ));
+        assert!(!is_readonly_process_input(&serde_json::json!("bad")));
+
+        // Unified git_diff works in unborn repo AND committed repo with untracked file.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("untracked.rs"), "fn main() {}\n").unwrap();
+        let (unborn_diff, _) = supervise_git_diff(dir.path(), 65536).unwrap();
+        assert!(unborn_diff.contains("untracked.rs"), "{unborn_diff}");
     }
 }

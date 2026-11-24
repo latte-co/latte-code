@@ -1,10 +1,12 @@
 use crate::provider::{
-    Message, OpenAiProvider, Provider, ProviderCapabilities, ProviderContext, ProviderError,
-    ProviderFuture, ProviderRequest, RESERVED_HEADERS, SESSION_ID_PLACEHOLDER,
+    ANTHROPIC_RESERVED_HEADERS, AnthropicProvider, Message, OpenAiProvider, Provider,
+    ProviderCapabilities, ProviderContext, ProviderError, ProviderFuture, ProviderRequest,
+    RESERVED_HEADERS, SESSION_ID_PLACEHOLDER,
 };
-use latte_core::SessionProviderBinding;
+use latte_core::{SessionProviderBinding, ToolPresentationStyle};
 use latte_engine::ToolDescriptor;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,7 +51,7 @@ pub enum ProviderDefinition {
         max_tokens: Option<u32>,
         #[serde(default)]
         compatibility_input_request: bool,
-        #[serde(default)]
+        #[serde(default = "default_streaming")]
         streaming: bool,
         /// Extra request headers this Provider requires beyond the Chat
         /// Completions protocol. `${session_id}` in a value expands to an
@@ -63,13 +65,44 @@ pub enum ProviderDefinition {
         headers: BTreeMap<String, String>,
         #[serde(default)]
         aliases: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_style: Option<ToolPresentationStyle>,
+    },
+    AnthropicMessages {
+        models: OpenAiChatModels,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
+        api_key: SecretRef,
+        #[serde(default = "default_timeout")]
+        timeout_ms: u64,
+        #[serde(default = "default_attempts")]
+        max_attempts: u32,
+        #[serde(default)]
+        temperature: Option<f64>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
+        #[serde(default = "default_streaming")]
+        streaming: bool,
+        #[serde(default = "default_prompt_caching")]
+        prompt_caching: bool,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+        #[serde(default)]
+        aliases: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_style: Option<ToolPresentationStyle>,
     },
 }
 
 /// Validates one provider's configured headers before any request is built.
 /// Failing at load time keeps a typo from silently dropping the header a
 /// Provider requires — some reject the whole request without it.
-fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), RegistryError> {
+fn validate_headers(
+    headers: &BTreeMap<String, String>,
+    reserved: &[&str],
+) -> Result<(), RegistryError> {
     for (name, value) in headers {
         if name.is_empty()
             || !name
@@ -80,7 +113,7 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), RegistryEr
                 "header name {name:?} must be non-empty and use only ASCII letters, digits, `-`, or `_`"
             )));
         }
-        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        if reserved.contains(&name.to_ascii_lowercase().as_str()) {
             return Err(RegistryError::Invalid(format!(
                 "header {name:?} is derived by the provider and cannot be configured"
             )));
@@ -139,22 +172,39 @@ pub struct OpenAiChatModelOptions {
 }
 
 impl ProviderDefinition {
-    fn available_models(&self) -> Vec<&str> {
+    fn models_catalog(&self) -> &OpenAiChatModels {
         match self {
-            Self::OpenaiChat { models, .. } => models.ids(),
+            Self::OpenaiChat { models, .. } | Self::AnthropicMessages { models, .. } => models,
         }
+    }
+
+    fn api_key_ref(&self) -> &SecretRef {
+        match self {
+            Self::OpenaiChat { api_key, .. } | Self::AnthropicMessages { api_key, .. } => api_key,
+        }
+    }
+
+    fn effective_tool_style(&self) -> ToolPresentationStyle {
+        match self {
+            Self::OpenaiChat { tool_style, .. } => {
+                tool_style.unwrap_or(ToolPresentationStyle::Canonical)
+            }
+            Self::AnthropicMessages { tool_style, .. } => {
+                tool_style.unwrap_or(ToolPresentationStyle::ClaudeCode)
+            }
+        }
+    }
+
+    fn available_models(&self) -> Vec<&str> {
+        self.models_catalog().ids()
     }
 
     fn model_options(&self, selected: &str) -> Option<OpenAiChatModelOptions> {
-        match self {
-            Self::OpenaiChat { models, .. } => models.options(selected),
-        }
+        self.models_catalog().options(selected)
     }
 
     fn model_name(&self, selected: &str) -> Option<&str> {
-        match self {
-            Self::OpenaiChat { models, .. } => models.name(selected),
-        }
+        self.models_catalog().name(selected)
     }
 
     fn require_model(&self, provider: &str, selected: &str) -> Result<(), RegistryError> {
@@ -337,6 +387,7 @@ impl ProviderRegistry {
         let mut value: serde_json::Value =
             json5::from_str(text).map_err(|e| RegistryError::Invalid(e.to_string()))?;
         if let Some(object) = value.as_object_mut() {
+            object.remove("$schema");
             object.remove("database");
             object.remove("verification");
             // Application-owned transcript-history limits are validated by
@@ -452,9 +503,11 @@ impl ProviderRegistry {
             .ok_or_else(|| RegistryError::Invalid(format!("unknown provider {name}")))?;
         definition.require_model(name, model)?;
         let binding = Self::binding_for_model(name, definition, model, tools)?;
-        let ProviderDefinition::OpenaiChat { api_key, .. } = definition;
-        let result =
-            binding.with_session_scope(api_key.credential_ref_id(name), "workspace".into(), 1);
+        let result = binding.with_session_scope(
+            definition.api_key_ref().credential_ref_id(name),
+            "workspace".into(),
+            1,
+        );
         result.validate().map_err(RegistryError::Invalid)?;
         Ok(result)
     }
@@ -489,11 +542,19 @@ impl ProviderRegistry {
     /// configured bound.
     #[must_use]
     pub fn model_context_window(&self, provider: &str, model: &str) -> Option<u32> {
-        match self.config.providers.get(provider)? {
-            ProviderDefinition::OpenaiChat { models, .. } => models
-                .options(model)
-                .and_then(|options| options.context_window),
-        }
+        self.config
+            .providers
+            .get(provider)?
+            .model_options(model)
+            .and_then(|options| options.context_window)
+    }
+
+    #[must_use]
+    pub fn provider_tool_presentation(&self, provider: &str) -> Option<ToolPresentationStyle> {
+        self.config
+            .providers
+            .get(provider)
+            .map(ProviderDefinition::effective_tool_style)
     }
 
     /// Validates a persisted v2 binding before resolving the configured secret.
@@ -550,6 +611,7 @@ impl ProviderRegistry {
     }
 
     /// Resolves one explicit configured provider/model pair.
+    #[allow(clippy::too_many_lines)]
     pub fn resolve_model(
         &self,
         name: &str,
@@ -562,12 +624,23 @@ impl ProviderRegistry {
             .get(name)
             .ok_or_else(|| RegistryError::Invalid(format!("unknown provider {name}")))?;
         definition.require_model(name, selected_model)?;
+        let model_options = definition.model_options(selected_model).ok_or_else(|| {
+            RegistryError::Invalid(format!(
+                "unknown model {selected_model} for provider {name}"
+            ))
+        })?;
+        let key = resolve_secret(definition.api_key_ref())?;
+        let binding = Self::binding_for_model(name, definition, selected_model, tools)?;
+        let reverse: BTreeMap<String, String> = binding
+            .aliases
+            .iter()
+            .map(|(canonical, wire)| (wire.clone(), canonical.clone()))
+            .collect();
+        let style = definition.effective_tool_style();
         match definition {
             ProviderDefinition::OpenaiChat {
                 base_url,
                 endpoint,
-                api_key,
-                aliases: _,
                 timeout_ms,
                 max_attempts,
                 temperature,
@@ -577,32 +650,13 @@ impl ProviderRegistry {
                 headers,
                 ..
             } => {
-                let model_options = definition.model_options(selected_model).ok_or_else(|| {
-                    RegistryError::Invalid(format!(
-                        "unknown model {selected_model} for provider {name}"
-                    ))
-                })?;
-                let key = match api_key {
-                    SecretRef::Literal(value) => {
-                        (!value.is_empty()).then(|| value.clone()).ok_or_else(|| {
-                            RegistryError::Invalid(
-                                "provider inline api_key must not be empty".into(),
-                            )
-                        })?
-                    }
-                    SecretRef::Env { name, .. } => env::var(name)
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| RegistryError::MissingSecret(name.clone()))?,
-                };
                 let endpoint = endpoint.clone().unwrap_or_else(|| {
                     format!(
                         "{}/chat/completions",
                         base_url.as_deref().unwrap().trim_end_matches('/')
                     )
                 });
-                let binding = Self::binding_for_model(name, definition, selected_model, tools)?;
-                validate_headers(headers)?;
+                validate_headers(headers, &RESERVED_HEADERS)?;
                 let provider = OpenAiProvider::new(
                     endpoint,
                     selected_model,
@@ -618,16 +672,53 @@ impl ProviderRegistry {
                 .with_compatibility_input_request(*compatibility_input_request)
                 .with_streaming(*streaming)
                 .with_headers(headers.clone());
-                let reverse = binding
-                    .aliases
-                    .iter()
-                    .map(|(canonical, wire)| (wire.clone(), canonical.clone()))
-                    .collect();
                 Ok(ResolvedProvider {
                     provider: Arc::new(AliasedProvider {
                         inner: provider,
                         forward: binding.aliases.clone(),
                         reverse,
+                        style,
+                    }),
+                    binding,
+                })
+            }
+            ProviderDefinition::AnthropicMessages {
+                base_url,
+                endpoint,
+                timeout_ms,
+                max_attempts,
+                temperature,
+                max_tokens,
+                streaming,
+                prompt_caching,
+                headers,
+                ..
+            } => {
+                let endpoint = endpoint
+                    .clone()
+                    .unwrap_or_else(|| derive_anthropic_endpoint(base_url.as_deref().unwrap()));
+                validate_headers(headers, &ANTHROPIC_RESERVED_HEADERS)?;
+                let provider = AnthropicProvider::new(
+                    endpoint,
+                    selected_model,
+                    key,
+                    Duration::from_millis(*timeout_ms),
+                )?
+                .with_max_attempts(*max_attempts)
+                .with_sampling_options(
+                    model_options.temperature.or(*temperature),
+                    model_options.max_tokens.or(*max_tokens),
+                )
+                .with_reasoning_effort(model_options.reasoning_effort)
+                .with_streaming(*streaming)
+                .with_prompt_caching(*prompt_caching)
+                .with_headers(headers.clone());
+                Ok(ResolvedProvider {
+                    provider: Arc::new(AliasedProvider {
+                        inner: provider,
+                        forward: binding.aliases.clone(),
+                        reverse,
+                        style,
                     }),
                     binding,
                 })
@@ -641,24 +732,33 @@ impl ProviderRegistry {
         selected_model: &str,
         tools: &[ToolDescriptor],
     ) -> Result<ProviderModelBinding, RegistryError> {
-        match definition {
+        let style = definition.effective_tool_style();
+        let (provider_type, protocol, aliases) = match definition {
             ProviderDefinition::OpenaiChat { aliases, .. } => {
-                let alias_table = ToolAliases::new(tools, aliases)?.canonical_to_wire;
-                Ok(ProviderModelBinding {
-                    binding_version: BINDING_VERSION,
-                    provider_name: name.into(),
-                    provider_type: "openai-chat".into(),
-                    protocol: "openai-chat-completions-v1".into(),
-                    model: selected_model.into(),
-                    config_fingerprint: fingerprint(&semantic_definition_for_model(
-                        definition,
-                        selected_model,
-                    )?),
-                    tools_fingerprint: fingerprint(&canonical_tools(tools, &alias_table)?),
-                    aliases: alias_table,
-                })
+                ("openai-chat", "openai-chat-completions-v1", aliases)
             }
-        }
+            ProviderDefinition::AnthropicMessages { aliases, .. } => {
+                ("anthropic-messages", "anthropic-messages-v1", aliases)
+            }
+        };
+        let alias_table = ToolAliases::new(tools, aliases, style)?.canonical_to_wire;
+        Ok(ProviderModelBinding {
+            binding_version: BINDING_VERSION,
+            provider_name: name.into(),
+            provider_type: provider_type.into(),
+            protocol: protocol.into(),
+            model: selected_model.into(),
+            config_fingerprint: fingerprint(&semantic_definition_for_model(
+                definition,
+                selected_model,
+            )?),
+            tools_fingerprint: fingerprint(&canonical_tools_with_style(
+                tools,
+                &alias_table,
+                style,
+            )?),
+            aliases: alias_table,
+        })
     }
 
     fn validate(&self) -> Result<(), RegistryError> {
@@ -722,16 +822,65 @@ impl ProviderRegistry {
     }
 }
 
+fn resolve_secret(api_key: &SecretRef) -> Result<String, RegistryError> {
+    match api_key {
+        SecretRef::Literal(value) => (!value.is_empty()).then(|| value.clone()).ok_or_else(|| {
+            RegistryError::Invalid("provider inline api_key must not be empty".into())
+        }),
+        SecretRef::Env { name, .. } => env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| RegistryError::MissingSecret(name.clone())),
+    }
+}
+
+fn derive_anthropic_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
 fn validate_provider(name: &str, provider: &ProviderDefinition) -> Result<(), RegistryError> {
-    let ProviderDefinition::OpenaiChat {
-        models,
-        base_url,
-        endpoint,
-        timeout_ms,
-        max_attempts,
-        temperature,
-        ..
-    } = provider;
+    let (models, base_url, endpoint, timeout_ms, max_attempts, temperature, max_temp) =
+        match provider {
+            ProviderDefinition::OpenaiChat {
+                models,
+                base_url,
+                endpoint,
+                timeout_ms,
+                max_attempts,
+                temperature,
+                ..
+            } => (
+                models,
+                base_url,
+                endpoint,
+                timeout_ms,
+                max_attempts,
+                temperature,
+                2.0_f64,
+            ),
+            ProviderDefinition::AnthropicMessages {
+                models,
+                base_url,
+                endpoint,
+                timeout_ms,
+                max_attempts,
+                temperature,
+                ..
+            } => (
+                models,
+                base_url,
+                endpoint,
+                timeout_ms,
+                max_attempts,
+                temperature,
+                1.0_f64,
+            ),
+        };
     let model_ids = models.ids();
     if model_ids.is_empty()
         || model_ids.len() > 256
@@ -754,9 +903,9 @@ fn validate_provider(name: &str, provider: &ProviderDefinition) -> Result<(), Re
             "provider {name} timeout/attempts are out of range"
         )));
     }
-    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+    if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=max_temp).contains(&value)) {
         return Err(RegistryError::Invalid(format!(
-            "provider {name} temperature must be between 0 and 2"
+            "provider {name} temperature must be between 0 and {max_temp}"
         )));
     }
     for (model, config) in models.configured() {
@@ -769,7 +918,7 @@ fn validate_provider(name: &str, provider: &ProviderDefinition) -> Result<(), Re
                 .is_some_and(|(context_window, max_tokens)| max_tokens >= context_window)
             || options
                 .temperature
-                .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+                .is_some_and(|value| !value.is_finite() || !(0.0..=max_temp).contains(&value))
             || options.reasoning_effort.as_ref().is_some_and(|effort| {
                 effort.trim().is_empty()
                     || effort.len() > 64
@@ -789,32 +938,42 @@ fn validate_provider(name: &str, provider: &ProviderDefinition) -> Result<(), Re
     Ok(())
 }
 
-struct AliasedProvider {
-    inner: OpenAiProvider,
+struct AliasedProvider<P> {
+    inner: P,
     forward: BTreeMap<String, String>,
     reverse: BTreeMap<String, String>,
+    style: ToolPresentationStyle,
 }
-impl Provider for AliasedProvider {
+
+impl<P: Provider> Provider for AliasedProvider<P> {
     fn complete(
         &self,
         mut request: ProviderRequest,
         context: ProviderContext,
     ) -> ProviderFuture<'_> {
+        let style = self.style;
         let lowered = (|| {
             for tool in &mut request.tools {
-                tool.name = self.forward.get(&tool.name).cloned().ok_or_else(|| {
+                let canonical = tool.name.clone();
+                let wire = self.forward.get(&canonical).cloned().ok_or_else(|| {
                     ProviderError::Malformed("tool binding does not contain a declaration".into())
                 })?;
+                present_tool_descriptor(tool, &canonical, wire, style);
             }
             for message in &mut request.messages {
                 match message {
                     Message::Assistant { tool_calls, .. } => {
                         for call in tool_calls {
-                            call.name = self.forward.get(&call.name).cloned().ok_or_else(|| {
+                            let canonical = call.name.clone();
+                            call.name = self.forward.get(&canonical).cloned().ok_or_else(|| {
                                 ProviderError::Malformed(
                                     "historical tool call is not in the pinned binding".into(),
                                 )
                             })?;
+                            if style == ToolPresentationStyle::ClaudeCode {
+                                call.input =
+                                    canonical_input_to_claude_wire(&canonical, &call.input);
+                            }
                         }
                     }
                     Message::Tool {
@@ -835,9 +994,13 @@ impl Provider for AliasedProvider {
             let request = lowered?;
             let mut outcome = self.inner.complete(request, context).await?;
             for call in &mut outcome.tool_calls {
-                call.name = self.reverse.get(&call.name).cloned().ok_or_else(|| {
+                let canonical = self.reverse.get(&call.name).cloned().ok_or_else(|| {
                     ProviderError::Malformed("provider returned an unknown tool alias".into())
                 })?;
+                if style == ToolPresentationStyle::ClaudeCode {
+                    call.input = claude_wire_input_to_canonical(&canonical, &call.input);
+                }
+                call.name = canonical;
             }
             Ok(outcome)
         })
@@ -854,6 +1017,7 @@ impl ToolAliases {
     fn new(
         tools: &[ToolDescriptor],
         configured: &BTreeMap<String, String>,
+        style: ToolPresentationStyle,
     ) -> Result<Self, RegistryError> {
         let names: BTreeSet<_> = tools.iter().map(|t| t.name.as_str()).collect();
         if configured.keys().any(|n| !names.contains(n.as_str())) {
@@ -867,7 +1031,7 @@ impl ToolAliases {
             let alias = configured
                 .get(&tool.name)
                 .cloned()
-                .unwrap_or_else(|| deterministic_alias(&tool.name));
+                .unwrap_or_else(|| default_wire_name(&tool.name, style));
             if !valid_wire_name(&alias) || !wire.insert(alias.clone()) {
                 return Err(RegistryError::Invalid(format!(
                     "tool alias collision or invalid alias: {alias}"
@@ -879,6 +1043,396 @@ impl ToolAliases {
             canonical_to_wire: result,
         })
     }
+}
+
+fn default_wire_name(canonical: &str, style: ToolPresentationStyle) -> String {
+    if style == ToolPresentationStyle::ClaudeCode {
+        match canonical {
+            "read_file" => return "Read".into(),
+            "edit_file" => return "Edit".into(),
+            "write_file" => return "Write".into(),
+            "list_directory" => return "Glob".into(),
+            "search" => return "Grep".into(),
+            "process" => return "Bash".into(),
+            "git_diff" => return "GitDiff".into(),
+            "read_project_manifest" => return "ReadManifest".into(),
+            _ => {}
+        }
+    }
+    deterministic_alias(canonical)
+}
+
+#[allow(clippy::too_many_lines)]
+fn present_tool_descriptor(
+    tool: &mut ToolDescriptor,
+    canonical: &str,
+    wire_name: String,
+    style: ToolPresentationStyle,
+) {
+    tool.name = wire_name;
+    if style != ToolPresentationStyle::ClaudeCode {
+        return;
+    }
+    let path_prop = serde_json::json!({"type": "string", "minLength": 1, "maxLength": 4096});
+    match canonical {
+        "read_file" => {
+            tool.description = "Read a UTF-8 file inside the workspace. Supports optional 1-based line pagination via `offset` and `limit`. Reading a file records its snapshot so `Edit` and `Write` can mutate it safely.".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["file_path"],
+                "properties": {
+                    "file_path": path_prop,
+                    "offset": {"type": "integer", "minimum": 1, "maximum": 1_000_000},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10_000}
+                },
+                "additionalProperties": false
+            });
+        }
+        "edit_file" => {
+            tool.description = "Perform an exact string replacement in an existing file inside the workspace. Call `Read` on the file before editing. `old_string` must match uniquely unless `replace_all` is true.".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["file_path", "old_string", "new_string"],
+                "properties": {
+                    "file_path": path_prop,
+                    "old_string": {"type": "string", "minLength": 1},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            });
+        }
+        "write_file" => {
+            tool.description = "Create a new file (missing parent directories are created automatically) or replace an entire existing file inside the workspace. Call `Read` first before overwriting an existing file.".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["file_path", "content"],
+                "properties": {
+                    "file_path": path_prop,
+                    "content": {"type": "string"}
+                },
+                "additionalProperties": false
+            });
+        }
+        "list_directory" => {
+            tool.description = "Find files and directories inside the workspace matching a glob `pattern` (for example `**/*.rs` or `src/**`).".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "path": path_prop
+                },
+                "additionalProperties": false
+            });
+        }
+        "search" => {
+            tool.description = "Search file contents inside the workspace by regex or literal `pattern`, returning `path:line:content` matches.".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "path": path_prop,
+                    "glob": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "literal": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            });
+        }
+        "process" => {
+            tool.description = "Execute a command inside the workspace with bounded output and process-group supervision.".into();
+            tool.input_schema = serde_json::json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {"type": "string", "minLength": 1, "maxLength": 16_384},
+                    "cwd": path_prop,
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600_000}
+                },
+                "additionalProperties": false
+            });
+        }
+        "git_diff" => {
+            tool.description = "Show the current `git diff HEAD` inside the workspace.".into();
+        }
+        "read_project_manifest" => {
+            tool.description = "Read top-level project manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, etc.) in the workspace.".into();
+        }
+        _ => {}
+    }
+}
+
+fn canonical_input_to_claude_wire(canonical: &str, input: &Value) -> Value {
+    let Some(obj) = input.as_object() else {
+        return input.clone();
+    };
+    let mut out = serde_json::Map::new();
+    match canonical {
+        "read_file" => {
+            if let Some(p) = obj.get("path").or_else(|| obj.get("file_path")) {
+                out.insert("file_path".into(), p.clone());
+            }
+            for key in ["offset", "limit"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        "edit_file" => {
+            if let Some(p) = obj.get("path").or_else(|| obj.get("file_path")) {
+                out.insert("file_path".into(), p.clone());
+            }
+            if let Some(b) = obj
+                .get("before")
+                .or_else(|| obj.get("anchor"))
+                .or_else(|| obj.get("old_string"))
+            {
+                out.insert("old_string".into(), b.clone());
+            }
+            if let Some(a) = obj.get("after").or_else(|| obj.get("new_string")) {
+                out.insert("new_string".into(), a.clone());
+            }
+            if let Some(r) = obj.get("replace_all") {
+                out.insert("replace_all".into(), r.clone());
+            }
+        }
+        "write_file" => {
+            if let Some(p) = obj.get("path").or_else(|| obj.get("file_path")) {
+                out.insert("file_path".into(), p.clone());
+            }
+            if let Some(c) = obj.get("content") {
+                out.insert("content".into(), c.clone());
+            }
+        }
+        "list_directory" => {
+            let pattern = obj
+                .get("glob")
+                .or_else(|| obj.get("pattern"))
+                .cloned()
+                .unwrap_or_else(|| Value::String("*".into()));
+            out.insert("pattern".into(), pattern);
+            if let Some(p) = obj.get("path") {
+                out.insert("path".into(), p.clone());
+            }
+        }
+        "search" => {
+            if let Some(q) = obj.get("query").or_else(|| obj.get("pattern")) {
+                out.insert("pattern".into(), q.clone());
+            }
+            for key in ["path", "glob"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+            if obj.get("regex").and_then(Value::as_bool) == Some(false) {
+                out.insert("literal".into(), Value::Bool(true));
+            }
+        }
+        "process" => {
+            if let Some(shell) = obj.get("shell").and_then(Value::as_str) {
+                out.insert("command".into(), Value::String(shell.to_owned()));
+            } else if let Some(argv) = obj.get("argv").and_then(Value::as_array) {
+                let joined = argv
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.insert("command".into(), Value::String(joined));
+            }
+            for key in ["cwd", "timeout_ms"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        _ => return input.clone(),
+    }
+    Value::Object(out)
+}
+
+fn simple_command_to_argv(command: &str) -> Option<Vec<String>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed.bytes().any(|b| {
+            matches!(
+                b,
+                b'|' | b'&'
+                    | b';'
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'$'
+                    | b'`'
+                    | b'\\'
+                    | b'"'
+                    | b'\''
+                    | b'*'
+                    | b'?'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'~'
+                    | b'#'
+                    | b'!'
+                    | b'\n'
+                    | b'\r'
+            )
+        })
+    {
+        return None;
+    }
+    let tokens: Vec<String> = trimmed
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if tokens.is_empty() || tokens.len() > 256 || tokens[0].contains('=') {
+        return None;
+    }
+    Some(tokens)
+}
+
+#[allow(clippy::too_many_lines)]
+fn claude_wire_input_to_canonical(canonical: &str, input: &Value) -> Value {
+    let Some(obj) = input.as_object() else {
+        return input.clone();
+    };
+    let mut out = serde_json::Map::new();
+    match canonical {
+        "read_file" => {
+            if let Some(p) = obj.get("file_path").or_else(|| obj.get("path")) {
+                out.insert("path".into(), p.clone());
+            }
+            for key in ["offset", "limit", "max_output"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        "edit_file" => {
+            if let Some(p) = obj.get("file_path").or_else(|| obj.get("path")) {
+                out.insert("path".into(), p.clone());
+            }
+            if let Some(b) = obj.get("old_string").or_else(|| obj.get("before")) {
+                out.insert("before".into(), b.clone());
+            }
+            if let Some(a) = obj.get("new_string").or_else(|| obj.get("after")) {
+                out.insert("after".into(), a.clone());
+            }
+            for key in ["replace_all", "anchor", "precondition"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        "write_file" => {
+            if let Some(p) = obj.get("file_path").or_else(|| obj.get("path")) {
+                out.insert("path".into(), p.clone());
+            }
+            if let Some(c) = obj.get("content") {
+                out.insert("content".into(), c.clone());
+            }
+            for key in ["create_intent", "precondition"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        "list_directory" => {
+            if let Some(p) = obj.get("path") {
+                out.insert("path".into(), p.clone());
+            }
+            let pattern = obj.get("pattern").or_else(|| obj.get("glob"));
+            if let Some(pat) = pattern {
+                out.insert("glob".into(), pat.clone());
+            }
+            out.insert(
+                "max_depth".into(),
+                obj.get("max_depth")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(8)),
+            );
+        }
+        "search" => {
+            let query_val = obj.get("pattern").or_else(|| obj.get("query"));
+            if let Some(q) = query_val {
+                out.insert("query".into(), q.clone());
+            }
+            for key in ["path", "glob", "max_results", "max_output"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+            let regex = if obj.get("literal").and_then(Value::as_bool) == Some(true) {
+                false
+            } else if let Some(explicit) = obj.get("regex").and_then(Value::as_bool) {
+                explicit
+            } else {
+                query_val
+                    .and_then(Value::as_str)
+                    .is_some_and(looks_like_valid_regex)
+            };
+            out.insert("regex".into(), Value::Bool(regex));
+        }
+        "process" => {
+            if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
+                if let Some(argv) = simple_command_to_argv(cmd) {
+                    out.insert("argv".into(), serde_json::json!(argv));
+                } else {
+                    out.insert("shell".into(), Value::String(cmd.to_owned()));
+                }
+            } else {
+                for key in ["argv", "shell"] {
+                    if let Some(v) = obj.get(key) {
+                        out.insert(key.into(), v.clone());
+                    }
+                }
+            }
+            for key in ["cwd", "timeout_ms", "env"] {
+                if let Some(v) = obj.get(key) {
+                    out.insert(key.into(), v.clone());
+                }
+            }
+        }
+        _ => return input.clone(),
+    }
+    Value::Object(out)
+}
+
+fn looks_like_valid_regex(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut paren_depth = 0_usize;
+    for ch in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if ch == ']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match ch {
+            '[' => in_class = true,
+            '(' => paren_depth += 1,
+            ')' => {
+                let Some(next) = paren_depth.checked_sub(1) else {
+                    return false;
+                };
+                paren_depth = next;
+            }
+            _ => {}
+        }
+    }
+    !escaped && !in_class && paren_depth == 0
 }
 
 fn deterministic_alias(name: &str) -> String {
@@ -897,6 +1451,12 @@ fn valid_wire_name(name: &str) -> bool {
 }
 fn default_timeout() -> u64 {
     60_000
+}
+const fn default_streaming() -> bool {
+    true
+}
+const fn default_prompt_caching() -> bool {
+    true
 }
 fn default_attempts() -> u32 {
     1
@@ -934,14 +1494,28 @@ fn semantic_definition_for_model(
     }
     Ok(serde_json::json!({"version":1,"provider":v}))
 }
+fn canonical_tools_with_style(
+    tools: &[ToolDescriptor],
+    aliases: &BTreeMap<String, String>,
+    style: ToolPresentationStyle,
+) -> Result<serde_json::Value, RegistryError> {
+    let mut tools = tools.to_vec();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    if style == ToolPresentationStyle::Canonical {
+        serde_json::to_value(serde_json::json!({"version":1,"tools":tools,"aliases":aliases}))
+            .map_err(|e| RegistryError::Invalid(e.to_string()))
+    } else {
+        serde_json::to_value(
+            serde_json::json!({"version":1,"tools":tools,"aliases":aliases,"style":style}),
+        )
+        .map_err(|e| RegistryError::Invalid(e.to_string()))
+    }
+}
 fn canonical_tools(
     tools: &[ToolDescriptor],
     aliases: &BTreeMap<String, String>,
 ) -> Result<serde_json::Value, RegistryError> {
-    let mut tools = tools.to_vec();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
-    serde_json::to_value(serde_json::json!({"version":1,"tools":tools,"aliases":aliases}))
-        .map_err(|e| RegistryError::Invalid(e.to_string()))
+    canonical_tools_with_style(tools, aliases, ToolPresentationStyle::Canonical)
 }
 
 /// The tools fingerprint a pre-upgrade binary computed, reproduced over the
@@ -1089,8 +1663,10 @@ mod tests {
     #[test]
     fn aliases_are_deterministic_bijective_and_byte_bounded() {
         let tools = vec![tool("合法/名字")];
-        let a = ToolAliases::new(&tools, &BTreeMap::new()).unwrap();
-        let b = ToolAliases::new(&tools, &BTreeMap::new()).unwrap();
+        let a =
+            ToolAliases::new(&tools, &BTreeMap::new(), ToolPresentationStyle::Canonical).unwrap();
+        let b =
+            ToolAliases::new(&tools, &BTreeMap::new(), ToolPresentationStyle::Canonical).unwrap();
         assert_eq!(a.canonical_to_wire, b.canonical_to_wire);
         assert!(
             a.canonical_to_wire
@@ -1109,7 +1685,9 @@ mod tests {
                 ("search".into(), "same".into()),
             ]),
         ] {
-            assert!(ToolAliases::new(&tools, &configured).is_err());
+            assert!(
+                ToolAliases::new(&tools, &configured, ToolPresentationStyle::Canonical).is_err()
+            );
         }
     }
 
@@ -1275,6 +1853,7 @@ mod tests {
             streaming: false,
             headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
+            tool_style: None,
         };
         let forward = ProviderRegistry::binding_for_model(
             "main",
@@ -1418,6 +1997,7 @@ mod tests {
             .unwrap(),
             forward: BTreeMap::new(),
             reverse: BTreeMap::new(),
+            style: ToolPresentationStyle::Canonical,
         };
         assert!(provider.capabilities().tools);
         let context = || ProviderContext {
@@ -1438,6 +2018,8 @@ mod tests {
             session_ref: "session-ref".into(),
             messages: vec![Message::Assistant {
                 content: None,
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![crate::provider::ToolCall {
                     id: "call".into(),
                     name: "read_file".into(),
@@ -1473,6 +2055,7 @@ mod tests {
             inner: OpenAiProvider::new(endpoint, "m", "test-key", Duration::from_secs(1)).unwrap(),
             forward: BTreeMap::new(),
             reverse: BTreeMap::new(),
+            style: ToolPresentationStyle::Canonical,
         };
         assert!(matches!(
             provider
@@ -1513,6 +2096,7 @@ mod tests {
                 .with_sampling_options(Some(0.4), Some(77)),
             reverse: BTreeMap::from([("rf".into(), "read_file".into())]),
             forward,
+            style: ToolPresentationStyle::Canonical,
         };
         let outcome = provider
             .complete(
@@ -1520,6 +2104,8 @@ mod tests {
                     session_ref: "session-ref".into(),
                     messages: vec![Message::Assistant {
                         content: None,
+                        reasoning_content: None,
+                        thinking_blocks: vec![],
                         tool_calls: vec![crate::provider::ToolCall {
                             id: "old".into(),
                             name: "read_file".into(),
@@ -1650,6 +2236,7 @@ mod tests {
             streaming: false,
             headers: BTreeMap::new(),
             aliases: BTreeMap::default(),
+            tool_style: None,
         };
         assert_eq!(definition.model_name("m"), Some("Display"));
         assert_eq!(definition.model_name("missing"), None);
@@ -1843,6 +2430,179 @@ mod tests {
         assert!(
             matches!(err, ProviderError::Transport(_) | ProviderError::Timeout),
             "expected transport or timeout error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anthropic_messages_registry_and_claude_code_tool_presentation_roundtrip() {
+        assert_eq!(
+            derive_anthropic_endpoint("http://10.37.20.168:8317/"),
+            "http://10.37.20.168:8317/v1/messages"
+        );
+        assert_eq!(
+            derive_anthropic_endpoint("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // Anthropic rejects temperature > 1.0 at config validation time.
+        assert!(ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'c/m',providers:{c:{type:'anthropic-messages',models:['m'],base_url:'http://127.0.0.1:1',api_key:'k',temperature:1.5}}}",
+        )
+        .is_err());
+        // Anthropic reserved headers (`x-api-key`, `anthropic-version`) are rejected.
+        let reserved_reg = ProviderRegistry::parse_jsonc(
+            r"{version:1,default_model:'c/m',providers:{c:{type:'anthropic-messages',models:['m'],base_url:'http://127.0.0.1:1',api_key:'k',headers:{'x-api-key':'bad'}}}}",
+        )
+        .unwrap();
+        assert!(reserved_reg.resolve_model("c", "m", &[]).is_err());
+
+        let tools = vec![
+            tool("read_file"),
+            tool("edit_file"),
+            tool("write_file"),
+            tool("list_directory"),
+            tool("search"),
+            tool("process"),
+            tool("git_diff"),
+            tool("read_project_manifest"),
+        ];
+        let response_json = r#"{"type":"message","content":[
+            {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/lib.rs","offset":1,"limit":50}},
+            {"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"old","new_string":"new","replace_all":true}},
+            {"type":"tool_use","id":"t3","name":"Write","input":{"file_path":"src/new.rs","content":"fn a() {}\n"}},
+            {"type":"tool_use","id":"t4","name":"Glob","input":{"pattern":"**/*.rs","path":"src"}},
+            {"type":"tool_use","id":"t5","name":"Grep","input":{"pattern":"fn main(","path":"src"}},
+            {"type":"tool_use","id":"t6","name":"Bash","input":{"command":"git status --short"}},
+            {"type":"tool_use","id":"t7","name":"Bash","input":{"command":"cargo test 2>&1 | head -n 5","cwd":"."}}
+        ],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let (endpoint, captured) = capturing_server(response_json);
+        let registry = ProviderRegistry::parse_jsonc(&format!(
+            r"{{version:1,default_model:'claude/seed',providers:{{claude:{{type:'anthropic-messages',models:{{seed:{{options:{{context_window:200000,reasoning_effort:'high',max_tokens:16384}}}}}},endpoint:{endpoint:?},api_key:'cpk-key',streaming:false}}}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            registry.model_context_window("claude", "seed"),
+            Some(200_000)
+        );
+        assert_eq!(
+            registry.provider_tool_presentation("claude"),
+            Some(ToolPresentationStyle::ClaudeCode)
+        );
+
+        let session_binding = registry.session_binding_for_default(&tools).unwrap();
+        assert_eq!(session_binding.provider_type, "anthropic-messages");
+        assert_eq!(session_binding.protocol, "anthropic-messages-v1");
+        assert_eq!(session_binding.aliases["read_file"], "Read");
+        assert_eq!(session_binding.aliases["edit_file"], "Edit");
+        assert_eq!(session_binding.aliases["process"], "Bash");
+
+        let resolved = registry
+            .resolve_session_bound(&session_binding, &tools)
+            .unwrap();
+        let outcome = resolved
+            .provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "s1".into(),
+                    tools,
+                    messages: vec![
+                        Message::User {
+                            content: "go".into(),
+                        },
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![],
+                            tool_calls: vec![
+                                crate::provider::ToolCall {
+                                    id: "h1".into(),
+                                    name: "read_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "offset": 2}),
+                                },
+                                crate::provider::ToolCall {
+                                    id: "h2".into(),
+                                    name: "edit_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "before": "x", "after": "y", "replace_all": true}),
+                                },
+                                crate::provider::ToolCall {
+                                    id: "h3".into(),
+                                    name: "write_file".into(),
+                                    input: serde_json::json!({"path": "b.rs", "content": "c"}),
+                                },
+                                crate::provider::ToolCall {
+                                    id: "h4".into(),
+                                    name: "list_directory".into(),
+                                    input: serde_json::json!({"path": "src", "glob": "*.rs"}),
+                                },
+                                crate::provider::ToolCall {
+                                    id: "h5".into(),
+                                    name: "search".into(),
+                                    input: serde_json::json!({"query": "foo", "regex": false}),
+                                },
+                                crate::provider::ToolCall {
+                                    id: "h6".into(),
+                                    name: "process".into(),
+                                    input: serde_json::json!({"argv": ["git", "status"]}),
+                                },
+                            ],
+                        },
+                        Message::Tool {
+                            tool_call_id: "h1".into(),
+                            name: Some("read_file".into()),
+                            content: "ok".into(),
+                        },
+                    ],
+                },
+                test_provider_context(),
+            )
+            .await
+            .unwrap();
+
+        let outbound = captured.recv().unwrap();
+        let tool_names: Vec<&str> = outbound["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(tool_names.contains(&"Read") && tool_names.contains(&"Edit"));
+        assert!(tool_names.contains(&"Bash") && tool_names.contains(&"Grep"));
+        let hist_blocks = outbound["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(hist_blocks[0]["name"], "Read");
+        assert_eq!(hist_blocks[0]["input"]["file_path"], "a.rs");
+        assert_eq!(hist_blocks[1]["name"], "Edit");
+        assert_eq!(hist_blocks[1]["input"]["old_string"], "x");
+        assert_eq!(hist_blocks[5]["name"], "Bash");
+        assert_eq!(hist_blocks[5]["input"]["command"], "git status");
+
+        // Inbound tool calls are mapped back to canonical engine names & inputs.
+        assert_eq!(outcome.tool_calls.len(), 7);
+        assert_eq!(outcome.tool_calls[0].name, "read_file");
+        assert_eq!(outcome.tool_calls[0].input["path"], "src/lib.rs");
+        assert_eq!(outcome.tool_calls[1].name, "edit_file");
+        assert_eq!(outcome.tool_calls[1].input["before"], "old");
+        assert_eq!(outcome.tool_calls[1].input["after"], "new");
+        assert_eq!(outcome.tool_calls[1].input["replace_all"], true);
+        assert_eq!(outcome.tool_calls[2].name, "write_file");
+        assert_eq!(outcome.tool_calls[2].input["path"], "src/new.rs");
+        assert_eq!(outcome.tool_calls[3].name, "list_directory");
+        assert_eq!(outcome.tool_calls[3].input["glob"], "**/*.rs");
+        assert_eq!(outcome.tool_calls[3].input["max_depth"], 8);
+        assert_eq!(outcome.tool_calls[4].name, "search");
+        assert_eq!(outcome.tool_calls[4].input["query"], "fn main(");
+        assert_eq!(
+            outcome.tool_calls[4].input["regex"], false,
+            "unclosed paren auto-falls back to literal search"
+        );
+        assert_eq!(outcome.tool_calls[5].name, "process");
+        assert_eq!(
+            outcome.tool_calls[5].input["argv"],
+            serde_json::json!(["git", "status", "--short"])
+        );
+        assert_eq!(outcome.tool_calls[6].name, "process");
+        assert_eq!(
+            outcome.tool_calls[6].input["shell"],
+            "cargo test 2>&1 | head -n 5"
         );
     }
 }

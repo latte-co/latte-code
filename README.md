@@ -8,7 +8,7 @@ Latte Code is a Rust code agent for scoped repository changes. Its Ratatui UI is
 
 - Rust 1.93 or newer (the MSRV is declared in `Cargo.toml`)
 - A terminal for the interactive TUI
-- An OpenAI-compatible chat-completions endpoint for `run` and `resume`
+- An OpenAI Chat Completions (`openai-chat`) or Anthropic Messages (`anthropic-messages`) endpoint for `run` and `resume`
 
 ## Build and install
 
@@ -23,8 +23,9 @@ Run `cargo run -p latte-code -- --help` without installing.
 
 ```bash
 latte-code tui
-latte-code run --focus crates/latte-core "add the requested validation"
-latte-code resume <session-id> "continue with the next step"
+latte-code tui --permission-mode auto-edit
+latte-code run --auto --focus crates/latte-core "add the requested validation"
+latte-code resume <session-id> --auto "continue with the next step"
 latte-code show <session-id>
 latte-code context <session-id>
 latte-code list
@@ -35,7 +36,7 @@ latte-code --json list
 latte-code serve --port 4096
 ```
 
-`run`/`list`/`show`/`context`/`compact`/`resume` are session commands served over HTTP+SSE: by default the server is embedded in the process (random loopback port, token kept in memory); `--server <url>` connects to a standalone server, reading its token from `$LATTE_CODE_HOME/server.token` or `--token`. `serve` starts a standalone server on 127.0.0.1 (default port 4096) and writes its Bearer token to `$LATTE_CODE_HOME/server.token` with owner-only permissions. `context <session-id>` prints the read-only context-usage projection (exact used/remaining bytes, estimated tokens, discardable segments, compaction trigger state). `compact <session-id>` forces context compaction on an idle session even below the trigger watermark (deterministic tool-result elision first, then a model summary); an already-small session reports `nothing_to_compact` instead of failing, and a session with an active turn is rejected with a conflict.
+`run`/`list`/`show`/`context`/`compact`/`resume` are session commands served over HTTP+SSE: by default the server is embedded in the process (random loopback port, token kept in memory); `--server <url>` connects to a standalone server, reading its token from `$LATTE_CODE_HOME/server.token` or `--token`. `--permission-mode <ask|auto-edit|full-auto>` (and shorthand `--auto` for `full-auto`) sets the session permission mode on `tui`, `run`, and `resume`; inside the TUI, `Shift+Tab` or `/mode [ask|auto-edit|full-auto]` switches modes interactively. `serve` starts a standalone server on 127.0.0.1 (default port 4096) and writes its Bearer token to `$LATTE_CODE_HOME/server.token` with owner-only permissions. `context <session-id>` prints the read-only context-usage projection (exact used/remaining bytes, estimated tokens, discardable segments, compaction trigger state). `compact <session-id>` forces context compaction on an idle session even below the trigger watermark (deterministic tool-result elision first, then a model summary); an already-small session reports `nothing_to_compact` instead of failing, and a session with an active turn is rejected with a conflict.
 
 With no arguments Latte Code opens the TUI when stdin/stdout are terminals. Latte Code starts from built-in application defaults, recursively overlays `$HOME/.latte/latte-code.jsonc`, and then overlays `<workspace>/.latte/latte-code.jsonc`. Provider/model configuration is explicit: TUI and Provider-backed operations require the merged configuration to define `default_model` and at least one matching Provider model, while read-only state commands remain available with an empty Provider catalog. For the same key, the workspace value wins; arrays, scalar values, and each Provider's complete `models` catalog replace the earlier value.
 
@@ -54,7 +55,7 @@ The TUI creates sessions. A completed child is immutable; a follow-up creates a 
 
 A workspace `.latte/latte-code.jsonc` ships with the repository clone, so Latte Code treats workspace-provided endpoints as untrusted. If the workspace layer sets `providers.*.base_url`/`endpoint` while a credential held outside the workspace — a home-layer `api_key`, or an environment variable the merged configuration references — would be attached to it, startup fails with remediation guidance instead of sending the secret to that endpoint. Only the HOME layer can opt in per provider with `trust_repo_endpoint: true`; the flag is stripped before merging, invisible to the configuration schema, and never enters fingerprints. A workspace provider that carries its own literal `api_key` is treated as self-owned and allowed.
 
-OpenAI Chat Completions can use bounded SSE when `streaming` is true. Only actual deltas are rendered; a valid inline JSON response renders only its final answer. A zero-body unsupported streaming response may make one non-streaming retry; any body byte, malformed SSE, or cancellation does not fall back. Responses API and other provider protocols are not implemented. Provider-issued v2 tool calls are executed only by the engine through fenced durable `Prepare -> Started -> Observe` transitions. A restart or lost authority after `Started` records `Unknown` and requires explicit reconciliation; neither the TUI nor provider has direct effect authority.
+OpenAI Chat Completions (`type: "openai-chat"`) and Anthropic Messages (`type: "anthropic-messages"`, including explicit `cache_control` prompt-caching breakpoints, signed `thinking` / `redacted_thinking` replay, and `ClaudeCode` wire tool presentation `Read`/`Edit`/`Write`/`Glob`/`Grep`/`Bash`) can use bounded SSE when `streaming` is true. Only actual deltas are rendered; a valid inline JSON response renders only its final answer. A zero-body unsupported streaming response may make one non-streaming retry; any body byte, malformed SSE, or cancellation does not fall back. OpenAI Responses API is not implemented. Provider-issued v2 tool calls are executed only by the engine through fenced durable `Prepare -> Started -> Observe` transitions. A restart or lost authority after `Started` records `Unknown` and requires explicit reconciliation; neither the TUI nor provider has direct effect authority.
 
 An OpenAI Chat provider may declare `headers` for gateways that require request headers beyond the protocol itself. Each value is sent verbatim except for `${session_id}`, which expands to an opaque per-Session reference — derived from the Session, stable for all of its turns, and not the Session id itself, so a Provider can group a conversation without receiving an internal identifier. Any other `${...}` name, a malformed header name, a control character in a value, and the provider-derived `authorization`, `content-type`, `host`, and `content-length` headers are rejected when the model is resolved rather than at request time. Configured headers participate in the Session binding fingerprint.
 
@@ -77,8 +78,8 @@ providers: {
 - Effect state is persisted before execution. Ambiguous interruption becomes `Unknown` and requires explicit reconciliation; it is never silently retried.
 - File writes use handle-relative replacement on supported platforms and fail before starting on unsupported platforms.
 - Process execution is argv-first, drains bounded output, and terminates Unix process groups on timeout or cancellation. Process supervision fails closed on non-Unix targets; CI still runs Windows check, Clippy, UT, Contract, portable final-binary E2E, and release build gates without claiming Windows process execution support.
-- Each provider request gets `session.provider_timeout_ms` (default 60000), and the whole turn may optionally be bounded by `session.max_tool_rounds`: omitted (or null) means unlimited, which is the default — protection against a model that keeps calling tools without converging comes from the per-request timeout, cancellation, and I/O bounds instead. With an explicit budget (at least 1), opening another tool batch beyond it ends the turn as a retryable failure naming the limit: the work so far stays durable and the Session remains usable. The budget spans the whole turn and is tracked by a durable per-turn counter, so a permission approval or input answer resumes the count rather than refilling it.
-- TUI Enter sends a nonblank composer or pending-input value, while Shift+Enter inserts a newline. Permission and reconciliation prompts consume both keys without approving or acknowledging anything; those protected actions require their explicit chords.
+- Each provider request gets `session.provider_timeout_ms` (default 120000), and the whole turn may optionally be bounded by `session.max_tool_rounds`: omitted (or null) means unlimited, which is the default — protection against a model that keeps calling tools without converging comes from the per-request timeout, cancellation, and I/O bounds instead. With an explicit budget (at least 1), opening another tool batch beyond it ends the turn as a retryable failure naming the limit: the work so far stays durable and the Session remains usable. The budget spans the whole turn and is tracked by a durable per-turn counter, so a permission approval or input answer resumes the count rather than refilling it.
+- TUI Enter sends a nonblank composer or pending-input value, while `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` inserts a newline across terminals. Permission and reconciliation prompts consume Enter without approving or acknowledging anything; permissions use explicit keys (`y`/`Ctrl+A` allow once, `a` allow and enable auto mode, `n`/`d`/`Ctrl+X` deny).
 
 ## Configuration library
 
