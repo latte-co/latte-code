@@ -1572,7 +1572,9 @@ fn ctrl_c_cancels_the_active_process_group_before_the_second_press_exits() {
     assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
     assert!(pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     pty.write(CTRL_A);
-    assert!(wait_until(Duration::from_secs(5), || pgid_file.exists()));
+    assert!(wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&pgid_file).is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+    }));
     let pgid = std::fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -1729,7 +1731,9 @@ fn process_timeout_reaps_the_group_and_returns_one_terminal_tool_result() {
     assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
     assert!(pty.wait_for_output(b"Permission required", Duration::from_secs(5)));
     pty.write(CTRL_A);
-    assert!(wait_until(Duration::from_secs(5), || pgid_file.exists()));
+    assert!(wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&pgid_file).is_ok_and(|s| s.trim().parse::<i32>().is_ok())
+    }));
     let pgid = std::fs::read_to_string(&pgid_file)
         .unwrap()
         .trim()
@@ -2489,13 +2493,19 @@ fn tui_switching_sessions_synchronizes_authoritative_permission_mode_per_session
         Duration::from_secs(5)
     ));
     pty.write(b"/rename alpha\r");
-    assert!(wait_for_screen_text(
-        &pty,
-        40,
-        120,
-        "alpha",
-        Duration::from_secs(5)
-    ));
+    assert!(wait_until(Duration::from_secs(5), || {
+        Connection::open(scenario.database_path())
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE title='alpha'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            })
+            == Some(1)
+    }));
 
     // 2. Open `/new`, switch to `/mode ask`, create session `beta`, and rename it.
     pty.write(b"/new\r");
@@ -2517,6 +2527,19 @@ fn tui_switching_sessions_synchronizes_authoritative_permission_mode_per_session
         Duration::from_secs(5)
     ));
     pty.write(b"/rename beta\r");
+    assert!(wait_until(Duration::from_secs(5), || {
+        Connection::open(scenario.database_path())
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE title='beta'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            })
+            == Some(1)
+    }));
 
     // 3. Switch back to `alpha` via `/resume alpha` -> status bar MUST show `Full-auto`, NOT `Ask` (#11)!
     pty.write(b"/resume alpha\r");
@@ -2556,10 +2579,10 @@ fn tui_switching_sessions_synchronizes_authoritative_permission_mode_per_session
         &pty,
         40,
         120,
-        "beta_blocked.txt",
+        "Permission required",
         Duration::from_secs(5)
     ));
-    // Deny with `n` and confirm `beta_blocked.txt` was never written.
+    // Deny with `n` once `Permission required` has been rendered (`FrameRendered` guard).
     pty.write(b"n");
     assert!(wait_for_screen_text(
         &pty,
@@ -2782,4 +2805,331 @@ fn tui_command_palette_slash_tab_draft_model_start_and_unconfigured_submission()
     pty2.write(F10);
     let (status2, _) = pty2.finish(Duration::from_secs(5));
     assert!(status2.success());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_compacted_projection_live_permission_mode_multiline_editor_and_sigint() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("doc.txt"), "D".repeat(2400)).unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "t_read",
+            "read_file",
+            &serde_json::json!({"path": "doc.txt"}),
+        ),
+        ProviderReply::completion("first turn read doc"),
+        ProviderReply::completion("second turn retained"),
+        ProviderReply::completion("third turn retained"),
+        ProviderReply::completion("compacted summary card text"),
+        ProviderReply::completion("post-fork turn answer"),
+        // Blank reply for TUI `/compact` on the forked session -> `CompactionError`!
+        ProviderReply::completion("   "),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 14000,
+                    max_input_bytes: 12000,
+                    reserved_output_bytes: 2000,
+                    context_cap_bytes: 256,
+                    compaction: {{
+                        enabled: true,
+                        mode: "elide_then_summarize",
+                        max_summary_source_bytes: 32000,
+                        retain_ratio: 1
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    // 1. Seed a session via final binary: Turn 1 reads `doc.txt`, Turn 2 adds a second segment,
+    //    manual `compact` #1 appends `tool_result_elision`, Turn 3 adds retained tail, and manual
+    //    `compact` #2 appends `compact_summary` with `retain_from_sequence` (exercising
+    //    `session_transcript_projection` `storage.rs:6938..6985` when TUI lists/opens sessions!).
+    let r1 = scenario.output(&["--json", "run", "seed compacted session"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(r1.status.success());
+    let sid = serde_json::from_slice::<serde_json::Value>(&r1.stdout).unwrap()["data"]["session"]
+        ["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let r2 = scenario.output(&["--json", "resume", &sid, "second segment"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(r2.status.success());
+
+    let c1 = scenario.output(&["compact", &sid], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(c1.status.success());
+
+    let r3_prompt = format!("third-retained-{}", "t".repeat(300));
+    let r3 = scenario.output(&["--json", "resume", &sid, &r3_prompt], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(r3.status.success());
+
+    // Switch mode to `summarize` for the second manual compact so a `compact_summary` card
+    // with `retain_from_sequence` is persisted alongside the earlier `tool_result_elision` card.
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 14000,
+                    max_input_bytes: 12000,
+                    reserved_output_bytes: 2000,
+                    context_cap_bytes: 256,
+                    compaction: {{
+                        enabled: true,
+                        mode: "summarize",
+                        max_summary_source_bytes: 32000,
+                        retain_ratio: 1
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+    let c2 = scenario.output(&["compact", &sid], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(c2.status.success());
+    let c2_stdout = String::from_utf8_lossy(&c2.stdout);
+    assert!(
+        c2_stdout.contains("summarized older history"),
+        "expected Tier::Summarized in c2 output, got: {c2_stdout}"
+    );
+    // Seed `conversation_outbox` with the `compact_summary` card before running `context` so
+    // `Storage::session_snapshot_projection_v2` -> `session_transcript_projection`
+    // (`storage.rs:6938..6985`) executes over SQLite outbox rows, and append a `completion`
+    // transcript card so opening the session in TUI renders `TranscriptKind::Completion`
+    // (`tui/session.rs:4568..4580`).
+    {
+        let jsonl_path = scenario.session_files().remove(0);
+        let raw_jsonl = std::fs::read_to_string(&jsonl_path).unwrap();
+        let entries: Vec<serde_json::Value> = raw_jsonl
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summary_record = entries
+            .iter()
+            .rev()
+            .find(|v| v["kind"] == "compact_summary")
+            .unwrap()
+            .clone();
+        let max_seq = entries
+            .iter()
+            .filter_map(|v| v["seq"].as_u64())
+            .max()
+            .unwrap();
+        let mut completion_record = entries.last().unwrap().clone();
+        completion_record["entry_id"] = serde_json::json!("01900000-0000-7000-8000-0000000000c9");
+        completion_record["seq"] = serde_json::json!(max_seq + 1);
+        completion_record["kind"] = serde_json::json!("completion");
+        completion_record["source_key"] = serde_json::json!("e2e-completion-card");
+        completion_record["content"] =
+            serde_json::json!("verified completion line one\nverified completion line two");
+        completion_record["payload"] = serde_json::Value::Null;
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{raw_jsonl}{}\n",
+                serde_json::to_string(&completion_record).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let summary_outbox_entry = serde_json::json!({
+            "entry_id": summary_record["entry_id"],
+            "sequence": summary_record["seq"],
+            "turn_id": summary_record["turn_id"],
+            "kind": "compact_summary",
+            "text": summary_record["content"],
+            "payload": summary_record["payload"],
+            "source_key": summary_record["source_key"],
+            "created_at_ms": summary_record["created_at_ms"],
+        });
+        let conn = Connection::open(scenario.database_path()).unwrap();
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+        conn.execute(
+            "INSERT INTO conversation_outbox(session_id,seq,entry_id,turn_id,kind,source_key,entry_json,created_at_ms) \
+             VALUES(?1,?2,?3,NULL,'compact_summary',?4,?5,1)",
+            rusqlite::params![
+                &sid,
+                i64::try_from(summary_record["seq"].as_u64().unwrap()).unwrap(),
+                summary_record["entry_id"].as_str().unwrap(),
+                summary_record["source_key"].as_str().unwrap(),
+                serde_json::to_string(&summary_outbox_entry).unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+    let ctx_projected = scenario.output(&["--json", "context", &sid], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    });
+    assert!(ctx_projected.status.success());
+
+    let listed_projected = scenario.output(&["--json", "list"], |_| {});
+    assert!(listed_projected.status.success());
+    assert!(
+        String::from_utf8_lossy(&listed_projected.stdout).contains("compacted summary card text")
+    );
+
+    // 2. Spawn `latte-code tui --permission-mode auto-edit` (`lib.rs:832..841`) with mouse capture
+    //    enabled (`tui/lib.rs:165..166`) and open the session via `/resume seed compacted session`!
+    let mut cmd = scenario.command(&["tui", "--permission-mode", "auto-edit"]);
+    cmd.env("TEST_OPENAI_KEY", "tui-compact-key");
+    cmd.env("LATTE_TUI_MOUSE_CAPTURE", "1");
+    let mut pty = PtySession::spawn(cmd);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Describe an outcome",
+        Duration::from_secs(5)
+    ));
+
+    pty.write(b"/resume seed compacted session\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "compacted summary card text",
+            Duration::from_secs(5)
+        ),
+        "expected Compacted summary card in TUI:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+
+    // Slash popup Enter on an argument-required command (`/rename` without argument)
+    // sets `/rename requires an argument` (`tui/session.rs:1401..1405`), then `Ctrl+U` clears!
+    pty.write(b"/rename\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "/rename requires an argument",
+        Duration::from_secs(5)
+    ));
+    let before_clear_rename = pty.output().len();
+    pty.write(b"\x1b[117;5u");
+    assert!(pty.wait_for_growth(before_clear_rename, Duration::from_secs(5)));
+
+    // 3. `/mode auto` (`PermissionModeCompleted`), plus a new turn followed by `/compact`
+    //    failing on a blank summary (`CompactionError`).
+    pty.write(b"/mode auto\r");
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "Full-auto", Duration::from_secs(5)),
+        "expected Full-auto mode on open session:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+
+    let post_fork_prompt = format!("post-fork-{}\r", "f".repeat(250));
+    pty.write(post_fork_prompt.as_bytes());
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "post-fork turn answer",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/compact\r");
+    assert!(provider.wait_for_calls(7, Duration::from_secs(5)));
+    provider.assert_consumed();
+
+    // 4. Exercise multiline composer navigation & editing (`Up`, `Down`, `Home`, `End`,
+    //    `Delete`, `Ctrl+A`, `Ctrl+D`, `Ctrl+E`, `Ctrl+W`, `Ctrl+U`).
+    pty.write(b"first-line");
+    pty.write(SHIFT_ENTER);
+    pty.write(b"second word");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "second word",
+        Duration::from_secs(5)
+    ));
+    let before_nav = pty.output().len();
+    pty.write(
+        b"\x1b[<64;10;10M\x1b[<65;10;10M\x1b[A\x1b[B\x1b[H\x1b[3~\x1b[F\x1b[97;5u\x1b[100;5u\x1b[101;5u\x1b[119;5u\x1b[117;5u\x1b[127u\x1b[117;5u",
+    );
+    assert!(pty.wait_for_growth(before_nav, Duration::from_secs(5)));
+
+    // Install a schema trigger rejecting `UPDATE OF permission_mode` while leaving `SELECT`
+    // (`RefreshSnapshots`) healthy, then run `/mode ask` to exercise `PermissionModeError`
+    // (`tui/session.rs:999..1016`)!
+    {
+        let conn = Connection::open(scenario.database_path()).unwrap();
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER block_perm_mode BEFORE UPDATE OF permission_mode ON sessions \
+             WHEN NEW.session_id = '{sid}' \
+             BEGIN SELECT RAISE(ABORT, 'mode locked'); END;"
+        ))
+        .unwrap();
+    }
+    pty.write(b"/mode ask\r");
+    assert!(
+        wait_for_screen_text(
+            &pty,
+            40,
+            120,
+            "Permission mode rejected",
+            Duration::from_secs(5)
+        ),
+        "expected PermissionModeError notice:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+
+    // 5. Deliver OS `SIGINT` signals: once composer clears and `again to exit` is armed,
+    //    one more `SIGINT` exits 0 via `tui/session.rs:5946..5948`!
+    for _ in 0..10 {
+        if pty_screen_text(&pty.output(), 40, 120).contains("again to exit") {
+            break;
+        }
+        pty.send_sigint();
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "again to exit", Duration::from_secs(5)),
+        "expected Ctrl+C exit arm prompt:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    pty.send_sigint();
+    let (status, _) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
 }

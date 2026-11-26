@@ -753,20 +753,6 @@ impl EngineHandle {
         &self.project_key
     }
 
-    /// Updates the permission posture for `session_id`, persisting to `SQLite`
-    /// when the session already exists and mirroring into in-memory overrides.
-    pub fn set_session_permission_mode(
-        &self,
-        session_id: SessionId,
-        mode: latte_core::PermissionMode,
-    ) {
-        self.session_permission_modes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id, mode);
-        let _ = self.storage.set_session_permission_mode(session_id, mode);
-    }
-
     /// Durably updates the permission posture of an existing local session and
     /// returns its refreshed authoritative snapshot.
     pub fn set_session_permission_mode_v2(
@@ -7029,7 +7015,9 @@ mod tool_effect_tests {
         };
 
         // Switch session to AutoEdit: write_file becomes Allow (no Ask), creating nested parent dirs.
-        engine.set_session_permission_mode(session_id, latte_core::PermissionMode::AutoEdit);
+        engine
+            .set_session_permission_mode_v2(session_id, latte_core::PermissionMode::AutoEdit)
+            .unwrap();
         assert_eq!(
             engine.session_permission_mode(session_id),
             latte_core::PermissionMode::AutoEdit
@@ -7129,7 +7117,9 @@ mod tool_effect_tests {
         );
 
         // FullAuto promotes process shell Ask -> Allow as well.
-        engine.set_session_permission_mode(session_id, latte_core::PermissionMode::FullAuto);
+        engine
+            .set_session_permission_mode_v2(session_id, latte_core::PermissionMode::FullAuto)
+            .unwrap();
         #[cfg(unix)]
         {
             let proc_outcome = engine

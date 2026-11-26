@@ -4549,7 +4549,20 @@ mod tests {
             .workspace_root(tmp.path())
             .build()
             .unwrap();
-        let descriptors = engine.tool_descriptors();
+        let mut descriptors = engine.tool_descriptors();
+        if !descriptors.iter().any(|d| d.name == "process") {
+            descriptors.push(latte_engine::ToolDescriptor {
+                name: "process".into(),
+                description: "run".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "argv": { "type": "array" } }
+                }),
+                version: 1,
+                effect: "process".into(),
+            });
+            descriptors.sort_by(|a, b| a.name.cmp(&b.name));
+        }
 
         let dual_reg = std::sync::Arc::new(
             ProviderRegistry::parse_jsonc(

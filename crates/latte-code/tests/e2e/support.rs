@@ -865,6 +865,14 @@ impl PtySession {
         self.child.as_mut().unwrap().try_wait().unwrap().is_none()
     }
 
+    pub fn send_sigint(&self) {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.process_group),
+            nix::sys::signal::Signal::SIGINT,
+        )
+        .unwrap();
+    }
+
     pub fn finish(mut self, timeout: Duration) -> (std::process::ExitStatus, Vec<u8>) {
         self.input.take();
         let deadline = Instant::now() + timeout;

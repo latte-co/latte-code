@@ -660,11 +660,6 @@ impl SessionRuntimeService {
             .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))
     }
 
-    /// Updates the permission posture for `session_id`.
-    pub fn set_permission_mode(&self, session_id: SessionId, mode: latte_core::PermissionMode) {
-        self.engine.set_session_permission_mode(session_id, mode);
-    }
-
     /// Durably updates the permission posture for an existing session and
     /// returns the updated authoritative snapshot.
     pub fn set_permission_mode_checked(
@@ -1992,7 +1987,7 @@ impl SessionRuntimeService {
         };
         let provider = (self.provider)(&snapshot.binding)
             .map_err(SessionRuntimeError::ProviderConfiguration)?;
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked_async(session_id).await?;
         // Adopt-or-create the queue intake under the lease (issue #22): the
         // prompts queued while this turn was parked survive the resume and
         // run when this turn's own drain reaches them.
@@ -2106,7 +2101,7 @@ impl SessionRuntimeService {
         } else {
             None
         };
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked_async(session_id).await?;
         // Adopt-or-create the queue intake under the lease (issue #22), the
         // same contract as provide_input.
         let mut runner = self.ensure_runner(session_id);
@@ -2356,7 +2351,7 @@ impl SessionRuntimeService {
                 return self.load_full(session_id);
             }
         }
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked(session_id)?;
         let snapshot = self.commit(
             session_id,
             turn_id,
@@ -5212,6 +5207,63 @@ impl SessionRuntimeService {
 
     fn acquire(&self, session_id: SessionId) -> Result<SessionLeaseGuard, SessionRuntimeError> {
         self.acquire_with_ttl(session_id, self.authority_ttl())
+    }
+
+    const PARKED_LEASE_SETTLE_MS: u64 = 250;
+
+    fn should_retry_parked_lease(
+        &self,
+        session_id: SessionId,
+        deadline: Instant,
+        error: &SessionRuntimeError,
+    ) -> bool {
+        matches!(
+            error,
+            SessionRuntimeError::Storage(StorageError::EngineUnavailable)
+        ) && Instant::now() < deadline
+            && self.load_full(session_id).is_ok_and(|current| {
+                matches!(
+                    current.lifecycle,
+                    SessionLifecycle::WaitingPermission | SessionLifecycle::WaitingInput
+                )
+            })
+    }
+
+    /// Acquires the session lease for an already-parked (`WaitingPermission` /
+    /// `WaitingInput`) session, giving a just-parked runner task up to a bounded
+    /// settle window to finish stack unwinding and drop its `SessionLeaseGuard`.
+    fn acquire_parked(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionLeaseGuard, SessionRuntimeError> {
+        let deadline = Instant::now()
+            + Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS.max(Self::PARKED_LEASE_SETTLE_MS));
+        loop {
+            match self.acquire(session_id) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if self.should_retry_parked_lease(session_id, deadline, &error) => {
+                    std::thread::sleep(Duration::from_millis(RESIDUE_SETTLE_INTERVAL_MS));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn acquire_parked_async(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionLeaseGuard, SessionRuntimeError> {
+        let deadline = Instant::now()
+            + Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS.max(Self::PARKED_LEASE_SETTLE_MS));
+        loop {
+            match self.acquire(session_id) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if self.should_retry_parked_lease(session_id, deadline, &error) => {
+                    tokio::time::sleep(Duration::from_millis(RESIDUE_SETTLE_INTERVAL_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn acquire_with_ttl(
@@ -15723,5 +15775,111 @@ mod tests {
         let summary_user = summary_req.messages[1].content().unwrap();
         assert!(summary_user.contains("LARGE_TURN_ONE_"));
         assert!(summary_user.len() <= 512, "len={}", summary_user.len());
+    }
+
+    #[tokio::test]
+    async fn cancel_durable_and_parked_resume_settle_transient_lease_release_and_fail_closed_on_live_lease()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(
+                        serde_json::from_value::<InputRequest>(serde_json::json!({
+                            "id": "ask_1",
+                            "prompt": "enter token",
+                            "secret": false
+                        }))
+                        .unwrap(),
+                    ),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                simple_response("resumed after settle"),
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(
+                        serde_json::from_value::<InputRequest>(serde_json::json!({
+                            "id": "ask_2",
+                            "prompt": "enter second",
+                            "secret": false
+                        }))
+                        .unwrap(),
+                    ),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ],
+        );
+        // 1. Parked `provide_input` waits out a dying runner lease that drops within settle window.
+        let sid1 = SessionId::from_uuid(Uuid::now_v7());
+        let parked1 = service
+            .start(sid1, "park for input".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(parked1.lifecycle, SessionLifecycle::WaitingInput);
+        let held1 = engine.acquire_session_lease(sid1, now_ms(), 5_000).unwrap();
+        let engine_release1 = engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = engine_release1.release_lease(&held1);
+        });
+        let resumed1 = service
+            .provide_input(
+                sid1,
+                parked1.session_revision,
+                test_turn_revision(&parked1),
+                "ask_1".into(),
+                "answer".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed1.lifecycle, SessionLifecycle::Ready);
+
+        // 2. Parked `cancel_durable` fails closed when a foreign lease outlives the settle budget,
+        //    and succeeds cleanly when a lingering guard releases within the settle budget.
+        let sid2 = SessionId::from_uuid(Uuid::now_v7());
+        let parked2 = service
+            .start(sid2, "park for cancel".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(parked2.lifecycle, SessionLifecycle::WaitingInput);
+        let turn_rev2 = test_turn_revision(&parked2);
+        let stuck_lease = engine
+            .acquire_session_lease(sid2, now_ms(), 10_000)
+            .unwrap();
+        let stuck_err = service
+            .cancel_durable(sid2, parked2.session_revision, turn_rev2)
+            .unwrap_err();
+        assert!(
+            matches!(
+                stuck_err,
+                SessionRuntimeError::Storage(StorageError::EngineUnavailable)
+            ),
+            "expected EngineUnavailable when lease stays held, got {stuck_err:?}"
+        );
+        engine.release_lease(&stuck_lease).unwrap();
+
+        let transient_lease = engine.acquire_session_lease(sid2, now_ms(), 5_000).unwrap();
+        let engine_release2 = engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = engine_release2.release_lease(&transient_lease);
+        });
+        let cancelled = service
+            .cancel_durable(sid2, parked2.session_revision, turn_rev2)
+            .unwrap();
+        assert_eq!(cancelled.lifecycle, SessionLifecycle::Failed);
     }
 }
