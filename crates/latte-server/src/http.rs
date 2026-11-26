@@ -153,7 +153,7 @@ impl ServerState {
 pub enum ServerEvent {
     SessionChanged {
         session_id: String,
-        #[serde(alias = "revision")]
+        #[serde(rename = "revision", alias = "session_revision")]
         session_revision: u64,
     },
     Progress {
@@ -540,13 +540,19 @@ async fn create_session(
         ));
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
-    let payload_digest = canonical_digest(&serde_json::json!({
+    let mut digest_body = serde_json::json!({
         "session_id": req.session_id.to_string(),
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "binding": serde_json::to_value(&req.binding).unwrap_or(serde_json::Value::Null),
         "focus": req.focus,
-    }));
+    });
+    if let Some(mode) = req.permission_mode
+        && let Some(obj) = digest_body.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
+    let payload_digest = canonical_digest(&digest_body);
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
     if let Some(key) = &idempotency {
@@ -608,21 +614,20 @@ async fn create_session_owned(
     let prompt = req.prompt;
     let focus = req.focus.map(std::path::PathBuf::from);
     let binding = req.binding;
-    if let Some(mode) = req.permission_mode {
-        runtime.set_permission_mode(session_id, mode);
-    }
+    let permission_mode = req.permission_mode;
 
     // Run the turn under supervised background execution, but only acknowledge
     // 202 after the runtime signals the submission is durably accepted.
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .start_accepted(
+            .start_accepted_with_mode(
                 session_id,
                 command_id,
                 prompt,
                 binding,
                 focus.as_deref(),
+                permission_mode,
                 accept_tx,
             )
             .await
@@ -887,11 +892,17 @@ async fn follow_up(
         ));
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
-    let payload_digest = canonical_digest(&serde_json::json!({
+    let mut digest_body = serde_json::json!({
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "expected_session_revision": req.expected_session_revision,
-    }));
+    });
+    if let Some(mode) = req.permission_mode
+        && let Some(obj) = digest_body.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
+    let payload_digest = canonical_digest(&digest_body);
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key, &payload_digest) {
             IdempotencyClaim::Replay(record) => {
@@ -935,14 +946,19 @@ async fn follow_up_owned(
     let command_id = req.command_id;
     let prompt = req.prompt;
     let expected = req.expected_session_revision;
-    if let Some(mode) = req.permission_mode {
-        runtime.set_permission_mode(session_id, mode);
-    }
+    let permission_mode = req.permission_mode;
 
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .follow_up_accepted(session_id, command_id, expected, prompt, accept_tx)
+            .follow_up_accepted_with_mode(
+                session_id,
+                command_id,
+                expected,
+                prompt,
+                permission_mode,
+                accept_tx,
+            )
             .await
         {
             warn!("session {session_id} background follow-up failed: {error}");
@@ -978,12 +994,22 @@ async fn set_permission_mode(
 ) -> Result<Json<PermissionModeResponse>, HandlerError> {
     let session_id = parse_session_id(&id)?;
     let workspace = lookup_workspace(&state, session_id).await?;
-    workspace
+    let snapshot = workspace
         .runtime
-        .set_permission_mode(session_id, req.permission_mode);
+        .set_permission_mode_checked(session_id, req.permission_mode)
+        .map_err(|error| match error {
+            SessionRuntimeError::Storage(latte_engine::StorageError::SessionNotFound(_)) => {
+                not_found("session not found")
+            }
+            other => failed(&format!("failed to update permission mode: {other}")),
+        })?;
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
+        session_id: session_id.to_string(),
+        session_revision: snapshot.session_revision,
+    });
     Ok(Json(PermissionModeResponse {
         session_id: session_id.to_string(),
-        permission_mode: req.permission_mode,
+        permission_mode: snapshot.permission_mode,
     }))
 }
 
@@ -1521,7 +1547,7 @@ mod tests {
 
     fn valid_binding() -> serde_json::Value {
         serde_json::json!({
-            "binding_version": 1,
+            "version": 1,
             "provider_name": "test",
             "provider_type": "openai-chat",
             "protocol": "chat",
@@ -1656,7 +1682,7 @@ mod tests {
             let (status, body) =
                 call(state, "GET", &format!("/v1/sessions/{session_id}"), None).await;
             if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["revision"].as_u64().unwrap();
                 return (session_id, revision);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1735,7 +1761,7 @@ mod tests {
             if status == StatusCode::OK
                 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission")
             {
-                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"]
                     .as_str()
@@ -1819,7 +1845,7 @@ mod tests {
             if status == StatusCode::OK
                 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input")
             {
-                let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
+                let revision = body["snapshot"]["revision"].as_u64().unwrap();
                 let pending = &body["snapshot"]["pending"];
                 let request_id = pending["request_id"].as_str().unwrap().to_string();
                 let turn_revision = pending["expected_turn_revision"].as_u64().unwrap();
@@ -4050,7 +4076,7 @@ mod tests {
                 if status == StatusCode::OK {
                     let snapshot = &body["snapshot"];
                     if let Some(active_turn_id) = snapshot["active_turn_id"].as_str() {
-                        let revision = snapshot["session_revision"].as_u64().unwrap();
+                        let revision = snapshot["revision"].as_u64().unwrap();
                         let turn_revision = snapshot["turns"]
                             .as_array()
                             .unwrap()
@@ -5176,5 +5202,114 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn rejected_and_replayed_requests_preserve_permission_mode_and_v1_wire_keys() {
+        let state = permission_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        // Invalid create carrying FullAuto must not pre-seed mode for that session_id.
+        let preset_sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let mut bad_binding = valid_binding();
+        bad_binding["model"] = serde_json::json!("");
+        let (bad_status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "session_id": preset_sid.to_string(),
+                "prompt": "bad",
+                "binding": bad_binding,
+                "permission_mode": "full_auto",
+            }),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+        // Creating the same session_id without permission_mode must still start in Ask and park!
+        let (ok_status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "session_id": preset_sid.to_string(),
+                "prompt": "write it",
+                "binding": valid_binding(),
+            }),
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::ACCEPTED);
+        let sid_str = preset_sid.to_string();
+        let mut parked_rev = None;
+        let mut req_id = String::new();
+        let mut turn_rev = 0;
+        for _ in 0..200 {
+            let (st, body) = call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+            if st == StatusCode::OK
+                && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission")
+            {
+                let snap = &body["snapshot"];
+                // Verify /v1 wire contract keys (#7).
+                assert!(snap.get("revision").is_some());
+                assert!(snap.get("session_revision").is_none());
+                assert_eq!(snap["permission_mode"], "ask");
+                assert!(snap["binding"].get("version").is_some());
+                assert!(snap["binding"].get("binding_version").is_none());
+                assert_eq!(snap["turns"][0]["ordinal"], 0);
+                assert!(snap["turns"][0].get("turn_ordinal").is_none());
+                parked_rev = snap["revision"].as_u64();
+                req_id = snap["pending"]["request_id"].as_str().unwrap().to_string();
+                turn_rev = snap["pending"]["expected_turn_revision"].as_u64().unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let parked_rev = parked_rev.expect("session must park in Ask mode");
+
+        // Stale/conflicting follow-up carrying FullAuto must return 409 AND leave session in Ask (#5).
+        let stale_cmd = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let (conflict_status, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/follow-up"),
+            Some(serde_json::json!({
+                "command_id": stale_cmd,
+                "prompt": "try escalate",
+                "expected_session_revision": parked_rev + 99,
+                "permission_mode": "full_auto",
+            })),
+            &[("idempotency-key", &stale_cmd)],
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        let (_, after_conflict) =
+            call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+        assert_eq!(after_conflict["snapshot"]["permission_mode"], "ask");
+
+        // Deny current turn so session reaches terminal Failed, then check mode endpoint.
+        let (deny_status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/permissions/{req_id}"),
+            Some(serde_json::json!({
+                "allow": false,
+                "expected_session_revision": parked_rev,
+                "expected_turn_revision": turn_rev,
+            })),
+        )
+        .await;
+        assert_eq!(deny_status, StatusCode::OK);
+        let (mode_status, mode_body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/permission-mode"),
+            Some(serde_json::json!({ "permission_mode": "auto_edit" })),
+        )
+        .await;
+        assert_eq!(mode_status, StatusCode::OK);
+        assert_eq!(mode_body["permission_mode"], "auto_edit");
+        let (_, snap_after_mode) =
+            call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+        assert_eq!(snap_after_mode["snapshot"]["permission_mode"], "auto_edit");
     }
 }

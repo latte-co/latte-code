@@ -180,6 +180,14 @@ pub enum SessionUiInput {
     ModelSwitchCompleted {
         switch_id: u64,
     },
+    PermissionModeError {
+        session_id: SessionId,
+        error: String,
+    },
+    PermissionModeCompleted {
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+    },
     Tick,
     /// Read-only next-request context usage refreshed alongside a snapshot
     /// reload. Carries the session id so a stale fetch for a since-deselected
@@ -210,6 +218,11 @@ pub enum SessionUiFeedback {
     ModelSwitchResult {
         switch_id: u64,
         result: Result<String, String>,
+    },
+    PermissionModeResult {
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+        result: Result<(), String>,
     },
     Command(Result<String, String>),
     Compaction(Result<String, String>),
@@ -265,6 +278,19 @@ impl SessionUiFeedback {
     #[must_use]
     pub fn model_switch(switch_id: u64, result: Result<String, String>) -> Self {
         Self::ModelSwitchResult { switch_id, result }
+    }
+
+    #[must_use]
+    pub fn permission_mode(
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+        result: Result<(), String>,
+    ) -> Self {
+        Self::PermissionModeResult {
+            session_id,
+            mode,
+            result,
+        }
     }
 }
 
@@ -458,6 +484,12 @@ pub struct SessionUiModel {
     history_saved_draft: String,
     /// Active session permission mode (`Ask`, `AutoEdit`, `FullAuto`).
     pub permission_mode: latte_core::PermissionMode,
+    draft_permission_mode: latte_core::PermissionMode,
+    pending_permission_mode: Option<(
+        SessionId,
+        latte_core::PermissionMode,
+        latte_core::PermissionMode,
+    )>,
     /// Most recent redacted runtime submission error reason, if any.
     last_submission_error: Option<String>,
     last_input_submission_error: Option<String>,
@@ -557,6 +589,8 @@ impl Default for SessionUiModel {
             history_index: None,
             history_saved_draft: String::new(),
             permission_mode: latte_core::PermissionMode::Ask,
+            draft_permission_mode: latte_core::PermissionMode::Ask,
+            pending_permission_mode: None,
             last_submission_error: None,
             last_input_submission_error: None,
             scroll: 0,
@@ -619,6 +653,7 @@ impl SessionUiModel {
             startup: Some(startup),
             pending_model_selection,
             permission_mode,
+            draft_permission_mode: permission_mode,
             status,
             active_session: Some(ActiveSession::SessionDraft),
             ..Self::default()
@@ -738,6 +773,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             finalize_failed_submissions_after_snapshot(model);
             restore_stranded_follow_up(model);
             synchronize_input_target(model);
+            sync_selected_permission_mode(model);
             if model
                 .reconciliation_confirmation
                 .as_ref()
@@ -852,6 +888,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             finalize_failed_submissions_after_snapshot(model);
             restore_stranded_follow_up(model);
             synchronize_input_target(model);
+            sync_selected_permission_mode(model);
         }
         SessionUiInput::ContextUsage { session_id, usage } => {
             model.context_usage = Some((session_id, *usage));
@@ -943,6 +980,41 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 return vec![SessionUiAction::RefreshSnapshots];
             }
         }
+        SessionUiInput::PermissionModeCompleted { session_id, mode } => {
+            if let Some(session) = model
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                session.permission_mode = mode;
+            }
+            if model
+                .pending_permission_mode
+                .is_some_and(|(pending_id, target, _)| pending_id == session_id && target == mode)
+            {
+                model.pending_permission_mode = None;
+            }
+            sync_selected_permission_mode(model);
+        }
+        SessionUiInput::PermissionModeError { session_id, error } => {
+            if let Some((pending_id, _, previous)) = model.pending_permission_mode
+                && pending_id == session_id
+            {
+                model.pending_permission_mode = None;
+                if let Some(session) = model
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.session_id == session_id)
+                {
+                    session.permission_mode = previous;
+                }
+            }
+            sync_selected_permission_mode(model);
+            let notice = format!("Permission mode rejected: {error}");
+            model.status.clone_from(&notice);
+            model.command_notice = Some(notice);
+            return vec![SessionUiAction::RefreshSnapshots];
+        }
         SessionUiInput::SubmissionAssigned {
             submission_id,
             session_id,
@@ -968,6 +1040,7 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                     model.selected = index;
                 }
                 reconcile_pending_submission(model);
+                sync_selected_permission_mode(model);
             }
         }
         SessionUiInput::SubmissionError { submission_id } => {
@@ -1563,6 +1636,8 @@ fn dispatch_builtin(
             model.sessions.clear();
             model.selected = 0;
             model.active_session = Some(ActiveSession::SessionDraft);
+            model.pending_permission_mode = None;
+            sync_selected_permission_mode(model);
             model.session_picker = false;
             model.model_picker = None;
             model.pending_model_selection = model.startup.as_ref().and_then(|startup| {
@@ -1669,10 +1744,43 @@ fn dispatch_builtin(
     }
 }
 
+fn sync_selected_permission_mode(model: &mut SessionUiModel) {
+    if let Some(session) = model.selected_session() {
+        let session_id = session.session_id;
+        let authoritative = session.permission_mode;
+        if let Some((pending_id, target, _)) = model.pending_permission_mode
+            && pending_id == session_id
+        {
+            if authoritative == target {
+                model.pending_permission_mode = None;
+            }
+            model.permission_mode = target;
+            return;
+        }
+        model.permission_mode = authoritative;
+    } else {
+        model.permission_mode = model.draft_permission_mode;
+    }
+}
+
 fn set_model_permission_mode(model: &mut SessionUiModel, mode: latte_core::PermissionMode) {
-    model.permission_mode = mode;
-    if let Some(startup) = model.startup.as_mut() {
-        startup.permission_mode = mode;
+    if let Some(session_id) = model.selected_session().map(|session| session.session_id) {
+        let previous = model.permission_mode;
+        model.pending_permission_mode = Some((session_id, mode, previous));
+        if let Some(session) = model
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.permission_mode = mode;
+        }
+        model.permission_mode = mode;
+    } else {
+        model.draft_permission_mode = mode;
+        model.permission_mode = mode;
+        if let Some(startup) = model.startup.as_mut() {
+            startup.permission_mode = mode;
+        }
     }
 }
 
@@ -5746,6 +5854,22 @@ fn drain_runtime_updates(
                 switch_id,
                 result: Err(error),
             } => reduce(model, SessionUiInput::ModelSwitchError { switch_id, error }),
+            SessionUiFeedback::PermissionModeResult {
+                session_id,
+                mode,
+                result: Ok(()),
+            } => reduce(
+                model,
+                SessionUiInput::PermissionModeCompleted { session_id, mode },
+            ),
+            SessionUiFeedback::PermissionModeResult {
+                session_id,
+                result: Err(error),
+                ..
+            } => reduce(
+                model,
+                SessionUiInput::PermissionModeError { session_id, error },
+            ),
             SessionUiFeedback::Command(Ok(message)) => {
                 reduce(model, SessionUiInput::CommandCompleted(message))
             }
@@ -5910,6 +6034,7 @@ mod tests {
             session_revision: 1,
             sequence: 1,
             lifecycle,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: SessionProviderBinding {
                 binding_version: 1,
                 provider_name: "p".into(),
@@ -12447,6 +12572,71 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("500 Internal Server Error")
+        );
+
+        // Per-session permission_mode synchronization across session switch + error rollback (#11).
+        let mut sess_a = snapshot(SessionLifecycle::Ready);
+        sess_a.permission_mode = latte_core::PermissionMode::FullAuto;
+        let mut sess_b = snapshot(SessionLifecycle::Ready);
+        sess_b.permission_mode = latte_core::PermissionMode::Ask;
+        let mut mode_model = SessionUiModel::default();
+        reduce(
+            &mut mode_model,
+            SessionUiInput::Snapshot(vec![sess_a.clone(), sess_b.clone()]),
+        );
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::FullAuto
+        );
+
+        // Select session B (Ask) -> status bar reflects Ask!
+        mode_model.selected = 1;
+        sync_selected_permission_mode(&mut mode_model);
+        assert_eq!(mode_model.permission_mode, latte_core::PermissionMode::Ask);
+        assert!(rendered(&mode_model, 110, 28).contains("Ask"));
+
+        // Switch back to session A (FullAuto) -> status bar reflects Full-auto, NOT stale Ask!
+        mode_model.selected = 0;
+        sync_selected_permission_mode(&mut mode_model);
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::FullAuto
+        );
+        assert!(rendered(&mode_model, 110, 28).contains("Full-auto"));
+
+        // Select session B (Ask), press Shift+Tab -> optimistic AutoEdit; server error rolls back to Ask!
+        mode_model.selected = 1;
+        sync_selected_permission_mode(&mut mode_model);
+        let shift_tab_actions = reduce(&mut mode_model, key(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            shift_tab_actions,
+            vec![SessionUiAction::SetPermissionMode {
+                session_id: Some(sess_b.session_id),
+                mode: latte_core::PermissionMode::AutoEdit,
+            }]
+        );
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::AutoEdit
+        );
+        tx.send(SessionUiFeedback::permission_mode(
+            sess_b.session_id,
+            latte_core::PermissionMode::AutoEdit,
+            Err("permission mode RPC failed".into()),
+        ))
+        .unwrap();
+        let _ = drain_runtime_updates(&mut mode_model, &rx, &prx);
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::Ask,
+            "failed SetPermissionMode must roll back to session's authoritative mode"
+        );
+        assert!(
+            mode_model
+                .command_notice
+                .as_deref()
+                .unwrap()
+                .contains("permission mode RPC failed")
         );
     }
 }

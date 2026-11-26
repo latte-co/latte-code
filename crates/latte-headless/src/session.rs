@@ -665,6 +665,18 @@ impl SessionRuntimeService {
         self.engine.set_session_permission_mode(session_id, mode);
     }
 
+    /// Durably updates the permission posture for an existing session and
+    /// returns the updated authoritative snapshot.
+    pub fn set_permission_mode_checked(
+        &self,
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        self.engine
+            .set_session_permission_mode_v2(session_id, mode)
+            .map_err(SessionRuntimeError::from)
+    }
+
     /// Reads the active permission posture for `session_id`.
     #[must_use]
     pub fn permission_mode(&self, session_id: SessionId) -> latte_core::PermissionMode {
@@ -1070,7 +1082,7 @@ impl SessionRuntimeService {
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let runner = self.begin_runner(session_id)?;
         let snapshot = match self
-            .start_one(None, session_id, prompt, binding, focus, None)
+            .start_one(None, session_id, prompt, binding, focus, None, None)
             .await?
         {
             latte_core::CreateOutcome::Created(snapshot)
@@ -1097,6 +1109,25 @@ impl SessionRuntimeService {
             Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        self.start_accepted_with_mode(session_id, command_id, prompt, binding, focus, None, accept)
+            .await
+    }
+
+    /// Like [`Self::start_accepted`], applying `permission_mode` atomically
+    /// only when a fresh session is durably created (`CreateOutcome::Created`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_accepted_with_mode(
+        &self,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: String,
+        binding: SessionProviderBinding,
+        focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
         let runner = match self.begin_runner(session_id) {
             Ok(runner) => runner,
             Err(error) => {
@@ -1113,6 +1144,7 @@ impl SessionRuntimeService {
                 prompt,
                 binding,
                 focus,
+                permission_mode,
                 Some(accept),
             )
             .await?;
@@ -1142,18 +1174,21 @@ impl SessionRuntimeService {
         prompt: &str,
         binding: &SessionProviderBinding,
         focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
     ) -> Result<Option<SessionSnapshot>, SessionRuntimeError> {
         self.engine
-            .lookup_create_replay(
+            .lookup_create_replay_with_mode(
                 command_id,
                 session_id,
                 prompt,
                 binding,
                 focus.and_then(|focus| focus.to_str()),
+                permission_mode,
             )
             .map_err(SessionRuntimeError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_one(
         &self,
         command_id: Option<SessionCommandId>,
@@ -1161,6 +1196,7 @@ impl SessionRuntimeService {
         prompt: String,
         binding: SessionProviderBinding,
         focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
         accept: Option<
             oneshot::Sender<
                 Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
@@ -1187,7 +1223,14 @@ impl SessionRuntimeService {
         // acquiring the lease. A retry after a crash hits the record and
         // replays without blocking on the dead owner's still-unexpired lease.
         if let Some(command_id) = &command_id {
-            match self.durable_replay(command_id, session_id, &prompt, &binding, focus) {
+            match self.durable_replay(
+                command_id,
+                session_id,
+                &prompt,
+                &binding,
+                focus,
+                permission_mode,
+            ) {
                 Ok(Some(snapshot)) => {
                     signal_accept(
                         accept,
@@ -1219,12 +1262,13 @@ impl SessionRuntimeService {
         // never replay, but the create contract is uniform).
         let create_command_id =
             command_id.unwrap_or_else(|| SessionCommandId::from_uuid(Uuid::now_v7()));
-        let started = match self.engine.create_started_session_v2(
+        let started = match self.engine.create_started_session_v2_with_mode(
             &create_command_id,
             session_id,
             turn_id,
             binding,
             &prompt,
+            permission_mode,
             &lease,
             now,
             focus.and_then(|f| f.to_str()),
@@ -1321,6 +1365,7 @@ impl SessionRuntimeService {
                 prompt,
                 Some(command_id),
                 None,
+                None,
             )
             .await?
         {
@@ -1345,6 +1390,30 @@ impl SessionRuntimeService {
             Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        self.follow_up_accepted_with_mode(
+            session_id,
+            command_id,
+            expected_session_revision,
+            prompt,
+            None,
+            accept,
+        )
+        .await
+    }
+
+    /// Like [`Self::follow_up_accepted`], applying `permission_mode` atomically
+    /// only when the follow-up turn is durably created (`CreateOutcome::Created`).
+    pub async fn follow_up_accepted_with_mode(
+        &self,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        expected_session_revision: u64,
+        prompt: String,
+        permission_mode: Option<latte_core::PermissionMode>,
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
         let runner = match self.begin_runner_when_settled(session_id).await {
             Ok(runner) => runner,
             Err(error) => {
@@ -1358,6 +1427,7 @@ impl SessionRuntimeService {
                 expected_session_revision,
                 prompt,
                 Some(command_id),
+                permission_mode,
                 Some(accept),
             )
             .await?;
@@ -1383,6 +1453,7 @@ impl SessionRuntimeService {
         expected_session_revision: u64,
         prompt: String,
         command_id: Option<SessionCommandId>,
+        permission_mode: Option<latte_core::PermissionMode>,
         accept: Option<
             oneshot::Sender<
                 Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
@@ -1402,11 +1473,12 @@ impl SessionRuntimeService {
         // still-unexpired lease, and without failing the revision fence (the
         // client's expected revision predates the accepted follow-up).
         if let Some(command_id) = &command_id {
-            match self.engine.lookup_follow_up_replay(
+            match self.engine.lookup_follow_up_replay_with_mode(
                 command_id,
                 session_id,
                 expected_session_revision,
                 &prompt,
+                permission_mode,
             ) {
                 Ok(Some(snapshot)) => {
                     signal_accept(
@@ -1468,12 +1540,13 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        let started = match self.engine.create_started_session_follow_up_v2(
+        let started = match self.engine.create_started_session_follow_up_v2_with_mode(
             command_id.as_ref(),
             session_id,
             turn_id,
             expected_session_revision,
             &prompt,
+            permission_mode,
             &lease,
             now_ms(),
         ) {
@@ -1736,6 +1809,7 @@ impl SessionRuntimeService {
                             snapshot.session_revision,
                             prompt,
                             Some(command_id),
+                            None,
                             None,
                         )
                         .await?
@@ -2934,16 +3008,35 @@ impl SessionRuntimeService {
             return Ok(None);
         };
         let budget = profile.history_policy().budget().unwrap_or(0);
+        let max_source_bytes = profile.compaction().max_summary_source_bytes;
         let (messages, tools) = if profile.compaction().reuse_prefix
             && let Some(prefix) = warm_prefix.filter(|p| !p.is_empty())
         {
+            let history_slice: Vec<Message> = prefix
+                .iter()
+                .enumerate()
+                .filter(|(idx, msg)| {
+                    if *idx == 0 && matches!(msg, Message::System { .. }) {
+                        return false;
+                    }
+                    if let Message::User { content } = msg
+                        && content.starts_with("<repository-context>\n")
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .map(|(_, msg)| msg.clone())
+                .collect();
+            let within_source_cap =
+                wire_bytes(&history_slice).is_ok_and(|bytes| bytes <= max_source_bytes);
             let mut candidate = prefix.to_vec();
             candidate.push(Message::User {
                 content: format!(
                     "{instructions}\n[Summarize the conversation turns above according to these instructions.]"
                 ),
             });
-            if wire_bytes(&candidate).is_ok_and(|bytes| bytes <= budget) {
+            if within_source_cap && wire_bytes(&candidate).is_ok_and(|bytes| bytes <= budget) {
                 (candidate, self.engine.tool_descriptors())
             } else {
                 (
@@ -3169,6 +3262,104 @@ impl SessionRuntimeService {
     /// provider-grammar rules shared by every scan path. Compact-summary and
     /// tool-result-elision cards are handled by
     /// [`Self::scan_history_segments`] directly and never reach this fold.
+    fn apply_tool_result_entry(
+        segments: &mut [HistorySegment],
+        entry: &latte_core::TranscriptEntry,
+        elided: &std::collections::HashSet<u64>,
+    ) {
+        let Some(payload) = entry.payload.as_ref() else {
+            return;
+        };
+        let (Some(tool_call_id), Some(original)) = (
+            payload
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
+            payload
+                .get("provider_content")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            return;
+        };
+        // A `tool` message is only legal as the answer to a call the assistant
+        // actually made. Repaired `ToolResult` cards are appended at tail
+        // sequence after later turns or final assistant cards, so route by
+        // `entry.turn_id` + declared `tool_call_id` into the exact assistant
+        // batch rather than blindly appending to `segments.last_mut()`.
+        let last_idx = segments.len().checked_sub(1);
+        let Some((seg_idx, segment)) = segments.iter_mut().enumerate().rev().find(|(_, seg)| {
+            !seg.from_summary
+                && (entry.turn_id.is_none() || seg.turn_id == entry.turn_id)
+                && declared_tool_call(&seg.messages, tool_call_id)
+        }) else {
+            return;
+        };
+        if segment.messages.iter().any(|msg| {
+            matches!(
+                msg,
+                Message::Tool {
+                    tool_call_id: existing,
+                    ..
+                } if existing == tool_call_id
+            )
+        }) {
+            return;
+        }
+        let name = payload.get("name").and_then(serde_json::Value::as_str);
+        let content = if elided.contains(&entry.sequence) {
+            Self::elided_tool_skeleton(name, original, payload)
+        } else {
+            original.to_owned()
+        };
+        let insert_idx = segment
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, msg)| match msg {
+                Message::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .position(|call| call.id == tool_call_id)
+                    .map(|call_pos| (idx, tool_calls.clone(), call_pos)),
+                _ => None,
+            })
+            .map_or(
+                segment.messages.len(),
+                |(assistant_idx, calls, call_pos)| {
+                    let mut idx = assistant_idx + 1;
+                    while let Some(Message::Tool {
+                        tool_call_id: existing_id,
+                        ..
+                    }) = segment.messages.get(idx)
+                    {
+                        let existing_pos = calls
+                            .iter()
+                            .position(|call| call.id == *existing_id)
+                            .unwrap_or(usize::MAX);
+                        if existing_pos > call_pos {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    idx
+                },
+            );
+        segment.messages.insert(
+            insert_idx,
+            Message::Tool {
+                tool_call_id: tool_call_id.into(),
+                name: name.map(str::to_owned),
+                content: content.clone(),
+            },
+        );
+        let seq_for_bounds = if Some(seg_idx) == last_idx {
+            entry.sequence
+        } else {
+            segment.max_sequence.unwrap_or(entry.sequence)
+        };
+        segment.push_tool_result(entry.sequence, tool_call_id);
+        segment.push_text(&format!("[tool]\n{content}\n"), seq_for_bounds);
+    }
+
     fn apply_entry(
         segments: &mut Vec<HistorySegment>,
         entry: &latte_core::TranscriptEntry,
@@ -3219,39 +3410,7 @@ impl SessionRuntimeService {
                 }
             }
             TranscriptKind::ToolResult => {
-                if let Some(segment) = segments.last_mut()
-                        && let Some(payload) = entry.payload.as_ref()
-                        && let (Some(tool_call_id), Some(original)) = (
-                            payload
-                                .get("tool_call_id")
-                                .and_then(serde_json::Value::as_str),
-                            payload
-                                .get("provider_content")
-                                .and_then(serde_json::Value::as_str),
-                        )
-                        // A `tool` message is only legal as the answer to a
-                        // call the assistant actually made. Engine-initiated
-                        // effects — verification above all — are recorded as
-                        // tool results with an id we minted, which the model
-                        // never declared; replaying one makes every later turn
-                        // of the Session a protocol violation the Provider
-                        // rejects outright.
-                        && declared_tool_call(&segment.messages, tool_call_id)
-                {
-                    let name = payload.get("name").and_then(serde_json::Value::as_str);
-                    let content = if elided.contains(&entry.sequence) {
-                        Self::elided_tool_skeleton(name, original, payload)
-                    } else {
-                        original.to_owned()
-                    };
-                    segment.push_message(Message::Tool {
-                        tool_call_id: tool_call_id.into(),
-                        name: name.map(str::to_owned),
-                        content: content.clone(),
-                    });
-                    segment.push_tool_result(entry.sequence, tool_call_id);
-                    segment.push_text(&format!("[tool]\n{content}\n"), entry.sequence);
-                }
+                Self::apply_tool_result_entry(segments, entry, elided);
             }
             TranscriptKind::Failure
                 if entry.payload.as_ref().is_some_and(|payload| {
@@ -3797,7 +3956,8 @@ impl SessionRuntimeService {
         }
         let content_absent = response.message.is_none();
         let reasoning_content = response.reasoning_content().map(redact_session_text);
-        let thinking_blocks = redact_thinking_blocks(&response.thinking_blocks());
+        let raw_thinking_blocks = response.thinking_blocks();
+        let redacted_thinking_blocks = redact_thinking_blocks(&raw_thinking_blocks);
         let assistant_text = response.message.clone().unwrap_or_default();
         let first_tool_call_id = response.tool_calls[0].id.clone();
         let tool_calls = response.tool_calls;
@@ -3812,8 +3972,8 @@ impl SessionRuntimeService {
         if let Some(reasoning) = &reasoning_content {
             payload_obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
         }
-        if !thinking_blocks.is_empty()
-            && let Ok(serialized) = serde_json::to_value(&thinking_blocks)
+        if !redacted_thinking_blocks.is_empty()
+            && let Ok(serialized) = serde_json::to_value(&redacted_thinking_blocks)
         {
             payload_obj["thinking_blocks"] = serialized;
         }
@@ -3833,10 +3993,13 @@ impl SessionRuntimeService {
             },
             lease,
         )?;
+        // Keep exact signed `thinking_blocks` in memory for immediate tool-round
+        // continuations so Anthropic signature verification succeeds while the
+        // durable transcript stores only `redacted_thinking_blocks`.
         messages.push(Message::Assistant {
             content: response.message,
             reasoning_content,
-            thinking_blocks,
+            thinking_blocks: raw_thinking_blocks,
             tool_calls: tool_calls.clone(),
         });
         let round = ToolRound {
@@ -9629,6 +9792,7 @@ mod tests {
             session_revision: 1,
             sequence: 1,
             lifecycle: SessionLifecycle::Running,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: SessionProviderBinding {
                 binding_version: 2,
                 provider_name: String::new(),
@@ -14926,5 +15090,638 @@ mod tests {
                 && last_request.contains("error"),
             "observed tool error and remaining round-2 call must reach the next provider request: {last_request}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mid_turn_cold_prefix_compaction_and_lease_loss_recovery_boundaries() {
+        use crate::{
+            profile::ProfileCatalog,
+            provider::{ProviderUsage, ToolCall},
+            registry::ProviderRegistry,
+        };
+        use latte_core::{
+            CompactionPolicy, CompactionStrategy, ContextPolicy, IdSource, PermissionMode,
+            SystemIdSource,
+        };
+        use std::collections::VecDeque;
+
+        struct SeqProv(Arc<std::sync::Mutex<VecDeque<Result<ProviderResponse, ProviderError>>>>);
+        impl Provider for SeqProv {
+            fn complete(
+                &self,
+                _req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                let res = self.0.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { res })
+            }
+        }
+
+        struct LeaseStealProv {
+            engine: EngineHandle,
+            session_id: SessionId,
+        }
+        impl Provider for LeaseStealProv {
+            fn complete(
+                &self,
+                _req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                let engine = self.engine.clone();
+                let sid = self.session_id;
+                Box::pin(async move {
+                    let _ = engine.acquire_session_lease(sid, u64::MAX / 4, 60_000);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(ProviderResponse {
+                        message: Some("late".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                })
+            }
+        }
+
+        let mid_ws = tempfile::tempdir().unwrap();
+        std::fs::write(mid_ws.path().join("big.txt"), "X".repeat(3_600)).unwrap();
+        let mid_engine = EngineBuilder::new()
+            .workspace_root(mid_ws.path())
+            .permission_mode(PermissionMode::FullAuto)
+            .build()
+            .unwrap();
+        let mid_desc = mid_engine.tool_descriptors();
+        let mid_reg = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"oai/m",providers:{oai:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9/v1/chat/completions",api_key:"k"}}}"#,
+            )
+            .unwrap(),
+        );
+        let mid_binding = mid_reg.session_binding_for_default(&mid_desc).unwrap();
+        let mid_policy = SessionHistoryPolicy {
+            max_request_bytes: 9_216,
+            max_input_bytes: 9_216,
+            reserved_output_bytes: 512,
+            context_cap_bytes: 1_024,
+            provider_timeout_ms: 2_000,
+            max_tool_rounds: Some(8),
+        };
+        let mid_compaction = CompactionPolicy {
+            strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+            max_summary_source_bytes: 16_384,
+            trigger_ratio: 45,
+            retain_ratio: 1,
+            reuse_prefix: false,
+            ..CompactionPolicy::default()
+        };
+        let mid_cat = Arc::new(
+            ProfileCatalog::new(
+                ContextPolicy {
+                    max_request_bytes: 9_216,
+                    max_input_bytes: 9_216,
+                    reserved_output_bytes: 512,
+                    context_cap_bytes: 1_024,
+                    max_tool_rounds: Some(8),
+                    provider_timeout_ms: 2_000,
+                    compaction: mid_compaction,
+                    ..ContextPolicy::default()
+                },
+                Arc::clone(&mid_reg),
+            )
+            .unwrap(),
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t1-l".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("A".repeat(1_800)),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-r".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "big.txt"}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Err(ProviderError::Transport(
+                "mid-turn summary transient".into(),
+            )),
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-l2".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("cold-prefix mid-turn summary".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("turn2 done".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+        ])));
+        let seq_prov: Arc<dyn Provider> = Arc::new(SeqProv(calls));
+        let reg_for_mid = Arc::clone(&mid_reg);
+        let desc_for_mid = mid_desc.clone();
+        let mid_svc = SessionRuntimeService::new(
+            mid_engine.clone(),
+            mid_ws.path(),
+            mid_policy,
+            Arc::new(move |sel| {
+                let res = reg_for_mid
+                    .resolve_session_bound(sel, &desc_for_mid)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&seq_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_profile_catalog(mid_cat);
+
+        let m_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let s1 = mid_svc
+            .start(m_sid, "seed history".into(), mid_binding.clone(), None)
+            .await
+            .unwrap();
+        let s2 = mid_svc
+            .follow_up(
+                m_sid,
+                s1.session_revision,
+                "trigger mid-turn summarize".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(s2.lifecycle, SessionLifecycle::Ready);
+        assert!(
+            s2.transcript
+                .entries
+                .iter()
+                .any(|e| e.kind == TranscriptKind::CompactSummary)
+        );
+
+        let steal_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let steal_prov: Arc<dyn Provider> = Arc::new(LeaseStealProv {
+            engine: mid_engine.clone(),
+            session_id: steal_sid,
+        });
+        let reg_for_steal = Arc::clone(&mid_reg);
+        let steal_svc = SessionRuntimeService::new(
+            mid_engine,
+            mid_ws.path(),
+            SessionHistoryPolicy::default(),
+            Arc::new(move |sel| {
+                let res = reg_for_steal
+                    .resolve_session_bound(sel, &mid_desc)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&steal_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_lease_ttl_ms(20);
+        assert!(
+            steal_svc
+                .start(steal_sid, "lose lease".into(), mid_binding, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn repaired_tail_tool_result_signed_thinking_redaction_and_warm_prefix_source_cap_regressions()
+     {
+        use crate::{
+            profile::ProfileCatalog,
+            provider::{ProviderUsage, ThinkingBlock, ToolCall},
+            registry::ProviderRegistry,
+        };
+        use latte_core::{
+            CompactionPolicy, CompactionStrategy, ContextPolicy, IdSource, PermissionMode,
+            SessionTurnStatus, SessionTurnSummary, SystemIdSource, TranscriptEntry,
+            TranscriptEntryId, TurnId,
+        };
+
+        struct RecordingProv {
+            reqs: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+            replies: std::sync::Mutex<std::collections::VecDeque<ProviderResponse>>,
+        }
+        impl Provider for RecordingProv {
+            fn complete(
+                &self,
+                req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                self.reqs.lock().unwrap().push(req);
+                let reply = self.replies.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { Ok(reply) })
+            }
+        }
+
+        let ids = SystemIdSource::default();
+
+        // 1. Repaired tail ToolResult from Turn 1 projects back into Turn 1's exact assistant batch (#8).
+        let t1 = TurnId::from_uuid(ids.next_uuid_v7());
+        let t2 = TurnId::from_uuid(ids.next_uuid_v7());
+        let mk_entry =
+            |seq: u64,
+             tid: Option<TurnId>,
+             kind: TranscriptKind,
+             text: &str,
+             payload: Option<serde_json::Value>| TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+                sequence: seq,
+                turn_id: tid,
+                kind,
+                text: text.into(),
+                payload,
+                source_key: format!("k:{seq}"),
+                created_at_ms: seq,
+            };
+        let mut snap = SessionSnapshot {
+            session_id: SessionId::from_uuid(ids.next_uuid_v7()),
+            session_revision: 7,
+            sequence: 7,
+            lifecycle: SessionLifecycle::Ready,
+            permission_mode: PermissionMode::Ask,
+            binding: binding(),
+            latest_turn_id: Some(t2),
+            active_turn_id: None,
+            pending: None,
+            turns: vec![
+                SessionTurnSummary {
+                    turn_id: t1,
+                    parent_turn_id: None,
+                    turn_ordinal: 0,
+                    status: SessionTurnStatus::Completed,
+                    turn_revision: 3,
+                    failure_code: None,
+                    completed_at_ms: Some(4),
+                },
+                SessionTurnSummary {
+                    turn_id: t2,
+                    parent_turn_id: Some(t1),
+                    turn_ordinal: 1,
+                    status: SessionTurnStatus::Completed,
+                    turn_revision: 2,
+                    failure_code: None,
+                    completed_at_ms: Some(6),
+                },
+            ],
+            transcript: latte_core::TranscriptPage {
+                entries: vec![
+                    mk_entry(1, Some(t1), TranscriptKind::User, "turn-1 prompt", None),
+                    mk_entry(
+                        2,
+                        Some(t1),
+                        TranscriptKind::Assistant,
+                        "",
+                        Some(serde_json::json!({
+                            "content_absent": true,
+                            "round_id": 1,
+                            "tool_calls": [
+                                {"id": "call-missing", "name": "read_file", "input": {"path": "a.txt"}},
+                                {"id": "call-present", "name": "read_file", "input": {"path": "b.txt"}}
+                            ]
+                        })),
+                    ),
+                    mk_entry(
+                        3,
+                        Some(t1),
+                        TranscriptKind::ToolResult,
+                        "b-ok",
+                        Some(serde_json::json!({
+                            "tool_call_id": "call-present",
+                            "name": "read_file",
+                            "provider_content": "B_CONTENT"
+                        })),
+                    ),
+                    mk_entry(4, Some(t1), TranscriptKind::Assistant, "turn-1 final", None),
+                    mk_entry(5, Some(t2), TranscriptKind::User, "turn-2 prompt", None),
+                    mk_entry(6, Some(t2), TranscriptKind::Assistant, "turn-2 final", None),
+                    // Appended at tail sequence 7 during startup repair!
+                    mk_entry(
+                        7,
+                        Some(t1),
+                        TranscriptKind::ToolResult,
+                        "repaired-a",
+                        Some(serde_json::json!({
+                            "tool_call_id": "call-missing",
+                            "name": "read_file",
+                            "provider_content": "REPAIRED_A_CONTENT",
+                            "repaired_from_observation": true
+                        })),
+                    ),
+                ],
+                next_after: None,
+                has_more: false,
+            },
+            focus: None,
+        };
+        let segments = SessionRuntimeService::scan_history_segments(&snap);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].max_sequence, Some(4));
+        assert_eq!(segments[0].messages.len(), 5);
+        assert!(matches!(
+            &segments[0].messages[2],
+            Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call-missing" && content == "REPAIRED_A_CONTENT"
+        ));
+        assert!(matches!(
+            &segments[0].messages[3],
+            Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call-present" && content == "B_CONTENT"
+        ));
+        assert!(matches!(
+            &segments[0].messages[4],
+            Message::Assistant { content: Some(text), .. } if text == "turn-1 final"
+        ));
+        assert_eq!(segments[1].messages.len(), 2);
+
+        // Duplicate repaired card is ignored cleanly.
+        snap.transcript.entries.push(mk_entry(
+            8,
+            Some(t1),
+            TranscriptKind::ToolResult,
+            "dup",
+            Some(serde_json::json!({
+                "tool_call_id": "call-missing",
+                "name": "read_file",
+                "provider_content": "DUP",
+                "repaired_from_observation": true
+            })),
+        ));
+        assert_eq!(
+            SessionRuntimeService::scan_history_segments(&snap)[0]
+                .messages
+                .len(),
+            5
+        );
+
+        // 2. Signed thinking block containing secret token preserves signature in-memory for tool round
+        //    while redacting persisted transcript (#13).
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello\n").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(ws.path())
+            .build()
+            .unwrap();
+        let captured_requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs_clone = Arc::clone(&captured_requests);
+        let prov: Arc<dyn Provider> = Arc::new(RecordingProv {
+            reqs: reqs_clone,
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-think-1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "note.txt"}),
+                    }],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: Some(serde_json::json!({
+                        "thinking_blocks": [ThinkingBlock::Thinking {
+                            thinking: "inspecting token=secret-value-12345678901234567890".into(),
+                            signature: Some("sig-opaque-1".into()),
+                        }]
+                    })),
+                },
+                ProviderResponse {
+                    message: Some("completed after signed thinking".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ])),
+        });
+        let prov_for_factory = Arc::clone(&prov);
+        let svc = SessionRuntimeService::new(
+            engine,
+            ws.path(),
+            SessionHistoryPolicy::default(),
+            Arc::new(move |_| {
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&prov_for_factory),
+                    binding: crate::registry::ProviderModelBinding::direct(&[]),
+                })
+            }),
+        );
+        let think_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let think_snap = svc
+            .start(think_sid, "run tool with thinking".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(think_snap.lifecycle, SessionLifecycle::Ready);
+        let round2_req = captured_requests.lock().unwrap()[1].clone();
+        let asst_in_round2 = round2_req
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant {
+                    thinking_blocks, ..
+                } if !thinking_blocks.is_empty() => Some(thinking_blocks.clone()),
+                _ => None,
+            })
+            .expect("round 2 must receive the exact signed thinking block");
+        assert_eq!(
+            asst_in_round2,
+            vec![ThinkingBlock::Thinking {
+                thinking: "inspecting token=secret-value-12345678901234567890".into(),
+                signature: Some("sig-opaque-1".into()),
+            }]
+        );
+        // Meanwhile, the durable transcript entry MUST be redacted and have signature cleared!
+        let persisted_asst = think_snap
+            .transcript
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind == TranscriptKind::Assistant
+                    && e.payload
+                        .as_ref()
+                        .and_then(|p| p.get("thinking_blocks"))
+                        .is_some()
+            })
+            .unwrap();
+        let persisted_payload = serde_json::to_string(&persisted_asst.payload).unwrap();
+        assert!(!persisted_payload.contains("secret-value-12345678901234567890"));
+        assert!(!persisted_payload.contains("sig-opaque-1"));
+
+        // 3. Warm-prefix summarizer (`reuse_prefix: true`) honors `max_summary_source_bytes` (#14).
+        let cap_ws = tempfile::tempdir().unwrap();
+        let cap_engine = EngineBuilder::new()
+            .workspace_root(cap_ws.path())
+            .build()
+            .unwrap();
+        let cap_desc = cap_engine.tool_descriptors();
+        let cap_reg = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"claude/m",providers:{claude:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1/",api_key:"k"}}}"#,
+            )
+            .unwrap(),
+        );
+        let cap_binding = cap_reg.session_binding_for_default(&cap_desc).unwrap();
+        let cap_cat = Arc::new(
+            ProfileCatalog::new(
+                ContextPolicy {
+                    max_request_bytes: 64_000,
+                    max_input_bytes: 64_000,
+                    reserved_output_bytes: 1_024,
+                    context_cap_bytes: 4_096,
+                    compaction: CompactionPolicy {
+                        strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                        max_summary_source_bytes: 512,
+                        trigger_ratio: 95,
+                        retain_ratio: 1,
+                        reuse_prefix: true,
+                        ..CompactionPolicy::default()
+                    },
+                    ..ContextPolicy::default()
+                },
+                Arc::clone(&cap_reg),
+            )
+            .unwrap(),
+        );
+        let cap_reqs: Arc<std::sync::Mutex<Vec<ProviderRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap_reqs_clone = Arc::clone(&cap_reqs);
+        let cap_prov: Arc<dyn Provider> = Arc::new(RecordingProv {
+            reqs: cap_reqs_clone,
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ProviderResponse {
+                    message: Some("LARGE_TURN_ONE_".repeat(120)),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                ProviderResponse {
+                    message: Some("turn two answer".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                ProviderResponse {
+                    message: Some("bounded summary".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ])),
+        });
+        let reg_for_cap = Arc::clone(&cap_reg);
+        let cap_svc = SessionRuntimeService::new(
+            cap_engine,
+            cap_ws.path(),
+            SessionHistoryPolicy {
+                max_request_bytes: 64_000,
+                max_input_bytes: 64_000,
+                reserved_output_bytes: 1_024,
+                context_cap_bytes: 4_096,
+                ..SessionHistoryPolicy::default()
+            },
+            Arc::new(move |sel| {
+                let res = reg_for_cap
+                    .resolve_session_bound(sel, &cap_desc)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&cap_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_profile_catalog(cap_cat);
+        let c_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let c1 = cap_svc
+            .start(c_sid, "first prompt".into(), cap_binding, None)
+            .await
+            .unwrap();
+        let _c2 = cap_svc
+            .follow_up(c_sid, c1.session_revision, "second prompt".into())
+            .await
+            .unwrap();
+        let compacted = cap_svc.compact_session(c_sid).await.unwrap();
+        assert!(matches!(
+            compacted.state,
+            latte_core::ManualCompactionState::Compacted { .. }
+        ));
+        let summary_req = &cap_reqs.lock().unwrap()[2];
+        // Because Turn 1 exceeded `max_summary_source_bytes = 512`, `reuse_prefix` MUST NOT send
+        // the multi-message warm prefix; it must fall back to `[System, User("<conversation_to_summarize>...")]`!
+        assert_eq!(
+            summary_req.messages.len(),
+            2,
+            "warm-prefix exceeding max_summary_source_bytes must fall back to bounded source_text: {:?}",
+            summary_req.messages
+        );
+        assert!(summary_req.tools.is_empty());
+        let summary_user = summary_req.messages[1].content().unwrap();
+        assert!(summary_user.contains("LARGE_TURN_ONE_"));
+        assert!(summary_user.len() <= 512, "len={}", summary_user.len());
     }
 }

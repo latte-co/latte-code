@@ -1067,3 +1067,208 @@ fn anthropic_bash_allows_readonly_inspection_and_denies_catastrophic_argv() {
         "{second_wire}"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_git_diff_deny_globs_fsmonitor_symlink_head_and_empty_workspace_verification() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    // 1. Symlinked `.git/HEAD` outside workspace is never leaked into `<repository-context>` (#9).
+    let sym_ws = Scenario::new();
+    std::fs::create_dir_all(sym_ws.root().join(".git")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_head = outside.path().join("HEAD");
+    std::fs::write(&outside_head, "ref: refs/heads/secret-outside-branch\n").unwrap();
+    let head_path = sym_ws.root().join(".git/HEAD");
+    if head_path.exists() {
+        std::fs::remove_file(&head_path).unwrap();
+    }
+    symlink(&outside_head, &head_path).unwrap();
+    let sym_prov = ScriptedProvider::start([ProviderReply::completion("sym-ok")]);
+    sym_ws.write_config(sym_prov.endpoint(), r#"["/usr/bin/true"]"#);
+    let sym_out = sym_ws.output(&["--json", "run", "check overview"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(sym_out.status.success());
+    let sym_req = serde_json::to_string(&sym_prov.requests()[0].body).unwrap();
+    assert!(
+        !sym_req.contains("secret-outside-branch"),
+        "external symlinked .git/HEAD must never enter provider request: {sym_req}"
+    );
+
+    // 2. `GitDiff` filters disallowed/external-symlink paths (#3) and `Ask`-mode `git status` neutralizes `core.fsmonitor` (#4).
+    let git_ws = Scenario::new();
+    let outside_secret = outside.path().join("outside_secret.txt");
+    std::fs::write(&outside_secret, "OUTSIDE_SYMLINK_SECRET\n").unwrap();
+    std::fs::write(git_ws.root().join("public.txt"), "pub-v1\n").unwrap();
+    std::fs::write(git_ws.root().join("escaped.txt"), "before-symlink\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."][..],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "c1",
+        ][..],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(git_ws.root())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(git_ws.root().join("public.txt"), "pub-v2\n").unwrap();
+    std::fs::remove_file(git_ws.root().join("escaped.txt")).unwrap();
+    symlink(&outside_secret, git_ws.root().join("escaped.txt")).unwrap();
+    symlink(&outside_secret, git_ws.root().join("untracked_escape.pem")).unwrap();
+
+    let marker = outside.path().join("fsmonitor-pwned");
+    let helper = outside.path().join("evil-fsmonitor.sh");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["config", "core.fsmonitor", helper.to_str().unwrap()])
+            .current_dir(git_ws.root())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let r1 = r#"{"type":"message","content":[
+        {"type":"tool_use","id":"g1","name":"GitDiff","input":{}},
+        {"type":"tool_use","id":"g2","name":"Bash","input":{"argv":["git","status","--short"]}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":10}}"#;
+    let r2 = r#"{"type":"message","content":[{"type":"text","text":"checked git safely"}],"stop_reason":"end_turn","usage":{"input_tokens":15,"output_tokens":6}}"#;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap_clone = std::sync::Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        for body in [r1, r2] {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut end = None;
+            let mut len = 0_usize;
+            loop {
+                let mut buf = [0_u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if end.is_none()
+                    && let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    end = Some(p + 4);
+                    for line in String::from_utf8_lossy(&raw[..p + 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(e) = end
+                    && raw.len() >= e + len
+                {
+                    break;
+                }
+            }
+            let e = end.unwrap();
+            cap_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&raw[e..e + len]).unwrap());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    std::fs::create_dir_all(git_ws.home().join(".latte")).unwrap();
+    let ep = format!("http://{addr}/v1/messages");
+    std::fs::write(
+        git_ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"claude/m",providers:{{claude:{{type:"anthropic-messages",models:["m"],endpoint:{ep:?},api_key:"k",streaming:false}}}}}}"#
+        ),
+    )
+    .unwrap();
+    // Run in default `Ask` mode (NO `--auto`!): both `GitDiff` and safe `git status` auto-allow,
+    // without executing `core.fsmonitor` and without leaking disallowed paths!
+    let git_out = git_ws.output(&["--json", "run", "inspect repo"], |_| {});
+    assert!(
+        git_out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&git_out.stdout),
+        String::from_utf8_lossy(&git_out.stderr)
+    );
+    handle.join().unwrap();
+    assert!(
+        !marker.exists(),
+        "auto-allowed git status must not execute repo core.fsmonitor"
+    );
+    let req2 = &captured.lock().unwrap()[1];
+    let g1_result = req2["messages"][2]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    assert!(g1_result.contains("pub-v2"), "{g1_result}");
+    assert!(!g1_result.contains("escaped.txt"), "{g1_result}");
+    assert!(!g1_result.contains("OUTSIDE_SYMLINK_SECRET"), "{g1_result}");
+    assert!(!g1_result.contains("untracked_escape.pem"), "{g1_result}");
+
+    // 3. Empty workspace with two processes in the same turn preserves `{}` baseline and runs required verification (#6).
+    let empty_ws = Scenario::new();
+    let verify_marker = outside.path().join("empty-ws-verified");
+    let empty_prov = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "p1-create",
+            "process",
+            &serde_json::json!({"shell": "printf 'created\\n' > first_created.txt"}),
+        ),
+        ProviderReply::tool_call("p2-noop", "process", &serde_json::json!({"shell": "true"})),
+        ProviderReply::completion("created file in empty workspace"),
+    ]);
+    let empty_ep = empty_prov.endpoint();
+    let ver_cmd = format!(
+        "test -f first_created.txt && touch {}",
+        verify_marker.display()
+    );
+    std::fs::create_dir_all(empty_ws.home().join(".latte")).unwrap();
+    std::fs::write(
+        empty_ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"p/m",providers:{{p:{{type:"openai-chat",models:["m"],endpoint:{empty_ep:?},api_key:"k"}}}},verification:{{argv:["/bin/sh","-c",{ver_cmd:?}]}}}}"#
+        ),
+    )
+    .unwrap();
+    let empty_out = empty_ws.output(&["--json", "run", "--auto", "bootstrap empty ws"], |_| {});
+    assert!(
+        empty_out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&empty_out.stdout),
+        String::from_utf8_lossy(&empty_out.stderr)
+    );
+    assert!(
+        verify_marker.exists(),
+        "configured verification MUST execute when first process creates a file in an empty workspace"
+    );
+    let empty_json = json(&empty_out);
+    assert_eq!(empty_json["status"], "completed");
+}

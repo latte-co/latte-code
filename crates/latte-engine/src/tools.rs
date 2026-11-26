@@ -96,6 +96,7 @@ pub(crate) struct Prepared {
     effect: EffectClass,
     action: Action,
     expected_hash: Option<String>,
+    snapshot_scope: String,
 }
 enum Action {
     Read {
@@ -288,6 +289,7 @@ impl Tool for Builtin {
             effect,
             action,
             expected_hash: None,
+            snapshot_scope: String::new(),
         })
     }
 }
@@ -389,7 +391,7 @@ pub(crate) struct ToolRegistry {
     database_path: Option<std::path::PathBuf>,
     policy: PermissionPolicy,
     tools: BTreeMap<String, Box<dyn Tool>>,
-    snapshots: Mutex<BTreeMap<String, FileIdentity>>,
+    snapshots: Mutex<BTreeMap<(String, String), FileIdentity>>,
     #[cfg(test)]
     approvals: Mutex<BTreeMap<String, PendingApproval>>,
 }
@@ -714,9 +716,57 @@ impl ToolRegistry {
     pub(crate) fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.tools.values().map(|t| t.descriptor()).collect()
     }
+    pub(crate) fn resolve_session_mutation_authority(
+        &self,
+        snapshot_scope: &str,
+        mut authority: crate::EffectAuthority,
+    ) -> Result<crate::EffectAuthority, ToolError> {
+        if !matches!(authority.name.as_str(), "edit_file" | "write_file") {
+            return Ok(authority);
+        }
+        let tool = self
+            .tools
+            .get(&authority.name)
+            .ok_or_else(|| ToolError::Unknown(authority.name.clone()))?;
+        let prepared = tool.prepare(
+            &authority.input,
+            &Context {
+                workspace: &self.workspace,
+            },
+        )?;
+        let explicit_precondition = optional_string(&authority.input, "precondition")?.is_some();
+        if let Action::Write { create, .. } = &prepared.action
+            && optional_bool_field(&authority.input, "create_intent")?.is_none()
+            && let Some(obj) = authority.input.as_object_mut()
+        {
+            obj.insert("create_intent".into(), Value::Bool(*create));
+        }
+        if prepared.effect == EffectClass::Modify && !explicit_precondition {
+            let snap = self
+                .snapshots
+                .lock()
+                .unwrap()
+                .get(&(snapshot_scope.to_owned(), prepared.target.clone()))
+                .cloned()
+                .ok_or(ToolError::ReadRequired(prepared.target))?;
+            if let Some(obj) = authority.input.as_object_mut() {
+                obj.insert("precondition".into(), Value::String(snap.hash));
+            }
+        }
+        Ok(authority)
+    }
+
     pub(crate) fn prepare_for_engine(
         &self,
         invocation: &ToolInvocation<'_>,
+    ) -> Result<(Prepared, PolicyDecision, String), ToolError> {
+        self.prepare_for_engine_scoped(invocation, invocation.lease_owner)
+    }
+
+    pub(crate) fn prepare_for_engine_scoped(
+        &self,
+        invocation: &ToolInvocation<'_>,
+        snapshot_scope: &str,
     ) -> Result<(Prepared, PolicyDecision, String), ToolError> {
         let tool = self
             .tools
@@ -728,20 +778,24 @@ impl ToolRegistry {
                 workspace: &self.workspace,
             },
         )?;
+        snapshot_scope.clone_into(&mut prepared.snapshot_scope);
         if prepared.effect != EffectClass::Read {
             self.workspace.validate_mutation_support()?;
         }
-        if prepared.effect == EffectClass::Modify
-            && invocation.precondition.is_none()
-            && !self
-                .snapshots
-                .lock()
-                .unwrap()
-                .contains_key(&prepared.target)
-        {
-            return Err(ToolError::ReadRequired(prepared.target));
+        if prepared.effect == EffectClass::Modify {
+            if let Some(hash) = invocation.precondition {
+                prepared.expected_hash = Some(hash.to_owned());
+            } else {
+                let snap = self
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .get(&(snapshot_scope.to_owned(), prepared.target.clone()))
+                    .cloned()
+                    .ok_or_else(|| ToolError::ReadRequired(prepared.target.clone()))?;
+                prepared.expected_hash = Some(snap.hash);
+            }
         }
-        prepared.expected_hash = invocation.precondition.map(str::to_owned);
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
             turn_revision: invocation.turn_revision,
@@ -775,7 +829,20 @@ impl ToolRegistry {
                 workspace: &self.workspace,
             },
         )?;
-        prepared.expected_hash = invocation.precondition.map(str::to_owned);
+        prepared.snapshot_scope = invocation.lease_owner.to_owned();
+        if prepared.effect == EffectClass::Modify {
+            if let Some(hash) = invocation.precondition {
+                prepared.expected_hash = Some(hash.to_owned());
+            } else if let Some(snap) = self
+                .snapshots
+                .lock()
+                .unwrap()
+                .get(&(prepared.snapshot_scope.clone(), prepared.target.clone()))
+                .cloned()
+            {
+                prepared.expected_hash = Some(snap.hash);
+            }
+        }
         let digest = policy::digest(&OperationBinding {
             descriptor_version: tool.descriptor().version,
             turn_revision: invocation.turn_revision,
@@ -829,10 +896,10 @@ impl ToolRegistry {
                         prepared.target
                     )));
                 }
-                self.snapshots
-                    .lock()
-                    .unwrap()
-                    .insert(prepared.target, id.clone());
+                self.snapshots.lock().unwrap().insert(
+                    (prepared.snapshot_scope.clone(), prepared.target),
+                    id.clone(),
+                );
                 let full_text = String::from_utf8_lossy(&bytes);
                 let total_lines = full_text.lines().count();
                 if offset.is_some() || limit.is_some() {
@@ -1100,16 +1167,21 @@ impl ToolRegistry {
                         "target identity changed before mutation".into(),
                     ));
                 }
-                self.require_fresh(&prepared.target, &path, prepared.expected_hash.as_deref())?;
+                self.require_fresh(
+                    &prepared.snapshot_scope,
+                    &prepared.target,
+                    &path,
+                    prepared.expected_hash.as_deref(),
+                )?;
                 let content = fs::read_to_string(&path)?;
                 let next = apply_edit_span(&content, &before, &after, replace_all)?;
                 self.workspace
                     .atomic_replace(&prepared.target, next.as_bytes(), false)?;
                 let id = WorkspacePath::identity(&path)?;
-                self.snapshots
-                    .lock()
-                    .unwrap()
-                    .insert(prepared.target, id.clone());
+                self.snapshots.lock().unwrap().insert(
+                    (prepared.snapshot_scope.clone(), prepared.target),
+                    id.clone(),
+                );
                 Ok(ToolOutput {
                     value: json!({"sha256":id.hash,"size":id.size}),
                     truncated: false,
@@ -1133,15 +1205,20 @@ impl ToolRegistry {
                         ));
                     }
                 } else {
-                    self.require_fresh(&prepared.target, &path, prepared.expected_hash.as_deref())?;
+                    self.require_fresh(
+                        &prepared.snapshot_scope,
+                        &prepared.target,
+                        &path,
+                        prepared.expected_hash.as_deref(),
+                    )?;
                 }
                 self.workspace
                     .atomic_replace(&prepared.target, content.as_bytes(), create)?;
                 let id = WorkspacePath::identity(&path)?;
-                self.snapshots
-                    .lock()
-                    .unwrap()
-                    .insert(prepared.target, id.clone());
+                self.snapshots.lock().unwrap().insert(
+                    (prepared.snapshot_scope.clone(), prepared.target),
+                    id.clone(),
+                );
                 Ok(ToolOutput {
                     value: json!({"sha256":id.hash,"size":id.size}),
                     truncated: false,
@@ -1149,8 +1226,10 @@ impl ToolRegistry {
             }
             Action::GitDiff { max } => {
                 let (text, truncated) =
-                    crate::process::supervise_git_diff(self.workspace.root(), max)
-                        .map_err(|e| ToolError::Git(e.to_string()))?;
+                    crate::process::supervise_git_diff(self.workspace.root(), max, |rel_path| {
+                        self.is_git_diff_path_allowed(rel_path)
+                    })
+                    .map_err(|e| ToolError::Git(e.to_string()))?;
                 Ok(ToolOutput {
                     value: json!({"summary":text}),
                     truncated,
@@ -1158,8 +1237,30 @@ impl ToolRegistry {
             }
         }
     }
+    fn is_git_diff_path_allowed(&self, rel_path: &str) -> bool {
+        if rel_path.is_empty() {
+            return false;
+        }
+        let Ok(display) = self.workspace.display(rel_path) else {
+            return false;
+        };
+        if self
+            .workspace
+            .root()
+            .join(rel_path)
+            .symlink_metadata()
+            .is_ok()
+            && self.workspace.read(rel_path).is_err()
+        {
+            return false;
+        }
+        !self.policy.is_denied(rel_path)
+            && !self.policy.is_denied(&display)
+            && self.policy.decide(EffectClass::Read, &display) == PolicyDecision::Allow
+    }
     fn require_fresh(
         &self,
+        scope: &str,
         target: &str,
         path: &Path,
         expected_hash: Option<&str>,
@@ -1175,7 +1276,7 @@ impl ToolRegistry {
             .snapshots
             .lock()
             .unwrap()
-            .get(target)
+            .get(&(scope.to_owned(), target.to_owned()))
             .cloned()
             .ok_or_else(|| ToolError::ReadRequired(target.into()))?;
         if actual != expected {
@@ -2421,5 +2522,52 @@ mod tests {
             ),
             Err(ToolError::MatchCount(2))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_diff_excludes_deny_glob_tracked_patches_and_untracked_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("secret")).unwrap();
+        fs::write(dir.path().join("allowed.txt"), "public-v1\n").unwrap();
+        fs::write(dir.path().join("secret/keys.env"), "TOP_SECRET_V1\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "base"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        fs::write(dir.path().join("allowed.txt"), "public-v2\n").unwrap();
+        fs::write(dir.path().join("secret/keys.env"), "TOP_SECRET_V2_LEAK\n").unwrap();
+        fs::write(
+            dir.path().join("secret/untracked.key"),
+            "UNTRACKED_SECRET\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("visible_new.txt"), "new\n").unwrap();
+
+        let registry =
+            ToolRegistry::new(dir.path(), None, &["secret/**".to_owned()], None).unwrap();
+        let out = registry
+            .invoke(&call("git_diff", &json!({}), None))
+            .unwrap();
+        let patch = out.value["summary"].as_str().unwrap();
+        assert!(patch.contains("public-v2"), "{patch}");
+        assert!(patch.contains("visible_new.txt"), "{patch}");
+        assert!(!patch.contains("keys.env"), "{patch}");
+        assert!(!patch.contains("TOP_SECRET"), "{patch}");
+        assert!(!patch.contains("untracked.key"), "{patch}");
     }
 }

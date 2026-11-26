@@ -189,10 +189,7 @@ async fn completed_session(state: &Arc<ServerState>, workspace_id: &str) -> (Str
         )
         .await;
         if status == StatusCode::OK && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            return (
-                session_id,
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
-            );
+            return (session_id, body["snapshot"]["revision"].as_u64().unwrap());
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -279,9 +276,10 @@ async fn response_schema_snapshots() {
         &body["snapshot"],
         &[
             "session_id",
-            "session_revision",
+            "revision",
             "sequence",
             "lifecycle",
+            "permission_mode",
             "binding",
             "latest_turn_id",
             "active_turn_id",
@@ -299,7 +297,7 @@ async fn response_schema_snapshots() {
         Some(serde_json::json!({
             "command_id": command_id,
             "prompt": "again",
-            "expected_session_revision": body["snapshot"]["session_revision"].as_u64().unwrap_or(1),
+            "expected_session_revision": body["snapshot"]["revision"].as_u64().unwrap_or(1),
         })),
         &[("idempotency-key", &command_id)],
     )
@@ -504,7 +502,7 @@ async fn sse_event_type_completeness() {
     .unwrap();
     assert_eq!(changed["type"].as_str(), Some("session_changed"));
     assert_eq!(changed["session_id"].as_str(), Some("s"));
-    assert_eq!(changed["session_revision"].as_u64(), Some(1));
+    assert_eq!(changed["revision"].as_u64(), Some(1));
 
     let progress = serde_json::to_value(latte_server::http::ServerEvent::Progress {
         session_id: "s".into(),

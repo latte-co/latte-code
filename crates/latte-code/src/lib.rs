@@ -1665,19 +1665,21 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                     });
                 }
                 SessionUiAction::SetPermissionMode { session_id, mode } => {
-                    *current_permission_mode
-                        .lock()
-                        .expect("permission mode lock") = mode;
                     if let Some(session_id) = session_id {
                         let handle = server_handle.clone();
                         let feedback = feedback_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = handle.set_permission_mode(&session_id, mode).await
-                            {
-                                let _ = feedback
-                                    .send(SessionUiFeedback::command(Err(error.to_string())));
-                            }
+                            let result = handle
+                                .set_permission_mode(&session_id, mode)
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = feedback
+                                .send(SessionUiFeedback::permission_mode(session_id, mode, result));
                         });
+                    } else {
+                        *current_permission_mode
+                            .lock()
+                            .expect("permission mode lock") = mode;
                     }
                 }
                 SessionUiAction::RefreshSnapshots

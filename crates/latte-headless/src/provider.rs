@@ -303,6 +303,26 @@ pub struct OpenAiProvider {
     streaming: bool,
     headers: std::collections::BTreeMap<String, String>,
 }
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        let Some(first) = attempt.previous().first() else {
+            return attempt.stop();
+        };
+        let next = attempt.url();
+        let same_origin = next.scheme() == first.scheme()
+            && next.host_str() == first.host_str()
+            && next.port_or_known_default() == first.port_or_known_default();
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error("refusing cross-origin redirect on credentialed provider request")
+        }
+    })
+}
+
 impl OpenAiProvider {
     pub fn new(
         endpoint: impl Into<String>,
@@ -312,6 +332,7 @@ impl OpenAiProvider {
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(timeout.min(Duration::from_secs(30)))
+            .redirect(same_origin_redirect_policy())
             .build()
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         Ok(Self {
@@ -1268,6 +1289,7 @@ impl AnthropicProvider {
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(timeout.min(Duration::from_secs(30)))
+            .redirect(same_origin_redirect_policy())
             .build()
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         Ok(Self {
@@ -1423,14 +1445,18 @@ fn push_anthropic_turn(turns: &mut Vec<(String, Vec<Value>)>, role: &str, blocks
 fn build_anthropic_payload(
     provider: &AnthropicProvider,
     request: &ProviderRequest,
-) -> (Value, bool) {
+) -> Result<(Value, bool), ProviderError> {
     let (max_tokens, thinking_budget) =
         resolve_anthropic_budgets(provider.max_tokens, provider.reasoning_effort.as_deref());
     let ephemeral = || serde_json::json!({ "type": "ephemeral" });
+    let last_plain_user_idx = request
+        .messages
+        .iter()
+        .rposition(|msg| matches!(msg, Message::User { .. }));
 
     let mut system_blocks = Vec::<Value>::new();
     let mut turns = Vec::<(String, Vec<Value>)>::new();
-    for message in &request.messages {
+    for (msg_idx, message) in request.messages.iter().enumerate() {
         match message {
             Message::System { content } => {
                 if !content.is_empty() {
@@ -1474,12 +1500,15 @@ fn build_anthropic_payload(
                 ..
             } => {
                 let mut blocks = Vec::<Value>::new();
+                let mut has_valid_thinking = false;
+                let mut had_unsigned_thinking = false;
                 for block in thinking_blocks {
                     match block {
                         ThinkingBlock::Thinking {
                             thinking,
                             signature: Some(sig),
                         } if !sig.is_empty() => {
+                            has_valid_thinking = true;
                             blocks.push(serde_json::json!({
                                 "type": "thinking",
                                 "thinking": thinking,
@@ -1487,14 +1516,30 @@ fn build_anthropic_payload(
                             }));
                         }
                         ThinkingBlock::RedactedThinking { data } if !data.is_empty() => {
+                            has_valid_thinking = true;
                             blocks.push(serde_json::json!({
                                 "type": "redacted_thinking",
                                 "data": data,
                             }));
                         }
-                        ThinkingBlock::Thinking { .. } | ThinkingBlock::RedactedThinking { .. } => {
+                        ThinkingBlock::Thinking { .. } => {
+                            had_unsigned_thinking = true;
                         }
+                        ThinkingBlock::RedactedThinking { .. } => {}
                     }
+                }
+                let in_open_continuation =
+                    last_plain_user_idx.is_none_or(|user_idx| msg_idx > user_idx);
+                if thinking_budget.is_some()
+                    && in_open_continuation
+                    && !tool_calls.is_empty()
+                    && had_unsigned_thinking
+                    && !has_valid_thinking
+                {
+                    return Err(ProviderError::Malformed(
+                        "signed thinking block could not be replayed verbatim after transcript secret redaction"
+                            .into(),
+                    ));
                 }
                 if let Some(text) = content.as_deref().filter(|s| !s.is_empty()) {
                     blocks.push(serde_json::json!({ "type": "text", "text": text }));
@@ -1607,7 +1652,7 @@ fn build_anthropic_payload(
     if provider.streaming {
         body["stream"] = Value::Bool(true);
     }
-    (body, thinking_budget.is_some())
+    Ok((body, thinking_budget.is_some()))
 }
 
 impl Provider for AnthropicProvider {
@@ -1617,7 +1662,7 @@ impl Provider for AnthropicProvider {
             if context.cancellation.is_cancelled() {
                 return Err(ProviderError::Cancelled);
             }
-            let (body, thinking_enabled) = build_anthropic_payload(&this, &request);
+            let (body, thinking_enabled) = build_anthropic_payload(&this, &request)?;
             let response =
                 send_json_with_retries(&body, this.timeout, this.max_attempts, &context, || {
                     this.request_builder(&request.session_ref, thinking_enabled)
@@ -4140,7 +4185,7 @@ mod tests {
             ],
         };
 
-        let (payload, thinking_on) = build_anthropic_payload(&provider, &request);
+        let (payload, thinking_on) = build_anthropic_payload(&provider, &request).unwrap();
         assert!(thinking_on);
         assert_eq!(count_cache_controls(&payload), 4);
         // Thinking enabled omits `temperature` and sets `thinking.budget_tokens`.
@@ -4189,7 +4234,8 @@ mod tests {
                     tool_calls: vec![],
                 }],
             },
-        );
+        )
+        .unwrap();
         assert!(!plain_thinking);
         assert_eq!(count_cache_controls(&plain_payload), 0);
         assert_eq!(plain_payload["temperature"], 0.3);
@@ -4472,6 +4518,611 @@ mod tests {
         assert_eq!(
             anthropic_finish_reason("custom".into()),
             FinishReason::Other("custom".into())
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anthropic_provider_registry_profile_and_aliased_translation_boundaries() {
+        use crate::{profile::ProfileCatalog, registry::ProviderRegistry};
+        use latte_core::{
+            CompactionPolicy, CompactionStrategy, ContextPolicy, SessionProviderBinding,
+            ToolPresentationStyle,
+        };
+        use latte_engine::EngineBuilder;
+        use std::collections::BTreeMap;
+
+        assert!(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"c/m",providers:{c:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1",api_key:"k",temperature:1.5}}}"#
+            )
+            .is_err()
+        );
+        let bad_hdr_reg = ProviderRegistry::parse_jsonc(
+            r#"{version:1,default_model:"c/m",providers:{c:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1/",api_key:"k",headers:{"x-api-key":"override"}}}}"#,
+        )
+        .unwrap();
+        assert!(bad_hdr_reg.resolve_model("c", "m", &[]).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(tmp.path())
+            .build()
+            .unwrap();
+        let descriptors = engine.tool_descriptors();
+
+        let dual_reg = std::sync::Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{
+                    version: 1,
+                    default_model: "claude/m",
+                    providers: {
+                        claude: {
+                            type: "anthropic-messages",
+                            models: { m: { options: { context_window: 128000, reasoning_effort: "low", max_tokens: 4096 } } },
+                            base_url: "https://api.anthropic.com/v1/",
+                            api_key: "secret-anth",
+                            prompt_caching: false
+                        },
+                        oai_claude: {
+                            type: "openai-chat",
+                            models: ["m2"],
+                            endpoint: "http://127.0.0.1:9/v1/chat/completions",
+                            api_key: "secret-oai",
+                            tool_style: "claude_code"
+                        }
+                    }
+                }"#,
+            )
+            .unwrap(),
+        );
+        let base_ctx = ContextPolicy {
+            compaction: CompactionPolicy {
+                strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                ..CompactionPolicy::default()
+            },
+            ..ContextPolicy::default()
+        };
+        let catalog = ProfileCatalog::new(base_ctx, std::sync::Arc::clone(&dual_reg)).unwrap();
+        let anth_binding: SessionProviderBinding = dual_reg
+            .session_binding_for_model("claude", "m", &descriptors)
+            .unwrap();
+        let anth_prof = catalog.resolve(&anth_binding).unwrap();
+        assert_eq!(
+            anth_prof.tool_presentation(),
+            ToolPresentationStyle::ClaudeCode
+        );
+        assert!(anth_prof.compaction().reuse_prefix);
+        assert!(anth_prof.system_prompt("").unwrap().contains("`Edit`"));
+
+        let oai_binding = dual_reg
+            .session_binding_for_model("oai_claude", "m2", &descriptors)
+            .unwrap();
+        let oai_prof = catalog.resolve(&oai_binding).unwrap();
+        assert_eq!(
+            oai_prof.tool_presentation(),
+            ToolPresentationStyle::ClaudeCode
+        );
+        assert!(oai_prof.system_prompt("").unwrap().contains("`Bash`"));
+
+        let serve_seq = |replies: Vec<(&'static str, &'static str, &'static str)>| -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            thread::spawn(move || {
+                for (status, ctype, body) in replies {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = [0_u8; 16 * 1024];
+                    let _ = sock.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nrequest-id: req_test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+            });
+            format!("http://{addr}/v1/messages")
+        };
+
+        let ep_fallback = serve_seq(vec![
+            ("400 Bad Request", "application/json", ""),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"type":"message","content":[{"type":"redacted_thinking","data":"enc1"},{"type":"text","text":"fb-ok"}],"stop_reason":"max_tokens","usage":{"output_tokens":7}}"#,
+            ),
+        ]);
+        let prov = AnthropicProvider::new(ep_fallback, "m", "secret-token", Duration::from_secs(2))
+            .unwrap()
+            .with_prompt_caching(false)
+            .with_sampling_options(Some(0.2), None)
+            .with_reasoning_effort(Some("off".into()))
+            .with_headers(BTreeMap::from([
+                ("x-api-key".into(), "ignored".into()),
+                ("anthropic-beta".into(), "custom-beta".into()),
+            ]));
+        assert!(format!("{prov:?}").contains("[REDACTED]"));
+        assert!(!prov.capabilities().input_request);
+        let overlong = "call_".to_owned() + &"z".repeat(80);
+        let fb_out = prov
+            .complete(
+                ProviderRequest {
+                    session_ref: "s1".into(),
+                    tools: vec![],
+                    messages: vec![
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![ThinkingBlock::Thinking {
+                                thinking: "unsigned".into(),
+                                signature: None,
+                            }],
+                            tool_calls: vec![ToolCall {
+                                id: overlong.clone(),
+                                name: "Read".into(),
+                                input: serde_json::json!("non-object"),
+                            }],
+                        },
+                        Message::Tool {
+                            tool_call_id: overlong,
+                            name: Some("Read".into()),
+                            content: "ok".into(),
+                        },
+                    ],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fb_out.message.as_deref(), Some("fb-ok"));
+        assert_eq!(fb_out.finish_reason, Some(FinishReason::Length));
+        assert_eq!(fb_out.thinking_blocks().len(), 1);
+
+        for (effort, max_tok, stop, expected_reason) in [
+            ("minimal", None, "refusal", FinishReason::ContentFilter),
+            ("low", Some(1024), "stop_sequence", FinishReason::Stop),
+            (
+                "medium",
+                None,
+                "custom_stop",
+                FinishReason::Other("custom_stop".into()),
+            ),
+            ("xhigh", Some(65_536), "end_turn", FinishReason::Stop),
+            ("2048", Some(8_192), "end_turn", FinishReason::Stop),
+        ] {
+            let body = format!(
+                r#"{{"type":"message","content":[{{"type":"text","text":"ok"}}],"stop_reason":{stop:?},"usage":{{"input_tokens":5}}}}"#
+            );
+            let ep = server("200 OK", &body, 0);
+            let res = AnthropicProvider::new(ep, "m", "k", Duration::from_secs(2))
+                .unwrap()
+                .with_streaming(false)
+                .with_sampling_options(Some(0.5), max_tok)
+                .with_reasoning_effort(Some(effort.into()))
+                .complete(
+                    ProviderRequest {
+                        session_ref: "s".into(),
+                        tools: vec![],
+                        messages: vec![Message::User {
+                            content: String::new(),
+                        }],
+                    },
+                    context(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.finish_reason, Some(expected_reason));
+        }
+
+        let ep_sse_malformed = serve_seq(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"name\":\"Read\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"seed\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0}\n\n",
+            ),
+        ]);
+        let sse_prov =
+            AnthropicProvider::new(ep_sse_malformed, "m", "k", Duration::from_secs(2)).unwrap();
+        for _ in 0..6 {
+            assert!(matches!(
+                sse_prov
+                    .complete(
+                        ProviderRequest {
+                            session_ref: "s".into(),
+                            tools: vec![],
+                            messages: vec![
+                                Message::User {
+                                    content: "u".into()
+                                },
+                                Message::Assistant {
+                                    content: None,
+                                    reasoning_content: None,
+                                    thinking_blocks: vec![],
+                                    tool_calls: vec![],
+                                },
+                            ],
+                        },
+                        context(),
+                    )
+                    .await,
+                Err(ProviderError::Malformed(_))
+            ));
+        }
+
+        let ep_claude = serve_seq(vec![(
+            "200 OK",
+            "application/json",
+            r#"{"type":"message","content":[
+                {"type":"tool_use","id":"c1","name":"GitDiff","input":{}},
+                {"type":"tool_use","id":"c2","name":"ReadManifest","input":{}},
+                {"type":"tool_use","id":"c3","name":"Grep","input":{"pattern":"a+b","literal":true}},
+                {"type":"tool_use","id":"c4","name":"Write","input":{"file_path":"w.txt","content":"hi","create_intent":true}},
+                {"type":"tool_use","id":"c5","name":"Bash","input":{"argv":["ls"],"cwd":".","timeout_ms":500}},
+                {"type":"tool_use","id":"c6","name":"Bash","input":{"command":"FOO=1 env"}}
+            ],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}"#,
+        )]);
+        let reg = ProviderRegistry::parse_jsonc(&format!(
+            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",models:["m"],endpoint:{ep_claude:?},api_key:"k",streaming:false}}}}}}"#
+        ))
+        .unwrap();
+        assert!(format!("{reg:?}").contains("[REDACTED]"));
+        let resolved = reg.resolve_default(&descriptors).unwrap();
+        let out = resolved
+            .provider
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: descriptors.clone(),
+                    messages: vec![
+                        Message::User {
+                            content: "check".into(),
+                        },
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![],
+                            tool_calls: vec![
+                                ToolCall {
+                                    id: "h1".into(),
+                                    name: "search".into(),
+                                    input: serde_json::json!({"query": "lit", "regex": false, "glob": "*.rs"}),
+                                },
+                                ToolCall {
+                                    id: "h2".into(),
+                                    name: "process".into(),
+                                    input: serde_json::json!({"shell": "echo a | cat", "cwd": ".", "timeout_ms": 1000}),
+                                },
+                                ToolCall {
+                                    id: "h3".into(),
+                                    name: "read_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "offset": 1, "limit": 10}),
+                                },
+                                ToolCall {
+                                    id: "h4".into(),
+                                    name: "edit_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "before": "x", "after": "y", "replace_all": true}),
+                                },
+                                ToolCall {
+                                    id: "h5".into(),
+                                    name: "write_file".into(),
+                                    input: serde_json::json!({"path": "a.rs", "content": "z"}),
+                                },
+                                ToolCall {
+                                    id: "h6".into(),
+                                    name: "list_directory".into(),
+                                    input: serde_json::json!({"path": "src"}),
+                                },
+                                ToolCall {
+                                    id: "h7".into(),
+                                    name: "git_diff".into(),
+                                    input: serde_json::json!("raw"),
+                                },
+                            ],
+                        },
+                        Message::Tool {
+                            tool_call_id: "h1".into(),
+                            name: Some("search".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h2".into(),
+                            name: Some("process".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h3".into(),
+                            name: Some("read_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h4".into(),
+                            name: Some("edit_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h5".into(),
+                            name: Some("write_file".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h6".into(),
+                            name: Some("list_directory".into()),
+                            content: "ok".into(),
+                        },
+                        Message::Tool {
+                            tool_call_id: "h7".into(),
+                            name: Some("git_diff".into()),
+                            content: "ok".into(),
+                        },
+                    ],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls[0].name, "git_diff");
+        assert_eq!(out.tool_calls[1].name, "read_project_manifest");
+        assert_eq!(out.tool_calls[2].name, "search");
+        assert_eq!(out.tool_calls[2].input["regex"], false);
+        assert_eq!(out.tool_calls[3].name, "write_file");
+        assert_eq!(out.tool_calls[3].input["create_intent"], true);
+        assert_eq!(out.tool_calls[4].name, "process");
+        assert_eq!(out.tool_calls[4].input["argv"], serde_json::json!(["ls"]));
+        assert_eq!(out.tool_calls[5].name, "process");
+        assert_eq!(out.tool_calls[5].input["shell"], "FOO=1 env");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn cross_origin_redirects_are_blocked_without_credential_egress_while_same_origin_succeeds()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Target server on a different loopback port that must NEVER receive credentials.
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_clone = std::sync::Arc::clone(&target_hits);
+        let _target_guard = thread::spawn(move || {
+            let _ = target_listener.set_nonblocking(true);
+            for _ in 0..30 {
+                if let Ok((mut sock, _)) = target_listener.accept() {
+                    hits_clone.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0_u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let redirect_origin = |location: String| -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0_u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+            });
+            format!("http://{addr}/v1/messages")
+        };
+
+        let anth_ep = redirect_origin(format!("http://{target_addr}/steal"));
+        let anth = AnthropicProvider::new(anth_ep, "m", "anth-secret-xyz", Duration::from_secs(2))
+            .unwrap()
+            .with_max_attempts(1);
+        let anth_err = anth
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(anth_err, ProviderError::Transport(_)),
+            "{anth_err:?}"
+        );
+
+        let oai_ep = redirect_origin(format!("http://{target_addr}/steal-oai"));
+        let oai = OpenAiProvider::new(oai_ep, "m", "oai-secret-xyz", Duration::from_secs(2))
+            .unwrap()
+            .with_max_attempts(1);
+        let oai_err = oai
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                },
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(oai_err, ProviderError::Transport(_)),
+            "{oai_err:?}"
+        );
+        assert_eq!(
+            target_hits.load(Ordering::SeqCst),
+            0,
+            "cross-origin redirect target must never be contacted"
+        );
+
+        // Same-origin redirect (identical scheme + host + port) is permitted.
+        let same_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let same_addr = same_listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut s1, _) = same_listener.accept().unwrap();
+            let mut b1 = [0_u8; 4096];
+            let _ = s1.read(&mut b1);
+            let r1 = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{same_addr}/v1/messages-v2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s1.write_all(r1.as_bytes());
+
+            let (mut s2, _) = same_listener.accept().unwrap();
+            let mut b2 = [0_u8; 4096];
+            let n = s2.read(&mut b2).unwrap();
+            let req_text = String::from_utf8_lossy(&b2[..n]).to_ascii_lowercase();
+            assert!(req_text.contains("x-api-key: same-origin-key"));
+            let body = r#"{"type":"message","content":[{"type":"text","text":"same-ok"}],"stop_reason":"end_turn","usage":{"output_tokens":2}}"#;
+            let r2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s2.write_all(r2.as_bytes());
+        });
+        let same_prov = AnthropicProvider::new(
+            format!("http://{same_addr}/v1/messages"),
+            "m",
+            "same-origin-key",
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .with_streaming(false);
+        let same_out = same_prov
+            .complete(
+                ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_out.message.as_deref(), Some("same-ok"));
+    }
+
+    #[test]
+    fn anthropic_payload_rejects_unsigned_thinking_only_on_open_tool_continuations() {
+        let prov = AnthropicProvider::new(
+            "http://127.0.0.1:9/v1/messages",
+            "m",
+            "k",
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_reasoning_effort(Some("low".into()));
+
+        // Open tool continuation whose signed thinking was stripped -> Malformed error (#13).
+        let open_err = build_anthropic_payload(
+            &prov,
+            &ProviderRequest {
+                session_ref: "s".into(),
+                tools: vec![],
+                messages: vec![
+                    Message::User {
+                        content: "do work".into(),
+                    },
+                    Message::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        thinking_blocks: vec![ThinkingBlock::Thinking {
+                            thinking: "[REDACTED]".into(),
+                            signature: None,
+                        }],
+                        tool_calls: vec![ToolCall {
+                            id: "call_1".into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({"file_path":"a.txt"}),
+                        }],
+                    },
+                    Message::Tool {
+                        tool_call_id: "call_1".into(),
+                        name: Some("Read".into()),
+                        content: "hello".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(open_err, ProviderError::Malformed(_)),
+            "{open_err:?}"
+        );
+
+        // Historical completed turn with unsigned thinking followed by a final Assistant turn succeeds.
+        assert!(
+            build_anthropic_payload(
+                &prov,
+                &ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![
+                        Message::User {
+                            content: "turn 1".into(),
+                        },
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: vec![ThinkingBlock::Thinking {
+                                thinking: "[REDACTED]".into(),
+                                signature: None,
+                            }],
+                            tool_calls: vec![ToolCall {
+                                id: "call_1".into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({"file_path":"a.txt"}),
+                            }],
+                        },
+                        Message::Tool {
+                            tool_call_id: "call_1".into(),
+                            name: Some("Read".into()),
+                            content: "hello".into(),
+                        },
+                        Message::Assistant {
+                            content: Some("done".into()),
+                            reasoning_content: None,
+                            thinking_blocks: vec![],
+                            tool_calls: vec![],
+                        },
+                        Message::User {
+                            content: "turn 2".into(),
+                        },
+                    ],
+                },
+            )
+            .is_ok()
         );
     }
 }

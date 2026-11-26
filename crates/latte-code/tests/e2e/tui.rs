@@ -2416,3 +2416,370 @@ fn tui_supports_cursor_editing_ctrl_j_newline_and_permission_mode_switching() {
         "LATTE_TUI_MOUSE_CAPTURE=1 enables and restores mouse capture cleanly"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_switching_sessions_synchronizes_authoritative_permission_mode_per_session() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        // Session alpha initial prompt -> Ready.
+        ProviderReply::completion("alpha initial ready"),
+        // Session beta initial prompt -> Ready.
+        ProviderReply::completion("beta initial ready"),
+        // Session alpha follow-up after switching back from beta (must still be Full-auto!).
+        ProviderReply::tool_call(
+            "alpha-auto-write",
+            "write_file",
+            &serde_json::json!({
+                "path": "alpha_auto.txt",
+                "content": "alpha stayed full-auto\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("alpha follow-up completed without asking"),
+        // Session beta follow-up after switching back from alpha (must still be Ask and park!).
+        ProviderReply::tool_call(
+            "beta-ask-write",
+            "write_file",
+            &serde_json::json!({
+                "path": "beta_blocked.txt",
+                "content": "must ask\n",
+                "create_intent": true
+            }),
+        ),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let mut command = scenario.command(&["tui"]);
+    command.env("TEST_OPENAI_KEY", "tui-mode-secret");
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Ask",
+        Duration::from_secs(5)
+    ));
+
+    // 1. Set draft to Full-auto, create session `alpha`, and rename it.
+    pty.write(b"/mode auto\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Full-auto",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"start alpha\r");
+    assert!(provider.wait_for_calls(1, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "alpha initial ready",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/rename alpha\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "alpha",
+        Duration::from_secs(5)
+    ));
+
+    // 2. Open `/new`, switch to `/mode ask`, create session `beta`, and rename it.
+    pty.write(b"/new\r");
+    pty.write(b"/mode ask\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Permission mode set to Ask mode",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"start beta\r");
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "beta initial ready",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/rename beta\r");
+
+    // 3. Switch back to `alpha` via `/resume alpha` -> status bar MUST show `Full-auto`, NOT `Ask` (#11)!
+    pty.write(b"/resume alpha\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Full-auto",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"alpha write now\r");
+    assert!(provider.wait_for_calls(4, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "alpha follow-up completed without asking",
+        Duration::from_secs(5)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("alpha_auto.txt")).unwrap(),
+        "alpha stayed full-auto\n"
+    );
+
+    // 4. Switch back to `beta` via `/resume beta` -> status bar MUST show `Ask`, and write_file MUST park!
+    pty.write(b"/resume beta\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "beta initial ready",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"beta write now\r");
+    assert!(provider.wait_for_calls(5, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "beta_blocked.txt",
+        Duration::from_secs(5)
+    ));
+    // Deny with `n` and confirm `beta_blocked.txt` was never written.
+    pty.write(b"n");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Permission denied",
+        Duration::from_secs(5)
+    ));
+    assert!(!scenario.root().join("beta_blocked.txt").exists());
+
+    pty.write(F10);
+    let (status, _) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tui_command_palette_slash_tab_draft_model_start_and_unconfigured_submission() {
+    // 0. Invalid `tui` CLI flags fail closed with usage exit code 2.
+    let bad_flag_scenario = Scenario::new();
+    for bad_args in [
+        &["tui", "--permission-mode"][..],
+        &["tui", "--permission-mode", "bogus"][..],
+        &["tui", "--unexpected-flag"][..],
+    ] {
+        let out = bad_flag_scenario.output(bad_args, |_| {});
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected usage error for {bad_args:?}"
+        );
+    }
+
+    // 1. Unconfigured TUI inside `~/workspace-under-home` (`workspace_display_path` `~/...` branch):
+    //    renders `Not configured` and refuses draft submission / `/model` picker cleanly.
+    let unconfigured = Scenario::new();
+    let canon_home = unconfigured.home().canonicalize().unwrap();
+    let home_sub_ws = canon_home.join("workspace-under-home");
+    std::fs::create_dir_all(home_sub_ws.join(".git")).unwrap();
+    let mut unconf_cmd = unconfigured.command(&["tui"]);
+    unconf_cmd
+        .env("HOME", &canon_home)
+        .current_dir(&home_sub_ws);
+    let mut unconf_pty = PtySession::spawn(unconf_cmd);
+    assert!(unconf_pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &unconf_pty,
+        40,
+        120,
+        "~/workspace-under-home",
+        Duration::from_secs(5)
+    ));
+    assert!(wait_for_screen_text(
+        &unconf_pty,
+        40,
+        120,
+        "Not configured",
+        Duration::from_secs(5)
+    ));
+    unconf_pty.write(b"/model\rhello without config\r");
+    assert!(wait_for_screen_text(
+        &unconf_pty,
+        40,
+        120,
+        "Provider setup required",
+        Duration::from_secs(5)
+    ));
+    unconf_pty.write(F10);
+    assert!(unconf_pty.finish(Duration::from_secs(5)).0.success());
+
+    // 2. Configured TUI with two models (`main/mock` default, `main/alt` secondary)
+    //    and `/usr/bin/true` verification: exercises slash Tab completion, Command
+    //    Palette disabled & required-argument branches, draft `/model` selection
+    //    (`SessionUiAction::StartWithModel`), and verified `TranscriptKind::Completion` rendering.
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "alt-write",
+            "write_file",
+            &serde_json::json!({
+                "path": "alt_verified.txt",
+                "content": "created by alt model\n",
+                "create_intent": true
+            }),
+        ),
+        ProviderReply::completion("alt verified completion card"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock", "alt"],
+                        endpoint: {endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }},
+                verification: {{ argv: ["/usr/bin/true"] }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let mut command = scenario.command(&["tui", "--auto"]);
+    command.env("TEST_OPENAI_KEY", "tui-alt-secret");
+    let mut pty = PtySession::spawn(command);
+    assert!(pty.wait_for_output(TUI_READY, Duration::from_secs(5)));
+
+    // On Draft: Command Palette (`Ctrl+P` = `\x1b[112;5u`) -> navigate 7x `j` to `Rename` (Disabled on draft) + Enter!
+    let before_draft_palette = pty.output().len();
+    pty.write(b"\x1b[112;5u");
+    assert!(pty.wait_for_growth(before_draft_palette, Duration::from_secs(5)));
+    pty.write(b"jjjjjjj\x1b[13u");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "open saved session",
+        Duration::from_secs(5)
+    ));
+
+    // Slash popup Tab completion: `/mo` + Tab completes `/model`, then Enter opens the model picker;
+    // Down (`\x1b[B`) + Enter selects `main/alt` on the draft session!
+    pty.write(b"/mo\t\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "alt",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"\x1b[B\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "New sessions will use main/alt",
+        Duration::from_secs(5)
+    ));
+
+    // Submit prompt on draft -> dispatches `SessionUiAction::StartWithModel` (`main/alt`),
+    // writes `alt_verified.txt` in Full-auto mode, passes `/usr/bin/true` verification,
+    // and renders `TranscriptKind::Completion`!
+    pty.write(b"ship with alt\r");
+    assert!(provider.wait_for_calls(2, Duration::from_secs(5)));
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "alt verified completion card",
+        Duration::from_secs(5)
+    ));
+    assert_eq!(provider.requests()[0].body["model"], "alt");
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("alt_verified.txt")).unwrap(),
+        "created by alt model\n"
+    );
+
+    // Wait until post-mutation verification (`/usr/bin/true`) finishes and renders the
+    // final `VERIFIED` handoff block, then close `pty` cleanly.
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "VERIFIED",
+        Duration::from_secs(5)
+    ));
+    pty.write(F10);
+    let (status, _) = pty.finish(Duration::from_secs(5));
+    assert!(status.success());
+
+    // 3. Reopen in a fresh TUI (zero background SSE mutations in flight), open the saved
+    //    session, then open Command Palette (`Ctrl+P`) and select index 7 (`Rename`,
+    //    `ArgumentPolicy::Required`) -> renders `/rename requires an argument`!
+    let mut pty2 = PtySession::spawn(scenario.command(&["tui"]));
+    assert!(pty2.wait_for_output(TUI_READY, Duration::from_secs(5)));
+    pty2.write(b"/sessions\r");
+    assert!(wait_for_screen_text(
+        &pty2,
+        40,
+        120,
+        "ship with alt",
+        Duration::from_secs(5)
+    ));
+    pty2.write(b"\x1b[13u");
+    assert!(wait_for_screen_text(
+        &pty2,
+        40,
+        120,
+        "VERIFIED",
+        Duration::from_secs(5)
+    ));
+    pty2.write(b"\x1b[112;5u");
+    assert!(wait_for_screen_text(
+        &pty2,
+        40,
+        120,
+        "Rename the current session",
+        Duration::from_secs(5)
+    ));
+    pty2.write(b"jjjjjjj\x1b[13u");
+    assert!(
+        wait_for_screen_text(
+            &pty2,
+            40,
+            120,
+            "/rename requires an argument",
+            Duration::from_secs(5)
+        ),
+        "expected `/rename requires an argument` on screen, got:\n{}",
+        pty_screen_text(&pty2.output(), 40, 120)
+    );
+
+    pty2.write(F10);
+    let (status2, _) = pty2.finish(Duration::from_secs(5));
+    assert!(status2.success());
+}

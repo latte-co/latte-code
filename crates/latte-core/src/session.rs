@@ -228,7 +228,7 @@ pub enum ManualCompactionState {
     Compacted {
         tier: ManualCompactionTier,
         /// Session revision after the card append.
-        #[serde(alias = "revision")]
+        #[serde(rename = "revision", alias = "session_revision")]
         session_revision: u64,
     },
     /// Nothing to compact; the session is unchanged.
@@ -248,7 +248,7 @@ pub struct ManualCompactionResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProviderBinding {
     /// Schema version of the provider-binding record itself (not the session protocol).
-    #[serde(alias = "version")]
+    #[serde(rename = "version", alias = "binding_version")]
     pub binding_version: u32,
     pub provider_name: String,
     pub provider_type: String,
@@ -307,7 +307,7 @@ pub struct SessionTurnSummary {
     pub turn_id: TurnId,
     #[serde(alias = "parent_run_id")]
     pub parent_turn_id: Option<TurnId>,
-    #[serde(alias = "ordinal")]
+    #[serde(rename = "ordinal", alias = "turn_ordinal")]
     pub turn_ordinal: u64,
     pub status: SessionTurnStatus,
     #[serde(alias = "run_revision")]
@@ -393,10 +393,12 @@ pub struct SessionSnapshot {
     // break; this only deserializes persisted snapshots/results.
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    #[serde(alias = "revision")]
+    #[serde(rename = "revision", alias = "session_revision")]
     pub session_revision: u64,
     pub sequence: u64,
     pub lifecycle: SessionLifecycle,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub binding: SessionProviderBinding,
     // Always serialized (null when absent): this is a hard key rename only,
     // the wire shape must not change beyond the field name.
@@ -546,7 +548,7 @@ pub struct SessionEventEnvelope {
     pub event_id: SessionEventId,
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    #[serde(alias = "revision")]
+    #[serde(rename = "revision", alias = "session_revision")]
     pub session_revision: u64,
     pub sequence: u64,
     pub event: SessionEvent,

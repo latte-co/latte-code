@@ -13,7 +13,7 @@ use std::{path::Path, sync::Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const LEGACY_RUNTIME_LEASE_SCOPE: &str = "runtime";
 /// The interactive session list carries a recent, bounded transcript per
 /// session.  The bound prevents a single long-running conversation from
@@ -330,6 +330,16 @@ pub(crate) struct VerificationRecord {
 pub(crate) struct MaterializingPrepared {
     pub user_entry: TranscriptEntry,
     pub command_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializingSessionRecord {
+    pub session_id: latte_core::SessionId,
+    pub binding_json: String,
+    pub focus: Option<String>,
+    pub permission_mode: latte_core::PermissionMode,
+    pub create_command_id: Option<String>,
+    pub create_command_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -886,6 +896,47 @@ impl Storage {
                 "INSERT INTO schema_migrations(version,applied_at_ms) VALUES(15,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=15;",
             )?;
             tx.commit()?;
+            version = 15;
+        }
+        if version == 15 {
+            let tx = connection.unchecked_transaction()?;
+            for (table, column, ddl) in [
+                (
+                    "sessions",
+                    "permission_mode",
+                    "ALTER TABLE sessions ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask';",
+                ),
+                (
+                    "sessions",
+                    "create_command_id",
+                    "ALTER TABLE sessions ADD COLUMN create_command_id TEXT;",
+                ),
+                (
+                    "sessions",
+                    "create_command_digest",
+                    "ALTER TABLE sessions ADD COLUMN create_command_digest TEXT;",
+                ),
+                (
+                    "turn_baselines",
+                    "captured",
+                    "ALTER TABLE turn_baselines ADD COLUMN captured INTEGER NOT NULL DEFAULT 1;",
+                ),
+            ] {
+                let exists: bool = tx.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    tx.execute_batch(ddl)?;
+                }
+            }
+            tx.execute_batch(
+                "INSERT OR REPLACE INTO schema_migrations(version,applied_at_ms) VALUES(16,CAST(strftime('%s','now') AS INTEGER)*1000); PRAGMA user_version=16;",
+            )?;
+            tx.commit()?;
         }
         let integrity: String =
             connection.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
@@ -1265,7 +1316,7 @@ impl Storage {
         )?;
         if let Some(baseline) = baseline {
             tx.execute(
-                "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
+                "INSERT INTO turn_baselines(turn_id,manifest_json,captured) VALUES(?1,?2,1)",
                 params![
                     state.turn_id.to_string(),
                     serde_json::to_string(baseline).map_err(invalid_json)?
@@ -1311,6 +1362,7 @@ impl Storage {
         .map_err(Into::into)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_session_v2(
         &self,
@@ -1322,6 +1374,30 @@ impl Storage {
         baseline: &std::collections::BTreeMap<String, String>,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
+        self.create_session_v2_with_mode(
+            session_id,
+            turn_id,
+            binding,
+            workspace_root,
+            prompt,
+            baseline,
+            latte_core::PermissionMode::Ask,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_session_v2_with_mode(
+        &self,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        binding: &SessionProviderBinding,
+        workspace_root: &str,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        effective_mode: latte_core::PermissionMode,
+        now_ms: u64,
+    ) -> Result<SessionSnapshot, StorageError> {
         self.create_session_v2_inner(
             None,
             session_id,
@@ -1330,6 +1406,9 @@ impl Storage {
             workspace_root,
             prompt,
             baseline,
+            !baseline.is_empty(),
+            None,
+            effective_mode,
             None,
             now_ms,
             None,
@@ -1346,6 +1425,7 @@ impl Storage {
     /// `SessionCommandReplayMismatch` when the id was reused with a different
     /// command identity. This runs *before* lease acquisition so a retry after
     /// a crash never blocks on the dead owner's still-unexpired lease.
+    #[cfg(test)]
     pub(crate) fn lookup_create_replay(
         &self,
         command_id: &latte_core::SessionCommandId,
@@ -1355,17 +1435,57 @@ impl Storage {
         binding: &SessionProviderBinding,
         focus: Option<&str>,
     ) -> Result<Option<SessionSnapshot>, StorageError> {
-        let workspace_root = validate_workspace_root(workspace_root)?;
-        let digest = create_command_digest(session_id, workspace_root, prompt, binding, focus);
-        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+        self.lookup_create_replay_with_mode(
+            command_id,
             session_id,
             workspace_root,
             prompt,
             binding,
             focus,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lookup_create_replay_with_mode(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: latte_core::SessionId,
+        workspace_root: &str,
+        prompt: &str,
+        binding: &SessionProviderBinding,
+        focus: Option<&str>,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<Option<SessionSnapshot>, StorageError> {
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let digest = create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
         );
-        let legacy_digest =
-            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let v2_binding_digest = v2_binding_create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
+        );
+        let v1_binding_digest = permission_mode.is_none().then(|| {
+            legacy_v1_binding_create_command_digest(
+                session_id,
+                workspace_root,
+                prompt,
+                binding,
+                focus,
+            )
+        });
+        let legacy_digest = permission_mode.is_none().then(|| {
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus)
+        });
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1378,8 +1498,9 @@ impl Storage {
             return Ok(None);
         };
         if stored_digest != digest
-            && stored_digest != v1_binding_digest
-            && stored_digest != legacy_digest
+            && stored_digest != v2_binding_digest
+            && v1_binding_digest.as_deref() != Some(stored_digest.as_str())
+            && legacy_digest.as_deref() != Some(stored_digest.as_str())
         {
             return Err(StorageError::SessionCommandReplayMismatch);
         }
@@ -1392,16 +1513,23 @@ impl Storage {
     /// crashed before responding); the caller replays the snapshot and must
     /// not acquire a lease or start a runner. A same-id different-digest
     /// retry fails with [`StorageError::SessionCommandReplayMismatch`].
-    pub(crate) fn lookup_follow_up_replay(
+    pub(crate) fn lookup_follow_up_replay_with_mode(
         &self,
         command_id: &latte_core::SessionCommandId,
         session_id: latte_core::SessionId,
         expected_session_revision: u64,
         prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
     ) -> Result<Option<SessionSnapshot>, StorageError> {
-        let digest = follow_up_command_digest(session_id, expected_session_revision, prompt);
-        let legacy_digest =
-            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt);
+        let digest = follow_up_command_digest_with_mode(
+            session_id,
+            expected_session_revision,
+            prompt,
+            permission_mode,
+        );
+        let legacy_digest = permission_mode.is_none().then(|| {
+            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt)
+        });
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let row: Option<(String, String)> = conn
             .query_row(
@@ -1413,7 +1541,7 @@ impl Storage {
         let Some((stored_digest, result_json)) = row else {
             return Ok(None);
         };
-        if stored_digest != digest && stored_digest != legacy_digest {
+        if stored_digest != digest && legacy_digest.as_deref() != Some(stored_digest.as_str()) {
             return Err(StorageError::SessionCommandReplayMismatch);
         }
         let snapshot: SessionSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
@@ -1431,6 +1559,7 @@ impl Storage {
     /// non-replay create for an already-existing session fails with
     /// `SessionAlreadyExists`. A same-id same-digest retry returns `Replayed`
     /// without starting a runner.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_started_session_v2(
         &self,
@@ -1445,6 +1574,40 @@ impl Storage {
         now_ms: u64,
         focus: Option<&str>,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
+        self.create_started_session_v2_with_mode(
+            command_id,
+            session_id,
+            turn_id,
+            binding,
+            workspace_root,
+            prompt,
+            baseline,
+            !baseline.is_empty(),
+            None,
+            latte_core::PermissionMode::Ask,
+            lease,
+            now_ms,
+            focus,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_started_session_v2_with_mode(
+        &self,
+        command_id: Option<&latte_core::SessionCommandId>,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        binding: &SessionProviderBinding,
+        workspace_root: &str,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        baseline_captured: bool,
+        requested_mode: Option<latte_core::PermissionMode>,
+        effective_mode: latte_core::PermissionMode,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
         let (outcome, session_event) = self.create_session_v2_inner(
             command_id,
             session_id,
@@ -1453,6 +1616,9 @@ impl Storage {
             workspace_root,
             prompt,
             baseline,
+            baseline_captured,
+            requested_mode,
+            effective_mode,
             Some(lease),
             now_ms,
             focus,
@@ -1471,6 +1637,9 @@ impl Storage {
         workspace_root: &str,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
+        baseline_captured: bool,
+        requested_mode: Option<latte_core::PermissionMode>,
+        effective_mode: latte_core::PermissionMode,
         initial_lease: Option<&Lease>,
         now_ms: u64,
         focus: Option<&str>,
@@ -1486,20 +1655,37 @@ impl Storage {
         // Durable idempotency digest binds the raw request identity so that
         // payloads which collapse under redaction still produce distinct
         // digests and fail with 422 idempotency_mismatch on replay.
-        let command_digest =
-            create_command_digest(session_id, workspace_root, prompt, binding, focus);
-        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+        let command_digest = create_command_digest_with_mode(
             session_id,
             workspace_root,
             prompt,
             binding,
             focus,
+            requested_mode,
         );
+        let v2_binding_digest = v2_binding_create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            requested_mode,
+        );
+        let v1_binding_digest = requested_mode.is_none().then(|| {
+            legacy_v1_binding_create_command_digest(
+                session_id,
+                workspace_root,
+                prompt,
+                binding,
+                focus,
+            )
+        });
         // Pre-rename (schema <13) durable accepts stored the `thread.*` digest
         // namespace; compute it from the same raw identity so an upgraded binary
         // recognizes a pre-upgrade retry as a replay instead of a mismatch.
-        let legacy_command_digest =
-            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let legacy_command_digest = requested_mode.is_none().then(|| {
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus)
+        });
         // Redacted text is used for all durable readable records (transcript,
         // title); the raw prompt is never persisted.
         let prompt = redact_session_text(prompt);
@@ -1539,8 +1725,9 @@ impl Storage {
                 .optional()?;
             if let Some((stored_digest, result_json)) = previous {
                 if stored_digest != command_digest
-                    && stored_digest != v1_binding_digest
-                    && stored_digest != legacy_command_digest
+                    && stored_digest != v2_binding_digest
+                    && v1_binding_digest.as_deref() != Some(stored_digest.as_str())
+                    && legacy_command_digest.as_deref() != Some(stored_digest.as_str())
                 {
                     return Err(StorageError::SessionCommandReplayMismatch);
                 }
@@ -1599,15 +1786,16 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
+            "INSERT INTO turn_baselines(turn_id,manifest_json,captured) VALUES(?1,?2,?3)",
             params![
                 turn_id.to_string(),
-                serde_json::to_string(baseline).map_err(invalid_json)?
+                serde_json::to_string(baseline).map_err(invalid_json)?,
+                i64::from(baseline_captured)
             ],
         )?;
         tx.execute(
-            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?6,?7,?8,?9)",
-            params![session_id.to_string(), to_i64(session_revision)?, to_i64(session_sequence)?, serde_json::to_string(binding).map_err(invalid_json)?, turn_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus) VALUES(?1,?2,?3,'running',?4,?5,?6,?7,?7,?8,?9,?10)",
+            params![session_id.to_string(), to_i64(session_revision)?, to_i64(session_sequence)?, effective_mode.as_str(), serde_json::to_string(binding).map_err(invalid_json)?, turn_id.to_string(), to_i64(now_ms)?, title, workspace_root, focus],
         )?;
         tx.execute(
             "INSERT INTO session_turns(turn_id,session_id,parent_turn_id,ordinal) VALUES(?1,?2,NULL,0)",
@@ -1706,6 +1894,8 @@ impl Storage {
             expected_session_revision,
             prompt,
             baseline,
+            !baseline.is_empty(),
+            None,
             None,
             now_ms,
         )
@@ -1724,6 +1914,7 @@ impl Storage {
     /// same-id different-digest retry fails with
     /// [`StorageError::SessionCommandReplayMismatch`], and a same-id
     /// same-digest retry returns `Replayed` without starting a runner.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_started_session_follow_up_v2(
         &self,
@@ -1742,6 +1933,40 @@ impl Storage {
         ),
         StorageError,
     > {
+        self.create_started_session_follow_up_v2_with_mode(
+            command_id,
+            session_id,
+            turn_id,
+            expected_session_revision,
+            prompt,
+            baseline,
+            !baseline.is_empty(),
+            None,
+            lease,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_started_session_follow_up_v2_with_mode(
+        &self,
+        command_id: Option<&latte_core::SessionCommandId>,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
+        prompt: &str,
+        baseline: &std::collections::BTreeMap<String, String>,
+        baseline_captured: bool,
+        requested_mode: Option<latte_core::PermissionMode>,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<
+        (
+            latte_core::CreateOutcome<SessionSnapshot>,
+            Option<StoredSessionEvent>,
+        ),
+        StorageError,
+    > {
         self.create_session_follow_up_v2_inner(
             command_id,
             session_id,
@@ -1749,6 +1974,8 @@ impl Storage {
             expected_session_revision,
             prompt,
             baseline,
+            baseline_captured,
+            requested_mode,
             Some(lease),
             now_ms,
         )
@@ -1763,6 +1990,8 @@ impl Storage {
         expected_session_revision: u64,
         prompt: &str,
         baseline: &std::collections::BTreeMap<String, String>,
+        baseline_captured: bool,
+        requested_mode: Option<latte_core::PermissionMode>,
         initial_lease: Option<&Lease>,
         now_ms: u64,
     ) -> Result<
@@ -1773,13 +2002,18 @@ impl Storage {
         StorageError,
     > {
         // Durable idempotency digest binds the raw request identity.
-        let follow_up_digest =
-            follow_up_command_digest(session_id, expected_session_revision, prompt);
+        let follow_up_digest = follow_up_command_digest_with_mode(
+            session_id,
+            expected_session_revision,
+            prompt,
+            requested_mode,
+        );
         // Pre-rename (schema <13) follow-up accepts stored the
         // `thread.follow_up` digest namespace; accept it on replay so an
         // upgraded binary recognizes a pre-upgrade retry.
-        let legacy_follow_up_digest =
-            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt);
+        let legacy_follow_up_digest = requested_mode.is_none().then(|| {
+            legacy_follow_up_command_digest(session_id, expected_session_revision, prompt)
+        });
         // Redacted text is used for all durable readable records.
         let prompt = redact_session_text(prompt);
         if prompt.trim().is_empty() {
@@ -1816,7 +2050,9 @@ impl Storage {
                 )
                 .optional()?;
             if let Some((stored_digest, result_json)) = previous {
-                if stored_digest != follow_up_digest && stored_digest != legacy_follow_up_digest {
+                if stored_digest != follow_up_digest
+                    && legacy_follow_up_digest.as_deref() != Some(stored_digest.as_str())
+                {
                     return Err(StorageError::SessionCommandReplayMismatch);
                 }
                 let snapshot: SessionSnapshot =
@@ -1911,10 +2147,11 @@ impl Storage {
             ],
         )?;
         tx.execute(
-            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
+            "INSERT INTO turn_baselines(turn_id,manifest_json,captured) VALUES(?1,?2,?3)",
             params![
                 turn_id.to_string(),
-                serde_json::to_string(baseline).map_err(invalid_json)?
+                serde_json::to_string(baseline).map_err(invalid_json)?,
+                i64::from(baseline_captured)
             ],
         )?;
         tx.execute(
@@ -1973,7 +2210,21 @@ impl Storage {
             event: SessionEvent::TurnLinked { turn: summary },
         };
         tx.execute("INSERT INTO session_events(session_id,seq,event_id,revision,event_json,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![session_id.to_string(),to_i64(seq)?,event.event_id.to_string(),to_i64(next_revision)?,serde_json::to_string(&event).map_err(invalid_json)?,to_i64(now_ms)?])?;
-        tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle='running',latest_turn_id=?3,updated_at_ms=?4 WHERE session_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,turn_id.to_string(),to_i64(now_ms)?,session_id.to_string()])?;
+        if let Some(mode) = requested_mode {
+            tx.execute(
+                "UPDATE sessions SET revision=?1,last_seq=?2,lifecycle='running',permission_mode=?3,latest_turn_id=?4,updated_at_ms=?5 WHERE session_id=?6",
+                params![
+                    to_i64(next_revision)?,
+                    to_i64(seq)?,
+                    mode.as_str(),
+                    turn_id.to_string(),
+                    to_i64(now_ms)?,
+                    session_id.to_string()
+                ],
+            )?;
+        } else {
+            tx.execute("UPDATE sessions SET revision=?1,last_seq=?2,lifecycle='running',latest_turn_id=?3,updated_at_ms=?4 WHERE session_id=?5",params![to_i64(next_revision)?,to_i64(seq)?,turn_id.to_string(),to_i64(now_ms)?,session_id.to_string()])?;
+        }
         let session_event = if initial_lease.is_some() {
             let turn_event = EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
@@ -2245,6 +2496,38 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn set_session_permission_mode(
+        &self,
+        session_id: latte_core::SessionId,
+        mode: latte_core::PermissionMode,
+    ) -> Result<bool, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE sessions SET permission_mode=?1 WHERE session_id=?2 AND lifecycle <> 'materializing'",
+            params![mode.as_str(), session_id.to_string()],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub(crate) fn session_permission_mode(
+        &self,
+        session_id: latte_core::SessionId,
+    ) -> Result<Option<latte_core::PermissionMode>, StorageError> {
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT permission_mode FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing'",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.as_deref()
+            .map(latte_core::PermissionMode::parse_mode)
+            .transpose()
+            .map_err(StorageError::InvalidData)
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_materializing_session_v2(
         &self,
@@ -2258,19 +2541,66 @@ impl Storage {
         now_ms: u64,
         focus: Option<&str>,
     ) -> Result<BeginMaterializingOutcome, StorageError> {
+        self.begin_materializing_session_v2_with_mode(
+            command_id,
+            session_id,
+            turn_id,
+            binding,
+            workspace_root,
+            prompt,
+            None,
+            latte_core::PermissionMode::Ask,
+            lease,
+            now_ms,
+            focus,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn begin_materializing_session_v2_with_mode(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: latte_core::SessionId,
+        turn_id: TurnId,
+        binding: &SessionProviderBinding,
+        workspace_root: &str,
+        prompt: &str,
+        requested_mode: Option<latte_core::PermissionMode>,
+        effective_mode: latte_core::PermissionMode,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<BeginMaterializingOutcome, StorageError> {
         binding.validate().map_err(StorageError::InvalidData)?;
         let workspace_root = validate_workspace_root(workspace_root)?;
-        let command_digest =
-            create_command_digest(session_id, workspace_root, prompt, binding, focus);
-        let v1_binding_digest = legacy_v1_binding_create_command_digest(
+        let command_digest = create_command_digest_with_mode(
             session_id,
             workspace_root,
             prompt,
             binding,
             focus,
+            requested_mode,
         );
-        let legacy_command_digest =
-            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus);
+        let v2_binding_digest = v2_binding_create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            requested_mode,
+        );
+        let v1_binding_digest = requested_mode.is_none().then(|| {
+            legacy_v1_binding_create_command_digest(
+                session_id,
+                workspace_root,
+                prompt,
+                binding,
+                focus,
+            )
+        });
+        let legacy_command_digest = requested_mode.is_none().then(|| {
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus)
+        });
         let prompt = redact_session_text(prompt);
         if prompt.trim().is_empty() {
             return Err(StorageError::InvalidData(
@@ -2299,8 +2629,9 @@ impl Storage {
             .optional()?;
         if let Some((stored_digest, result_json)) = previous {
             if stored_digest != command_digest
-                && stored_digest != v1_binding_digest
-                && stored_digest != legacy_command_digest
+                && stored_digest != v2_binding_digest
+                && v1_binding_digest.as_deref() != Some(stored_digest.as_str())
+                && legacy_command_digest.as_deref() != Some(stored_digest.as_str())
             {
                 return Err(StorageError::SessionCommandReplayMismatch);
             }
@@ -2318,15 +2649,18 @@ impl Storage {
             return Err(StorageError::SessionAlreadyExists(session_id));
         }
         tx.execute(
-            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus) \
-             VALUES(?1,0,0,'materializing',?2,NULL,?3,?3,?4,?5,?6)",
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus,create_command_id,create_command_digest) \
+             VALUES(?1,0,0,'materializing',?2,?3,NULL,?4,?4,?5,?6,?7,?8,?9)",
             params![
                 session_id.to_string(),
+                effective_mode.as_str(),
                 serde_json::to_string(binding).map_err(invalid_json)?,
                 to_i64(now_ms)?,
                 title,
                 workspace_root,
-                focus
+                focus,
+                command_id.to_string(),
+                &command_digest
             ],
         )?;
         let user_entry = TranscriptEntry {
@@ -2355,6 +2689,7 @@ impl Storage {
         turn_id: TurnId,
         user_entry: &TranscriptEntry,
         baseline: &std::collections::BTreeMap<String, String>,
+        baseline_captured: bool,
         lease: &Lease,
         now_ms: u64,
     ) -> Result<(SessionSnapshot, StoredSessionEvent), StorageError> {
@@ -2390,14 +2725,15 @@ impl Storage {
             params![turn_id.to_string(), state_json],
         )?;
         tx.execute(
-            "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,?2)",
+            "INSERT INTO turn_baselines(turn_id,manifest_json,captured) VALUES(?1,?2,?3)",
             params![
                 turn_id.to_string(),
-                serde_json::to_string(baseline).map_err(invalid_json)?
+                serde_json::to_string(baseline).map_err(invalid_json)?,
+                i64::from(baseline_captured)
             ],
         )?;
         let updated = tx.execute(
-            "UPDATE sessions SET revision=1,last_seq=2,lifecycle='running',latest_turn_id=?1,updated_at_ms=?2 \
+            "UPDATE sessions SET revision=1,last_seq=2,lifecycle='running',latest_turn_id=?1,updated_at_ms=?2,create_command_id=NULL,create_command_digest=NULL \
              WHERE session_id=?3 AND lifecycle='materializing'",
             params![turn_id.to_string(), to_i64(now_ms)?, session_id.to_string()],
         )?;
@@ -2503,11 +2839,11 @@ impl Storage {
         &self,
         workspace_root: &str,
         now_ms: u64,
-    ) -> Result<Vec<(latte_core::SessionId, String, Option<String>)>, StorageError> {
+    ) -> Result<Vec<MaterializingSessionRecord>, StorageError> {
         let workspace_root = validate_workspace_root(workspace_root)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
         let mut statement = conn.prepare(
-            "SELECT s.session_id,s.binding_json,s.focus \
+            "SELECT s.session_id,s.binding_json,s.focus,s.permission_mode,s.create_command_id,s.create_command_digest \
              FROM sessions s \
              WHERE s.workspace_root=?1 AND s.lifecycle='materializing' \
                AND NOT EXISTS( \
@@ -2521,11 +2857,30 @@ impl Storage {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         rows.map(|row| {
-            let (session_id, binding_json, focus) = row?;
-            Ok((parse_session_id(&session_id)?, binding_json, focus))
+            let (
+                session_id,
+                binding_json,
+                focus,
+                permission_mode_raw,
+                create_command_id,
+                create_command_digest,
+            ) = row?;
+            let permission_mode = latte_core::PermissionMode::parse_mode(&permission_mode_raw)
+                .unwrap_or(latte_core::PermissionMode::Ask);
+            Ok(MaterializingSessionRecord {
+                session_id: parse_session_id(&session_id)?,
+                binding_json,
+                focus,
+                permission_mode,
+                create_command_id,
+                create_command_digest,
+            })
         })
         .collect()
     }
@@ -2595,7 +2950,7 @@ impl Storage {
         docs: &[crate::conversation::ConversationDocument],
         materializing_overrides: &std::collections::BTreeMap<
             latte_core::SessionId,
-            (String, Option<String>),
+            MaterializingSessionRecord,
         >,
         now_ms: u64,
     ) -> Result<usize, StorageError> {
@@ -2610,8 +2965,8 @@ impl Storage {
             if doc.entries.is_empty() {
                 continue;
             }
-            let (binding_json, focus) =
-                if let Some((binding_json, focus)) = materializing_overrides.get(&doc.session_id) {
+            let (binding_json, focus, permission_mode, dedup_identity) =
+                if let Some(record) = materializing_overrides.get(&doc.session_id) {
                     let deleted = tx.execute(
                         "DELETE FROM sessions WHERE session_id=?1 AND lifecycle='materializing'",
                         [doc.session_id.to_string()],
@@ -2619,7 +2974,16 @@ impl Storage {
                     if deleted == 0 {
                         continue;
                     }
-                    (binding_json.clone(), focus.clone())
+                    let dedup = record
+                        .create_command_id
+                        .clone()
+                        .zip(record.create_command_digest.clone());
+                    (
+                        record.binding_json.clone(),
+                        record.focus.clone(),
+                        record.permission_mode,
+                        dedup,
+                    )
                 } else {
                     let exists: bool = tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1)",
@@ -2630,7 +2994,12 @@ impl Storage {
                         continue;
                     }
                     let binding = recovered_binding_from_entries(&doc.entries);
-                    (serde_json::to_string(&binding).map_err(invalid_json)?, None)
+                    (
+                        serde_json::to_string(&binding).map_err(invalid_json)?,
+                        None,
+                        latte_core::PermissionMode::Ask,
+                        None,
+                    )
                 };
             let title = doc
                 .entries
@@ -2662,12 +3031,13 @@ impl Storage {
 
             let latest_turn_id = turn_ids.last().map(ToString::to_string);
             tx.execute(
-                "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
-                 VALUES(?1,?2,?3,'ready',?4,?5,?6,?7,?8,?9,NULL,?10)",
+                "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,parent_session_id,focus) \
+                 VALUES(?1,?2,?3,'ready',?4,?5,?6,?7,?8,?9,?10,NULL,?11)",
                 params![
                     doc.session_id.to_string(),
                     to_i64(revision)?,
                     to_i64(last_seq)?,
+                    permission_mode.as_str(),
                     binding_json,
                     latest_turn_id,
                     to_i64(created_at_ms)?,
@@ -2784,13 +3154,14 @@ impl Storage {
                 turn_ids.is_empty(),
                 updated_at_ms,
                 &doc.entries,
+                dedup_identity,
             ));
         }
 
         // Second pass: restore fork lineage (`parent_session_id`) when the
         // parent session exists, or attach a completed seed turn if a forked
         // session has zero child turns and its parent is absent.
-        for (session_id, had_no_turns, updated_at_ms, entries) in &rebuilt {
+        for (session_id, had_no_turns, updated_at_ms, entries, dedup_identity) in &rebuilt {
             let parent_candidate = entries
                 .first()
                 .and_then(|entry| entry.source_key.strip_prefix("fork:"))
@@ -2841,7 +3212,7 @@ impl Storage {
                     params![seed_turn.to_string(), state_json],
                 )?;
                 tx.execute(
-                    "INSERT INTO turn_baselines(turn_id,manifest_json) VALUES(?1,'{}')",
+                    "INSERT INTO turn_baselines(turn_id,manifest_json,captured) VALUES(?1,'{}',0)",
                     [seed_turn.to_string()],
                 )?;
                 tx.execute(
@@ -2851,6 +3222,28 @@ impl Storage {
                 tx.execute(
                     "UPDATE sessions SET latest_turn_id=?1 WHERE session_id=?2",
                     params![seed_turn.to_string(), session_id.to_string()],
+                )?;
+            }
+            if let Some((command_id, command_digest)) = dedup_identity {
+                let mut snapshot = current_session_snapshot(
+                    &tx,
+                    *session_id,
+                    SESSION_PROJECTION_TRANSCRIPT_LIMIT,
+                )?;
+                snapshot.transcript = TranscriptPage {
+                    entries: (*entries).clone(),
+                    next_after: entries.last().map(|entry| entry.sequence),
+                    has_more: false,
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO session_command_dedup(command_id,digest,result_json,created_at_ms) \
+                     VALUES(?1,?2,?3,?4)",
+                    params![
+                        command_id,
+                        command_digest,
+                        serde_json::to_string(&snapshot).map_err(invalid_json)?,
+                        to_i64(now_ms)?
+                    ],
                 )?;
             }
         }
@@ -3605,20 +3998,13 @@ impl Storage {
     pub(crate) fn session_turn_mutation_summary(
         &self,
         turn_id: TurnId,
-    ) -> Result<
-        (
-            std::collections::BTreeMap<String, String>,
-            Vec<crate::EffectAuthority>,
-            bool,
-        ),
-        StorageError,
-    > {
+    ) -> Result<(bool, Vec<crate::EffectAuthority>, bool), StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let baseline_json: String = conn
+        let (baseline_json, captured_raw): (String, i64) = conn
             .query_row(
-                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                "SELECT manifest_json, captured FROM turn_baselines WHERE turn_id=?1",
                 [turn_id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -3626,6 +4012,7 @@ impl Storage {
             })?;
         let baseline: std::collections::BTreeMap<String, String> =
             serde_json::from_str(&baseline_json).map_err(invalid_json)?;
+        let baseline_captured = captured_raw != 0 || !baseline.is_empty();
         let mut stmt = conn.prepare(
             "SELECT e.effect_id, e.status, c.descriptor_json \
              FROM effects e \
@@ -3663,19 +4050,19 @@ impl Storage {
                 _ => {}
             }
         }
-        Ok((baseline, file_mutations, mutating_process_ran))
+        Ok((baseline_captured, file_mutations, mutating_process_ran))
     }
 
-    pub(crate) fn has_nonempty_turn_baseline(&self, turn_id: TurnId) -> Result<bool, StorageError> {
+    pub(crate) fn is_turn_baseline_captured(&self, turn_id: TurnId) -> Result<bool, StorageError> {
         let conn = self.connection.lock().expect("storage mutex poisoned");
-        let raw: Option<String> = conn
+        let captured: Option<i64> = conn
             .query_row(
-                "SELECT manifest_json FROM turn_baselines WHERE turn_id=?1",
+                "SELECT captured FROM turn_baselines WHERE turn_id=?1",
                 [turn_id.to_string()],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(raw.is_some_and(|text| text != "{}" && !text.trim().is_empty()))
+        Ok(captured.is_some_and(|flag| flag != 0))
     }
 
     pub(crate) fn store_lazy_turn_baseline(
@@ -3686,7 +4073,7 @@ impl Storage {
         let encoded = serde_json::to_string(manifest).map_err(invalid_json)?;
         let conn = self.connection.lock().expect("storage mutex poisoned");
         conn.execute(
-            "UPDATE turn_baselines SET manifest_json=?1 WHERE turn_id=?2 AND manifest_json='{}'",
+            "UPDATE turn_baselines SET manifest_json=?1, captured=1 WHERE turn_id=?2 AND captured=0",
             params![encoded, turn_id.to_string()],
         )?;
         Ok(())
@@ -6365,16 +6752,17 @@ fn session_snapshot(
     after: Option<u64>,
     limit: usize,
 ) -> Result<SessionSnapshot, StorageError> {
-    let (revision, sequence, lifecycle, binding_json, latest, focus): (
+    let (revision, sequence, lifecycle, permission_mode_raw, binding_json, latest, focus): (
         i64,
         i64,
+        String,
         String,
         String,
         Option<String>,
         Option<String>,
     ) = connection
         .query_row(
-            "SELECT revision,last_seq,lifecycle,binding_json,latest_turn_id,focus \
+            "SELECT revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,focus \
              FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing'",
             [session_id.to_string()],
             |row| {
@@ -6385,11 +6773,14 @@ fn session_snapshot(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?
         .ok_or(StorageError::SessionNotFound(session_id))?;
+    let permission_mode = latte_core::PermissionMode::parse_mode(&permission_mode_raw)
+        .map_err(StorageError::InvalidData)?;
     let binding = serde_json::from_str(&binding_json).map_err(invalid_json)?;
     let latest_turn_id = latest
         .as_deref()
@@ -6503,6 +6894,7 @@ fn session_snapshot(
         session_revision: from_i64(revision)?,
         sequence: from_i64(sequence)?,
         lifecycle: parse_lifecycle(&lifecycle)?,
+        permission_mode,
         binding,
         latest_turn_id,
         active_turn_id,
@@ -6980,15 +7372,16 @@ fn validate_session_source(source: &str) -> Result<(), StorageError> {
 /// complete identity: operation kind, protocol version, workspace, session,
 /// prompt, binding, and normalized focus. Two creates with the same
 /// `command_id` but different digests fail with 422 `idempotency_mismatch`.
-fn create_command_digest(
+fn create_command_digest_with_mode(
     session_id: latte_core::SessionId,
     workspace_root: &str,
     prompt: &str,
     binding: &SessionProviderBinding,
     focus: Option<&str>,
+    permission_mode: Option<latte_core::PermissionMode>,
 ) -> String {
     use sha2::{Digest, Sha256};
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "operation": "session.start",
         "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
         "workspace": workspace_root,
@@ -6997,6 +7390,56 @@ fn create_command_digest(
         "binding": binding,
         "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
     });
+    if let Some(mode) = permission_mode
+        && let Some(obj) = canonical.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
+    )
+}
+
+fn v2_binding_json_value(binding: &SessionProviderBinding) -> serde_json::Value {
+    serde_json::json!({
+        "binding_version": binding.binding_version,
+        "provider_name": binding.provider_name,
+        "provider_type": binding.provider_type,
+        "protocol": binding.protocol,
+        "model": binding.model,
+        "config_fingerprint": binding.config_fingerprint,
+        "tools_fingerprint": binding.tools_fingerprint,
+        "aliases": binding.aliases,
+        "credential_ref_id": binding.credential_ref_id,
+        "data_scope_id": binding.data_scope_id,
+        "credential_generation": binding.credential_generation,
+    })
+}
+
+fn v2_binding_create_command_digest_with_mode(
+    session_id: latte_core::SessionId,
+    workspace_root: &str,
+    prompt: &str,
+    binding: &SessionProviderBinding,
+    focus: Option<&str>,
+    permission_mode: Option<latte_core::PermissionMode>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut canonical = serde_json::json!({
+        "operation": "session.start",
+        "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
+        "workspace": workspace_root,
+        "session_id": session_id.to_string(),
+        "prompt": prompt,
+        "binding": v2_binding_json_value(binding),
+        "focus": focus.map(str::trim).filter(|value| !value.is_empty()),
+    });
+    if let Some(mode) = permission_mode
+        && let Some(obj) = canonical.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
@@ -7006,19 +7449,25 @@ fn create_command_digest(
 /// Stable digest of a follow-up command's complete identity. A same-command
 /// retry must reproduce it byte-for-byte; any payload change fails with
 /// 422 `idempotency_mismatch`.
-fn follow_up_command_digest(
+fn follow_up_command_digest_with_mode(
     session_id: latte_core::SessionId,
     expected_session_revision: u64,
     prompt: &str,
+    permission_mode: Option<latte_core::PermissionMode>,
 ) -> String {
     use sha2::{Digest, Sha256};
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "operation": "session.follow_up",
         "protocol_version": latte_core::SESSION_PROTOCOL_VERSION,
         "session_id": session_id.to_string(),
         "expected_session_revision": expected_session_revision,
         "prompt": prompt,
     });
+    if let Some(mode) = permission_mode
+        && let Some(obj) = canonical.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
@@ -7566,6 +8015,10 @@ fn reconstruct_turn_from_entries(
 #[cfg(test)]
 const REVERSE_SCHEMA_15: &str = r"
     PRAGMA legacy_alter_table=OFF;
+    ALTER TABLE sessions DROP COLUMN permission_mode;
+    ALTER TABLE sessions DROP COLUMN create_command_id;
+    ALTER TABLE sessions DROP COLUMN create_command_digest;
+    ALTER TABLE turn_baselines DROP COLUMN captured;
     ALTER TABLE sessions RENAME COLUMN latest_turn_id TO latest_run_id;
     ALTER TABLE session_effect_canonical RENAME COLUMN turn_id TO run_id;
     ALTER TABLE conversation_outbox RENAME COLUMN turn_id TO run_id;
@@ -7586,7 +8039,7 @@ const REVERSE_SCHEMA_15: &str = r"
     ALTER TABLE turns RENAME TO runs;
     ALTER TABLE session_active_turns RENAME TO session_active_runs;
     ALTER TABLE session_turns RENAME TO session_runs;
-    DELETE FROM schema_migrations WHERE version=15;
+    DELETE FROM schema_migrations WHERE version IN (15,16);
 ";
 
 #[cfg(test)]
@@ -14006,7 +14459,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         drop(dir);
     }
 
@@ -14104,7 +14557,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         // …and the pre-15 JSON rows are still readable with the same UUID.
         // (Opening the catalog without a live engine recovery-sweeps an
         // orphaned Running child to Interrupted; the point under test is that

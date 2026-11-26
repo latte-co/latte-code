@@ -168,7 +168,7 @@ fn final_binary_context_endpoint_reports_usage_that_grows_with_history() {
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
 
     let ready = wait_session_idle(&server, &session_id);
-    let revision = ready["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = ready["snapshot"]["revision"].as_u64().unwrap();
 
     let (status, first) = server.request(
         "GET",
@@ -1148,7 +1148,7 @@ fn final_binary_manual_compact_forces_below_watermark_and_reports_empty_state() 
         "summarized"
     );
     assert!(
-        compact_body["data"]["compact"]["compacted"]["session_revision"]
+        compact_body["data"]["compact"]["compacted"]["revision"]
             .as_u64()
             .unwrap()
             > 0,
@@ -1229,7 +1229,7 @@ fn final_binary_manual_compact_rejects_a_parked_session_with_409() {
 
     // Wait for the parked waiting_input state.
     let parked = wait_session_lifecycle(&server, &session_id, "waiting_input");
-    let session_revision = parked["snapshot"]["session_revision"].as_u64().unwrap();
+    let session_revision = parked["snapshot"]["revision"].as_u64().unwrap();
     let turn_revision = parked["snapshot"]["turns"][0]["turn_revision"]
         .as_u64()
         .unwrap();
@@ -1316,7 +1316,7 @@ fn final_binary_manual_compact_repeated_is_idle_without_another_summary_request(
     let (_status, create_body) =
         server.create_session(&workspace_id, "REPEAT-COMPACT-T1 base", &binding);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
-    let mut revision = wait_session_idle(&server, &session_id)["snapshot"]["session_revision"]
+    let mut revision = wait_session_idle(&server, &session_id)["snapshot"]["revision"]
         .as_u64()
         .unwrap();
 
@@ -1334,7 +1334,7 @@ fn final_binary_manual_compact_repeated_is_idle_without_another_summary_request(
         &[("Idempotency-Key", &command_id)],
     );
     assert_eq!(status, 202, "follow-up: {body:?}");
-    revision = wait_session_idle(&server, &session_id)["snapshot"]["session_revision"]
+    revision = wait_session_idle(&server, &session_id)["snapshot"]["revision"]
         .as_u64()
         .unwrap();
     assert_eq!(
@@ -1353,7 +1353,7 @@ fn final_binary_manual_compact_repeated_is_idle_without_another_summary_request(
     );
     assert_eq!(first_status, 200, "first compact: {first_body}");
     assert_eq!(first_body["state"]["compacted"]["tier"], "summarized");
-    let compacted_revision = first_body["state"]["compacted"]["session_revision"]
+    let compacted_revision = first_body["state"]["compacted"]["revision"]
         .as_u64()
         .expect("compacted revision");
     assert_eq!(compacted_revision, revision + 1);
@@ -1377,7 +1377,7 @@ fn final_binary_manual_compact_repeated_is_idle_without_another_summary_request(
         "repeating compact on the same floor is the documented empty-state: {second_body}"
     );
     assert_eq!(
-        second_body["snapshot"]["session_revision"].as_u64(),
+        second_body["snapshot"]["revision"].as_u64(),
         Some(compacted_revision),
         "the idle repeat must not advance the revision"
     );
@@ -1436,7 +1436,7 @@ fn final_binary_near_budget_prompt_drops_both_volatile_tails_without_overflow() 
         server.create_session(&workspace_id, "TAILDROP base tiny prompt", &binding);
     let session_id = create_body["session_id"].as_str().unwrap().to_string();
     let ready = wait_session_idle(&server, &session_id);
-    let revision = ready["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = ready["snapshot"]["revision"].as_u64().unwrap();
 
     // Arm a one-shot reminder large enough that it could only ride as slack.
     let (arm_status, arm_body) = server.request(
@@ -1834,7 +1834,7 @@ fn final_binary_reminder_slot_is_oneshot_nonpersistent_and_idle_only() {
     assert!(arm_body["bytes"].as_u64().unwrap() > 0);
 
     // The next turn carries the framed, redacted reminder ahead of its prompt.
-    let mut revision = ready_one["snapshot"]["session_revision"].as_u64().unwrap();
+    let mut revision = ready_one["snapshot"]["revision"].as_u64().unwrap();
     let command_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
     let (follow_status, follow_body) = server.request(
         "POST",
@@ -1849,7 +1849,7 @@ fn final_binary_reminder_slot_is_oneshot_nonpersistent_and_idle_only() {
     );
     assert_eq!(follow_status, 202, "follow-up returned {follow_body:?}");
     let ready_two = wait_session_idle(&server, &session_id);
-    revision = ready_two["snapshot"]["session_revision"].as_u64().unwrap();
+    revision = ready_two["snapshot"]["revision"].as_u64().unwrap();
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -2004,7 +2004,7 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
                 &[],
             );
             if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                break body["snapshot"]["session_revision"].as_u64().unwrap();
+                break body["snapshot"]["revision"].as_u64().unwrap();
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
@@ -2034,7 +2034,7 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -2175,7 +2175,7 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
                 &[],
             );
             if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                break body["snapshot"]["session_revision"].as_u64().unwrap();
+                break body["snapshot"]["revision"].as_u64().unwrap();
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
@@ -2203,7 +2203,7 @@ fn final_binary_input_answer_compacts_superseded_history_and_degrades_when_the_s
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -2950,7 +2950,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -3009,7 +3009,7 @@ fn final_binary_keeps_the_verification_effect_out_of_replayed_provider_history()
                     Some(&server.token),
                     Some(&serde_json::json!({
                         "allow": true,
-                        "expected_session_revision": body["snapshot"]["session_revision"],
+                        "expected_session_revision": body["snapshot"]["revision"],
                         "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
@@ -3232,7 +3232,7 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
     // revision) so the follow-up cannot race the runner's teardown on a slow
     // machine.
     let settled = wait_session_idle(&server, &session_id);
-    let revision = settled["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = settled["snapshot"]["revision"].as_u64().unwrap();
 
     // Turn 2: a follow-up that hits the permission gate on its first round.
     let command = "01900000-0000-7000-8000-000000000021";
@@ -3293,7 +3293,7 @@ fn final_binary_round_budget_does_not_accumulate_across_turns() {
                     Some(&server.token),
                     Some(&serde_json::json!({
                         "allow": true,
-                        "expected_session_revision": body["snapshot"]["session_revision"],
+                        "expected_session_revision": body["snapshot"]["revision"],
                         "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
@@ -3376,7 +3376,7 @@ fn wait_session_idle(server: &ServeChild, sid: &str) -> serde_json::Value {
             match snapshot["lifecycle"].as_str() {
                 Some("failed") => panic!("turn failed before reaching idle: {body:?}"),
                 Some("ready") if snapshot["active_turn_id"].is_null() => {
-                    let revision = snapshot["session_revision"].as_u64().unwrap();
+                    let revision = snapshot["revision"].as_u64().unwrap();
                     if previous_revision == Some(revision) {
                         return body;
                     }
@@ -3481,7 +3481,7 @@ fn final_binary_replays_a_pre_upgrade_durable_accept_after_schema_13() {
         assert_eq!(status, 202, "fresh create returned {body:?}");
         let sid = body["session_id"].as_str().unwrap().to_string();
         let settled = wait_session_idle(&server, &sid);
-        follow_revision = settled["snapshot"]["session_revision"].as_u64().unwrap();
+        follow_revision = settled["snapshot"]["revision"].as_u64().unwrap();
 
         // Durable follow-up accept (its dedup row uses `thread.follow_up`).
         let (fu_status, fu_body) = server.request(
@@ -3664,10 +3664,7 @@ fn final_binary_resumes_a_pre_upgrade_binding_after_schema_13() {
         assert_eq!(status, 202, "create returned {body:?}");
         let sid = body["session_id"].as_str().unwrap().to_string();
         let settled = wait_session_idle(&server, &sid);
-        (
-            sid,
-            settled["snapshot"]["session_revision"].as_u64().unwrap(),
-        )
+        (sid, settled["snapshot"]["revision"].as_u64().unwrap())
     };
 
     // --- Rewind to v12 and rewrite the persisted binding's tools_fingerprint
@@ -3807,7 +3804,7 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
                         Some(&server.token),
                         Some(&serde_json::json!({
                             "allow": true,
-                            "expected_session_revision": body["snapshot"]["session_revision"],
+                            "expected_session_revision": body["snapshot"]["revision"],
                             "expected_turn_revision":
                                 body["snapshot"]["pending"]["expected_turn_revision"],
                         })),
@@ -3885,7 +3882,7 @@ fn final_binary_approves_a_pre_upgrade_waiting_verification_after_schema_13() {
                     Some(&server.token),
                     Some(&serde_json::json!({
                         "allow": true,
-                        "expected_session_revision": body["snapshot"]["session_revision"],
+                        "expected_session_revision": body["snapshot"]["revision"],
                         "expected_turn_revision":
                             body["snapshot"]["pending"]["expected_turn_revision"],
                     })),
@@ -4020,7 +4017,7 @@ fn final_binary_keeps_the_round_budget_across_a_permission_approval() {
                     Some(&server.token),
                     Some(&serde_json::json!({
                         "allow": true,
-                        "expected_session_revision": body["snapshot"]["session_revision"],
+                        "expected_session_revision": body["snapshot"]["revision"],
                         "expected_turn_revision": pending["expected_turn_revision"],
                     })),
                     &[],
@@ -4114,7 +4111,7 @@ fn final_binary_input_answer_does_not_reset_the_active_run_tool_budget() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -4311,7 +4308,7 @@ fn final_binary_round_budget_survives_more_than_500_transcript_cards_across_inpu
                 .as_array()
                 .map_or(0, Vec::len);
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -4811,7 +4808,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         None,
         &[],
     );
-    let revision = snapshot["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
 
     // Switching to the other configured model on an idle session succeeds and
     // returns the updated snapshot binding.
@@ -4836,7 +4833,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
         None,
         &[],
     );
-    let revision = snapshot["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
 
     // Subscribe to the workspace SSE stream in a reader session, then trigger a
     // follow-up whose durable transitions must surface as session_changed
@@ -5068,7 +5065,7 @@ fn final_binary_serves_http_api_with_auth_workspace_and_session_lifecycle() {
             None,
             &[],
         );
-        b["snapshot"]["session_revision"].as_u64().unwrap()
+        b["snapshot"]["revision"].as_u64().unwrap()
     };
     let (no_key_follow_status, _) = server.request(
         "POST",
@@ -5190,7 +5187,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -5248,7 +5245,7 @@ fn final_binary_server_resolves_a_permission_request_through_http() {
         None,
         &[],
     );
-    let revision = snapshot["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = snapshot["snapshot"]["revision"].as_u64().unwrap();
     let (noop_status, _) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/model"),
@@ -5322,7 +5319,7 @@ fn final_binary_server_denies_a_permission_request_through_http() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -5505,7 +5502,7 @@ fn final_binary_server_rejects_stale_turn_revision_on_permission() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -5603,7 +5600,7 @@ fn final_binary_server_rejects_stale_turn_revision_on_input() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -5703,7 +5700,7 @@ fn final_binary_server_provides_input_through_http() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -5786,7 +5783,7 @@ fn final_binary_server_provides_input_through_http() {
                 None,
                 &[],
             );
-            b["snapshot"]["session_revision"].as_u64().unwrap()
+            b["snapshot"]["revision"].as_u64().unwrap()
         };
         // Cancel with matching revisions exercises the cancel handler success path.
         let (cancel_status, _) = server.request(
@@ -5859,7 +5856,7 @@ fn final_binary_terminal_finish_audits_the_discarded_queue() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_input") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -6497,7 +6494,7 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
             &[],
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-            let revision = body["snapshot"]["session_revision"].as_u64().unwrap();
+            let revision = body["snapshot"]["revision"].as_u64().unwrap();
             let (sw, sw_body) = server.request(
                 "POST",
                 &format!("/v1/sessions/{session_id}/model"),
@@ -6529,7 +6526,7 @@ fn final_binary_server_switches_model_and_replays_follow_up() {
         None,
         &[],
     );
-    let revision = snap["snapshot"]["session_revision"].as_u64().unwrap();
+    let revision = snap["snapshot"]["revision"].as_u64().unwrap();
     let (f1, f1_body) = server.request(
         "POST",
         &format!("/v1/sessions/{session_id}/follow-up"),
@@ -6600,7 +6597,7 @@ fn final_binary_follow_up_replays_after_restart_without_duplicate_turn() {
                 &[],
             );
             if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                break body["snapshot"]["session_revision"].as_u64().unwrap();
+                break body["snapshot"]["revision"].as_u64().unwrap();
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
@@ -6737,7 +6734,7 @@ fn final_binary_follow_up_durable_mismatch_after_restart_returns_422() {
                 &[],
             );
             if body["snapshot"]["lifecycle"].as_str() == Some("ready") {
-                break body["snapshot"]["session_revision"].as_u64().unwrap();
+                break body["snapshot"]["revision"].as_u64().unwrap();
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
@@ -7697,7 +7694,7 @@ fn final_binary_cli_show_denied_session_in_text_mode() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -8132,7 +8129,7 @@ fn final_binary_cli_show_cancelled_waiting_session_renders_failed() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["expected_turn_revision"]
                     .as_u64()
                     .unwrap(),
@@ -10955,7 +10952,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -10998,7 +10995,7 @@ fn final_binary_cli_run_with_failing_verification_fails() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             verify_pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -11116,7 +11113,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -11159,7 +11156,7 @@ fn final_binary_cli_run_with_passing_verification_completes() {
         );
         if status == 200 && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission") {
             verify_pending = Some((
-                body["snapshot"]["session_revision"].as_u64().unwrap(),
+                body["snapshot"]["revision"].as_u64().unwrap(),
                 body["snapshot"]["pending"]["request_id"]
                     .as_str()
                     .unwrap()
@@ -13096,7 +13093,7 @@ fn final_binary_rebuilds_catalog_from_orphaned_jsonl_and_resumes_after_model_reb
     let shown_session = json(&shown)["data"]["session"].clone();
     assert_eq!(shown_session["lifecycle"], "ready");
     assert_eq!(shown_session["turns"].as_array().unwrap().len(), 1);
-    assert_eq!(shown_session["turns"][0]["turn_ordinal"], 0);
+    assert_eq!(shown_session["turns"][0]["ordinal"], 0);
     assert_eq!(shown_session["turns"][0]["status"], "completed");
     assert!(
         shown_session["transcript"]["entries"]
@@ -13150,7 +13147,7 @@ fn final_binary_rebuilds_catalog_from_orphaned_jsonl_and_resumes_after_model_reb
             &[],
         );
         assert_eq!(snap_status, 200);
-        let expected_rev = snap_body["snapshot"]["session_revision"].as_u64().unwrap();
+        let expected_rev = snap_body["snapshot"]["revision"].as_u64().unwrap();
         let binding = server_binding(&scenario);
         let (switch_status, switch_body) = server.request(
             "POST",
@@ -13202,6 +13199,7 @@ fn final_binary_repairs_missing_observed_tool_result_without_reexecuting_tool() 
             &serde_json::json!({"path": "ephemeral.txt"}),
         ),
         ProviderReply::completion("turn-one-observed"),
+        ProviderReply::completion("turn-two-completed"),
         ProviderReply::completion("continued-with-repaired-output"),
     ]);
     scenario.write_config(provider.endpoint(), r#"["verification-must-not-run"]"#);
@@ -13211,6 +13209,13 @@ fn final_binary_repairs_missing_observed_tool_result_without_reexecuting_tool() 
     });
     assert!(initial.status.success());
     let sid = session_id(&initial);
+
+    // Complete a second turn BEFORE stripping Turn 1's ToolResult so the repaired
+    // ToolResult is physically appended at the tail after Turn 2 (#8).
+    let second_turn = scenario.output(&["--json", "resume", &sid, "second plain turn"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "repair-secret");
+    });
+    assert!(second_turn.status.success());
 
     // Remove the workspace file after Turn 1 finishes so re-executing
     // `read_file` would fail with NotFound instead of producing the sentinel.
@@ -13261,8 +13266,8 @@ fn final_binary_repairs_missing_observed_tool_result_without_reexecuting_tool() 
         repaired_lines
     );
 
-    // A follow-up `resume` replays the repaired tool output into the provider
-    // conversation window and completes cleanly without touching `ephemeral.txt`.
+    // A follow-up `resume` (Turn 3) replays the repaired Turn 1 tool output into
+    // Turn 1's exact assistant tool batch BEFORE `turn-one-observed` and Turn 2!
     let resumed = scenario.output(
         &["--json", "resume", &sid, "confirm repaired tool output"],
         |cmd| {
@@ -13277,8 +13282,46 @@ fn final_binary_repairs_missing_observed_tool_result_without_reexecuting_tool() 
     );
     assert_eq!(json(&resumed)["status"], "completed");
     provider.assert_consumed();
-    let third_req = serde_json::to_string(&provider.requests()[2].body).unwrap();
-    assert!(third_req.contains("observed-once-sentinel"));
+    let req_messages = provider.requests()[3].body["messages"]
+        .as_array()
+        .expect("messages array")
+        .clone();
+    let tool_positions: Vec<usize> = req_messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| (msg["role"] == "tool").then_some(idx))
+        .collect();
+    assert_eq!(
+        tool_positions.len(),
+        1,
+        "repaired tool result must appear exactly once: {req_messages:?}"
+    );
+    let tool_idx = tool_positions[0];
+    assert_eq!(req_messages[tool_idx]["tool_call_id"], "repair-read-1");
+    assert!(
+        req_messages[tool_idx]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("observed-once-sentinel")
+    );
+    let turn1_asst_done_idx = req_messages
+        .iter()
+        .position(|m| m["role"] == "assistant" && m["content"] == "turn-one-observed")
+        .expect("turn 1 final assistant message");
+    let turn2_user_idx = req_messages
+        .iter()
+        .position(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("second plain turn")
+        })
+        .expect("turn 2 user message");
+    assert!(
+        tool_idx < turn1_asst_done_idx && turn1_asst_done_idx < turn2_user_idx,
+        "repaired Turn 1 tool result must precede Turn 1 completion and Turn 2: {req_messages:?}"
+    );
 }
 
 /// Batch 4 CLI error vocabulary: HTTP 422 `idempotency_mismatch` maps to
@@ -14470,4 +14513,1346 @@ fn final_binary_claude_edit_fallbacks_and_ambiguity_errors_report_cleanly() {
         round3_wire.contains("edit match count must be exactly one, found 0"),
         "{round3_wire}"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_anthropic_redirect_block_signed_thinking_redaction_and_warm_prefix_source_cap() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Cross-origin redirect on Anthropic endpoint blocks credential egress (#1).
+    let redir_ws = Scenario::new();
+    let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let target_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits_clone = std::sync::Arc::clone(&target_hits);
+    std::thread::spawn(move || {
+        let _ = target_listener.set_nonblocking(true);
+        for _ in 0..40 {
+            if let Ok((mut s, _)) = target_listener.accept() {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut b = [0_u8; 2048];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let origin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_addr = origin_listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = origin_listener.accept() {
+            let mut b = [0_u8; 4096];
+            let _ = s.read(&mut b);
+            let resp = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/v1/messages\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    std::fs::create_dir_all(redir_ws.home().join(".latte")).unwrap();
+    let redir_ep = format!("http://{origin_addr}/v1/messages");
+    std::fs::write(
+        redir_ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"claude/m",providers:{{claude:{{type:"anthropic-messages",models:["m"],endpoint:{redir_ep:?},api_key:"anth-super-secret-e2e",max_attempts:1}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let redir_out = redir_ws.output(&["--json", "run", "probe redirect"], |_| {});
+    assert!(!redir_out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&redir_out.stdout),
+        String::from_utf8_lossy(&redir_out.stderr)
+    );
+    assert!(!combined.contains("anth-super-secret-e2e"));
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "redirect target must never receive cross-origin request"
+    );
+
+    // 2. Final-binary Anthropic SSE signed thinking with secret continues tool round while
+    //    `show --json` is redacted (#10, #13), plus warm-prefix compaction honors `max_summary_source_bytes` (#14).
+    let ws = Scenario::new();
+    std::fs::write(ws.root().join("note.txt"), "hello-from-note\n").unwrap();
+
+    let sse_round1 = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":4}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"checking token=secret-value-12345678901234567890\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-e2e-opaque-99\"}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_e2e_1\",\"name\":\"Read\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"note.txt\\\"}\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    )
+    .to_owned();
+    let json_round2 = format!(
+        r#"{{"type":"message","content":[{{"type":"redacted_thinking","data":"enc-blob"}},{{"type":"text","text":"{}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":20,"output_tokens":30}}}}"#,
+        "LARGE_TURN1_BODY_".repeat(90)
+    );
+    let json_turn2 = r#"{"type":"message","content":[{"type":"text","text":"turn2-short"}],"stop_reason":"end_turn","usage":{"input_tokens":15,"output_tokens":5}}"#.to_owned();
+    let json_summary = r#"{"type":"message","content":[{"type":"text","text":"COMPACTED_BOUNDED_SUMMARY"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":6}}"#.to_owned();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap_clone = std::sync::Arc::clone(&captured);
+    let server_thread = std::thread::spawn(move || {
+        let steps: Vec<(&str, &str, String)> = vec![
+            ("200 OK", "text/event-stream", sse_round1),
+            // Round 2: empty 400 triggers non-streaming fallback -> 200 JSON!
+            ("400 Bad Request", "application/json", String::new()),
+            ("200 OK", "application/json", json_round2),
+            // Turn 2: empty 400 -> 200 JSON!
+            ("400 Bad Request", "application/json", String::new()),
+            ("200 OK", "application/json", json_turn2),
+            // Manual `compact`: empty 400 -> 200 JSON!
+            ("400 Bad Request", "application/json", String::new()),
+            ("200 OK", "application/json", json_summary),
+        ];
+        for (status, ctype, body) in steps {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut end = None;
+            let mut len = 0_usize;
+            loop {
+                let mut buf = [0_u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if end.is_none()
+                    && let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    end = Some(p + 4);
+                    for line in String::from_utf8_lossy(&raw[..p + 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(e) = end
+                    && raw.len() >= e + len
+                {
+                    break;
+                }
+            }
+            let e = end.unwrap();
+            cap_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&raw[e..e + len]).unwrap());
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    std::fs::create_dir_all(ws.home().join(".latte")).unwrap();
+    let base_url = format!("http://{addr}");
+    std::fs::write(
+        ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "claude/m",
+                providers: {{
+                    claude: {{
+                        type: "anthropic-messages",
+                        models: {{ m: {{ options: {{ reasoning_effort: "low", max_tokens: 4096 }} }} }},
+                        base_url: {base_url:?},
+                        api_key: "anth-key"
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 64000,
+                    max_input_bytes: 64000,
+                    reserved_output_bytes: 1024,
+                    context_cap_bytes: 8192,
+                    compaction: {{
+                        enabled: true,
+                        max_summary_source_bytes: 512,
+                        trigger_ratio: 95,
+                        retain_ratio: 1
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let run1 = ws.output(&["--json", "run", "inspect note.txt"], |_| {});
+    assert!(
+        run1.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&run1.stdout),
+        String::from_utf8_lossy(&run1.stderr)
+    );
+    let sid = session_id(&run1);
+
+    // Durable transcript via `show --json` MUST have redacted the secret in thinking and cleared signature!
+    let shown = ws.output(&["--json", "show", &sid], |_| {});
+    assert!(shown.status.success());
+    let shown_str = String::from_utf8_lossy(&shown.stdout);
+    assert!(!shown_str.contains("secret-value-12345678901234567890"));
+    assert!(!shown_str.contains("sig-e2e-opaque-99"));
+
+    let run2 = ws.output(&["--json", "resume", &sid, "follow up short"], |_| {});
+    assert!(run2.status.success());
+
+    let cmp = ws.output(&["--json", "compact", &sid], |_| {});
+    assert!(
+        cmp.status.success(),
+        "compact failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&cmp.stdout),
+        String::from_utf8_lossy(&cmp.stderr)
+    );
+    assert_eq!(
+        json(&cmp)["data"]["compact"]["compacted"]["tier"],
+        "summarized"
+    );
+    server_thread.join().unwrap();
+
+    let reqs = captured.lock().unwrap();
+    // Round 2 request (`reqs[1]`) must carry the signed thinking block intact for tool continuation (#13)!
+    let round2_str = serde_json::to_string(&reqs[1]).unwrap();
+    assert!(
+        round2_str.contains("sig-e2e-opaque-99"),
+        "in-turn tool continuation must preserve signed thinking block: {round2_str}"
+    );
+    // Summarizer request (`reqs[5]`) must fall back to bounded source_text (no tools, single user message <= 512 bytes) (#14)!
+    let summary_req = &reqs[5];
+    assert!(
+        summary_req.get("tools").is_none(),
+        "warm-prefix exceeding max_summary_source_bytes must fall back to tool-free bounded summary: {summary_req}"
+    );
+    let summary_msgs = summary_req["messages"].as_array().unwrap();
+    assert_eq!(summary_msgs.len(), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn final_binary_parallel_sessions_prevent_stale_clobber_and_preserve_ask_mode_on_409() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("shared.txt"), "v1-initial\n").unwrap();
+
+    let provider = ScriptedProvider::start([
+        // Session A Turn 1: read shared.txt (v1) -> complete.
+        ProviderReply::tool_call(
+            "a-read-1",
+            "read_file",
+            &serde_json::json!({"path": "shared.txt"}),
+        ),
+        ProviderReply::completion("A read v1"),
+        // Session B Turn 1: read shared.txt (v1) -> write v2 -> complete.
+        ProviderReply::tool_call(
+            "b-read-1",
+            "read_file",
+            &serde_json::json!({"path": "shared.txt"}),
+        ),
+        ProviderReply::tool_call(
+            "b-write-1",
+            "write_file",
+            &serde_json::json!({"path": "shared.txt", "content": "v2-from-B\n"}),
+        ),
+        ProviderReply::completion("B wrote v2"),
+        // Session A Turn 2: whole-file write WITHOUT precondition -> rejected stale -> complete!
+        ProviderReply::tool_call(
+            "a-write-stale",
+            "write_file",
+            &serde_json::json!({"path": "shared.txt", "content": "clobber-from-A\n"}),
+        ),
+        ProviderReply::completion("A observed stale conflict"),
+        // Session C (Ask mode): Turn 1 plain complete; Turn 2 attempts write_file -> must park at waiting_permission!
+        ProviderReply::completion("C turn 1 ready"),
+        ProviderReply::tool_call(
+            "c-write-ask",
+            "write_file",
+            &serde_json::json!({"path": "new_c.txt", "content": "must-ask\n", "create_intent": true}),
+        ),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let server = ServeChild::start(&scenario);
+    let root = scenario.root().to_string_lossy().into_owned();
+    let (_, ws_body) = server.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&server.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let ws_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+    let binding = server_binding(&scenario);
+
+    let create_with_mode = |prompt: &str, mode: Option<&str>| -> String {
+        let sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let mut body = serde_json::json!({
+            "session_id": sid,
+            "command_id": cid,
+            "prompt": prompt,
+            "binding": binding,
+        });
+        if let Some(m) = mode {
+            body["permission_mode"] = serde_json::json!(m);
+        }
+        let (st, resp) = server.request(
+            "POST",
+            &format!("/v1/workspaces/{ws_id}/sessions"),
+            Some(&server.token),
+            Some(&body),
+            &[("Idempotency-Key", &cid)],
+        );
+        assert_eq!(st, 202, "create failed: {resp}");
+        sid
+    };
+
+    let sid_a = create_with_mode("A read", Some("full_auto"));
+    let ready_a1 = wait_session_idle(&server, &sid_a);
+    // Verify /v1 wire compatibility keys (#7): `revision`, `version`, `ordinal`, `permission_mode`.
+    assert!(ready_a1["snapshot"].get("revision").is_some());
+    assert!(ready_a1["snapshot"].get("session_revision").is_none());
+    assert_eq!(ready_a1["snapshot"]["permission_mode"], "full_auto");
+    assert_eq!(ready_a1["snapshot"]["binding"]["version"], 1);
+    assert_eq!(ready_a1["snapshot"]["turns"][0]["ordinal"], 0);
+    let rev_a1 = ready_a1["snapshot"]["revision"].as_u64().unwrap();
+
+    let sid_b = create_with_mode("B read and write", Some("full_auto"));
+    let _ready_b1 = wait_session_idle(&server, &sid_b);
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("shared.txt")).unwrap(),
+        "v2-from-B\n"
+    );
+
+    // Session A follows up attempting whole-file write omitting `precondition` (#2).
+    let cid_a2 = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (st_a2, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{sid_a}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": cid_a2,
+            "prompt": "A write stale",
+            "expected_session_revision": rev_a1,
+        })),
+        &[("Idempotency-Key", &cid_a2)],
+    );
+    assert_eq!(st_a2, 202);
+    let _ready_a2 = wait_session_idle(&server, &sid_a);
+    assert_eq!(
+        std::fs::read_to_string(scenario.root().join("shared.txt")).unwrap(),
+        "v2-from-B\n",
+        "Session A must never overwrite Session B's concurrent modification"
+    );
+    let a_stale_req = serde_json::to_string(&provider.requests()[6].body).unwrap();
+    assert!(
+        a_stale_req.contains("file changed since read"),
+        "Session A must observe stale error: {a_stale_req}"
+    );
+
+    // Session C starts in default Ask mode; stale 409 follow-up carrying `full_auto` MUST NOT escalate C (#5)!
+    let sid_c = create_with_mode("C start in ask", None);
+    let ready_c1 = wait_session_idle(&server, &sid_c);
+    let rev_c1 = ready_c1["snapshot"]["revision"].as_u64().unwrap();
+    assert_eq!(ready_c1["snapshot"]["permission_mode"], "ask");
+
+    let stale_cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (st_conflict, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{sid_c}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": stale_cid,
+            "prompt": "stale full_auto escalation",
+            "expected_session_revision": rev_c1 + 77,
+            "permission_mode": "full_auto",
+        })),
+        &[("Idempotency-Key", &stale_cid)],
+    );
+    assert_eq!(st_conflict, 409);
+
+    let ok_cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (st_c2, _) = server.request(
+        "POST",
+        &format!("/v1/sessions/{sid_c}/follow-up"),
+        Some(&server.token),
+        Some(&serde_json::json!({
+            "command_id": ok_cid,
+            "prompt": "now try write without mode override",
+            "expected_session_revision": rev_c1,
+        })),
+        &[("Idempotency-Key", &ok_cid)],
+    );
+    assert_eq!(st_c2, 202);
+    let parked_c2 = wait_session_lifecycle(&server, &sid_c, "waiting_permission");
+    assert_eq!(parked_c2["snapshot"]["permission_mode"], "ask");
+    assert!(!scenario.root().join("new_c.txt").exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_cross_restart_create_replay_with_mode_and_foreign_bucket_isolation() {
+    let primary = Scenario::new();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("foreign-seeded"),
+        ProviderReply::completion("primary-created"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(primary.home().join(".latte")).unwrap();
+    // Use an explicit shared global DB under HOME so both workspaces share one catalog (#15).
+    let shared_db = primary.home().join(".latte/shared-global.db");
+    let shared_db_str = shared_db.to_string_lossy().into_owned();
+    std::fs::write(
+        primary.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}},database:{{path:{shared_db_str:?}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // 1. Seed a session in `foreign_dir` using the SAME `HOME` via `CARGO_BIN_EXE_latte-code`.
+    let foreign_out = primary.output(&["--json", "run", "seed foreign"], |cmd| {
+        cmd.current_dir(foreign_dir.path())
+            .env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(
+        foreign_out.status.success(),
+        "foreign run failed: {}",
+        String::from_utf8_lossy(&foreign_out.stderr)
+    );
+
+    // Corrupt `foreign_dir`'s conversation bucket on Unix with a symlinked `.jsonl` entry (#15),
+    // or >0 noise files on non-Unix; primary workspace MUST still start and serve cleanly!
+    let conv_root = primary.home().join(".latte/conversations");
+    if let Ok(entries) = std::fs::read_dir(&conv_root) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let bogus_sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+                #[cfg(unix)]
+                {
+                    let target = foreign_dir.path().join("outside.txt");
+                    std::fs::write(&target, "x").unwrap();
+                    let _ = std::os::unix::fs::symlink(
+                        &target,
+                        entry.path().join(format!("{bogus_sid}.jsonl")),
+                    );
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(entry.path().join("noise.tmp"), "ignore").unwrap();
+                }
+            }
+        }
+    }
+
+    // 2. Start `ServeChild` #1 on `primary`, create a session with `permission_mode: "auto_edit"`,
+    //    wait until Ready, then stop `ServeChild` #1 and start a fresh `ServeChild` #2 (#12).
+    let sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let root = primary.root().to_string_lossy().into_owned();
+    let binding = server_binding(&primary);
+    {
+        let srv1 = ServeChild::start(&primary);
+        let (ws_st, ws_body) = srv1.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&srv1.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        assert_eq!(ws_st, 200, "primary workspace open failed: {ws_body}");
+        let ws_id = ws_body["workspace_id"].as_str().unwrap();
+        let (c_st, c_body) = srv1.request(
+            "POST",
+            &format!("/v1/workspaces/{ws_id}/sessions"),
+            Some(&srv1.token),
+            Some(&serde_json::json!({
+                "session_id": sid,
+                "command_id": cid,
+                "prompt": "durable auto_edit create",
+                "binding": binding,
+                "permission_mode": "auto_edit",
+            })),
+            &[("Idempotency-Key", &cid)],
+        );
+        assert_eq!(c_st, 202, "{c_body}");
+        let ready = wait_session_idle(&srv1, &sid);
+        assert_eq!(ready["snapshot"]["permission_mode"], "auto_edit");
+    }
+
+    // Fresh server process (empty in-memory idempotency cache): retrying exact create MUST return 200 OK!
+    let srv2 = ServeChild::start(&primary);
+    let (_, ws_body2) = srv2.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&srv2.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let ws_id2 = ws_body2["workspace_id"].as_str().unwrap();
+    let (replay_st, replay_body) = srv2.request(
+        "POST",
+        &format!("/v1/workspaces/{ws_id2}/sessions"),
+        Some(&srv2.token),
+        Some(&serde_json::json!({
+            "session_id": sid,
+            "command_id": cid,
+            "prompt": "durable auto_edit create",
+            "binding": binding,
+            "permission_mode": "auto_edit",
+        })),
+        &[("Idempotency-Key", &cid)],
+    );
+    assert_eq!(
+        replay_st, 200,
+        "durable create replay must return 200: {replay_body}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "replay must not re-invoke provider"
+    );
+
+    // Retrying same `command_id` with a different `permission_mode` MUST fail with 422 `idempotency_mismatch`!
+    let (mismatch_st, mismatch_body) = srv2.request(
+        "POST",
+        &format!("/v1/workspaces/{ws_id2}/sessions"),
+        Some(&srv2.token),
+        Some(&serde_json::json!({
+            "session_id": sid,
+            "command_id": cid,
+            "prompt": "durable auto_edit create",
+            "binding": binding,
+            "permission_mode": "full_auto",
+        })),
+        &[("Idempotency-Key", &cid)],
+    );
+    assert_eq!(mismatch_st, 422, "{mismatch_body}");
+    let (_, after_mismatch) = srv2.request(
+        "GET",
+        &format!("/v1/sessions/{sid}"),
+        Some(&srv2.token),
+        None,
+        &[],
+    );
+    assert_eq!(after_mismatch["snapshot"]["permission_mode"], "auto_edit");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_materializing_crash_recovery_preserves_create_replay_and_exact_title_pagination() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        ProviderReply::completion("s1"),
+        ProviderReply::completion("s2"),
+        ProviderReply::completion("s3"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:{endpoint:?},api_key:{{source:"env",name:"TEST_OPENAI_KEY"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // 1. Verify human-readable `latte-code serve --port 0` readiness announcement.
+    {
+        let mut cmd = scenario.command(&["serve", "--port", "0"]);
+        cmd.env("TEST_OPENAI_KEY", "k")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line).unwrap();
+        assert!(
+            line.contains("latte-code server listening on http://127.0.0.1:"),
+            "unexpected human-readable readiness line: {line}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let root = scenario.root().to_string_lossy().into_owned();
+    let binding = server_binding(&scenario);
+    let crash_session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let create_cmd_id = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+
+    {
+        let srv1 = ServeChild::start(&scenario);
+        let (_, ws_body) = srv1.request(
+            "POST",
+            "/v1/workspaces",
+            Some(&srv1.token),
+            Some(&serde_json::json!({ "path": root })),
+            &[],
+        );
+        let ws_id = ws_body["workspace_id"].as_str().unwrap().to_string();
+
+        // Create two sessions via helper + one target session with `permission_mode: "auto_edit"`.
+        let mut sids = Vec::new();
+        for prompt in ["first", "second"] {
+            let (st, created) = srv1.create_session(&ws_id, prompt, &binding);
+            assert_eq!(st, 202);
+            let sid = created["session_id"].as_str().unwrap().to_string();
+            wait_session_idle(&srv1, &sid);
+            sids.push(sid);
+        }
+        let (st3, _) = srv1.request(
+            "POST",
+            &format!("/v1/workspaces/{ws_id}/sessions"),
+            Some(&srv1.token),
+            Some(&serde_json::json!({
+                "session_id": crash_session_id,
+                "command_id": create_cmd_id,
+                "prompt": "materialized auto-edit create",
+                "binding": binding,
+                "permission_mode": "auto_edit",
+            })),
+            &[("Idempotency-Key", &create_cmd_id)],
+        );
+        assert_eq!(st3, 202);
+        wait_session_idle(&srv1, &crash_session_id);
+        sids.push(crash_session_id.clone());
+
+        // Rename all three to the exact same title `"shared-exact"` and walk keyset pages with `limit=1`.
+        for sid in &sids {
+            let (rst, _) = srv1.request(
+                "PATCH",
+                &format!("/v1/sessions/{sid}"),
+                Some(&srv1.token),
+                Some(&serde_json::json!({ "title": "shared-exact" })),
+                &[],
+            );
+            assert_eq!(rst, 200);
+        }
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let url = match &cursor {
+                None => {
+                    format!("/v1/workspaces/{ws_id}/sessions/exact-title?q=shared-exact&limit=1")
+                }
+                Some(cur) => format!(
+                    "/v1/workspaces/{ws_id}/sessions/exact-title?q=shared-exact&limit=1&cursor={cur}"
+                ),
+            };
+            let (pst, pbody) = srv1.request("GET", &url, Some(&srv1.token), None, &[]);
+            assert_eq!(pst, 200, "exact-title page failed: {pbody}");
+            for item in pbody["sessions"].as_array().unwrap() {
+                collected.push(item["session_id"].as_str().unwrap().to_string());
+            }
+            cursor = pbody["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            collected.len(),
+            3,
+            "exact-title pagination must return all 3 sessions"
+        );
+
+        // Malformed cursor fails closed with 400.
+        let (bad_st, _) = srv1.request(
+            "GET",
+            &format!(
+                "/v1/workspaces/{ws_id}/sessions/exact-title?q=shared-exact&cursor=bad_cursor"
+            ),
+            Some(&srv1.token),
+            None,
+            &[],
+        );
+        assert_eq!(bad_st, 400);
+    }
+
+    // 2. Simulate a crash between Phase 1 (`materializing` row + `.jsonl` header & user entry,
+    //    including `create_command_id`, `create_command_digest`, and `permission_mode`)
+    //    and Phase 2 (`session_turns` and `session_command_dedup` not yet written).
+    {
+        let conn = rusqlite::Connection::open(scenario.database_path()).unwrap();
+        let cmd_digest: String = conn
+            .query_row(
+                "SELECT digest FROM session_command_dedup WHERE command_id=?1",
+                [&create_cmd_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "DELETE FROM runtime_lease WHERE scope=?1",
+            [format!("session:{crash_session_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM conversation_outbox WHERE session_id=?1",
+            [&crash_session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_events WHERE session_id=?1",
+            [&crash_session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_active_turns WHERE session_id=?1",
+            [&crash_session_id],
+        )
+        .unwrap();
+        let turn_ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT turn_id FROM session_turns WHERE session_id=?1")
+                .unwrap();
+            stmt.query_map([&crash_session_id], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        conn.execute(
+            "DELETE FROM session_turns WHERE session_id=?1",
+            [&crash_session_id],
+        )
+        .unwrap();
+        for tid in turn_ids {
+            conn.execute("DELETE FROM turns WHERE turn_id=?1", [&tid])
+                .unwrap();
+        }
+        conn.execute(
+            "UPDATE sessions SET lifecycle='materializing', latest_turn_id=NULL, create_command_id=?1, create_command_digest=?2 WHERE session_id=?3",
+            rusqlite::params![create_cmd_id, cmd_digest, crash_session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_command_dedup WHERE command_id=?1",
+            [&create_cmd_id],
+        )
+        .unwrap();
+    }
+
+    // 3. Fresh server startup promotes the `materializing` row from `.jsonl` AND restores
+    //    `session_command_dedup`, so retrying the exact create returns 200 OK without a 4th provider call!
+    let srv2 = ServeChild::start(&scenario);
+    let (_, ws_body2) = srv2.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&srv2.token),
+        Some(&serde_json::json!({ "path": root })),
+        &[],
+    );
+    let ws_id2 = ws_body2["workspace_id"].as_str().unwrap();
+    let (replay_st, replay_body) = srv2.request(
+        "POST",
+        &format!("/v1/workspaces/{ws_id2}/sessions"),
+        Some(&srv2.token),
+        Some(&serde_json::json!({
+            "session_id": crash_session_id,
+            "command_id": create_cmd_id,
+            "prompt": "materialized auto-edit create",
+            "binding": binding,
+            "permission_mode": "auto_edit",
+        })),
+        &[("Idempotency-Key", &create_cmd_id)],
+    );
+    assert_eq!(
+        replay_st, 200,
+        "recovered materializing create must replay as 200 OK: {replay_body}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "replay must not invoke provider again"
+    );
+    let (_, snap_after) = srv2.request(
+        "GET",
+        &format!("/v1/sessions/{crash_session_id}"),
+        Some(&srv2.token),
+        None,
+        &[],
+    );
+    assert_eq!(snap_after["snapshot"]["permission_mode"], "auto_edit");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_anthropic_sse_fallback_claude_style_and_finish_reasons() {
+    let scenario = Scenario::new();
+    std::fs::write(
+        scenario.root().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let sse_overloaded = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+    let sse_truncated = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":2}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"ponder\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-2\"}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"enc-stream\"}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"init-\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let sse_api_error = "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream boom\"}}\n\n";
+
+    let anthropic_provider = ScriptedProvider::start([
+        // Turn 1 attempt 1: SSE overloaded_error -> retried as 529!
+        ProviderReply::raw(200, "text/event-stream", sse_overloaded),
+        // Turn 1 attempt 2: 415 with empty body -> triggers non-streaming inline JSON fallback!
+        ProviderReply::raw(415, "text/plain", ""),
+        // Turn 1 inline fallback: thinking + redacted_thinking + tool_use with non-Anthropic ID (`call_long_id_012345678901234567890123456789012345678901234567890123456789`).
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "content": [
+                    {"type": "thinking", "thinking": "inspect manifest", "signature": "sig-1"},
+                    {"type": "redacted_thinking", "data": "enc-inline"},
+                    {"type": "tool_use", "id": "call_long_id_012345678901234567890123456789012345678901234567890123456789", "name": "ReadManifest", "input": {}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {
+                    "input_tokens": 15,
+                    "output_tokens": 6,
+                    "cache_creation_input_tokens": 3,
+                    "cache_read_input_tokens": 5
+                }
+            }),
+        ),
+        // Turn 1 round 2: SSE truncated (`max_tokens`) with non-empty text `"init-cut"`.
+        ProviderReply::raw(200, "text/event-stream", sse_truncated),
+        // Turn 2 (`resume`): inline JSON truncated (`max_tokens`) with empty content.
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "content": [],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 8, "output_tokens": 0}
+            }),
+        ),
+        // Turn 3 (`resume`): inline JSON `refusal` (`ContentFilter`) with partial text.
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "content": [{"type": "text", "text": "withheld segment"}],
+                "stop_reason": "refusal"
+            }),
+        ),
+        // Turn 4 (`resume`, max_attempts exhausted on malformed stream error): SSE `api_error`.
+        ProviderReply::raw(200, "text/event-stream", sse_api_error),
+        // Turn 5 (`resume`): HTTP 401 Unauthorized -> terminalizes session!
+        ProviderReply::error(401, "invalid x-api-key"),
+    ]);
+    let anth_endpoint = anthropic_provider.endpoint();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "anth/claude",
+                providers: {{
+                    anth: {{
+                        type: "anthropic-messages",
+                        endpoint: {anth_endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_ANTH_KEY" }},
+                        streaming: true,
+                        prompt_caching: false,
+                        max_attempts: 2,
+                        temperature: 0.2,
+                        models: {{
+                            claude: {{
+                                name: "Claude Off",
+                                options: {{
+                                    context_window: 32000,
+                                    max_tokens: 4096,
+                                    reasoning_effort: "off"
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    // Turn 1: SSE `overloaded_error` maps to HTTP 529 and fails Turn 1 retryably (`ready`).
+    let run0 = scenario.output(&["--json", "run", "check manifest"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run0.status.code(), Some(1));
+    let j0 = json(&run0);
+    let sid = j0["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(j0["data"]["session"]["lifecycle"], "ready");
+    let entries0 = serde_json::to_string(&j0["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        entries0.contains("http 529"),
+        "expected SSE overloaded_error -> 529 in {entries0}"
+    );
+
+    // Turn 1b (`resume`): 415 empty-body inline fallback -> ReadManifest -> SSE max_tokens truncation.
+    let run1 = scenario.output(&["--json", "resume", &sid, "retry manifest"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run1.status.code(), Some(1));
+    let j1 = json(&run1);
+    assert_eq!(j1["data"]["session"]["lifecycle"], "ready");
+    let entries1 = serde_json::to_string(&j1["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        entries1.contains("init-cut") && entries1.contains("output limit"),
+        "expected truncated partial text and output-limit failure in {entries1}"
+    );
+    // Sanitized tool_use_id (`toolu_...`) must appear on round 2 wire request!
+    let round2_wire = serde_json::to_string(&anthropic_provider.requests()[3].body).unwrap();
+    assert!(
+        round2_wire.contains("toolu_")
+            && !round2_wire.contains(
+                "call_long_id_012345678901234567890123456789012345678901234567890123456789"
+            ),
+        "expected sanitized Anthropic tool_use_id in {round2_wire}"
+    );
+
+    // Turn 2: empty `max_tokens` stays retryable (`ready`) without appending an empty assistant card.
+    let run2 = scenario.output(&["--json", "resume", &sid, "empty length"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run2.status.code(), Some(1));
+    assert_eq!(json(&run2)["data"]["session"]["lifecycle"], "ready");
+
+    // Turn 3: `refusal` maps to ContentFilter and fails retryably.
+    let run3 = scenario.output(&["--json", "resume", &sid, "refusal check"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run3.status.code(), Some(1));
+    let entries3 =
+        serde_json::to_string(&json(&run3)["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        entries3.contains("withheld segment") && entries3.contains("content was filtered"),
+        "expected refusal partial text and content_filter reason in {entries3}"
+    );
+
+    // Turn 4: SSE `api_error` surfaces malformed stream error and stays retryable.
+    let run4 = scenario.output(&["--json", "resume", &sid, "stream error"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run4.status.code(), Some(1));
+    assert_eq!(json(&run4)["data"]["session"]["lifecycle"], "ready");
+
+    // Turn 5: HTTP 401 terminalizes the session (`lifecycle == "failed"`).
+    let run5 = scenario.output(&["--json", "resume", &sid, "auth revoked"], |cmd| {
+        cmd.env("TEST_ANTH_KEY", "anth-secret-1");
+    });
+    assert_eq!(run5.status.code(), Some(1));
+    assert_eq!(json(&run5)["data"]["session"]["lifecycle"], "failed");
+    anthropic_provider.assert_consumed();
+
+    // Sub-journey B: `openai-chat` configured with `tool_style: "claude_code"` + streaming `reasoning_content`.
+    let openai_sse_tools = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan-step \",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"Glob\",\"arguments\":\"{\\\"pattern\\\":\\\"*.toml\\\"}\"}},{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"pattern\\\":\\\"demo\\\",\\\"literal\\\":true}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let claude_style_openai = ScriptedProvider::start([
+        ProviderReply::raw(200, "text/event-stream", openai_sse_tools),
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "claude-style-openai-done",
+                        "reasoning_content": "final-reasoning-note",
+                        "tool_calls": []
+                    }
+                }]
+            }),
+        ),
+    ]);
+    let oai_endpoint = claude_style_openai.endpoint();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {oai_endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }},
+                        streaming: true,
+                        tool_style: "claude_code"
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+    let oai_out = scenario.output(&["--json", "run", "use claude tools"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "oai-secret");
+    });
+    assert!(
+        oai_out.status.success(),
+        "claude-style openai run failed: {}",
+        String::from_utf8_lossy(&oai_out.stderr)
+    );
+    let oai_json = json(&oai_out);
+    let final_entries =
+        serde_json::to_string(&oai_json["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        final_entries.contains("claude-style-openai-done")
+            && final_entries.contains("final-reasoning-note"),
+        "expected final reasoning_content persisted in transcript: {final_entries}"
+    );
+    claude_style_openai.assert_consumed();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_mid_turn_elision_summarization_overflow_recovery_and_human_cli() {
+    let scenario = Scenario::new();
+    std::fs::write(scenario.root().join("big.txt"), "x".repeat(3_500)).unwrap();
+    std::fs::write(scenario.root().join("small.txt"), "ok\n").unwrap();
+    std::fs::create_dir_all(scenario.home().join(".latte")).unwrap();
+
+    // 1. Config validation negative check: `compaction.enabled: true` with `max_summary_source_bytes: 0`.
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        "{version:1,session:{compaction:{enabled:true,max_summary_source_bytes:0}}}",
+    )
+    .unwrap();
+    let bad_cfg = scenario.output(&["--json", "list"], |_| {});
+    assert_eq!(bad_cfg.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_cfg.stdout)
+            .contains("max_summary_source_bytes must be nonzero"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&bad_cfg.stdout)
+    );
+
+    // 2. Mid-turn elision cure (round 1) -> mid-turn summarize fail (round 2) -> mid-turn summarize ok (round 3)
+    //    -> provider `ContextOverflow` forced recovery (turn 3) -> unshrinkable `ContextOverflow` (fresh session).
+    let long_assistant_1 = format!("turn1-done {}", "a".repeat(1_000));
+    let provider = ScriptedProvider::start([
+        // Turn 1: read `big.txt` -> complete with ~1KB text (~6.6KB total < 7.7KB trigger).
+        ProviderReply::tool_call(
+            "t1-r1",
+            "read_file",
+            &serde_json::json!({"path": "big.txt"}),
+        ),
+        ProviderReply::completion(&long_assistant_1),
+        // Turn 2 round 1: read `big.txt` -> crosses 55% trigger; eliding Turn 1's `big.txt` cures pressure without summarizer!
+        ProviderReply::tool_call(
+            "t2-r1",
+            "read_file",
+            &serde_json::json!({"path": "big.txt"}),
+        ),
+        // Turn 2 round 2: read `big.txt` again -> crosses 55% trigger; Turn 1 already elided, so `mid_turn_summarize` runs:
+        ProviderReply::tool_call(
+            "t2-r2",
+            "read_file",
+            &serde_json::json!({"path": "big.txt"}),
+        ),
+        // Summarizer call after round 2 fails (HTTP 500, max_attempts=1) -> records `compact-summary-failed:round`!
+        ProviderReply::error(500, "summarizer temporarily unavailable"),
+        // Turn 2 round 3: read `small.txt` -> `mid_turn_summarize` runs again:
+        ProviderReply::tool_call(
+            "t2-r3",
+            "read_file",
+            &serde_json::json!({"path": "small.txt"}),
+        ),
+        // Summarizer call after round 3 succeeds -> records `compact-summary:round:3`!
+        ProviderReply::completion("concise cold summary of turn 1"),
+        // Turn 2 round 4: final answer!
+        ProviderReply::completion("turn2-completed-after-mid-turn-compaction"),
+    ]);
+    let endpoint = provider.endpoint();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }},
+                        max_attempts: 1
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 16000,
+                    max_input_bytes: 14000,
+                    reserved_output_bytes: 2000,
+                    context_cap_bytes: 512,
+                    compaction: {{
+                        enabled: true,
+                        mode: "elide_then_summarize",
+                        max_summary_source_bytes: 32000,
+                        trigger_ratio: 65,
+                        retain_ratio: 1,
+                        reuse_prefix: false
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let t1 = scenario.output(&["--json", "run", "seed turn 1"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(
+        t1.status.success(),
+        "t1 failed: {}",
+        String::from_utf8_lossy(&t1.stderr)
+    );
+    let sid = json(&t1)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let t2 = scenario.output(&["--json", "resume", &sid, "drive mid-turn tiers"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(
+        t2.status.success(),
+        "t2 failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&t2.stdout),
+        String::from_utf8_lossy(&t2.stderr)
+    );
+    let t2_entries =
+        serde_json::to_string(&json(&t2)["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        t2_entries.contains("tool_result_elision")
+            && t2_entries.contains("context compaction failed; continuing without a summary")
+            && t2_entries.contains("concise cold summary of turn 1"),
+        "expected elision, failed-summary audit, and compact_summary in {t2_entries}"
+    );
+    provider.assert_consumed();
+
+    // 3. Provider `ContextOverflow` recovery (HTTP 400 `context_length_exceeded`) + `max_tool_rounds: 1`
+    //    + human-readable CLI (`run`, `resume`, `show`, `context`, `compact`).
+    let overflow_provider = ScriptedProvider::start([
+        // Session B turn 1 (human-readable `run`): reads `big.txt`, then tries a 2nd tool call under `max_tool_rounds: 1`!
+        ProviderReply::tool_call("b1", "read_file", &serde_json::json!({"path": "big.txt"})),
+        ProviderReply::tool_call("b2", "read_file", &serde_json::json!({"path": "small.txt"})),
+        // Session B turn 2 (human-readable `resume`): 1st provider call returns 400 `context_length_exceeded`!
+        // Forced mid-turn elision shrinks Turn 1's `big.txt` result and retries once -> completes!
+        ProviderReply::json(
+            400,
+            &serde_json::json!({"error": {"code": "context_length_exceeded", "message": "maximum context length exceeded"}}),
+        ),
+        ProviderReply::completion("recovered-from-provider-overflow"),
+        // Manual `compact` #1 summarizer call -> HTTP 500 surfaces manual compaction error on stderr!
+        ProviderReply::error(500, "manual compact summarizer error"),
+        // Manual `compact` #2 summarizer call -> succeeds!
+        ProviderReply::completion("manual-cli-summary"),
+    ]);
+    let ov_endpoint = overflow_provider.endpoint();
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {ov_endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }},
+                        max_attempts: 1
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 16000,
+                    max_input_bytes: 14000,
+                    reserved_output_bytes: 2000,
+                    context_cap_bytes: 512,
+                    max_tool_rounds: 1,
+                    compaction: {{
+                        enabled: true,
+                        mode: "elide_then_summarize",
+                        max_summary_source_bytes: 32000,
+                        trigger_ratio: 95,
+                        retain_ratio: 1,
+                        reuse_prefix: false
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    // Human-readable `run` hitting `max_tool_rounds: 1`.
+    let b_run = scenario.output(&["run", "hit tool round cap"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert_eq!(b_run.status.code(), Some(1));
+    let b_run_text = String::from_utf8_lossy(&b_run.stdout);
+    assert!(
+        b_run_text.contains("turn stopped after 1 tool rounds"),
+        "expected round-bound failure in human-readable output: {b_run_text}"
+    );
+
+    // Find Session B's ID from `--json list`.
+    let listed = scenario.output(&["--json", "list"], |_| {});
+    let sid_b = json(&listed)["data"]["sessions"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Human-readable `resume` recovering from HTTP 400 `context_length_exceeded`.
+    let b_resume = scenario.output(&["resume", &sid_b, "recover overflow"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(
+        b_resume.status.success(),
+        "overflow recovery resume failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&b_resume.stdout),
+        String::from_utf8_lossy(&b_resume.stderr)
+    );
+    assert!(String::from_utf8_lossy(&b_resume.stdout).contains("recovered-from-provider-overflow"));
+
+    // Human-readable `show`, `context`, and `compact` (error -> summarized -> nothing-to-compact).
+    let b_show = scenario.output(&["show", &sid_b], |_| {});
+    assert!(b_show.status.success());
+    assert!(String::from_utf8_lossy(&b_show.stdout).contains("recovered-from-provider-overflow"));
+
+    let b_ctx = scenario.output(&["context", &sid_b], |_| {});
+    assert!(b_ctx.status.success());
+
+    // Switch to `mode: "summarize"` so manual `compact` invokes the summarizer directly.
+    std::fs::write(
+        scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {ov_endpoint:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }},
+                        max_attempts: 1
+                    }}
+                }},
+                session: {{
+                    max_request_bytes: 16000,
+                    max_input_bytes: 14000,
+                    reserved_output_bytes: 2000,
+                    context_cap_bytes: 512,
+                    compaction: {{
+                        enabled: true,
+                        mode: "summarize",
+                        max_summary_source_bytes: 32000,
+                        trigger_ratio: 95,
+                        retain_ratio: 1,
+                        reuse_prefix: false
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let b_compact_err = scenario.output(&["compact", &sid_b], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(!b_compact_err.status.success());
+
+    let b_compact_ok = scenario.output(&["compact", &sid_b], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(b_compact_ok.status.success());
+
+    let b_compact_noop = scenario.output(&["compact", &sid_b], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert!(b_compact_noop.status.success());
+    overflow_provider.assert_consumed();
+
+    // 4. Fresh isolated session with no older segments to shrink on `context_length_exceeded`.
+    let unshrink_scenario = Scenario::new();
+    let unshrink_provider = ScriptedProvider::start([ProviderReply::json(
+        400,
+        &serde_json::json!({"error": {"code": "context_length_exceeded", "message": "maximum context length exceeded"}}),
+    )]);
+    let unshrink_ep = unshrink_provider.endpoint();
+    std::fs::create_dir_all(unshrink_scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        unshrink_scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {unshrink_ep:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }},
+                        max_attempts: 1
+                    }}
+                }},
+                session: {{
+                    compaction: {{
+                        enabled: true,
+                        mode: "elide_then_summarize",
+                        max_summary_source_bytes: 32000
+                    }}
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+    let unshrinkable = unshrink_scenario.output(&["--json", "run", "too big on turn 1"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert_eq!(unshrinkable.status.code(), Some(1));
+    let unshrink_entries =
+        serde_json::to_string(&json(&unshrinkable)["data"]["session"]["transcript"]["entries"])
+            .unwrap();
+    assert!(
+        unshrink_entries.contains("no older history could be shrunk"),
+        "expected unshrinkable overflow message in {unshrink_entries}"
+    );
+    unshrink_provider.assert_consumed();
 }

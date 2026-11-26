@@ -167,14 +167,14 @@ fn v1_running_run_migrates_and_recovers_through_final_binary_restarts() {
     );
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        15
+        16
     );
     assert_eq!(
         sqlite_integer(
             &scenario.database_path(),
             "SELECT COUNT(*) FROM schema_migrations;"
         ),
-        15
+        16
     );
     assert_eq!(
         sqlite_integer(
@@ -212,7 +212,7 @@ fn newer_schema_fails_as_typed_engine_initialization_error() {
     assert_eq!(json(&output)["error"]["code"], "internal");
     assert_eq!(
         json(&output)["error"]["message"],
-        "server setup: database schema version 99 is newer than supported version 15"
+        "server setup: database schema version 99 is newer than supported version 16"
     );
 }
 
@@ -298,7 +298,7 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
     assert!(pty.finish(Duration::from_secs(5)).0.success());
     assert_eq!(
         sqlite_integer(&scenario.database_path(), "PRAGMA user_version;"),
-        15
+        16
     );
     assert_eq!(sqlite_integer(&legacy_path, "PRAGMA user_version;"), 9);
     assert_eq!(
@@ -312,4 +312,188 @@ fn v9_workspace_session_imports_unchanged_then_reopens_in_final_tui() {
             .unwrap(),
         "restore the legacy session catalog title"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn v8_titleless_database_migrates_and_incompatible_legacy_db_warns_cleanly() {
+    // 1. Seed a schema-8 global `state.db` in pure SQL (zero in-process Engine calls!):
+    //    opening a shared v8 catalog without a workspace identity must fail closed cleanly.
+    let v8_global = Scenario::new();
+    v8_global.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+    std::fs::create_dir_all(v8_global.database_path().parent().unwrap()).unwrap();
+    sqlite_execute(
+        &v8_global.database_path(),
+        r"
+        CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);
+        CREATE TABLE threads_v2(
+          thread_id TEXT PRIMARY KEY,
+          revision INTEGER NOT NULL,
+          last_seq INTEGER NOT NULL,
+          lifecycle TEXT NOT NULL,
+          binding_json TEXT NOT NULL,
+          latest_run_id TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+        INSERT INTO threads_v2(thread_id,revision,last_seq,lifecycle,binding_json,latest_run_id,created_at_ms,updated_at_ms)
+          VALUES('01900000-0000-7000-8000-0000000000b8',1,1,'ready','{}',NULL,1,1);
+        INSERT INTO schema_migrations(version,applied_at_ms) VALUES(8,1);
+        PRAGMA user_version=8;
+        ",
+    );
+    let rejected = v8_global.output(&["--json", "list"], |_| {});
+    assert_eq!(rejected.status.code(), Some(70));
+    assert!(
+        json(&rejected)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("legacy Sessions have no workspace identity"),
+        "unexpected v8 global error: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+
+    // 2. Place a post-v12 (schema 16) `.latte/latte-code.db` inside a workspace checkout
+    //    (minted via a prior final-binary `list` run, zero in-process Engine calls!):
+    //    human-readable `latte-code list` must emit a skip warning rather than bricking.
+    let scenario = Scenario::new();
+    scenario.write_config("http://127.0.0.1:1", r#"["/usr/bin/true"]"#);
+    let init = scenario.output(&["--json", "list"], |_| {});
+    assert!(init.status.success());
+    let workspace_legacy_db = scenario.root().join(".latte/latte-code.db");
+    std::fs::create_dir_all(workspace_legacy_db.parent().unwrap()).unwrap();
+    std::fs::copy(scenario.database_path(), &workspace_legacy_db).unwrap();
+
+    let listed = scenario.output(&["list"], |_| {});
+    assert!(
+        listed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(
+        stderr.contains("warning: skipping incompatible legacy workspace database"),
+        "expected incompatible legacy DB warning on stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn final_binary_header_validation_git_staged_diff_and_failed_verification_stdout() {
+    use super::support::{ProviderReply, ScriptedProvider};
+
+    // 1. Invalid provider header configurations fail closed at startup with usage exit code 2.
+    let header_scenario = Scenario::new();
+    std::fs::create_dir_all(header_scenario.home().join(".latte")).unwrap();
+    for bad_headers in [
+        r#"{"bad name": "ok"}"#,
+        r#"{"authorization": "Bearer override"}"#,
+        r#"{"x-custom": "unterminated-${session_id"}"#,
+        r#"{"x-custom": "unknown-${other_var}"}"#,
+        "{\"x-custom\": \"ctrl\\u0007val\"}",
+    ] {
+        std::fs::write(
+            header_scenario.home().join(".latte/latte-code.jsonc"),
+            format!(
+                r#"{{version:1,default_model:"main/mock",providers:{{main:{{type:"openai-chat",models:["mock"],endpoint:"http://127.0.0.1:1",api_key:{{source:"env",name:"TEST_OPENAI_KEY"}},headers:{bad_headers}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let out = header_scenario.output(&["--json", "run", "check header"], |cmd| {
+            cmd.env("TEST_OPENAI_KEY", "k");
+        });
+        assert!(!out.status.success(), "expected failure for {bad_headers}");
+    }
+
+    // 2. Git staged index diff (`UnifiedDiffIndexPaths`), readonly `git status -b --porcelain`,
+    //    and verification failure with empty stderr + stdout diagnostics.
+    let git_scenario = Scenario::new();
+    git_scenario.init_git();
+    std::fs::write(git_scenario.root().join("tracked.txt"), "v1\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(git_scenario.root())
+            .env("HOME", git_scenario.home())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(git_scenario.root())
+            .env("HOME", git_scenario.home())
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Stage a modification into the index (`git diff --cached` / `UnifiedDiffIndexPaths` path!).
+    std::fs::write(git_scenario.root().join("tracked.txt"), "v2-staged\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(git_scenario.root())
+            .env("HOME", git_scenario.home())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let provider = ScriptedProvider::start([
+        ProviderReply::tool_calls([
+            (
+                "g1",
+                "process",
+                &serde_json::json!({"argv": ["git", "status", "-b", "--porcelain"]}),
+            ),
+            ("g2", "git_diff", &serde_json::json!({})),
+            (
+                "g3",
+                "write_file",
+                &serde_json::json!({"path": "mutated.txt", "content": "needs-verify\n", "create_intent": true}),
+            ),
+        ]),
+        ProviderReply::completion("attempted completion with failing stdout-only verifier"),
+    ]);
+    let ep = provider.endpoint();
+    std::fs::create_dir_all(git_scenario.home().join(".latte")).unwrap();
+    std::fs::write(
+        git_scenario.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{
+                version: 1,
+                default_model: "main/mock",
+                providers: {{
+                    main: {{
+                        type: "openai-chat",
+                        models: ["mock"],
+                        endpoint: {ep:?},
+                        api_key: {{ source: "env", name: "TEST_OPENAI_KEY" }}
+                    }}
+                }},
+                verification: {{ argv: ["/bin/sh", "-c", "printf 'verify-stdout-detail'; exit 3"] }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let run = git_scenario.output(&["--json", "run", "--auto", "inspect staged diff"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "k");
+    });
+    assert_eq!(run.status.code(), Some(1));
+    let req2 = serde_json::to_string(&provider.requests()[1].body).unwrap();
+    assert!(
+        req2.contains("v2-staged"),
+        "expected staged index diff in git_diff tool result: {req2}"
+    );
+    let entries =
+        serde_json::to_string(&json(&run)["data"]["session"]["transcript"]["entries"]).unwrap();
+    assert!(
+        entries.contains("verify-stdout-detail"),
+        "expected stdout fallback detail on failed verification: {entries}"
+    );
+    provider.assert_consumed();
 }

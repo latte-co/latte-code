@@ -2101,6 +2101,7 @@ mod tests {
             session_revision: 1,
             sequence: 0,
             lifecycle,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: binding(),
             latest_turn_id: runs.last().map(|run| run.turn_id),
             active_turn_id: None,

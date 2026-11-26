@@ -148,15 +148,47 @@ fn safe_contained_file(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+fn read_safe_git_head(root: &Path) -> Option<String> {
+    use std::io::Read;
+    let git_dir = root.join(".git");
+    let git_meta = fs::symlink_metadata(&git_dir).ok()?;
+    if git_meta.file_type().is_symlink() || !git_meta.file_type().is_dir() {
+        return None;
+    }
+    let head_path = git_dir.join("HEAD");
+    let head_meta = fs::symlink_metadata(&head_path).ok()?;
+    if head_meta.file_type().is_symlink() || !head_meta.file_type().is_file() {
+        return None;
+    }
+    let canonical = safe_contained_file(root, &head_path)?;
+    let file = fs::File::open(canonical).ok()?;
+    let mut bytes = Vec::with_capacity(256);
+    file.take(256).read_to_end(&mut bytes).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    if let Some(branch) = text.strip_prefix("ref: refs/heads/") {
+        if !branch.is_empty()
+            && branch.len() <= 200
+            && !branch.contains("..")
+            && !branch.starts_with('/')
+            && !branch.ends_with('/')
+            && branch
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+        {
+            return Some(format!("git_branch: {branch}"));
+        }
+        return None;
+    }
+    if (40..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(format!("git_head: {}", &text[..12]));
+    }
+    None
+}
+
 fn build_workspace_overview(root: &Path) -> Option<String> {
     let mut lines = Vec::new();
-    if let Ok(head) = fs::read_to_string(root.join(".git/HEAD")) {
-        let head = head.trim();
-        if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-            lines.push(format!("git_branch: {branch}"));
-        } else if !head.is_empty() && !head.starts_with("gitdir:") {
-            lines.push(format!("git_head: {}", &head[..head.len().min(12)]));
-        }
+    if let Some(head_line) = read_safe_git_head(root) {
+        lines.push(head_line);
     }
     if let Ok(read_dir) = fs::read_dir(root) {
         let mut entries = Vec::new();
@@ -308,5 +340,65 @@ mod tests {
         assert_eq!(bundle.sources, vec!["CLAUDE.md"]);
         assert!(bundle.text.contains("claude root guide"));
         assert!(!bundle.text.contains("external secret"));
+    }
+
+    #[test]
+    fn workspace_overview_validates_git_head_and_rejects_symlinks_and_non_utf8_slices() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        fs::create_dir(workspace.path().join(".git")).unwrap();
+
+        // Valid symbolic ref.
+        fs::write(
+            workspace.path().join(".git/HEAD"),
+            "ref: refs/heads/feat/safe-head\n",
+        )
+        .unwrap();
+        let branch_bundle = build(workspace.path(), None, 4096).unwrap();
+        assert!(
+            branch_bundle.text.contains("git_branch: feat/safe-head"),
+            "{}",
+            branch_bundle.text
+        );
+
+        // Valid 40-hex detached OID.
+        fs::write(
+            workspace.path().join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        let oid_bundle = build(workspace.path(), None, 4096).unwrap();
+        assert!(
+            oid_bundle.text.contains("git_head: 0123456789ab"),
+            "{}",
+            oid_bundle.text
+        );
+
+        // Multi-byte UTF-8 where raw `&head[..12]` would split a 4-byte codepoint, plus arbitrary secret text.
+        for bad_head in ["😀😀😀😀😀\n", "super-secret-outside-line-123456\n"] {
+            fs::write(workspace.path().join(".git/HEAD"), bad_head).unwrap();
+            let bad_bundle = build(workspace.path(), None, 4096).unwrap();
+            assert!(!bad_bundle.text.contains("git_branch:"));
+            assert!(!bad_bundle.text.contains("git_head:"));
+            assert!(!bad_bundle.text.contains("super-secret"));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            let secret_head = outside.path().join("HEAD");
+            fs::write(&secret_head, "ref: refs/heads/leaked-outside-branch\n").unwrap();
+            fs::remove_file(workspace.path().join(".git/HEAD")).unwrap();
+            symlink(&secret_head, workspace.path().join(".git/HEAD")).unwrap();
+            let sym_bundle = build(workspace.path(), None, 4096).unwrap();
+            assert!(!sym_bundle.text.contains("leaked-outside-branch"));
+            assert!(!sym_bundle.text.contains("git_branch:"));
+            assert!(!sym_bundle.text.contains("git_head:"));
+        }
     }
 }

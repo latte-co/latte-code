@@ -184,11 +184,12 @@ impl ConversationStore {
     ) -> Result<Vec<ConversationDocument>, String> {
         let _guard = self.io.lock().expect("conversation mutex poisoned");
         ensure_private_directory(&self.workspace_dir)?;
+        let max_raw_entries = max_entries.saturating_mul(64).max(250_000);
         let mut candidates = Vec::new();
-        let mut scanned = 0usize;
+        let mut raw_scanned = 0usize;
         for dir_entry in fs::read_dir(&self.workspace_dir).map_err(io_error)? {
-            scanned = scanned.saturating_add(1);
-            if scanned > max_entries {
+            raw_scanned = raw_scanned.saturating_add(1);
+            if raw_scanned > max_raw_entries {
                 return Err("conversation workspace directory exceeds bounded scan limit".into());
             }
             let dir_entry = dir_entry.map_err(io_error)?;
@@ -215,6 +216,9 @@ impl ConversationStore {
             let session_id = SessionId::from_uuid(uuid);
             if known_sessions.contains(&session_id) {
                 continue;
+            }
+            if candidates.len() >= max_entries {
+                return Err("conversation workspace directory exceeds bounded scan limit".into());
             }
             candidates.push((session_id, dir_entry.path()));
         }
@@ -899,10 +903,24 @@ mod tests {
 
         assert!(
             store
-                .scan_orphans_with_cap(&BTreeSet::new(), 2)
+                .scan_orphans_with_cap(&BTreeSet::new(), 1)
                 .unwrap_err()
                 .contains("exceeds bounded scan limit")
         );
+        // Registered sessions do NOT consume the orphan cap (#15): there are 4 unregistered
+        // `.jsonl` files (`zero_byte`, `header_only`, `missing_created`, `orphan`) plus 6
+        // registered sessions (`10` `.jsonl` files total), so `cap = 4` succeeds!
+        let mut many_known = BTreeSet::from([known]);
+        for seq in 0..5 {
+            let sid = SessionId::from_uuid(ids.next_uuid_v7());
+            store
+                .sync(sid, 100 + seq, &[entry(1, "registered")])
+                .unwrap();
+            many_known.insert(sid);
+        }
+        let bounded_orphans = store.scan_orphans_with_cap(&many_known, 4).unwrap();
+        assert_eq!(bounded_orphans.len(), 1);
+        assert_eq!(bounded_orphans[0].session_id, orphan);
 
         #[cfg(unix)]
         {

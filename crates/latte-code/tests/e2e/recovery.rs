@@ -189,7 +189,7 @@ impl ServerChild {
             let snapshot = self.snapshot(session_id);
             if snapshot["lifecycle"].as_str() == Some("waiting_permission") {
                 return (
-                    snapshot["session_revision"].as_u64().unwrap(),
+                    snapshot["revision"].as_u64().unwrap(),
                     snapshot["pending"]["request_id"]
                         .as_str()
                         .unwrap()

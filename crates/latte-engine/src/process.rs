@@ -218,7 +218,10 @@ fn is_safe_readonly_git(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
     };
-    if !matches!(first.as_str(), "git" | "/usr/bin/git") || argv.len() < 2 {
+    if !matches!(first.as_str(), "git" | "/usr/bin/git")
+        || argv.len() < 2
+        || resolve_trusted_git_binary().is_none()
+    {
         return false;
     }
     // Reject any leading `git -c ...` or `--git-dir` / `--work-tree` overrides.
@@ -812,48 +815,83 @@ fn storage(error: crate::StorageError) -> ProcessError {
     ProcessError::Supervision(format!("durable sequencing: {error}"))
 }
 
-fn resolve_git_binary() -> &'static str {
-    for candidate in [
+fn resolve_trusted_git_binary() -> Option<&'static str> {
+    [
         "/usr/bin/git",
         "/opt/homebrew/bin/git",
         "/usr/local/bin/git",
-    ] {
-        if std::path::Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    "git"
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
+}
+
+fn resolve_git_binary() -> &'static str {
+    resolve_trusted_git_binary().unwrap_or("git")
 }
 
 pub(crate) fn supervise_git_diff(
     cwd: &std::path::Path,
     cap: usize,
+    mut allow_path: impl FnMut(&str) -> bool,
 ) -> Result<(String, bool), ProcessError> {
-    let (mut diff, mut truncated) = match supervise_git(cwd, cap, GitQuery::UnifiedDiffHead) {
-        Ok(result) => result,
-        Err(_) => supervise_git(cwd, cap, GitQuery::UnifiedDiffIndex)?,
+    const MAX_DIFF_PATH_LIST_BYTES: usize = 512 * 1024;
+    const MAX_DIFF_PATHS: usize = 512;
+
+    let (against_head, raw_paths, paths_truncated) = if let Ok((paths, truncated)) =
+        supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::TrackedPathsZ)
+    {
+        (true, paths, truncated)
+    } else {
+        let (paths, truncated) =
+            supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::IndexPathsZ)?;
+        (false, paths, truncated)
     };
-    if !truncated && diff.len() + 32 < cap {
-        let remaining = cap.saturating_sub(diff.len()).saturating_sub(24);
-        if let Ok((untracked, untracked_truncated)) =
-            supervise_git(cwd, remaining, GitQuery::Untracked)
-        {
-            let files: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
-            if !files.is_empty() {
-                if !diff.is_empty() && !diff.ends_with('\n') {
-                    diff.push('\n');
-                }
-                diff.push_str("Untracked files:\n");
-                for file in files {
-                    let line = format!("  {file}\n");
-                    if diff.len() + line.len() > cap {
-                        truncated = true;
-                        break;
-                    }
-                    diff.push_str(&line);
-                }
-                truncated |= untracked_truncated;
+    let mut allowed_paths = Vec::new();
+    let mut path_cap_hit = paths_truncated;
+    for path in raw_paths.split('\0').filter(|entry| !entry.is_empty()) {
+        if !allow_path(path) {
+            continue;
+        }
+        if allowed_paths.len() >= MAX_DIFF_PATHS {
+            path_cap_hit = true;
+            break;
+        }
+        allowed_paths.push(path.to_owned());
+    }
+    let (mut diff, mut truncated) = if allowed_paths.is_empty() {
+        (String::new(), path_cap_hit)
+    } else {
+        let query = if against_head {
+            GitQuery::UnifiedDiffHeadPaths(allowed_paths)
+        } else {
+            GitQuery::UnifiedDiffIndexPaths(allowed_paths)
+        };
+        let (patch, patch_truncated) = supervise_git(cwd, cap, query)?;
+        (patch, patch_truncated || path_cap_hit)
+    };
+    if !truncated
+        && diff.len() + 32 < cap
+        && let Ok((untracked, untracked_truncated)) =
+            supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::UntrackedZ)
+    {
+        let files: Vec<&str> = untracked
+            .split('\0')
+            .filter(|entry| !entry.is_empty() && allow_path(entry))
+            .collect();
+        if !files.is_empty() {
+            if !diff.is_empty() && !diff.ends_with('\n') {
+                diff.push('\n');
             }
+            diff.push_str("Untracked files:\n");
+            for file in files {
+                let line = format!("  {file}\n");
+                if diff.len() + line.len() > cap {
+                    truncated = true;
+                    break;
+                }
+                diff.push_str(&line);
+            }
+            truncated |= untracked_truncated;
         }
     }
     Ok((diff, truncated))
@@ -881,10 +919,13 @@ pub(crate) fn supervise_git_changed_files(
     ))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum GitQuery {
-    UnifiedDiffHead,
-    UnifiedDiffIndex,
+    UnifiedDiffHeadPaths(Vec<String>),
+    UnifiedDiffIndexPaths(Vec<String>),
+    TrackedPathsZ,
+    IndexPathsZ,
+    UntrackedZ,
     TrackedChanges,
     Untracked,
 }
@@ -917,9 +958,31 @@ fn supervise_git(
                 "core.fsmonitor=false".into(),
             ];
             match query {
-                GitQuery::UnifiedDiffHead => argv.extend([
+                GitQuery::UnifiedDiffHeadPaths(paths) => {
+                    argv.extend([
+                        "diff".into(),
+                        "--patch-with-stat".into(),
+                        "--no-ext-diff".into(),
+                        "--no-textconv".into(),
+                        "HEAD".into(),
+                        "--".into(),
+                    ]);
+                    argv.extend(paths);
+                }
+                GitQuery::UnifiedDiffIndexPaths(paths) => {
+                    argv.extend([
+                        "diff".into(),
+                        "--patch-with-stat".into(),
+                        "--no-ext-diff".into(),
+                        "--no-textconv".into(),
+                        "--".into(),
+                    ]);
+                    argv.extend(paths);
+                }
+                GitQuery::TrackedPathsZ => argv.extend([
                     "diff".into(),
-                    "--patch-with-stat".into(),
+                    "-z".into(),
+                    "--name-only".into(),
                     "--no-ext-diff".into(),
                     "--no-textconv".into(),
                     "HEAD".into(),
@@ -928,11 +991,22 @@ fn supervise_git(
                     ":(exclude).latte/**".into(),
                     ":(exclude)target/**".into(),
                 ]),
-                GitQuery::UnifiedDiffIndex => argv.extend([
+                GitQuery::IndexPathsZ => argv.extend([
                     "diff".into(),
-                    "--patch-with-stat".into(),
+                    "-z".into(),
+                    "--name-only".into(),
                     "--no-ext-diff".into(),
                     "--no-textconv".into(),
+                    "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
+                ]),
+                GitQuery::UntrackedZ => argv.extend([
+                    "ls-files".into(),
+                    "-z".into(),
+                    "--others".into(),
+                    "--exclude-standard".into(),
                     "--".into(),
                     ".".into(),
                     ":(exclude).latte/**".into(),
@@ -963,6 +1037,7 @@ fn supervise_git(
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
                 ("GIT_CONFIG_SYSTEM".into(), "/dev/null".into()),
+                ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
             ]);
             let invocation = ProcessInvocation {
                 argv: &argv,
@@ -1057,9 +1132,27 @@ async fn supervise(
             "process cancelled before it could be started".into(),
         ));
     }
+    let readonly_git = i.shell.is_none() && is_safe_readonly_git(i.argv);
     let mut command = if let Some(shell) = i.shell {
         let mut c = Command::new("/bin/sh");
         c.args(["-c", shell]);
+        c
+    } else if readonly_git {
+        let git_bin = resolve_trusted_git_binary()
+            .ok_or_else(|| ProcessError::SpawnFailed("trusted git binary not found".into()))?;
+        let mut c = Command::new(git_bin);
+        c.args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+        c.args(&i.argv[1..]);
         c
     } else {
         let mut c = Command::new(&i.argv[0]);
@@ -1075,6 +1168,14 @@ async fn supervise(
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
+    }
+    if readonly_git {
+        command.envs([
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+        ]);
     }
     command.envs(i.env);
     command.as_std_mut().process_group(0);
@@ -2113,7 +2214,7 @@ mod tests {
             .unwrap();
         // Modify the file to produce a diff.
         std::fs::write(repo.join("file.txt"), "modified content\n").unwrap();
-        let (output, truncated) = supervise_git_diff(repo, 65536).unwrap();
+        let (output, truncated) = supervise_git_diff(repo, 65536, |_| true).unwrap();
         assert!(!output.is_empty());
         assert!(!truncated);
     }
@@ -2312,7 +2413,71 @@ mod tests {
             .status()
             .unwrap();
         std::fs::write(dir.path().join("untracked.rs"), "fn main() {}\n").unwrap();
-        let (unborn_diff, _) = supervise_git_diff(dir.path(), 65536).unwrap();
+        let (unborn_diff, _) = supervise_git_diff(dir.path(), 65536, |_| true).unwrap();
         assert!(unborn_diff.contains("untracked.rs"), "{unborn_diff}");
+    }
+
+    #[tokio::test]
+    async fn readonly_git_status_neutralizes_repo_fsmonitor_and_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fsmonitor-pwned");
+        let helper = dir.path().join("evil-fsmonitor.sh");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "v1\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "tracked.txt"],
+            vec!["commit", "-qm", "init"],
+            vec!["config", "core.fsmonitor", helper.to_str().unwrap()],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+
+        let argv = vec!["git".to_owned(), "status".to_owned(), "--short".to_owned()];
+        let env = BTreeMap::new();
+        let inv = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 5_000,
+            grace_ms: 100,
+            stdout_cap: 16_384,
+            stderr_cap: 16_384,
+            turn_revision: 1,
+            effect_id: "git-status-safe",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "o",
+            lease_token: 1,
+        };
+        assert_eq!(classify(&inv), ProcessDecision::Allow);
+        let out = supervise(&inv, dir.path(), &CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(out.command_succeeded(), "{out:?}");
+        assert!(out.stdout.contains("tracked.txt"), "{out:?}");
+        assert!(
+            !marker.exists(),
+            "auto-allowed git status must never execute repo core.fsmonitor"
+        );
     }
 }
