@@ -555,7 +555,6 @@ fn wire_message(message: &Message) -> Result<WireRequestMessage<'_>, ProviderErr
 }
 impl Provider for OpenAiProvider {
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_lines)]
     fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
         let this = self.clone();
         Box::pin(async move {

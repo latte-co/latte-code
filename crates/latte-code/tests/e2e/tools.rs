@@ -971,6 +971,7 @@ fn multi_write_permission_queue_survives_restarts_and_completes_in_order() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn anthropic_bash_allows_readonly_inspection_and_denies_catastrophic_argv() {
     let scenario = Scenario::new();
     std::process::Command::new("git")
@@ -978,18 +979,42 @@ fn anthropic_bash_allows_readonly_inspection_and_denies_catastrophic_argv() {
         .current_dir(scenario.root())
         .status()
         .unwrap();
-    std::fs::write(scenario.root().join("hello.txt"), "hi\n").unwrap();
+    std::fs::write(scenario.root().join("hello.txt"), "hi one\nhi two\n").unwrap();
+    std::fs::write(
+        scenario.root().join("fuzzy.txt"),
+        "fn a() {   \n    let x = 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        scenario.root().join("ambig.txt"),
+        "  foo = 1\n    foo = 1\n",
+    )
+    .unwrap();
 
     // 1. In `--auto` (`FullAuto`), Claude `Bash` `{"command": ...}` stays on `shell`
-    //    so shell builtins (`export` / `cd`) work, while catastrophic `rm` variants
-    //    (`rm -r -f /*`, `sudo rm -rf /`, `sh -c 'rm -rf /'`) and `.git/config` writes
-    //    are hard-denied BEFORE execution even in FullAuto!
+    //    so shell builtins (`export` / `cd`) work, Claude tool wire<->canonical adapters
+    //    round-trip (`Read`, `Write`, `Edit` fuzzy + cross-tier ambiguity + `replace_all`,
+    //    `Glob`, `Grep` literal/regex, `Bash`), while catastrophic `rm` variants and
+    //    `.git/config` writes are hard-denied BEFORE execution even in FullAuto!
     let r1 = r#"{"type":"message","content":[
-        {"type":"tool_use","id":"b1","name":"Bash","input":{"command":"export SHELL_BUILTIN_OK=verified && printf '%s' \"$SHELL_BUILTIN_OK\""}},
+        {"type":"tool_use","id":"r_1","name":"Read","input":{"file_path":"hello.txt","offset":1,"limit":2}},
+        {"type":"tool_use","id":"r_2","name":"Read","input":{"file_path":"fuzzy.txt"}},
+        {"type":"tool_use","id":"r_3","name":"Read","input":{"file_path":"ambig.txt"}},
+        {"type":"tool_use","id":"w_ok","name":"Write","input":{"file_path":"created.txt","content":"alpha\n"}},
+        {"type":"tool_use","id":"e_all","name":"Edit","input":{"file_path":"hello.txt","old_string":"hi","new_string":"yo","replace_all":true}},
+        {"type":"tool_use","id":"e_fuz","name":"Edit","input":{"file_path":"fuzzy.txt","old_string":"fn a() {\n    let x = 1;\n}","new_string":"fn a() {\n    let x = 2;\n}"}},
+        {"type":"tool_use","id":"e_amb","name":"Edit","input":{"file_path":"ambig.txt","old_string":"foo = 1","new_string":"foo = 9"}},
+        {"type":"tool_use","id":"gl_1","name":"Glob","input":{"pattern":"*.txt","path":"."}},
+        {"type":"tool_use","id":"gr_1","name":"Grep","input":{"pattern":"unclosed[(","path":".","glob":"*.txt"}},
+        {"type":"tool_use","id":"gr_2","name":"Grep","input":{"pattern":"\\(yo\\)","path":"."}},
+        {"type":"tool_use","id":"b1","name":"Bash","input":{"command":"export SHELL_BUILTIN_OK=verified && printf '%s' \"$SHELL_BUILTIN_OK\"","cwd":".","timeout_ms":5000}},
         {"type":"tool_use","id":"b2","name":"Bash","input":{"command":"rm -r -f /*"}},
         {"type":"tool_use","id":"b3","name":"Bash","input":{"command":"sudo -u root -- rm --recursive --force /"}},
+        {"type":"tool_use","id":"b3b","name":"Bash","input":{"command":"sudo -n rm -rf /"}},
         {"type":"tool_use","id":"b4","name":"Bash","input":{"command":"env -u FOO BAR=1 -- rm --no-preserve-root /"}},
+        {"type":"tool_use","id":"b4b","name":"Bash","input":{"command":"env -i FOO=1 rm -rf /"}},
         {"type":"tool_use","id":"b5","name":"Bash","input":{"command":"nice -n 5 command nohup dd of=/dev/sda if=/dev/zero"}},
+        {"type":"tool_use","id":"b5b","name":"Bash","input":{"command":"nice -10 time -p -- rm -rf /"}},
         {"type":"tool_use","id":"b6","name":"Bash","input":{"command":"echo 'sq' \"dq\" a\\ b; (echo sub) && $(rm -- -rf /)"}},
         {"type":"tool_use","id":"b7","name":"Bash","input":{"command":"echo `mkfs.ext4 /dev/sda`"}},
         {"type":"tool_use","id":"b8","name":"Bash","input":{"command":"sh -c 'rm -rf /'"}},
@@ -1129,11 +1154,18 @@ fn anthropic_bash_allows_readonly_inspection_and_denies_catastrophic_argv() {
         );
     }
     std::fs::write(ask_ws.root().join("tracked.txt"), "v2\n").unwrap();
-    let ask_prov = ScriptedProvider::start([ProviderReply::tool_call(
-        "status-ask",
-        "process",
-        &serde_json::json!({"argv": ["git", "status", "--short"]}),
-    )]);
+    let ask_prov = ScriptedProvider::start([
+        ProviderReply::tool_call(
+            "safe-ls",
+            "process",
+            &serde_json::json!({"argv": ["ls", "-la", "."]}),
+        ),
+        ProviderReply::tool_call(
+            "status-ask",
+            "process",
+            &serde_json::json!({"argv": ["git", "status", "--short"]}),
+        ),
+    ]);
     ask_ws.write_config(ask_prov.endpoint(), r#"["/usr/bin/true"]"#);
     let ask_out = ask_ws.output(
         &[

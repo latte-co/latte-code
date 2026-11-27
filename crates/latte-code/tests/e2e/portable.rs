@@ -17289,11 +17289,36 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
         .unwrap();
         pair
     };
-    // Retry within 60s lease -> promotes `.jsonl` and returns `200 Replayed`!
-    let (prom_retry_st, _) = mat_srv.request(
+    drop(mat_srv);
+    // Start a fresh `ServeChild` (no in-memory HTTP `Idempotency-Key` cache, while the 60s
+    // `runtime_lease` keeps startup from auto-promoting `prom_sid`): a mismatched prompt gets
+    // `422`, and the matching retry promotes `.jsonl` via `lookup_create_replay_with_mode` (`200`)!
+    let mat_srv_prom = ServeChild::start_with_env(&mat_scen, &[("TEST_OPENAI_KEY", "k")]);
+    let (_, prom_ws_body) = mat_srv_prom.request(
         "POST",
-        &format!("/v1/workspaces/{mat_ws_id}/sessions"),
-        Some(&mat_srv.token),
+        "/v1/workspaces",
+        Some(&mat_srv_prom.token),
+        Some(&serde_json::json!({ "path": mat_ws_root })),
+        &[],
+    );
+    let prom_ws_id = prom_ws_body["workspace_id"].as_str().unwrap();
+    let (prom_mismatch_st, _) = mat_srv_prom.request(
+        "POST",
+        &format!("/v1/workspaces/{prom_ws_id}/sessions"),
+        Some(&mat_srv_prom.token),
+        Some(&serde_json::json!({
+            "session_id": prom_sid,
+            "command_id": prom_cid,
+            "prompt": "different prompt must 422",
+            "binding": mat_binding,
+        })),
+        &[("Idempotency-Key", &prom_cid)],
+    );
+    assert_eq!(prom_mismatch_st, 422);
+    let (prom_retry_st, _) = mat_srv_prom.request(
+        "POST",
+        &format!("/v1/workspaces/{prom_ws_id}/sessions"),
+        Some(&mat_srv_prom.token),
         Some(&serde_json::json!({
             "session_id": prom_sid,
             "command_id": prom_cid,
@@ -17303,7 +17328,7 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
         &[("Idempotency-Key", &prom_cid)],
     );
     assert_eq!(prom_retry_st, 200);
-    drop(mat_srv);
+    drop(mat_srv_prom);
 
     // Now convert `prom_sid` (after deleting its `.jsonl` too!) into a FILELESS crashed
     // `materializing` row with active 60s lease, start a fresh `ServeChild` (whose startup
@@ -17380,63 +17405,46 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
     // 3. Anthropic `auth: "bearer"`, pre-delta SSE `overloaded_error` retry, and
     //    `model_context_window_exceeded` finish_reason via `CARGO_BIN_EXE_latte-code`.
     let anth_scen = Scenario::new();
-    let anth_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let anth_addr = anth_listener.local_addr().unwrap();
-    let (anth_hdr_tx, anth_hdr_rx) = std::sync::mpsc::channel();
-    let anth_thread = std::thread::spawn(move || {
-        // Attempt 1: pre-delta SSE `overloaded_error` -> retried!
-        let (mut s1, _) = anth_listener.accept().unwrap();
-        let mut b1 = [0_u8; 4096];
-        let n1 = s1.read(&mut b1).unwrap_or(0);
-        let _ = anth_hdr_tx.send(String::from_utf8_lossy(&b1[..n1]).to_ascii_lowercase());
-        let sse_over = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
-            "event: error\n",
-            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n"
-        );
-        let r1 = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_over}",
-            sse_over.len()
-        );
-        s1.write_all(r1.as_bytes()).unwrap();
-
-        // Attempt 2: SSE completes with `stop_reason: "model_context_window_exceeded"` -> mapped to Length!
-        let (mut s2, _) = anth_listener.accept().unwrap();
-        let mut b2 = [0_u8; 4096];
-        let _ = s2.read(&mut b2);
-        let sse_len = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"truncated answer\"}}\n\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":50}}\n\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n\n"
-        );
-        let r2 = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_len}",
-            sse_len.len()
-        );
-        s2.write_all(r2.as_bytes()).unwrap();
-    });
+    let sse_over = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n"
+    );
+    let sse_len = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"truncated answer\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":50}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let anth_prov = ScriptedProvider::start([
+        ProviderReply::raw(200, "text/event-stream", sse_over),
+        ProviderReply::raw(200, "text/event-stream", sse_len),
+    ]);
     std::fs::create_dir_all(anth_scen.home().join(".latte")).unwrap();
-    let anth_base = format!("http://{anth_addr}");
+    let anth_ep = anth_prov.endpoint();
     std::fs::write(
         anth_scen.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"gw/claude",providers:{{gw:{{type:"anthropic-messages",auth:"bearer",max_attempts:2,models:["claude"],base_url:{anth_base:?},api_key:"gw-bearer-token"}}}}}}"#
+            r#"{{version:1,default_model:"gw/claude",providers:{{gw:{{type:"anthropic-messages",auth:"bearer",max_attempts:2,models:["claude"],endpoint:{anth_ep:?},api_key:"gw-bearer-token"}}}}}}"#
         ),
     )
     .unwrap();
     let anth_out = anth_scen.output(&["--json", "run", "hello gateway"], |_| {});
-    anth_thread.join().unwrap();
-    let anth_hdr = anth_hdr_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
-    assert!(anth_hdr.contains("authorization: bearer gw-bearer-token"));
-    assert!(!anth_hdr.contains("x-api-key:"));
+    let anth_reqs = anth_prov.requests();
+    assert_eq!(anth_reqs.len(), 2);
+    assert_eq!(
+        anth_reqs[0]
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer gw-bearer-token")
+    );
+    assert!(!anth_reqs[0].headers.contains_key("x-api-key"));
     // `FinishReason::Length` causes the turn to fail retryably rather than pretending normal completion!
     assert!(!anth_out.status.success());
     let anth_str = String::from_utf8_lossy(&anth_out.stdout);
@@ -17447,52 +17455,39 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
         "{anth_str}"
     );
 
-    // 4. Mixed signed + unsigned thinking rejection on open continuation across CLI restart,
-    //    `retry-after-ms` + jitter backoff, pasted `<repository-context>` source cap, and
-    //    invalid registry / focus boundary rejections via `CARGO_BIN_EXE_latte-code`.
+    // 4. Mixed signed + unsigned thinking rejection on open continuation, `retry-after-ms` +
+    //    `Retry-After` seconds + jitter backoff, and Anthropic SSE `tool_use` / `[DONE]` / error branches!
     let mix_scen = Scenario::new();
-    let mix_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mix_addr = mix_listener.local_addr().unwrap();
-    let mix_thread = std::thread::spawn(move || {
-        // Attempt 1: 429 with `retry-after-ms: 10` -> retried!
-        let (mut s1, _) = mix_listener.accept().unwrap();
-        let mut b1 = [0_u8; 4096];
-        let _ = s1.read(&mut b1);
-        s1.write_all(
-            b"HTTP/1.1 429 Too Many Requests\r\nretry-after-ms: 10\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        )
-        .unwrap();
-        // Attempt 2: 503 with NO Retry-After header -> exercises exponential backoff + jitter!
-        let (mut s2, _) = mix_listener.accept().unwrap();
-        let mut b2 = [0_u8; 4096];
-        let _ = s2.read(&mut b2);
-        s2.write_all(
-            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        )
-        .unwrap();
-        // Attempt 3: inline JSON with 2 thinking blocks (1 signed + 1 unsigned) and a portable `Read`
-        // tool call so Round 2 immediately enters `build_anthropic_payload` on an open continuation!
-        let (mut s3, _) = mix_listener.accept().unwrap();
-        let mut b3 = [0_u8; 4096];
-        let _ = s3.read(&mut b3);
-        let body = r#"{"type":"message","content":[
-            {"type":"thinking","thinking":"step one","signature":"sig_keep_1"},
-            {"type":"thinking","thinking":"step two","signature":""},
-            {"type":"tool_use","id":"r_mix","name":"Read","input":{"file_path":"AGENTS.md"}}
-        ],"stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":8}}"#;
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        s3.write_all(resp.as_bytes()).unwrap();
-    });
     std::fs::write(mix_scen.root().join("AGENTS.md"), "ok\n").unwrap();
+    let mix_prov = ScriptedProvider::start([
+        // Attempt 1: 429 with `retry-after-ms: 10` -> retried!
+        ProviderReply::json(429, &serde_json::json!({})).header("retry-after-ms", "10"),
+        // Attempt 2: 503 with NO Retry-After -> exercises exponential backoff + jitter!
+        ProviderReply::json(503, &serde_json::json!({})),
+        // Attempt 3: 429 with integer `Retry-After: 0` -> exercises seconds Retry-After parsing!
+        ProviderReply::json(429, &serde_json::json!({})).header("Retry-After", "0"),
+        // Attempt 4: inline JSON with 2 thinking blocks (1 signed + 1 unsigned) and a portable `Read`
+        // tool call so Round 2 immediately enters `build_anthropic_payload` on an open continuation!
+        ProviderReply::json(
+            200,
+            &serde_json::json!({
+                "type": "message",
+                "content": [
+                    {"type": "thinking", "thinking": "step one", "signature": "sig_keep_1"},
+                    {"type": "thinking", "thinking": "step two", "signature": ""},
+                    {"type": "tool_use", "id": "r_mix", "name": "Read", "input": {"file_path": "AGENTS.md"}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 12, "output_tokens": 8}
+            }),
+        ),
+    ]);
     std::fs::create_dir_all(mix_scen.home().join(".latte")).unwrap();
-    let mix_base = format!("http://{mix_addr}");
+    let mix_ep = mix_prov.endpoint();
     std::fs::write(
         mix_scen.home().join(".latte/latte-code.jsonc"),
         format!(
-            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",max_attempts:3,streaming:false,headers:{{"x-trace":"${{session_id}}"}},models:{{m:{{options:{{context_window:64000,max_tokens:8192,reasoning_effort:"minimal"}}}}}},base_url:{mix_base:?},api_key:"k"}}}}}}"#
+            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",max_attempts:4,streaming:false,headers:{{"x-trace":"${{session_id}}"}},models:{{m:{{options:{{context_window:64000,max_tokens:8192,reasoning_effort:"minimal"}}}}}},endpoint:{mix_ep:?},api_key:"k"}}}}}}"#
         ),
     )
     .unwrap();
@@ -17500,13 +17495,73 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
         &["--json", "run", "mixed thinking open continuation"],
         |_| {},
     );
-    mix_thread.join().unwrap();
     assert!(!mix_resumed.status.success());
     let mix_resumed_str = String::from_utf8_lossy(&mix_resumed.stdout);
     assert!(
         mix_resumed_str.contains("signed thinking block"),
         "mixed signed+unsigned thinking must fail closed on open continuation: {mix_resumed_str}"
     );
+
+    // 4b. Anthropic SSE `tool_use` (`input_json_delta` partial_json), `[DONE]` terminator,
+    //     SSE `context_overflow`, missing `message_stop`, and invalid JSON via final binary!
+    let sse_tool_scen = Scenario::new();
+    std::fs::write(sse_tool_scen.root().join("note.txt"), "line1\nline2\n").unwrap();
+    let sse_tool_round1 = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_stream\",\"name\":\"Read\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"note.txt\\\",\\\"offset\\\":1\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\",\\\"limit\\\":2}\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let sse_tool_round2 = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":18}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream-tool-done\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let sse_no_stop =
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n";
+    let sse_bad_json = "data: {not-valid-json\n\n";
+    let sse_ctx_over = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: maximum context length\"}}\n\n"
+    );
+    let sse_tool_prov = ScriptedProvider::start([
+        ProviderReply::raw(200, "text/event-stream", sse_tool_round1),
+        ProviderReply::raw(200, "text/event-stream", sse_tool_round2),
+        ProviderReply::raw(200, "text/event-stream", sse_no_stop),
+        ProviderReply::raw(200, "text/event-stream", sse_bad_json),
+        ProviderReply::raw(200, "text/event-stream", sse_ctx_over),
+    ]);
+    std::fs::create_dir_all(sse_tool_scen.home().join(".latte")).unwrap();
+    let sse_tool_ep = sse_tool_prov.endpoint();
+    std::fs::write(
+        sse_tool_scen.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",max_attempts:1,streaming:true,prompt_caching:true,models:["m"],endpoint:{sse_tool_ep:?},api_key:"k"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let st_ok = sse_tool_scen.output(&["--json", "run", "read via sse tool_use"], |_| {});
+    assert!(
+        st_ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st_ok.stdout)
+    );
+    let st_sid = json(&st_ok)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for p in ["no-stop", "bad-json", "ctx-over"] {
+        assert!(
+            !sse_tool_scen
+                .output(&["--json", "resume", &st_sid, p], |_| {})
+                .status
+                .success()
+        );
+    }
 
     // 5. Pasted `<repository-context>` user prompt counts against `max_summary_source_bytes` during compaction.
     let cap_scen = Scenario::new();
@@ -17541,30 +17596,113 @@ fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_mater
         "pasted <repository-context> exceeding max_summary_source_bytes must bypass warm_prefix reuse: {summary_req}"
     );
 
-    // 6. Invalid `latte-code.jsonc` registry boundaries & escaping `--focus` fail closed via final CLI!
+    // 6. Nested `AGENTS.md` `--focus`, `tool_style: "claude_code"` on `openai-chat` profile merge,
+    //    CLI argument validation, and `latte-code.jsonc` / `LATTE_CODE_HOME` boundaries via final CLI!
+    let focus_scen = Scenario::new();
+    std::fs::write(focus_scen.root().join("AGENTS.md"), "root note\n").unwrap();
+    std::fs::write(
+        focus_scen.root().join("Cargo.toml"),
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(focus_scen.root().join("src/deep")).unwrap();
+    std::fs::write(focus_scen.root().join("src/AGENTS.md"), "nested src note\n").unwrap();
+    let focus_prov = ScriptedProvider::start([
+        ProviderReply::completion("nested focus ok"),
+        ProviderReply::completion("dashdash prompt ok"),
+    ]);
+    let focus_ep = focus_prov.endpoint();
+    std::fs::create_dir_all(focus_scen.home().join(".latte")).unwrap();
+    std::fs::write(
+        focus_scen.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{$schema:"https://example.invalid/schema.json",version:1,default_provider:"legacy",approval_policy:"ask",permissions:{{}},default_model:"o/m",providers:{{o:{{type:"openai-chat",tool_style:"claude_code",models:{{m:{{name:"Claude-Styled OpenAI",options:{{context_window:4096,max_tokens:512,reasoning_effort:"high"}}}}}},endpoint:{focus_ep:?},api_key:"k"}}}},session:{{context_cap_bytes:96,max_tool_rounds:3,compaction:{{enabled:false}}}}}}"#
+        ),
+    )
+    .unwrap();
     assert!(
-        !cap_scen
-            .output(&["--json", "run", "--focus", "../outside", "hi"], |_| {})
+        focus_scen
+            .output(
+                &[
+                    "--json",
+                    "run",
+                    "--focus",
+                    "src/deep/missing.rs",
+                    "inspect \x1b[31mcolored\x1b[0m\x07",
+                ],
+                |_| {}
+            )
             .status
             .success()
     );
+    assert!(
+        focus_scen
+            .output(&["--json", "run", "--", "--auto"], |_| {})
+            .status
+            .success()
+    );
+    for bad_cli in [
+        &["--json", "run", "--focus", "../outside", "hi"][..],
+        &["--json", "run", "--focus", "", "hi"][..],
+        &["--json", "list", "--focus", "src"][..],
+        &["--json", "run", "--permission-mode", "bad-mode", "hi"][..],
+        &["--json", "run", "--allow", "req-1", "hi"][..],
+        &["--json", "run", "--deny", "req-1", "hi"][..],
+        &["--json", "list", "--unknown-opt"][..],
+        &["--json", "run"][..],
+        &["--json", "list", "extra"][..],
+        &["--json", "show"][..],
+        &["--json", "show", "not-a-uuid"][..],
+        &["--json", "resume", "018f0000-0000-7000-8000-000000000001"][..],
+        &["--json", "unknown-subcmd"][..],
+        &["--json", "list", "--server"][..],
+    ] {
+        assert!(
+            !focus_scen.output(bad_cli, |_| {}).status.success(),
+            "expected CLI usage error for {bad_cli:?}"
+        );
+    }
+    for bad_home in ["", "relative/latte-home"] {
+        assert!(
+            !focus_scen
+                .output(&["--json", "list"], |cmd| {
+                    cmd.env("LATTE_CODE_HOME", bad_home);
+                })
+                .status
+                .success()
+        );
+    }
     let bad_cfg_scen = Scenario::new();
     std::fs::create_dir_all(bad_cfg_scen.home().join(".latte")).unwrap();
     for bad_cfg in [
+        "[]",
         r#"{version:2,default_model:"",providers:{}}"#,
         r#"{version:1,default_model:"x/m",providers:{"":{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"malformed",providers:{}}"#,
+        r#"{version:1,default_model:"/m",providers:{}}"#,
         r#"{version:1,default_model:"missing/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"p/missing",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:[],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],base_url:"http://127.0.0.1:9",endpoint:"http://127.0.0.1:9/v1",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:""}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",timeout_ms:0}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",max_attempts:11}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",temperature:3}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"anthropic-messages",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",temperature:1.5}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{options:{context_window:0}}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{options:{context_window:16,max_tokens:16}}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{options:{reasoning_effort:""}}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{name:""}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",aliases:{unknown_tool:"X"}}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",aliases:{read_file:"bad space"}}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",headers:{authorization:"Bearer x"}}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",headers:{"x-bad":"${UNTERMINATED"}}}}"#,
         r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",headers:{"x-bad":"${UNKNOWN_VAR}"}}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}},verification:{argv:[]}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}},session:{compaction:{enabled:true,max_summary_source_bytes:0}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}},session:{compaction:{enabled:true,trigger_ratio:101}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}},session:{compaction:{enabled:true,retain_ratio:81}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}},session:{compaction:{enabled:true,mode:"bogus"}}}"#,
     ] {
         std::fs::write(bad_cfg_scen.home().join(".latte/latte-code.jsonc"), bad_cfg).unwrap();
         assert!(
