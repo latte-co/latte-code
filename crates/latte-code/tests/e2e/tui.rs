@@ -3089,20 +3089,35 @@ fn tui_compacted_projection_live_permission_mode_multiline_editor_and_sigint() {
     );
     assert!(pty.wait_for_growth(before_nav, Duration::from_secs(5)));
 
-    // Install a schema trigger rejecting `UPDATE OF permission_mode` while leaving `SELECT`
-    // (`RefreshSnapshots`) healthy, then run `/mode ask` to exercise `PermissionModeError`
-    // (`tui/session.rs:999..1016`)!
+    // Install a conditional trigger rejecting ONLY `auto_edit` while allowing `full_auto`
+    // and `ask`: rapid `/mode auto-edit` (fails) followed immediately by `/mode full-auto`
+    // (succeeds) must keep `Full-auto` without stale failure rollback, while a standalone
+    // `/mode auto-edit` failure surfaces `PermissionModeError`!
     {
         let conn = Connection::open(scenario.database_path()).unwrap();
         let _ = conn.busy_timeout(Duration::from_secs(5));
         conn.execute_batch(&format!(
             "CREATE TRIGGER block_perm_mode BEFORE UPDATE OF permission_mode ON sessions \
-             WHEN NEW.session_id = '{sid}' \
+             WHEN NEW.session_id = '{sid}' AND NEW.permission_mode = 'auto_edit' \
              BEGIN SELECT RAISE(ABORT, 'mode locked'); END;"
         ))
         .unwrap();
     }
     pty.write(b"/mode ask\r");
+    assert!(wait_for_screen_text(
+        &pty,
+        40,
+        120,
+        "Ask",
+        Duration::from_secs(5)
+    ));
+    pty.write(b"/mode auto-edit\r/mode full-auto\r");
+    assert!(
+        wait_for_screen_text(&pty, 40, 120, "Full-auto", Duration::from_secs(5)),
+        "newer /mode full-auto must win over failed /mode auto-edit:\n{}",
+        pty_screen_text(&pty.output(), 40, 120)
+    );
+    pty.write(b"/mode auto-edit\r");
     assert!(
         wait_for_screen_text(
             &pty,

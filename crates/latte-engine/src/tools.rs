@@ -1491,6 +1491,12 @@ fn apply_edit_span(
     let needle_spans = split_line_spans(before);
     let cand_spans = split_line_spans(content);
 
+    // Collect candidates across all lenient normalization stages before accepting
+    // a single match so an ambiguous match in a later stage is never masked by an
+    // earlier stage's single hit.
+    let adapted_after = adapt_line_endings(after, use_crlf);
+    let mut stage1_hits: Vec<(usize, usize)> = Vec::new();
+
     // Stage 1: line-trimmed-end & CRLF normalization.
     if !needle_spans.is_empty()
         && needle_spans
@@ -1498,7 +1504,6 @@ fn apply_edit_span(
             .any(|s| !s.body.trim_end_matches([' ', '\t']).is_empty())
         && cand_spans.len() >= needle_spans.len()
     {
-        let mut hits: Vec<(usize, usize)> = Vec::new();
         let win = needle_spans.len();
         let mut idx = 0usize;
         while idx + win <= cand_spans.len() {
@@ -1514,46 +1519,27 @@ fn apply_edit_span(
                 } else {
                     last.end_body
                 };
-                hits.push((start, end));
+                stage1_hits.push((start, end));
                 idx += if replace_all { win } else { 1 };
             } else {
                 idx += 1;
             }
         }
-        if hits.len() == 1 || (replace_all && !hits.is_empty()) {
-            let adapted = adapt_line_endings(after, use_crlf);
-            let mut out = content.to_owned();
-            for &(start, end) in hits.iter().rev() {
-                out.replace_range(start..end, &adapted);
-            }
-            return Ok(out);
-        }
-        if hits.len() > 1 {
-            return Err(ToolError::MatchCount(hits.len()));
-        }
     }
 
     // Stage 2: typographic curly-quote normalization.
+    let mut stage2_hits: Vec<(usize, usize)> = Vec::new();
     let (norm_content, norm_map) = normalize_quotes_with_map(content);
     let (norm_before, _) = normalize_quotes_with_map(before);
     if !norm_before.is_empty() {
-        let quote_hits: Vec<(usize, usize)> = norm_content
+        stage2_hits = norm_content
             .match_indices(&norm_before)
             .map(|(start, matched)| (norm_map[start], norm_map[start + matched.len()]))
             .collect();
-        if quote_hits.len() == 1 || (replace_all && !quote_hits.is_empty()) {
-            let mut out = content.to_owned();
-            for &(start, end) in quote_hits.iter().rev() {
-                out.replace_range(start..end, after);
-            }
-            return Ok(out);
-        }
-        if quote_hits.len() > 1 {
-            return Err(ToolError::MatchCount(quote_hits.len()));
-        }
     }
 
     // Stage 3: uniform space-indentation shift for multi-line blocks (`!replace_all`).
+    let mut stage3_hits: Vec<(usize, usize, String)> = Vec::new();
     if !replace_all
         && let Some((needle_indent, non_empty)) =
             min_space_indent(needle_spans.iter().map(|s| s.body))
@@ -1572,7 +1558,6 @@ fn apply_edit_span(
                 }
             })
             .collect();
-        let mut indent_hits: Vec<(usize, usize, usize)> = Vec::new();
         for idx in 0..=(cand_spans.len() - win) {
             let window = &cand_spans[idx..idx + win];
             let Some((cand_indent, cand_non_empty)) =
@@ -1600,24 +1585,72 @@ fn apply_edit_span(
                 } else {
                     last.end_body
                 };
-                indent_hits.push((start, end, cand_indent));
+                let delta = isize::try_from(cand_indent).unwrap_or(0)
+                    - isize::try_from(needle_indent).unwrap_or(0);
+                stage3_hits.push((start, end, shift_space_indent(after, delta, use_crlf)));
             }
-        }
-        if indent_hits.len() == 1 {
-            let (start, end, cand_indent) = indent_hits[0];
-            let delta = isize::try_from(cand_indent).unwrap_or(0)
-                - isize::try_from(needle_indent).unwrap_or(0);
-            let shifted = shift_space_indent(after, delta, use_crlf);
-            let mut out = content.to_owned();
-            out.replace_range(start..end, &shifted);
-            return Ok(out);
-        }
-        if indent_hits.len() > 1 {
-            return Err(ToolError::MatchCount(indent_hits.len()));
         }
     }
 
-    Err(ToolError::MatchCount(0))
+    // Deduplicate candidate spans by exact `(start, end)` byte range (preserving
+    // Stage 1 > Stage 2 > Stage 3 replacement precedence when two stages match the
+    // exact same span), while rejecting any distinct multi-span ambiguity.
+    let mut unique_candidates: Vec<(usize, usize, String)> = Vec::new();
+    for &(start, end) in &stage1_hits {
+        if !unique_candidates
+            .iter()
+            .any(|&(s, e, _)| s == start && e == end)
+        {
+            unique_candidates.push((start, end, adapted_after.clone()));
+        }
+    }
+    for &(start, end) in &stage2_hits {
+        if !unique_candidates
+            .iter()
+            .any(|&(s, e, _)| s == start && e == end)
+        {
+            unique_candidates.push((start, end, after.to_owned()));
+        }
+    }
+    for (start, end, shifted) in stage3_hits {
+        if !unique_candidates
+            .iter()
+            .any(|&(s, e, _)| s == start && e == end)
+        {
+            unique_candidates.push((start, end, shifted));
+        }
+    }
+
+    if unique_candidates.is_empty() {
+        return Err(ToolError::MatchCount(0));
+    }
+    if !replace_all {
+        if unique_candidates.len() > 1 {
+            return Err(ToolError::MatchCount(unique_candidates.len()));
+        }
+        let (start, end, replacement) = &unique_candidates[0];
+        let mut out = content.to_owned();
+        out.replace_range(*start..*end, replacement);
+        return Ok(out);
+    }
+
+    // `replace_all`: if both Stage 1 and Stage 2 matched different span sets, or any
+    // spans overlap, fail closed rather than mixing incompatible normalizations.
+    if !stage1_hits.is_empty() && !stage2_hits.is_empty() && stage1_hits != stage2_hits {
+        return Err(ToolError::MatchCount(unique_candidates.len()));
+    }
+    unique_candidates.sort_by_key(|&(start, end, _)| (start, end));
+    if unique_candidates
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0)
+    {
+        return Err(ToolError::MatchCount(unique_candidates.len()));
+    }
+    let mut out = content.to_owned();
+    for (start, end, replacement) in unique_candidates.into_iter().rev() {
+        out.replace_range(start..end, &replacement);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2426,6 +2459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn edit_file_supports_replace_all_and_uniqueness_checked_fallbacks() {
         // 1. Exact replace_all vs ambiguous rejection when replace_all is false.
         let repeated = "alpha = 1;\nbeta = 2;\nalpha = 1;\n";
@@ -2522,6 +2556,33 @@ mod tests {
             ),
             Err(ToolError::MatchCount(2))
         ));
+
+        // Cross-tier ambiguity: Stage 1 matches line 1..2 (trailing whitespace), while
+        // Stage 3 also matches line 4..5 (uniformly indented). Must fail closed with
+        // MatchCount(2) instead of silently picking Stage 1's hit!
+        let cross_tier =
+            "if ready {\n    step();   \n}\n\n    if ready {\n        step();\n    }\n";
+        assert!(matches!(
+            apply_edit_span(
+                cross_tier,
+                "if ready {\n    step();\n}",
+                "if ready {\n    done();\n}",
+                false
+            ),
+            Err(ToolError::MatchCount(2))
+        ));
+
+        // Same-span deduplication: Stage 1 and Stage 3 both match the exact same byte
+        // span `(0, len)` -> deduplicated to 1 unique candidate and applied cleanly.
+        let same_span = "if ready {\n    step();   \n}\n";
+        let edited_same = apply_edit_span(
+            same_span,
+            "if ready {\n    step();\n}",
+            "if ready {\n    done();\n}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(edited_same, "if ready {\n    done();\n}\n");
     }
 
     #[cfg(unix)]

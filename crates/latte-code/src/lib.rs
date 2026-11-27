@@ -1664,7 +1664,11 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                         let _ = feedback.send(SessionUiFeedback::model_switch(switch_id, result));
                     });
                 }
-                SessionUiAction::SetPermissionMode { session_id, mode } => {
+                SessionUiAction::SetPermissionMode {
+                    change_id,
+                    session_id,
+                    mode,
+                } => {
                     if let Some(session_id) = session_id {
                         let handle = server_handle.clone();
                         let feedback = feedback_tx.clone();
@@ -1673,8 +1677,9 @@ fn tui_main_loop(setup: TuiSetup) -> i32 {
                                 .set_permission_mode(&session_id, mode)
                                 .await
                                 .map_err(|error| error.to_string());
-                            let _ = feedback
-                                .send(SessionUiFeedback::permission_mode(session_id, mode, result));
+                            let _ = feedback.send(SessionUiFeedback::permission_mode(
+                                change_id, session_id, mode, result,
+                            ));
                         });
                     } else {
                         *current_permission_mode

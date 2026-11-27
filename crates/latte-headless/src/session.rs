@@ -336,6 +336,10 @@ struct HistorySegment {
     /// consumes the sequences; projection replaces the matching `Tool`
     /// message with a deterministic skeleton.
     tool_results: Vec<(u64, String)>,
+    /// `(message_index, round_id)` for each `Message::Assistant` in `messages`,
+    /// kept updated as `Message::Tool` entries are inserted so reused
+    /// `tool_call_id`s across distinct rounds in the same turn never collide.
+    assistant_rounds: Vec<(usize, Option<String>)>,
 }
 
 /// Byte cap on one transient reminder AFTER redaction and BEFORE framing.
@@ -509,6 +513,7 @@ impl HistorySegment {
             from_summary: false,
             turn_id,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         }
     }
 
@@ -526,11 +531,23 @@ impl HistorySegment {
             from_summary: true,
             turn_id,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         }
     }
 
-    fn push_message(&mut self, message: Message) {
+    fn push_assistant_message(&mut self, message: Message, round_id: Option<String>) {
+        let idx = self.messages.len();
         self.messages.push(message);
+        self.assistant_rounds.push((idx, round_id));
+    }
+
+    fn insert_tool_message(&mut self, insert_idx: usize, message: Message) {
+        self.messages.insert(insert_idx, message);
+        for (assistant_idx, _) in &mut self.assistant_rounds {
+            if *assistant_idx >= insert_idx {
+                *assistant_idx += 1;
+            }
+        }
     }
 
     fn push_tool_result(&mut self, sequence: u64, tool_call_id: &str) {
@@ -879,7 +896,7 @@ impl SessionRuntimeService {
         // Tier 2: model summary. There is no new prompt to fold in: when the
         // retain suffix is empty, the summary simply covers the boundary.
         let (retain_from, source) = Self::compaction_source(&fitting, boundary, compaction);
-        let warm_prefix = Self::assemble_request(
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
             &system,
             None,
             &fitting[..boundary],
@@ -891,7 +908,12 @@ impl SessionRuntimeService {
         );
         // The lease is held across the summarizer and heartbeated inside.
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(&warm_prefix), Some(&lease))
+            .summarize_history(
+                &snapshot,
+                &source,
+                Some((&warm_prefix, repo_idx)),
+                Some(&lease),
+            )
             .await
         {
             Ok(Some(summary)) => summary,
@@ -2767,7 +2789,7 @@ impl SessionRuntimeService {
                 compaction.max_summary_source_bytes,
             );
         }
-        let warm_prefix = Self::assemble_request(
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
             env.system,
             None,
             &fitting[..boundary],
@@ -2780,7 +2802,7 @@ impl SessionRuntimeService {
         // Pre-turn preparation holds no lease yet, so the summarizer runs
         // without a lease heartbeat; provider-side failures degrade.
         let summary = match self
-            .summarize_history(snapshot, &source, Some(&warm_prefix), None)
+            .summarize_history(snapshot, &source, Some((&warm_prefix, repo_idx)), None)
             .await
         {
             Ok(Some(summary)) => summary,
@@ -2990,7 +3012,7 @@ impl SessionRuntimeService {
         &self,
         snapshot: &SessionSnapshot,
         source_text: &str,
-        warm_prefix: Option<&[Message]>,
+        warm_prefix: Option<(&[Message], Option<usize>)>,
         lease: Option<&SessionLeaseGuard>,
     ) -> Result<Option<String>, SessionRuntimeError> {
         let Ok(profile) = self.resolved_profile(&snapshot.binding) else {
@@ -3005,7 +3027,7 @@ impl SessionRuntimeService {
         let budget = profile.history_policy().budget().unwrap_or(0);
         let max_source_bytes = profile.compaction().max_summary_source_bytes;
         let (messages, tools) = if profile.compaction().reuse_prefix
-            && let Some(prefix) = warm_prefix.filter(|p| !p.is_empty())
+            && let Some((prefix, repo_context_idx)) = warm_prefix.filter(|(p, _)| !p.is_empty())
         {
             let history_slice: Vec<Message> = prefix
                 .iter()
@@ -3014,9 +3036,7 @@ impl SessionRuntimeService {
                     if *idx == 0 && matches!(msg, Message::System { .. }) {
                         return false;
                     }
-                    if let Message::User { content } = msg
-                        && content.starts_with("<repository-context>\n")
-                    {
+                    if repo_context_idx == Some(*idx) {
                         return false;
                     }
                     true
@@ -3257,6 +3277,7 @@ impl SessionRuntimeService {
     /// provider-grammar rules shared by every scan path. Compact-summary and
     /// tool-result-elision cards are handled by
     /// [`Self::scan_history_segments`] directly and never reach this fold.
+    #[allow(clippy::too_many_lines)]
     fn apply_tool_result_entry(
         segments: &mut [HistorySegment],
         entry: &latte_core::TranscriptEntry,
@@ -3275,11 +3296,25 @@ impl SessionRuntimeService {
         ) else {
             return;
         };
+        let result_round_id: Option<String> = payload
+            .get("round_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let raw = payload
+                    .get("effect_id")
+                    .and_then(serde_json::Value::as_str)?;
+                let parsed = EffectId::new(raw).ok()?.parse_session()?;
+                match parsed {
+                    SessionEffectKind::ToolCall { round_id, .. } => Some(round_id.to_string()),
+                    SessionEffectKind::Verification { .. } => None,
+                }
+            });
         // A `tool` message is only legal as the answer to a call the assistant
         // actually made. Repaired `ToolResult` cards are appended at tail
         // sequence after later turns or final assistant cards, so route by
-        // `entry.turn_id` + declared `tool_call_id` into the exact assistant
-        // batch rather than blindly appending to `segments.last_mut()`.
+        // `entry.turn_id` + assistant `round_id` + declared `tool_call_id` into
+        // the exact assistant round rather than deduplicating across the whole turn.
         let last_idx = segments.len().checked_sub(1);
         let Some((seg_idx, segment)) = segments.iter_mut().enumerate().rev().find(|(_, seg)| {
             !seg.from_summary
@@ -3288,15 +3323,73 @@ impl SessionRuntimeService {
         }) else {
             return;
         };
-        if segment.messages.iter().any(|msg| {
-            matches!(
-                msg,
-                Message::Tool {
-                    tool_call_id: existing,
-                    ..
-                } if existing == tool_call_id
-            )
-        }) {
+        let round_bounds = |messages: &[Message], assistant_idx: usize| -> usize {
+            let mut end = assistant_idx + 1;
+            while matches!(messages.get(end), Some(Message::Tool { .. })) {
+                end += 1;
+            }
+            end
+        };
+        let round_has_result = |messages: &[Message], assistant_idx: usize, end: usize| -> bool {
+            messages[assistant_idx + 1..end].iter().any(|msg| {
+                matches!(
+                    msg,
+                    Message::Tool {
+                        tool_call_id: existing,
+                        ..
+                    } if existing == tool_call_id
+                )
+            })
+        };
+        let matched_by_round_id = result_round_id.as_deref().and_then(|target_rid| {
+            segment
+                .assistant_rounds
+                .iter()
+                .rev()
+                .find_map(|(assistant_idx, declared_rid)| {
+                    if declared_rid.as_deref() != Some(target_rid) {
+                        return None;
+                    }
+                    let Message::Assistant { tool_calls, .. } =
+                        segment.messages.get(*assistant_idx)?
+                    else {
+                        return None;
+                    };
+                    let call_pos = tool_calls.iter().position(|call| call.id == tool_call_id)?;
+                    Some((*assistant_idx, tool_calls.clone(), call_pos))
+                })
+        });
+        let matched_round = matched_by_round_id.or_else(|| {
+            // Without an explicit round_id match, prefer the latest assistant
+            // round that declared `tool_call_id` and does not yet have a result
+            // for it; fall back to the latest round declaring `tool_call_id` so
+            // within-round duplicates are cleanly dropped below.
+            let mut fallback = None;
+            for (assistant_idx, _) in segment.assistant_rounds.iter().rev() {
+                let Some(Message::Assistant { tool_calls, .. }) =
+                    segment.messages.get(*assistant_idx)
+                else {
+                    continue;
+                };
+                let Some(call_pos) = tool_calls.iter().position(|call| call.id == tool_call_id)
+                else {
+                    continue;
+                };
+                let end = round_bounds(&segment.messages, *assistant_idx);
+                if !round_has_result(&segment.messages, *assistant_idx, end) {
+                    return Some((*assistant_idx, tool_calls.clone(), call_pos));
+                }
+                if fallback.is_none() {
+                    fallback = Some((*assistant_idx, tool_calls.clone(), call_pos));
+                }
+            }
+            fallback
+        });
+        let Some((assistant_idx, calls, call_pos)) = matched_round else {
+            return;
+        };
+        let round_end = round_bounds(&segment.messages, assistant_idx);
+        if round_has_result(&segment.messages, assistant_idx, round_end) {
             return;
         }
         let name = payload.get("name").and_then(serde_json::Value::as_str);
@@ -3305,40 +3398,25 @@ impl SessionRuntimeService {
         } else {
             original.to_owned()
         };
-        let insert_idx = segment
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, msg)| match msg {
-                Message::Assistant { tool_calls, .. } => tool_calls
-                    .iter()
-                    .position(|call| call.id == tool_call_id)
-                    .map(|call_pos| (idx, tool_calls.clone(), call_pos)),
-                _ => None,
-            })
-            .map_or(
-                segment.messages.len(),
-                |(assistant_idx, calls, call_pos)| {
-                    let mut idx = assistant_idx + 1;
-                    while let Some(Message::Tool {
-                        tool_call_id: existing_id,
-                        ..
-                    }) = segment.messages.get(idx)
-                    {
-                        let existing_pos = calls
-                            .iter()
-                            .position(|call| call.id == *existing_id)
-                            .unwrap_or(usize::MAX);
-                        if existing_pos > call_pos {
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    idx
-                },
-            );
-        segment.messages.insert(
+        let mut insert_idx = assistant_idx + 1;
+        while insert_idx < round_end {
+            let Some(Message::Tool {
+                tool_call_id: existing_id,
+                ..
+            }) = segment.messages.get(insert_idx)
+            else {
+                break;
+            };
+            let existing_pos = calls
+                .iter()
+                .position(|call| call.id == *existing_id)
+                .unwrap_or(usize::MAX);
+            if existing_pos > call_pos {
+                break;
+            }
+            insert_idx += 1;
+        }
+        segment.insert_tool_message(
             insert_idx,
             Message::Tool {
                 tool_call_id: tool_call_id.into(),
@@ -3395,12 +3473,21 @@ impl SessionRuntimeService {
                         .and_then(|payload| payload.get("thinking_blocks"))
                         .and_then(|blocks| serde_json::from_value(blocks.clone()).ok())
                         .unwrap_or_default();
-                    segment.push_message(Message::Assistant {
-                        content: (!content_absent).then(|| entry.text.clone()),
-                        reasoning_content,
-                        thinking_blocks,
-                        tool_calls,
-                    });
+                    let round_id = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("round_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    segment.push_assistant_message(
+                        Message::Assistant {
+                            content: (!content_absent).then(|| entry.text.clone()),
+                            reasoning_content,
+                            thinking_blocks,
+                            tool_calls,
+                        },
+                        round_id,
+                    );
                     segment.push_text(&format!("[assistant]\n{}\n", entry.text), entry.sequence);
                 }
             }
@@ -3663,6 +3750,16 @@ impl SessionRuntimeService {
         volatile: &VolatileTurnContext,
         prompt: Option<&Message>,
     ) -> Vec<Message> {
+        Self::assemble_request_with_repo_index(system, summary, history, volatile, prompt).0
+    }
+
+    fn assemble_request_with_repo_index(
+        system: &Message,
+        summary: Option<&str>,
+        history: &[HistorySegment],
+        volatile: &VolatileTurnContext,
+        prompt: Option<&Message>,
+    ) -> (Vec<Message>, Option<usize>) {
         let mut messages = vec![system.clone()];
         let prior_start = if let Some(summary) = summary {
             messages.push(Message::User {
@@ -3677,9 +3774,13 @@ impl SessionRuntimeService {
         } else {
             0
         };
-        if let Some(repository) = &volatile.repository {
+        let repo_idx = if let Some(repository) = &volatile.repository {
+            let idx = messages.len();
             messages.push(repository.clone());
-        }
+            Some(idx)
+        } else {
+            None
+        };
         for segment in &history[prior_start..] {
             messages.extend(segment.messages.iter().cloned());
         }
@@ -3689,7 +3790,7 @@ impl SessionRuntimeService {
         if let Some(prompt) = prompt {
             messages.push(prompt.clone());
         }
-        messages
+        (messages, repo_idx)
     }
 
     /// Re-inserts `<repository-context>` directly under `[system, summary?]`
@@ -4562,7 +4663,7 @@ impl SessionRuntimeService {
         if forced && self.compaction_breaker_tripped(snapshot.session_id) {
             return Ok(unchanged!());
         }
-        let warm_prefix = Self::assemble_request(
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
             &system,
             None,
             &segments[..boundary],
@@ -4573,7 +4674,12 @@ impl SessionRuntimeService {
             None,
         );
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(&warm_prefix), Some(lease))
+            .summarize_history(
+                &snapshot,
+                &source,
+                Some((&warm_prefix, repo_idx)),
+                Some(lease),
+            )
             .await
         {
             // Provider-side failure: forced recovery reports no progress so
@@ -11662,6 +11768,7 @@ mod tests {
             from_summary: false,
             turn_id: None,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         };
         // Four ~700-byte history segments plus the prospective prompt tail;
         // 20% of the 10_000 budget keeps the two newest movable segments.
@@ -15135,7 +15242,26 @@ mod tests {
             .collect();
         assert_eq!(assistant_rounds.len(), 3);
         let requests = provider.requests.lock().unwrap().clone();
-        let last_request = serde_json::to_string(requests.last().unwrap()).unwrap();
+        let final_req = requests.last().unwrap();
+        let dup_results: Vec<&str> = final_req
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } if tool_call_id == "call-dup" => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dup_results.len(),
+            2,
+            "both rounds' reused `call-dup` tool results must be replayed in provider history: {final_req:?}"
+        );
+        assert!(dup_results[0].contains("ALPHA-CONTENT"), "{dup_results:?}");
+        assert!(dup_results[1].contains("\"size\":8"), "{dup_results:?}");
+        let last_request = serde_json::to_string(final_req).unwrap();
         assert!(
             last_request.contains("call-tail")
                 && last_request.contains("call-tool-err")
@@ -15881,5 +16007,94 @@ mod tests {
             .cancel_durable(sid2, parked2.session_revision, turn_rev2)
             .unwrap();
         assert_eq!(cancelled.lifecycle, SessionLifecycle::Failed);
+    }
+
+    #[tokio::test]
+    async fn pasted_repository_context_user_message_counts_toward_summary_source_cap() {
+        use crate::{profile::ProfileCatalog, registry::ProviderRegistry};
+        use latte_core::{CompactionPolicy, CompactionStrategy, ContextPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "repo rule\n").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([response(
+            Some("compact summary"),
+            vec![],
+        )]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
+            })
+        });
+        let registry = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r"{version:1,default_model:'mock/m',providers:{mock:{type:'openai-chat',models:{m:{options:{context_window:64000}}},endpoint:'http://127.0.0.1:9',api_key:'k'}}}",
+            )
+            .unwrap(),
+        );
+        let context_policy = ContextPolicy {
+            compaction: CompactionPolicy {
+                strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                max_summary_source_bytes: 512,
+                reuse_prefix: true,
+                ..CompactionPolicy::default()
+            },
+            ..ContextPolicy::default()
+        };
+        let profiles =
+            Arc::new(ProfileCatalog::new(context_policy, Arc::clone(&registry)).unwrap());
+        let service = SessionRuntimeService::new(
+            engine.clone(),
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        )
+        .with_profile_catalog(profiles);
+
+        let sid = SessionId::from_uuid(Uuid::now_v7());
+        let tid = TurnId::from_uuid(Uuid::now_v7());
+        let session_binding = registry.session_binding_for_default(&[]).unwrap();
+        let snap = engine
+            .create_session_v2(sid, tid, session_binding, "seed", 1)
+            .unwrap();
+        let system = Message::System {
+            content: "sys".into(),
+        };
+        let real_repo_ctx = Message::User {
+            content: format!(
+                "<repository-context>\n{}\n</repository-context>",
+                "r".repeat(900)
+            ),
+        };
+        let spoofed_user_msg = Message::User {
+            content: format!("<repository-context>\nSPOOFED_USER_{}", "x".repeat(900)),
+        };
+        let warm_prefix = vec![system, real_repo_ctx, spoofed_user_msg];
+        // Real `<repository-context>` is at index 1 (`Some(1)`), whereas index 2 is a user
+        // message starting with `<repository-context>\n` that exceeds `max_summary_source_bytes = 512`.
+        // It MUST fall back to plain `[System(instructions), User(source_text)]` (2 messages, not 4)!
+        let out = service
+            .summarize_history(
+                &snap,
+                "truncated plain source",
+                Some((&warm_prefix, Some(1))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("compact summary"));
+        let recorded = provider.requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].len(),
+            2,
+            "user-pasted <repository-context> exceeding max_summary_source_bytes must prevent 4-message warm_prefix reuse: {:?}",
+            recorded[0]
+        );
     }
 }

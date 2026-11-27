@@ -93,7 +93,9 @@ impl PermissionPolicy {
         self.denies.is_match(target)
     }
     pub(crate) fn decide(&self, effect: EffectClass, target: &str) -> PolicyDecision {
-        if self.is_denied(target) {
+        if self.is_denied(target)
+            || (effect != EffectClass::Read && is_protected_vcs_target(target))
+        {
             PolicyDecision::Deny
         } else if effect == EffectClass::Read {
             PolicyDecision::Allow
@@ -101,6 +103,14 @@ impl PermissionPolicy {
             PolicyDecision::Ask
         }
     }
+}
+
+fn is_protected_vcs_target(target: &str) -> bool {
+    let first = target
+        .trim_start_matches("./")
+        .split(['/', '\\'])
+        .find(|part| !part.is_empty());
+    first.is_some_and(crate::workspace::is_protected_vcs_component)
 }
 
 #[cfg(test)]
@@ -129,5 +139,40 @@ mod tests {
             PolicyDecision::Ask
         );
         assert_eq!(policy.version, 1);
+    }
+
+    #[test]
+    fn permission_policy_denies_mutations_on_git_metadata_paths() {
+        let policy = PermissionPolicy::new(&[], 1).expect("valid policy");
+        for path in [
+            ".git",
+            ".git/config",
+            "./.git/hooks/pre-commit",
+            ".GIT/HEAD",
+            "GIT~1/config",
+        ] {
+            assert_eq!(
+                policy.decide(EffectClass::Create, path),
+                PolicyDecision::Deny,
+                "Create on {path} must be Deny"
+            );
+            assert_eq!(
+                policy.decide(EffectClass::Modify, path),
+                PolicyDecision::Deny,
+                "Modify on {path} must be Deny"
+            );
+        }
+        assert_eq!(
+            policy.decide(EffectClass::Read, ".git/HEAD"),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.decide(EffectClass::Modify, ".github/workflows/ci.yml"),
+            PolicyDecision::Ask
+        );
+        assert_eq!(
+            policy.decide(EffectClass::Modify, ".gitignore"),
+            PolicyDecision::Ask
+        );
     }
 }

@@ -181,10 +181,12 @@ pub enum SessionUiInput {
         switch_id: u64,
     },
     PermissionModeError {
+        change_id: u64,
         session_id: SessionId,
         error: String,
     },
     PermissionModeCompleted {
+        change_id: u64,
         session_id: SessionId,
         mode: latte_core::PermissionMode,
     },
@@ -220,6 +222,7 @@ pub enum SessionUiFeedback {
         result: Result<String, String>,
     },
     PermissionModeResult {
+        change_id: u64,
         session_id: SessionId,
         mode: latte_core::PermissionMode,
         result: Result<(), String>,
@@ -282,11 +285,13 @@ impl SessionUiFeedback {
 
     #[must_use]
     pub fn permission_mode(
+        change_id: u64,
         session_id: SessionId,
         mode: latte_core::PermissionMode,
         result: Result<(), String>,
     ) -> Self {
         Self::PermissionModeResult {
+            change_id,
             session_id,
             mode,
             result,
@@ -368,11 +373,20 @@ pub enum SessionUiAction {
         model: String,
     },
     SetPermissionMode {
+        change_id: u64,
         session_id: Option<SessionId>,
         mode: latte_core::PermissionMode,
     },
     RefreshSnapshots,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingPermissionMode {
+    change_id: u64,
+    session_id: SessionId,
+    target: latte_core::PermissionMode,
+    rollback: latte_core::PermissionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -485,11 +499,8 @@ pub struct SessionUiModel {
     /// Active session permission mode (`Ask`, `AutoEdit`, `FullAuto`).
     pub permission_mode: latte_core::PermissionMode,
     draft_permission_mode: latte_core::PermissionMode,
-    pending_permission_mode: Option<(
-        SessionId,
-        latte_core::PermissionMode,
-        latte_core::PermissionMode,
-    )>,
+    pending_permission_mode: Option<PendingPermissionMode>,
+    last_settled_permission_mode_id: u64,
     /// Most recent redacted runtime submission error reason, if any.
     last_submission_error: Option<String>,
     last_input_submission_error: Option<String>,
@@ -551,6 +562,7 @@ pub struct SessionUiModel {
     pub submission_error: Option<String>,
     pub next_submission_id: u64,
     pub next_model_switch_id: u64,
+    pub next_permission_mode_id: u64,
     /// A reconciliation acknowledgement is high-impact: it records the
     /// unknown effect as failed and terminalizes the linked child. Opening
     /// this state is not itself an action; only Ctrl+A can dispatch it.
@@ -591,6 +603,7 @@ impl Default for SessionUiModel {
             permission_mode: latte_core::PermissionMode::Ask,
             draft_permission_mode: latte_core::PermissionMode::Ask,
             pending_permission_mode: None,
+            last_settled_permission_mode_id: 0,
             last_submission_error: None,
             last_input_submission_error: None,
             scroll: 0,
@@ -623,6 +636,7 @@ impl Default for SessionUiModel {
             submission_error: None,
             next_submission_id: 1,
             next_model_switch_id: 1,
+            next_permission_mode_id: 1,
             reconciliation_confirmation: None,
             reconciliation_hint: None,
             ctrl_c_exit_armed_until: None,
@@ -980,7 +994,37 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
                 return vec![SessionUiAction::RefreshSnapshots];
             }
         }
-        SessionUiInput::PermissionModeCompleted { session_id, mode } => {
+        SessionUiInput::PermissionModeCompleted {
+            change_id,
+            session_id,
+            mode,
+        } => {
+            if change_id <= model.last_settled_permission_mode_id {
+                return vec![SessionUiAction::RefreshSnapshots];
+            }
+            if let Some(pending) = model.pending_permission_mode.as_mut()
+                && pending.session_id == session_id
+            {
+                if change_id < pending.change_id {
+                    model.last_settled_permission_mode_id = change_id;
+                    pending.rollback = mode;
+                    return Vec::new();
+                }
+                if change_id == pending.change_id {
+                    model.last_settled_permission_mode_id = change_id;
+                    model.pending_permission_mode = None;
+                    if let Some(session) = model
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.session_id == session_id)
+                    {
+                        session.permission_mode = mode;
+                    }
+                    sync_selected_permission_mode(model);
+                    return Vec::new();
+                }
+            }
+            model.last_settled_permission_mode_id = change_id;
             if let Some(session) = model
                 .sessions
                 .iter_mut()
@@ -988,26 +1032,26 @@ pub fn reduce(model: &mut SessionUiModel, input: SessionUiInput) -> Vec<SessionU
             {
                 session.permission_mode = mode;
             }
-            if model
-                .pending_permission_mode
-                .is_some_and(|(pending_id, target, _)| pending_id == session_id && target == mode)
-            {
-                model.pending_permission_mode = None;
-            }
             sync_selected_permission_mode(model);
         }
-        SessionUiInput::PermissionModeError { session_id, error } => {
-            if let Some((pending_id, _, previous)) = model.pending_permission_mode
-                && pending_id == session_id
+        SessionUiInput::PermissionModeError {
+            change_id,
+            session_id,
+            error,
+        } => {
+            let Some(pending) = model.pending_permission_mode else {
+                return Vec::new();
+            };
+            if pending.change_id != change_id || pending.session_id != session_id {
+                return Vec::new();
+            }
+            model.pending_permission_mode = None;
+            if let Some(session) = model
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
             {
-                model.pending_permission_mode = None;
-                if let Some(session) = model
-                    .sessions
-                    .iter_mut()
-                    .find(|session| session.session_id == session_id)
-                {
-                    session.permission_mode = previous;
-                }
+                session.permission_mode = pending.rollback;
             }
             sync_selected_permission_mode(model);
             let notice = format!("Permission mode rejected: {error}");
@@ -1219,9 +1263,10 @@ fn reduce_key_at(model: &mut SessionUiModel, key: KeyEvent, now: Instant) -> Vec
                     } else {
                         latte_core::PermissionMode::AutoEdit
                     };
-                    set_model_permission_mode(model, next_mode);
+                    let change_id = set_model_permission_mode(model, next_mode);
                     return vec![
                         SessionUiAction::SetPermissionMode {
+                            change_id,
                             session_id: Some(session.session_id),
                             mode: next_mode,
                         },
@@ -1730,13 +1775,14 @@ fn dispatch_builtin(
                 };
                 parsed
             };
-            set_model_permission_mode(model, next_mode);
+            let change_id = set_model_permission_mode(model, next_mode);
             let session_id = model.selected_session().map(|session| session.session_id);
             set_notice(
                 model,
                 format!("Permission mode set to {}", next_mode.card_label()),
             );
             vec![SessionUiAction::SetPermissionMode {
+                change_id,
                 session_id,
                 mode: next_mode,
             }]
@@ -1748,13 +1794,10 @@ fn sync_selected_permission_mode(model: &mut SessionUiModel) {
     if let Some(session) = model.selected_session() {
         let session_id = session.session_id;
         let authoritative = session.permission_mode;
-        if let Some((pending_id, target, _)) = model.pending_permission_mode
-            && pending_id == session_id
+        if let Some(pending) = model.pending_permission_mode
+            && pending.session_id == session_id
         {
-            if authoritative == target {
-                model.pending_permission_mode = None;
-            }
-            model.permission_mode = target;
+            model.permission_mode = pending.target;
             return;
         }
         model.permission_mode = authoritative;
@@ -1763,10 +1806,20 @@ fn sync_selected_permission_mode(model: &mut SessionUiModel) {
     }
 }
 
-fn set_model_permission_mode(model: &mut SessionUiModel, mode: latte_core::PermissionMode) {
+fn set_model_permission_mode(model: &mut SessionUiModel, mode: latte_core::PermissionMode) -> u64 {
+    let change_id = model.next_permission_mode_id;
+    model.next_permission_mode_id = model.next_permission_mode_id.saturating_add(1);
     if let Some(session_id) = model.selected_session().map(|session| session.session_id) {
-        let previous = model.permission_mode;
-        model.pending_permission_mode = Some((session_id, mode, previous));
+        let rollback = match model.pending_permission_mode {
+            Some(pending) if pending.session_id == session_id => pending.rollback,
+            _ => model.permission_mode,
+        };
+        model.pending_permission_mode = Some(PendingPermissionMode {
+            change_id,
+            session_id,
+            target: mode,
+            rollback,
+        });
         if let Some(session) = model
             .sessions
             .iter_mut()
@@ -1782,6 +1835,7 @@ fn set_model_permission_mode(model: &mut SessionUiModel, mode: latte_core::Permi
             startup.permission_mode = mode;
         }
     }
+    change_id
 }
 
 fn selected_session_action(
@@ -1832,13 +1886,14 @@ fn reduce_composer_key(model: &mut SessionUiModel, key: KeyEvent) -> Vec<Session
         }
         KeyCode::BackTab => {
             let next_mode = model.permission_mode.next();
-            set_model_permission_mode(model, next_mode);
+            let change_id = set_model_permission_mode(model, next_mode);
             let session_id = model.selected_session().map(|session| session.session_id);
             set_notice(
                 model,
                 format!("Permission mode: {}", next_mode.card_label()),
             );
             return vec![SessionUiAction::SetPermissionMode {
+                change_id,
                 session_id,
                 mode: next_mode,
             }];
@@ -5799,6 +5854,7 @@ fn apply_session_actions(
     Ok(false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn drain_runtime_updates(
     model: &mut SessionUiModel,
     feedback: &Receiver<SessionUiFeedback>,
@@ -5855,20 +5911,30 @@ fn drain_runtime_updates(
                 result: Err(error),
             } => reduce(model, SessionUiInput::ModelSwitchError { switch_id, error }),
             SessionUiFeedback::PermissionModeResult {
+                change_id,
                 session_id,
                 mode,
                 result: Ok(()),
             } => reduce(
                 model,
-                SessionUiInput::PermissionModeCompleted { session_id, mode },
+                SessionUiInput::PermissionModeCompleted {
+                    change_id,
+                    session_id,
+                    mode,
+                },
             ),
             SessionUiFeedback::PermissionModeResult {
+                change_id,
                 session_id,
                 result: Err(error),
                 ..
             } => reduce(
                 model,
-                SessionUiInput::PermissionModeError { session_id, error },
+                SessionUiInput::PermissionModeError {
+                    change_id,
+                    session_id,
+                    error,
+                },
             ),
             SessionUiFeedback::Command(Ok(message)) => {
                 reduce(model, SessionUiInput::CommandCompleted(message))
@@ -12462,6 +12528,7 @@ mod tests {
         assert_eq!(
             reduce(&mut model, key(KeyCode::BackTab, KeyModifiers::SHIFT)),
             vec![SessionUiAction::SetPermissionMode {
+                change_id: 1,
                 session_id: None,
                 mode: latte_core::PermissionMode::AutoEdit,
             }]
@@ -12470,6 +12537,7 @@ mod tests {
         assert_eq!(
             reduce(&mut model, key(KeyCode::Enter, KeyModifiers::NONE)),
             vec![SessionUiAction::SetPermissionMode {
+                change_id: 2,
                 session_id: None,
                 mode: latte_core::PermissionMode::FullAuto,
             }]
@@ -12516,6 +12584,7 @@ mod tests {
             reduce(&mut perm_model, key(KeyCode::Char('a'), KeyModifiers::NONE)),
             vec![
                 SessionUiAction::SetPermissionMode {
+                    change_id: 1,
                     session_id: Some(perm_session.session_id),
                     mode: latte_core::PermissionMode::AutoEdit,
                 },
@@ -12611,6 +12680,7 @@ mod tests {
         assert_eq!(
             shift_tab_actions,
             vec![SessionUiAction::SetPermissionMode {
+                change_id: 1,
                 session_id: Some(sess_b.session_id),
                 mode: latte_core::PermissionMode::AutoEdit,
             }]
@@ -12620,6 +12690,7 @@ mod tests {
             latte_core::PermissionMode::AutoEdit
         );
         tx.send(SessionUiFeedback::permission_mode(
+            1,
             sess_b.session_id,
             latte_core::PermissionMode::AutoEdit,
             Err("permission mode RPC failed".into()),
@@ -12637,6 +12708,77 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("permission mode RPC failed")
+        );
+
+        // Out-of-order generation guard: rapid Ask -> AutoEdit (id=2, slow fail) -> FullAuto (id=3, fast ok)
+        // must keep FullAuto when stale id=2 fails or completes out of order!
+        let _ = reduce(&mut mode_model, key(KeyCode::BackTab, KeyModifiers::SHIFT)); // id=2 -> AutoEdit
+        let second = reduce(&mut mode_model, key(KeyCode::BackTab, KeyModifiers::SHIFT)); // id=3 -> FullAuto
+        assert_eq!(
+            second,
+            vec![SessionUiAction::SetPermissionMode {
+                change_id: 3,
+                session_id: Some(sess_b.session_id),
+                mode: latte_core::PermissionMode::FullAuto,
+            }]
+        );
+        // Case 1: stale error (id=2) arrives while id=3 is still in flight -> ignored!
+        tx.send(SessionUiFeedback::permission_mode(
+            2,
+            sess_b.session_id,
+            latte_core::PermissionMode::AutoEdit,
+            Err("stale timeout".into()),
+        ))
+        .unwrap();
+        let (_, stale_in_flight_actions) = drain_runtime_updates(&mut mode_model, &rx, &prx);
+        assert!(stale_in_flight_actions.is_empty());
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::FullAuto
+        );
+        // Case 2: id=3 succeeds -> settles on FullAuto, then late error/completion from id=2 is ignored!
+        tx.send(SessionUiFeedback::permission_mode(
+            3,
+            sess_b.session_id,
+            latte_core::PermissionMode::FullAuto,
+            Ok(()),
+        ))
+        .unwrap();
+        tx.send(SessionUiFeedback::permission_mode(
+            2,
+            sess_b.session_id,
+            latte_core::PermissionMode::AutoEdit,
+            Err("late stale error".into()),
+        ))
+        .unwrap();
+        let _ = drain_runtime_updates(&mut mode_model, &rx, &prx);
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::FullAuto,
+            "stale generation error must never revert UI to Ask while server holds FullAuto"
+        );
+        // Case 3: Ask/FullAuto -> Ask (id=4, ok) -> AutoEdit (id=5, fail): rollback uses id=4's Ask!
+        let _ = reduce(&mut mode_model, key(KeyCode::BackTab, KeyModifiers::SHIFT)); // id=4 -> Ask
+        let _ = reduce(&mut mode_model, key(KeyCode::BackTab, KeyModifiers::SHIFT)); // id=5 -> AutoEdit
+        tx.send(SessionUiFeedback::permission_mode(
+            4,
+            sess_b.session_id,
+            latte_core::PermissionMode::Ask,
+            Ok(()),
+        ))
+        .unwrap();
+        tx.send(SessionUiFeedback::permission_mode(
+            5,
+            sess_b.session_id,
+            latte_core::PermissionMode::AutoEdit,
+            Err("id=5 rejected".into()),
+        ))
+        .unwrap();
+        let _ = drain_runtime_updates(&mut mode_model, &rx, &prx);
+        assert_eq!(
+            mode_model.permission_mode,
+            latte_core::PermissionMode::Ask,
+            "earlier settled generation updates rollback baseline for subsequent failure"
         );
     }
 }

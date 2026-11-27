@@ -93,6 +93,8 @@ pub enum ProviderDefinition {
         aliases: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_style: Option<ToolPresentationStyle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<AnthropicAuthStyle>,
     },
 }
 
@@ -141,6 +143,15 @@ fn validate_headers(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnthropicAuthStyle {
+    #[default]
+    #[serde(alias = "api_key", alias = "x_api_key")]
+    XApiKey,
+    Bearer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -692,6 +703,7 @@ impl ProviderRegistry {
                 streaming,
                 prompt_caching,
                 headers,
+                auth,
                 ..
             } => {
                 let endpoint = endpoint
@@ -704,6 +716,7 @@ impl ProviderRegistry {
                     key,
                     Duration::from_millis(*timeout_ms),
                 )?
+                .with_bearer_auth(*auth == Some(AnthropicAuthStyle::Bearer))
                 .with_max_attempts(*max_attempts)
                 .with_sampling_options(
                     model_options.temperature.or(*temperature),
@@ -1251,49 +1264,6 @@ fn canonical_input_to_claude_wire(canonical: &str, input: &Value) -> Value {
     Value::Object(out)
 }
 
-fn simple_command_to_argv(command: &str) -> Option<Vec<String>> {
-    let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed.bytes().any(|b| {
-            matches!(
-                b,
-                b'|' | b'&'
-                    | b';'
-                    | b'<'
-                    | b'>'
-                    | b'('
-                    | b')'
-                    | b'$'
-                    | b'`'
-                    | b'\\'
-                    | b'"'
-                    | b'\''
-                    | b'*'
-                    | b'?'
-                    | b'['
-                    | b']'
-                    | b'{'
-                    | b'}'
-                    | b'~'
-                    | b'#'
-                    | b'!'
-                    | b'\n'
-                    | b'\r'
-            )
-        })
-    {
-        return None;
-    }
-    let tokens: Vec<String> = trimmed
-        .split_ascii_whitespace()
-        .map(str::to_owned)
-        .collect();
-    if tokens.is_empty() || tokens.len() > 256 || tokens[0].contains('=') {
-        return None;
-    }
-    Some(tokens)
-}
-
 #[allow(clippy::too_many_lines)]
 fn claude_wire_input_to_canonical(canonical: &str, input: &Value) -> Value {
     let Some(obj) = input.as_object() else {
@@ -1378,11 +1348,7 @@ fn claude_wire_input_to_canonical(canonical: &str, input: &Value) -> Value {
         }
         "process" => {
             if let Some(cmd) = obj.get("command").and_then(Value::as_str) {
-                if let Some(argv) = simple_command_to_argv(cmd) {
-                    out.insert("argv".into(), serde_json::json!(argv));
-                } else {
-                    out.insert("shell".into(), Value::String(cmd.to_owned()));
-                }
+                out.insert("shell".into(), Value::String(cmd.to_owned()));
             } else {
                 for key in ["argv", "shell"] {
                     if let Some(v) = obj.get(key) {
@@ -2595,14 +2561,19 @@ mod tests {
             "unclosed paren auto-falls back to literal search"
         );
         assert_eq!(outcome.tool_calls[5].name, "process");
-        assert_eq!(
-            outcome.tool_calls[5].input["argv"],
-            serde_json::json!(["git", "status", "--short"])
-        );
+        assert!(outcome.tool_calls[5].input.get("argv").is_none());
+        assert_eq!(outcome.tool_calls[5].input["shell"], "git status --short");
         assert_eq!(outcome.tool_calls[6].name, "process");
         assert_eq!(
             outcome.tool_calls[6].input["shell"],
             "cargo test 2>&1 | head -n 5"
         );
+        // Shell builtins (`cd`, `export`, `source`) stay on `shell` rather than breaking under `execve` argv!
+        let builtin_mapped = claude_wire_input_to_canonical(
+            "process",
+            &serde_json::json!({"command": "export FOO=1"}),
+        );
+        assert_eq!(builtin_mapped["shell"], "export FOO=1");
+        assert!(builtin_mapped.get("argv").is_none());
     }
 }

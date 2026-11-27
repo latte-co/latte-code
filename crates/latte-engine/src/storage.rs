@@ -838,13 +838,28 @@ impl Storage {
             tx.execute_batch(
                 r"
                 UPDATE session_runs
-                   SET tool_round_count = (
-                         SELECT COUNT(*) FROM conversation_outbox
-                          WHERE conversation_outbox.run_id = session_runs.run_id
-                            AND conversation_outbox.kind = 'assistant'
-                            AND json_array_length(
-                                  COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
-                                ) > 0
+                   SET tool_round_count = MAX(
+                         (
+                           SELECT COUNT(*) FROM conversation_outbox
+                            WHERE conversation_outbox.run_id = session_runs.run_id
+                              AND conversation_outbox.kind = 'assistant'
+                              AND json_array_length(
+                                    COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
+                                  ) > 0
+                         ),
+                         (
+                           SELECT COUNT(DISTINCT
+                                    CASE
+                                      WHEN e.effect_id LIKE 'session-effect:%'
+                                       AND instr(substr(e.effect_id, 53), ':') > 0
+                                      THEN substr(e.effect_id, 1, 51 + instr(substr(e.effect_id, 53), ':'))
+                                      ELSE e.effect_id
+                                    END
+                                  )
+                             FROM effects e
+                            WHERE e.run_id = session_runs.run_id
+                              AND e.effect_id NOT LIKE 'verify:%'
+                         )
                        );
                 ",
             )?;
@@ -1228,17 +1243,33 @@ impl Storage {
                 "INSERT OR IGNORE INTO main.conversation_outbox SELECT * FROM legacy_import.{transcript_source};"
             ))?;
             // Rebuild the imported turns' tool-round counters from their
-            // durable cards, mirroring the schema-14 migration backfill.
+            // durable cards (or distinct effect rounds if outbox was drained),
+            // mirroring the schema-14 migration backfill.
             tx.execute_batch(
                 r"
                 UPDATE session_turns
-                   SET tool_round_count = (
-                         SELECT COUNT(*) FROM conversation_outbox
-                          WHERE conversation_outbox.turn_id = session_turns.turn_id
-                            AND conversation_outbox.kind = 'assistant'
-                            AND json_array_length(
-                                  COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
-                                ) > 0
+                   SET tool_round_count = MAX(
+                         (
+                           SELECT COUNT(*) FROM conversation_outbox
+                            WHERE conversation_outbox.turn_id = session_turns.turn_id
+                              AND conversation_outbox.kind = 'assistant'
+                              AND json_array_length(
+                                    COALESCE(json_extract(entry_json,'$.payload.tool_calls'),'[]')
+                                  ) > 0
+                         ),
+                         (
+                           SELECT COUNT(DISTINCT
+                                    CASE
+                                      WHEN e.effect_id LIKE 'session-effect:%'
+                                       AND instr(substr(e.effect_id, 53), ':') > 0
+                                      THEN substr(e.effect_id, 1, 51 + instr(substr(e.effect_id, 53), ':'))
+                                      ELSE e.effect_id
+                                    END
+                                  )
+                             FROM effects e
+                            WHERE e.turn_id = session_turns.turn_id
+                              AND e.effect_id NOT LIKE 'verify:%'
+                         )
                        );
                 ",
             )?;
@@ -1506,6 +1537,138 @@ impl Storage {
         }
         let snapshot: SessionSnapshot = serde_json::from_str(&result_json).map_err(invalid_json)?;
         Ok(Some(snapshot))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lookup_materializing_create_command(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: latte_core::SessionId,
+        workspace_root: &str,
+        prompt: &str,
+        binding: &SessionProviderBinding,
+        focus: Option<&str>,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<Option<MaterializingSessionRecord>, StorageError> {
+        type MaterializingLookupRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let workspace_root = validate_workspace_root(workspace_root)?;
+        let digest = create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
+        );
+        let v2_binding_digest = v2_binding_create_command_digest_with_mode(
+            session_id,
+            workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
+        );
+        let v1_binding_digest = permission_mode.is_none().then(|| {
+            legacy_v1_binding_create_command_digest(
+                session_id,
+                workspace_root,
+                prompt,
+                binding,
+                focus,
+            )
+        });
+        let legacy_digest = permission_mode.is_none().then(|| {
+            legacy_create_command_digest(session_id, workspace_root, prompt, binding, focus)
+        });
+        let conn = self.connection.lock().expect("storage mutex poisoned");
+        let row: Option<MaterializingLookupRow> = conn
+            .query_row(
+                "SELECT session_id,workspace_root,binding_json,focus,permission_mode,create_command_id,create_command_digest \
+                 FROM sessions \
+                 WHERE lifecycle='materializing' AND create_command_id=?1",
+                [command_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            raw_sid,
+            row_workspace_root,
+            binding_json,
+            row_focus,
+            permission_mode_raw,
+            create_command_id,
+            create_command_digest,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let row_session_id = parse_session_id(&raw_sid)?;
+        let digest_matches = create_command_digest.as_deref().is_some_and(|stored| {
+            stored == digest
+                || stored == v2_binding_digest
+                || v1_binding_digest.as_deref() == Some(stored)
+                || legacy_digest.as_deref() == Some(stored)
+        });
+        if row_session_id != session_id || row_workspace_root != workspace_root || !digest_matches {
+            return Err(StorageError::SessionCommandReplayMismatch);
+        }
+        let parsed_mode = latte_core::PermissionMode::parse_mode(&permission_mode_raw)
+            .unwrap_or(latte_core::PermissionMode::Ask);
+        Ok(Some(MaterializingSessionRecord {
+            session_id: row_session_id,
+            binding_json,
+            focus: row_focus,
+            permission_mode: parsed_mode,
+            create_command_id,
+            create_command_digest,
+        }))
+    }
+
+    pub(crate) fn discard_crashed_materializing_session(
+        &self,
+        session_id: latte_core::SessionId,
+        command_id: &latte_core::SessionCommandId,
+    ) -> Result<bool, StorageError> {
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dedup_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_command_dedup WHERE command_id=?1)",
+            [command_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if dedup_exists {
+            return Ok(false);
+        }
+        let deleted = tx.execute(
+            "DELETE FROM sessions WHERE session_id=?1 AND lifecycle='materializing' AND create_command_id=?2",
+            params![session_id.to_string(), command_id.to_string()],
+        )?;
+        if deleted > 0 {
+            tx.execute(
+                "DELETE FROM runtime_lease WHERE scope=?1",
+                [session_lease_scope(session_id)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
     }
 
     /// Pre-acquire durable dedup lookup for a follow-up command. A hit means
@@ -2974,6 +3137,10 @@ impl Storage {
                     if deleted == 0 {
                         continue;
                     }
+                    tx.execute(
+                        "DELETE FROM runtime_lease WHERE scope=?1",
+                        [session_lease_scope(doc.session_id)],
+                    )?;
                     let dedup = record
                         .create_command_id
                         .clone()
@@ -4132,7 +4299,6 @@ impl Storage {
         Ok(displayed.into_keys().collect())
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn commit_session_turn_update(
         &self,
         request: &SessionCommitRequest,
@@ -4145,6 +4311,100 @@ impl Storage {
         let digest = session_command_digest(request)?;
         let mut conn = self.connection.lock().expect("storage mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((replay, _)) =
+            Self::check_session_commit_replay_in_tx(&tx, request, &[digest.as_str()], now_ms)?
+        {
+            tx.commit()?;
+            return Ok(replay);
+        }
+        Self::verify_session_lease_in_tx(&tx, &expected_scope, lease, now_ms)?;
+        Self::commit_session_turn_update_after_lease(tx, request, &digest, lease, now_ms)
+    }
+
+    pub(crate) fn commit_session_turn_update_with_ask_fallback(
+        &self,
+        allow_request: &SessionCommitRequest,
+        ask_request: Option<&SessionCommitRequest>,
+        tool_name: &str,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<(SessionCommitResponse, SessionEffectPolicy), StorageError> {
+        let expected_scope = session_lease_scope(allow_request.session_id);
+        require_lease_scope(lease, &expected_scope)?;
+        validate_session_source(allow_request.update.source_key())?;
+        let allow_digest = session_command_digest(allow_request)?;
+        let ask_digest = ask_request.map(session_command_digest).transpose()?;
+        let mut conn = self.connection.lock().expect("storage mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accepted: Vec<&str> = std::iter::once(allow_digest.as_str())
+            .chain(ask_digest.as_deref())
+            .collect();
+        if let Some((replay, matched_digest)) =
+            Self::check_session_commit_replay_in_tx(&tx, allow_request, &accepted, now_ms)?
+        {
+            let replayed_policy = if ask_digest.as_deref() == Some(matched_digest.as_str()) {
+                SessionEffectPolicy::Ask
+            } else {
+                SessionEffectPolicy::Allow
+            };
+            tx.commit()?;
+            return Ok((replay, replayed_policy));
+        }
+        Self::verify_session_lease_in_tx(&tx, &expected_scope, lease, now_ms)?;
+        let Some(ask_req) = ask_request else {
+            let response = Self::commit_session_turn_update_after_lease(
+                tx,
+                allow_request,
+                &allow_digest,
+                lease,
+                now_ms,
+            )?;
+            return Ok((response, SessionEffectPolicy::Allow));
+        };
+        let raw_mode: String = tx
+            .query_row(
+                "SELECT permission_mode FROM sessions WHERE session_id=?1 AND lifecycle <> 'materializing'",
+                [allow_request.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StorageError::SessionNotFound(allow_request.session_id))?;
+        let mode =
+            latte_core::PermissionMode::parse_mode(&raw_mode).map_err(StorageError::InvalidData)?;
+        let effective_policy = match mode {
+            latte_core::PermissionMode::FullAuto => SessionEffectPolicy::Allow,
+            latte_core::PermissionMode::AutoEdit if tool_name != "process" => {
+                SessionEffectPolicy::Allow
+            }
+            latte_core::PermissionMode::Ask | latte_core::PermissionMode::AutoEdit => {
+                SessionEffectPolicy::Ask
+            }
+        };
+        let (chosen_req, chosen_digest) = match effective_policy {
+            SessionEffectPolicy::Allow => (allow_request, allow_digest.as_str()),
+            SessionEffectPolicy::Ask => (
+                ask_req,
+                ask_digest
+                    .as_deref()
+                    .expect("ask_digest computed alongside ask_request"),
+            ),
+        };
+        let response = Self::commit_session_turn_update_after_lease(
+            tx,
+            chosen_req,
+            chosen_digest,
+            lease,
+            now_ms,
+        )?;
+        Ok((response, effective_policy))
+    }
+
+    fn check_session_commit_replay_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        request: &SessionCommitRequest,
+        accepted_digests: &[&str],
+        now_ms: u64,
+    ) -> Result<Option<(SessionCommitResponse, String)>, StorageError> {
         let previous_command: Option<(String, String)> = tx
             .query_row(
                 "SELECT digest,result_json FROM session_command_dedup WHERE command_id=?1",
@@ -4153,27 +4413,69 @@ impl Storage {
             )
             .optional()?;
         if let Some((stored_digest, result)) = previous_command {
-            if stored_digest != digest {
+            if !accepted_digests.contains(&stored_digest.as_str()) {
                 return Err(StorageError::SessionCommandReplayMismatch);
             }
             let replay = serde_json::from_str(&result).map_err(invalid_json)?;
-            tx.commit()?;
-            return Ok(replay);
+            return Ok(Some((replay, stored_digest)));
         }
-        let previous_source: Option<(String, String)> = tx.query_row("SELECT digest,result_json FROM session_commit_sources WHERE session_id=?1 AND source_key=?2",params![request.session_id.to_string(),request.update.source_key()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let previous_source: Option<(String, String)> = tx
+            .query_row(
+                "SELECT digest,result_json FROM session_commit_sources WHERE session_id=?1 AND source_key=?2",
+                params![request.session_id.to_string(), request.update.source_key()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         if let Some((stored_digest, result)) = previous_source {
-            if stored_digest != digest {
+            if !accepted_digests.contains(&stored_digest.as_str()) {
                 return Err(StorageError::SessionCommandReplayMismatch);
             }
             let replay = serde_json::from_str(&result).map_err(invalid_json)?;
-            tx.execute("INSERT INTO session_command_dedup(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",params![request.command_id.to_string(),digest,result,to_i64(now_ms)?])?;
-            tx.commit()?;
-            return Ok(replay);
+            tx.execute(
+                "INSERT INTO session_command_dedup(command_id,digest,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+                params![
+                    request.command_id.to_string(),
+                    &stored_digest,
+                    result,
+                    to_i64(now_ms)?
+                ],
+            )?;
+            return Ok(Some((replay, stored_digest)));
         }
-        let lease_ok: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",params![expected_scope,lease.owner,to_i64(lease.fencing_token)?,to_i64(now_ms)?],|row|row.get(0))?;
+        Ok(None)
+    }
+
+    fn verify_session_lease_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        expected_scope: &str,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let lease_ok: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_lease WHERE scope=?1 AND owner=?2 AND fencing_token=?3 AND expires_at_ms>?4)",
+            params![
+                expected_scope,
+                lease.owner,
+                to_i64(lease.fencing_token)?,
+                to_i64(now_ms)?
+            ],
+            |row| row.get(0),
+        )?;
         if !lease_ok {
             return Err(StorageError::LeaseLost);
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn commit_session_turn_update_after_lease(
+        tx: rusqlite::Transaction<'_>,
+        request: &SessionCommitRequest,
+        digest: &str,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<SessionCommitResponse, StorageError> {
+        let expected_scope = session_lease_scope(request.session_id);
         let (session_revision, last_seq, lifecycle, latest_turn): (i64, i64, String, Option<String>) = tx
             .query_row(
                 "SELECT revision,last_seq,lifecycle,latest_turn_id FROM sessions WHERE session_id=?1",
@@ -14335,6 +14637,8 @@ mod tests {
         let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let other_session = SessionId::from_uuid(ids.next_uuid_v7());
         let other_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let drained_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let drained_turn = TurnId::from_uuid(ids.next_uuid_v7());
         {
             let store = Storage::open(&path).unwrap();
             store
@@ -14359,7 +14663,38 @@ mod tests {
                     2,
                 )
                 .unwrap();
+            store
+                .create_session_v2(
+                    drained_session,
+                    drained_turn,
+                    &session_binding(),
+                    "/workspace",
+                    "drained outbox",
+                    &std::collections::BTreeMap::new(),
+                    3,
+                )
+                .unwrap();
             let conn = store.connection.lock().unwrap();
+            // Simulate a v13 turn whose conversation_outbox was already drained
+            // into JSONL while 2 multi-effect rounds (+ 1 verification effect)
+            // remain in `effects`.
+            conn.execute(
+                "DELETE FROM conversation_outbox WHERE session_id=?1",
+                [drained_session.to_string()],
+            )
+            .unwrap();
+            for effect_id in [
+                format!("session-effect:{drained_turn}:round-alpha:0"),
+                format!("session-effect:{drained_turn}:round-alpha:1"),
+                format!("session-effect:{drained_turn}:round-beta:0"),
+                format!("verify:{drained_turn}:1"),
+            ] {
+                conn.execute(
+                    "INSERT INTO effects(effect_id,turn_id,status,started_at_ms,attempt) VALUES(?1,?2,'observed_success',4,1)",
+                    params![effect_id, drained_turn.to_string()],
+                )
+                .unwrap();
+            }
             // seq 1 is the initial user card created above; lay out a run of
             // 3 tool rounds interleaved with non-round cards.
             let cards: Vec<(u64, TurnId, TranscriptKind, Option<serde_json::Value>)> = vec![
@@ -14453,6 +14788,11 @@ mod tests {
         let reopened = Storage::open(&path).unwrap();
         assert_eq!(reopened.tool_round_count_for_turn(turn_id).unwrap(), 3);
         assert_eq!(reopened.tool_round_count_for_turn(other_turn).unwrap(), 1);
+        assert_eq!(
+            reopened.tool_round_count_for_turn(drained_turn).unwrap(),
+            2,
+            "schema 14 migration must backfill tool_round_count from distinct non-verify effect rounds when outbox is empty"
+        );
         let version: i64 = reopened
             .connection
             .lock()

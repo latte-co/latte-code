@@ -16,6 +16,8 @@ pub(crate) enum PathError {
     Escape,
     #[error("symbolic links are forbidden for mutations: {0}")]
     Symlink(String),
+    #[error("protected VCS metadata path cannot be modified: {0}")]
+    Protected(String),
     #[error("path does not exist: {0}")]
     Missing(String),
     #[error("filesystem operation failed: {0}")]
@@ -36,6 +38,16 @@ pub(crate) struct FileIdentity {
     pub hash: String,
     pub size: u64,
     pub modified_ns: u128,
+}
+
+pub(crate) fn is_protected_vcs_component(name: &str) -> bool {
+    if name.eq_ignore_ascii_case(".git") {
+        return true;
+    }
+    if name.len() > 4 && name[..4].eq_ignore_ascii_case("git~") {
+        return name[4..].bytes().all(|b| b.is_ascii_digit());
+    }
+    false
 }
 
 impl WorkspacePath {
@@ -101,6 +113,13 @@ impl WorkspacePath {
             .strip_prefix(&self.root)
             .map_err(|_| PathError::Escape)?;
         let parts = relative.components().collect::<Vec<_>>();
+        if parts.first().is_some_and(|part| {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(is_protected_vcs_component)
+        }) {
+            return Err(PathError::Protected(self.display(input)?));
+        }
         let mut cursor = self.root.clone();
         for (index, part) in parts.iter().enumerate() {
             cursor.push(part.as_os_str());
@@ -272,5 +291,46 @@ mod tests {
             workspace.mutation("nested/deep/script.sh/child.txt", true),
             Err(PathError::Invalid)
         ));
+    }
+
+    #[test]
+    fn mutation_rejects_protected_git_paths_while_allowing_dotgithub_and_gitignore() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/config"), "[core]\n").unwrap();
+        let workspace = WorkspacePath::new(root.path()).unwrap();
+
+        for forbidden in [
+            ".git",
+            ".git/config",
+            "./.git/hooks/pre-commit",
+            ".GIT/config",
+            "GIT~1/config",
+            "git~2/HEAD",
+        ] {
+            assert!(
+                matches!(
+                    workspace.mutation(forbidden, true),
+                    Err(PathError::Protected(_))
+                ),
+                "expected Protected for {forbidden}"
+            );
+            assert!(
+                matches!(
+                    workspace.atomic_replace(forbidden, b"pwned", true),
+                    Err(PathError::Protected(_))
+                ),
+                "expected atomic_replace Protected for {forbidden}"
+            );
+        }
+
+        workspace
+            .atomic_replace(".gitignore", b"target/\n", true)
+            .unwrap();
+        workspace
+            .atomic_replace(".github/workflows/ci.yml", b"name: ci\n", true)
+            .unwrap();
+        assert!(root.path().join(".gitignore").is_file());
+        assert!(root.path().join(".github/workflows/ci.yml").is_file());
     }
 }

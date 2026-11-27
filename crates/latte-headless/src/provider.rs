@@ -555,6 +555,7 @@ fn wire_message(message: &Message) -> Result<WireRequestMessage<'_>, ProviderErr
 }
 impl Provider for OpenAiProvider {
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
         let this = self.clone();
         Box::pin(async move {
@@ -820,17 +821,28 @@ where
         let status = response.status().as_u16();
         if !response.status().is_success() && is_retryable_status(status) && attempt < max_attempts
         {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after = parse_retry_after(response.headers());
             retry_pause(context, attempt, retry_after).await?;
             continue;
         }
         return Ok(response);
     }
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(ms));
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|&secs| secs.is_finite() && secs >= 0.0)
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
 }
 
 async fn send_json_once(
@@ -1227,16 +1239,24 @@ fn consume_sse_event(
     }
     Ok(false)
 }
+#[allow(clippy::duration_suboptimal_units)]
 async fn retry_pause(
     context: &ProviderContext,
     attempt: u32,
     retry_after: Option<Duration>,
 ) -> Result<(), ProviderError> {
-    let exponential =
-        Duration::from_millis(100_u64.saturating_mul(1_u64 << attempt.saturating_sub(1).min(4)));
-    let delay = retry_after
-        .unwrap_or(exponential)
-        .min(Duration::from_secs(2));
+    let delay = if let Some(server_delay) = retry_after {
+        server_delay.min(Duration::from_secs(60))
+    } else {
+        let base_ms = 100_u64
+            .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+            .min(2_000);
+        let jitter_cap = (base_ms / 4).max(1);
+        let entropy = uuid::Uuid::now_v7().into_bytes();
+        let rand_u16 = u64::from(u16::from_le_bytes([entropy[14], entropy[15]]));
+        let jitter_ms = rand_u16 % (jitter_cap + 1);
+        Duration::from_millis(base_ms.saturating_add(jitter_ms))
+    };
     if Instant::now()
         .checked_add(delay)
         .is_none_or(|wake| wake >= context.deadline)
@@ -1277,6 +1297,7 @@ pub struct AnthropicProvider {
     reasoning_effort: Option<String>,
     streaming: bool,
     prompt_caching: bool,
+    bearer_auth: bool,
     headers: std::collections::BTreeMap<String, String>,
 }
 
@@ -1304,6 +1325,7 @@ impl AnthropicProvider {
             reasoning_effort: None,
             streaming: true,
             prompt_caching: true,
+            bearer_auth: false,
             headers: std::collections::BTreeMap::new(),
         })
     }
@@ -1354,6 +1376,12 @@ impl AnthropicProvider {
         self
     }
 
+    #[must_use]
+    pub fn with_bearer_auth(mut self, enabled: bool) -> Self {
+        self.bearer_auth = enabled;
+        self
+    }
+
     fn request_builder(
         &self,
         session_ref: &str,
@@ -1362,9 +1390,12 @@ impl AnthropicProvider {
         let mut builder = self
             .client
             .post(&self.endpoint)
-            .header("x-api-key", &self.api_key)
-            .bearer_auth(&self.api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION);
+        builder = if self.bearer_auth {
+            builder.bearer_auth(&self.api_key)
+        } else {
+            builder.header("x-api-key", &self.api_key)
+        };
         if thinking_enabled
             && !self
                 .headers
@@ -1500,7 +1531,6 @@ fn build_anthropic_payload(
                 ..
             } => {
                 let mut blocks = Vec::<Value>::new();
-                let mut has_valid_thinking = false;
                 let mut had_unsigned_thinking = false;
                 for block in thinking_blocks {
                     match block {
@@ -1508,7 +1538,6 @@ fn build_anthropic_payload(
                             thinking,
                             signature: Some(sig),
                         } if !sig.is_empty() => {
-                            has_valid_thinking = true;
                             blocks.push(serde_json::json!({
                                 "type": "thinking",
                                 "thinking": thinking,
@@ -1516,26 +1545,19 @@ fn build_anthropic_payload(
                             }));
                         }
                         ThinkingBlock::RedactedThinking { data } if !data.is_empty() => {
-                            has_valid_thinking = true;
                             blocks.push(serde_json::json!({
                                 "type": "redacted_thinking",
                                 "data": data,
                             }));
                         }
-                        ThinkingBlock::Thinking { .. } => {
+                        ThinkingBlock::Thinking { .. } | ThinkingBlock::RedactedThinking { .. } => {
                             had_unsigned_thinking = true;
                         }
-                        ThinkingBlock::RedactedThinking { .. } => {}
                     }
                 }
                 let in_open_continuation =
                     last_plain_user_idx.is_none_or(|user_idx| msg_idx > user_idx);
-                if thinking_budget.is_some()
-                    && in_open_continuation
-                    && !tool_calls.is_empty()
-                    && had_unsigned_thinking
-                    && !has_valid_thinking
-                {
+                if in_open_continuation && !tool_calls.is_empty() && had_unsigned_thinking {
                     return Err(ProviderError::Malformed(
                         "signed thinking block could not be replayed verbatim after transcript secret redaction"
                             .into(),
@@ -1656,6 +1678,7 @@ fn build_anthropic_payload(
 }
 
 impl Provider for AnthropicProvider {
+    #[allow(clippy::too_many_lines)]
     fn complete(&self, request: ProviderRequest, context: ProviderContext) -> ProviderFuture<'_> {
         let this = self.clone();
         Box::pin(async move {
@@ -1663,56 +1686,109 @@ impl Provider for AnthropicProvider {
                 return Err(ProviderError::Cancelled);
             }
             let (body, thinking_enabled) = build_anthropic_payload(&this, &request)?;
-            let response =
-                send_json_with_retries(&body, this.timeout, this.max_attempts, &context, || {
-                    this.request_builder(&request.session_ref, thinking_enabled)
-                })
-                .await?;
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let request_id = extract_request_id(response.headers());
-                let error_body = tokio::time::timeout(this.timeout, response.bytes())
-                    .await
-                    .map_err(|_| ProviderError::Timeout)?
-                    .map_err(|error| ProviderError::Transport(error.to_string()))?;
-                if this.streaming
-                    && matches!(status, 400 | 404 | 415 | 422)
-                    && error_body.is_empty()
-                {
-                    let mut inline_body = body;
-                    if let Some(obj) = inline_body.as_object_mut() {
-                        obj.remove("stream");
-                    }
-                    let fallback = send_json_once(
-                        &inline_body,
-                        this.timeout,
-                        &context,
-                        this.request_builder(&request.session_ref, thinking_enabled),
-                    )
-                    .await?;
-                    let wire: AnthropicWireMessage =
-                        tokio::time::timeout(this.timeout, fallback.json())
-                            .await
-                            .map_err(|_| ProviderError::Timeout)?
-                            .map_err(|error| ProviderError::Malformed(error.to_string()))?;
-                    return decode_anthropic_message(wire);
+            let mut attempt = 1_u32;
+            loop {
+                if context.cancellation.is_cancelled() {
+                    return Err(ProviderError::Cancelled);
                 }
-                return Err(classify_http_error(status, request_id, &error_body));
+                emit_provider_event(&context, ProviderEvent::Attempt { number: attempt });
+                let remaining = context
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(this.timeout);
+                if remaining.is_zero() {
+                    return Err(ProviderError::Timeout);
+                }
+                let sent = tokio::time::timeout(
+                    remaining,
+                    this.request_builder(&request.session_ref, thinking_enabled)
+                        .json(&body)
+                        .send(),
+                )
+                .await;
+                let response = match sent {
+                    Err(_) => return Err(ProviderError::Timeout),
+                    Ok(Err(error)) if error.is_connect() && attempt < this.max_attempts => {
+                        retry_pause(&context, attempt, None).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(if error.is_timeout() {
+                            ProviderError::Timeout
+                        } else {
+                            ProviderError::Transport(error.to_string())
+                        });
+                    }
+                    Ok(Ok(response)) => response,
+                };
+                if !response.status().is_success() {
+                    let status = response.status().as_u16();
+                    if is_retryable_status(status) && attempt < this.max_attempts {
+                        let retry_after = parse_retry_after(response.headers());
+                        retry_pause(&context, attempt, retry_after).await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    let request_id = extract_request_id(response.headers());
+                    let error_body = tokio::time::timeout(this.timeout, response.bytes())
+                        .await
+                        .map_err(|_| ProviderError::Timeout)?
+                        .map_err(|error| ProviderError::Transport(error.to_string()))?;
+                    if this.streaming
+                        && matches!(status, 400 | 404 | 415 | 422)
+                        && error_body.is_empty()
+                    {
+                        let mut inline_body = body;
+                        if let Some(obj) = inline_body.as_object_mut() {
+                            obj.remove("stream");
+                        }
+                        let fallback = send_json_once(
+                            &inline_body,
+                            this.timeout,
+                            &context,
+                            this.request_builder(&request.session_ref, thinking_enabled),
+                        )
+                        .await?;
+                        let wire: AnthropicWireMessage =
+                            tokio::time::timeout(this.timeout, fallback.json())
+                                .await
+                                .map_err(|_| ProviderError::Timeout)?
+                                .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+                        return decode_anthropic_message(wire);
+                    }
+                    return Err(classify_http_error(status, request_id, &error_body));
+                }
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if this.streaming && content_type.contains("text/event-stream") {
+                    let mut emitted_delta = false;
+                    match parse_anthropic_sse(response, this.timeout, &context, &mut emitted_delta)
+                        .await
+                    {
+                        Err(ProviderError::Http {
+                            status: 529,
+                            retryable: true,
+                            ..
+                        }) if !emitted_delta && attempt < this.max_attempts => {
+                            retry_pause(&context, attempt, None).await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        other => return other,
+                    }
+                }
+                let wire: AnthropicWireMessage =
+                    tokio::time::timeout(this.timeout, response.json())
+                        .await
+                        .map_err(|_| ProviderError::Timeout)?
+                        .map_err(|error| ProviderError::Malformed(error.to_string()))?;
+                return decode_anthropic_message(wire);
             }
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if this.streaming && content_type.contains("text/event-stream") {
-                return parse_anthropic_sse(response, this.timeout, &context).await;
-            }
-            let wire: AnthropicWireMessage = tokio::time::timeout(this.timeout, response.json())
-                .await
-                .map_err(|_| ProviderError::Timeout)?
-                .map_err(|error| ProviderError::Malformed(error.to_string()))?;
-            decode_anthropic_message(wire)
         })
     }
 
@@ -1813,7 +1889,7 @@ fn anthropic_finish_reason(reason: String) -> FinishReason {
     match reason.as_str() {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
         "tool_use" => FinishReason::ToolCalls,
-        "max_tokens" => FinishReason::Length,
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
         "refusal" => FinishReason::ContentFilter,
         _ => FinishReason::Other(reason),
     }
@@ -1923,18 +1999,22 @@ struct AnthropicStreamAssembly {
     stop_reason: Option<String>,
     usage: AnthropicWireUsage,
     saw_start: bool,
+    emitted_delta: bool,
 }
 
 async fn parse_anthropic_sse(
     response: reqwest::Response,
     idle_timeout: Duration,
     context: &ProviderContext,
+    emitted_delta_out: &mut bool,
 ) -> Result<ProviderResponse, ProviderError> {
     let mut assembly = AnthropicStreamAssembly::default();
-    let done = stream_sse_events(response, idle_timeout, context, |data, ctx| {
+    let stream_res = stream_sse_events(response, idle_timeout, context, |data, ctx| {
         consume_anthropic_sse_event(data, &mut assembly, ctx)
     })
-    .await?;
+    .await;
+    *emitted_delta_out = assembly.emitted_delta;
+    let done = stream_res?;
     if !done || !assembly.saw_start {
         return Err(ProviderError::Malformed(
             "Anthropic SSE stream ended without message_stop".into(),
@@ -2080,6 +2160,7 @@ fn consume_anthropic_sse_event(
                 "text" => {
                     let initial = block.text.unwrap_or_default();
                     if !initial.is_empty() {
+                        assembly.emitted_delta = true;
                         emit_provider_event(
                             context,
                             ProviderEvent::AssistantDelta {
@@ -2143,6 +2224,7 @@ fn consume_anthropic_sse_event(
                                 "stream assistant content exceeds limit".into(),
                             ));
                         }
+                        assembly.emitted_delta = true;
                         emit_provider_event(
                             context,
                             ProviderEvent::AssistantDelta {
@@ -4344,7 +4426,10 @@ mod tests {
 
         let raw_req = hdr_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(raw_req.contains("x-api-key: cpk-test-token"));
-        assert!(raw_req.contains("authorization: bearer cpk-test-token"));
+        assert!(
+            !raw_req.contains("authorization:"),
+            "default Anthropic auth must send only x-api-key without conflicting Authorization header: {raw_req}"
+        );
         assert!(raw_req.contains("anthropic-version: 2023-06-01"));
         assert!(raw_req.contains("anthropic-beta: interleaved-thinking-2025-05-14"));
 
@@ -4662,12 +4747,27 @@ mod tests {
                     session_ref: "s1".into(),
                     tools: vec![],
                     messages: vec![
+                        Message::User {
+                            content: "prior".into(),
+                        },
+                        Message::Assistant {
+                            content: Some("prior done".into()),
+                            reasoning_content: None,
+                            thinking_blocks: vec![ThinkingBlock::Thinking {
+                                thinking: "unsigned-historical".into(),
+                                signature: None,
+                            }],
+                            tool_calls: vec![],
+                        },
+                        Message::User {
+                            content: "current".into(),
+                        },
                         Message::Assistant {
                             content: None,
                             reasoning_content: None,
                             thinking_blocks: vec![ThinkingBlock::Thinking {
-                                thinking: "unsigned".into(),
-                                signature: None,
+                                thinking: "signed-open".into(),
+                                signature: Some("sig_open_ok".into()),
                             }],
                             tool_calls: vec![ToolCall {
                                 id: overlong.clone(),
@@ -5047,6 +5147,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn anthropic_payload_rejects_unsigned_thinking_only_on_open_tool_continuations() {
         let prov = AnthropicProvider::new(
             "http://127.0.0.1:9/v1/messages",
@@ -5094,6 +5195,83 @@ mod tests {
             "{open_err:?}"
         );
 
+        // Mixed signed + unsigned thinking in an open tool continuation MUST fail closed
+        // even when one valid signed block is present and even if reasoning_effort is off!
+        let plain_prov = AnthropicProvider::new(
+            "http://127.0.0.1:9/v1/messages",
+            "m",
+            "k",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        for blocks in [
+            vec![
+                ThinkingBlock::Thinking {
+                    thinking: "valid".into(),
+                    signature: Some("sig_ok".into()),
+                },
+                ThinkingBlock::Thinking {
+                    thinking: "[REDACTED]".into(),
+                    signature: None,
+                },
+            ],
+            vec![
+                ThinkingBlock::Thinking {
+                    thinking: "valid".into(),
+                    signature: Some("sig_ok".into()),
+                },
+                ThinkingBlock::RedactedThinking {
+                    data: String::new(),
+                },
+            ],
+        ] {
+            let mixed_err = build_anthropic_payload(
+                &plain_prov,
+                &ProviderRequest {
+                    session_ref: "s".into(),
+                    tools: vec![],
+                    messages: vec![
+                        Message::User {
+                            content: "do work".into(),
+                        },
+                        Message::Assistant {
+                            content: None,
+                            reasoning_content: None,
+                            thinking_blocks: blocks,
+                            tool_calls: vec![ToolCall {
+                                id: "call_1".into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({"file_path":"a.txt"}),
+                            }],
+                        },
+                        Message::Tool {
+                            tool_call_id: "call_1".into(),
+                            name: Some("Read".into()),
+                            content: "hello".into(),
+                        },
+                    ],
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(mixed_err, ProviderError::Malformed(_)),
+                "mixed signed+unsigned thinking must fail closed: {mixed_err:?}"
+            );
+        }
+
+        // `model_context_window_exceeded` maps to `FinishReason::Length`.
+        assert_eq!(
+            anthropic_finish_reason("model_context_window_exceeded".into()),
+            FinishReason::Length
+        );
+
+        // `parse_retry_after` honors Retry-After > 2s and retry-after-ms without 2s clamping.
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        hdrs.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(parse_retry_after(&hdrs), Some(Duration::from_secs(5)));
+        hdrs.insert("retry-after-ms", "2500".parse().unwrap());
+        assert_eq!(parse_retry_after(&hdrs), Some(Duration::from_millis(2500)));
+
         // Historical completed turn with unsigned thinking followed by a final Assistant turn succeeds.
         assert!(
             build_anthropic_payload(
@@ -5137,5 +5315,122 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn anthropic_bearer_auth_mode_retry_after_over_2s_and_pre_delta_sse_overloaded_retry() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hdr_tx, hdr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Attempt 1: 429 with Retry-After: 3 where deadline is 1s -> must fail immediately with Timeout
+            // (proving Retry-After > 2s is NOT clamped down to 2s or ignored!).
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let _ = hdr_tx.send(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+            // Attempt 2: SSE stream returning `overloaded_error` BEFORE any text delta -> retried!
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let sse_err = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse_err.len(),
+                    sse_err
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+            // Attempt 3: SSE stream succeeds!
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let sse_ok = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                    "event: content_block_start\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"recovered!\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse_ok.len(),
+                    sse_ok
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let prov = AnthropicProvider::new(
+            format!("http://{addr}/v1/messages"),
+            "claude-sonnet-4-5",
+            "bearer-only-secret",
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .with_bearer_auth(true)
+        .with_max_attempts(3);
+
+        // 1. Short deadline (1.5s) vs `Retry-After: 3` -> fails with Timeout without clamping 3s to 2s!
+        let short_err = prov
+            .complete(
+                ProviderRequest {
+                    session_ref: "s1".into(),
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_millis(1500),
+                    cancellation: latte_engine::CancellationToken::new(),
+                    events: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(short_err, ProviderError::Timeout), "{short_err:?}");
+        let raw_hdr = hdr_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(raw_hdr.contains("authorization: bearer bearer-only-secret"));
+        assert!(
+            !raw_hdr.contains("x-api-key:"),
+            "bearer_auth mode must send only Authorization header: {raw_hdr}"
+        );
+
+        // 2. Pre-delta SSE `overloaded_error` retries within `max_attempts` and succeeds on the next attempt!
+        let ok_resp = prov
+            .complete(
+                ProviderRequest {
+                    session_ref: "s2".into(),
+                    messages: vec![Message::User {
+                        content: "hi".into(),
+                    }],
+                    tools: vec![],
+                },
+                ProviderContext {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cancellation: latte_engine::CancellationToken::new(),
+                    events: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.message.as_deref(), Some("recovered!"));
     }
 }

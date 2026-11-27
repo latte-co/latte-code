@@ -131,14 +131,246 @@ impl CancellationToken {
 
 fn is_catastrophic_shell_text(shell: &str) -> bool {
     let lower = shell.to_ascii_lowercase();
-    lower.contains("rm -rf /")
-        || lower.contains("rm -fr /")
-        || lower.contains("--no-preserve-root")
-        || lower.contains(":(){")
-        || lower.contains("mkfs")
+    if lower.contains("--no-preserve-root") || lower.contains(":(){") {
+        return true;
+    }
+    for segment in split_shell_command_segments(shell) {
+        let tokens = tokenize_shell_words(&segment);
+        let unwrapped = unwrap_command_wrappers(&tokens);
+        if !unwrapped.is_empty() && is_catastrophic_argv(&unwrapped) {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_shell_command_segments(shell: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = shell.chars().collect();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && !in_single && i + 1 < chars.len() {
+            current.push(ch);
+            current.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        // Extract `$(...)` and `` `...` `` command substitutions even inside double quotes!
+        if !in_single && ch == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            let mut inner = String::new();
+            while j < chars.len() && depth > 0 {
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                inner.push(chars[j]);
+                j += 1;
+            }
+            segments.extend(split_shell_command_segments(&inner));
+            i = (j + 1).min(chars.len());
+            continue;
+        }
+        if !in_single && ch == '`' {
+            let mut j = i + 1;
+            let mut inner = String::new();
+            while j < chars.len() && chars[j] != '`' {
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    inner.push(chars[j + 1]);
+                    j += 2;
+                } else {
+                    inner.push(chars[j]);
+                    j += 1;
+                }
+            }
+            segments.extend(split_shell_command_segments(&inner));
+            i = (j + 1).min(chars.len());
+            continue;
+        }
+        if !in_single && !in_double && matches!(ch, ';' | '|' | '&' | '\n' | '\r' | '(' | ')') {
+            if current.trim().is_empty() {
+                current.clear();
+            } else {
+                segments.push(std::mem::take(&mut current));
+            }
+            i += 1;
+            continue;
+        }
+        current.push(ch);
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn tokenize_shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut active = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let chars: Vec<char> = segment.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && !in_single && i + 1 < chars.len() {
+            word.push(chars[i + 1]);
+            active = true;
+            i += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            active = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            active = true;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch.is_ascii_whitespace() {
+            if active {
+                words.push(std::mem::take(&mut word));
+                active = false;
+            }
+            i += 1;
+            continue;
+        }
+        word.push(ch);
+        active = true;
+        i += 1;
+    }
+    if active {
+        words.push(word);
+    }
+    words
+}
+
+fn unwrap_command_wrappers(tokens: &[String]) -> Vec<String> {
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        // Skip leading `VAR=value` assignments.
+        if !tok.starts_with('-')
+            && let Some((lhs, _)) = tok.split_once('=')
+            && !lhs.is_empty()
+            && lhs.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            idx += 1;
+            continue;
+        }
+        let base = std::path::Path::new(tok)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(tok.as_str())
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "sudo" => {
+                idx += 1;
+                while idx < tokens.len() {
+                    let flag = tokens[idx].as_str();
+                    if flag == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if matches!(
+                        flag,
+                        "-u" | "-g"
+                            | "-C"
+                            | "-D"
+                            | "-h"
+                            | "-p"
+                            | "-R"
+                            | "-T"
+                            | "-U"
+                            | "--user"
+                            | "--group"
+                            | "--chdir"
+                            | "--host"
+                            | "--prompt"
+                    ) {
+                        idx = (idx + 2).min(tokens.len());
+                    } else if flag.starts_with('-') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "env" => {
+                idx += 1;
+                while idx < tokens.len() {
+                    let flag = tokens[idx].as_str();
+                    if flag == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if matches!(flag, "-u" | "-C" | "--unset" | "--chdir") {
+                        idx = (idx + 2).min(tokens.len());
+                    } else if flag.starts_with('-') || flag.contains('=') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                idx += 1;
+                if idx < tokens.len() && matches!(tokens[idx].as_str(), "-n" | "--adjustment") {
+                    idx = (idx + 2).min(tokens.len());
+                } else if idx < tokens.len() && tokens[idx].starts_with('-') {
+                    idx += 1;
+                }
+            }
+            "command" | "nohup" | "exec" | "time" => {
+                idx += 1;
+                while idx < tokens.len() && tokens[idx].starts_with('-') {
+                    let is_end = tokens[idx] == "--";
+                    idx += 1;
+                    if is_end {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    tokens[idx..].to_vec()
 }
 
 fn is_catastrophic_argv(argv: &[String]) -> bool {
+    let unwrapped = unwrap_command_wrappers(argv);
+    let argv = if unwrapped.is_empty() {
+        return argv.is_empty();
+    } else {
+        unwrapped.as_slice()
+    };
     let Some(first) = argv.first() else {
         return true;
     };
@@ -148,6 +380,14 @@ fn is_catastrophic_argv(argv: &[String]) -> bool {
         .unwrap_or(first.as_str())
         .to_ascii_lowercase();
     if prog == "mkfs" || prog.starts_with("mkfs.") {
+        return true;
+    }
+    if prog == "dd"
+        && argv[1..].iter().any(|arg| {
+            arg.to_ascii_lowercase().starts_with("of=/dev/")
+                && !arg.to_ascii_lowercase().starts_with("of=/dev/null")
+        })
+    {
         return true;
     }
     if matches!(prog.as_str(), "sh" | "bash" | "zsh") {
@@ -166,7 +406,6 @@ fn is_catastrophic_argv(argv: &[String]) -> bool {
     }
     if prog == "rm" {
         let mut recursive = false;
-        let mut force = false;
         let mut no_preserve_root = false;
         let mut targets_root = false;
         let mut after_double_dash = false;
@@ -178,7 +417,6 @@ fn is_catastrophic_argv(argv: &[String]) -> bool {
             if !after_double_dash && let Some(long) = arg.strip_prefix("--") {
                 match long {
                     "recursive" => recursive = true,
-                    "force" => force = true,
                     "no-preserve-root" => no_preserve_root = true,
                     _ => {}
                 }
@@ -186,20 +424,31 @@ fn is_catastrophic_argv(argv: &[String]) -> bool {
             }
             if !after_double_dash && arg.starts_with('-') && arg.len() > 1 {
                 for ch in arg[1..].chars() {
-                    match ch {
-                        'r' | 'R' => recursive = true,
-                        'f' => force = true,
-                        _ => {}
+                    if matches!(ch, 'r' | 'R') {
+                        recursive = true;
                     }
                 }
                 continue;
             }
             let trimmed = arg.trim_end_matches('/');
-            if arg == "/" || arg == "/*" || trimmed.is_empty() {
+            if matches!(
+                arg.as_str(),
+                "/" | "/*"
+                    | "/."
+                    | "/.."
+                    | "~"
+                    | "~/*"
+                    | "$HOME"
+                    | "$HOME/*"
+                    | "${HOME}"
+                    | "${HOME}/*"
+            ) || trimmed.is_empty()
+                || trimmed == "/*"
+            {
                 targets_root = true;
             }
         }
-        if no_preserve_root || (recursive && force && targets_root) {
+        if no_preserve_root || (recursive && targets_root) {
             return true;
         }
     }
@@ -224,19 +473,10 @@ fn is_safe_readonly_git(argv: &[String]) -> bool {
     {
         return false;
     }
-    // Reject any leading `git -c ...` or `--git-dir` / `--work-tree` overrides.
+    // Reject any leading `git -c ...` or `--git-dir` / `--work-tree` overrides,
+    // and never auto-allow `git status` (which refreshes `.git/index` and can
+    // execute repository-configured clean/process filters).
     match argv[1].as_str() {
-        "status" => argv[2..].iter().all(|arg| {
-            matches!(
-                arg.as_str(),
-                "-s" | "--short"
-                    | "-b"
-                    | "--branch"
-                    | "--porcelain"
-                    | "-u"
-                    | "--untracked-files=no"
-            )
-        }),
         "branch" => argv[2..] == ["--show-current"],
         "rev-parse" => {
             argv.len() == 3 && matches!(argv[2].as_str(), "HEAD" | "--abbrev-ref" | "--short")
@@ -829,6 +1069,11 @@ fn resolve_git_binary() -> &'static str {
     resolve_trusted_git_binary().unwrap_or("git")
 }
 
+fn complete_nul_entries(raw: &str) -> impl Iterator<Item = &str> {
+    let complete = raw.rfind('\0').map_or("", |pos| &raw[..pos]);
+    complete.split('\0').filter(|entry| !entry.is_empty())
+}
+
 pub(crate) fn supervise_git_diff(
     cwd: &std::path::Path,
     cap: usize,
@@ -848,7 +1093,7 @@ pub(crate) fn supervise_git_diff(
     };
     let mut allowed_paths = Vec::new();
     let mut path_cap_hit = paths_truncated;
-    for path in raw_paths.split('\0').filter(|entry| !entry.is_empty()) {
+    for path in complete_nul_entries(&raw_paths) {
         if !allow_path(path) {
             continue;
         }
@@ -874,9 +1119,8 @@ pub(crate) fn supervise_git_diff(
         && let Ok((untracked, untracked_truncated)) =
             supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::UntrackedZ)
     {
-        let files: Vec<&str> = untracked
-            .split('\0')
-            .filter(|entry| !entry.is_empty() && allow_path(entry))
+        let files: Vec<&str> = complete_nul_entries(&untracked)
+            .filter(|entry| allow_path(entry))
             .collect();
         if !files.is_empty() {
             if !diff.is_empty() && !diff.ends_with('\n') {
@@ -967,7 +1211,7 @@ fn supervise_git(
                         "HEAD".into(),
                         "--".into(),
                     ]);
-                    argv.extend(paths);
+                    argv.extend(paths.into_iter().map(|path| format!(":(literal){path}")));
                 }
                 GitQuery::UnifiedDiffIndexPaths(paths) => {
                     argv.extend([
@@ -977,7 +1221,7 @@ fn supervise_git(
                         "--no-textconv".into(),
                         "--".into(),
                     ]);
-                    argv.extend(paths);
+                    argv.extend(paths.into_iter().map(|path| format!(":(literal){path}")));
                 }
                 GitQuery::TrackedPathsZ => argv.extend([
                     "diff".into(),
@@ -1525,7 +1769,6 @@ mod tests {
             ProcessDecision::Ask
         );
         for allowed_ro in [
-            vec!["git".into(), "status".into(), "--short".into()],
             vec!["git".into(), "branch".into(), "--show-current".into()],
             vec!["git".into(), "rev-parse".into(), "HEAD".into()],
             vec!["ls".into(), "-la".into(), "src".into()],
@@ -1538,6 +1781,7 @@ mod tests {
         for gated_git in [
             vec!["git".into()],
             vec!["git".into(), "commit".into(), "-m".into(), "x".into()],
+            vec!["git".into(), "status".into(), "--short".into()],
             vec!["git".into(), "status".into(), "--ignored=matching".into()],
             vec!["ls".into(), "/etc".into()],
         ] {
@@ -2469,15 +2713,154 @@ mod tests {
             lease_owner: "o",
             lease_token: 1,
         };
-        assert_eq!(classify(&inv), ProcessDecision::Allow);
-        let out = supervise(&inv, dir.path(), &CancellationToken::new(), None)
+        assert_eq!(
+            classify(&inv),
+            ProcessDecision::Ask,
+            "git status can trigger clean/smudge filters via .gitattributes and must require approval"
+        );
+        assert!(!is_readonly_process_input(
+            &serde_json::json!({"argv":["git","status","--short"]})
+        ));
+        let ro_argv = vec!["git".to_owned(), "rev-parse".to_owned(), "HEAD".to_owned()];
+        let ro_inv = ProcessInvocation {
+            argv: &ro_argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 5_000,
+            grace_ms: 100,
+            stdout_cap: 16_384,
+            stderr_cap: 16_384,
+            turn_revision: 1,
+            effect_id: "git-rev-parse-safe",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "o",
+            lease_token: 1,
+        };
+        assert_eq!(classify(&ro_inv), ProcessDecision::Allow);
+        let out = supervise(&ro_inv, dir.path(), &CancellationToken::new(), None)
             .await
             .unwrap();
         assert!(out.command_succeeded(), "{out:?}");
-        assert!(out.stdout.contains("tracked.txt"), "{out:?}");
+        assert_eq!(out.stdout.trim().len(), 40, "{out:?}");
         assert!(
             !marker.exists(),
-            "auto-allowed git status must never execute repo core.fsmonitor"
+            "auto-allowed readonly git must never execute repo core.fsmonitor"
+        );
+    }
+
+    #[test]
+    fn catastrophic_shell_classifier_catches_split_flags_wrappers_and_subshells() {
+        let env = BTreeMap::new();
+        for dangerous in [
+            "rm -r -f /*",
+            "rm --recursive --force /",
+            "rm   -rf   /",
+            "sudo rm -rf /",
+            "sudo -u root rm -f -r /*",
+            "env FOO=1 command rm -rf /",
+            "(rm -rf /)",
+            "echo ok && $(rm -r -f /)",
+            "echo `mkfs.ext4 /dev/sda`",
+            "nohup dd of=/dev/sda if=/dev/zero",
+        ] {
+            let inv = ProcessInvocation {
+                argv: &[],
+                shell: Some(dangerous),
+                cwd: ".",
+                env: &env,
+                timeout_ms: 1_000,
+                grace_ms: 100,
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                turn_revision: 1,
+                effect_id: "catastrophic-shell",
+                attempt: 1,
+                approval_digest: None,
+                lease_owner: "o",
+                lease_token: 1,
+            };
+            assert_eq!(
+                classify(&inv),
+                ProcessDecision::Deny,
+                "expected Deny for shell command: {dangerous}"
+            );
+        }
+
+        for ask_only in [
+            "rm -rf target",
+            "echo 'rm -rf /' > note.txt",
+            "git status --short",
+        ] {
+            let inv = ProcessInvocation {
+                argv: &[],
+                shell: Some(ask_only),
+                cwd: ".",
+                env: &env,
+                timeout_ms: 1_000,
+                grace_ms: 100,
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                turn_revision: 1,
+                effect_id: "ask-shell",
+                attempt: 1,
+                approval_digest: None,
+                lease_owner: "o",
+                lease_token: 1,
+            };
+            assert_eq!(
+                classify(&inv),
+                ProcessDecision::Ask,
+                "expected Ask for shell command: {ask_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_treats_glob_named_files_literally_and_drops_truncated_nul_tail() {
+        let entries: Vec<&str> = complete_nul_entries("a.rs\0b.rs\0partial_tail").collect();
+        assert_eq!(entries, vec!["a.rs", "b.rs"]);
+        assert!(complete_nul_entries("unterminated_only").next().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("*"), "star-v1\n").unwrap();
+        std::fs::write(dir.path().join(".latte/state.txt"), "latte-v1\n").unwrap();
+        std::fs::write(dir.path().join("target/out.txt"), "target-v1\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "-f", "*", ".latte/state.txt", "target/out.txt"],
+            vec!["commit", "-qm", "init"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        std::fs::write(dir.path().join("*"), "star-v2\n").unwrap();
+        std::fs::write(dir.path().join(".latte/state.txt"), "LATTE_INTERNAL_DIFF\n").unwrap();
+        std::fs::write(dir.path().join("target/out.txt"), "TARGET_BUILD_DIFF\n").unwrap();
+
+        let (diff, truncated) = supervise_git_diff(dir.path(), 65_536, |_| true).unwrap();
+        assert!(!truncated);
+        assert!(diff.contains("star-v2"), "{diff}");
+        assert!(
+            !diff.contains("LATTE_INTERNAL_DIFF"),
+            "literal pathspec must prevent '*' from expanding into .latte/: {diff}"
+        );
+        assert!(
+            !diff.contains("TARGET_BUILD_DIFF"),
+            "literal pathspec must prevent '*' from expanding into target/: {diff}"
         );
     }
 }

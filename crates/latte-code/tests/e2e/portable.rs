@@ -14333,7 +14333,10 @@ fn final_binary_anthropic_messages_streams_thinking_claude_tools_and_warm_prefix
     assert!(calls[0].0.starts_with("POST /v1/messages "));
     let hdr0 = calls[0].1.to_ascii_lowercase();
     assert!(hdr0.contains("x-api-key: cpk-e2e-token"));
-    assert!(hdr0.contains("authorization: bearer cpk-e2e-token"));
+    assert!(
+        !hdr0.contains("authorization:"),
+        "default Anthropic auth must send only x-api-key: {hdr0}"
+    );
     assert!(hdr0.contains("anthropic-version: 2023-06-01"));
     assert!(hdr0.contains("anthropic-beta: interleaved-thinking-2025-05-14"));
 
@@ -15322,7 +15325,11 @@ fn final_binary_anthropic_sse_fallback_claude_style_and_finish_reasons() {
     )
     .unwrap();
 
-    let sse_overloaded = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+    let sse_overloaded = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"partial\"}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n"
+    );
     let sse_truncated = concat!(
         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":2}}}\n\n",
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
@@ -16924,6 +16931,648 @@ fn final_binary_anthropic_sse_stream_lease_loss_recovery_and_catalog_queries() {
         assert!(
             !bad_out.status.success(),
             "expected rejection for {bad_session}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+fn final_binary_cross_process_permission_mode_reused_tool_ids_thinking_and_materializing_regressions()
+ {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // 1. Reused `tool_call_id` across 2 rounds in one turn + cross-process permission_mode
+    //    downgrade (`FullAuto` -> `Ask` via a second `ServeChild` sharing `state.db`) +
+    //    `replace_all: true` permission summary `"replace all matches"`.
+    let scen = Scenario::new();
+    std::fs::write(scen.root().join("doc.txt"), "old\nold\n").unwrap();
+    let (r1_entered_tx, r1_entered_rx) = std::sync::mpsc::channel();
+    let (r2_release_tx, r2_release_rx) = std::sync::mpsc::channel();
+    let captured_reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let cap_clone = std::sync::Arc::clone(&captured_reqs);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let replies = [
+            // Round 1: `call_dup` reads `doc.txt`
+            r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_dup","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"doc.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            // Round 2: reuses `call_dup` for `write_file` (still FullAuto -> auto-executes!),
+            // and we pause BEFORE returning Round 3 so Process B can downgrade the session to `Ask`!
+            r#"{"id":"c2","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_dup","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"created_r2.txt\",\"content\":\"R2_CONTENT\",\"create_intent\":true}"}}]},"finish_reason":"tool_calls"}]}"#,
+            // Round 3: receives BOTH `call_dup` results, then requests `edit_file` (`replace_all: true`)
+            // AFTER Process B downgraded `permission_mode` to `Ask` -> MUST park at `waiting_permission`!
+            r#"{"id":"c3","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_edit_all","type":"function","function":{"name":"edit_file","arguments":"{\"path\":\"doc.txt\",\"before\":\"old\",\"after\":\"new\",\"replace_all\":true}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ];
+        for (idx, body) in replies.into_iter().enumerate() {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut end = None;
+            let mut len = 0_usize;
+            loop {
+                let mut buf = [0_u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if end.is_none()
+                    && let Some(p) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    end = Some(p + 4);
+                    for line in String::from_utf8_lossy(&raw[..p + 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(e) = end
+                    && raw.len() >= e + len
+                {
+                    break;
+                }
+            }
+            let e = end.unwrap();
+            cap_clone
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&raw[e..e + len]).unwrap());
+            if idx == 2 {
+                let _ = r1_entered_tx.send(());
+                let _ = r2_release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+
+    scen.write_config(
+        &format!("http://{addr}/v1/chat/completions"),
+        r#"["/bin/true"]"#,
+    );
+    let srv_a = ServeChild::start_with_env(&scen, &[("TEST_OPENAI_KEY", "k")]);
+    let srv_b = ServeChild::start_with_env(&scen, &[("TEST_OPENAI_KEY", "k")]);
+    let ws_root = scen.root().to_str().unwrap();
+    let (st_ws_a, ws_body_a) = srv_a.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&srv_a.token),
+        Some(&serde_json::json!({ "path": ws_root })),
+        &[],
+    );
+    assert_eq!(st_ws_a, 200);
+    let ws_id_a = ws_body_a["workspace_id"].as_str().unwrap().to_owned();
+    let (st_ws_b, ws_body_b) = srv_b.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&srv_b.token),
+        Some(&serde_json::json!({ "path": ws_root })),
+        &[],
+    );
+    assert_eq!(st_ws_b, 200);
+    let ws_id_b = ws_body_b["workspace_id"].as_str().unwrap().to_owned();
+
+    let url_a = format!("http://127.0.0.1:{}", srv_a.port);
+    let tok_a = srv_a.token.clone();
+    let bin_path = env!("CARGO_BIN_EXE_latte-code");
+    let home_path = scen.home().clone();
+    let root_path = scen.root().to_path_buf();
+    let cli_runner = std::thread::spawn(move || {
+        std::process::Command::new(bin_path)
+            .current_dir(&root_path)
+            .env("HOME", &home_path)
+            .env("LATTE_CODE_HOME", home_path.join(".latte"))
+            .env("TEST_OPENAI_KEY", "k")
+            .args([
+                "--json",
+                "run",
+                "--auto",
+                "--server",
+                &url_a,
+                "--token",
+                &tok_a,
+                "run two rounds with reused id then cross-process mode switch",
+            ])
+            .output()
+            .unwrap()
+    });
+
+    // Wait until Round 3 request arrives at provider (after Round 1 & Round 2 both ran `call_dup`).
+    r1_entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("provider should reach round 3");
+
+    let (_, list_body) = srv_a.request(
+        "GET",
+        &format!("/v1/workspaces/{ws_id_a}/sessions?limit=5"),
+        Some(&srv_a.token),
+        None,
+        &[],
+    );
+    let sid = list_body["sessions"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Process B (`srv_b`, separate OS process!) switches the session to `ask` while Process A holds the lease!
+    let (st_mode, mode_body) = srv_b.request(
+        "POST",
+        &format!("/v1/sessions/{sid}/permission-mode"),
+        Some(&srv_b.token),
+        Some(&serde_json::json!({ "permission_mode": "ask" })),
+        &[],
+    );
+    assert_eq!(st_mode, 200, "{mode_body}");
+    let _ = r2_release_tx.send(());
+
+    let cli_out = cli_runner.join().unwrap();
+    assert_eq!(
+        cli_out.status.code(),
+        Some(10),
+        "expected EXIT_WAITING: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&cli_out.stdout),
+        String::from_utf8_lossy(&cli_out.stderr)
+    );
+    let (_, snap_body) = srv_a.request(
+        "GET",
+        &format!("/v1/sessions/{sid}"),
+        Some(&srv_a.token),
+        None,
+        &[],
+    );
+    let parked_snap = snap_body["snapshot"].clone();
+    assert_eq!(parked_snap["lifecycle"], "waiting_permission");
+    let http_binding = parked_snap["binding"].clone();
+    let perm_desc = parked_snap["pending"]["description"].as_str().unwrap();
+    assert!(
+        perm_desc.contains("replace all matches"),
+        "replace_all: true permission card must say 'replace all matches': {perm_desc}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scen.root().join("doc.txt")).unwrap(),
+        "old\nold\n",
+        "downgraded Ask mode must prevent unapproved edit_file from mutating doc.txt"
+    );
+
+    server_thread.join().unwrap();
+    let reqs = captured_reqs.lock().unwrap();
+    let r3_msgs = reqs[2]["messages"].as_array().unwrap();
+    let dup_tools: Vec<&serde_json::Value> = r3_msgs
+        .iter()
+        .filter(|m| m["role"] == "tool" && m["tool_call_id"] == "call_dup")
+        .collect();
+    assert_eq!(
+        dup_tools.len(),
+        2,
+        "reused tool_call_id across rounds must preserve BOTH tool results: {r3_msgs:?}"
+    );
+
+    // 2. Crashed `materializing` session retried within the 60s lease TTL via `ServeChild`
+    //    succeeds with `202` (instead of `409`) and rejects mismatched prompt with `422`!
+    let crash_sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let crash_cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let canonical_ws = std::fs::canonicalize(scen.root())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    {
+        // Copy a valid `binding_json` & digest shape by starting from `srv_b`? Even simpler:
+        // inspect `sessions` row of `sid` and compute exact `create_command_digest_with_mode`?
+        // No in-process engine needed: let's check `mismatch` (`422`) on any digest first!
+        let conn = rusqlite::Connection::open(scen.database_path()).unwrap();
+        let binding_json: String = conn
+            .query_row(
+                "SELECT binding_json FROM sessions WHERE session_id=?1",
+                [&sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runtime_lease(scope,owner,fencing_token,expires_at_ms) VALUES(?1,'crashed-proc',1,?2)",
+            rusqlite::params![format!("session:{crash_sid}"), now_ms + 60_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus,create_command_id,create_command_digest) \
+             VALUES(?1,0,0,'materializing','ask',?2,NULL,?3,?3,'crashed',?4,NULL,?5,'deadbeef')",
+            rusqlite::params![&crash_sid, &binding_json, now_ms, &canonical_ws, &crash_cid],
+        )
+        .unwrap();
+    }
+    let (mismatch_st, _) = srv_b.request(
+        "POST",
+        &format!("/v1/workspaces/{ws_id_b}/sessions"),
+        Some(&srv_b.token),
+        Some(&serde_json::json!({
+            "session_id": crash_sid,
+            "command_id": crash_cid,
+            "prompt": "different prompt",
+            "binding": http_binding,
+        })),
+        &[("Idempotency-Key", &crash_cid)],
+    );
+    assert_eq!(mismatch_st, 422);
+
+    // 2b. Matching `.jsonl`-backed AND fileless `materializing` retries within 60s lease TTL
+    //     promote (`200 Replayed`) and recreate (`202 Created`) instead of returning `409`!
+    let mat_prov = ScriptedProvider::start([
+        ProviderReply::completion("seed-promoted-mat"),
+        ProviderReply::completion("seed-fileless-mat"),
+        ProviderReply::completion("recreated-fileless-mat"),
+    ]);
+    let mat_scen = Scenario::new();
+    mat_scen.write_config(mat_prov.endpoint(), r#"["/bin/true"]"#);
+    let mat_srv = ServeChild::start_with_env(&mat_scen, &[("TEST_OPENAI_KEY", "k")]);
+    let mat_ws_root = mat_scen.root().to_str().unwrap();
+    let (_, mat_ws_body) = mat_srv.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&mat_srv.token),
+        Some(&serde_json::json!({ "path": mat_ws_root })),
+        &[],
+    );
+    let mat_ws_id = mat_ws_body["workspace_id"].as_str().unwrap().to_owned();
+    let (_, mat_seed_body) = mat_srv.create_session(&mat_ws_id, "bootstrap binding", &http_binding);
+    let _ = mat_seed_body;
+    // Use `latte-code run` to obtain a genuine `mat_scen` binding & session.
+    let mat_url = format!("http://127.0.0.1:{}", mat_srv.port);
+    let mat_boot = mat_scen.output(
+        &[
+            "--json",
+            "run",
+            "--server",
+            &mat_url,
+            "--token",
+            &mat_srv.token,
+            "boot mat",
+        ],
+        |cmd| {
+            cmd.env("TEST_OPENAI_KEY", "k");
+        },
+    );
+    assert!(mat_boot.status.success());
+    let mat_binding = json(&mat_boot)["data"]["session"]["binding"].clone();
+    let mat_canon = std::fs::canonicalize(mat_scen.root())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // Create a second session via HTTP with explicit `(prom_sid, prom_cid)` so SQLite records its exact digest + `.jsonl`.
+    let prom_sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let prom_cid = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+    let (prom_st0, _) = mat_srv.request(
+        "POST",
+        &format!("/v1/workspaces/{mat_ws_id}/sessions"),
+        Some(&mat_srv.token),
+        Some(&serde_json::json!({
+            "session_id": prom_sid,
+            "command_id": prom_cid,
+            "prompt": "promote me within 60s",
+            "binding": mat_binding,
+        })),
+        &[("Idempotency-Key", &prom_cid)],
+    );
+    assert_eq!(prom_st0, 202);
+    let _ = wait_session_idle(&mat_srv, &prom_sid);
+
+    // Convert `prom_sid` back to a crashed `materializing` row with an active 60s lease (keeping its `.jsonl`!).
+    let (real_digest, binding_raw) = {
+        let conn = rusqlite::Connection::open(mat_scen.database_path()).unwrap();
+        let pair: (String, String) = conn
+            .query_row(
+                "SELECT d.digest, s.binding_json FROM session_command_dedup d JOIN sessions s ON s.session_id=?1 WHERE d.command_id=?2",
+                rusqlite::params![&prom_sid, &prom_cid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let now_ms = i64::try_from(latte_core::wall_time_ms()).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM session_command_dedup WHERE command_id='{prom_cid}';
+             DELETE FROM session_events WHERE session_id='{prom_sid}';
+             DELETE FROM session_commit_sources WHERE session_id='{prom_sid}';
+             DELETE FROM conversation_outbox WHERE session_id='{prom_sid}';
+             DELETE FROM session_active_turns WHERE session_id='{prom_sid}';
+             DELETE FROM turn_baselines WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM events WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM turns WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM session_turns WHERE session_id='{prom_sid}';
+             DELETE FROM sessions WHERE session_id='{prom_sid}';
+             PRAGMA foreign_keys = ON;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_lease(scope,owner,fencing_token,expires_at_ms) VALUES(?1,'dead-writer',1,?2)",
+            rusqlite::params![format!("session:{prom_sid}"), now_ms + 60_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus,create_command_id,create_command_digest) \
+             VALUES(?1,0,0,'materializing','ask',?2,NULL,?3,?3,'prom',?4,NULL,?5,?6)",
+            rusqlite::params![&prom_sid, &pair.1, now_ms, &mat_canon, &prom_cid, &pair.0],
+        )
+        .unwrap();
+        pair
+    };
+    // Retry within 60s lease -> promotes `.jsonl` and returns `200 Replayed`!
+    let (prom_retry_st, _) = mat_srv.request(
+        "POST",
+        &format!("/v1/workspaces/{mat_ws_id}/sessions"),
+        Some(&mat_srv.token),
+        Some(&serde_json::json!({
+            "session_id": prom_sid,
+            "command_id": prom_cid,
+            "prompt": "promote me within 60s",
+            "binding": mat_binding,
+        })),
+        &[("Idempotency-Key", &prom_cid)],
+    );
+    assert_eq!(prom_retry_st, 200);
+    drop(mat_srv);
+
+    // Now convert `prom_sid` (after deleting its `.jsonl` too!) into a FILELESS crashed
+    // `materializing` row with active 60s lease, start a fresh `ServeChild` (whose startup
+    // leaves the live-leased `materializing` row untouched!), and retry -> returns `202 Created`!
+    {
+        let conn = rusqlite::Connection::open(mat_scen.database_path()).unwrap();
+        let mut dirs = vec![mat_scen.home().clone(), mat_scen.root().to_path_buf()];
+        let target_jsonl = format!("{prom_sid}.jsonl");
+        while let Some(dir_path) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir_path).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.file_name().and_then(|n| n.to_str()) == Some(target_jsonl.as_str()) {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        let now_ms = i64::try_from(latte_core::wall_time_ms()).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM session_command_dedup WHERE command_id='{prom_cid}';
+             DELETE FROM session_events WHERE session_id='{prom_sid}';
+             DELETE FROM session_commit_sources WHERE session_id='{prom_sid}';
+             DELETE FROM conversation_outbox WHERE session_id='{prom_sid}';
+             DELETE FROM session_active_turns WHERE session_id='{prom_sid}';
+             DELETE FROM turn_baselines WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM events WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM turns WHERE turn_id IN (SELECT turn_id FROM session_turns WHERE session_id='{prom_sid}');
+             DELETE FROM session_turns WHERE session_id='{prom_sid}';
+             DELETE FROM sessions WHERE session_id='{prom_sid}';
+             PRAGMA foreign_keys = ON;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_lease(scope,owner,fencing_token,expires_at_ms) VALUES(?1,'dead-writer-2',1,?2)",
+            rusqlite::params![format!("session:{prom_sid}"), now_ms + 60_000],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(session_id,revision,last_seq,lifecycle,permission_mode,binding_json,latest_turn_id,created_at_ms,updated_at_ms,title,workspace_root,focus,create_command_id,create_command_digest) \
+             VALUES(?1,0,0,'materializing','ask',?2,NULL,?3,?3,'fl',?4,NULL,?5,?6)",
+            rusqlite::params![&prom_sid, &binding_raw, now_ms, &mat_canon, &prom_cid, &real_digest],
+        )
+        .unwrap();
+    }
+    let mat_srv2 = ServeChild::start_with_env(&mat_scen, &[("TEST_OPENAI_KEY", "k")]);
+    let (_, mat_ws_body2) = mat_srv2.request(
+        "POST",
+        "/v1/workspaces",
+        Some(&mat_srv2.token),
+        Some(&serde_json::json!({ "path": mat_ws_root })),
+        &[],
+    );
+    let mat_ws_id2 = mat_ws_body2["workspace_id"].as_str().unwrap().to_owned();
+    let (fl_retry_st, _) = mat_srv2.request(
+        "POST",
+        &format!("/v1/workspaces/{mat_ws_id2}/sessions"),
+        Some(&mat_srv2.token),
+        Some(&serde_json::json!({
+            "session_id": prom_sid,
+            "command_id": prom_cid,
+            "prompt": "promote me within 60s",
+            "binding": mat_binding,
+        })),
+        &[("Idempotency-Key", &prom_cid)],
+    );
+    assert_eq!(fl_retry_st, 202);
+    let _ = wait_session_idle(&mat_srv2, &prom_sid);
+    drop(mat_srv2);
+    drop(srv_a);
+    drop(srv_b);
+
+    // 3. Anthropic `auth: "bearer"`, pre-delta SSE `overloaded_error` retry, and
+    //    `model_context_window_exceeded` finish_reason via `CARGO_BIN_EXE_latte-code`.
+    let anth_scen = Scenario::new();
+    let anth_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let anth_addr = anth_listener.local_addr().unwrap();
+    let (anth_hdr_tx, anth_hdr_rx) = std::sync::mpsc::channel();
+    let anth_thread = std::thread::spawn(move || {
+        // Attempt 1: pre-delta SSE `overloaded_error` -> retried!
+        let (mut s1, _) = anth_listener.accept().unwrap();
+        let mut b1 = [0_u8; 4096];
+        let n1 = s1.read(&mut b1).unwrap_or(0);
+        let _ = anth_hdr_tx.send(String::from_utf8_lossy(&b1[..n1]).to_ascii_lowercase());
+        let sse_over = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n"
+        );
+        let r1 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_over}",
+            sse_over.len()
+        );
+        s1.write_all(r1.as_bytes()).unwrap();
+
+        // Attempt 2: SSE completes with `stop_reason: "model_context_window_exceeded"` -> mapped to Length!
+        let (mut s2, _) = anth_listener.accept().unwrap();
+        let mut b2 = [0_u8; 4096];
+        let _ = s2.read(&mut b2);
+        let sse_len = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"truncated answer\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":50}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let r2 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_len}",
+            sse_len.len()
+        );
+        s2.write_all(r2.as_bytes()).unwrap();
+    });
+    std::fs::create_dir_all(anth_scen.home().join(".latte")).unwrap();
+    let anth_base = format!("http://{anth_addr}");
+    std::fs::write(
+        anth_scen.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"gw/claude",providers:{{gw:{{type:"anthropic-messages",auth:"bearer",max_attempts:2,models:["claude"],base_url:{anth_base:?},api_key:"gw-bearer-token"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let anth_out = anth_scen.output(&["--json", "run", "hello gateway"], |_| {});
+    anth_thread.join().unwrap();
+    let anth_hdr = anth_hdr_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(anth_hdr.contains("authorization: bearer gw-bearer-token"));
+    assert!(!anth_hdr.contains("x-api-key:"));
+    // `FinishReason::Length` causes the turn to fail retryably rather than pretending normal completion!
+    assert!(!anth_out.status.success());
+    let anth_str = String::from_utf8_lossy(&anth_out.stdout);
+    assert!(
+        anth_str.contains("length")
+            || anth_str.contains("truncated")
+            || anth_str.contains("output"),
+        "{anth_str}"
+    );
+
+    // 4. Mixed signed + unsigned thinking rejection on open continuation across CLI restart,
+    //    `retry-after-ms` + jitter backoff, pasted `<repository-context>` source cap, and
+    //    invalid registry / focus boundary rejections via `CARGO_BIN_EXE_latte-code`.
+    let mix_scen = Scenario::new();
+    let mix_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mix_addr = mix_listener.local_addr().unwrap();
+    let mix_thread = std::thread::spawn(move || {
+        // Attempt 1: 429 with `retry-after-ms: 10` -> retried!
+        let (mut s1, _) = mix_listener.accept().unwrap();
+        let mut b1 = [0_u8; 4096];
+        let _ = s1.read(&mut b1);
+        s1.write_all(
+            b"HTTP/1.1 429 Too Many Requests\r\nretry-after-ms: 10\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .unwrap();
+        // Attempt 2: 503 with NO Retry-After header -> exercises exponential backoff + jitter!
+        let (mut s2, _) = mix_listener.accept().unwrap();
+        let mut b2 = [0_u8; 4096];
+        let _ = s2.read(&mut b2);
+        s2.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .unwrap();
+        // Attempt 3: inline JSON with 2 thinking blocks (1 signed + 1 unsigned) and a portable `Read`
+        // tool call so Round 2 immediately enters `build_anthropic_payload` on an open continuation!
+        let (mut s3, _) = mix_listener.accept().unwrap();
+        let mut b3 = [0_u8; 4096];
+        let _ = s3.read(&mut b3);
+        let body = r#"{"type":"message","content":[
+            {"type":"thinking","thinking":"step one","signature":"sig_keep_1"},
+            {"type":"thinking","thinking":"step two","signature":""},
+            {"type":"tool_use","id":"r_mix","name":"Read","input":{"file_path":"AGENTS.md"}}
+        ],"stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s3.write_all(resp.as_bytes()).unwrap();
+    });
+    std::fs::write(mix_scen.root().join("AGENTS.md"), "ok\n").unwrap();
+    std::fs::create_dir_all(mix_scen.home().join(".latte")).unwrap();
+    let mix_base = format!("http://{mix_addr}");
+    std::fs::write(
+        mix_scen.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"c/m",providers:{{c:{{type:"anthropic-messages",max_attempts:3,streaming:false,headers:{{"x-trace":"${{session_id}}"}},models:{{m:{{options:{{context_window:64000,max_tokens:8192,reasoning_effort:"minimal"}}}}}},base_url:{mix_base:?},api_key:"k"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let mix_resumed = mix_scen.output(
+        &["--json", "run", "mixed thinking open continuation"],
+        |_| {},
+    );
+    mix_thread.join().unwrap();
+    assert!(!mix_resumed.status.success());
+    let mix_resumed_str = String::from_utf8_lossy(&mix_resumed.stdout);
+    assert!(
+        mix_resumed_str.contains("signed thinking block"),
+        "mixed signed+unsigned thinking must fail closed on open continuation: {mix_resumed_str}"
+    );
+
+    // 5. Pasted `<repository-context>` user prompt counts against `max_summary_source_bytes` during compaction.
+    let cap_scen = Scenario::new();
+    std::fs::write(cap_scen.root().join("AGENTS.md"), "workspace note\n").unwrap();
+    let cap_prov = ScriptedProvider::start([
+        ProviderReply::completion(&"A".repeat(2_000)),
+        ProviderReply::completion("bounded plain summary"),
+        ProviderReply::completion("second reply"),
+    ]);
+    let cap_ep = cap_prov.endpoint();
+    std::fs::create_dir_all(cap_scen.home().join(".latte")).unwrap();
+    std::fs::write(
+        cap_scen.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"o/m",providers:{{o:{{type:"openai-chat",models:["m"],endpoint:{cap_ep:?},api_key:"k"}}}},session:{{max_request_bytes:5600,max_input_bytes:5600,reserved_output_bytes:1,context_cap_bytes:65536,compaction:{{enabled:true,mode:"elide_then_summarize",max_summary_source_bytes:512,reuse_prefix:true}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let pasted_prompt = format!("<repository-context>\n{}", "p".repeat(2_000));
+    let cap_run = cap_scen.output(&["--json", "run", &pasted_prompt], |_| {});
+    assert!(cap_run.status.success());
+    let cap_sid = json(&cap_run)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cap_res = cap_scen.output(&["--json", "resume", &cap_sid, "second"], |_| {});
+    assert!(cap_res.status.success());
+    let summary_req = &cap_prov.requests()[1].body;
+    assert!(
+        summary_req.get("tools").is_none()
+            || summary_req["tools"].as_array().is_some_and(Vec::is_empty),
+        "pasted <repository-context> exceeding max_summary_source_bytes must bypass warm_prefix reuse: {summary_req}"
+    );
+
+    // 6. Invalid `latte-code.jsonc` registry boundaries & escaping `--focus` fail closed via final CLI!
+    assert!(
+        !cap_scen
+            .output(&["--json", "run", "--focus", "../outside", "hi"], |_| {})
+            .status
+            .success()
+    );
+    let bad_cfg_scen = Scenario::new();
+    std::fs::create_dir_all(bad_cfg_scen.home().join(".latte")).unwrap();
+    for bad_cfg in [
+        r#"{version:2,default_model:"",providers:{}}"#,
+        r#"{version:1,default_model:"x/m",providers:{"":{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"malformed",providers:{}}"#,
+        r#"{version:1,default_model:"missing/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/missing",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:[],endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],base_url:"http://127.0.0.1:9",endpoint:"http://127.0.0.1:9/v1",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",timeout_ms:0}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",max_attempts:11}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",temperature:3}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{options:{context_window:16,max_tokens:16}}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:{m:{name:""}},endpoint:"http://127.0.0.1:9",api_key:"k"}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",headers:{"x-bad":"${UNTERMINATED"}}}}"#,
+        r#"{version:1,default_model:"p/m",providers:{p:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9",api_key:"k",headers:{"x-bad":"${UNKNOWN_VAR}"}}}}"#,
+    ] {
+        std::fs::write(bad_cfg_scen.home().join(".latte/latte-code.jsonc"), bad_cfg).unwrap();
+        assert!(
+            !bad_cfg_scen
+                .output(&["--json", "run", "probe"], |_| {})
+                .status
+                .success(),
+            "expected CLI rejection for {bad_cfg}"
         );
     }
 }
